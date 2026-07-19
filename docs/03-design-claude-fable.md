@@ -1,0 +1,313 @@
+# serial_nexus — Design Document
+
+**Status:** Design settled; pre-implementation.
+**Scope:** A daemon and CLI client for managing serial ports as a graph of data-routing nodes.
+**Targets:** Rust edition 2024. Linux is required; macOS is best-effort; Windows is out of scope (§13, §15.13).
+**Names:** The project is `serial_nexus`; the daemon is `serialnexusd` and the CLI is `serialnexusctl`.
+
+This document records both the design and the reasoning. Sections 1–14 describe the system as settled. Section 15 is the historical record: each problem uncovered during design review, the path chosen, and its implications. A reader who wants only "what are we building" can stop after §14; a reader who wants "why is it built this way" should treat §15 as normative context for future changes.
+
+---
+
+## 1. Problem
+
+Working with embedded targets over serial links looks simple — open `/dev/ttyUSB0`, run a terminal program — until several realities collide:
+
+One physical serial port often carries several logical streams. Devices with a hardware or firmware multiplexer present multiple consoles, trace channels, and control channels interleaved on a single UART, framed by a device-specific protocol. Nothing off the shelf will split that port into separately usable streams.
+
+Every interesting stream has more than one consumer. The same console needs an interactive terminal for the operator, a permanent log for forensics, and a forwarded copy on another machine — simultaneously, without the consumers interfering with each other or with the device.
+
+Streams must cross machines. A lab machine physically wired to the devices is rarely the machine where people work. Streams need to travel over TCP or Unix sockets to a second daemon that re-exposes them as local pseudo-terminals and logs.
+
+Writers must not collide. When two people (or a person and a script, on the same or different machines) write to one console, their bytes interleave at arbitrary boundaries and corrupt whatever line- or packet-oriented protocol the device speaks. Device maintenance requires disciplined, exclusive write access with an escape hatch for stealing it.
+
+Ports come and go. USB serial adapters disappear and reappear; the same adapter does not always return as the same `/dev` path. Operator intent must survive replugging, daemon restarts, and device power cycles.
+
+Existing tools each solve a slice: ser2net exposes ports over TCP, socat plumbs ad-hoc pipelines, conserver manages shared console access and logging. None of them compose demultiplexing, PTY fan-out, per-stream logging, re-multiplexing, and cross-machine forwarding under a single operator-owned configuration — and all three are copyleft-licensed, which this project may run as external tools but not link (§13). serialnexusd is a permissively-licensed daemon that composes all of the above as one explicit, inspectable graph.
+
+## 2. Illustrating use case
+
+This scenario exercised every design decision and is the reference configuration for the rest of the document.
+
+A device exposes one physical serial port carrying a hardware multiplexer: several logical serial streams (main console, coprocessor console, trace output) interleaved by a protocol the operator knows. Computer A is wired to the device and runs serialnexusd with this configuration: a **serial port node** owns the physical port; a **codec node** speaking the device's multiplexing protocol (supplied as a compiled-in codec with configuration attributes, or via the exec codec escape hatch) demultiplexes the port into named **channels**; each channel fans out to a **PTY node** (an interactive pseudo-terminal for local operators), a **log node** (an append-only file with on-demand rotation), and one channel of a **leg node** — a socket transport that re-multiplexes all channels over a single TCP connection.
+
+Computer B, where the operators actually sit, runs serialnexusd with the mirror configuration: a leg node accepts the connection (bound to localhost on both ends and carried over SSH forwarding), announces the channel identities across the wire, and each bound channel fans out again into B-local PTY nodes and log nodes.
+
+Maintenance works from either machine: an operator grabs the exclusive write lock on a channel, types into its PTY (or lets a script drive it), and releases. The write lock, backpressure, and purge rules guarantee that concurrent operators cannot interleave bytes and that stale, buffered commands never fire into a device that has rebooted in the meantime. When a second device is wired to computer A, its channels join the same leg, and computer B sees them appear as additional channel identities.
+
+The apparent redundancy — demultiplex, then re-multiplex — is the point: once streams are first-class channels inside the graph, forwarding, logging, spying, and write arbitration apply uniformly to every stream regardless of how it entered the system.
+
+## 3. Concepts and terminology
+
+**Target system and host system.** Every stream in the graph runs between the *target system* — the device under control — and the *host system* — the world of consumers: terminals, logs, sockets, remote daemons. These are semantic anchors, not physical ones: on computer B, the target lies across a network hop, and a simulated device behind a pseudo-terminal is a target with no hardware at all. *Targetward* and *hostward* are the relative directions (what casual usage calls upstream and downstream).
+
+**Nodes, endpoints, edges.** The daemon manages a graph. *Nodes* process data and move it in and out of the system. Nodes expose typed *endpoints*; an *edge* connects exactly two endpoints and carries a bidirectional byte stream. Edge direction encodes topological role, not data flow: data flows both ways along every edge (a console both prints and accepts input).
+
+**Facing.** Every endpoint declares an orientation: it *faces target* or *faces host*, meaning the direction it looks along the target–host axis. A valid edge always joins one host-facing endpoint to one target-facing endpoint. Boundary nodes face inward: a serial port node's endpoint faces host (it offers the device's stream to consumers); PTY nodes and log nodes face target (they look back toward the device); a codec node faces target on its multiplexed side and host on its channels. Dual-role node types — leg nodes, existing-PTY connectors, serial ports used as outputs — carry a `faces` configuration attribute. In the reference configuration, computer A's leg faces target (it consumes local channels for transport) and computer B's leg faces host (it offers the arriving channels to local consumers).
+
+**Configuration and state.** Everything the daemon knows is either *configuration* — desired, operator-owned, round-trippable — or *state* — observed, environment-owned, reportable but never persisted. The governing invariant: **operators own the graph; the environment owns only state.** Configuration operations fail only on structural invalidity; environmental failure (a missing device, an unwritable directory) never changes the graph, only a node's state.
+
+**Names and identities.** Nodes have operator-chosen *names*, used for configuration addressing and CLI verbs. Channels have codec-scoped *channel identities*, which are the names that cross the wire between daemons. The display form `node/channel` combines them for human output; neither is derived from device paths.
+
+**Origins.** An *origin* is a hostward boundary through which bytes enter the graph traveling targetward: a PTY with a client attached, an accepted socket connection, the CLI's `send` verb, a remote daemon's leg. Write arbitration and backpressure both act on origins.
+
+**Boundary nodes.** Nodes where the graph touches a kernel object with its own finite buffer and independent consumer: serial ports (both directions), PTY masters, sockets, and files. All buffering, dropping, and flow-control policy lives at boundaries; the graph interior is policy-free (§5).
+
+## 4. Graph model
+
+The graph obeys three structural rules, checked at load and on every incremental operation:
+
+1. Every edge joins exactly one host-facing endpoint to exactly one target-facing endpoint.
+2. A host-facing endpoint may have any number of attached edges; a target-facing endpoint has exactly one.
+3. The graph is acyclic.
+
+Rule 2 carries most of the semantics. Fan-out is implicit at host-facing endpoints: hostward data arriving at the endpoint is broadcast to every attached edge, and targetward writes from the attached edges are arbitrated by that endpoint's write lock (§6). There is no tee node; "attach the PTY, the log, and the leg to channel 2" is expressed directly as three edges on one endpoint. The single-edge rule on target-facing endpoints enforces the *one-producer invariant*: behind every endpoint sits exactly one source of hostward data, which is what makes unrestricted reading safe by construction. The dual failure mode — two streams interleaving hostward into one consumer — is unrepresentable, and accidental duplicate delivery would require a node whose documented job is duplication. Merging streams is always explicit: the multi-input node doing it (a codec, or a future labeled-combiner) frames its inputs rather than interleaving raw bytes.
+
+Data flows both directions along every edge; some endpoints simply never exercise one direction (a log node never writes targetward). Symmetric configurations — the daemon bridging two physical devices as a virtual null modem or man-in-the-middle — are legal; the operator declares one side the target, and the docs state plainly that the choice is a labeling judgment, not a property the daemon can infer.
+
+## 5. Data plane
+
+The design assumption is the modern common case: 3-wire UART (TX/RX/GND), no flow-control lines. Consequently no end-to-end flow control exists toward the host — the device transmits whether or not anyone listens — while real, persistent bottlenecks exist toward the target (the port drains at line rate). The data plane is built around that asymmetry.
+
+**The interior contract.** Interior nodes are queue-free and policy-free. They may hold parser state (a partial frame, bounded by the codec's frame size) and a single-chunk holdover slot per direction, but never queues. All policy — buffering, dropping, pausing — lives at the four boundary types: serial ports, PTY masters, sockets, files.
+
+**Hostward flow is lossy at boundaries.** `deliver(chunk)` hostward is infallible and immediate: interior nodes transform and forward synchronously in the caller's context; host-facing endpoints broadcast to all attached edges; and each consuming boundary applies its own policy when its kernel object can't accept data — bounded buffering where configured, then counted drops. A slow spy costs itself data, never its neighbors.
+
+**Targetward flow is backpressured to the origin.** `deliver(chunk)` targetward returns Accepted or Busy and never blocks. Busy propagates synchronously back to the origin, which stops reading its own kernel object until the path drains: the TCP window closes, the PTY client's write blocks — the kernel buffers on the client's side of the fence, and nothing is dropped. Commands are delayed, never lost. A transform that has already emitted output when downstream refuses parks it in its holdover slot, capping interior memory at one frame per node. If a port does have flow control configured (XON/XOFF or RTS/CTS remain ordinary port attributes; the 3-wire assumption is a default, not a constraint), the kernel pausing transmission surfaces as Busy, so hardware flow control transparently extends across the graph to remote writers.
+
+**Serial ingest never blocks and never idles.** A configured serial node holds its port open (§7.1) and reads continuously. When nothing is attached, data is discarded with a counter rather than left to overflow the kernel: the alternative — not reading — fills the driver buffer, drops on overrun anyway, and greets the first consumer with a stale burst followed by a gap. Driver overrun counters (TIOCGICOUNT, where supported) are surfaced in state alongside the daemon's own discard counters, so loss is always visible and attributable.
+
+**Files are the exception that proves the boundary rule.** Regular-file writes cannot be made non-blocking (O_NONBLOCK is a no-op on them), so each log node owns a bounded queue feeding a dedicated writer task, with an overflow policy of drop-oldest-with-counters or fault-the-node — triggered in practice by full disks and slow network filesystems.
+
+At serial data rates the entire synchronous data plane fits comfortably on one thread, which also makes the immediate-delivery contract trivially safe.
+
+## 6. Write arbitration
+
+Reading is never arbitrated: the one-producer invariant (§4) makes hostward flow unambiguous, and every attachment may watch. Writing is arbitrated per host-facing endpoint: among all edges attached to an endpoint, at most one holds the exclusive write lock, and only the holder's bytes are read targetward. The lock is implemented as a gate on the §5 pause machinery — non-holders are simply not read from — so arbitration adds no new data path.
+
+Each edge declares a **write mode**:
+
+- `never` — the read-only capability. Log edges and spy PTYs; these attachments cannot contend for the lock at all.
+- `on-demand` — the default for interactive and programmatic origins (PTY clients, socket connections, the CLI). Acquisition is explicit via the control plane for named origins, and implicit for leg channels: a leg acquires when it has pending targetward bytes and the lock is free, and releases after a configurable idle interval or on peer disconnect.
+- `held` — acquire-on-attach, held indefinitely. The demux codec's edge to the serial port holds that endpoint's lock permanently, because any other writer would corrupt the multiplexing protocol's framing on the wire. Stealing that lock is possible and stalls every channel — which is not a limitation but an accurate description of what raw injection does to a multiplexed link.
+
+**Etiquette and the CLI.** The intended workflow for admin operations is grab, write, release: `serialnexusctl lock <node/channel>`, interact, `serialnexusctl unlock`. The atomic form `serialnexusctl send <node/channel> --line "..."` performs acquire-with-timeout, write, and release as one daemon-side operation. Acquisition happens out-of-band on the control socket because the data streams have no side channel, and in-band escape sequences would corrupt binary protocols.
+
+**Purge rules — the stale-command hazard.** Because non-holders are paused rather than dropped, a locked-out client can type into its kernel buffer, get no response, and walk away; when the lock later frees, minutes-old commands would fire into the device. Therefore: on explicit lock acquisition, the daemon drains and discards (with a counter) anything the origin buffered before the grant — safe by construction for correct clients, which acquire before writing; on origin detach without the lock, the backlog is likewise purged. Implicitly-acquiring leg channels are exempt from purge-on-acquire (data arrival is the acquisition trigger); the analogous hazard for legs and for reappearing serial devices is covered by purge-on-reconnect (§7.1, §7.4).
+
+**Lifecycle.** The lock releases on explicit unlock and automatically on origin detach (slave closed, connection dropped). `serialnexusctl lock --steal` exists for the hung-script case and is recorded in state so the previous holder can see what happened; an optional lease duration bounds a wedged session. State reports holder, waiters, and per-origin purge counters per endpoint. A per-endpoint attribute `arbitration = exclusive | free-for-all` defaults to exclusive; free-for-all ("no lock") remains for machine-to-machine links coordinated elsewhere.
+
+**Limits, documented.** The holder is an origin endpoint, not a process: two processes sharing one PTY slave are indistinguishable to the daemon. Cross-machine exclusion composes by nesting — the remote daemon's writers contend locally on their side, and the whole remote leg contends as one origin on this side, with backpressure crossing the TCP link — at the cost of blocking rather than fail-fast UX for remote contenders; explicit lock request/grant frames are a reserved wire capability (§9) for later.
+
+## 7. Node types
+
+Each node type is specified as: endpoints and facing, configuration (operator-owned, round-trips through dump/load), state (observed, reported by the `state` verb), and behavior. Common to all node types: a `name` (configuration), a status of `active | waiting | faulted` with reason and timestamp (state), and the rule that environmental failure faults the node without failing the operation that created it.
+
+### 7.1 Serial port node
+
+One endpoint; faces host in the normal role, or target when the port is used as an output leg toward another machine's tools (`faces` attribute). Configuration: device identity in resolver form (§12), termios parameters (baud, data bits, parity, stop bits), flow control (`none` default, `xonxoff`, `rtscts`), initial modem-line assertions, and hostward-consumer drop policy. State: resolved `/dev` path, status, daemon discard counters, driver overrun counters where available, current modem-line readings.
+
+Behavior: the node opens with O_NOCTTY, takes TIOCEXCL so stray processes cannot share the port, applies configured termios and modem lines, and holds the port open for its lifetime — open/close toggles DTR on many USB adapters (the classic auto-reset), so line states must be deterministic. It reads continuously, discarding with counters when nothing is attached (§5). On read failure the node goes **faulted-and-wait**: hostward flow goes silent, targetward reports Busy so all origins pause, and the node polls the resolver (a stat every second or two — cheap, portable, and free of libudev's LGPL linkage) until *the same identity* reappears; a different adapter squatting on the old path is not adopted. Reopening reapplies configured termios, retakes TIOCEXCL, restores modem lines, and by default purges origin backlogs accumulated during the outage (the device likely power-cycled; twenty minutes of buffered commands must not fire into its boot prompt), with counters and a per-node override. Serial nodes leave the graph only by explicit configuration operations.
+
+Control-plane verbs on this node: `send-break`, `set-modem`/`pulse-dtr` (and RTS), read modem lines — the signals a 3-wire-focused PTY cannot convey (§7.2).
+
+### 7.2 PTY node
+
+One endpoint, faces target. Configuration: symlink `path` (required), `owner`/`mode` (default: daemon user, 0600; 0660 when a group is configured — applied to the slave device node, which is what gates open(2)), write mode (default `on-demand`; `never` makes a spy terminal), hostward drop policy, and an optional `advertised_baud` (default 115200) — cosmetic, since PTYs ignore baud, but it makes tcgetattr tell attached clients something sensible, and it may be set to mirror the paired serial node's configured rate. State: allocated pts path, client-present flag, the client's current termios parameters (baud, character size, parity, flags), and drop counters.
+
+Behavior: at creation the daemon allocates the pair, sets the baseline termios — raw, echo off, EXTPROC on — and creates the configured symlink to the pts node. Raw-and-no-echo is load-bearing: a fresh PTY echoes slave input back to the master and translates newlines, which builds feedback loops the moment data reflects. Packet mode (TIOCPKT) is enabled on the master; combined with EXTPROC, any client tcsetattr surfaces as a control packet, after which one tcgetattr updates the reported client parameters in state — TIOCPKT alone reports flushes and flow-control toggles but not baud changes, so EXTPROC is the necessary companion. Clients that rebuild termios from scratch clear EXTPROC; that clearing generates a final notification and the daemon re-asserts the flag through the master. A slow reconciliation poll (a few seconds; one ioctl, effectively free) backstops the mechanism's obscure corners and is the sole mechanism on macOS if EXTPROC behavior there disappoints. The daemon only *observes* client termios; propagation to hardware is deliberately deferred (§14), with an experiment path already available: subscribe to state changes and drive the serial node's configuration via RPC from a userspace tool.
+
+Presence and HUP: the PTY outputs hostward data while at least one client holds the slave open, and discards (with counters) while none does — which conveniently also means the daemon never parks bytes in a kernel buffer nobody will read. Disconnect detection is the master's HUP condition; attach detection needs two mechanisms because no un-HUP event exists: terminal programs announce themselves instantly by calling tcsetattr (a packet-mode event), and a sub-second zero-timeout HUP-status check catches silent openers like `cat`. On last close, the daemon resets the pair's termios to the baseline so every client session starts deterministic. Presence means "at least one opener"; the daemon cannot tell sharers apart (§6).
+
+Symlink rules: the configured path is configuration; the pts target is state. A pre-existing path faults the node (environmental) — except a symlink dangling into devpts, presumed to be our stale artifact from a crash, which is silently replaced. The symlink is unlinked on node removal and clean shutdown.
+
+### 7.3 Log node
+
+One endpoint, faces target; write mode is inherently `never`. Configuration: directory, filename, overflow policy (drop-oldest with counters, or fault), and rotation-suffix padding (default three digits). State: current file, most recent rotation number, queued bytes, dropped bytes.
+
+Behavior: raw bytes are appended via the bounded-queue-plus-writer-task shape required by regular-file semantics (§5). Rotation is on demand only — `serialnexusctl rotate <node>` renames the current file to `<name>.NNN` with an incrementing counter (higher is newer; no logrotate-style shifting cascade) and reopens fresh at a byte boundary. The counter is state, recovered at node start by scanning the directory, never persisted. Removal and clean shutdown flush the queue within a bounded wait before closing.
+
+### 7.4 Leg node
+
+The cross-daemon transport: a socket carrying all of its channels multiplexed by the built-in link codec (§8, §9). Endpoints: one per configured channel, each with a channel identity; all channel endpoints face target on the sending side (`faces = target`, computer A: the leg consumes local channels) or host on the receiving side (`faces = host`, computer B: the leg offers arriving channels). Configuration: `faces`, transport (`tcp | unix`), `role = listen | connect`, address (loopback-only by default; any non-loopback bind or dial requires the deliberately ugly `insecure_bind = true`), reconnect backoff for the connect role, idle-release interval for implicit lock acquisition, purge-on-reconnect override, and the channel list with identities. State: peer address, connection status, per-channel binding — `bound`, `waiting` (configured here, not announced by the peer), and the peer's announced-but-unconfigured identities listed as `unbound`.
+
+Behavior: one active peer per leg; concurrent second connections are refused. The connect role retries with backoff; an outage is faulted-and-wait, so targetward writers pause on existing machinery and purge-on-reconnect (default on) discards outage-era backlogs with counters. Wire announcements never grow the graph: they bind to configured channel identities, and everything else is visible state awaiting an operator (§8). SSH is the confidentiality and authentication layer for now — including OpenSSH streamlocal forwarding of Unix-socket legs, which skips TCP entirely (§9).
+
+### 7.5 Codec node
+
+A protocol transform: one multiplexed-side endpoint and N channel endpoints, instantiable in either orientation via `faces` on the multiplexed side (demultiplexer: multiplexed side faces target, channels face host; the mirror for re-multiplexing). Configuration: codec name (selecting from the compiled-in registry), an opaque attribute table the codec deserializes and validates itself (schema failure is structural and fails the load), and the channel list with identities. State: per-channel status and codec-specific counters (framing errors, resyncs).
+
+### 7.6 Exec codec node
+
+The escape hatch, packaged as an ordinary compiled-in codec (§8): configuration adds argv, environment, and restart backoff. The child process speaks the fixed envelope protocol on stdin/stdout — the same frame format as the link codec's wire protocol — translating between it and the device's proprietary framing; stderr passes through to daemon diagnostics. A crashed child faults the node and restarts with backoff. The child runs as the daemon's user (documented plainly). Because the child is a separate process speaking a documented protocol, protocol tools under any license, including copyleft, can be used unmodified without linking.
+
+### 7.7 Existing-terminal node
+
+Connects to a pre-existing PTY or tty device by path (no hardware identity; the resolver passes paths through, §12). `faces` is configuration: `host` when the far side acts as the target — a QEMU serial console, a protocol simulator, a mock device for testing — or `target` when the daemon feeds a stream into some other program's terminal. Otherwise behaves as a boundary with the standard policies.
+
+## 8. Codecs and extensibility
+
+A **codec** is a multi-channel framing transform: it converts between one multiplexed byte stream and N channels, in both directions, emitting and consuming per-channel events drawn from a small vocabulary — `data`, `open`, `close`, `error`. One implementation serves both orientations; the node's `faces` attribute selects which. Edges always carry raw bytes; all framing knowledge is internal to codec nodes, which keeps the interior contract (§5) intact — a codec may hold a partial frame, bounded by its frame size, and nothing else.
+
+**Static and announced channels.** Hardware mux codecs declare their channel set from configuration, so their endpoints exist at load time. The link codec inside leg nodes instead *announces* channels over the wire — and an announcement must not grow the graph. The binding rule reconciles this with the operators-own-the-graph invariant: announcements bind to channel identities the receiving configuration already declares; announced-but-unconfigured channels appear in state as `unbound` with no endpoints and no attachments; configured-but-unannounced endpoints sit in `waiting` — the same state family as an unplugged serial port, reusing faulted-and-wait wholesale.
+
+**Registry and workspace.** The project is a multi-crate Cargo workspace. A `codec-api` crate defines the codec trait, the event vocabulary, and the envelope frame types; codec crates depend on it and never on the daemon. The daemon binary registers compiled-in codecs in one explicit match-on-name — no linker-magic auto-registration — and each codec crate sits behind a Cargo feature so minimal builds can drop what they don't need. Codec attributes arrive as an opaque table (from the TOML/JSON configuration) that the codec deserializes via serde into its own types; a schema failure is structural and fails the load or operation, consistent with §11.
+
+**The envelope.** The exec codec's child-process interface and the daemon-to-daemon wire framing are two *contracts* with distinct stability promises: the envelope is public and versioned for external codec authors; the wire protocol is internal between daemons and free to evolve under the §9 contract. In v1 they deliberately share one frame format and one implementation, defined in `codec-api` — one specification to document, pipe-testable codecs, and any-language authorship (including wrapping copyleft protocol tools) behind a stable, non-linking interface — but they version independently, and evolving the wire must never break envelope users.
+
+## 9. Wire protocol
+
+The framing protocol is a module, not a design element. The design imposes a contract on any leg framing and otherwise stays out of it: frame layouts, handshake encodings, and substrate choices are properties of a particular protocol version and must not cascade into the rest of the system. Any framing must:
+
+1. Multiplex any number of independent bidirectional byte channels over one reliable, ordered transport, addressing them by channel identity carried losslessly.
+2. Transport the §8 event vocabulary per channel — `data`, `open`, `close`, `error` — and be evolvable to additional per-channel control events (the reserved lock request/grant relay of §6 depends on this).
+3. Convey each peer's channel announcements, so the receiving daemon computes `bound`/`waiting`/`unbound` state without operator involvement.
+4. Declare a bounded maximum frame size, so the interior one-frame holdover (§5) and receive-side reassembly remain bounded-memory (v1: a fixed constant; negotiable later).
+5. Preserve the targetward no-drop guarantee end to end — at minimum through whole-connection backpressure, optionally through per-channel flow control. The protocol itself never drops; hostward loss remains a counted boundary policy of the sending daemon's leg.
+6. Identify its version and negotiate optional capabilities at connection start, refusing mismatches cleanly with the reason surfaced in leg state.
+
+Conversely, the design keeps — and names as such — the aspects that exist to admit some form of protocol: identity-keyed channels, the event vocabulary as lingua franca, Accepted/Busy as a flow-control hook, binding states in leg state, and capability-conditional features.
+
+**The v1 protocol.** A custom framing satisfying the contract minimally: length-prefixed frames carrying a channel identity and a type, opened by a `hello` frame (magic number, protocol version, channel announcements, capability bitset). yamux was evaluated as a substrate — permissively licensed, with per-stream flow control — and declined for v1 because identities, announcements, and the envelope sharing below are exactly what it would not provide; under this contract, swapping the substrate later is a contained change (§14). Two v1 properties are documented as protocol properties, not design properties: flow control is whole-connection only, so targetward traffic is subject to head-of-line blocking — one Busy targetward path stalls all channels' targetward flow across that leg, acceptable because targetward traffic is human-scale command entry, and hostward flow is unaffected — and the v1 frame format doubles as the exec-codec envelope's v1 implementation, though the two are separately versioned contracts (§8) and wire evolution must never break envelope users.
+
+Security posture, version one: legs bind and dial loopback only; SSH port forwarding (or streamlocal forwarding for Unix-socket legs) provides confidentiality and authentication between machines. Non-loopback addresses require `insecure_bind = true` — a named footgun beats the patched binary someone would otherwise ship. Serial consoles are frequently root shells and bootloader prompts; the documentation says so in exactly those words. In-daemon TLS is deferred work (§14).
+
+## 10. Control plane
+
+The daemon listens on a Unix domain socket: `/run/serialnexusd.sock` when running as root, `$XDG_RUNTIME_DIR/serialnexusd.sock` otherwise, either overridden by a command-line argument. Socket permissions **are** the authorization model — whoever can open the socket owns every console — with mode 0600 by default and flags to widen to a group; the standard stale-socket unlink dance runs at startup, and the socket is removed on clean shutdown. SO_PEERCRED remains available for finer authorization later without protocol changes.
+
+The protocol is JSON-RPC 2.0, hand-rolled over newline-delimited JSON — a page of serde types, no framework crate. Request/response correlation supports concurrent CLI clients (mutations are serialized daemon-side); id-less notifications are the natural shape for subscriptions: a `subscribe` verb streams node status transitions, lock changes, client-termios updates, and counter snapshots. Batch arrays are rejected outright, deleting the specification's awkward corner. Everything is debuggable with socat and jq.
+
+The verb surface, grouped: configuration (`load`, `load --replace`, `dump`, `add-node`, `remove-node [--cascade]`, `connect`, `disconnect`, `set-attribute`); observation (`state`, `subscribe`); arbitration (`lock [--steal] [--wait] [--lease]`, `unlock`, `send`); logging (`rotate`); serial signals (`send-break`, `set-modem`, `pulse-dtr`); lifecycle (`teardown`, `shutdown`). `serialnexusctl` is a thin presentation layer over that surface — deliberately nothing more.
+
+**CLI shape is presentation, not contract.** The CLI's shape — subcommand names and hierarchy, argument names, output formatting — will iterate on feedback from its users, human and AI agent alike, and the daemon must stay flexible to that iteration: nothing in `serialnexusd` may depend on how the CLI spells things. The stable surface is the RPC method set and its JSON schemas; the verb list above names semantic operations, not command-line spellings, and a CLI subcommand may be renamed, regrouped, or composed from several RPCs without any daemon change. All human-oriented rendering — tables, prose, color — lives in the CLI; the daemon returns structured results only, which makes a raw JSON pass-through mode essentially free and gives AI agents the choice of driving the CLI or speaking JSON-RPC to the socket directly. Version skew between CLI and daemon degrades gracefully by construction: JSON-RPC's standard method-not-found error tells a mismatched CLI exactly which operations this daemon lacks. The two surfaces evolve on different budgets — the RPC surface deliberately, additively where possible; the CLI shape freely.
+
+Windows is out of scope, declared loudly rather than left ambiguous: PTY nodes have no Windows equivalent (ConPTY hosts console applications; it does not emulate serial devices), and the control socket assumes Unix domain sockets. The declaration deletes an interprocess-abstraction layer, keeps the PTY story purely POSIX, and is accepted with eyes open: supporting Windows later would be a redesign, not a port.
+
+## 11. Configuration lifecycle
+
+**Load is accepted only on an empty graph** — at daemon startup or after explicit teardown; `load --replace` composes teardown-then-load so nobody scripts it by hand. Reconciling a new configuration file against a running graph (diffing) is deliberately deferred (§14); until then, running graphs are modified only through the incremental verbs, which validate against the same structural rules as load and touch only what they name. `remove-node` refuses while edges are attached unless `--cascade`; removal flushes log queues within a bounded wait.
+
+**Load is structurally atomic.** The entire file is validated — the three graph rules (§4), attribute schemas including codec tables, resolver-input well-formedness — before anything is created; a structural error creates nothing. Environmental failures never fail a load: nodes whose environment is missing come up faulted-and-wait or waiting, visible in state, healing on their own. This is the operators-own-the-graph invariant in operational form.
+
+**Dump round-trips.** `dump` emits configuration only, in exactly the load format; it is the migration story and the backup story. `state` is a separate verb for everything observed. The split is enforced mechanically by the schema: state fields simply do not exist in the configuration types.
+
+**The daemon persists its own configuration.** After each successful mutation, the daemon snapshots configuration (same format) to a state file; startup loads the state file if present, else the file given on the command line. Without this, incremental surgery would silently die with the daemon. A restart with devices missing simply comes up faulted and heals — restart, replug, and first boot are the same code path.
+
+## 12. Device identity
+
+Operator input naming a serial port — a raw `/dev` path or a device serial number — is converted by the **resolver** into a canonical, structured identity stored in configuration: `usb:<vid>:<pid>:<serial>:<iface>` in the common case. The resolved `/dev/tty*` path is state. The resolver runs in two directions: input-to-identity once, at add time; identity-to-current-path at every open and every faulted-and-wait recheck. On Linux both directions are implemented by reading `/dev/serial/by-id` and its symlinks — no dependencies, no libudev. One consequence worth stating as a rule: adding a node by raw path requires the device present at that moment (identity must be captured); adding or loading by identity never does, which is why dump emits identities and why configurations survive cold starts with hardware unplugged.
+
+The real world requires a fallback chain: adapters with absent or duplicated serial numbers degrade to topology identity (by-path: "whatever occupies this physical port"), and finally to a raw-path escape hatch carrying a documented instability warning. Multi-port adapters — one serial number, several UARTs — are why the interface index is part of the identity. Existing-terminal nodes (§7.7) have no hardware identity and pass through as path identities. At add time the CLI echoes the resolved identity in human terms ("bound: FTDI FT232R, serial A6008isP, interface 0") so the operator notices if the wrong physical device answered. macOS has no by-id tree; an IOKit-backed resolver is deferred (§14), with raw `cu.*` paths as the interim.
+
+## 13. Platform support and licensing
+
+**Linux** is the required platform and the one all mechanisms are specified against. **macOS** is best-effort: PTYs and the data plane are plain POSIX; known deltas are the `cu.*`-not-`tty.*` device convention (the `tty.*` nodes block on carrier detect), the missing by-id tree (§12), and unverified EXTPROC behavior (§7.2 degrades to poll-only). **Windows** is out of scope (§10).
+
+Dependency licensing policy: permissive licenses only (MIT, Apache-2.0, BSD) for anything linked; no copyleft crates, including weak copyleft; copyleft *tools and daemons* may be used unmodified as external processes. Selections under that policy: **serial2** and **serial2-tokio** (BSD-2-Clause OR Apache-2.0) for port I/O — providing custom baud rates, modem-line control for the §7.1 verbs, and concurrent async read/write — chosen over the ecosystem-default **serialport** stack, which is MPL-2.0 (weak copyleft) and remains in the dependency tree even under the MIT-badged tokio-serial/mio-serial wrappers. PTY syscalls come from **nix** (MIT) or **rustix** (Apache-2.0 OR MIT); raw termios via the same crates is the fallback if serial2 ever falls short. The remaining stack is the permissive standard set: tokio, serde, clap, bytes, tracing. Deliberately avoided: libudev bindings (LGPL linkage; hotplug uses resolver polling, with raw kernel uevent netlink as a dependency-free Linux upgrade), and linked use of ser2net/gensio, socat, or conserver — all valuable prior art, all copyleft, all fine to run beside the daemon.
+
+## 14. Deferred work
+
+Recorded so deferral stays deliberate: configuration diffing/reconciliation against a running graph (load-on-empty is the v1 constraint); native client-termios propagation to hardware (observe-only now; the subscribe-plus-RPC experiment path exists precisely to inform this); lock request/grant wire frames for fail-fast cross-machine arbitration (capability bit reserved); the conserver-style attach-time replay ring (an opt-in feature buffer, not flow control); an explicit labeled-combiner node for merged logs; in-daemon TLS and non-loopback legs; uevent-based hotplug detection replacing the resolver poll; an IOKit-backed macOS resolver; swapping the framing substrate (yamux) if per-channel flow control is ever needed — a contained change under the §9 contract; systemd socket activation.
+
+---
+
+## 15. Historical decisions
+
+Each subsection records a problem uncovered during design review, the decision taken, and its implications. These are the document's ADRs; changing one later means re-reading its implications, not just its decision.
+
+### 15.1 The serial crate licensing landmine
+
+**Problem.** The ecosystem-default `serialport` crate is MPL-2.0 — weak copyleft, excluded by this project's licensing policy — and the MIT-badged async wrappers (`mio-serial`, `tokio-serial`) keep it in the dependency tree; mio-serial's own documentation describes itself as a Larger Work over serialport-rs. The obvious dependency choice silently violated a stated constraint.
+**Decision.** Use `serial2`/`serial2-tokio` (BSD-2-Clause OR Apache-2.0), with raw termios via nix/rustix as the fallback.
+**Implications.** Full license compliance with no capability loss for this design (custom bauds, modem lines, concurrent async I/O). A smaller ecosystem than serialport's, mitigated by the fallback being plain POSIX. Port enumeration is not depended on at all — the resolver reads `/dev/serial/by-id` directly, which turned out cleaner anyway (§12).
+
+### 15.2 Edges terminate on endpoints, not nodes
+
+**Problem.** The original sketch connected edges to nodes, but a demultiplexer's outgoing edges each carry a *different* stream: "which channel" had nowhere to live except ad-hoc edge attributes.
+**Decision.** Nodes expose typed endpoints; edges join endpoints. Channels are endpoints with identities.
+**Implications.** Channel selection is structural, not annotational; configuration addressing (`node/channel`) falls out; every later mechanism — facing, locks, binding — attaches to endpoints. This decision is upstream of nearly everything else in the design.
+
+### 15.3 Orientation: from global rules to local typing, and the target/host anchor
+
+**Problem.** The sketch encoded direction as global constraints ("file writers can only be downstream") plus the unintuitive note that data flows both ways along directed edges. Global rules are hard to validate locally, and the original naming candidates ("hardware-facing"/"user-facing") were factually wrong for three configurations the design itself requires: a TCP socket as the targetward extremity on the receiving machine, a physical serial port used on the host side, and a simulated target behind a PTY with no hardware at all.
+**Decision.** Orientation is a local, per-endpoint property — faces target or faces host, with "faces" meaning looks-toward — anchored on the *system under control* rather than on silicon. An edge always joins one of each. Upstream/downstream survive as informal synonyms for targetward/hostward. Flow-connoting names (source/sink, producer/consumer, input/output) were explicitly rejected because bidirectional flow on an oriented edge is the whole point.
+**Implications.** The original global rules become derivable facts about node types; validation is per-edge; dual-role nodes need one `faces` attribute; symmetric bridging configurations require the operator to declare a target, documented as a labeling judgment. Residual hazards: "host" collides with socket addressing (schema uses `address`, never `host`), and "target" collides with graph-theory edge terminology (edges reference two endpoints; the words source/target never appear in the schema).
+
+### 15.4 Fan-out without tee nodes; the one-producer invariant
+
+**Problem.** With 1:1 endpoint-edge binding, fan-out required explicit tee nodes, and the DAG admitted a silent failure: a diamond — one stream fanned through two paths that reconverge — duplicates hostward delivery and, worse, doubles targetward writes into the device.
+**Decision.** Host-facing endpoints accept any number of edges (broadcast hostward, arbitrate targetward); target-facing endpoints accept exactly one.
+**Implications.** Tee nodes vanish from configurations. The one-producer invariant makes unrestricted reading safe by construction, and accidental duplication becomes unrepresentable rather than merely lintable — validation shrinks to three checks. The cost: implicit merging of two streams into one consumer is also unrepresentable, deliberately; merging must be an explicit framing node (deferred, §14). The write lock acquired a natural, universal scope in the same stroke (15.7).
+
+### 15.5 Boundary-only policy and the directional asymmetry
+
+**Problem.** The sketch was silent on backpressure. A stalled PTY, socket, file, or outbound port must not stall serial ingest, yet dropping device *commands* is worse than delaying them; and 3-wire UART offers no flow control toward the host, so end-to-end backpressure hostward is physically impossible.
+**Decision.** Interior nodes are queue-free and policy-free (parser state and a one-chunk holdover excepted); all policy lives at the four boundary types — a set that review expanded beyond the sketch's sockets-and-files to include PTY masters and serial ports in both directions. Hostward flow is lossy at boundaries with counters; targetward flow returns Accepted/Busy and backpressures to the origin, whose own kernel object buffers via native flow control.
+**Implications.** No hidden latency, no unbounded memory, no tuning knobs in the interior; a single-threaded data plane suffices. Loss is always located, counted, and attributable. Kernel-level flow control, where configured, extends across the graph for free. The pause machinery built here is reused wholesale by arbitration (15.7) and outage handling (15.9's faulted-and-wait), which is the design's main economy.
+
+### 15.6 Idle serial ports: gate reads or read-and-discard
+
+**Problem.** The intuition "serial readers don't read unless something is connected" meets a kernel that buffers a few KB and then drops on overrun regardless — so not reading merely relocates the loss and greets the first consumer with a stale burst followed by a gap, mid-maintenance.
+**Decision.** A configured serial node holds its port open (exclusivity; deterministic DTR against auto-reset adapters) and reads continuously, discarding with counters when nothing is attached.
+**Implications.** Consumers always start on fresh data; loss is visible in state alongside driver overrun counters rather than silent in the kernel; the port is continuously owned. The polling-cost intuition was also corrected on the record: the expensive thing about polling is latency, never CPU. A replay ring for attach-time history became a clean opt-in future feature rather than an accidental side effect (§14).
+
+### 15.7 Write arbitration: exclusive locks, write modes, and the stale-command hazard
+
+**Problem.** Multiple writers to one console interleave at arbitrary chunk boundaries and corrupt protocols; the design's own use case puts writers on two machines. Additionally, byte streams offer no side channel through which a client could request exclusivity.
+**Decision.** An exclusive write lock per host-facing endpoint, gating the existing pause machinery; reading is never arbitrated. Per-edge write modes `never`/`on-demand`/`held`; out-of-band acquisition via the control plane with an atomic `send` verb; purge-on-acquire and purge-on-detach as defaults; steal, lease, and detach-release for lifecycle; `free-for-all` retained as a per-endpoint opt-out; cross-machine exclusion by lock nesting with backpressure across the leg.
+**Implications.** Arbitration costs no new data path. Correct scripts lose nothing to purging by construction; the 3-a.m. stale `reboot` cannot fire. The demux's `held` lock makes raw injection into a muxed port an explicit steal that stalls channels — the model telling the truth about the wire. Known limits are documented rather than hidden: origins are endpoints, not processes, and remote contenders block instead of failing fast until lock-forwarding frames ship (§9, §14).
+
+### 15.8 Configuration versus state; operators own the graph
+
+**Problem.** The sketch mixed desired settings with observed facts in one attribute list — baud rate beside "current log file" — which poisons round-tripping, and left unspecified what a missing device does to the graph.
+**Decision.** A strict configuration/state split, enforced by schema, with the invariant: operators own the graph; the environment owns only state. Configuration operations fail only on structural invalidity; environmental failure faults nodes without removing them, generalized from serial ports to every boundary type as faulted-and-wait.
+**Implications.** `dump` round-trips by construction and is the backup and migration story. Restart, replug, and first boot collapse into one code path. Every "what happens when X breaks" question in later design rounds had a one-word answer — faulted — which is the second major economy of the design.
+
+### 15.9 Load semantics and the persistence gap
+
+**Problem.** Applying a full configuration to a running graph requires diffing by stable identity; done naively it would HUP every PTY client and drop device bytes on every edit. And once running graphs are mutated incrementally instead, a daemon crash silently loses the surgery, because memory matches no file on disk.
+**Decision.** Load is accepted only on an empty graph and is structurally atomic; running graphs change only via incremental verbs; diffing is deferred, explicitly, as future work. The daemon snapshots its configuration to a state file after every successful mutation; startup prefers the state file.
+**Implications.** V1 avoids the hardest reconciliation code honestly rather than accidentally. The incremental verbs are promoted to core surface with defined cascade semantics. Full-file edits to a live system mean `--replace` and an accepted outage — a documented v1 cost. The state file makes crash recovery boring, at the price of the daemon owning a writable path.
+
+### 15.10 Device identity and hotplug without libudev
+
+**Problem.** `/dev/ttyUSB0` is not an identity: adapters return under different names, another adapter can squat on the old path, and a faulted node must recognize *its* device. Meanwhile the standard hotplug answer, libudev, is LGPL — excluded from linking by policy.
+**Decision.** A resolver converts operator input to a structured canonical identity (`usb:vid:pid:serial:iface`) stored in configuration, resolving identity-to-path at every open and recheck via `/dev/serial/by-id` readlinks; fallback chain to topology identity and raw path; reappearance detected by cheap polling, with raw uevent netlink as a future Linux optimization.
+**Implications.** Configurations survive cold starts with hardware absent (identity-form never requires presence; raw-path input requires the device at add time, once). Wrong-device adoption is impossible by construction. Cheap-clone adapters degrade gracefully with documented instability. macOS needs only a resolver backend, not a design change (§14).
+
+### 15.11 Codec pluggability and the envelope unification
+
+**Problem.** Demultiplexing needs operator-supplied protocol knowledge, Rust has no sane runtime plugin story, and the licensing policy forbids linking existing (copyleft) protocol tools. Separately, wire-announced channels threatened the operators-own-the-graph invariant.
+**Decision.** Compiled-in codecs behind an explicit registry and Cargo features, in their own workspace crates against a `codec-api` crate; attributes as codec-validated opaque tables; an exec codec whose child-process envelope is *the same frame format* as the link codec's wire protocol; announced channels bind to configured identities, with `unbound` and `waiting` as state.
+**Implications.** New codecs are a crate plus one registry line; external codecs are any-language processes testable through a pipe; copyleft tools run unmodified behind a documented, versioned, non-linking interface. Dynamic wire channels became a state-visibility feature instead of a graph-mutation hazard. The cost of no dynamic loading is a recompile per new built-in codec — accepted.
+
+### 15.12 Wire security posture and channel identity
+
+**Problem.** Serial consoles are frequently root shells; an unauthenticated TCP listener is a footgun. And "labels" had been doing two jobs — configuration addressing and stream naming — while containing slashes from device paths.
+**Decision.** Loopback-only by default with SSH (including streamlocal forwarding) as the security layer and `insecure_bind = true` as the named exception; a hello frame with magic, version, announcements, and capability bits; terminology split into operator-chosen node names and codec-scoped channel identities, with `node/channel` as display form; a small custom frame format over yamux, for the identity/hello/envelope semantics yamux would not carry.
+**Implications.** V1 ships no crypto to get wrong and inherits SSH's authentication; remote binds require a visible, greppable confession. Protocol evolution has a doorway (capabilities) instead of a flag day. The path-escaping wart from the original sketch dissolved with the terminology.
+
+### 15.13 Control plane and the Windows exclusion
+
+**Problem.** The sketch had no control plane at all, yet every design round added verbs that need one — and lock acquisition (15.7) structurally requires out-of-band signaling. Separately, "Windows if it's free" needed an honest answer.
+**Decision.** A Unix domain socket (path by privilege level, CLI-overridable) whose file permissions are the entire authorization model; hand-rolled JSON-RPC 2.0 over newline-delimited JSON, batches rejected, notifications powering `subscribe`. Windows declared out of scope, with a large redesign accepted as the price of ever changing that.
+**Implications.** One page of serde types instead of a framework dependency; concurrent CLI clients and streaming state observation from day one; everything debuggable with socat and jq. The Windows exclusion deleted an interprocess-abstraction layer and kept the PTY story purely POSIX — the honest answer was that it was never going to be free.
+
+### 15.14 The PTY is not a serial port
+
+**Problem.** PTYs differ from serial ports in ways that corrupt data or mislead operators: fresh PTYs echo and translate newlines (feedback loops the moment data reflects); client tcsetattr calls change nothing on real hardware and are invisible without an obscure mechanism (TIOCPKT alone does not report baud changes); break and modem lines don't traverse a PTY; there is no un-HUP event, so a silently watching client is indistinguishable from an absent one; and `/dev/pts/N` allocation is unstable across restarts.
+**Decision.** Baseline raw + echo-off + EXTPROC at creation, reasserted on last close; packet mode plus EXTPROC to *observe* client termios as state, with a slow reconciliation poll as backstop, and propagation to hardware deferred behind an already-available subscribe-plus-RPC experiment path; break and modem signals as control-plane verbs on the serial node; presence-gated output (deliver when a client holds the slave, discard with counters when not) with attach detection via tcsetattr packets plus a sub-second HUP check; a configured symlink with owner/mode as configuration and the pts target as state, including the stale-dangling-symlink recovery rule.
+**Implications.** Feedback loops are impossible by default; every client session starts deterministic; the semantic gap between PTY and port is *reported* honestly rather than papered over, and the propagation question will be decided from observed data rather than speculation. The mechanism's one exotic flag (EXTPROC) is flagged for early verification in implementation, with the poll path as the safety net — and as the whole mechanism on macOS if needed.
+
+### 15.15 Protocol agnosticism: the framing is a module
+
+**Problem.** Ratifying custom-frames-over-yamux (15.12) raised the opposite risk: v1 frame details ossifying into the design. Review found two live cascades. The exec envelope and the wire framing had been specified as one thing, so evolving the wire would have broken external codec processes that depend on envelope stability; and the targetward no-drop guarantee was implicitly resting on whole-connection TCP backpressure — a property of this particular framing, not of the design.
+**Decision.** The design constrains the protocol and otherwise stays out of it, with one sanctioned exception: design aspects that exist to admit some form of protocol (identity-keyed channels, the event vocabulary, Accepted/Busy as a flow-control hook, binding states, capability-conditional features). The constraints are the six-clause contract of §9 — identity-addressed channel multiplexing, event-vocabulary transport with evolvability to control events, announcements, bounded frame size, no-drop targetward with flow control at least at connection scope, and version/capability negotiation with clean refusal. The envelope and the wire become two separately versioned contracts that happen to share one v1 implementation.
+**Implications.** Substrate swaps (yamux) are contained changes rather than redesigns. Head-of-line blocking on targetward flow is documented as a v1 protocol property, bounded to human-scale command traffic, with per-channel flow control admissible without design change. External codec stability survives wire evolution by construction. §9 is restructured into contract plus v1 implementation, and future protocol work has an explicit conformance checklist.
+
+### 15.16 CLI shape is presentation, not contract
+
+**Problem.** The CLI's shape — subcommands and their names, argument names, output format — is expected to iterate as humans and AI agents use the tool and report back. The draft's phrasing ("a thin client mapping one verb to one RPC") quietly coupled the surfaces: taken literally, renaming a subcommand or regrouping the hierarchy would imply daemon-side changes, and any human-readable formatting in the daemon would have frozen presentation into the contract.
+**Decision.** The 15.15 principle applied one layer up: the daemon constrains the CLI only through the RPC surface and otherwise stays out of it. `serialnexusd` exposes semantic operations returning structured JSON; all rendering lives in `serialnexusctl`; CLI shape may rename, regroup, and compose RPCs freely. Two stability tiers: the RPC surface evolves deliberately and additively where possible, the CLI shape freely.
+**Implications.** CLI iterations ship without daemon releases and without breaking scripts or agents pinned to the RPC surface. AI agents get two supported entry points — the CLI (with a near-free raw JSON mode) or the socket directly. Version skew degrades gracefully via JSON-RPC's method-not-found. The §10 verb list documents semantics, not spellings, and the usage examples elsewhere in this document (§6, §7.3) are illustrative spellings of the day, not commitments.
