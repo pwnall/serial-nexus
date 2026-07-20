@@ -17,7 +17,7 @@
 //!   `TIOCPKT_IOCTL` packet (§7.2). This side is human-scale command entry. On
 //!   last close it re-asserts the baseline termios (§7.2).
 //! * Hostward delivery is a dedicated **blocking writer thread** so a fast
-//!   consumer receives at line rate (§15.18), fed by an async pump through a
+//!   consumer receives at line rate (§15.19), fed by an async pump through a
 //!   bounded bridge (full-buffer drops counted there, §5). It is **presence-
 //!   gated** — written only while a client holds the slave, discarded-with-count
 //!   otherwise (§7.2).
@@ -79,7 +79,7 @@ pub struct PtyNode {
     /// it) and the blocking hostward writer thread (which gates on it), hence
     /// atomic.
     present: Arc<AtomicBool>,
-    /// The blocking hostward writer thread (§15.18): a fast consumer receives at
+    /// The blocking hostward writer thread (§15.19): a fast consumer receives at
     /// line rate rather than the poll path's ~1 MB/s.
     writer: Option<ThreadHandle<()>>,
     /// Set on teardown to stop the writer thread at its next recv timeout — the
@@ -256,7 +256,7 @@ impl PtyNode {
         )));
 
         // Writer: serial → client (hostward), presence-gated, on a dedicated
-        // blocking thread so a fast consumer receives at line rate (§15.18). An
+        // blocking thread so a fast consumer receives at line rate (§15.19). An
         // async pump bridges the hostward channel to a std channel the thread
         // blocks on; aborting the pump on teardown drops its sender, which unblocks
         // and ends the thread (std recv returns Err once every sender is gone).
@@ -390,7 +390,16 @@ async fn read_and_poll(
             loop {
                 match sys::read_fd(fd, &mut buf) {
                     Ok(0) => {
-                        present.store(false, Ordering::Relaxed);
+                        // Last close seen on the read path (EOF): re-assert the
+                        // baseline and forget the client's settings exactly once
+                        // on the present→absent transition, mirroring the POLLHUP
+                        // branch. A close observed here first would otherwise leave
+                        // that branch's `was && !now` guard false, so the baseline
+                        // reset (§7.2) would never run.
+                        if present.swap(false, Ordering::Relaxed) {
+                            let _ = apply_baseline(master.as_fd(), advertised_baud);
+                            *client_termios.borrow_mut() = None;
+                        }
                         break;
                     }
                     Ok(n) if n >= 1 => {
@@ -418,9 +427,14 @@ async fn read_and_poll(
                     }
                     Ok(_) => break, // zero-length non-EOF read: nothing to do
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    // A client that closed surfaces as EIO; mark absent.
+                    // A client that closed surfaces as EIO; reset to baseline
+                    // once on the present→absent transition (§7.2), the same as
+                    // the EOF and POLLHUP paths.
                     Err(e) if e.raw_os_error() == Some(libc::EIO) => {
-                        present.store(false, Ordering::Relaxed);
+                        if present.swap(false, Ordering::Relaxed) {
+                            let _ = apply_baseline(master.as_fd(), advertised_baud);
+                            *client_termios.borrow_mut() = None;
+                        }
                         break;
                     }
                     Err(_) => break,
@@ -430,14 +444,16 @@ async fn read_and_poll(
 
         // Slow reconciliation backstop (§7.2): while a client is present, re-read
         // termios periodically so a missed packet-mode notification still lands.
-        if now && last_reconcile.elapsed() >= RECONCILE_INTERVAL {
+        // Gate on live presence, not the top-of-loop `now`, so a close detected
+        // mid-drain above cannot re-populate the client_termios it just cleared.
+        if present.load(Ordering::Relaxed) && last_reconcile.elapsed() >= RECONCILE_INTERVAL {
             reconcile_termios(&master, &client_termios);
             last_reconcile = Instant::now();
         }
 
         // Active transfer rechecks promptly (ACTIVE_POLL); a truly idle master
         // backs off toward IDLE_POLL — well under the §7.2 sub-second presence
-        // requirement (§15.18).
+        // requirement (§15.19's adaptive active-to-idle backoff).
         if did {
             wait = ACTIVE_POLL;
         } else {
@@ -480,7 +496,7 @@ fn reconcile_termios(master: &PtyMaster, store: &RefCell<Option<Value>>) {
     }));
 }
 
-/// Blocking hostward writer thread (§15.18): drain the bridged channel to the
+/// Blocking hostward writer thread (§15.19): drain the bridged channel to the
 /// master while a client is present — a blocking write delivers at line rate,
 /// where the poll path capped a fast consumer at ~1 MB/s — and discard otherwise
 /// (§7.2 presence-gated output; the discard is counted so loss stays visible, §5).

@@ -1,10 +1,10 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-20 (data-plane slice; phase 0-2 realigned to v3). **Branch:**
+**As of:** 2026-07-20 (phase 0-3 done and audited against v4). **Branch:**
 `implementation` (off `main`).
-**Normative docs:** `docs/07-design-claude-fable-v3.md` (design) and
-`docs/08-implementation-plan-claude-fable-v3.md` (plan). v1/v2 docs are in
-`docs/historical/`. Section references (§) point at the v3 design.
+**Normative docs:** `docs/09-design-claude-fable-v4.md` (design) and
+`docs/10-implementation-plan-claude-fable-v4.md` (plan). v1/v2/v3 docs (03–08) are
+in `docs/historical/`. Section references (§) point at the v4 design.
 
 **v3 revision (2026-07-20).** The v3 docs folded the refinements below (§3.1–3.10)
 into the design text and added two new normative requirements that phase 0-2 code
@@ -15,6 +15,24 @@ containing `/` a **structural validation error** — enforced in
 strong as the committed graph) — `Cargo.lock` was un-gitignored and checked in. The
 lingering `serial2-tokio` workspace-dependency declaration was also dropped (§13,
 §15.1), matching the design narrative that it was removed during implementation.
+
+**v4 revision + audit (2026-07-20).** The v4 docs are v3 plus one substantive
+change: the phase-3 hybrid data plane (§3.11 below) was folded into design §5 and
+recorded as a new ADR **§15.19** ("The benchmark cashed the escape hatch: a hybrid
+data plane"), with **§15.18** now carrying a "(Superseded in part by §15.19)" note.
+The split is now clean: §15.18 owns only the *poll(2)-not-epoll / `AsyncFd`-
+prohibition* decision, while §15.19 owns the *dedicated blocking threads for the
+hot hostward paths* (serial reader, PTY master writer) and the *adaptive
+active-to-idle backoff* for the cold async paths. Phase 0-3 was then re-audited
+against v4 (multi-agent + adversarial verify). Two genuine deviations were found
+and fixed: (a) the PTY node re-asserted the baseline termios on last close only
+when the close was observed via POLLHUP, skipping it when the read path saw
+EOF/EIO first (§7.2) — `nodes/pty.rs` now does a swap-guarded reset on all three
+paths, and the reconciliation backstop is gated on live presence; (b)
+`scripts/validate/phase3/subscribe.sh` used a bare `sleep 0.3` to await
+subscription registration, against plan §3 — now a bounded `wait-for` on the first
+snapshot. Code comments that cited §15.18 for the thread/backoff decision were
+repointed to §15.19. No other phase 0-3 deviations surfaced.
 
 This document records where the implementation stands and every place the code
 deviates from — or refines — the design. The rule from plan §1 holds: where
@@ -109,8 +127,9 @@ design text; it is a faithful refinement of §7.2's model, confirmed identical o
 runtime only retries on new origin input. `nexus-core::data::TargetwardSink` has
 a `flush()` method the runtime calls when a boundary becomes writable,
 independent of new input, draining parked holdovers in order. Caught by a
-property test (`prop_targetward_no_loss_bounded_interior`). This is a runtime
-detail §5 implies but does not name.
+property test (`prop_targetward_no_loss_bounded_interior`). v4 §5 now names this
+explicitly ("boundaries announce writability, and the runtime drains parked
+holdover frames on that signal, independent of any new origin input").
 
 ### 3.4 `EndpointAddr` serializes as its display string
 **Design:** §3/§15.12 — display form is `node/channel`; neither part contains `/`.
@@ -146,10 +165,11 @@ PTY `advertised_baud` is cosmetic (§7.2). nix on Linux sets termios speed via a
 `BaudRate` enum (standard rates only), so a non-standard advertised baud is
 skipped rather than approximated. (`nodes/pty.rs::standard_baud`.)
 
-### 3.9 Unimplemented node kinds are a structural load error (temporary)
-A configuration containing a **log** node (phase 3) is rejected at load with
-`node <name>: log nodes land in phase 3`, nothing created. This is a
-build-stage limitation, not a design position; it disappears when phase 3 lands.
+### 3.9 Unimplemented node kinds were a structural load error (resolved in phase 3)
+Before phase 3, a configuration containing a **log** node was rejected at load
+(`node <name>: log nodes land in phase 3`), nothing created — a build-stage
+limitation, not a design position. Phase 3 (slice B) implemented the log node and
+removed the rejection; a log node now loads normally. Kept here only as a record.
 
 ### 3.10 Data-plane readiness is poll-based, not `tokio::AsyncFd` (the pty-master spin)
 **Design:** §5 — a single-threaded async data plane; the design does not name a
@@ -203,10 +223,11 @@ PTY→serial, PTY presence/termios) stay async poll-based, now with an
 `ACTIVE_POLL`→`IDLE_POLL` adaptive backoff → **~0.06%/idle-fd** (2% total for 32
 idle PTYs, well under budget; the §15.18 idle-CPU concern, resolved).
 **Recorded:** `docs/benchmarks/phase3.json` (throughput + idle axes);
-`scripts/validate/phase3/{firehose,exact-loss,benchmark}.sh`. This is faithful to
-§15.18 (the reserved escape hatch, selected by the benchmark) — worth folding the
-"never throughput" phrasing into "never throughput *once the high-baud path is on
-a thread*" in a future design pass.
+`scripts/validate/phase3/{firehose,exact-loss,benchmark}.sh`. **Folded into the
+design in v4:** this decision is now ADR **§15.19** and §5's "hybrid" paragraph,
+and §15.18's "never throughput" claim is corrected there (it held only until the
+hot hostward path moved to a blocking thread). The design pass this section asked
+for is done; the code comments were repointed from §15.18 to §15.19 to match.
 
 ---
 

@@ -150,10 +150,11 @@ pub fn poll_ready(fd: RawFd, interest: nix::poll::PollFlags) -> nix::poll::PollF
 /// A *blocking* readiness poll with a bounded timeout — for use only off the
 /// async runtime thread (via `spawn_blocking` or a dedicated thread). The kernel
 /// wakes it the instant the fd is ready, so a high-throughput reader drains at
-/// line rate and a *quiescent* one costs zero CPU while parked — the §15.18
-/// escape hatch (a blocking helper off the runtime thread; never epoll, which
-/// misreports pty-master readiness). Returns the reported events (empty on
-/// timeout, so the caller can re-arm and observe a stop flag).
+/// line rate and a *quiescent* one costs zero CPU while parked — the hybrid data
+/// plane's hot-path hatch (§15.19; a blocking helper off the runtime thread,
+/// never epoll, which misreports pty-master readiness, §15.18). Returns the
+/// reported events (empty on timeout, so the caller can re-arm and observe a
+/// stop flag).
 pub fn poll_blocking(
     fd: RawFd,
     interest: nix::poll::PollFlags,

@@ -102,7 +102,11 @@ EOF
 # Subscribe in the background, then attach a client that sets a distinctive baud
 # and holds the slave open long enough for a snapshot to capture it.
 ( timeout 6 "$C" subscribe --count 25 >"$TMPD/sub2.json" ) & SUBPID=$!
-sleep 0.3   # let the subscription register before the client attaches
+# Wait for the subscription to register before the client attaches — bounded, not
+# a bare sleep (plan §3). The daemon's periodic state snapshot no-ops until a
+# subscriber exists, so the first bytes landing in sub2.json prove it is live.
+bash "$WAIT" "test -s '$TMPD/sub2.json'" 5 0.05 \
+  || { cat "$TMPD/daemon.log"; fail "subscription never produced its first snapshot"; }
 "$SIM" client --path "$TTY2" --set-baud 9600 --hold-ms 1800 --seed 1 --timeout-ms 15000 \
   | jq -e '.pass==true' >/dev/null || { cat "$TMPD/daemon.log"; fail "termios-setting client failed"; }
 wait "$SUBPID" 2>/dev/null || true
@@ -113,6 +117,21 @@ node_of console '.client_termios.baud=="B9600"' "$TMPD/sub2.json" >/dev/null \
   || { cat "$TMPD/daemon.log"; fail "client_termios baud change (B9600) never surfaced in the stream"; }
 node_of console '.client_present==true' "$TMPD/sub2.json" >/dev/null \
   || fail "client_present never observed true in the stream"
+
+# Last-close reset (§7.2): once the B9600 client departs, the daemon re-asserts
+# the baseline termios and forgets the client's settings — on whichever path
+# (POLLHUP or the read-path EOF/EIO) observes the close first. Verify the invariant
+# directly: presence returns false, state clears client_termios to null, and a
+# fresh probe reads the baseline (EXTPROC on, echo off) rather than the departed
+# client's B9600. (Previously untested; a bare last-close reset that fired only on
+# POLLHUP would pass the stream checks above but fail here.)
+bash "$WAIT" "\"$C\" --json state | jq -e '.nodes[]|select(.name==\"console\")|.client_present==false'" 3 0.05 \
+  || { cat "$TMPD/daemon.log"; fail "client_present never returned false after the B9600 client exited"; }
+"$C" --json state | jq -e '.nodes[]|select(.name=="console")|.client_termios==null' >/dev/null \
+  || { cat "$TMPD/daemon.log"; fail "client_termios not cleared to null on last close"; }
+"$SIM" client --path "$TTY2" --report-termios \
+  | jq -e '.echo==false and .extproc==true' >/dev/null \
+  || { cat "$TMPD/daemon.log"; fail "baseline termios not restored after the B9600 client closed"; }
 
 "$C" shutdown >/dev/null
 echo '{"check":"phase3-subscribe","pass":true}'

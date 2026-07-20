@@ -20,7 +20,7 @@
 //! Readiness is driven by `poll(2)`, *never* `tokio::io::unix::AsyncFd`: on a pty
 //! master, `AsyncFd`'s epoll readiness spuriously and persistently fires
 //! "readable" and busy-loops the single-threaded runtime (§15.18). Two shapes,
-//! per §15.18:
+//! per §15.19 (the hybrid data plane the phase-3 benchmark settled):
 //!
 //! * Low-rate paths (targetward PTY→serial, PTY presence/termios) stay **async
 //!   tasks** using a non-blocking `poll(2)` (`sys::poll_ready`) with an
@@ -31,8 +31,8 @@
 //!   ([`sys::poll_blocking`]) — the kernel wakes them the instant the fd is ready,
 //!   so they move data at line rate (a non-blocking poll-plus-sleep on the
 //!   runtime thread capped this at ~1 MB/s) and park at zero CPU otherwise. This
-//!   is §15.18's "spawn_blocking reader threads" escape hatch. Cross-thread
-//!   counters are therefore atomic ([`DropCounters`]).
+//!   is the hatch §15.18 reserved and §15.19 cashed. Cross-thread counters are
+//!   therefore atomic ([`DropCounters`]).
 
 use std::collections::HashMap;
 use std::os::fd::RawFd;
@@ -53,7 +53,7 @@ use crate::sys;
 /// attributable — a slow spy costs itself data, never its neighbors. One instance
 /// is shared (via `Arc`) between the producing serial reader — which counts
 /// full-buffer drops and, since the high-throughput reader runs on a dedicated
-/// blocking thread (§15.18), needs the counters to be `Send`/`Sync`, hence
+/// blocking thread (§15.19), needs the counters to be `Send`/`Sync`, hence
 /// atomics — and the consuming boundary, which counts presence-gated discards and
 /// reports both in state. `Relaxed` suffices: counters are monotonic and read
 /// only for reporting, never to synchronize other memory.
@@ -203,9 +203,10 @@ impl Wiring {
 /// empty/full buffer mid-stream is rechecked in ~1ms (the tokio timer floor)
 /// rather than the 5ms [`IDLE_POLL`] — the difference between ~1 MB/s and tens of
 /// MB/s. A boundary resets its wait to this on every byte of progress, then lets
-/// it back off toward [`IDLE_POLL`] (§15.18: bound idle latency, never
-/// throughput; a `yield_now` spin does nothing here because the peer is a
-/// separate process that only advances as real wall-clock passes).
+/// it back off toward [`IDLE_POLL`] (§15.19: a `yield_now` spin does nothing
+/// here because the peer is a separate process that only advances as real
+/// wall-clock passes — the finding that retired §15.18's "never throughput"
+/// claim once the hot path moved to a blocking thread).
 pub const ACTIVE_POLL: Duration = Duration::from_micros(200);
 
 /// Grow a readiness wait toward [`IDLE_POLL`]: doubles `*wait`, capped. Callers
@@ -219,7 +220,7 @@ pub fn back_off(wait: &mut Duration) {
 /// pace: upstream buffering (and any drops) happen in the feeding channel, never
 /// here. `Err` means the peer hung up. On `WouldBlock` the writability wait polls
 /// with the [`ACTIVE_POLL`]→[`IDLE_POLL`] backoff, so a fast consumer is drained
-/// at full rate (§15.18).
+/// at full rate (§15.19's adaptive active-to-idle backoff).
 pub async fn write_all(fd: RawFd, mut data: &[u8]) -> std::io::Result<()> {
     let mut wait = ACTIVE_POLL;
     while !data.is_empty() {

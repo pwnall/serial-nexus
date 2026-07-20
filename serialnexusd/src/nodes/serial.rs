@@ -13,8 +13,9 @@
 //! blocking thread** — a `poll(2)` blocking wait wakes it the instant the device
 //! has data, so it drains at line rate (a non-blocking poll-plus-sleep on the
 //! runtime thread capped hostward throughput at ~1 MB/s) and costs zero CPU while
-//! parked. This is §15.18's "spawn_blocking reader threads for high-baud ports"
-//! escape hatch. It broadcasts to every attached consumer (lossy `try_send`, §5).
+//! parked. This is §15.18's reserved "spawn_blocking reader threads" hatch, which
+//! the phase-3 benchmark cashed and §15.19 made normative (the hybrid data plane).
+//! It broadcasts to every attached consumer (lossy `try_send`, §5).
 //! The low-rate **targetward writer** stays an async task draining the bounded
 //! channel to the port (backpressure via the channel, §5); read and write on the
 //! shared fd are independent directions.
@@ -60,7 +61,7 @@ pub struct SerialNode {
     discarded_unattached: Arc<AtomicU64>,
     /// Set on teardown to stop the reader thread at its next poll timeout.
     reader_stop: Arc<AtomicBool>,
-    /// The dedicated hostward reader thread (§15.18).
+    /// The dedicated hostward reader thread (§15.19).
     reader: Option<ThreadHandle<()>>,
     /// The async targetward writer task, if any.
     tasks: Vec<JoinHandle<()>>,
@@ -150,7 +151,7 @@ impl SerialNode {
         }
 
         // Hostward: a dedicated thread reads the device continuously (blocking
-        // poll → line rate, §15.18) and broadcasts to every attached consumer.
+        // poll → line rate, §15.19) and broadcasts to every attached consumer.
         // The read happens whether or not a client is attached downstream — a
         // full consumer channel drops at ingest, never here (§5).
         let fd = port.as_raw_fd();
@@ -233,7 +234,7 @@ impl SerialNode {
     }
 }
 
-/// Hostward reader thread (§15.18): a blocking `poll(2)` waits for readability —
+/// Hostward reader thread (§15.19): a blocking `poll(2)` waits for readability —
 /// waking the instant the device has data (line rate) and parking at zero CPU
 /// otherwise — then the loop drains fully and broadcasts each chunk to every
 /// attached consumer. Exits on device close, stop flag, or a fatal error (phase 7
