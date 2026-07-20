@@ -1,0 +1,24 @@
+[package]
+name = "serialnexusctl"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The serial_nexus CLI: a thin RPC client plus a rendering layer (§10, §15.16)."
+
+[[bin]]
+name = "serialnexusctl"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+nexus-rpc.workspace = true
+
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true

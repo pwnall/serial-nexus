@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "codec-api",
+    "nexus-core",
+    "nexus-rpc",
+    "nexus-sim",
+    "serialnexusd",
+    "serialnexusctl",
+    "spikes",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pwnall/serial-nexus"
+authors = ["serial_nexus contributors"]
+
+# Shared dependency versions. Individual crates opt in with `dep.workspace = true`.
+# Versions reflect the current registry (mid-2026); see §13 of the design for the
+# permissive-only licensing policy that gates every entry here.
+[workspace.dependencies]
+# Async runtime and I/O.
+tokio = { version = "1.53", default-features = false }
+futures = "0.3"
+bytes = "1"
+
+# Serialization: TOML for configuration files, JSON for the RPC surface (§10).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+# CLI parsing (serialnexusctl, nexus-sim, spikes).
+clap = { version = "4", features = ["derive"] }
+
+# Diagnostics.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2"
+anyhow = "1"
+
+# Serial ports (§13: serial2 chosen over the MPL serialport stack).
+serial2 = "0.2"
+serial2-tokio = "0.1"
+
+# POSIX syscalls the daemon needs beyond std (PTY, termios, ioctls, poll).
+nix = { version = "0.31", default-features = false }
+libc = "0.2"
+
+# Property testing (dev-dependency in nexus-core / codec-api).
+proptest = "1"
+
+# Checksums for the nexus-sim test double's verdicts (§3). Confined to the
+# non-shipping test binary; RustCrypto is MIT/Apache (permissive, §13).
+sha2 = "0.10"
+
+# Internal crates.
+codec-api = { path = "codec-api" }
+nexus-core = { path = "nexus-core" }
+nexus-rpc = { path = "nexus-rpc" }
+
+# Lints applied to every crate that opts in with `[lints] workspace = true`.
+# The unsafe-code policy is expressed per-crate at the source level (§2): pure
+# crates `#![forbid(unsafe_code)]`; crates with a `sys` module `#![deny(..)]`
+# and localize `#[allow(unsafe_code)]`.
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+
+# Optimize dependencies even in dev builds so the data-plane tests run at a
+# realistic rate; keep our own crates unoptimized for fast rebuilds.
+[profile.dev.package."*"]
+opt-level = 2

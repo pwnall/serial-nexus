@@ -1,0 +1,19 @@
+[package]
+name = "codec-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Codec trait, per-channel event vocabulary, and envelope frame types for serial_nexus (§8)."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

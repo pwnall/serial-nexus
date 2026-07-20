@@ -1,0 +1,47 @@
+# cargo-deny configuration — the licensing gate of §13 / §15.1, enforced in CI
+# (§2: "Licensing enforcement is CI, not vigilance"). Only permissive licenses
+# are allowed for anything linked; the known copyleft landmines are named in an
+# explicit ban list so they cannot re-enter the tree transitively.
+
+[graph]
+all-features = true
+
+[advisories]
+# Security advisories fail the build; yank checks stay on.
+ignore = []
+
+[licenses]
+# Permissive allowlist only. Anything whose license is not listed here fails.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Multiple versions of the same crate are a smell but not a hard failure.
+multiple-versions = "warn"
+wildcards = "allow"
+# The §13 / §15.1 ban list: the MPL serial stack and any libudev binding
+# (LGPL). Naming them here means a transitive dependency cannot pull them in
+# without failing CI.
+deny = [
+    { name = "serialport" },
+    { name = "mio-serial" },
+    { name = "tokio-serial" },
+    { name = "libudev" },
+    { name = "libudev-sys" },
+    { name = "udev" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

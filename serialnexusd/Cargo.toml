@@ -1,0 +1,37 @@
+[package]
+name = "serialnexusd"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The serial_nexus daemon: boundary nodes, data-plane runtime, control plane, state file."
+
+[[bin]]
+name = "serialnexusd"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+nexus-core.workspace = true
+nexus-rpc.workspace = true
+codec-api.workspace = true
+
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
+futures.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+serial2.workspace = true
+serial2-tokio.workspace = true
+nix = { workspace = true, features = ["term", "fs", "poll", "ioctl", "process", "signal"] }
+libc.workspace = true

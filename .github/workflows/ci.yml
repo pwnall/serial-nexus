@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Unprivileged lane: builds, lints, unit/property tests, license gate.
+  # Runs on every push (§3). MSRV is pinned to edition-2024's floor.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.85 --profile minimal --component rustfmt,clippy
+          rustup default 1.85
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  # The licensing gate proven, not assumed (§13, phase 0 validation).
+  license-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: License and ban check
+        run: cargo deny check licenses bans sources
+      - name: Prove the gate rejects a banned crate
+        run: bash scripts/validate/phase0/license-gate.sh
+
+  # Kernel-facing integration lane: the phase validation scripts that need real
+  # PTYs and Unix sockets. Unprivileged; the privileged/nightly lanes are added
+  # as their phases land.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Build workspace
+        run: cargo build --workspace
+      - name: Run validation scripts (through current phase)
+        run: bash scripts/validate/all.sh --through 1

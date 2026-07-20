@@ -1,0 +1,17 @@
+[package]
+name = "nexus-rpc"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "JSON-RPC 2.0 request/response/notification types shared by daemon and CLI (§10, §15.16)."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]

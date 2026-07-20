@@ -1,0 +1,43 @@
+[package]
+name = "spikes"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Phase-0 throwaway spikes (§Phase 0). Excluded from release; kept in-tree as documentation."
+publish = false
+
+[lints]
+workspace = true
+
+# Each spike is self-judging: prints one JSON verdict line and exits nonzero on
+# a mismatch between observed and designed behavior (a stop condition, §1).
+[[bin]]
+name = "s1_extproc"
+path = "src/bin/s1_extproc.rs"
+
+[[bin]]
+name = "s2_presence"
+path = "src/bin/s2_presence.rs"
+
+[[bin]]
+name = "s3_serial2"
+path = "src/bin/s3_serial2.rs"
+
+[[bin]]
+name = "s4_resolver"
+path = "src/bin/s4_resolver.rs"
+
+[[bin]]
+name = "s5_rpc"
+path = "src/bin/s5_rpc.rs"
+
+[dependencies]
+nexus-rpc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+nix = { workspace = true, features = ["term", "fs", "poll", "ioctl"] }
+libc.workspace = true
+serial2.workspace = true
