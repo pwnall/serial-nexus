@@ -16,9 +16,10 @@ workspace = true
 
 [dependencies]
 nexus-rpc.workspace = true
+nexus-core.workspace = true
 
-tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
-serde.workspace = true
 serde_json.workspace = true
-clap.workspace = true
+toml.workspace = true
+clap = { workspace = true, features = ["derive"] }
 anyhow.workspace = true
+nix = { workspace = true, features = ["user"] }

@@ -33,5 +33,5 @@ anyhow.workspace = true
 
 serial2.workspace = true
 serial2-tokio.workspace = true
-nix = { workspace = true, features = ["term", "fs", "poll", "ioctl", "process", "signal"] }
+nix = { workspace = true, features = ["term", "fs", "poll", "ioctl", "process", "signal", "user"] }
 libc.workspace = true
