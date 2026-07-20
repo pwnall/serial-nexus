@@ -58,12 +58,27 @@ Rust 1.97.1, edition 2024. Adapter: FTDI FT232R `usb:0403:6001:ABSCDJ6O:00`.
 None of these contradict the design; two implementation notes (P2 priming, P3
 serial-node fd strategy) are carried into phases 2 and 7.
 
-## Running on other kernels (Linux 6.18 target)
+## Confirmed on Linux 6.18 (Debian rodete)
 
-serial_nexus must run on **Linux 6.18**, older than this dev box (7.0). Every
-mechanism used is long-stable Linux, so 6.18 is expected to behave identically —
-but confirm rather than assume: run `nexus-doctor` (and `nexus-doctor --json |
-jq -e -f expectations/linux.jq`) on the 6.18 machine and compare. If P1 reports
-`degraded` there, that is fine — the poll backstop is unconditional. If P2 ever
-reports `unsupported`, that is a real stop condition to bring back for a design
-amendment before phase 2's PTY node relies on it.
+serial_nexus must run on **Linux 6.18**, older than the 7.0 dev box. Confirmed
+2026-07-19 on `6.18.14-1rodete4-amd64` (Debian GNU/Linux rodete), FTDI FT232R
+`usb:0403:6001:ABSCDGL6:00`:
+
+**All probes `supported` — 12 supported · 0 degraded · 0 unsupported · 0 skipped;
+zero deltas from 7.0.**
+
+- **P1 supported** — EXTPROC packet-mode signaling behaves identically; the
+  primary observation path works, poll stays a backstop.
+- **P2 supported** — HUP semantics byte-identical, including
+  `hup_when_never_opened == false` (so the slave-priming refinement transfers);
+  zero-timeout poll ≈ 605 ns.
+- **P4 supported** — the sysfs ancestor-walk resolves the canonical identity on
+  Debian too.
+- **P3 supported** — custom baud (exact), `TIOCEXCL`, modem lines, break, and
+  `TIOCGICOUNT` all confirmed on real hardware.
+
+So the kernel-sensitive mechanics (EXTPROC observation, POLLHUP presence) are
+de-risked across the matrix; the design's fallbacks remain live regardless. Re-run
+`nexus-doctor --json | jq -e -f expectations/linux.jq` on any new target — if P1
+ever reports `degraded` that is fine (poll backstop), but a P2 `unsupported`
+would be a real stop condition.
