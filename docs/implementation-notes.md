@@ -1,9 +1,20 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-20 (data-plane slice). **Branch:** `implementation` (off `main`).
-**Normative docs:** `docs/05-design-claude-fable-v2.md` (design) and
-`docs/06-implementation-plan-claude-fable-v2.md` (plan). v1 docs are in
-`docs/historical/`. Section references (§) point at the v2 design.
+**As of:** 2026-07-20 (data-plane slice; phase 0-2 realigned to v3). **Branch:**
+`implementation` (off `main`).
+**Normative docs:** `docs/07-design-claude-fable-v3.md` (design) and
+`docs/08-implementation-plan-claude-fable-v3.md` (plan). v1/v2 docs are in
+`docs/historical/`. Section references (§) point at the v3 design.
+
+**v3 revision (2026-07-20).** The v3 docs folded the refinements below (§3.1–3.10)
+into the design text and added two new normative requirements that phase 0-2 code
+was realigned to satisfy: (a) design §3 now makes a node name or channel identity
+containing `/` a **structural validation error** — enforced in
+`nexus_core::graph::GraphModel::validate` (`ValidationError::InvalidName`); and
+(b) plan §2 now requires **`Cargo.lock` committed** (the cargo-deny gate is only as
+strong as the committed graph) — `Cargo.lock` was un-gitignored and checked in. The
+lingering `serial2-tokio` workspace-dependency declaration was also dropped (§13,
+§15.1), matching the design narrative that it was removed during implementation.
 
 This document records where the implementation stands and every place the code
 deviates from — or refines — the design. The rule from plan §1 holds: where
@@ -74,7 +85,10 @@ break, and the raw ioctls via `as_raw_fd`), set it non-blocking, and drive async
 I/O with poll-based readiness (see §3.10) — rather than `serial2-tokio`.
 Consistent with §13's "raw termios via nix/rustix as the fallback." `TIOCEXCL` is
 issued by the daemon itself (`nodes/serial.rs`). `serial2-tokio` is now an unused
-dependency and was dropped from `serialnexusd/Cargo.toml`.
+dependency and was dropped from `serialnexusd/Cargo.toml` — and, in the v3
+realignment, from the root `Cargo.toml` `[workspace.dependencies]` as well, so the
+design's "dropped during implementation" (§13, §15.1) is literally true of the
+manifest.
 
 ### 3.2 PTY slave is *primed* at creation (POLLHUP never-opened refinement)
 **Design:** §7.2 detects presence via the master's HUP condition.
@@ -277,9 +291,10 @@ revisited if needed.
   `SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="0403", GROUP="plugdev",
   MODE="0660"` (or dialout membership) grants it. `nexus-doctor`'s env checks
   report `group:*` membership and `access:<dev>`.
-- **`Cargo.lock`** is gitignored (per the repo's original `.gitignore`); the
-  build resolves deps fresh. Reconsider committing it before release for
-  reproducible CI + cargo-deny.
+- **`Cargo.lock` is committed** (v3 plan §2): this is a binary workspace, and the
+  cargo-deny gate is only as strong as the graph it inspects — an uncommitted lock
+  would gate a freshly resolved, potentially different graph on every CI run. It was
+  removed from `.gitignore` in the v3 realignment.
 - **Licensing gate** (`deny.toml`) is proven in CI (rejects `serialport`); keep
   all new deps permissive (MIT/Apache/BSD/ISC/Zlib/Unicode), §13.
 - **`nexus-doctor` never gates the daemon:** runtime degradation paths (e.g.

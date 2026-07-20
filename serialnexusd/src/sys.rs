@@ -46,11 +46,13 @@ pub fn set_exclusive(fd: RawFd, on: bool) -> nix::Result<()> {
     Ok(())
 }
 
-/// Put a fd into non-blocking mode (`O_NONBLOCK`). Required before a fd is
-/// handed to `tokio::io::unix::AsyncFd`, which drives readiness via the reactor
-/// and expects the underlying I/O never to block (slice 2). `posix_openpt` and
-/// `serial2::SerialPort::open` both leave the fd blocking, so the data plane
-/// sets this itself.
+/// Put a fd into non-blocking mode (`O_NONBLOCK`) so the data plane's
+/// `poll(2)` + `read(2)`/`write(2)` readiness loop ([`poll_ready`], [`read_fd`],
+/// [`write_fd`]) never blocks the current-thread runtime. `tokio::io::unix::AsyncFd`
+/// is deliberately *not* used for tty-family fds — it is prohibited for pty
+/// masters (§15.18), whose epoll readiness busy-loops the runtime (see
+/// [`poll_ready`]). `posix_openpt` and `serial2::SerialPort::open` both leave the
+/// fd blocking, so the data plane sets this itself.
 pub fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
     // Safety: F_GETFL/F_SETFL take no memory arguments; fd is a valid open fd.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };

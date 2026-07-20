@@ -46,6 +46,7 @@ pub struct PtyNode {
     pub name: String,
     path: PathBuf,
     mode: u32,
+    owner: Option<String>,
     group: Option<String>,
     advertised_baud: u32,
     /// The master, shared between the read+presence and writer tasks. `None`
@@ -66,6 +67,7 @@ impl PtyNode {
         let NodeConfig::Pty {
             name,
             path,
+            owner,
             group,
             mode,
             advertised_baud,
@@ -81,6 +83,7 @@ impl PtyNode {
             name: name.clone(),
             path: PathBuf::from(path),
             mode: mode.unwrap_or(default_mode),
+            owner: owner.clone(),
             group: group.clone(),
             advertised_baud: *advertised_baud,
             master: None,
@@ -141,18 +144,37 @@ impl PtyNode {
         symlink(pts, &self.path).map_err(|e| format!("symlink {}: {e}", self.path.display()))
     }
 
-    /// Apply mode (and group, if configured) to the slave device node — what
-    /// gates open(2) (§7.2).
+    /// Apply mode, owner, and group to the slave device node — what gates
+    /// open(2) (§7.2). A configured owner/group that cannot be resolved or
+    /// applied faults the node (an environmental failure, §15.8) rather than
+    /// being silently dropped; leaving either unset keeps the daemon-user
+    /// default the freshly allocated pts already has.
     fn apply_perms(&self, pts: &str) -> Result<(), String> {
         std::fs::set_permissions(pts, std::os::unix::fs::PermissionsExt::from_mode(self.mode))
             .map_err(|e| format!("chmod {pts}: {e}"))?;
-        if let Some(group) = &self.group {
-            let gid = nix::unistd::Group::from_name(group)
-                .ok()
-                .flatten()
-                .map(|g| g.gid)
-                .ok_or_else(|| format!("group {group} not found"))?;
-            nix::unistd::chown(pts, None, Some(gid)).map_err(|e| format!("chown {pts}: {e}"))?;
+
+        let uid = match &self.owner {
+            Some(owner) => Some(
+                nix::unistd::User::from_name(owner)
+                    .ok()
+                    .flatten()
+                    .map(|u| u.uid)
+                    .ok_or_else(|| format!("user {owner} not found"))?,
+            ),
+            None => None,
+        };
+        let gid = match &self.group {
+            Some(group) => Some(
+                nix::unistd::Group::from_name(group)
+                    .ok()
+                    .flatten()
+                    .map(|g| g.gid)
+                    .ok_or_else(|| format!("group {group} not found"))?,
+            ),
+            None => None,
+        };
+        if uid.is_some() || gid.is_some() {
+            nix::unistd::chown(pts, uid, gid).map_err(|e| format!("chown {pts}: {e}"))?;
         }
         Ok(())
     }

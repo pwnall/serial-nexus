@@ -232,6 +232,14 @@ impl EdgeSpec {
 /// A structural validation failure, always naming the offender (§4, §11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
+    /// A node name or channel identity contains `/` — forbidden because the
+    /// display form `node/channel` and the on-disk address encoding depend on
+    /// its absence (§3, §15.12). `endpoint` is `None` when the offending name is
+    /// the node's own name, `Some` when it is one of its channel identities.
+    InvalidName {
+        node: String,
+        endpoint: Option<String>,
+    },
     /// An edge references a node that does not exist.
     UnknownNode { edge: usize, node: String },
     /// An edge references an endpoint the node does not expose.
@@ -249,6 +257,24 @@ pub enum ValidationError {
 impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ValidationError::InvalidName {
+                node,
+                endpoint: None,
+            } => {
+                write!(
+                    f,
+                    "node name {node:?} contains '/', which names and channel identities may not (§3)"
+                )
+            }
+            ValidationError::InvalidName {
+                node,
+                endpoint: Some(channel),
+            } => {
+                write!(
+                    f,
+                    "channel identity {channel:?} on node {node:?} contains '/', which names and channel identities may not (§3)"
+                )
+            }
             ValidationError::UnknownNode { edge, node } => {
                 write!(f, "edge {edge} references unknown node {node:?}")
             }
@@ -307,6 +333,27 @@ impl GraphModel {
     /// a time). An empty vector means the graph is structurally valid.
     pub fn validate(&self) -> Vec<ValidationError> {
         let mut errors = Vec::new();
+
+        // §3/§15.12: a node name or channel identity containing `/` breaks the
+        // `node/channel` display form and the on-disk address encoding, so it is
+        // a structural error. Checked on declared names (shape keys and endpoint
+        // names); malformed *references* in edges surface as UnknownNode/Endpoint.
+        for (node, shape) in &self.shapes {
+            if node.contains('/') {
+                errors.push(ValidationError::InvalidName {
+                    node: node.clone(),
+                    endpoint: None,
+                });
+            }
+            for ep in &shape.endpoints {
+                if ep.name.contains('/') {
+                    errors.push(ValidationError::InvalidName {
+                        node: node.clone(),
+                        endpoint: Some(ep.name.clone()),
+                    });
+                }
+            }
+        }
 
         // Rule 1 + reference integrity, and tally target-facing edge counts for
         // rule 2. Directed arcs (host-node -> target-node) feed rule 3.
@@ -604,6 +651,51 @@ mod tests {
             errs.as_slice(),
             [ValidationError::UnknownNode { node, .. }] if node == "ghost"
         ));
+    }
+
+    #[test]
+    fn slash_in_node_name_is_rejected() {
+        // §3/§15.12: a '/' in a node name breaks `node/channel` addressing, so it
+        // is a structural validation error naming the offender.
+        let mut g = GraphModel::new();
+        g.add_node("bad/name", NodeShape::single(Facing::Host));
+        let errs = g.validate();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidName { node, endpoint: None } if node == "bad/name"
+            )),
+            "expected InvalidName for a slashed node name, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn slash_in_channel_identity_is_rejected() {
+        // A codec/leg channel identity containing '/' is equally forbidden (§3).
+        let mut g = GraphModel::new();
+        g.add_node("mux", NodeShape::new(vec![EndpointSpec::host("con/sole")]));
+        let errs = g.validate();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidName { node, endpoint: Some(c) }
+                    if node == "mux" && c == "con/sole"
+            )),
+            "expected InvalidName for a slashed channel identity, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn legal_names_pass_the_slash_check() {
+        // The canonical fan-out (plain names, empty default endpoints) has no '/'
+        // offenders — the check must not fire on legal graphs.
+        let errs = fanout_graph().validate();
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidName { .. })),
+            "legal names must not trip the slash check, got {errs:?}"
+        );
     }
 
     #[test]

@@ -23,9 +23,9 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   # The licensing gate proven, not assumed (§13, phase 0 validation).
   license-gate:
@@ -53,8 +53,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
       - name: Capability report
         run: |
-          cargo run -q -p nexus-doctor -- --markdown | tee nexus-doctor-report.md
-          cargo run -q -p nexus-doctor -- --json | jq -e -f expectations/linux.jq
+          cargo run -q --locked -p nexus-doctor -- --markdown | tee nexus-doctor-report.md
+          cargo run -q --locked -p nexus-doctor -- --json | jq -e -f expectations/linux.jq
       - uses: actions/upload-artifact@v4
         with:
           name: nexus-doctor-report
@@ -73,6 +73,6 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
       - name: Build workspace
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
       - name: Run validation scripts (through current phase)
-        run: bash scripts/validate/all.sh --through 1
+        run: bash scripts/validate/all.sh --through 2
