@@ -75,4 +75,4 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace --locked
       - name: Run validation scripts (through current phase)
-        run: bash scripts/validate/all.sh --through 2
+        run: bash scripts/validate/all.sh --through 3

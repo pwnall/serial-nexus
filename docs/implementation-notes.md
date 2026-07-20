@@ -30,13 +30,14 @@ the items below are refinements consistent with the design, none contradict it.
 | 0 | Doctor + scaffolding | **done** — `nexus-doctor`, CI, cargo-deny gate |
 | 1 | Contracts in the small | **done** — nexus-core, codec-api, nexus-sim |
 | 2 | Walking skeleton | **done** — control plane + node lifecycle + data plane (serial↔PTY byte flow, presence gating, backpressure) |
-| 3–8 | Boundaries/log, arbitration, codecs, wire, identity, hardening | not started |
+| 3 | Boundaries & logging | **done** — drop counters, log node, `rotate`/`subscribe`, client-termios, high-throughput data plane + benchmark (§3.11) |
+| 4–8 | Arbitration, codecs, wire, identity, hardening | not started |
 
 **Quality gates (all green):** `cargo fmt --all --check`, `cargo clippy
---workspace --all-targets -- -D warnings`, `cargo test --workspace` (36 tests),
-and `bash scripts/validate/all.sh --through 2` (now including
-`phase2/data-path.sh`: a 64 KiB client↔daemon↔device echo round-trip with
-matching checksums, presence transitions, and end-to-end baseline termios).
+--workspace --all-targets --locked -- -D warnings`, `cargo test --workspace`,
+and `bash scripts/validate/all.sh --through 3` (phase 3 adds `counters.sh`,
+`log.sh`, `log-enospc.sh`, `subscribe.sh`, `firehose.sh`, `exact-loss.sh`,
+`benchmark.sh`).
 
 **Kernel matrix:** every kernel-behavior probe is `supported` on **Linux 7.0.0**
 (dev box, Ubuntu 26.04) and **Linux 6.18.14** (Debian rodete) with **zero
@@ -178,6 +179,35 @@ interval, or a `spawn_blocking` reader thread for high-baud serial, is a phase-3
 optimization if the throughput benchmark demands it. `AsyncFd` is *not* the
 answer for pty masters.
 
+### 3.11 The phase-3 benchmark demanded §15.18's thread escape hatch (both axes)
+**Design:** §15.18 frames the poll(2) readiness as bounding "idle latency, never
+throughput" (re-poll immediately during active transfer), with `spawn_blocking`
+reader threads as an escape hatch *if the benchmark demands it*, and idle CPU as
+the named concern (~1%/idle-fd).
+**Reality (phase-3 benchmark):** on the current-thread runtime the "re-poll
+immediately" intuition does **not** hold for a peer in a *separate process* — a
+`yield_now` spin returns instantly (no other runnable task), so no wall-clock
+passes and the peer never refills; the wait therefore always pays the ~1 ms tokio
+timer floor per buffer cycle, capping hostward throughput at **~1 MB/s** (measured
+1.2 MiB/s serial→log). That is below even one 3 Mbaud port for a fast consumer —
+so the escape hatch was **required**, not optional, exactly as §15.18 reserved.
+**Decision:** the two high-throughput paths — the **serial hostward reader** and
+the **PTY hostward writer** — run on **dedicated blocking threads** doing a
+*blocking* `poll(2)` (`sys::poll_blocking`), which the kernel wakes the instant
+the fd is ready. Result: ~185 MiB/s, lossless, and **zero** CPU while parked
+(a blocked poll costs nothing — this also dissolves the idle-CPU concern for
+these fds). Cross-thread counters became atomics (`Rc`→`Arc`, `Cell`→`Atomic*`);
+the PTY writer is fed by an async pump through a **bounded** bridge so the buffer
+stays bounded and full-buffer drops are counted. Low-rate paths (targetward
+PTY→serial, PTY presence/termios) stay async poll-based, now with an
+`ACTIVE_POLL`→`IDLE_POLL` adaptive backoff → **~0.06%/idle-fd** (2% total for 32
+idle PTYs, well under budget; the §15.18 idle-CPU concern, resolved).
+**Recorded:** `docs/benchmarks/phase3.json` (throughput + idle axes);
+`scripts/validate/phase3/{firehose,exact-loss,benchmark}.sh`. This is faithful to
+§15.18 (the reserved escape hatch, selected by the benchmark) — worth folding the
+"never throughput" phrasing into "never throughput *once the high-baud path is on
+a thread*" in a future design pass.
+
 ---
 
 ## 4. Findings carried forward (from nexus-doctor)
@@ -266,17 +296,27 @@ Real bytes flow serial↔PTY through a configured daemon over RPC. As built:
   client's side (raw/echo-off/EXTPROC), and `client_present` true↔false
   transitions. Measured ad-hoc: ~1% idle CPU, 1 MiB echo in ~0.5 s.
 
-## 6a. Next up — Phase 3 (boundaries and logging)
+## 6a. Phase 3 (boundaries and logging) — DONE
 
-Per plan §Phase 3: every §5 boundary policy with **counters in state** (the
-PTY/socket drop counters — hostward drops are silent today; add
-`Rc<Cell<u64>>` counters surfaced in `state_extra`), serial discard-when-unattached
-plus `TIOCGICOUNT` surfacing, the **log node** entirely (bounded queue + writer
-task on the blocking pool, on-demand `rotate`, counter recovery by directory
-scan — this also removes the §3.9 temporary log-node load rejection), and
-`subscribe` notifications for counters/status. Then the phase-3 throughput
-benchmark, which is where §3.10's idle-poll interval / high-baud strategy gets
-revisited if needed.
+Built in four committed slices: **A** boundary drop counters + serial discard +
+`TIOCGICOUNT` (`e064025`); **B** the log node — bounded queue, dedicated blocking
+writer thread, on-demand `rotate`, counter recovery by directory scan, ENOSPC
+fault; removed the §3.9 log-load rejection (`04b394d`); **C** `subscribe`
+(broadcast + periodic snapshot) and client-termios surfacing via the
+`TIOCPKT_IOCTL` path (`86ff94c`); **D** the high-throughput data plane (§3.11:
+serial reader + PTY writer on dedicated blocking threads) with the firehose,
+exact-loss, and throughput/idle benchmark (`c4d0e64`). All validated by
+self-judging `scripts/validate/phase3/*.sh`; `docs/benchmarks/phase3.json` records
+the throughput (~185 MiB/s) and idle (2% for 32 fds) axes.
+
+## 6b. Next up — Phase 4 (arbitration)
+
+Per plan §Phase 4: the §6 write-lock machinery end to end — per-edge write modes,
+the per-endpoint lock as a gate on the pause machinery, `lock`/`unlock`/`send`
+over RPC with steal/lease/detach-release, purge-on-acquire and purge-on-detach
+with counters, `free-for-all` opt-out, and lock-state `subscribe` notifications.
+Test topology needs no codec: two PTYs on one serial endpoint is a legal §4
+fan-out.
 
 ---
 
