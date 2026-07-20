@@ -71,7 +71,8 @@ impl Node {
                 let hostward = wiring.consumer_hostward.remove(&n.name);
                 let targetward = wiring.pty_targetward.remove(&n.name);
                 let counters = wiring.consumer_counters.remove(&n.name);
-                n.start(hostward, targetward, counters);
+                let lock = wiring.origin_locks.remove(&n.name);
+                n.start(hostward, targetward, counters, lock);
             }
             Node::Log(n) => {
                 let hostward = wiring.consumer_hostward.remove(&n.name);

@@ -5,13 +5,16 @@
 //! `subscribe` (phase 3).
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use nexus_core::config::GraphConfig;
+use nexus_core::lock::{Acquire, OriginId};
 use nexus_rpc::{Notification, RpcError, error_codes};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
 
 use crate::nodes::Node;
+use crate::runtime::SharedLock;
 
 /// Depth of the notification broadcast buffer (§10 `subscribe`). A subscriber
 /// that falls this far behind sees a `Lagged` skip rather than blocking the
@@ -25,12 +28,21 @@ pub mod app_errors {
     pub const LOAD_NONEMPTY: i64 = APP_ERROR_BASE - 1;
     /// A structural validation failure (§4).
     pub const STRUCTURAL: i64 = APP_ERROR_BASE - 2;
+    /// A `lock`/`send` was refused because another origin holds the endpoint's
+    /// write lock (§6).
+    pub const LOCKED: i64 = APP_ERROR_BASE - 3;
 }
 
 #[derive(Default)]
 struct GraphState {
     config: GraphConfig,
     nodes: Vec<Node>,
+    /// Host-facing endpoint (serial node name) → its write lock (§6), shared with
+    /// the origin read tasks. The daemon mutates it on `lock`/`unlock`.
+    endpoint_locks: HashMap<String, SharedLock>,
+    /// Writing origin (PTY node name) → (its endpoint's lock, its origin id), for
+    /// resolving a `lock`/`unlock` by origin name to the right lock (§6).
+    origin_locks: HashMap<String, (SharedLock, OriginId)>,
 }
 
 /// The running daemon: graph state, a shutdown signal, and the `subscribe`
@@ -80,6 +92,8 @@ impl Daemon {
             // dispatch just acknowledges the subscription (§10).
             "subscribe" => Ok(json!({ "subscribed": true })),
             "rotate" => self.rotate(params),
+            "lock" => self.lock(params),
+            "unlock" => self.unlock(params),
             "teardown" => Ok(self.teardown()),
             "shutdown" => {
                 self.shutdown.notify_one();
@@ -135,6 +149,10 @@ impl Daemon {
         // tasks (§5). Building the plan before the config moves keeps it borrow-
         // clean; `start` spawns onto the current-thread LocalSet.
         let mut wiring = crate::runtime::Wiring::build(&config);
+        // Keep clones of the write locks (§6) so the control plane can acquire and
+        // release them; the same `Rc`s are handed to the origin read tasks below.
+        st.endpoint_locks = wiring.endpoint_locks.clone();
+        st.origin_locks = wiring.origin_locks.clone();
         st.nodes = nodes;
         st.config = config;
         for node in &mut st.nodes {
@@ -161,6 +179,16 @@ impl Daemon {
                 obj.insert("name".into(), json!(n.name()));
                 merge_into(&mut obj, serde_json::to_value(n.status()).unwrap());
                 merge_into(&mut obj, n.state_extra());
+                // A host-facing endpoint reports its write-lock state (§6: holder,
+                // waiters, per-origin purge counters). Observed state, disjoint
+                // from configuration (§15.8).
+                if let Some(lock) = st.endpoint_locks.get(n.name()) {
+                    obj.insert(
+                        "lock".into(),
+                        serde_json::to_value(lock.borrow().snapshot())
+                            .expect("lock snapshot serializes"),
+                    );
+                }
                 Value::Object(obj)
             })
             .collect();
@@ -187,6 +215,57 @@ impl Daemon {
         }
     }
 
+    /// `lock` (§6): a named origin explicitly acquires its endpoint's exclusive
+    /// write lock. A fresh grant makes the origin the sole writer targetward;
+    /// another origin holding it is refused with [`app_errors::LOCKED`], naming
+    /// the holder. `--steal`, `--wait`, and `--lease` land in a later slice.
+    fn lock(&self, params: Option<Value>) -> Result<Value, RpcError> {
+        let origin = origin_param(&params)?;
+        let st = self.state.borrow();
+        let (lock, id) = st.origin_locks.get(origin).ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "{origin:?} is not a writable origin on any endpoint"
+            ))
+        })?;
+        // Bind the outcome so the mutable borrow is released before the label
+        // lookup below (a Denied read-borrows the same lock).
+        let outcome = lock.borrow_mut().acquire(*id);
+        match outcome {
+            Acquire::Granted => Ok(json!({ "origin": origin, "held": true, "acquired": true })),
+            Acquire::AlreadyHeld => {
+                Ok(json!({ "origin": origin, "held": true, "acquired": false }))
+            }
+            Acquire::Denied { held_by } => {
+                let holder = lock.borrow().label(held_by).map(str::to_owned);
+                Err(RpcError::new(
+                    app_errors::LOCKED,
+                    format!(
+                        "endpoint is locked by {}",
+                        holder.as_deref().unwrap_or("another origin")
+                    ),
+                )
+                .with_data(json!({ "held_by": holder })))
+            }
+            Acquire::ReadOnly => Err(RpcError::invalid_params(format!(
+                "origin {origin:?} is write=never and cannot hold the lock"
+            ))),
+        }
+    }
+
+    /// `unlock` (§6): release the endpoint's write lock if the named origin holds
+    /// it. Releasing when you do not hold it is reported, not an error.
+    fn unlock(&self, params: Option<Value>) -> Result<Value, RpcError> {
+        let origin = origin_param(&params)?;
+        let st = self.state.borrow();
+        let (lock, id) = st.origin_locks.get(origin).ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "{origin:?} is not a writable origin on any endpoint"
+            ))
+        })?;
+        let released = lock.borrow_mut().release(*id);
+        Ok(json!({ "origin": origin, "released": released }))
+    }
+
     fn teardown(&self) -> Value {
         let mut st = self.state.borrow_mut();
         let count = st.nodes.len();
@@ -194,6 +273,8 @@ impl Daemon {
             n.teardown();
         }
         st.config = GraphConfig::default();
+        st.endpoint_locks.clear();
+        st.origin_locks.clear();
         json!({ "torn_down": count })
     }
 
@@ -215,6 +296,15 @@ fn merge_into(target: &mut serde_json::Map<String, Value>, source: Value) {
             target.insert(k, v);
         }
     }
+}
+
+/// Extract the required `origin` string from a `lock`/`unlock` request's params.
+fn origin_param(params: &Option<Value>) -> Result<&str, RpcError> {
+    params
+        .as_ref()
+        .and_then(|p| p.get("origin"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::invalid_params("missing 'origin' in params"))
 }
 
 fn parse_config_param(params: Option<Value>) -> Result<GraphConfig, RpcError> {

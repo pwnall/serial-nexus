@@ -51,6 +51,11 @@ enum Cmd {
     },
     /// Rotate a log node's file on demand.
     Rotate { node: String },
+    /// Acquire the exclusive write lock for an origin (§6): only its bytes are
+    /// then read targetward through the endpoint it feeds.
+    Lock { origin: String },
+    /// Release the write lock held by an origin.
+    Unlock { origin: String },
     /// Tear down the whole graph.
     Teardown,
     /// Ask the daemon to shut down.
@@ -102,6 +107,8 @@ fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
         Cmd::State => ("state", None),
         Cmd::Subscribe { .. } => unreachable!("subscribe is handled before dispatch"),
         Cmd::Rotate { node } => ("rotate", Some(json!({ "node": node }))),
+        Cmd::Lock { origin } => ("lock", Some(json!({ "origin": origin }))),
+        Cmd::Unlock { origin } => ("unlock", Some(json!({ "origin": origin }))),
         Cmd::Teardown => ("teardown", None),
         Cmd::Shutdown => ("shutdown", None),
     })
@@ -144,6 +151,35 @@ fn render(cmd: &Cmd, result: &Value) -> anyhow::Result<()> {
                 Some(n) => println!("{node}: rotating to {n}"),
                 None => println!("{node}: rotation requested"),
             }
+        }
+        Cmd::Lock { origin } => {
+            let acquired = result
+                .get("acquired")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let held = result.get("held").and_then(Value::as_bool).unwrap_or(false);
+            let msg = if acquired {
+                "lock acquired"
+            } else if held {
+                "already holds the lock"
+            } else {
+                "not held"
+            };
+            println!("{origin}: {msg}");
+        }
+        Cmd::Unlock { origin } => {
+            let released = result
+                .get("released")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            println!(
+                "{origin}: {}",
+                if released {
+                    "unlocked"
+                } else {
+                    "was not holding the lock"
+                }
+            );
         }
         Cmd::Teardown => {
             let n = result.get("torn_down").and_then(Value::as_u64).unwrap_or(0);

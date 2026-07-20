@@ -60,7 +60,9 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
 /// happen. At [`READ_BUF`]-sized chunks this is ~2 MiB.
 const WRITER_QUEUE: usize = 32;
 
-use crate::runtime::{ACTIVE_POLL, DropCounters, READ_BUF, back_off};
+use nexus_core::lock::OriginId;
+
+use crate::runtime::{ACTIVE_POLL, DropCounters, READ_BUF, SharedLock, back_off};
 use crate::sys;
 
 pub struct PtyNode {
@@ -221,12 +223,16 @@ impl PtyNode {
     }
 
     /// Start the data plane: forward targetward, poll presence, and drain
-    /// hostward presence-gated.
+    /// hostward presence-gated. `lock` is this PTY's write-arbitration handle
+    /// (§6) when it is a writing origin — the targetward drain is gated on it, so
+    /// a non-holder is simply not read from. `None` for a `never` spy, which
+    /// never writes.
     pub fn start(
         &mut self,
         hostward: Option<mpsc::Receiver<Chunk>>,
         targetward: Option<mpsc::Sender<Chunk>>,
         counters: Option<Arc<DropCounters>>,
+        lock: Option<(SharedLock, OriginId)>,
     ) {
         // Adopt the wiring's shared counters (the same Rc the serial reader
         // increments) so presence-gated discards and full-buffer drops land on
@@ -253,6 +259,7 @@ impl PtyNode {
             self.client_termios.clone(),
             targetward,
             self.advertised_baud,
+            lock,
         )));
 
         // Writer: serial → client (hostward), presence-gated, on a dedicated
@@ -369,6 +376,7 @@ async fn read_and_poll(
     client_termios: Rc<RefCell<Option<Value>>>,
     tx: Option<mpsc::Sender<Chunk>>,
     advertised_baud: u32,
+    lock: Option<(SharedLock, OriginId)>,
 ) {
     let fd = master.as_raw_fd();
     let mut buf = vec![0u8; READ_BUF];
@@ -385,8 +393,19 @@ async fn read_and_poll(
             *client_termios.borrow_mut() = None;
         }
 
+        // Write arbitration (§6): a writing origin drains targetward only while it
+        // holds the lock; a non-holder is *not read from*, so its bytes stay in
+        // the kernel buffer (backpressure to the client), never dropped. A spy
+        // with no lock handle still reads — its termios and presence surface — but
+        // has no `tx`, so its stray writes go nowhere. The borrow is dropped
+        // before any await below.
+        let may_write = match &lock {
+            Some((l, id)) => l.borrow().may_write(*id),
+            None => true,
+        };
+
         let mut did = false;
-        if now && re.contains(PollFlags::POLLIN) {
+        if now && may_write && re.contains(PollFlags::POLLIN) {
             loop {
                 match sys::read_fd(fd, &mut buf) {
                     Ok(0) => {

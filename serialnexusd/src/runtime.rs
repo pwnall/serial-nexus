@@ -34,19 +34,28 @@
 //!   is the hatch §15.18 reserved and §15.19 cashed. Cross-thread counters are
 //!   therefore atomic ([`DropCounters`]).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::fd::RawFd;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use nexus_core::Chunk;
 use nexus_core::config::{GraphConfig, NodeConfig};
-use nexus_core::graph::Facing;
+use nexus_core::graph::{Facing, WriteMode};
+use nexus_core::lock::{EndpointLock, OriginId};
 use nix::poll::PollFlags;
 use tokio::sync::mpsc;
 
 use crate::sys;
+
+/// A shared, single-threaded handle to one host-facing endpoint's write lock
+/// (§6). The daemon's control-plane methods mutate it (acquire/release) and each
+/// attached origin's read task consults [`EndpointLock::may_write`]; all run on
+/// the one runtime thread, so `Rc<RefCell<_>>` needs no synchronization.
+pub type SharedLock = Rc<RefCell<EndpointLock>>;
 
 /// Hostward drop counters for one consuming boundary (§5). All hostward loss is
 /// counted at the boundary that drops it, so it is always located, counted, and
@@ -125,6 +134,13 @@ pub struct Wiring {
     /// PTY node → its targetward sender (into its serial). Only targetward-writing
     /// consumers appear here; a log node's write mode is inherently `never` (§7.3).
     pub pty_targetward: HashMap<String, mpsc::Sender<Chunk>>,
+    /// Host-facing endpoint (serial node name) → its write lock (§6). The daemon
+    /// keeps a clone for `lock`/`unlock`/`send` and for reporting lock state.
+    pub endpoint_locks: HashMap<String, SharedLock>,
+    /// Writing origin (PTY node name) → (its endpoint's lock, its origin id). The
+    /// origin's read task consults this to gate its targetward drain (§6). Only
+    /// origins that can write appear here; a `never` spy or a log never does.
+    pub origin_locks: HashMap<String, (SharedLock, OriginId)>,
 }
 
 impl Wiring {
@@ -136,20 +152,31 @@ impl Wiring {
     /// sender — a log's write mode is inherently `never` (§7.3).
     pub fn build(config: &GraphConfig) -> Wiring {
         let mut facing: HashMap<&str, Facing> = HashMap::new();
-        let mut writes_targetward: HashMap<&str, bool> = HashMap::new();
+        let mut is_log: HashMap<&str, bool> = HashMap::new();
         for n in &config.nodes {
             let f = match n {
                 NodeConfig::Serial { faces, .. } => *faces,
                 NodeConfig::Pty { .. } | NodeConfig::Log { .. } => Facing::Target,
             };
             facing.insert(n.name(), f);
-            // Log nodes never write targetward; PTYs (and serials) can.
-            writes_targetward.insert(n.name(), !matches!(n, NodeConfig::Log { .. }));
+            is_log.insert(n.name(), matches!(n, NodeConfig::Log { .. }));
         }
 
         let mut wiring = Wiring::default();
+        // One write lock per host-facing endpoint (§6), carrying the node's
+        // configured arbitration policy (exclusive by default).
+        for n in &config.nodes {
+            if facing.get(n.name()) == Some(&Facing::Host) {
+                wiring.endpoint_locks.insert(
+                    n.name().to_owned(),
+                    Rc::new(RefCell::new(EndpointLock::new(n.arbitration()))),
+                );
+            }
+        }
+
         // One targetward sender per serial, cloned to each writing consumer.
         let mut serial_targetward_tx: HashMap<String, mpsc::Sender<Chunk>> = HashMap::new();
+        let mut next_origin = 0u64;
 
         for edge in &config.edges {
             let a = facing.get(edge.a.node.as_str()).copied();
@@ -162,13 +189,24 @@ impl Wiring {
                 _ => continue,
             };
 
-            // Targetward: only for consumers that write back (PTY). Create the
-            // serial's receiver lazily on the first such edge.
-            if writes_targetward
-                .get(target.as_str())
-                .copied()
-                .unwrap_or(true)
-            {
+            // Register this attachment as an origin on the host endpoint's lock
+            // (§6). A log's write mode is inherently `never` (§7.3) regardless of
+            // what the edge declares; every other edge carries its declared mode.
+            let mode = if is_log.get(target.as_str()).copied().unwrap_or(false) {
+                WriteMode::Never
+            } else {
+                edge.write_mode
+            };
+            let origin_id = OriginId(next_origin);
+            next_origin += 1;
+            if let Some(lock) = wiring.endpoint_locks.get(host) {
+                lock.borrow_mut().register(origin_id, target.clone(), mode);
+            }
+
+            // Targetward: only origins that can write (mode != never) get a path
+            // to the port and a lock handle to gate their drain (§6). A `never`
+            // spy or a log has neither, so it can never write.
+            if mode != WriteMode::Never {
                 let ttx = serial_targetward_tx
                     .entry(host.clone())
                     .or_insert_with(|| {
@@ -178,6 +216,11 @@ impl Wiring {
                     })
                     .clone();
                 wiring.pty_targetward.insert(target.clone(), ttx);
+                if let Some(lock) = wiring.endpoint_locks.get(host) {
+                    wiring
+                        .origin_locks
+                        .insert(target.clone(), (lock.clone(), origin_id));
+                }
             }
 
             // Hostward: one dedicated channel per (serial, consumer) edge, so a

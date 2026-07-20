@@ -190,13 +190,20 @@ impl NodeShape {
         NodeShape { endpoints }
     }
 
-    /// A node with a single endpoint of the given facing (serial, pty, log).
+    /// A node with a single endpoint of the given facing (serial, pty, log), with
+    /// the default exclusive arbitration.
     pub fn single(facing: Facing) -> Self {
+        Self::single_arb(facing, Arbitration::Exclusive)
+    }
+
+    /// A single-endpoint node with an explicit arbitration policy (§6) — used for
+    /// the serial node's host-facing endpoint, whose policy is configurable.
+    pub fn single_arb(facing: Facing, arbitration: Arbitration) -> Self {
         NodeShape {
             endpoints: vec![EndpointSpec {
                 name: DEFAULT_ENDPOINT.to_owned(),
                 facing,
-                arbitration: Arbitration::Exclusive,
+                arbitration,
             }],
         }
     }

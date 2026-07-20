@@ -44,6 +44,7 @@ cat > "$TMPD/c1.toml" <<EOF
 [[node]]
 type = "serial"
 name = "usb0"
+arbitration = "free-for-all"
 device = "$DEV1"
 [[node]]
 type = "log"
@@ -81,6 +82,7 @@ path = "$TTY2"
 [[node]]
 type = "serial"
 name = "usb0"
+arbitration = "free-for-all"
 device = "$DEV2"
 [[node]]
 type = "log"

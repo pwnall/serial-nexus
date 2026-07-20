@@ -51,6 +51,7 @@ path = "$TTY"
 [[node]]
 type = "serial"
 name = "usb0"
+arbitration = "free-for-all"
 device = "$DEV"
 [[node]]
 type = "log"

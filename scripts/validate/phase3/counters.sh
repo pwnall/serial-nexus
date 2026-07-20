@@ -50,6 +50,7 @@ cat > "$TMPD/c1.toml" <<EOF
 [[node]]
 type = "serial"
 name = "usb0"
+arbitration = "free-for-all"
 device = "$DEV1"
 EOF
 "$C" load "$TMPD/c1.toml" >/dev/null || { cat "$TMPD/daemon.log"; fail "load c1 failed"; }
@@ -73,6 +74,7 @@ path = "$TMPD/console2"
 [[node]]
 type = "serial"
 name = "usb0"
+arbitration = "free-for-all"
 device = "$DEV2"
 [[edge]]
 a = "usb0"
@@ -105,6 +107,7 @@ path = "$TTY3"
 [[node]]
 type = "serial"
 name = "usb0"
+arbitration = "free-for-all"
 device = "$DEV3"
 [[edge]]
 a = "usb0"

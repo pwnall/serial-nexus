@@ -53,6 +53,7 @@ path = "$TTY"
 [[node]]
 type = "serial"
 name = "usb0"
+arbitration = "free-for-all"
 device = "$DEV"
 [[edge]]
 a = "usb0"

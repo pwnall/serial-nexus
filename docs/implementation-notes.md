@@ -49,7 +49,8 @@ the items below are refinements consistent with the design, none contradict it.
 | 1 | Contracts in the small | **done** — nexus-core, codec-api, nexus-sim |
 | 2 | Walking skeleton | **done** — control plane + node lifecycle + data plane (serial↔PTY byte flow, presence gating, backpressure) |
 | 3 | Boundaries & logging | **done** — drop counters, log node, `rotate`/`subscribe`, client-termios, high-throughput data plane + benchmark (§3.11) |
-| 4–8 | Arbitration, codecs, wire, identity, hardening | not started |
+| 4 | Arbitration | **in progress** — slice A done: per-endpoint exclusive write lock, `lock`/`unlock`, the `may_write` gate on the PTY targetward drain, lock state in `state` (§3.12). Slices B (purge/detach-release/free-for-all) and C (send/steal/lease/wait/notifications) pending |
+| 5–8 | Codecs, wire, identity, hardening | not started |
 
 **Quality gates (all green):** `cargo fmt --all --check`, `cargo clippy
 --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace`,
@@ -229,6 +230,29 @@ and §15.18's "never throughput" claim is corrected there (it held only until th
 hot hostward path moved to a blocking thread). The design pass this section asked
 for is done; the code comments were repointed from §15.18 to §15.19 to match.
 
+### 3.12 Arbitration addressing: `lock`/`unlock` name the origin, not the endpoint
+**Design:** §6 shows `serialnexusctl lock <node/channel>` and `send <node/channel>`
+without pinning down whether `<node/channel>` is the origin acquiring the lock or
+the host-facing endpoint being locked.
+**Decision (phase 4, slice A):** the lock lives on a **host-facing endpoint** (the
+serial node), but the RPC `lock`/`unlock` name the **origin** — the target-facing
+writer (a PTY) that acquires it. The daemon resolves the origin to the unique
+endpoint it feeds (a target-facing endpoint has exactly one edge, §4). This is what
+makes the reference workflow coherent: `lock ptya` grants *ptya* the write lock so
+its operator can type, while other origins on the same serial are locked out. The
+later `send` verb (slice C) instead names the **target** endpoint, since the CLI is
+itself the transient origin. This is a presentation/RPC-shape choice the design
+leaves open (§15.16); the state machine (`nexus_core::lock`) is addressing-agnostic
+(it keys on an opaque `OriginId`), so a future spelling change costs only the daemon
+glue. **Architecture:** the lock is a pure state machine in `nexus_core::lock`
+(property-tested); the daemon shares one `Rc<RefCell<EndpointLock>>` per endpoint
+(all tasks are on the one runtime thread) between the control-plane methods that
+mutate it and each origin's PTY read task, which consults `may_write` before
+draining targetward. A non-holder is *not read from* (its bytes stay in the kernel
+buffer — backpressure, never dropped), so arbitration reuses the §5 pause machinery
+and adds no data path, exactly as §6 requires. The serial node's host endpoint
+carries a new `arbitration = exclusive | free-for-all` config attribute (§6).
+
 ---
 
 ## 4. Findings carried forward (from nexus-doctor)
@@ -330,14 +354,39 @@ exact-loss, and throughput/idle benchmark (`c4d0e64`). All validated by
 self-judging `scripts/validate/phase3/*.sh`; `docs/benchmarks/phase3.json` records
 the throughput (~185 MiB/s) and idle (2% for 32 fds) axes.
 
-## 6b. Next up — Phase 4 (arbitration)
+## 6b. Phase 4 (arbitration) — IN PROGRESS
 
-Per plan §Phase 4: the §6 write-lock machinery end to end — per-edge write modes,
-the per-endpoint lock as a gate on the pause machinery, `lock`/`unlock`/`send`
-over RPC with steal/lease/detach-release, purge-on-acquire and purge-on-detach
-with counters, `free-for-all` opt-out, and lock-state `subscribe` notifications.
-Test topology needs no codec: two PTYs on one serial endpoint is a legal §4
-fan-out.
+Per plan §Phase 4, built in slices; test topology needs no codec (PTYs on one
+serial endpoint is a legal §4 fan-out).
+
+- **Slice A DONE: the exclusive write lock.** `nexus_core::lock::EndpointLock` —
+  the pure, property-tested state machine (holder, per-origin write modes, purge
+  accounting; `may_write` is the gate). Serial node gains an `arbitration` config
+  attribute (§6). `Wiring::build` creates one `Rc<RefCell<EndpointLock>>` per
+  host-facing endpoint and registers every edge as an origin (a log/`never` edge is
+  a non-writer). Each writing PTY's read task gates its targetward drain on
+  `may_write` — a non-holder is **not read from** (backpressure, no drop, §5/§6).
+  `lock`/`unlock` RPC (address the **origin**, §3.12) with `-32003` LOCKED for a
+  contended acquire; the host endpoint reports `.lock` (arbitration, holder,
+  origins, purge) in `state`. CLI `lock`/`unlock`. Validated by
+  `phase4/exclusivity.sh` (byte-exact: only the holder's stream reaches the sink;
+  a locked-out present writer and a `write=never` spy leak nothing — verified with
+  a negative control that a disabled gate makes the test fail).
+  - **Consequence — exclusive is the default (§6), so a lone PTY needs a lock to
+    write.** `only the holder's bytes are read targetward` holds even with one
+    origin: an on-demand PTY that has not acquired the lock is not read from. This
+    (correctly) broke five pre-arbitration phase-2/3 tests that wrote targetward
+    (`--expect echo`) or changed termios without locking. They now set
+    `arbitration = "free-for-all"` on their serial node — §6's documented opt-out
+    — to keep testing the data plane / logging / termios (their actual subject)
+    without arbitration ceremony; the exclusive-lock path is covered by
+    `phase4/exclusivity.sh`. Real single-console operators have the same choice:
+    `free-for-all`, or the "grab, write, release" flow.
+- **Slice B PENDING:** purge-on-acquire + purge-on-detach with counters,
+  detach-release (holder's client closes → auto-release), `free-for-all` end to end.
+- **Slice C PENDING:** the atomic `send` verb, `--steal`/`--lease`/`--wait` (async
+  dispatch), and lock-change `subscribe` notifications (periodic snapshots already
+  surface `.lock`, so changes are visible at 200 ms granularity today).
 
 ---
 

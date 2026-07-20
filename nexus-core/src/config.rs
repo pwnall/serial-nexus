@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{EdgeSpec, EndpointAddr, Facing, GraphModel, NodeShape, WriteMode};
+use crate::graph::{Arbitration, EdgeSpec, EndpointAddr, Facing, GraphModel, NodeShape, WriteMode};
 
 /// A complete graph configuration: the exact shape `dump` emits and `load`
 /// accepts (§11).
@@ -78,6 +78,11 @@ pub enum NodeConfig {
         /// toward another machine's tools (§7.1).
         #[serde(default = "default_faces_host")]
         faces: Facing,
+        /// Write-arbitration policy for this node's host-facing endpoint (§6).
+        /// Defaults to exclusive; `free-for-all` is the escape hatch for
+        /// machine-to-machine links coordinated elsewhere.
+        #[serde(default)]
+        arbitration: Arbitration,
     },
     /// PTY node (§7.2). Always faces target.
     Pty {
@@ -118,9 +123,20 @@ impl NodeConfig {
     /// The topological shape (endpoints + facings) this node exposes (§4).
     pub fn shape(&self) -> NodeShape {
         match self {
-            NodeConfig::Serial { faces, .. } => NodeShape::single(*faces),
+            NodeConfig::Serial {
+                faces, arbitration, ..
+            } => NodeShape::single_arb(*faces, *arbitration),
             // PTY and log look back toward the device: they face target.
             NodeConfig::Pty { .. } | NodeConfig::Log { .. } => NodeShape::single(Facing::Target),
+        }
+    }
+
+    /// The write-arbitration policy of this node's host-facing endpoint (§6), or
+    /// the default for node kinds without a host-facing endpoint.
+    pub fn arbitration(&self) -> Arbitration {
+        match self {
+            NodeConfig::Serial { arbitration, .. } => *arbitration,
+            NodeConfig::Pty { .. } | NodeConfig::Log { .. } => Arbitration::default(),
         }
     }
 }
@@ -207,6 +223,7 @@ mod tests {
                     stop_bits: StopBits::One,
                     flow_control: FlowControl::None,
                     faces: Facing::Host,
+                    arbitration: Arbitration::Exclusive,
                 },
                 NodeConfig::Pty {
                     name: "console".into(),
@@ -279,6 +296,9 @@ mod tests {
     fn any_facing() -> impl Strategy<Value = Facing> {
         prop_oneof![Just(Facing::Host), Just(Facing::Target)]
     }
+    fn any_arbitration() -> impl Strategy<Value = Arbitration> {
+        prop_oneof![Just(Arbitration::Exclusive), Just(Arbitration::FreeForAll)]
+    }
     fn any_overflow() -> impl Strategy<Value = OverflowPolicy> {
         prop_oneof![
             Just(OverflowPolicy::DropOldest),
@@ -304,9 +324,20 @@ mod tests {
                 any_stop_bits(),
                 any_flow(),
                 any_facing(),
+                any_arbitration(),
             )
                 .prop_map(
-                    |(name, device, baud, data_bits, parity, stop_bits, flow_control, faces)| {
+                    |(
+                        name,
+                        device,
+                        baud,
+                        data_bits,
+                        parity,
+                        stop_bits,
+                        flow_control,
+                        faces,
+                        arbitration,
+                    )| {
                         NodeConfig::Serial {
                             name,
                             device,
@@ -316,6 +347,7 @@ mod tests {
                             stop_bits,
                             flow_control,
                             faces,
+                            arbitration,
                         }
                     }
                 ),
