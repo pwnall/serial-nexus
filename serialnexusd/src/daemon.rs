@@ -47,6 +47,7 @@ impl Daemon {
             "load" => self.load(parse_config_param(params)?),
             "dump" => Ok(self.dump()),
             "state" => Ok(self.state()),
+            "rotate" => self.rotate(params),
             "teardown" => Ok(self.teardown()),
             "shutdown" => {
                 self.shutdown.notify_one();
@@ -132,6 +133,26 @@ impl Daemon {
             })
             .collect();
         json!({ "nodes": nodes })
+    }
+
+    /// `rotate` (§7.3): rotate a log node's file on demand. Names the node in
+    /// `params.node`; errors if it is unknown or not a log node.
+    fn rotate(&self, params: Option<Value>) -> Result<Value, RpcError> {
+        let node = params
+            .as_ref()
+            .and_then(|p| p.get("node"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("missing 'node' in params"))?;
+        let st = self.state.borrow();
+        let target = st
+            .nodes
+            .iter()
+            .find(|n| n.name() == node)
+            .ok_or_else(|| RpcError::invalid_params(format!("unknown node {node:?}")))?;
+        match target.rotate() {
+            Ok(rotated_to) => Ok(json!({ "node": node, "rotated_to": rotated_to })),
+            Err(reason) => Err(RpcError::invalid_params(reason)),
+        }
     }
 
     fn teardown(&self) -> Value {

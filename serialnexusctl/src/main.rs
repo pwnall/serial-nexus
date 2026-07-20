@@ -42,6 +42,8 @@ enum Cmd {
     Dump,
     /// Report observed node state.
     State,
+    /// Rotate a log node's file on demand.
+    Rotate { node: String },
     /// Tear down the whole graph.
     Teardown,
     /// Ask the daemon to shut down.
@@ -85,6 +87,7 @@ fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
         }
         Cmd::Dump => ("dump", None),
         Cmd::State => ("state", None),
+        Cmd::Rotate { node } => ("rotate", Some(json!({ "node": node }))),
         Cmd::Teardown => ("teardown", None),
         Cmd::Shutdown => ("shutdown", None),
     })
@@ -120,6 +123,13 @@ fn render(cmd: &Cmd, result: &Value) -> anyhow::Result<()> {
         Cmd::Load { .. } => {
             let n = result.get("loaded").and_then(Value::as_u64).unwrap_or(0);
             println!("loaded {n} node(s)");
+        }
+        Cmd::Rotate { node } => {
+            let n = result.get("rotated_to").and_then(Value::as_u64);
+            match n {
+                Some(n) => println!("{node}: rotating to {n}"),
+                None => println!("{node}: rotation requested"),
+            }
         }
         Cmd::Teardown => {
             let n = result.get("torn_down").and_then(Value::as_u64).unwrap_or(0);

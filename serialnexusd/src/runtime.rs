@@ -103,67 +103,77 @@ pub type HostwardSink = (mpsc::Sender<Chunk>, Rc<DropCounters>);
 /// Built once from the loaded configuration; each node removes its own entries.
 #[derive(Default)]
 pub struct Wiring {
-    /// serial node → one hostward sink per attached PTY (fan-out, §4 rule 2).
+    /// serial node → one hostward sink per attached consumer (fan-out, §4 rule 2).
     pub serial_hostward: HashMap<String, Vec<HostwardSink>>,
-    /// serial node → the single targetward receiver (all attached PTYs feed it).
+    /// serial node → the single targetward receiver (all writing consumers feed it).
     pub serial_targetward: HashMap<String, mpsc::Receiver<Chunk>>,
-    /// PTY node → its hostward receiver (from its serial).
-    pub pty_hostward: HashMap<String, mpsc::Receiver<Chunk>>,
-    /// PTY node → its targetward sender (into its serial).
+    /// consumer node (PTY or log) → its hostward receiver (from its serial).
+    pub consumer_hostward: HashMap<String, mpsc::Receiver<Chunk>>,
+    /// consumer node → its [`DropCounters`] (shared with the serial hostward
+    /// sink), for drop/discard counts and state reporting (§5, §7.2, §7.3).
+    pub consumer_counters: HashMap<String, Rc<DropCounters>>,
+    /// PTY node → its targetward sender (into its serial). Only targetward-writing
+    /// consumers appear here; a log node's write mode is inherently `never` (§7.3).
     pub pty_targetward: HashMap<String, mpsc::Sender<Chunk>>,
-    /// PTY node → its [`DropCounters`] (shared with the serial hostward sender),
-    /// for the presence-gated discard count and state reporting (§5, §7.2).
-    pub pty_counters: HashMap<String, Rc<DropCounters>>,
 }
 
 impl Wiring {
-    /// Build the channel plan for the phase-2 topology: serial (host-facing)
-    /// endpoints fanning out to PTY (target-facing) endpoints. The graph is
-    /// already structurally valid here (load validates first, §11), so each edge
-    /// joins exactly one host and one target endpoint.
+    /// Build the channel plan for the phase-2/3 topology: serial (host-facing)
+    /// endpoints fanning out to target-facing consumers (PTY and log). The graph
+    /// is already structurally valid here (load validates first, §11), so each
+    /// edge joins exactly one host and one target endpoint. Every consumer gets a
+    /// hostward channel; only targetward-writing consumers (PTY) get a targetward
+    /// sender — a log's write mode is inherently `never` (§7.3).
     pub fn build(config: &GraphConfig) -> Wiring {
-        // Facing of each node's sole endpoint (phase 2: serial=host|target by
-        // `faces`, pty/log=target).
         let mut facing: HashMap<&str, Facing> = HashMap::new();
+        let mut writes_targetward: HashMap<&str, bool> = HashMap::new();
         for n in &config.nodes {
             let f = match n {
                 NodeConfig::Serial { faces, .. } => *faces,
                 NodeConfig::Pty { .. } | NodeConfig::Log { .. } => Facing::Target,
             };
             facing.insert(n.name(), f);
+            // Log nodes never write targetward; PTYs (and serials) can.
+            writes_targetward.insert(n.name(), !matches!(n, NodeConfig::Log { .. }));
         }
 
         let mut wiring = Wiring::default();
-        // One targetward sender per serial, cloned to each attached PTY.
+        // One targetward sender per serial, cloned to each writing consumer.
         let mut serial_targetward_tx: HashMap<String, mpsc::Sender<Chunk>> = HashMap::new();
 
         for edge in &config.edges {
             let a = facing.get(edge.a.node.as_str()).copied();
             let b = facing.get(edge.b.node.as_str()).copied();
-            // Identify the host (serial) and target (pty) ends. Same-facing or
-            // dangling edges can't occur post-validation; skip defensively.
+            // Identify the host (serial) and target (consumer) ends. Same-facing
+            // or dangling edges can't occur post-validation; skip defensively.
             let (host, target) = match (a, b) {
                 (Some(Facing::Host), Some(Facing::Target)) => (&edge.a.node, &edge.b.node),
                 (Some(Facing::Target), Some(Facing::Host)) => (&edge.b.node, &edge.a.node),
                 _ => continue,
             };
 
-            // Targetward: create the serial's receiver lazily on first edge, and
-            // hand every attached PTY a clone of the sender.
-            let ttx = serial_targetward_tx
-                .entry(host.clone())
-                .or_insert_with(|| {
-                    let (tx, rx) = mpsc::channel(CHANNEL_CAP);
-                    wiring.serial_targetward.insert(host.clone(), rx);
-                    tx
-                })
-                .clone();
-            wiring.pty_targetward.insert(target.clone(), ttx);
+            // Targetward: only for consumers that write back (PTY). Create the
+            // serial's receiver lazily on the first such edge.
+            if writes_targetward
+                .get(target.as_str())
+                .copied()
+                .unwrap_or(true)
+            {
+                let ttx = serial_targetward_tx
+                    .entry(host.clone())
+                    .or_insert_with(|| {
+                        let (tx, rx) = mpsc::channel(CHANNEL_CAP);
+                        wiring.serial_targetward.insert(host.clone(), rx);
+                        tx
+                    })
+                    .clone();
+                wiring.pty_targetward.insert(target.clone(), ttx);
+            }
 
-            // Hostward: one dedicated channel per (serial, pty) edge, so a slow
-            // PTY's drops are isolated to its own channel (§5). One shared
-            // DropCounters rides with both ends — the serial reader counts
-            // full-buffer drops, the PTY counts presence-gated discards.
+            // Hostward: one dedicated channel per (serial, consumer) edge, so a
+            // slow consumer's drops are isolated to its own channel (§5). One
+            // shared DropCounters rides with both ends — the serial reader counts
+            // full-buffer drops, the consumer counts its own boundary discards.
             let (htx, hrx) = mpsc::channel(CHANNEL_CAP);
             let counters = Rc::new(DropCounters::default());
             wiring
@@ -171,8 +181,8 @@ impl Wiring {
                 .entry(host.clone())
                 .or_default()
                 .push((htx, counters.clone()));
-            wiring.pty_hostward.insert(target.clone(), hrx);
-            wiring.pty_counters.insert(target.clone(), counters);
+            wiring.consumer_hostward.insert(target.clone(), hrx);
+            wiring.consumer_counters.insert(target.clone(), counters);
         }
 
         wiring
