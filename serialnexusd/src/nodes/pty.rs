@@ -18,11 +18,12 @@
 //! * A writer task drains the hostward channel to the master, **presence-gated**
 //!   — written only while a client holds the slave, discarded otherwise (§7.2).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use nexus_core::Chunk;
 use nexus_core::NodeStatus;
@@ -33,11 +34,17 @@ use nix::poll::PollFlags;
 use nix::pty::{PtyMaster, grantpt, posix_openpt, ptsname_r, unlockpt};
 use nix::sys::stat::Mode;
 use nix::sys::termios::{
-    BaudRate, LocalFlags, SetArg, cfmakeraw, cfsetspeed, tcgetattr, tcsetattr,
+    BaudRate, ControlFlags, LocalFlags, SetArg, cfgetospeed, cfmakeraw, cfsetspeed, tcgetattr,
+    tcsetattr,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+/// How often the reconciliation poll re-reads client termios as a backstop for
+/// the packet-mode notification, catching the mechanism's obscure corners (§7.2).
+/// A few seconds; one ioctl, effectively free.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
 
 use crate::runtime::{self, DropCounters, IDLE_POLL, READ_BUF};
 use crate::sys;
@@ -62,6 +69,11 @@ pub struct PtyNode {
     /// reader. Reports presence-gated discards and slow-consumer full-buffer
     /// drops in state. Defaulted at creation, replaced from the wiring at start.
     counters: Rc<DropCounters>,
+    /// Observed client termios (§7.2), updated by the reader on a packet-mode
+    /// `tcsetattr` notification and by the slow reconciliation backstop; `None`
+    /// while no client has touched the settings this session. The daemon only
+    /// *observes* — propagation to hardware is deferred (§14).
+    client_termios: Rc<RefCell<Option<Value>>>,
     tasks: Vec<JoinHandle<()>>,
     status: NodeStatus,
 }
@@ -95,6 +107,7 @@ impl PtyNode {
             symlink_installed: false,
             present: Rc::new(Cell::new(false)),
             counters: Rc::new(DropCounters::default()),
+            client_termios: Rc::new(RefCell::new(None)),
             tasks: Vec::new(),
             status: NodeStatus::Active,
         };
@@ -209,10 +222,12 @@ impl PtyNode {
         }
 
         // Reader + presence poll: client → serial (targetward), plus the presence
-        // check that also gates the writer below.
+        // check that also gates the writer below and the client-termios
+        // reconciliation that feeds state (§7.2).
         self.tasks.push(tokio::task::spawn_local(read_and_poll(
             master.clone(),
             self.present.clone(),
+            self.client_termios.clone(),
             targetward,
             self.advertised_baud,
         )));
@@ -243,6 +258,8 @@ impl PtyNode {
             // too slow to drain its bounded buffer.
             "discarded_no_client": self.counters.discarded_absent(),
             "dropped_slow_consumer": self.counters.dropped_full(),
+            // Observed client termios (§7.2), null until a client touches it.
+            "client_termios": self.client_termios.borrow().clone(),
         })
     }
 
@@ -291,19 +308,22 @@ fn apply_baseline(fd: BorrowedFd, advertised_baud: u32) -> Result<(), String> {
 async fn read_and_poll(
     master: Rc<PtyMaster>,
     present: Rc<Cell<bool>>,
+    client_termios: Rc<RefCell<Option<Value>>>,
     tx: Option<mpsc::Sender<Chunk>>,
     advertised_baud: u32,
 ) {
     let fd = master.as_raw_fd();
     let mut buf = vec![0u8; READ_BUF];
+    let mut last_reconcile = Instant::now();
     loop {
         let re = sys::poll_ready(fd, PollFlags::POLLIN | PollFlags::POLLHUP);
         let now = !re.contains(PollFlags::POLLHUP);
         let was = present.replace(now);
         if was && !now {
-            // Last close: reset to baseline for a deterministic next session
-            // (§7.2). No client is open, so this is safe.
+            // Last close: reset to baseline for a deterministic next session and
+            // forget the departed client's settings (§7.2). No client is open.
             let _ = apply_baseline(master.as_fd(), advertised_baud);
+            *client_termios.borrow_mut() = None;
         }
 
         let mut did = false;
@@ -314,20 +334,30 @@ async fn read_and_poll(
                         present.set(false);
                         break;
                     }
-                    Ok(n) => {
+                    Ok(n) if n >= 1 => {
                         did = true;
-                        // Packet mode: forward only TIOCPKT_DATA payloads; other
-                        // leading bytes are control packets with no data (§7.2).
-                        if n > 1 && buf[0] == sys::TIOCPKT_DATA {
-                            if let Some(tx) = &tx {
+                        if buf[0] == sys::TIOCPKT_DATA {
+                            // Data packet: forward the payload targetward.
+                            if n > 1
+                                && let Some(tx) = &tx
+                            {
                                 let payload = Chunk::copy_from_slice(&buf[1..n]);
                                 // Targetward: backpressure to the origin (await).
                                 if tx.send(payload).await.is_err() {
                                     return; // serial gone
                                 }
                             }
+                        } else if buf[0] & sys::TIOCPKT_IOCTL != 0 {
+                            // A client called tcsetattr: reconcile its termios
+                            // into state and re-assert EXTPROC if it was cleared
+                            // (§7.2). TIOCPKT alone would miss baud changes.
+                            reconcile_termios(&master, &client_termios);
+                            last_reconcile = Instant::now();
                         }
+                        // Other control packets (flush, flow-control) carry no
+                        // data and need no action here.
                     }
+                    Ok(_) => break, // zero-length non-EOF read: nothing to do
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     // A client that closed surfaces as EIO; mark absent.
                     Err(e) if e.raw_os_error() == Some(libc::EIO) => {
@@ -339,10 +369,50 @@ async fn read_and_poll(
             }
         }
 
+        // Slow reconciliation backstop (§7.2): while a client is present, re-read
+        // termios periodically so a missed packet-mode notification still lands.
+        if now && last_reconcile.elapsed() >= RECONCILE_INTERVAL {
+            reconcile_termios(&master, &client_termios);
+            last_reconcile = Instant::now();
+        }
+
         if !did {
             tokio::time::sleep(IDLE_POLL).await;
         }
     }
+}
+
+/// Read the client's current termios through the master and store it in state;
+/// re-assert EXTPROC if the client cleared it, so the daemon keeps observing
+/// subsequent changes (§7.2). Observe-only — never propagated to hardware (§14).
+fn reconcile_termios(master: &PtyMaster, store: &RefCell<Option<Value>>) {
+    let Ok(t) = tcgetattr(master) else { return };
+    if !t.local_flags.contains(LocalFlags::EXTPROC) {
+        let mut re = t.clone();
+        re.local_flags.insert(LocalFlags::EXTPROC);
+        let _ = tcsetattr(master, SetArg::TCSANOW, &re);
+    }
+    let char_bits = match t.control_flags & ControlFlags::CSIZE {
+        cs if cs == ControlFlags::CS8 => 8,
+        cs if cs == ControlFlags::CS7 => 7,
+        cs if cs == ControlFlags::CS6 => 6,
+        _ => 5,
+    };
+    let parity = if !t.control_flags.contains(ControlFlags::PARENB) {
+        "none"
+    } else if t.control_flags.contains(ControlFlags::PARODD) {
+        "odd"
+    } else {
+        "even"
+    };
+    *store.borrow_mut() = Some(json!({
+        "baud": format!("{:?}", cfgetospeed(&t)),
+        "char_bits": char_bits,
+        "parity": parity,
+        "echo": t.local_flags.contains(LocalFlags::ECHO),
+        "icanon": t.local_flags.contains(LocalFlags::ICANON),
+        "extproc": t.local_flags.contains(LocalFlags::EXTPROC),
+    }));
 }
 
 /// Writer task: drain the hostward channel to the master while a client is

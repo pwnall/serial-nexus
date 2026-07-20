@@ -29,6 +29,10 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use daemon::Daemon;
 
+/// How often the daemon publishes a state snapshot to `subscribe` streams (§10).
+/// Fine-grained enough to observe counter movement, coarse enough to stay cheap.
+const SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 #[derive(Parser)]
 #[command(name = "serialnexusd", version, about = "serial_nexus daemon (§10)")]
 struct Cli {
@@ -68,6 +72,19 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     tracing::info!(socket = %socket_path.display(), "control socket listening");
 
     let daemon = Rc::new(Daemon::new());
+
+    // Periodic state snapshots power `subscribe` (§10): status transitions and
+    // counter snapshots. The tick no-ops when nobody is subscribed, so it costs
+    // nothing on an idle daemon.
+    {
+        let daemon = daemon.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                tokio::time::sleep(SNAPSHOT_INTERVAL).await;
+                daemon.emit_state_snapshot();
+            }
+        });
+    }
 
     if let Some(config_path) = &cli.config {
         startup_load(&daemon, config_path)

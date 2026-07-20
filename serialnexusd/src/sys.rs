@@ -55,10 +55,9 @@ pub const TIOCPKT_DATA: u8 = 0;
 
 /// Packet-mode control-byte flag for a termios/ioctl change on the slave
 /// (stable Linux value; libc exports only the `TIOCPKT` request code). A read
-/// returning this leading byte means a client called `tcsetattr` — a later
-/// phase reconciles client termios into state; the data plane simply forwards
-/// no payload for it.
-#[allow(dead_code)]
+/// whose leading control byte has this bit set means a client called
+/// `tcsetattr`; the PTY reader reconciles client termios into state (§7.2) and
+/// forwards no payload for it.
 pub const TIOCPKT_IOCTL: u8 = 64;
 
 /// Enable or disable packet mode on a pty master (§7.2).

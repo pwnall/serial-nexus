@@ -1,16 +1,22 @@
 //! The daemon's graph state and the RPC method implementations (design §10,
 //! §11). Mutations run on the current-thread runtime, so a `RefCell` serializes
-//! them with no locks (plan §2). Phase 2 implements `load`/`dump`/`state`/
-//! `teardown`/`shutdown` with load-on-empty and structural atomicity.
+//! them with no locks (plan §2). Verbs: `load`/`dump`/`state`/`teardown`/
+//! `shutdown` (phase 2, load-on-empty + structural atomicity) plus `rotate` and
+//! `subscribe` (phase 3).
 
 use std::cell::RefCell;
 
 use nexus_core::config::GraphConfig;
-use nexus_rpc::{RpcError, error_codes};
+use nexus_rpc::{Notification, RpcError, error_codes};
 use serde_json::{Value, json};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, broadcast};
 
 use crate::nodes::Node;
+
+/// Depth of the notification broadcast buffer (§10 `subscribe`). A subscriber
+/// that falls this far behind sees a `Lagged` skip rather than blocking the
+/// daemon — state snapshots are cumulative, so a dropped one loses nothing.
+const NOTIFY_CAPACITY: usize = 64;
 
 /// Daemon-specific error codes, in the reserved application range (§10).
 pub mod app_errors {
@@ -27,18 +33,41 @@ struct GraphState {
     nodes: Vec<Node>,
 }
 
-/// The running daemon: graph state plus a shutdown signal.
+/// The running daemon: graph state, a shutdown signal, and the `subscribe`
+/// notification broadcast.
 pub struct Daemon {
     state: RefCell<GraphState>,
     pub shutdown: Notify,
+    notifier: broadcast::Sender<Notification>,
 }
 
 impl Daemon {
     pub fn new() -> Self {
+        let (notifier, _) = broadcast::channel(NOTIFY_CAPACITY);
         Daemon {
             state: RefCell::new(GraphState::default()),
             shutdown: Notify::new(),
+            notifier,
         }
+    }
+
+    /// A receiver for the `subscribe` stream (§10). Each subscribed connection
+    /// holds one; the daemon publishes id-less notifications to all of them.
+    pub fn subscribe(&self) -> broadcast::Receiver<Notification> {
+        self.notifier.subscribe()
+    }
+
+    /// Publish a full state snapshot to subscribers (§10: status transitions and
+    /// counter snapshots). A no-op when nobody is listening, so the periodic
+    /// tick costs nothing on an unsubscribed daemon.
+    pub fn emit_state_snapshot(&self) {
+        if self.notifier.receiver_count() == 0 {
+            return;
+        }
+        let snapshot = self.state();
+        let _ = self
+            .notifier
+            .send(Notification::new("state", Some(snapshot)));
     }
 
     /// Route one RPC method to its implementation (§10 verb surface).
@@ -47,6 +76,9 @@ impl Daemon {
             "load" => self.load(parse_config_param(params)?),
             "dump" => Ok(self.dump()),
             "state" => Ok(self.state()),
+            // The stream itself is served by the connection task (control.rs);
+            // dispatch just acknowledges the subscription (§10).
+            "subscribe" => Ok(json!({ "subscribed": true })),
             "rotate" => self.rotate(params),
             "teardown" => Ok(self.teardown()),
             "shutdown" => {

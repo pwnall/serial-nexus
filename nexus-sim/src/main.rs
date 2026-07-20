@@ -23,7 +23,9 @@ use clap::{Args, Parser, Subcommand};
 use nix::fcntl::OFlag;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::pty::{PtyMaster, grantpt, posix_openpt, ptsname_r, unlockpt};
-use nix::sys::termios::{LocalFlags, SetArg, cfgetospeed, cfmakeraw, tcgetattr, tcsetattr};
+use nix::sys::termios::{
+    BaudRate, LocalFlags, SetArg, cfgetospeed, cfmakeraw, cfsetspeed, tcgetattr, tcsetattr,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -86,6 +88,14 @@ struct ClientArgs {
     /// baseline (raw, echo off, EXTPROC) end to end.
     #[arg(long)]
     report_termios: bool,
+    /// Set the slave's baud (a standard rate) when opening, so the daemon's
+    /// packet-mode termios observation (§7.2) has a distinctive value to report.
+    #[arg(long)]
+    set_baud: Option<u32>,
+    /// After any exchange, keep the slave open this long (ms) before exiting, so
+    /// a subscriber can observe the client-present/termios state.
+    #[arg(long)]
+    hold_ms: Option<u64>,
     #[arg(long, default_value_t = 0)]
     seed: u64,
     #[arg(long, default_value_t = 10_000)]
@@ -159,11 +169,35 @@ fn err_verdict(mode: &str, e: &anyhow::Error) -> Value {
 
 /// Set a fd to raw termios (no echo, no translation) — binary-transparent.
 fn set_raw<F: AsFd>(fd: &F) -> anyhow::Result<()> {
+    set_raw_baud(fd, None)
+}
+
+/// Raw termios with an optional standard baud, applied in one `tcsetattr` so the
+/// daemon's packet-mode observation sees a single change (§7.2).
+fn set_raw_baud<F: AsFd>(fd: &F, baud: Option<u32>) -> anyhow::Result<()> {
     let mut t = tcgetattr(fd)?;
     cfmakeraw(&mut t);
     t.local_flags.remove(LocalFlags::ECHO);
+    if let Some(rate) = baud {
+        let br = baud_rate(rate)
+            .ok_or_else(|| anyhow::anyhow!("--set-baud {rate} is not a standard rate"))?;
+        cfsetspeed(&mut t, br)?;
+    }
     tcsetattr(fd, SetArg::TCSANOW, &t)?;
     Ok(())
+}
+
+/// Map a numeric baud to a standard `BaudRate` (the rates a PTY can carry).
+fn baud_rate(rate: u32) -> Option<BaudRate> {
+    Some(match rate {
+        9600 => BaudRate::B9600,
+        19200 => BaudRate::B19200,
+        38400 => BaudRate::B38400,
+        57600 => BaudRate::B57600,
+        115200 => BaudRate::B115200,
+        230400 => BaudRate::B230400,
+        _ => return None,
+    })
 }
 
 /// Poll a fd for readability (or hangup) up to `ms`. Returns the revents.
@@ -326,7 +360,7 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
             "pass": true
         }));
     }
-    set_raw(&file)?;
+    set_raw_baud(&file, a.set_baud)?;
 
     let payload = match a.send.as_deref() {
         Some(s) => {
@@ -356,6 +390,11 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
     let received = read_handle
         .join()
         .map_err(|_| anyhow::anyhow!("reader thread panicked"))??;
+
+    // Keep the slave open so a subscriber can observe our presence/termios.
+    if let Some(ms) = a.hold_ms {
+        thread::sleep(Duration::from_millis(ms));
+    }
 
     let sent_hash = sha256_hex(&payload);
     let recv_hash = sha256_hex(&received);

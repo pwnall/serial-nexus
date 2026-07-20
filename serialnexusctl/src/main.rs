@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use nexus_core::config::GraphConfig;
-use nexus_rpc::{Request, Response};
+use nexus_rpc::{Incoming, Request, Response};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -42,6 +42,13 @@ enum Cmd {
     Dump,
     /// Report observed node state.
     State,
+    /// Stream node status and counter snapshots as they change. Prints one JSON
+    /// notification per line; exits after `--count` of them (default: run until
+    /// the connection closes).
+    Subscribe {
+        #[arg(long)]
+        count: Option<usize>,
+    },
     /// Rotate a log node's file on demand.
     Rotate { node: String },
     /// Tear down the whole graph.
@@ -53,6 +60,12 @@ enum Cmd {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let socket = resolve_socket(cli.socket.clone());
+
+    // `subscribe` is a stream, not a single request/response — handle it apart
+    // from the one-shot verbs below.
+    if let Cmd::Subscribe { count } = &cli.cmd {
+        return subscribe_stream(&socket, *count);
+    }
 
     let (method, params) = build_request(&cli.cmd)?;
     let response = call(&socket, method, params)?;
@@ -87,6 +100,7 @@ fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
         }
         Cmd::Dump => ("dump", None),
         Cmd::State => ("state", None),
+        Cmd::Subscribe { .. } => unreachable!("subscribe is handled before dispatch"),
         Cmd::Rotate { node } => ("rotate", Some(json!({ "node": node }))),
         Cmd::Teardown => ("teardown", None),
         Cmd::Shutdown => ("shutdown", None),
@@ -136,6 +150,51 @@ fn render(cmd: &Cmd, result: &Value) -> anyhow::Result<()> {
             println!("tore down {n} node(s)");
         }
         Cmd::Shutdown => println!("shutdown requested"),
+        Cmd::Subscribe { .. } => unreachable!("subscribe is handled before dispatch"),
+    }
+    Ok(())
+}
+
+/// Open the socket, subscribe, and print one JSON notification per line as they
+/// arrive (§10). Exits after `count` notifications, or when the daemon closes
+/// the connection. The subscribe acknowledgement is consumed, not printed, so
+/// the output is a clean stream of notification objects for `jq`.
+fn subscribe_stream(socket: &Path, count: Option<usize>) -> anyhow::Result<()> {
+    let stream = UnixStream::connect(socket)
+        .map_err(|e| anyhow::anyhow!("connecting to {}: {e}", socket.display()))?;
+    let mut writer = stream.try_clone()?;
+    writer.write_all(nexus_rpc::to_line(&Request::new(1, "subscribe", None)).as_bytes())?;
+    writer.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let limit = count.unwrap_or(usize::MAX);
+    let mut printed = 0usize;
+    let mut stdout = std::io::stdout().lock();
+    while printed < limit {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break; // daemon closed the connection
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Incoming>(trimmed) {
+            // The ack for the subscribe request itself — swallow it.
+            Ok(Incoming::Response(_)) => {}
+            Ok(Incoming::Notification(note)) => {
+                writeln!(stdout, "{}", serde_json::to_string(&note)?)?;
+                stdout.flush()?;
+                printed += 1;
+            }
+            // Unrecognized frame: pass it through so nothing is silently lost.
+            Err(_) => {
+                writeln!(stdout, "{trimmed}")?;
+                stdout.flush()?;
+                printed += 1;
+            }
+        }
     }
     Ok(())
 }
