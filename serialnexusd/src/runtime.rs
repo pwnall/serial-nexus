@@ -17,22 +17,27 @@
 //! (interior) nodes arrive in phase 5. Phase 2 has no interior nodes, so the two
 //! boundaries connect directly through these channels.
 //!
-//! Both directions run as `spawn_local` tasks on the current-thread runtime
-//! (plan §2), sharing each kernel object through an `Rc<_>`.
-//!
-//! Readiness is driven by a non-blocking `poll(2)` (`sys::poll_ready`) plus a
-//! short async sleep when idle — *not* `tokio::io::unix::AsyncFd`. On a pty
+//! Readiness is driven by `poll(2)`, *never* `tokio::io::unix::AsyncFd`: on a pty
 //! master, `AsyncFd`'s epoll readiness spuriously and persistently fires
-//! "readable" and busy-loops the single-threaded runtime (see `sys::poll_ready`
-//! and implementation notes §3.10). `poll(2)` with a zero timeout reports the
-//! true state and never blocks the thread. During an active transfer a task
-//! re-polls immediately after draining (no sleep), so [`IDLE_POLL`] bounds idle
-//! latency, not throughput.
+//! "readable" and busy-loops the single-threaded runtime (§15.18). Two shapes,
+//! per §15.18:
+//!
+//! * Low-rate paths (targetward PTY→serial, PTY presence/termios) stay **async
+//!   tasks** using a non-blocking `poll(2)` (`sys::poll_ready`) with an
+//!   [`ACTIVE_POLL`]→[`IDLE_POLL`] backoff — quiescent fds settle onto the cheap
+//!   5ms poll (~0.06% CPU each), active ones recheck promptly.
+//! * High-throughput paths (the serial hostward reader, the PTY hostward writer)
+//!   run on **dedicated blocking threads** using a *blocking* `poll(2)`
+//!   ([`sys::poll_blocking`]) — the kernel wakes them the instant the fd is ready,
+//!   so they move data at line rate (a non-blocking poll-plus-sleep on the
+//!   runtime thread capped this at ~1 MB/s) and park at zero CPU otherwise. This
+//!   is §15.18's "spawn_blocking reader threads" escape hatch. Cross-thread
+//!   counters are therefore atomic ([`DropCounters`]).
 
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::os::fd::RawFd;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use nexus_core::Chunk;
@@ -45,47 +50,52 @@ use crate::sys;
 
 /// Hostward drop counters for one consuming boundary (§5). All hostward loss is
 /// counted at the boundary that drops it, so it is always located, counted, and
-/// attributable — a slow spy costs itself data, never its neighbors. The
-/// single-threaded data plane means a `Cell` suffices (no atomics); `state` reads
-/// these at an await boundary where no task is mid-update. One instance is shared
-/// (via `Rc`) between the producing serial reader (which counts full-buffer
-/// drops) and the consuming boundary (which counts presence-gated discards and
-/// reports both in state).
+/// attributable — a slow spy costs itself data, never its neighbors. One instance
+/// is shared (via `Arc`) between the producing serial reader — which counts
+/// full-buffer drops and, since the high-throughput reader runs on a dedicated
+/// blocking thread (§15.18), needs the counters to be `Send`/`Sync`, hence
+/// atomics — and the consuming boundary, which counts presence-gated discards and
+/// reports both in state. `Relaxed` suffices: counters are monotonic and read
+/// only for reporting, never to synchronize other memory.
 #[derive(Default)]
 pub struct DropCounters {
     /// Bytes dropped because the boundary's bounded buffer was full — a slow
     /// consumer that has fallen behind line rate (§5).
-    dropped_full: Cell<u64>,
+    dropped_full: AtomicU64,
     /// Bytes discarded because no consumer was present to receive them — a PTY
     /// with no client holding the slave open (§7.2 presence gating).
-    discarded_absent: Cell<u64>,
+    discarded_absent: AtomicU64,
 }
 
 impl DropCounters {
     pub fn add_full(&self, n: u64) {
-        self.dropped_full.set(self.dropped_full.get() + n);
+        self.dropped_full.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn add_absent(&self, n: u64) {
-        self.discarded_absent.set(self.discarded_absent.get() + n);
+        self.discarded_absent.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn dropped_full(&self) -> u64 {
-        self.dropped_full.get()
+        self.dropped_full.load(Ordering::Relaxed)
     }
 
     pub fn discarded_absent(&self) -> u64 {
-        self.discarded_absent.get()
+        self.discarded_absent.load(Ordering::Relaxed)
     }
 }
 
 /// Read-buffer size for one `read(2)` on a boundary fd. A PTY packet-mode read
-/// spends one byte on the control marker, leaving the rest for data.
-pub const READ_BUF: usize = 8192;
+/// spends one byte on the control marker, leaving the rest for data. Sized so a
+/// draining boundary reads many kilobytes per wakeup, keeping throughput well
+/// clear of the readiness cadence (§15.18): fewer, larger reads per idle gap.
+pub const READ_BUF: usize = 64 * 1024;
 
 /// Bounded channel depth, in chunks. This is the boundary's buffer: hostward it
-/// caps how much a slow PTY buffers before drops begin; targetward it caps how
-/// far a producer runs ahead before backpressure suspends the origin.
+/// caps how much a slow consumer buffers before drops begin; targetward it caps
+/// how far a producer runs ahead before backpressure suspends the origin. Sized
+/// to absorb the dedicated reader thread's bursts across a runtime-scheduling gap
+/// before a keep-up consumer (e.g. the log pump) drains them.
 pub const CHANNEL_CAP: usize = 256;
 
 /// How long a boundary task sleeps between readiness polls when there is nothing
@@ -97,7 +107,7 @@ pub const IDLE_POLL: Duration = Duration::from_millis(5);
 /// A hostward fan-out target: a bounded sender into one consuming boundary,
 /// paired with that boundary's [`DropCounters`] so a full-buffer drop is counted
 /// where it happens (§5).
-pub type HostwardSink = (mpsc::Sender<Chunk>, Rc<DropCounters>);
+pub type HostwardSink = (mpsc::Sender<Chunk>, Arc<DropCounters>);
 
 /// The channels the data plane hands to each node's `start`, keyed by node name.
 /// Built once from the loaded configuration; each node removes its own entries.
@@ -111,7 +121,7 @@ pub struct Wiring {
     pub consumer_hostward: HashMap<String, mpsc::Receiver<Chunk>>,
     /// consumer node → its [`DropCounters`] (shared with the serial hostward
     /// sink), for drop/discard counts and state reporting (§5, §7.2, §7.3).
-    pub consumer_counters: HashMap<String, Rc<DropCounters>>,
+    pub consumer_counters: HashMap<String, Arc<DropCounters>>,
     /// PTY node → its targetward sender (into its serial). Only targetward-writing
     /// consumers appear here; a log node's write mode is inherently `never` (§7.3).
     pub pty_targetward: HashMap<String, mpsc::Sender<Chunk>>,
@@ -175,7 +185,7 @@ impl Wiring {
             // shared DropCounters rides with both ends — the serial reader counts
             // full-buffer drops, the consumer counts its own boundary discards.
             let (htx, hrx) = mpsc::channel(CHANNEL_CAP);
-            let counters = Rc::new(DropCounters::default());
+            let counters = Arc::new(DropCounters::default());
             wiring
                 .serial_hostward
                 .entry(host.clone())
@@ -189,27 +199,46 @@ impl Wiring {
     }
 }
 
-/// Write every byte of `data` to a boundary fd, waiting for writability via a
-/// non-blocking `poll(2)` between partial writes. This is the boundary draining
-/// at its own pace: upstream buffering (and any drops) happen in the feeding
-/// channel, never here. `Err` means the peer hung up.
+/// The readiness-poll interval during an *active* transfer: short, so a momentary
+/// empty/full buffer mid-stream is rechecked in ~1ms (the tokio timer floor)
+/// rather than the 5ms [`IDLE_POLL`] — the difference between ~1 MB/s and tens of
+/// MB/s. A boundary resets its wait to this on every byte of progress, then lets
+/// it back off toward [`IDLE_POLL`] (§15.18: bound idle latency, never
+/// throughput; a `yield_now` spin does nothing here because the peer is a
+/// separate process that only advances as real wall-clock passes).
+pub const ACTIVE_POLL: Duration = Duration::from_micros(200);
+
+/// Grow a readiness wait toward [`IDLE_POLL`]: doubles `*wait`, capped. Callers
+/// reset `*wait = ACTIVE_POLL` on progress, so an active fd stays near
+/// [`ACTIVE_POLL`] and only a genuinely idle one settles onto [`IDLE_POLL`].
+pub fn back_off(wait: &mut Duration) {
+    *wait = (*wait * 2).min(IDLE_POLL);
+}
+
+/// Write every byte of `data` to a boundary fd. The boundary drains at its own
+/// pace: upstream buffering (and any drops) happen in the feeding channel, never
+/// here. `Err` means the peer hung up. On `WouldBlock` the writability wait polls
+/// with the [`ACTIVE_POLL`]→[`IDLE_POLL`] backoff, so a fast consumer is drained
+/// at full rate (§15.18).
 pub async fn write_all(fd: RawFd, mut data: &[u8]) -> std::io::Result<()> {
+    let mut wait = ACTIVE_POLL;
     while !data.is_empty() {
         match sys::write_fd(fd, data) {
             Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
-            Ok(n) => data = &data[n..],
+            Ok(n) => {
+                data = &data[n..];
+                wait = ACTIVE_POLL; // made progress: recheck promptly
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Wait for writability without blocking the runtime.
-                loop {
-                    let re = sys::poll_ready(fd, PollFlags::POLLOUT | PollFlags::POLLHUP);
-                    if re.contains(PollFlags::POLLOUT) {
-                        break;
-                    }
-                    if re.contains(PollFlags::POLLHUP) {
-                        return Err(std::io::ErrorKind::BrokenPipe.into());
-                    }
-                    tokio::time::sleep(IDLE_POLL).await;
+                let re = sys::poll_ready(fd, PollFlags::POLLOUT | PollFlags::POLLHUP);
+                if re.contains(PollFlags::POLLOUT) {
+                    continue;
                 }
+                if re.contains(PollFlags::POLLHUP) {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                tokio::time::sleep(wait).await;
+                back_off(&mut wait);
             }
             Err(e) => return Err(e),
         }

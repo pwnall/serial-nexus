@@ -146,3 +146,23 @@ pub fn poll_ready(fd: RawFd, interest: nix::poll::PollFlags) -> nix::poll::PollF
     let _ = poll(&mut fds, PollTimeout::ZERO);
     fds[0].revents().unwrap_or_else(nix::poll::PollFlags::empty)
 }
+
+/// A *blocking* readiness poll with a bounded timeout — for use only off the
+/// async runtime thread (via `spawn_blocking` or a dedicated thread). The kernel
+/// wakes it the instant the fd is ready, so a high-throughput reader drains at
+/// line rate and a *quiescent* one costs zero CPU while parked — the §15.18
+/// escape hatch (a blocking helper off the runtime thread; never epoll, which
+/// misreports pty-master readiness). Returns the reported events (empty on
+/// timeout, so the caller can re-arm and observe a stop flag).
+pub fn poll_blocking(
+    fd: RawFd,
+    interest: nix::poll::PollFlags,
+    timeout_ms: u16,
+) -> nix::poll::PollFlags {
+    use nix::poll::{PollFd, PollTimeout, poll};
+    // Safety: `fd` is a valid open fd kept alive by the caller across this call.
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let mut fds = [PollFd::new(borrowed, interest)];
+    let _ = poll(&mut fds, PollTimeout::from(timeout_ms));
+    fds[0].revents().unwrap_or_else(nix::poll::PollFlags::empty)
+}

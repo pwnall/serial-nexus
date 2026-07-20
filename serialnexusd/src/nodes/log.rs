@@ -19,7 +19,6 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::mpsc::{Receiver as StdReceiver, RecvTimeoutError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle as ThreadHandle;
@@ -73,7 +72,7 @@ pub struct LogNode {
     shared: Arc<Shared>,
     /// Shared with the serial reader: counts hostward bytes dropped because the
     /// node's ingest channel was full (§5). Folded into reported `dropped_bytes`.
-    ingest_counters: Rc<DropCounters>,
+    ingest_counters: Arc<DropCounters>,
     pump: Option<JoinHandle<()>>,
     writer: Option<ThreadHandle<()>>,
     /// Signalled by the writer when it exits, so teardown can bound its flush
@@ -129,7 +128,7 @@ impl LogNode {
             directory: directory.clone(),
             filename: filename.clone(),
             shared: shared.clone(),
-            ingest_counters: Rc::new(DropCounters::default()),
+            ingest_counters: Arc::new(DropCounters::default()),
             pump: None,
             writer: None,
             writer_done: None,
@@ -164,7 +163,7 @@ impl LogNode {
     pub fn start(
         &mut self,
         hostward: Option<mpsc::Receiver<Chunk>>,
-        counters: Option<Rc<DropCounters>>,
+        counters: Option<Arc<DropCounters>>,
     ) {
         if let Some(counters) = counters {
             self.ingest_counters = counters;

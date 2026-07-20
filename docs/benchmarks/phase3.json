@@ -1,0 +1,15 @@
+{
+  "throughput": {
+    "path": "device -> serial(reader thread) -> log(writer thread)",
+    "bytes": 268435456,
+    "mib_per_s": 183.0,
+    "headroom_target_mib_per_s": 30,
+    "headroom_basis": "10x over 8 ports at 3 Mbaud (3 MB/s aggregate)"
+  },
+  "idle_cost": {
+    "idle_tty_fds": 32,
+    "total_cpu_percent": 2.00,
+    "budget_percent": 20,
+    "mechanism": "adaptive poll backoff to IDLE_POLL when quiescent (§15.18)"
+  }
+}

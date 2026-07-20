@@ -6,19 +6,25 @@
 //! nexus-doctor P3 finding). A missing device does not fail the load — the node
 //! comes up `waiting` and heals later (§7.1 faulted-and-wait, phase 7).
 //!
-//! Slice 2 (this) drives byte flow: the blocking `serial2` fd is set
-//! non-blocking and driven by poll-based readiness (`sys::poll_ready`), *not*
-//! `serial2-tokio` (which hides the fd we need for `TIOCEXCL` and, later,
-//! `TIOCGICOUNT`) and *not* `tokio::io::unix::AsyncFd` (whose epoll readiness
-//! busy-loops on pty masters, implementation notes §3.10). A reader task
-//! broadcasts hostward to every attached PTY (lossy `try_send`, §5); a writer
-//! task drains the single targetward channel to the port (backpressure via the
-//! bounded channel, §5).
+//! Byte flow: the blocking `serial2` fd is set non-blocking (for the drain loop)
+//! and *not* driven by `serial2-tokio` (which hides the fd we need for
+//! `TIOCEXCL`/`TIOCGICOUNT`) nor `tokio::io::unix::AsyncFd` (whose epoll readiness
+//! busy-loops on pty masters, §15.18). The **hostward reader runs on a dedicated
+//! blocking thread** — a `poll(2)` blocking wait wakes it the instant the device
+//! has data, so it drains at line rate (a non-blocking poll-plus-sleep on the
+//! runtime thread capped hostward throughput at ~1 MB/s) and costs zero CPU while
+//! parked. This is §15.18's "spawn_blocking reader threads for high-baud ports"
+//! escape hatch. It broadcasts to every attached consumer (lossy `try_send`, §5).
+//! The low-rate **targetward writer** stays an async task draining the bounded
+//! channel to the port (backpressure via the channel, §5); read and write on the
+//! shared fd are independent directions.
 
-use std::cell::Cell;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::JoinHandle as ThreadHandle;
 
 use nexus_core::Chunk;
 use nexus_core::NodeStatus;
@@ -32,20 +38,31 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
-use crate::runtime::{self, HostwardSink, IDLE_POLL, READ_BUF};
+use crate::runtime::{self, HostwardSink, READ_BUF};
 use crate::sys;
+
+/// Re-arm interval (ms) for the serial reader thread's blocking readiness poll.
+/// A live device wakes it far sooner; on teardown the thread observes its stop
+/// flag within this bound, so `join` returns promptly.
+const READ_POLL_TIMEOUT_MS: u16 = 200;
 
 pub struct SerialNode {
     pub name: String,
     device: PathBuf,
     baud: u32,
-    /// The open port, shared between the reader and writer tasks and retained
-    /// for future control verbs (modem lines, break — phase 7). `None` while
-    /// `waiting`/`faulted`.
+    /// The open port, retained for the targetward writer and future control verbs
+    /// (modem lines, break — phase 7). `None` while `waiting`/`faulted`. The
+    /// reader thread borrows only its raw fd, so the port must outlive the thread
+    /// (teardown joins the thread before dropping it).
     port: Option<Rc<SerialPort>>,
     /// Bytes read from the port and discarded because nothing was attached to
-    /// consume them (§5 discard-when-unattached). Shared with the reader task.
-    discarded_unattached: Rc<Cell<u64>>,
+    /// consume them (§5). Shared with the reader thread, hence atomic.
+    discarded_unattached: Arc<AtomicU64>,
+    /// Set on teardown to stop the reader thread at its next poll timeout.
+    reader_stop: Arc<AtomicBool>,
+    /// The dedicated hostward reader thread (§15.18).
+    reader: Option<ThreadHandle<()>>,
+    /// The async targetward writer task, if any.
     tasks: Vec<JoinHandle<()>>,
     status: NodeStatus,
 }
@@ -71,7 +88,9 @@ impl SerialNode {
             device: PathBuf::from(device),
             baud: *baud,
             port: None,
-            discarded_unattached: Rc::new(Cell::new(0)),
+            discarded_unattached: Arc::new(AtomicU64::new(0)),
+            reader_stop: Arc::new(AtomicBool::new(false)),
+            reader: None,
             tasks: Vec::new(),
             status: NodeStatus::Active,
         };
@@ -130,18 +149,23 @@ impl SerialNode {
             return;
         }
 
-        // Hostward: read the device continuously and broadcast to every attached
-        // PTY (§5). The read happens whether or not a client is attached
-        // downstream — a full PTY channel drops at ingest, never here.
-        let port_r = port.clone();
-        self.tasks.push(tokio::task::spawn_local(read_hostward(
-            port_r,
-            hostward,
-            self.discarded_unattached.clone(),
-        )));
+        // Hostward: a dedicated thread reads the device continuously (blocking
+        // poll → line rate, §15.18) and broadcasts to every attached consumer.
+        // The read happens whether or not a client is attached downstream — a
+        // full consumer channel drops at ingest, never here (§5).
+        let fd = port.as_raw_fd();
+        let stop = self.reader_stop.clone();
+        let discarded = self.discarded_unattached.clone();
+        self.reader = Some(
+            std::thread::Builder::new()
+                .name(format!("serial-rx-{}", self.name))
+                .spawn(move || reader_thread(fd, hostward, discarded, stop))
+                .expect("spawn serial reader thread"),
+        );
 
         // Targetward: drain the bounded channel to the port at line rate; a full
-        // channel backpressures to the origin (§5).
+        // channel backpressures to the origin (§5). Human-scale command entry, so
+        // it stays an async task.
         if let Some(mut rx) = targetward {
             let port_w = port;
             self.tasks.push(tokio::task::spawn_local(async move {
@@ -154,6 +178,14 @@ impl SerialNode {
                     }
                 }
             }));
+        }
+    }
+
+    /// Stop the reader thread and join it within the poll-timeout bound.
+    fn stop_reader(&mut self) {
+        self.reader_stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.reader.take() {
+            let _ = h.join();
         }
     }
 
@@ -184,13 +216,16 @@ impl SerialNode {
             "resolved_path": self.device.display().to_string(),
             "baud": self.baud,
             "open": self.port.is_some(),
-            "discarded_unattached": self.discarded_unattached.get(),
+            "discarded_unattached": self.discarded_unattached.load(Ordering::Relaxed),
             "driver_counters": driver_counters,
         })
     }
 
-    /// Stop the data-plane tasks and drop the port. Called on teardown/shutdown.
+    /// Stop the reader thread and the targetward task, then drop the port. The
+    /// reader is joined *before* the port drops, so its fd stays valid throughout
+    /// (avoiding an fd-reuse race). Called on teardown/shutdown.
     pub fn teardown(&mut self) {
+        self.stop_reader();
         for t in self.tasks.drain(..) {
             t.abort();
         }
@@ -198,34 +233,38 @@ impl SerialNode {
     }
 }
 
-/// Hostward reader: poll the device for data, drain it fully, and broadcast each
-/// chunk to every attached PTY (lossy `try_send`, §5). Exits on device close —
-/// phase 7 restructures this into faulted-and-wait with re-open.
+/// Hostward reader thread (§15.18): a blocking `poll(2)` waits for readability —
+/// waking the instant the device has data (line rate) and parking at zero CPU
+/// otherwise — then the loop drains fully and broadcasts each chunk to every
+/// attached consumer. Exits on device close, stop flag, or a fatal error (phase 7
+/// restructures this into faulted-and-wait with re-open).
 ///
 /// Loss is always counted at the boundary that drops it: with nothing attached,
-/// the bytes are discarded against `discarded_unattached` (§5, so a first
-/// consumer starts on fresh data rather than a stale kernel burst); with a
-/// consumer attached but its bounded buffer full, the drop is counted against
-/// that consumer's [`DropCounters`] (a slow spy costs only itself).
-async fn read_hostward(
-    port: Rc<SerialPort>,
+/// bytes are discarded against `discarded_unattached` (§5, so a first consumer
+/// starts on fresh data, not a stale kernel burst); with a consumer attached but
+/// its bounded buffer full, the drop is counted against that consumer's
+/// [`DropCounters`] (a slow spy costs only itself).
+fn reader_thread(
+    fd: std::os::fd::RawFd,
     hostward: Vec<HostwardSink>,
-    discarded_unattached: Rc<Cell<u64>>,
+    discarded_unattached: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
 ) {
-    let fd = port.as_raw_fd();
     let mut buf = vec![0u8; READ_BUF];
-    loop {
-        let re = sys::poll_ready(fd, PollFlags::POLLIN | PollFlags::POLLHUP);
-        let mut did = false;
+    while !stop.load(Ordering::Relaxed) {
+        let re = sys::poll_blocking(
+            fd,
+            PollFlags::POLLIN | PollFlags::POLLHUP,
+            READ_POLL_TIMEOUT_MS,
+        );
         if re.contains(PollFlags::POLLIN) {
             loop {
                 match sys::read_fd(fd, &mut buf) {
                     Ok(0) => return, // device closed
                     Ok(n) => {
-                        did = true;
                         if hostward.is_empty() {
                             // Nothing attached: read-and-discard with a counter.
-                            discarded_unattached.set(discarded_unattached.get() + n as u64);
+                            discarded_unattached.fetch_add(n as u64, Ordering::Relaxed);
                             continue;
                         }
                         let chunk = Chunk::copy_from_slice(&buf[..n]);
@@ -246,14 +285,13 @@ async fn read_hostward(
         } else if re.contains(PollFlags::POLLHUP) {
             return; // device gone
         }
-        if !did {
-            tokio::time::sleep(IDLE_POLL).await;
-        }
+        // Bare timeout (empty revents): re-check the stop flag and re-arm.
     }
 }
 
 impl Drop for SerialNode {
     fn drop(&mut self) {
+        self.stop_reader();
         for t in self.tasks.drain(..) {
             t.abort();
         }

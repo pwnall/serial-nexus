@@ -7,22 +7,30 @@
 //! closing it once so POLLHUP reports "absent" for the never-opened case
 //! (nexus-doctor P2 finding).
 //!
-//! Slice 2 (this) drives byte flow and presence, poll-based (not `AsyncFd`,
-//! whose epoll readiness busy-loops on pty masters — implementation notes §3.10):
+//! Byte flow and presence (never `AsyncFd`, whose epoll readiness busy-loops on
+//! pty masters — §15.18):
 //!
-//! * A read+presence task polls the master (`POLLIN | POLLHUP`, non-blocking):
-//!   `POLLHUP` set ⇒ no client; `POLLIN` ⇒ drain, strip the packet-mode control
-//!   byte, and forward only `TIOCPKT_DATA` payloads targetward (§7.2). It sleeps
-//!   [`IDLE_POLL`] only when idle, so an active transfer streams at full rate. On
+//! * A read+presence **async task** polls the master (`POLLIN | POLLHUP`,
+//!   non-blocking) with an ACTIVE_POLL→IDLE_POLL backoff: `POLLHUP` set ⇒ no
+//!   client; `POLLIN` ⇒ drain, strip the packet-mode control byte, forward only
+//!   `TIOCPKT_DATA` payloads targetward, and reconcile client termios on a
+//!   `TIOCPKT_IOCTL` packet (§7.2). This side is human-scale command entry. On
 //!   last close it re-asserts the baseline termios (§7.2).
-//! * A writer task drains the hostward channel to the master, **presence-gated**
-//!   — written only while a client holds the slave, discarded otherwise (§7.2).
+//! * Hostward delivery is a dedicated **blocking writer thread** so a fast
+//!   consumer receives at line rate (§15.18), fed by an async pump through a
+//!   bounded bridge (full-buffer drops counted there, §5). It is **presence-
+//!   gated** — written only while a client holds the slave, discarded-with-count
+//!   otherwise (§7.2).
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
+use std::thread::JoinHandle as ThreadHandle;
 use std::time::{Duration, Instant};
 
 use nexus_core::Chunk;
@@ -46,7 +54,13 @@ use tokio::task::JoinHandle;
 /// A few seconds; one ioctl, effectively free.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
 
-use crate::runtime::{self, DropCounters, IDLE_POLL, READ_BUF};
+/// Depth (in chunks) of the bounded bridge between the async pump and the blocking
+/// writer thread. This is the PTY boundary's buffer for a slow consumer (§5):
+/// bounded, so memory can't grow, and full-buffer drops are counted where they
+/// happen. At [`READ_BUF`]-sized chunks this is ~2 MiB.
+const WRITER_QUEUE: usize = 32;
+
+use crate::runtime::{ACTIVE_POLL, DropCounters, READ_BUF, back_off};
 use crate::sys;
 
 pub struct PtyNode {
@@ -61,14 +75,21 @@ pub struct PtyNode {
     master: Option<Rc<PtyMaster>>,
     pts_path: Option<String>,
     symlink_installed: bool,
-    /// Observed client presence, shared with the reader task. Single-threaded
-    /// runtime, so a `Cell` (no atomics) suffices; `state` reads it at an await
-    /// boundary where no task is mid-update.
-    present: Rc<Cell<bool>>,
+    /// Observed client presence. Shared between the async reader task (which sets
+    /// it) and the blocking hostward writer thread (which gates on it), hence
+    /// atomic.
+    present: Arc<AtomicBool>,
+    /// The blocking hostward writer thread (§15.18): a fast consumer receives at
+    /// line rate rather than the poll path's ~1 MB/s.
+    writer: Option<ThreadHandle<()>>,
+    /// Set on teardown to stop the writer thread at its next recv timeout — the
+    /// sync teardown can't rely on the aborted async pump dropping its sender,
+    /// since the runtime isn't running while teardown blocks on the join.
+    writer_stop: Arc<AtomicBool>,
     /// Hostward drop counters for this boundary (§5), shared with the serial
     /// reader. Reports presence-gated discards and slow-consumer full-buffer
     /// drops in state. Defaulted at creation, replaced from the wiring at start.
-    counters: Rc<DropCounters>,
+    counters: Arc<DropCounters>,
     /// Observed client termios (§7.2), updated by the reader on a packet-mode
     /// `tcsetattr` notification and by the slow reconciliation backstop; `None`
     /// while no client has touched the settings this session. The daemon only
@@ -105,8 +126,10 @@ impl PtyNode {
             master: None,
             pts_path: None,
             symlink_installed: false,
-            present: Rc::new(Cell::new(false)),
-            counters: Rc::new(DropCounters::default()),
+            present: Arc::new(AtomicBool::new(false)),
+            writer: None,
+            writer_stop: Arc::new(AtomicBool::new(false)),
+            counters: Arc::new(DropCounters::default()),
             client_termios: Rc::new(RefCell::new(None)),
             tasks: Vec::new(),
             status: NodeStatus::Active,
@@ -203,7 +226,7 @@ impl PtyNode {
         &mut self,
         hostward: Option<mpsc::Receiver<Chunk>>,
         targetward: Option<mpsc::Sender<Chunk>>,
-        counters: Option<Rc<DropCounters>>,
+        counters: Option<Arc<DropCounters>>,
     ) {
         // Adopt the wiring's shared counters (the same Rc the serial reader
         // increments) so presence-gated discards and full-buffer drops land on
@@ -232,14 +255,37 @@ impl PtyNode {
             self.advertised_baud,
         )));
 
-        // Writer: serial → client (hostward), presence-gated.
-        if let Some(rx) = hostward {
-            self.tasks.push(tokio::task::spawn_local(write_hostward(
-                master,
-                self.present.clone(),
-                self.counters.clone(),
-                rx,
-            )));
+        // Writer: serial → client (hostward), presence-gated, on a dedicated
+        // blocking thread so a fast consumer receives at line rate (§15.18). An
+        // async pump bridges the hostward channel to a std channel the thread
+        // blocks on; aborting the pump on teardown drops its sender, which unblocks
+        // and ends the thread (std recv returns Err once every sender is gone).
+        if let Some(mut rx) = hostward {
+            // Bounded bridge: the pump moves chunks into it and drops-with-count
+            // when it is full (a slow consumer shedding at its own boundary, §5),
+            // so the writer thread's blocking recv can also observe the stop flag.
+            let (btx, brx) = std_mpsc::sync_channel::<Chunk>(WRITER_QUEUE);
+            let pump_counters = self.counters.clone();
+            self.tasks.push(tokio::task::spawn_local(async move {
+                while let Some(chunk) = rx.recv().await {
+                    let len = chunk.len() as u64;
+                    match btx.try_send(chunk) {
+                        Ok(()) => {}
+                        Err(std_mpsc::TrySendError::Full(_)) => pump_counters.add_full(len),
+                        Err(std_mpsc::TrySendError::Disconnected(_)) => break,
+                    }
+                }
+            }));
+            let fd = master.as_raw_fd();
+            let present = self.present.clone();
+            let counters = self.counters.clone();
+            let stop = self.writer_stop.clone();
+            self.writer = Some(
+                std::thread::Builder::new()
+                    .name(format!("pty-tx-{}", self.name))
+                    .spawn(move || writer_thread(fd, present, counters, stop, brx))
+                    .expect("spawn pty writer thread"),
+            );
         }
     }
 
@@ -252,7 +298,7 @@ impl PtyNode {
             "pts_path": self.pts_path,
             "symlink": self.path.display().to_string(),
             "advertised_baud": self.advertised_baud,
-            "client_present": self.present.get(),
+            "client_present": self.present.load(Ordering::Relaxed),
             // Hostward drops at this boundary (§5): bytes discarded while no
             // client held the slave, and bytes dropped because the client was
             // too slow to drain its bounded buffer.
@@ -264,8 +310,16 @@ impl PtyNode {
     }
 
     pub fn teardown(&mut self) {
+        // Signal the writer thread to stop, abort the async tasks, then join the
+        // thread before dropping the master so its fd stays valid throughout. The
+        // stop flag (not the pump's sender drop) is what ends the thread, since
+        // the runtime can't run the pump to completion while teardown blocks here.
+        self.writer_stop.store(true, Ordering::Relaxed);
         for t in self.tasks.drain(..) {
             t.abort();
+        }
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
         }
         self.master = None;
         if self.symlink_installed {
@@ -277,8 +331,12 @@ impl PtyNode {
 
 impl Drop for PtyNode {
     fn drop(&mut self) {
+        self.writer_stop.store(true, Ordering::Relaxed);
         for t in self.tasks.drain(..) {
             t.abort();
+        }
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
         }
         // The symlink is our artifact; unlink it on removal / clean shutdown.
         if self.symlink_installed {
@@ -307,7 +365,7 @@ fn apply_baseline(fd: BorrowedFd, advertised_baud: u32) -> Result<(), String> {
 /// deterministic (§7.2). Sleeps only when idle, so an active transfer streams.
 async fn read_and_poll(
     master: Rc<PtyMaster>,
-    present: Rc<Cell<bool>>,
+    present: Arc<AtomicBool>,
     client_termios: Rc<RefCell<Option<Value>>>,
     tx: Option<mpsc::Sender<Chunk>>,
     advertised_baud: u32,
@@ -315,10 +373,11 @@ async fn read_and_poll(
     let fd = master.as_raw_fd();
     let mut buf = vec![0u8; READ_BUF];
     let mut last_reconcile = Instant::now();
+    let mut wait = ACTIVE_POLL;
     loop {
         let re = sys::poll_ready(fd, PollFlags::POLLIN | PollFlags::POLLHUP);
         let now = !re.contains(PollFlags::POLLHUP);
-        let was = present.replace(now);
+        let was = present.swap(now, Ordering::Relaxed);
         if was && !now {
             // Last close: reset to baseline for a deterministic next session and
             // forget the departed client's settings (§7.2). No client is open.
@@ -331,7 +390,7 @@ async fn read_and_poll(
             loop {
                 match sys::read_fd(fd, &mut buf) {
                     Ok(0) => {
-                        present.set(false);
+                        present.store(false, Ordering::Relaxed);
                         break;
                     }
                     Ok(n) if n >= 1 => {
@@ -361,7 +420,7 @@ async fn read_and_poll(
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     // A client that closed surfaces as EIO; mark absent.
                     Err(e) if e.raw_os_error() == Some(libc::EIO) => {
-                        present.set(false);
+                        present.store(false, Ordering::Relaxed);
                         break;
                     }
                     Err(_) => break,
@@ -376,8 +435,14 @@ async fn read_and_poll(
             last_reconcile = Instant::now();
         }
 
-        if !did {
-            tokio::time::sleep(IDLE_POLL).await;
+        // Active transfer rechecks promptly (ACTIVE_POLL); a truly idle master
+        // backs off toward IDLE_POLL — well under the §7.2 sub-second presence
+        // requirement (§15.18).
+        if did {
+            wait = ACTIVE_POLL;
+        } else {
+            tokio::time::sleep(wait).await;
+            back_off(&mut wait);
         }
     }
 }
@@ -415,26 +480,58 @@ fn reconcile_termios(master: &PtyMaster, store: &RefCell<Option<Value>>) {
     }));
 }
 
-/// Writer task: drain the hostward channel to the master while a client is
-/// present; discard otherwise (§7.2 presence-gated output). A full master buffer
-/// backpressures the write within `write_all`; the feeding channel drops at
-/// ingest (§5).
-async fn write_hostward(
-    master: Rc<PtyMaster>,
-    present: Rc<Cell<bool>>,
-    counters: Rc<DropCounters>,
-    mut rx: mpsc::Receiver<Chunk>,
+/// Blocking hostward writer thread (§15.18): drain the bridged channel to the
+/// master while a client is present — a blocking write delivers at line rate,
+/// where the poll path capped a fast consumer at ~1 MB/s — and discard otherwise
+/// (§7.2 presence-gated output; the discard is counted so loss stays visible, §5).
+/// Exits when the stop flag is set or the bridge sender is gone.
+fn writer_thread(
+    fd: std::os::fd::RawFd,
+    present: Arc<AtomicBool>,
+    counters: Arc<DropCounters>,
+    stop: Arc<AtomicBool>,
+    rx: std_mpsc::Receiver<Chunk>,
 ) {
-    let fd = master.as_raw_fd();
-    while let Some(chunk) = rx.recv().await {
-        if present.get() {
-            let _ = runtime::write_all(fd, &chunk).await;
-        } else {
-            // No client holds the slave — discard, counted at this boundary so
-            // loss is visible and attributable (§5, §7.2 presence gating).
-            counters.add_absent(chunk.len() as u64);
+    loop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(chunk) => {
+                if present.load(Ordering::Relaxed) {
+                    if blocking_write_all(fd, &chunk).is_err() {
+                        // Peer hung up mid-write; presence will flip and the next
+                        // chunks are discarded-and-counted until a client returns.
+                    }
+                } else {
+                    counters.add_absent(chunk.len() as u64);
+                }
+            }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+/// Write every byte of `data` to the master, blocking the *thread* (not the async
+/// runtime) on `poll(2)` for writability between partial writes — line rate for a
+/// fast consumer, no busy loop. `Err` means the peer hung up.
+fn blocking_write_all(fd: std::os::fd::RawFd, mut data: &[u8]) -> std::io::Result<()> {
+    while !data.is_empty() {
+        match sys::write_fd(fd, data) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => data = &data[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let re = sys::poll_blocking(fd, PollFlags::POLLOUT | PollFlags::POLLHUP, 500);
+                if re.contains(PollFlags::POLLHUP) && !re.contains(PollFlags::POLLOUT) {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Open then immediately close the slave once, priming the master's HUP state to

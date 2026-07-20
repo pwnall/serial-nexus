@@ -67,6 +67,11 @@ struct PtyArgs {
     /// Size for source/sink, e.g. `1MiB`, `64KiB`, `512`.
     #[arg(long)]
     bytes: Option<String>,
+    /// Pace `--source` to at most this many bytes/second (default: unpaced, line
+    /// rate). A paced source keeps a slow consumer present *while* it sheds, so
+    /// drops are attributable to backpressure rather than absence.
+    #[arg(long)]
+    rate: Option<u64>,
     #[arg(long, default_value_t = 5000)]
     timeout_ms: u64,
 }
@@ -96,6 +101,23 @@ struct ClientArgs {
     /// a subscriber can observe the client-present/termios state.
     #[arg(long)]
     hold_ms: Option<u64>,
+    /// Receive exactly this many hostward bytes (e.g. `512MiB`), checksum them
+    /// incrementally, and report — the fast sink for the firehose test. Does not
+    /// send. Mutually exclusive with `--drain`.
+    #[arg(long)]
+    recv: Option<String>,
+    /// Read the hostward stream until it goes quiet (no bytes for `--quiet-ms`),
+    /// counting every byte — the fully-draining reader for exact loss accounting.
+    /// Combine with `--read-rate` to be a slow consumer. Does not send.
+    #[arg(long)]
+    drain: bool,
+    /// Throttle reads to at most this many bytes/second (a slow consumer). Applies
+    /// to `--recv`/`--drain`.
+    #[arg(long)]
+    read_rate: Option<u64>,
+    /// For `--drain`: stop after this many ms with no new bytes (default 1000).
+    #[arg(long)]
+    quiet_ms: Option<u64>,
     #[arg(long, default_value_t = 0)]
     seed: u64,
     #[arg(long, default_value_t = 10_000)]
@@ -252,7 +274,7 @@ fn run_pty_inner(a: &PtyArgs) -> anyhow::Result<Value> {
         pty_echo(&mut master, a.timeout_ms)
     } else if a.source {
         let n = parse_size(a.bytes.as_deref().unwrap_or("0"))?;
-        pty_source(&mut master, a.seed, n)
+        pty_source(&mut master, a.seed, n, a.rate)
     } else if a.sink {
         let n = parse_size(a.bytes.as_deref().unwrap_or("0"))?;
         pty_sink(&mut master, n, a.timeout_ms)
@@ -295,9 +317,32 @@ fn pty_echo(master: &mut PtyMaster, timeout_ms: u64) -> anyhow::Result<Value> {
     )
 }
 
-fn pty_source(master: &mut PtyMaster, seed: u64, n: usize) -> anyhow::Result<Value> {
+fn pty_source(
+    master: &mut PtyMaster,
+    seed: u64,
+    n: usize,
+    rate: Option<u64>,
+) -> anyhow::Result<Value> {
     let payload = seeded_bytes(seed, n);
-    master.write_all(&payload)?;
+    match rate.filter(|r| *r > 0) {
+        // Unpaced: one write_all at line rate.
+        None => master.write_all(&payload)?,
+        // Paced: write in blocks, sleeping to hold the overall byte rate.
+        Some(bps) => {
+            let start = Instant::now();
+            let block = 65536.min(payload.len().max(1));
+            let mut written = 0usize;
+            while written < payload.len() {
+                let end = (written + block).min(payload.len());
+                master.write_all(&payload[written..end])?;
+                written = end;
+                let expected = Duration::from_secs_f64(written as f64 / bps as f64);
+                if start.elapsed() < expected {
+                    thread::sleep(expected - start.elapsed());
+                }
+            }
+        }
+    }
     master.flush()?;
     Ok(json!({
         "tool": "nexus-sim", "mode": "pty", "behavior": "source",
@@ -361,6 +406,32 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
         }));
     }
     set_raw_baud(&file, a.set_baud)?;
+
+    // Receive-only modes: a fixed-size sink (`--recv`) or a fully-draining reader
+    // (`--drain`). Neither sends; both keep the slave open until done.
+    if a.recv.is_some() || a.drain {
+        let target = match a.recv.as_deref() {
+            Some(s) => Some(parse_size(s)?),
+            None => None,
+        };
+        let (received, sha) = recv_loop(
+            &file,
+            target,
+            a.read_rate,
+            if a.drain {
+                Some(a.quiet_ms.unwrap_or(1000))
+            } else {
+                None
+            },
+            a.timeout_ms,
+        )?;
+        let pass = target.is_none_or(|t| received as usize == t);
+        return Ok(json!({
+            "tool": "nexus-sim", "mode": "client",
+            "behavior": if a.drain { "drain" } else { "recv" },
+            "received": received, "sha256": sha, "pass": pass
+        }));
+    }
 
     let payload = match a.send.as_deref() {
         Some(s) => {
@@ -442,4 +513,69 @@ fn read_until<F: AsFd + Read>(mut fd: F, n: usize, timeout_ms: u64) -> anyhow::R
         }
     }
     Ok(out)
+}
+
+/// Receive hostward bytes, counting and checksumming them incrementally (so a
+/// multi-hundred-MiB firehose never buffers in the sink). Stops on a byte
+/// `target` (the fixed-size sink) or, when `quiet_ms` is set, after that long
+/// with no new bytes (the fully-draining reader — draining to quiet guarantees
+/// no daemon-delivered byte is left unread, which is what makes drop accounting
+/// exact). `read_rate` paces overall throughput to model a slow consumer.
+fn recv_loop<F: AsFd + Read>(
+    mut fd: F,
+    target: Option<usize>,
+    read_rate: Option<u64>,
+    quiet_ms: Option<u64>,
+    timeout_ms: u64,
+) -> anyhow::Result<(u64, String)> {
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(timeout_ms);
+    let mut received: u64 = 0;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    let mut last_data = Instant::now();
+    loop {
+        if target.is_some_and(|t| received as usize >= t) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        if quiet_ms.is_some_and(|q| last_data.elapsed() >= Duration::from_millis(q)) {
+            break;
+        }
+        // Throttle: hold overall throughput at or below `read_rate`.
+        if let Some(rate) = read_rate.filter(|r| *r > 0) {
+            let expected = Duration::from_secs_f64(received as f64 / rate as f64);
+            if start.elapsed() < expected {
+                thread::sleep(expected - start.elapsed());
+            }
+        }
+        // Short poll timeout so the quiet/deadline checks keep making progress.
+        let re = wait_readable(&fd, 200)?;
+        if re.contains(PollFlags::POLLIN) {
+            // Never overshoot a fixed target.
+            let cap = target.map_or(buf.len(), |t| (t - received as usize).min(buf.len()));
+            match fd.read(&mut buf[..cap]) {
+                Ok(0) => break,
+                Ok(k) => {
+                    hasher.update(&buf[..k]);
+                    received += k as u64;
+                    last_data = Instant::now();
+                }
+                Err(e) if is_eio(&e) => break,
+                Err(e) => return Err(e.into()),
+            }
+        } else if re.contains(PollFlags::POLLHUP) {
+            break;
+        }
+    }
+    Ok((
+        received,
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    ))
 }
