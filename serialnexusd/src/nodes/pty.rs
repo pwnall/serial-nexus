@@ -23,7 +23,7 @@
 //!   otherwise (§7.2).
 
 use std::cell::RefCell;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -60,7 +60,7 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
 /// happen. At [`READ_BUF`]-sized chunks this is ~2 MiB.
 const WRITER_QUEUE: usize = 32;
 
-use nexus_core::lock::OriginId;
+use nexus_core::lock::{Arbitration, OriginId, WriteMode};
 
 use crate::runtime::{ACTIVE_POLL, DropCounters, READ_BUF, SharedLock, back_off};
 use crate::sys;
@@ -316,6 +316,19 @@ impl PtyNode {
         })
     }
 
+    /// Drain and discard this origin's pre-grant targetward backlog from its
+    /// master, returning the count of data bytes discarded (§6 purge-on-acquire).
+    /// The control plane calls this synchronously at grant time — before the
+    /// client can write anything post-grant — so a correct acquire-before-write
+    /// client loses nothing and the counter reflects only pre-grant bytes.
+    pub fn purge_origin(&self) -> u64 {
+        let Some(master) = &self.master else {
+            return 0;
+        };
+        let mut buf = vec![0u8; READ_BUF];
+        drain_and_discard(master.as_raw_fd(), &mut buf)
+    }
+
     pub fn teardown(&mut self) {
         // Signal the writer thread to stop, abort the async tasks, then join the
         // thread before dropping the master so its fd stays valid throughout. The
@@ -366,6 +379,72 @@ fn apply_baseline(fd: BorrowedFd, advertised_baud: u32) -> Result<(), String> {
     tcsetattr(fd, SetArg::TCSANOW, &t).map_err(|e| format!("tcsetattr: {e}"))
 }
 
+/// Handle the origin's last close (§7.2, §6) on the present→absent transition,
+/// from whichever path (POLLHUP, EOF, or EIO) observes it first. Resets the pair
+/// to the baseline termios and forgets the client's settings so the next session
+/// starts deterministic; then applies the write-lock lifecycle — the holder
+/// releases (detach-release), while a non-holder's un-forwarded targetward backlog
+/// is drained and discarded (purge-on-detach), counted, so a locked-out client's
+/// buffered commands never fire when the lock later frees.
+fn handle_last_close(
+    fd: RawFd,
+    buf: &mut [u8],
+    master: &Rc<PtyMaster>,
+    advertised_baud: u32,
+    client_termios: &RefCell<Option<Value>>,
+    lock: &Option<(SharedLock, OriginId)>,
+) {
+    let _ = apply_baseline(master.as_fd(), advertised_baud);
+    *client_termios.borrow_mut() = None;
+    if let Some((l, id)) = lock {
+        let (held, exclusive, held_mode) = {
+            let g = l.borrow();
+            (
+                g.holder() == Some(*id),
+                g.arbitration() == Arbitration::Exclusive,
+                g.write_mode(*id) == Some(WriteMode::Held),
+            )
+        };
+        if held && !held_mode {
+            // Detach-release: an on-demand holder's client left, so the lock
+            // frees (§6). A `held` origin is held indefinitely and keeps the lock
+            // across a client detach — only node removal releases it.
+            l.borrow_mut().release(*id);
+        } else if !held && exclusive {
+            // Purge-on-detach: a locked-out writer's un-forwarded backlog is
+            // dropped and counted, so its stale commands never fire (§6). A
+            // free-for-all writer was drained above and has nothing to purge.
+            let purged = drain_and_discard(fd, buf);
+            if purged > 0 {
+                l.borrow_mut().record_purge(*id, purged);
+            }
+        }
+    }
+}
+
+/// Read and discard everything currently buffered on the master, returning the
+/// count of data-payload bytes discarded — the origin's un-forwarded targetward
+/// backlog. Used by purge-on-acquire and purge-on-detach (§6); control packets
+/// carry no data and are ignored. Stops at `WouldBlock`, EOF, or EIO.
+fn drain_and_discard(fd: RawFd, buf: &mut [u8]) -> u64 {
+    let mut discarded = 0u64;
+    loop {
+        match sys::read_fd(fd, buf) {
+            Ok(0) => break,
+            Ok(n) if n >= 1 => {
+                if buf[0] == sys::TIOCPKT_DATA {
+                    discarded += (n - 1) as u64;
+                }
+            }
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+            Err(_) => break,
+        }
+    }
+    discarded
+}
+
 /// Reader + presence task. Polls the master (non-blocking) for readability and
 /// hangup; drains data targetward stripping the packet-mode control byte; and on
 /// last close re-asserts the baseline termios so the next session starts
@@ -385,40 +464,30 @@ async fn read_and_poll(
     loop {
         let re = sys::poll_ready(fd, PollFlags::POLLIN | PollFlags::POLLHUP);
         let now = !re.contains(PollFlags::POLLHUP);
-        let was = present.swap(now, Ordering::Relaxed);
-        if was && !now {
-            // Last close: reset to baseline for a deterministic next session and
-            // forget the departed client's settings (§7.2). No client is open.
-            let _ = apply_baseline(master.as_fd(), advertised_baud);
-            *client_termios.borrow_mut() = None;
-        }
 
         // Write arbitration (§6): a writing origin drains targetward only while it
         // holds the lock; a non-holder is *not read from*, so its bytes stay in
         // the kernel buffer (backpressure to the client), never dropped. A spy
         // with no lock handle still reads — its termios and presence surface — but
-        // has no `tx`, so its stray writes go nowhere. The borrow is dropped
-        // before any await below.
+        // has no `tx`, so its stray writes go nowhere. Each borrow below is dropped
+        // before any await.
         let may_write = match &lock {
             Some((l, id)) => l.borrow().may_write(*id),
             None => true,
         };
 
         let mut did = false;
-        if now && may_write && re.contains(PollFlags::POLLIN) {
+        let mut closed = false;
+        // Drain available data for a writer that may write, *regardless of a
+        // simultaneous POLLHUP*: a closing writer's residual must still be
+        // forwarded (not purged) before the close is finalized. A non-holder
+        // (may_write false) is not read from, so its backlog stays buffered for
+        // purge-on-detach below.
+        if may_write && re.contains(PollFlags::POLLIN) {
             loop {
                 match sys::read_fd(fd, &mut buf) {
                     Ok(0) => {
-                        // Last close seen on the read path (EOF): re-assert the
-                        // baseline and forget the client's settings exactly once
-                        // on the present→absent transition, mirroring the POLLHUP
-                        // branch. A close observed here first would otherwise leave
-                        // that branch's `was && !now` guard false, so the baseline
-                        // reset (§7.2) would never run.
-                        if present.swap(false, Ordering::Relaxed) {
-                            let _ = apply_baseline(master.as_fd(), advertised_baud);
-                            *client_termios.borrow_mut() = None;
-                        }
+                        closed = true; // EOF: the slave closed
                         break;
                     }
                     Ok(n) if n >= 1 => {
@@ -434,10 +503,14 @@ async fn read_and_poll(
                                     return; // serial gone
                                 }
                             }
-                        } else if buf[0] & sys::TIOCPKT_IOCTL != 0 {
-                            // A client called tcsetattr: reconcile its termios
-                            // into state and re-assert EXTPROC if it was cleared
-                            // (§7.2). TIOCPKT alone would miss baud changes.
+                        } else if buf[0] & sys::TIOCPKT_IOCTL != 0 && now {
+                            // A present client called tcsetattr: reconcile its
+                            // termios into state and re-assert EXTPROC if it was
+                            // cleared (§7.2). TIOCPKT alone would miss baud changes.
+                            // Gated on `now`: a lingering control packet from a
+                            // client that already hung up must not re-populate the
+                            // state handle_last_close clears — we still drain (and
+                            // forward) data below regardless of POLLHUP.
                             reconcile_termios(&master, &client_termios);
                             last_reconcile = Instant::now();
                         }
@@ -446,19 +519,34 @@ async fn read_and_poll(
                     }
                     Ok(_) => break, // zero-length non-EOF read: nothing to do
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    // A client that closed surfaces as EIO; reset to baseline
-                    // once on the present→absent transition (§7.2), the same as
-                    // the EOF and POLLHUP paths.
+                    // A closed client surfaces as EIO once its buffer is drained.
                     Err(e) if e.raw_os_error() == Some(libc::EIO) => {
-                        if present.swap(false, Ordering::Relaxed) {
-                            let _ = apply_baseline(master.as_fd(), advertised_baud);
-                            *client_termios.borrow_mut() = None;
-                        }
+                        closed = true;
                         break;
                     }
                     Err(_) => break,
                 }
             }
+        }
+
+        // Presence + last close (§7.2, §6), after any residual has been drained:
+        // the client is gone if the slave hung up (POLLHUP) or a read hit EOF/EIO.
+        // Handle the present→absent transition exactly once, from whichever path
+        // observed it — reset the baseline and apply the write-lock lifecycle: the
+        // holder releases (detach-release); an exclusive non-holder's buffered
+        // backlog is purged-and-counted (purge-on-detach); a free-for-all writer,
+        // already drained above, keeps its bytes.
+        let present_now = now && !closed;
+        let was = present.swap(present_now, Ordering::Relaxed);
+        if was && !present_now {
+            handle_last_close(
+                fd,
+                &mut buf,
+                &master,
+                advertised_baud,
+                &client_termios,
+                &lock,
+            );
         }
 
         // Slow reconciliation backstop (§7.2): while a client is present, re-read

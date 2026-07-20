@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use nexus_core::config::GraphConfig;
-use nexus_core::lock::{Acquire, OriginId};
+use nexus_core::lock::{Acquire, Arbitration, OriginId};
 use nexus_rpc::{Notification, RpcError, error_codes};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
@@ -222,14 +222,32 @@ impl Daemon {
     fn lock(&self, params: Option<Value>) -> Result<Value, RpcError> {
         let origin = origin_param(&params)?;
         let st = self.state.borrow();
-        let (lock, id) = st.origin_locks.get(origin).ok_or_else(|| {
+        let entry = st.origin_locks.get(origin).ok_or_else(|| {
             RpcError::invalid_params(format!(
                 "{origin:?} is not a writable origin on any endpoint"
             ))
         })?;
-        // Bind the outcome so the mutable borrow is released before the label
-        // lookup below (a Denied read-borrows the same lock).
-        let outcome = lock.borrow_mut().acquire(*id);
+        let lock = &entry.0;
+        let id = entry.1;
+        // Bind the outcome so the mutable borrow is released before the purge and
+        // the label lookup below (both re-borrow the same lock).
+        let outcome = lock.borrow_mut().acquire(id);
+        // Purge-on-acquire (§6): on a fresh EXCLUSIVE grant, drain the origin's
+        // pre-grant targetward backlog NOW — synchronously, before this grant
+        // reply reaches the client, so a correct acquire-before-write client's
+        // later command is never mistaken for stale pre-grant input (draining in
+        // the async reader would race that command and discard it). Free-for-all
+        // has no acquisition, so a `lock` there must not disturb in-flight bytes.
+        if outcome == Acquire::Granted && lock.borrow().arbitration() == Arbitration::Exclusive {
+            let purged = st
+                .nodes
+                .iter()
+                .find(|n| n.name() == origin)
+                .map_or(0, |n| n.purge_origin());
+            if purged > 0 {
+                lock.borrow_mut().record_purge(id, purged);
+            }
+        }
         match outcome {
             Acquire::Granted => Ok(json!({ "origin": origin, "held": true, "acquired": true })),
             Acquire::AlreadyHeld => {

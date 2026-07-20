@@ -252,6 +252,22 @@ draining targetward. A non-holder is *not read from* (its bytes stay in the kern
 buffer — backpressure, never dropped), so arbitration reuses the §5 pause machinery
 and adds no data path, exactly as §6 requires. The serial node's host endpoint
 carries a new `arbitration = exclusive | free-for-all` config attribute (§6).
+**Purge-on-acquire runs synchronously in the daemon's `lock` at grant time**
+(draining the origin's master fd via `Node::purge_origin` before the grant reply
+returns), *not* lazily in the reader task — a lazy drain would race a correct
+acquire-before-write client's first command and discard it (caught by an
+adversarial review; guarded by `phase4/purge.sh` check 3).
+
+**Known limitation — sub-poll close+reopen (poll-based presence).** Detach-release
+and purge-on-detach hinge on observing the PTY's present→absent transition via
+level `POLLHUP` (§7.2). If a client closes and a *different* client reopens the
+same slave within one poll interval (≤ `IDLE_POLL`, 5 ms for a quiescent origin),
+the transition is unobservable — the successor inherits the predecessor's lock
+without an explicit re-acquire, and the baseline termios is not re-asserted. This
+is inherent to poll-based presence (the §15.18/§15.19 tradeoff), not a logic bug;
+it affects only the detach-release path (an explicit `unlock` is unaffected) and
+never lets a *different endpoint's* origin write (exclusion still holds). A
+per-open generation/epoch would close it if it ever matters; deferred.
 
 ---
 
@@ -382,8 +398,24 @@ serial endpoint is a legal §4 fan-out).
     without arbitration ceremony; the exclusive-lock path is covered by
     `phase4/exclusivity.sh`. Real single-console operators have the same choice:
     `free-for-all`, or the "grab, write, release" flow.
-- **Slice B PENDING:** purge-on-acquire + purge-on-detach with counters,
-  detach-release (holder's client closes → auto-release), `free-for-all` end to end.
+- **Slice B DONE: purge + detach-release + free-for-all e2e.** The PTY reader
+  (`nodes/pty.rs::read_and_poll`) was restructured: it now drains available data
+  for any `may_write` writer **regardless of a simultaneous `POLLHUP`** (so a
+  closing writer's residual is forwarded, not lost), and the present→absent
+  transition is handled once, post-drain, by `handle_last_close` — the holder
+  releases (detach-release), an **exclusive non-holder's** buffered backlog is
+  drained+counted (purge-on-detach), and a free-for-all writer keeps its bytes.
+  Purge-on-acquire fires on the `may_write` false→true transition (exclusive only),
+  draining+counting the pre-grant backlog via `drain_and_discard`. Purge counters
+  surface in `state` as `.lock.origins[].purged`. Two subtle bugs were caught in
+  build-out and fixed: a closing free-for-all writer's residual was purged instead
+  of forwarded (fixed by the drain-regardless-of-POLLHUP restructure + purge-only-
+  exclusive-non-holder); and a lingering `TIOCPKT_IOCTL` packet re-populated
+  `client_termios` after last-close cleared it (fixed by gating the termios
+  reconcile on `now`). Validated by `phase4/purge.sh` (purge-on-detach and
+  purge-on-acquire count exactly, device receives nothing) and
+  `phase4/free-for-all.sh` (two writers both reach the device — stable over many
+  runs after the fix); `exclusivity.sh` now also asserts detach-release.
 - **Slice C PENDING:** the atomic `send` verb, `--steal`/`--lease`/`--wait` (async
   dispatch), and lock-change `subscribe` notifications (periodic snapshots already
   surface `.lock`, so changes are visible at 200 ms granularity today).

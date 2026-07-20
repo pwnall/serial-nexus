@@ -127,9 +127,10 @@ RECV=$(jq -r '.received // -1' "$TMPD/sink.json")
 [ "$RECV" = "$LEN_A" ] || { cat "$TMPD/daemon.log" "$TMPD/sink.json"; fail "device received $RECV bytes, expected $LEN_A (a non-holder leaked?)"; }
 [ -n "$SHA_A" ] && [ "$SHA_A" = "$SHA_SINK" ] || { cat "$TMPD/daemon.log"; fail "device checksum != seeded-A (exclusivity broken)"; }
 
-# Release cleanly.
-"$C" --json unlock ptya | jq -e '.released==true' >/dev/null || fail "unlock ptya failed"
-usb0 '.lock.holder==null' || fail "holder not cleared after unlock"
+# Detach-release (§6): the holder's client (clientA) sent and then detached, so
+# the lock releases automatically — no explicit unlock needed.
+bash "$WAIT" "\"$C\" --json state | jq -e '.nodes[]|select(.name==\"usb0\")|.lock.holder==null'" 3 0.05 \
+  || { cat "$TMPD/daemon.log"; fail "holder not cleared by detach-release after the client detached"; }
 
 "$C" shutdown >/dev/null
 echo '{"check":"phase4-exclusivity","pass":true}'

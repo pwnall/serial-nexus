@@ -176,6 +176,12 @@ impl EndpointLock {
         self.origins.get(&id).map(|o| o.label.as_str())
     }
 
+    /// The write mode of a registered origin. A `Held` holder is held
+    /// indefinitely and must not be released by a client detach (§6).
+    pub fn write_mode(&self, id: OriginId) -> Option<WriteMode> {
+        self.origins.get(&id).map(|o| o.write_mode)
+    }
+
     /// Record `bytes` purged from an origin's targetward backlog (§6): pre-grant
     /// discard on explicit acquire, or backlog discard on detach without the lock.
     pub fn record_purge(&mut self, id: OriginId, bytes: u64) {

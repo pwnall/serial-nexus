@@ -82,6 +82,16 @@ impl Node {
         }
     }
 
+    /// Drain and discard this origin's pre-grant targetward backlog, returning
+    /// the count of bytes discarded (§6 purge-on-acquire). Only a PTY origin has
+    /// a backlog to purge; every other node kind returns 0.
+    pub fn purge_origin(&self) -> u64 {
+        match self {
+            Node::Pty(n) => n.purge_origin(),
+            _ => 0,
+        }
+    }
+
     /// Rotate a log node's file on demand (§7.3). Errors for a non-log node or a
     /// faulted log; returns the number the next completed rotation carries.
     pub fn rotate(&self) -> Result<u64, String> {
