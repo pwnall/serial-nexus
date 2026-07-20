@@ -5,9 +5,9 @@ members = [
     "nexus-core",
     "nexus-rpc",
     "nexus-sim",
+    "nexus-doctor",
     "serialnexusd",
     "serialnexusctl",
-    "spikes",
 ]
 
 [workspace.package]

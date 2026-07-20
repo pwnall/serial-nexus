@@ -39,6 +39,27 @@ jobs:
       - name: Prove the gate rejects a banned crate
         run: bash scripts/validate/phase0/license-gate.sh
 
+  # Capability report (design §15.17): run every probe on the runner, assert the
+  # platform expectation, and archive the Markdown so every capability claim has
+  # a dated report behind it. `skipped(no adapter)` is a valid CI verdict.
+  doctor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Capability report
+        run: |
+          cargo run -q -p nexus-doctor -- --markdown | tee nexus-doctor-report.md
+          cargo run -q -p nexus-doctor -- --json | jq -e -f expectations/linux.jq
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-doctor-report
+          path: nexus-doctor-report.md
+
   # Kernel-facing integration lane: the phase validation scripts that need real
   # PTYs and Unix sockets. Unprivileged; the privileged/nightly lanes are added
   # as their phases land.
