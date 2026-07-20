@@ -29,8 +29,10 @@
 //! re-polls immediately after draining (no sleep), so [`IDLE_POLL`] bounds idle
 //! latency, not throughput.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::os::fd::RawFd;
+use std::rc::Rc;
 use std::time::Duration;
 
 use nexus_core::Chunk;
@@ -40,6 +42,42 @@ use nix::poll::PollFlags;
 use tokio::sync::mpsc;
 
 use crate::sys;
+
+/// Hostward drop counters for one consuming boundary (§5). All hostward loss is
+/// counted at the boundary that drops it, so it is always located, counted, and
+/// attributable — a slow spy costs itself data, never its neighbors. The
+/// single-threaded data plane means a `Cell` suffices (no atomics); `state` reads
+/// these at an await boundary where no task is mid-update. One instance is shared
+/// (via `Rc`) between the producing serial reader (which counts full-buffer
+/// drops) and the consuming boundary (which counts presence-gated discards and
+/// reports both in state).
+#[derive(Default)]
+pub struct DropCounters {
+    /// Bytes dropped because the boundary's bounded buffer was full — a slow
+    /// consumer that has fallen behind line rate (§5).
+    dropped_full: Cell<u64>,
+    /// Bytes discarded because no consumer was present to receive them — a PTY
+    /// with no client holding the slave open (§7.2 presence gating).
+    discarded_absent: Cell<u64>,
+}
+
+impl DropCounters {
+    pub fn add_full(&self, n: u64) {
+        self.dropped_full.set(self.dropped_full.get() + n);
+    }
+
+    pub fn add_absent(&self, n: u64) {
+        self.discarded_absent.set(self.discarded_absent.get() + n);
+    }
+
+    pub fn dropped_full(&self) -> u64 {
+        self.dropped_full.get()
+    }
+
+    pub fn discarded_absent(&self) -> u64 {
+        self.discarded_absent.get()
+    }
+}
 
 /// Read-buffer size for one `read(2)` on a boundary fd. A PTY packet-mode read
 /// spends one byte on the control marker, leaving the rest for data.
@@ -56,18 +94,26 @@ pub const CHANNEL_CAP: usize = 256;
 /// under the §7.2 sub-second presence requirement.
 pub const IDLE_POLL: Duration = Duration::from_millis(5);
 
+/// A hostward fan-out target: a bounded sender into one consuming boundary,
+/// paired with that boundary's [`DropCounters`] so a full-buffer drop is counted
+/// where it happens (§5).
+pub type HostwardSink = (mpsc::Sender<Chunk>, Rc<DropCounters>);
+
 /// The channels the data plane hands to each node's `start`, keyed by node name.
 /// Built once from the loaded configuration; each node removes its own entries.
 #[derive(Default)]
 pub struct Wiring {
-    /// serial node → one hostward sender per attached PTY (fan-out, §4 rule 2).
-    pub serial_hostward: HashMap<String, Vec<mpsc::Sender<Chunk>>>,
+    /// serial node → one hostward sink per attached PTY (fan-out, §4 rule 2).
+    pub serial_hostward: HashMap<String, Vec<HostwardSink>>,
     /// serial node → the single targetward receiver (all attached PTYs feed it).
     pub serial_targetward: HashMap<String, mpsc::Receiver<Chunk>>,
     /// PTY node → its hostward receiver (from its serial).
     pub pty_hostward: HashMap<String, mpsc::Receiver<Chunk>>,
     /// PTY node → its targetward sender (into its serial).
     pub pty_targetward: HashMap<String, mpsc::Sender<Chunk>>,
+    /// PTY node → its [`DropCounters`] (shared with the serial hostward sender),
+    /// for the presence-gated discard count and state reporting (§5, §7.2).
+    pub pty_counters: HashMap<String, Rc<DropCounters>>,
 }
 
 impl Wiring {
@@ -115,14 +161,18 @@ impl Wiring {
             wiring.pty_targetward.insert(target.clone(), ttx);
 
             // Hostward: one dedicated channel per (serial, pty) edge, so a slow
-            // PTY's drops are isolated to its own channel (§5).
+            // PTY's drops are isolated to its own channel (§5). One shared
+            // DropCounters rides with both ends — the serial reader counts
+            // full-buffer drops, the PTY counts presence-gated discards.
             let (htx, hrx) = mpsc::channel(CHANNEL_CAP);
+            let counters = Rc::new(DropCounters::default());
             wiring
                 .serial_hostward
                 .entry(host.clone())
                 .or_default()
-                .push(htx);
+                .push((htx, counters.clone()));
             wiring.pty_hostward.insert(target.clone(), hrx);
+            wiring.pty_counters.insert(target.clone(), counters);
         }
 
         wiring

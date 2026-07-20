@@ -65,7 +65,8 @@ impl Node {
             Node::Pty(n) => {
                 let hostward = wiring.pty_hostward.remove(&n.name);
                 let targetward = wiring.pty_targetward.remove(&n.name);
-                n.start(hostward, targetward);
+                let counters = wiring.pty_counters.remove(&n.name);
+                n.start(hostward, targetward, counters);
             }
         }
     }

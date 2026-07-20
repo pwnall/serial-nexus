@@ -9,6 +9,43 @@ use std::os::fd::RawFd;
 nix::ioctl_write_ptr_bad!(tiocpkt, libc::TIOCPKT, libc::c_int);
 nix::ioctl_none_bad!(tiocexcl, libc::TIOCEXCL);
 nix::ioctl_none_bad!(tiocnxcl, libc::TIOCNXCL);
+nix::ioctl_read_bad!(tiocgicount, libc::TIOCGICOUNT, SerialIcounts);
+
+/// The kernel's `serial_icounter_struct` (TIOCGICOUNT): driver-maintained input
+/// counters the design surfaces in serial state *where supported* (§5, §7.1) —
+/// framing/parity/overrun errors are otherwise invisible loss. The layout (and
+/// the trailing `reserved[9]`) must match the kernel exactly, because the ioctl
+/// writes `sizeof(serial_icounter_struct)` bytes through the pointer. Not every
+/// driver implements it — a pts returns an error — so callers treat `Err` as
+/// "unsupported" and omit the counts rather than faulting.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+#[allow(dead_code)] // cts/dsr/rng/dcd/reserved are read by the kernel, not us.
+pub struct SerialIcounts {
+    pub cts: i32,
+    pub dsr: i32,
+    pub rng: i32,
+    pub dcd: i32,
+    pub rx: i32,
+    pub tx: i32,
+    pub frame: i32,
+    pub overrun: i32,
+    pub parity: i32,
+    pub brk: i32,
+    pub buf_overrun: i32,
+    reserved: [i32; 9],
+}
+
+/// Read the driver input counters (`TIOCGICOUNT`). `Err` means the fd's driver
+/// does not implement it (e.g. a pts standing in for a device in tests), which
+/// the caller surfaces as "unsupported" — never a fault (§5).
+pub fn read_icounts(fd: RawFd) -> nix::Result<SerialIcounts> {
+    let mut counts = SerialIcounts::default();
+    // Safety: the ioctl writes exactly `sizeof(SerialIcounts)` bytes into
+    // `counts`, whose layout mirrors the kernel struct.
+    unsafe { tiocgicount(fd, &mut counts) }?;
+    Ok(counts)
+}
 
 /// Packet-mode data marker: a master read whose leading control byte is
 /// `TIOCPKT_DATA` (0) carries slave-written data in the remaining bytes; any

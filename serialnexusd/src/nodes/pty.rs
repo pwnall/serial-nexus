@@ -39,7 +39,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::runtime::{self, IDLE_POLL, READ_BUF};
+use crate::runtime::{self, DropCounters, IDLE_POLL, READ_BUF};
 use crate::sys;
 
 pub struct PtyNode {
@@ -58,6 +58,10 @@ pub struct PtyNode {
     /// runtime, so a `Cell` (no atomics) suffices; `state` reads it at an await
     /// boundary where no task is mid-update.
     present: Rc<Cell<bool>>,
+    /// Hostward drop counters for this boundary (§5), shared with the serial
+    /// reader. Reports presence-gated discards and slow-consumer full-buffer
+    /// drops in state. Defaulted at creation, replaced from the wiring at start.
+    counters: Rc<DropCounters>,
     tasks: Vec<JoinHandle<()>>,
     status: NodeStatus,
 }
@@ -90,6 +94,7 @@ impl PtyNode {
             pts_path: None,
             symlink_installed: false,
             present: Rc::new(Cell::new(false)),
+            counters: Rc::new(DropCounters::default()),
             tasks: Vec::new(),
             status: NodeStatus::Active,
         };
@@ -185,7 +190,14 @@ impl PtyNode {
         &mut self,
         hostward: Option<mpsc::Receiver<Chunk>>,
         targetward: Option<mpsc::Sender<Chunk>>,
+        counters: Option<Rc<DropCounters>>,
     ) {
+        // Adopt the wiring's shared counters (the same Rc the serial reader
+        // increments) so presence-gated discards and full-buffer drops land on
+        // one instance this node reports from (§5).
+        if let Some(counters) = counters {
+            self.counters = counters;
+        }
         let Some(master) = self.master.clone() else {
             return; // setup faulted; nothing to drive
         };
@@ -210,6 +222,7 @@ impl PtyNode {
             self.tasks.push(tokio::task::spawn_local(write_hostward(
                 master,
                 self.present.clone(),
+                self.counters.clone(),
                 rx,
             )));
         }
@@ -225,6 +238,11 @@ impl PtyNode {
             "symlink": self.path.display().to_string(),
             "advertised_baud": self.advertised_baud,
             "client_present": self.present.get(),
+            // Hostward drops at this boundary (§5): bytes discarded while no
+            // client held the slave, and bytes dropped because the client was
+            // too slow to drain its bounded buffer.
+            "discarded_no_client": self.counters.discarded_absent(),
+            "dropped_slow_consumer": self.counters.dropped_full(),
         })
     }
 
@@ -334,14 +352,18 @@ async fn read_and_poll(
 async fn write_hostward(
     master: Rc<PtyMaster>,
     present: Rc<Cell<bool>>,
+    counters: Rc<DropCounters>,
     mut rx: mpsc::Receiver<Chunk>,
 ) {
     let fd = master.as_raw_fd();
     while let Some(chunk) = rx.recv().await {
         if present.get() {
             let _ = runtime::write_all(fd, &chunk).await;
+        } else {
+            // No client holds the slave — discard, counted at this boundary so
+            // loss is visible and attributable (§5, §7.2 presence gating).
+            counters.add_absent(chunk.len() as u64);
         }
-        // else: no client — discard (presence-gated). Counters land in phase 3.
     }
 }
 

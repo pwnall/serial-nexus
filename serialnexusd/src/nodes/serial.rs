@@ -15,6 +15,7 @@
 //! task drains the single targetward channel to the port (backpressure via the
 //! bounded channel, §5).
 
+use std::cell::Cell;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -28,9 +29,10 @@ use nix::poll::PollFlags;
 use serde_json::json;
 use serial2::{CharSize, FlowControl, Parity, SerialPort, Settings, StopBits};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
-use crate::runtime::{self, IDLE_POLL, READ_BUF};
+use crate::runtime::{self, HostwardSink, IDLE_POLL, READ_BUF};
 use crate::sys;
 
 pub struct SerialNode {
@@ -41,6 +43,9 @@ pub struct SerialNode {
     /// for future control verbs (modem lines, break — phase 7). `None` while
     /// `waiting`/`faulted`.
     port: Option<Rc<SerialPort>>,
+    /// Bytes read from the port and discarded because nothing was attached to
+    /// consume them (§5 discard-when-unattached). Shared with the reader task.
+    discarded_unattached: Rc<Cell<u64>>,
     tasks: Vec<JoinHandle<()>>,
     status: NodeStatus,
 }
@@ -66,6 +71,7 @@ impl SerialNode {
             device: PathBuf::from(device),
             baud: *baud,
             port: None,
+            discarded_unattached: Rc::new(Cell::new(0)),
             tasks: Vec::new(),
             status: NodeStatus::Active,
         };
@@ -104,7 +110,7 @@ impl SerialNode {
     /// spin on a dropped receiver.
     pub fn start(
         &mut self,
-        hostward: Vec<mpsc::Sender<Chunk>>,
+        hostward: Vec<HostwardSink>,
         targetward: Option<mpsc::Receiver<Chunk>>,
     ) {
         let Some(port) = self.port.clone() else {
@@ -128,8 +134,11 @@ impl SerialNode {
         // PTY (§5). The read happens whether or not a client is attached
         // downstream — a full PTY channel drops at ingest, never here.
         let port_r = port.clone();
-        self.tasks
-            .push(tokio::task::spawn_local(read_hostward(port_r, hostward)));
+        self.tasks.push(tokio::task::spawn_local(read_hostward(
+            port_r,
+            hostward,
+            self.discarded_unattached.clone(),
+        )));
 
         // Targetward: drain the bounded channel to the port at line rate; a full
         // channel backpressures to the origin (§5).
@@ -153,10 +162,30 @@ impl SerialNode {
     }
 
     pub fn state_extra(&self) -> serde_json::Value {
+        // Driver input counters (TIOCGICOUNT) surface framing/parity/overrun loss
+        // "where supported" (§5, §7.1); a pts (test device) returns an error, so
+        // report null rather than faulting or fabricating zeros.
+        let driver_counters = self
+            .port
+            .as_ref()
+            .and_then(|p| sys::read_icounts(p.as_raw_fd()).ok())
+            .map(|c| {
+                json!({
+                    "rx": c.rx,
+                    "tx": c.tx,
+                    "frame": c.frame,
+                    "overrun": c.overrun,
+                    "parity": c.parity,
+                    "brk": c.brk,
+                    "buf_overrun": c.buf_overrun,
+                })
+            });
         json!({
             "resolved_path": self.device.display().to_string(),
             "baud": self.baud,
             "open": self.port.is_some(),
+            "discarded_unattached": self.discarded_unattached.get(),
+            "driver_counters": driver_counters,
         })
     }
 
@@ -172,7 +201,17 @@ impl SerialNode {
 /// Hostward reader: poll the device for data, drain it fully, and broadcast each
 /// chunk to every attached PTY (lossy `try_send`, §5). Exits on device close —
 /// phase 7 restructures this into faulted-and-wait with re-open.
-async fn read_hostward(port: Rc<SerialPort>, hostward: Vec<mpsc::Sender<Chunk>>) {
+///
+/// Loss is always counted at the boundary that drops it: with nothing attached,
+/// the bytes are discarded against `discarded_unattached` (§5, so a first
+/// consumer starts on fresh data rather than a stale kernel burst); with a
+/// consumer attached but its bounded buffer full, the drop is counted against
+/// that consumer's [`DropCounters`] (a slow spy costs only itself).
+async fn read_hostward(
+    port: Rc<SerialPort>,
+    hostward: Vec<HostwardSink>,
+    discarded_unattached: Rc<Cell<u64>>,
+) {
     let fd = port.as_raw_fd();
     let mut buf = vec![0u8; READ_BUF];
     loop {
@@ -184,9 +223,20 @@ async fn read_hostward(port: Rc<SerialPort>, hostward: Vec<mpsc::Sender<Chunk>>)
                     Ok(0) => return, // device closed
                     Ok(n) => {
                         did = true;
+                        if hostward.is_empty() {
+                            // Nothing attached: read-and-discard with a counter.
+                            discarded_unattached.set(discarded_unattached.get() + n as u64);
+                            continue;
+                        }
                         let chunk = Chunk::copy_from_slice(&buf[..n]);
-                        for tx in &hostward {
-                            let _ = tx.try_send(chunk.clone());
+                        for (tx, counters) in &hostward {
+                            match tx.try_send(chunk.clone()) {
+                                Ok(()) => {}
+                                // Slow consumer: its bounded buffer is full.
+                                Err(TrySendError::Full(_)) => counters.add_full(n as u64),
+                                // Receiver gone (teardown): not a boundary drop.
+                                Err(TrySendError::Closed(_)) => {}
+                            }
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
