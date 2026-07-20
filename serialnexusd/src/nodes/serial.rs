@@ -1,29 +1,47 @@
 //! Serial port node (design §7.1). Faces host in the normal role.
 //!
-//! Slice 1: open the device (raw path for now — the resolver lands in phase 7
-//! without a config-format change), apply configured termios, and take
+//! Slice 1 opened the device (raw path for now — the resolver lands in phase 7
+//! without a config-format change), applied configured termios, and took
 //! `TIOCEXCL` on the raw fd (serial2 sets `O_NOCTTY` but not `TIOCEXCL`, per the
 //! nexus-doctor P3 finding). A missing device does not fail the load — the node
-//! comes up `waiting` and heals later (§7.1 faulted-and-wait, phase 7). Byte
-//! flow via a `tokio AsyncFd` wrapper lands in slice 2.
+//! comes up `waiting` and heals later (§7.1 faulted-and-wait, phase 7).
+//!
+//! Slice 2 (this) drives byte flow: the blocking `serial2` fd is set
+//! non-blocking and driven by poll-based readiness (`sys::poll_ready`), *not*
+//! `serial2-tokio` (which hides the fd we need for `TIOCEXCL` and, later,
+//! `TIOCGICOUNT`) and *not* `tokio::io::unix::AsyncFd` (whose epoll readiness
+//! busy-loops on pty masters, implementation notes §3.10). A reader task
+//! broadcasts hostward to every attached PTY (lossy `try_send`, §5); a writer
+//! task drains the single targetward channel to the port (backpressure via the
+//! bounded channel, §5).
 
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::rc::Rc;
 
+use nexus_core::Chunk;
 use nexus_core::NodeStatus;
 use nexus_core::config::{
     DataBits, FlowControl as CfgFlow, NodeConfig, Parity as CfgParity, StopBits as CfgStop,
 };
+use nix::poll::PollFlags;
 use serde_json::json;
 use serial2::{CharSize, FlowControl, Parity, SerialPort, Settings, StopBits};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
+use crate::runtime::{self, IDLE_POLL, READ_BUF};
 use crate::sys;
 
 pub struct SerialNode {
     pub name: String,
     device: PathBuf,
     baud: u32,
-    port: Option<SerialPort>,
+    /// The open port, shared between the reader and writer tasks and retained
+    /// for future control verbs (modem lines, break — phase 7). `None` while
+    /// `waiting`/`faulted`.
+    port: Option<Rc<SerialPort>>,
+    tasks: Vec<JoinHandle<()>>,
     status: NodeStatus,
 }
 
@@ -48,6 +66,7 @@ impl SerialNode {
             device: PathBuf::from(device),
             baud: *baud,
             port: None,
+            tasks: Vec::new(),
             status: NodeStatus::Active,
         };
 
@@ -60,7 +79,7 @@ impl SerialNode {
             *flow_control,
         ) {
             Ok(port) => {
-                node.port = Some(port);
+                node.port = Some(Rc::new(port));
                 node.status = NodeStatus::Active;
             }
             // A device that isn't present yet is `waiting` (it will heal when it
@@ -79,6 +98,56 @@ impl SerialNode {
         node
     }
 
+    /// Start the data plane for this port: broadcast hostward to the attached
+    /// PTYs, drain targetward from them. A `waiting`/`faulted` port (none
+    /// present) still drains its targetward channel so paused PTY writers don't
+    /// spin on a dropped receiver.
+    pub fn start(
+        &mut self,
+        hostward: Vec<mpsc::Sender<Chunk>>,
+        targetward: Option<mpsc::Receiver<Chunk>>,
+    ) {
+        let Some(port) = self.port.clone() else {
+            if let Some(mut rx) = targetward {
+                self.tasks.push(tokio::task::spawn_local(async move {
+                    while rx.recv().await.is_some() {}
+                }));
+            }
+            return;
+        };
+
+        if let Err(e) = sys::set_nonblocking(port.as_raw_fd()) {
+            self.status = NodeStatus::Faulted {
+                reason: format!("set_nonblocking: {e}"),
+            };
+            self.port = None;
+            return;
+        }
+
+        // Hostward: read the device continuously and broadcast to every attached
+        // PTY (§5). The read happens whether or not a client is attached
+        // downstream — a full PTY channel drops at ingest, never here.
+        let port_r = port.clone();
+        self.tasks
+            .push(tokio::task::spawn_local(read_hostward(port_r, hostward)));
+
+        // Targetward: drain the bounded channel to the port at line rate; a full
+        // channel backpressures to the origin (§5).
+        if let Some(mut rx) = targetward {
+            let port_w = port;
+            self.tasks.push(tokio::task::spawn_local(async move {
+                while let Some(chunk) = rx.recv().await {
+                    if runtime::write_all(port_w.as_raw_fd(), &chunk)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+
     pub fn status(&self) -> NodeStatus {
         self.status.clone()
     }
@@ -89,6 +158,55 @@ impl SerialNode {
             "baud": self.baud,
             "open": self.port.is_some(),
         })
+    }
+
+    /// Stop the data-plane tasks and drop the port. Called on teardown/shutdown.
+    pub fn teardown(&mut self) {
+        for t in self.tasks.drain(..) {
+            t.abort();
+        }
+        self.port = None;
+    }
+}
+
+/// Hostward reader: poll the device for data, drain it fully, and broadcast each
+/// chunk to every attached PTY (lossy `try_send`, §5). Exits on device close —
+/// phase 7 restructures this into faulted-and-wait with re-open.
+async fn read_hostward(port: Rc<SerialPort>, hostward: Vec<mpsc::Sender<Chunk>>) {
+    let fd = port.as_raw_fd();
+    let mut buf = vec![0u8; READ_BUF];
+    loop {
+        let re = sys::poll_ready(fd, PollFlags::POLLIN | PollFlags::POLLHUP);
+        let mut did = false;
+        if re.contains(PollFlags::POLLIN) {
+            loop {
+                match sys::read_fd(fd, &mut buf) {
+                    Ok(0) => return, // device closed
+                    Ok(n) => {
+                        did = true;
+                        let chunk = Chunk::copy_from_slice(&buf[..n]);
+                        for tx in &hostward {
+                            let _ = tx.try_send(chunk.clone());
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => return,
+                }
+            }
+        } else if re.contains(PollFlags::POLLHUP) {
+            return; // device gone
+        }
+        if !did {
+            tokio::time::sleep(IDLE_POLL).await;
+        }
+    }
+}
+
+impl Drop for SerialNode {
+    fn drop(&mut self) {
+        for t in self.tasks.drain(..) {
+            t.abort();
+        }
     }
 }
 

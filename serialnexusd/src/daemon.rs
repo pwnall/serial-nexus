@@ -98,8 +98,15 @@ impl Daemon {
             }
         }
 
+        // Wire the data plane from the validated edges, then start each node's
+        // tasks (§5). Building the plan before the config moves keeps it borrow-
+        // clean; `start` spawns onto the current-thread LocalSet.
+        let mut wiring = crate::runtime::Wiring::build(&config);
         st.nodes = nodes;
         st.config = config;
+        for node in &mut st.nodes {
+            node.start(&mut wiring);
+        }
         Ok(json!({ "loaded": st.nodes.len() }))
     }
 

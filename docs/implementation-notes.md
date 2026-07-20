@@ -1,6 +1,6 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-20. **Branch:** `implementation` (off `main`).
+**As of:** 2026-07-20 (data-plane slice). **Branch:** `implementation` (off `main`).
 **Normative docs:** `docs/05-design-claude-fable-v2.md` (design) and
 `docs/06-implementation-plan-claude-fable-v2.md` (plan). v1 docs are in
 `docs/historical/`. Section references (§) point at the v2 design.
@@ -18,12 +18,14 @@ the items below are refinements consistent with the design, none contradict it.
 |-------|-------|--------|
 | 0 | Doctor + scaffolding | **done** — `nexus-doctor`, CI, cargo-deny gate |
 | 1 | Contracts in the small | **done** — nexus-core, codec-api, nexus-sim |
-| 2 | Walking skeleton | **slice 1 done** (control plane + node lifecycle); **slice 2 pending** (data plane) |
+| 2 | Walking skeleton | **done** — control plane + node lifecycle + data plane (serial↔PTY byte flow, presence gating, backpressure) |
 | 3–8 | Boundaries/log, arbitration, codecs, wire, identity, hardening | not started |
 
 **Quality gates (all green):** `cargo fmt --all --check`, `cargo clippy
 --workspace --all-targets -- -D warnings`, `cargo test --workspace` (36 tests),
-and `bash scripts/validate/all.sh --through 2`.
+and `bash scripts/validate/all.sh --through 2` (now including
+`phase2/data-path.sh`: a 64 KiB client↔daemon↔device echo round-trip with
+matching checksums, presence transitions, and end-to-end baseline termios).
 
 **Kernel matrix:** every kernel-behavior probe is `supported` on **Linux 7.0.0**
 (dev box, Ubuntu 26.04) and **Linux 6.18.14** (Debian rodete) with **zero
@@ -39,15 +41,16 @@ are de-risked across the support matrix.
 | `codec-api` | codec trait, event vocabulary, envelope frame codec + golden vectors (§8/§9) | done for phase 1; reference codec is phase 5 |
 | `nexus-core` | graph model + 3-rule validator (§4), data-plane deliver contracts + holdover (§5), config/state split (§15.8) | done for phase 1 |
 | `nexus-rpc` | JSON-RPC 2.0 wire types — the stable §15.16 surface | done |
-| `nexus-sim` | test double: `pty`/`client` modes (§3) | phase 1 modes done; `mux`/`envelope`/`wire`/`tcp-proxy` later |
+| `nexus-sim` | test double: `pty`/`client` modes (§3) | phase 1 modes done + `client --report-termios`; `mux`/`envelope`/`wire`/`tcp-proxy` later |
 | `nexus-doctor` | shipping capability checker: probes P1–P4 + env checks (§15.17) | done |
-| `serialnexusd` | the daemon | control plane + node lifecycle done; data plane pending |
+| `serialnexusd` | the daemon | control plane + node lifecycle + data plane done |
 | `serialnexusctl` | the CLI (thin RPC client + `--json`) | `load`/`dump`/`state`/`teardown`/`shutdown` done |
 
 `serialnexusd` modules: `main.rs` (runtime, socket policy, shutdown),
 `control.rs` (JSON-RPC over UDS), `daemon.rs` (graph state + method impls),
-`nodes/{mod,pty,serial}.rs` (node runtimes), `sys.rs` (the single unsafe-bearing
-module: `TIOCEXCL`/`TIOCPKT` ioctls).
+`runtime.rs` (data-plane wiring + poll-based I/O helpers), `nodes/{mod,pty,serial}.rs`
+(node runtimes), `sys.rs` (the single unsafe-bearing module: `TIOCEXCL`/`TIOCPKT`
+ioctls, raw `read`/`write`/`fcntl`, and the non-blocking `poll_ready`).
 
 Validation scripts are the canonical exit criteria (plan §3):
 `scripts/validate/phaseN/*.sh`, each self-judging with a JSON verdict and exit
@@ -60,17 +63,18 @@ code. Helpers in `scripts/lib/` (`wait-for.sh`, `semantic-diff.sh`).
 These are implementation decisions the design does not spell out, or where a
 kernel/library reality shaped the approach. None contradict the design.
 
-### 3.1 Serial node uses blocking `serial2` + `tokio::AsyncFd`, not `serial2-tokio`
+### 3.1 Serial node uses blocking `serial2` + poll-based readiness, not `serial2-tokio`
 **Design:** §13 lists `serial2`/`serial2-tokio` for "concurrent async read/write."
 **Reality (nexus-doctor P3 research):** `serial2-tokio` 0.1.24 exposes **no
 accessor for the inner fd**, and `serial2` **does not take `TIOCEXCL`** (only
 `O_NOCTTY`). The daemon needs the raw fd for `TIOCEXCL` (§7.1) and later
 `TIOCGICOUNT` (§5).
 **Decision:** open a blocking `serial2::SerialPort` (settings, modem lines,
-break, and the raw ioctls via `as_raw_fd`) and drive async I/O by registering
-the fd with `tokio::io::unix::AsyncFd` in slice 2 — rather than `serial2-tokio`.
+break, and the raw ioctls via `as_raw_fd`), set it non-blocking, and drive async
+I/O with poll-based readiness (see §3.10) — rather than `serial2-tokio`.
 Consistent with §13's "raw termios via nix/rustix as the fallback." `TIOCEXCL` is
-issued by the daemon itself (`nodes/serial.rs`).
+issued by the daemon itself (`nodes/serial.rs`). `serial2-tokio` is now an unused
+dependency and was dropped from `serialnexusd/Cargo.toml`.
 
 ### 3.2 PTY slave is *primed* at creation (POLLHUP never-opened refinement)
 **Design:** §7.2 detects presence via the master's HUP condition.
@@ -132,6 +136,34 @@ A configuration containing a **log** node (phase 3) is rejected at load with
 `node <name>: log nodes land in phase 3`, nothing created. This is a
 build-stage limitation, not a design position; it disappears when phase 3 lands.
 
+### 3.10 Data-plane readiness is poll-based, not `tokio::AsyncFd` (the pty-master spin)
+**Design:** §5 — a single-threaded async data plane; the design does not name a
+readiness mechanism.
+**Reality (found while wiring slice 2):** `tokio::io::unix::AsyncFd` (epoll)
+**spuriously and persistently reports a pty master readable** once an external
+client is attached — `readable()` returns ready every poll while `read(2)` gives
+`EAGAIN` and a direct `poll(2)` reports *no* readiness (epoll disagrees with
+`poll`). Because `readable()` completing synchronously never yields, this
+busy-loops and **starves the entire current-thread runtime** (every other task,
+including the control plane, freezes until an unrelated I/O event — e.g. the
+client disconnecting — breaks the loop). Reproduced in isolation; independent of
+packet mode, the sync presence poll, shared-vs-dup fds, and `select!`. It is a
+genuine epoll/pty-master quirk, and `AsyncFd` is unsuitable for these fds.
+**Decision:** drive readiness with a **non-blocking `poll(2)`** (`sys::poll_ready`,
+zero timeout — returns immediately, never blocks the thread) plus a short async
+`tokio::time::sleep` (`runtime::IDLE_POLL`, 5 ms) only when idle. During an active
+transfer a task re-polls immediately after each full drain, so the interval
+bounds idle latency (and idle CPU — measured ~1%), never throughput (1 MiB
+echo round-trips in ~0.5 s). Reads: `poll(POLLIN|POLLHUP)` → drain to `WouldBlock`.
+Writes: `write(2)` then, on `WouldBlock`, `poll(POLLOUT|POLLHUP)` + sleep. This
+applies to **both** node types uniformly (`runtime.rs`, `nodes/{pty,serial}.rs`);
+a real UART tolerates epoll but the daemon must also drive the PTY master and
+(in tests) pts-backed "devices", so one poll-based path is simplest.
+**Future:** idle CPU is a fixed ~1%/idle-fd today; a longer or adaptive idle
+interval, or a `spawn_blocking` reader thread for high-baud serial, is a phase-3
+optimization if the throughput benchmark demands it. `AsyncFd` is *not* the
+answer for pty masters.
+
 ---
 
 ## 4. Findings carried forward (from nexus-doctor)
@@ -190,37 +222,47 @@ b = "console"
 
 ---
 
-## 6. Next up — Phase 2 slice 2 (the data plane)
+## 6. Phase 2 slice 2 (the data plane) — DONE
 
-The only thing between here and a full walking skeleton is real bytes flowing
-serial↔PTY. Design settled:
+Real bytes flow serial↔PTY through a configured daemon over RPC. As built:
 
-- **Async I/O:** wrap the serial fd and PTY-master fd in `tokio::io::unix::AsyncFd`
-  (blocking serial2 + AsyncFd, §3.1); `try_clone`/dup for concurrent read+write
-  tasks. Set `O_NONBLOCK` on the PTY master (posix_openpt doesn't).
+- **Readiness (§3.10):** poll-based, *not* `AsyncFd`. Each boundary fd is set
+  `O_NONBLOCK`; a task drains via `sys::poll_ready` + `sys::read_fd`/`write_fd`,
+  sleeping `runtime::IDLE_POLL` (5 ms) only when idle.
 - **Hostward (serial→PTY):** serial read → `try_send` into each attached PTY's
-  bounded channel (drop-on-full = lossy at the boundary, §5); the PTY write task
+  bounded channel (drop-on-full = lossy at the boundary, §5); the PTY writer
   drains to the master, **presence-gated** (discard when no client).
 - **Targetward (PTY→serial):** PTY read → `send().await` into the serial's bounded
   channel (lossless + backpressure: a full channel pauses the reader; the kernel
   buffers on the client side, §5).
-- **Packet mode:** strip the leading `TIOCPKT` control byte on every master read;
-  forward only `TIOCPKT_DATA` payloads (else the echo stream corrupts). The
-  `TIOCPKT_IOCTL` constant in `sys.rs` is `#[allow(dead_code)]` awaiting this.
-- **Presence:** per-PTY `client_present: Rc<Cell<bool>>` driven by a ~100 ms
-  zero-timeout `POLLHUP` poll; the readable branch is gated on presence to avoid
-  the HUP busy-loop. Feeds `PtyNode::state_extra` (`client_present` is currently
-  hard-coded `false`).
-- **Wiring:** a `runtime`/`DataPlane` module builds the channels from the loaded
-  edges and hands each node its endpoints; called from `daemon::load` after
-  instantiation. Nodes gain a `start()` that moves their kernel objects into
-  tasks (`spawn_local` on the `LocalSet`).
-- **Validation:** `scripts/validate/phase2/data-path.sh` — `nexus-sim client
-  --send seeded:64KiB --expect echo` through the daemon (checksums intact), plus
-  presence transitions and device-side `--report-termios` (raw/echo-off/EXTPROC).
+- **Packet mode:** the leading `TIOCPKT` byte is stripped on every master read;
+  only `TIOCPKT_DATA` (`sys::TIOCPKT_DATA`) payloads are forwarded. `TIOCPKT_IOCTL`
+  (client-termios reconciliation into state) is still `#[allow(dead_code)]` — a
+  later phase surfaces client termios; the data plane just drops control packets.
+- **Presence:** per-PTY `client_present: Rc<Cell<bool>>` driven by the same 5 ms
+  `POLLHUP` poll; reads are gated on presence, and on last close the baseline
+  termios is re-asserted (§7.2). Feeds `PtyNode::state_extra`.
+- **Wiring:** `runtime::Wiring::build` derives the channels from the validated
+  edges; `daemon::load` starts each node via `Node::start` (`spawn_local` on the
+  `LocalSet`). Teardown/Drop abort the tasks and close the fds.
+- **`nexus-sim`:** `client --report-termios` opens the daemon's PTY and reports
+  its termios *without* disturbing it (verifies the §7.2 baseline end to end).
+- **Validated by `scripts/validate/phase2/data-path.sh`:** 64 KiB seeded echo
+  round-trip (checksums intact), both nodes `active`, baseline termios from the
+  client's side (raw/echo-off/EXTPROC), and `client_present` true↔false
+  transitions. Measured ad-hoc: ~1% idle CPU, 1 MiB echo in ~0.5 s.
 
-Integration risk already retired: **serial2 opens a `nexus-sim` pts and sets
-baud** (the serial node goes `active`), so the plan's e2e topology works.
+## 6a. Next up — Phase 3 (boundaries and logging)
+
+Per plan §Phase 3: every §5 boundary policy with **counters in state** (the
+PTY/socket drop counters — hostward drops are silent today; add
+`Rc<Cell<u64>>` counters surfaced in `state_extra`), serial discard-when-unattached
+plus `TIOCGICOUNT` surfacing, the **log node** entirely (bounded queue + writer
+task on the blocking pool, on-demand `rotate`, counter recovery by directory
+scan — this also removes the §3.9 temporary log-node load rejection), and
+`subscribe` notifications for counters/status. Then the phase-3 throughput
+benchmark, which is where §3.10's idle-poll interval / high-baud strategy gets
+revisited if needed.
 
 ---
 

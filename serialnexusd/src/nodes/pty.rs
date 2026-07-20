@@ -1,27 +1,45 @@
 //! PTY node (design §7.2). Faces target.
 //!
-//! Slice 1: creation only — allocate the master/slave pair, set the baseline
-//! termios (raw, echo off, EXTPROC on), enable packet mode on the master,
-//! install the configured symlink (with the stale-dangling-symlink recovery
-//! rule), apply owner/mode to the slave device node, and *prime* the slave by
-//! opening and closing it once so POLLHUP reports "absent" for the never-opened
-//! case (nexus-doctor P2 finding). Presence detection and byte flow land in
-//! slice 2.
+//! Slice 1 built the pair: allocate the master/slave, set the baseline termios
+//! (raw, echo off, EXTPROC on), enable packet mode on the master, install the
+//! configured symlink (with the stale-dangling-symlink recovery rule), apply
+//! owner/mode to the slave device node, and *prime* the slave by opening and
+//! closing it once so POLLHUP reports "absent" for the never-opened case
+//! (nexus-doctor P2 finding).
+//!
+//! Slice 2 (this) drives byte flow and presence, poll-based (not `AsyncFd`,
+//! whose epoll readiness busy-loops on pty masters — implementation notes §3.10):
+//!
+//! * A read+presence task polls the master (`POLLIN | POLLHUP`, non-blocking):
+//!   `POLLHUP` set ⇒ no client; `POLLIN` ⇒ drain, strip the packet-mode control
+//!   byte, and forward only `TIOCPKT_DATA` payloads targetward (§7.2). It sleeps
+//!   [`IDLE_POLL`] only when idle, so an active transfer streams at full rate. On
+//!   last close it re-asserts the baseline termios (§7.2).
+//! * A writer task drains the hostward channel to the master, **presence-gated**
+//!   — written only while a client holds the slave, discarded otherwise (§7.2).
 
-use std::os::fd::AsRawFd;
+use std::cell::Cell;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
+use std::rc::Rc;
 
+use nexus_core::Chunk;
 use nexus_core::NodeStatus;
 use nexus_core::config::NodeConfig;
 use nix::fcntl::{OFlag, open};
+use nix::libc;
+use nix::poll::PollFlags;
 use nix::pty::{PtyMaster, grantpt, posix_openpt, ptsname_r, unlockpt};
 use nix::sys::stat::Mode;
 use nix::sys::termios::{
     BaudRate, LocalFlags, SetArg, cfmakeraw, cfsetspeed, tcgetattr, tcsetattr,
 };
 use serde_json::json;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
+use crate::runtime::{self, IDLE_POLL, READ_BUF};
 use crate::sys;
 
 pub struct PtyNode {
@@ -30,9 +48,16 @@ pub struct PtyNode {
     mode: u32,
     group: Option<String>,
     advertised_baud: u32,
-    master: Option<PtyMaster>,
+    /// The master, shared between the read+presence and writer tasks. `None`
+    /// once torn down (or if setup faulted).
+    master: Option<Rc<PtyMaster>>,
     pts_path: Option<String>,
     symlink_installed: bool,
+    /// Observed client presence, shared with the reader task. Single-threaded
+    /// runtime, so a `Cell` (no atomics) suffices; `state` reads it at an await
+    /// boundary where no task is mid-update.
+    present: Rc<Cell<bool>>,
+    tasks: Vec<JoinHandle<()>>,
     status: NodeStatus,
 }
 
@@ -61,6 +86,8 @@ impl PtyNode {
             master: None,
             pts_path: None,
             symlink_installed: false,
+            present: Rc::new(Cell::new(false)),
+            tasks: Vec::new(),
             status: NodeStatus::Active,
         };
 
@@ -78,7 +105,7 @@ impl PtyNode {
         unlockpt(&master).map_err(|e| format!("unlockpt: {e}"))?;
         let pts = ptsname_r(&master).map_err(|e| format!("ptsname: {e}"))?;
 
-        self.apply_baseline(&master)?;
+        apply_baseline(master.as_fd(), self.advertised_baud)?;
         sys::set_packet_mode(master.as_raw_fd(), true).map_err(|e| format!("TIOCPKT: {e}"))?;
 
         self.install_symlink(&pts)?;
@@ -86,22 +113,9 @@ impl PtyNode {
         self.apply_perms(&pts)?;
         prime_slave(&pts);
 
-        self.master = Some(master);
+        self.master = Some(Rc::new(master));
         self.pts_path = Some(pts);
         Ok(())
-    }
-
-    /// Baseline termios (§7.2): raw + echo off + EXTPROC on, applied through the
-    /// master, plus the cosmetic advertised baud.
-    fn apply_baseline(&self, master: &PtyMaster) -> Result<(), String> {
-        let mut t = tcgetattr(master).map_err(|e| format!("tcgetattr: {e}"))?;
-        cfmakeraw(&mut t);
-        t.local_flags.remove(LocalFlags::ECHO);
-        t.local_flags.insert(LocalFlags::EXTPROC);
-        if let Some(baud) = standard_baud(self.advertised_baud) {
-            let _ = cfsetspeed(&mut t, baud);
-        }
-        tcsetattr(master, SetArg::TCSANOW, &t).map_err(|e| format!("tcsetattr: {e}"))
     }
 
     /// Install the configured symlink to the pts node. A pre-existing path
@@ -143,6 +157,42 @@ impl PtyNode {
         Ok(())
     }
 
+    /// Start the data plane: forward targetward, poll presence, and drain
+    /// hostward presence-gated.
+    pub fn start(
+        &mut self,
+        hostward: Option<mpsc::Receiver<Chunk>>,
+        targetward: Option<mpsc::Sender<Chunk>>,
+    ) {
+        let Some(master) = self.master.clone() else {
+            return; // setup faulted; nothing to drive
+        };
+        if let Err(e) = sys::set_nonblocking(master.as_raw_fd()) {
+            self.status = NodeStatus::Faulted {
+                reason: format!("set_nonblocking: {e}"),
+            };
+            return;
+        }
+
+        // Reader + presence poll: client → serial (targetward), plus the presence
+        // check that also gates the writer below.
+        self.tasks.push(tokio::task::spawn_local(read_and_poll(
+            master.clone(),
+            self.present.clone(),
+            targetward,
+            self.advertised_baud,
+        )));
+
+        // Writer: serial → client (hostward), presence-gated.
+        if let Some(rx) = hostward {
+            self.tasks.push(tokio::task::spawn_local(write_hostward(
+                master,
+                self.present.clone(),
+                rx,
+            )));
+        }
+    }
+
     pub fn status(&self) -> NodeStatus {
         self.status.clone()
     }
@@ -152,26 +202,124 @@ impl PtyNode {
             "pts_path": self.pts_path,
             "symlink": self.path.display().to_string(),
             "advertised_baud": self.advertised_baud,
-            // Presence detection lands in slice 2; reported false until then.
-            "client_present": false,
+            "client_present": self.present.get(),
         })
     }
 
     pub fn teardown(&mut self) {
+        for t in self.tasks.drain(..) {
+            t.abort();
+        }
+        self.master = None;
         if self.symlink_installed {
             let _ = std::fs::remove_file(&self.path);
             self.symlink_installed = false;
         }
-        self.master = None;
     }
 }
 
 impl Drop for PtyNode {
     fn drop(&mut self) {
+        for t in self.tasks.drain(..) {
+            t.abort();
+        }
         // The symlink is our artifact; unlink it on removal / clean shutdown.
         if self.symlink_installed {
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+}
+
+/// Baseline termios (§7.2): raw + echo off + EXTPROC on, applied through the
+/// master, plus the cosmetic advertised baud. Free so both creation and the
+/// last-close reset can call it against a borrowed master fd.
+fn apply_baseline(fd: BorrowedFd, advertised_baud: u32) -> Result<(), String> {
+    let mut t = tcgetattr(fd).map_err(|e| format!("tcgetattr: {e}"))?;
+    cfmakeraw(&mut t);
+    t.local_flags.remove(LocalFlags::ECHO);
+    t.local_flags.insert(LocalFlags::EXTPROC);
+    if let Some(baud) = standard_baud(advertised_baud) {
+        let _ = cfsetspeed(&mut t, baud);
+    }
+    tcsetattr(fd, SetArg::TCSANOW, &t).map_err(|e| format!("tcsetattr: {e}"))
+}
+
+/// Reader + presence task. Polls the master (non-blocking) for readability and
+/// hangup; drains data targetward stripping the packet-mode control byte; and on
+/// last close re-asserts the baseline termios so the next session starts
+/// deterministic (§7.2). Sleeps only when idle, so an active transfer streams.
+async fn read_and_poll(
+    master: Rc<PtyMaster>,
+    present: Rc<Cell<bool>>,
+    tx: Option<mpsc::Sender<Chunk>>,
+    advertised_baud: u32,
+) {
+    let fd = master.as_raw_fd();
+    let mut buf = vec![0u8; READ_BUF];
+    loop {
+        let re = sys::poll_ready(fd, PollFlags::POLLIN | PollFlags::POLLHUP);
+        let now = !re.contains(PollFlags::POLLHUP);
+        let was = present.replace(now);
+        if was && !now {
+            // Last close: reset to baseline for a deterministic next session
+            // (§7.2). No client is open, so this is safe.
+            let _ = apply_baseline(master.as_fd(), advertised_baud);
+        }
+
+        let mut did = false;
+        if now && re.contains(PollFlags::POLLIN) {
+            loop {
+                match sys::read_fd(fd, &mut buf) {
+                    Ok(0) => {
+                        present.set(false);
+                        break;
+                    }
+                    Ok(n) => {
+                        did = true;
+                        // Packet mode: forward only TIOCPKT_DATA payloads; other
+                        // leading bytes are control packets with no data (§7.2).
+                        if n > 1 && buf[0] == sys::TIOCPKT_DATA {
+                            if let Some(tx) = &tx {
+                                let payload = Chunk::copy_from_slice(&buf[1..n]);
+                                // Targetward: backpressure to the origin (await).
+                                if tx.send(payload).await.is_err() {
+                                    return; // serial gone
+                                }
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    // A client that closed surfaces as EIO; mark absent.
+                    Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                        present.set(false);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        if !did {
+            tokio::time::sleep(IDLE_POLL).await;
+        }
+    }
+}
+
+/// Writer task: drain the hostward channel to the master while a client is
+/// present; discard otherwise (§7.2 presence-gated output). A full master buffer
+/// backpressures the write within `write_all`; the feeding channel drops at
+/// ingest (§5).
+async fn write_hostward(
+    master: Rc<PtyMaster>,
+    present: Rc<Cell<bool>>,
+    mut rx: mpsc::Receiver<Chunk>,
+) {
+    let fd = master.as_raw_fd();
+    while let Some(chunk) = rx.recv().await {
+        if present.get() {
+            let _ = runtime::write_all(fd, &chunk).await;
+        }
+        // else: no client — discard (presence-gated). Counters land in phase 3.
     }
 }
 

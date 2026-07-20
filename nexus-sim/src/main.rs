@@ -81,6 +81,11 @@ struct ClientArgs {
     /// sent.
     #[arg(long, default_value = "")]
     expect: String,
+    /// Report the termios the daemon applied to the PTY (from the client's side
+    /// of the slave), then exit — without disturbing it. Verifies the §7.2
+    /// baseline (raw, echo off, EXTPROC) end to end.
+    #[arg(long)]
+    report_termios: bool,
     #[arg(long, default_value_t = 0)]
     seed: u64,
     #[arg(long, default_value_t = 10_000)]
@@ -306,6 +311,21 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
         .write(true)
         .custom_flags(nix::libc::O_NOCTTY)
         .open(&a.path)?;
+
+    // Observe-only: read the termios the daemon set on the pair, without the
+    // set_raw below that would overwrite it.
+    if a.report_termios {
+        let t = tcgetattr(&file)?;
+        return Ok(json!({
+            "tool": "nexus-sim", "mode": "client", "behavior": "report-termios",
+            "baud": format!("{:?}", cfgetospeed(&t)),
+            "echo": t.local_flags.contains(LocalFlags::ECHO),
+            "icanon": t.local_flags.contains(LocalFlags::ICANON),
+            "extproc": t.local_flags.contains(LocalFlags::EXTPROC),
+            "opost": t.output_flags.contains(nix::sys::termios::OutputFlags::OPOST),
+            "pass": true
+        }));
+    }
     set_raw(&file)?;
 
     let payload = match a.send.as_deref() {

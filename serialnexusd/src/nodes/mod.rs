@@ -53,11 +53,29 @@ impl Node {
         }
     }
 
-    /// Release environment on teardown/shutdown (unlink the PTY symlink; drop
-    /// the serial port).
+    /// Start this node's data-plane tasks, taking its channels out of the
+    /// wiring plan (§5). Called from `load` after instantiation and validation.
+    pub fn start(&mut self, wiring: &mut crate::runtime::Wiring) {
+        match self {
+            Node::Serial(n) => {
+                let hostward = wiring.serial_hostward.remove(&n.name).unwrap_or_default();
+                let targetward = wiring.serial_targetward.remove(&n.name);
+                n.start(hostward, targetward);
+            }
+            Node::Pty(n) => {
+                let hostward = wiring.pty_hostward.remove(&n.name);
+                let targetward = wiring.pty_targetward.remove(&n.name);
+                n.start(hostward, targetward);
+            }
+        }
+    }
+
+    /// Release environment on teardown/shutdown: stop data-plane tasks, unlink
+    /// the PTY symlink, drop the serial port.
     pub fn teardown(&mut self) {
-        if let Node::Pty(n) = self {
-            n.teardown();
+        match self {
+            Node::Serial(n) => n.teardown(),
+            Node::Pty(n) => n.teardown(),
         }
     }
 }

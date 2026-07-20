@@ -13,6 +13,7 @@
 mod control;
 mod daemon;
 mod nodes;
+mod runtime;
 mod sys;
 
 use std::os::unix::fs::PermissionsExt;
