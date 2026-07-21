@@ -55,12 +55,40 @@ pub struct SerialIcounter {
     pub reserved: [libc::c_int; 9],
 }
 
+// `TIOCGICOUNT` is Linux-only (libc exports the request code only there); gate the
+// binding and read to Linux. Elsewhere P3/P5 already treat `Err` as "not a UART /
+// unsupported" (§13 macOS best-effort), so a stub keeps the doctor building and its
+// verdicts honest.
+#[cfg(target_os = "linux")]
 nix::ioctl_read_bad!(tiocgicount_raw, libc::TIOCGICOUNT, SerialIcounter);
 
 /// Read the driver's serial counters, where supported.
+#[cfg(target_os = "linux")]
 pub fn read_icounter(fd: RawFd) -> nix::Result<SerialIcounter> {
     let mut c = SerialIcounter::default();
     // Safety: writes a fixed-size struct we own through the pointer.
     unsafe { tiocgicount_raw(fd, &mut c) }?;
     Ok(c)
+}
+
+/// Non-Linux stub: no `TIOCGICOUNT`, so report "unsupported" — the not-a-UART path.
+#[cfg(not(target_os = "linux"))]
+pub fn read_icounter(_fd: RawFd) -> nix::Result<SerialIcounter> {
+    Err(nix::errno::Errno::ENOTSUP)
+}
+
+/// Resolve a pty master's slave path across platforms: reentrant `ptsname_r(3)` on
+/// Linux/Android, the static-buffer `ptsname(3)` (nix marks it `unsafe`) elsewhere.
+/// The returned `String` is copied out before this returns.
+pub fn ptsname(master: &nix::pty::PtyMaster) -> nix::Result<String> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        nix::pty::ptsname_r(master)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // Safety: single-threaded probe; the result is cloned out of the static
+        // buffer immediately.
+        unsafe { nix::pty::ptsname(master) }
+    }
 }

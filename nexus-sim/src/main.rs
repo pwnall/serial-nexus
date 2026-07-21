@@ -35,12 +35,30 @@ use codec_api::{
 };
 use nix::fcntl::OFlag;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use nix::pty::{PtyMaster, grantpt, posix_openpt, ptsname_r, unlockpt};
+use nix::pty::{PtyMaster, grantpt, posix_openpt, unlockpt};
 use nix::sys::termios::{
     BaudRate, LocalFlags, SetArg, cfgetospeed, cfmakeraw, cfsetspeed, tcgetattr, tcsetattr,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+/// Resolve a pty master's slave path across platforms: reentrant `ptsname_r(3)` on
+/// Linux/Android, the static-buffer `ptsname(3)` elsewhere. The daemon and doctor
+/// wrap this in their `sys` modules; the sim (which `#![deny]`s unsafe) localizes
+/// the one `unsafe` to this helper, and copies the `String` out before returning.
+#[allow(unsafe_code)]
+fn ptsname(master: &PtyMaster) -> nix::Result<String> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        nix::pty::ptsname_r(master)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // Safety: single-threaded sim; the result is cloned out of the static
+        // buffer immediately, before any other `ptsname` call could overwrite it.
+        unsafe { nix::pty::ptsname(master) }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "nexus-sim", about = "serial_nexus test double (§3)")]
@@ -439,7 +457,7 @@ fn run_pty_inner(a: &PtyArgs) -> anyhow::Result<Value> {
     let mut master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY)?;
     grantpt(&master)?;
     unlockpt(&master)?;
-    let pts = ptsname_r(&master)?;
+    let pts = ptsname(&master)?;
 
     // Raw baseline on the pair, applied through the master so we never open the
     // slave ourselves (per S2: opening+closing the slave would prime POLLHUP).
@@ -496,7 +514,7 @@ fn nullmodem_master(link: &std::path::Path) -> anyhow::Result<PtyMaster> {
     let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY)?;
     grantpt(&master)?;
     unlockpt(&master)?;
-    let pts = ptsname_r(&master)?;
+    let pts = ptsname(&master)?;
     set_raw(&master)?;
     let _ = std::fs::remove_file(link);
     std::os::unix::fs::symlink(&pts, link)?;
@@ -1017,7 +1035,7 @@ fn run_mux_inner(a: &MuxArgs) -> anyhow::Result<Value> {
     let mut master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY)?;
     grantpt(&master)?;
     unlockpt(&master)?;
-    let pts = ptsname_r(&master)?;
+    let pts = ptsname(&master)?;
     set_raw(&master)?;
     let _ = std::fs::remove_file(link);
     std::os::unix::fs::symlink(&pts, link)?;

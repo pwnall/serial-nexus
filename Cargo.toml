@@ -10,6 +10,9 @@ members = [
     "serialnexusd",
     "serialnexusctl",
 ]
+# The cargo-fuzz harness (fuzz/) is a separate crate: it needs a nightly toolchain
+# and libFuzzer, so it is excluded from the normal workspace build/test (§Phase 8).
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2024"

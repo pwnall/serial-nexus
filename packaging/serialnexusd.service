@@ -1,0 +1,115 @@
+# serialnexusd — systemd service unit (serial_nexus, design §10/§11/§13).
+#
+# Install to /etc/systemd/system/serialnexusd.service, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now serialnexusd
+# See packaging/README.md for the full setup (user, groups, device access).
+#
+# The daemon opens its OWN control socket (no socket activation — that is §14
+# out-of-scope), loads its configuration on start, and shuts down cleanly on
+# SIGTERM/SIGINT (releases PTY symlinks and serial ports, removes the socket).
+
+[Unit]
+Description=serial_nexus daemon (serial ports as a routing graph)
+Documentation=https://github.com/pwnall/serial-nexus
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/serialnexusd \
+    --socket /run/serialnexusd/serialnexusd.sock \
+    --state-file /var/lib/serialnexusd/state.toml \
+    --config /etc/serialnexusd/config.toml
+# The daemon prefers the persisted state file over --config when it exists (§11):
+# --config is the first-boot seed; incremental surgery (add-node/remove-node/rotate)
+# is captured in the state file and survives restarts and reboots.
+
+# --- Identity ------------------------------------------------------------------
+# A transient, unprivileged service identity. It still needs the `dialout` group to
+# open USB serial device nodes (/dev/ttyUSB*, /dev/ttyACM* are root:dialout 0660).
+# If your distro uses `uucp` instead, change it here.
+DynamicUser=yes
+SupplementaryGroups=dialout
+
+# --- Runtime, state & log directories (systemd creates AND chowns these) -------
+# These *Directory= families are created and chowned to the (transient) service
+# identity on every start — which is exactly why a log node must use LogsDirectory
+# and not a bare ReadWritePaths (the latter flips the mount to read-write but does
+# NOT chown, so a root-owned dir stays unwritable to a DynamicUser; see below).
+#
+# /run/serialnexusd holds the control socket (cleared on stop; §10 socket policy).
+# 0700 makes it owner-exclusive, bounding the brief post-bind window before the
+# daemon narrows the socket itself to 0600 (§10). If you widen the socket to a group
+# with --socket-group, also widen this to 0750 so that group can traverse to it.
+RuntimeDirectory=serialnexusd
+RuntimeDirectoryMode=0700
+# /var/lib/serialnexusd holds the config snapshot so surgery survives a REBOOT (the
+# socket-adjacent default under /run is wiped on reboot; §11/§15.9).
+StateDirectory=serialnexusd
+StateDirectoryMode=0700
+# /var/log/serialnexusd is where the example config's log node writes; LogsDirectory
+# creates and chowns it to the service so the log writer can create/rotate files (§7.3).
+LogsDirectory=serialnexusd
+LogsDirectoryMode=0750
+
+# The control socket's file permissions ARE the authorization model (§10): 0600
+# owner-only by default. To let a `console-operators` group drive the daemon, create
+# that group and uncomment (widens the socket to 0660 owned by that group) — and
+# widen RuntimeDirectoryMode above to 0750 so the group can traverse to the socket:
+#   SupplementaryGroups=dialout console-operators
+#   RuntimeDirectoryMode=0750
+#   ExecStart= ... --socket-group console-operators
+
+# --- Lifecycle -----------------------------------------------------------------
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=2
+
+# --- Sandboxing (systemd hardening) --------------------------------------------
+# Tightened as far as a daemon that needs raw character devices can go. The two
+# deliberate loosenings are called out: it MUST reach serial device nodes and the
+# pty subsystem, so PrivateDevices stays off and /dev access is scoped explicitly.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# AF_UNIX for the control socket; AF_INET/AF_INET6 only if you configure a leg node
+# (loopback-only by default, §7.4/§9). Drop the INET families if you use no legs.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Device access: the daemon needs USB serial nodes and the pty master/slave devices.
+# PrivateDevices=yes would HIDE /dev/ttyUSB*, so it is left off and /dev is scoped.
+PrivateDevices=no
+DevicePolicy=closed
+DeviceAllow=char-ttyUSB rw
+DeviceAllow=char-ttyACM rw
+DeviceAllow=/dev/ptmx rw
+DeviceAllow=char-pts rw
+# If your adapters enumerate under a different major (e.g. FTDI cdc-acm, or a
+# platform UART like /dev/ttyS* or /dev/ttyAMA*), add the matching DeviceAllow line.
+
+# The default log directory is handled by LogsDirectory= above (created and chowned
+# to the service). ProtectSystem=strict makes the rest of the filesystem read-only,
+# so for any EXTRA log-node directory OUTSIDE /var/log/serialnexusd, add it here —
+# and, under DynamicUser, pre-chown it to the service (a plain root-owned
+# ReadWritePaths dir is NOT writable: ReadWritePaths flips the mount but does not
+# chown). Prefer a subdirectory of the LogsDirectory to avoid this entirely.
+# ReadWritePaths=/srv/console-logs   # example: an extra, pre-chowned log directory
+
+[Install]
+WantedBy=multi-user.target

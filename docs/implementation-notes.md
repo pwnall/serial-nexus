@@ -1,7 +1,8 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-21 (phases 0-7 done; **phase 7 built + adversarially audited**).
-**Next: phase 8** (hardening & release). **Branch:** `implementation` (off `main`).
+**As of:** 2026-07-21 (**phases 0-8 done; phase 8 built + adversarially audited**).
+**All planned phases complete — ready for the `0.2.0` release mark.** **Branch:**
+`implementation` (off `main`).
 **Normative docs are now v6:** `docs/13-design-claude-fable-v6.md` (design) and
 `docs/14-implementation-plan-claude-fable-v6.md` (plan). v1–v5 docs (03–12) are in
 `docs/historical/`. Section references (§) point at the v6 design.
@@ -142,11 +143,13 @@ the items below are refinements consistent with the design, none contradict it.
 | 6 | The wire | **done** — leg node (§7.4) + v1 wire hello (§9), fragmentation, binding, faulted-and-wait/purge-on-reconnect, `nexus-sim` `wire`/`tcp-proxy`, §9 conformance scripts; audited (§6d, §15.24) |
 | — | **v6 alignment** | **done** — phase 0-4 re-audited against the revised v6 design; 5 deviations fixed (empty-node-name §11, boundary comment §5, serial/PTY `hostward_buffer` + serial `modem` §7.1/§7.2, `--socket-group` §10) (§3.13) |
 | 7 | Identity & resilience | **done** — resolver (§12) + faulted-and-wait/reopen (§7.1) + state file (§11) + `add-node`/`remove-node --cascade`/`load --replace` + serial-signal verbs (§7.1) + doctor P5 + `nexus-sim nullmodem`; audited (§6e, §15.25) |
-| 8 | Hardening & release | not started |
+| 8 | Hardening & release | **done** — macOS build+cfg-gating (cross-checked via `--target x86_64-apple-darwin`) + macOS CI lane + `docs/macos.md`; docs (README, `docs/security.md`, `docs/codec-authors.md`, `docs/rpc/`); packaging (systemd unit, udev, example config); cargo-fuzz targets (`fuzz/`, nightly); `phase8/{quickstart,agent-task,soak}.sh` + CI wiring; audited (§6f) |
 
 **Quality gates (all green):** `cargo fmt --all --check`, `cargo clippy
 --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace` (87
-pass), and `bash scripts/validate/all.sh --through 7` (**39 pass, 0 fail**). Phase 7
+pass), `cargo check --target x86_64-apple-darwin --workspace` (macOS portability,
+clean), and `bash scripts/validate/all.sh --through 8` (**42 pass, 0 fail**). Phase 8
+scripts: `phase8/{quickstart,agent-task,soak}.sh`; phase 7
 scripts: `phase7/{unplug,replug,squatter,matrix,crash-recovery,signals,p5}.sh`;
 phase 6 scripts: `phase6/{reference,binding,hostility,insecure-bind,outage,head-of-line}.sh`;
 phase 5 scripts: `phase5/{envelope,demux,resync,held,bad-attributes,exec-crash}.sh`;
@@ -836,6 +839,89 @@ deferred `connect`/`disconnect`/`set-attribute`).
   (test in `empty_input_is_malformed`). Two findings were REFUTED on verification (a
   `linux.jq` degraded-clause worry that misread intent; a reader POLLERR busy-spin
   unreachable for these fds).
+
+## 6f. Phase 8 (hardening & release) — COMPLETE
+
+The final phase (§13 macOS pass, packaging, docs, fuzzing, release validation).
+Built as five slices, then an adversarial audit fixed 5 confirmed findings. No new
+ADR (nothing contradicted the design); the additions are all §13/§Phase-8 plan work.
+
+- **macOS portability (design §13, best-effort).** The workspace now COMPILES and
+  degrades gracefully on `*-apple-darwin`, verified without a Mac by cross-checking
+  `cargo check --target x86_64-apple-darwin --workspace` (which type-checks cfg
+  resolution; it found the two blockers *and* one the up-front research missed). Two
+  hard-compile blockers, both `#[cfg(target_os = ...)]`-gated: (1) **`libc::TIOCGICOUNT`**
+  (Linux-only ioctl) in `serialnexusd/src/sys.rs` and `nexus-doctor/src/sys.rs` —
+  gated with a `#[cfg(not(target_os="linux"))]` `read_icounts`/`read_icounter` stub
+  returning `ENOTSUP`, which the callers already map to "omit driver counters, never
+  fault" (the same path a pts takes on Linux); (2) **`nix::pty::ptsname_r`** (Linux/
+  Android-only reentrant variant) in `pty.rs`, `probes.rs`, and `nexus-sim` — a shared
+  `sys::ptsname` wrapper (the daemon's + doctor's `sys` modules, a localized
+  `#[allow(unsafe_code)]` fn in the deny-unsafe sim) uses `ptsname_r` on Linux and the
+  static-buffer `unsafe ptsname` elsewhere. Plus the high-baud `BaudRate::{B460800,
+  B921600}` match arms in `pty.rs` (absent on macOS termios) and `nix::unistd::getgroups`
+  in the doctor's group-membership check (unavailable in nix on Apple) — both gated.
+  Everything else (TIOCPKT/TIOCEXCL/TIOCMGET/TIOCM_*/EXTPROC/the poll(2) data plane/
+  the resolver's `std::fs` backends) is portable; on macOS the by-id/sysfs resolver is
+  inert at runtime (`usb:`/`by-path:` identities stay `waiting`; `cu.*` raw paths are
+  the §12/§13 interim; the IOKit backend is the deferred §14 home). `expectations/
+  macos.jq` is a lenient structural gate; the macOS CI lane BUILDS + runs the portable
+  tests (gating) and the doctor report + phase-2 e2e informationally. `docs/macos.md`
+  records the deltas as verified/expected/unverified.
+- **Docs.** `README.md` (elevator pitch + five-minute quickstart, the author ran it);
+  `docs/security.md` (the §9 "serial consoles are root shells" posture verbatim + the
+  socket-permissions authz model + loopback/`insecure_bind`/SSH); `docs/codec-authors.md`
+  (the byte-exact envelope contract + golden vectors + the exec-codec walkthrough);
+  `docs/rpc/` (7 man-style pages over the full §10 verb surface, error codes,
+  notifications — the docs auditor caught that the daemon defines a 5th app code
+  `-32001` load-on-non-empty beyond the four in the research catalog).
+- **Packaging.** `packaging/serialnexusd.service` (a hardened systemd unit —
+  `DynamicUser`, `RuntimeDirectory`/`StateDirectory`/`LogsDirectory`, sandboxing with
+  the deliberate device-access loosenings, validated by `systemd-analyze verify`),
+  `serialnexusd.example.toml` (the §2 reference topology; load-verified), a udev rule,
+  and `packaging/README.md`.
+- **Fuzzing.** `fuzz/` — a cargo-fuzz crate (EXCLUDED from the workspace via root
+  `[workspace] exclude`, needs nightly + libFuzzer) with four targets over the pure
+  parsers: `envelope_decode` (`try_decode` + roundtrip), `frame_decoder`
+  (`FrameDecoder` stream reassembly), `wire_hello` (`try_decode_hello` + stability),
+  `reference_demux` (`ReferenceCodec::demux` resync termination + bounded buffer). The
+  harness bodies were compile-verified on stable via a throwaway crate (only the
+  libFuzzer glue needs nightly); a nightly CI job builds and runs each briefly.
+- **Release validation.** `scripts/validate/phase8/{quickstart,agent-task,soak}.sh`.
+  quickstart = the five-minute echo, wall-clocked under budget; agent-task = the full
+  operator scenario via `serialnexusctl --json` (inspect → lock + LOCKED negative
+  control → send --steal → device-received via the echo→log oracle → rotate + byte-exact
+  continuity → unlock), all deterministic with `printf|sha256sum` oracles; soak =
+  parameterized (`SOAK_SECONDS`, default 8 smoke / nightly 1800+) asserting bounded
+  VmRSS, an allowlist of loss counters staying zero, zero faults, and a final
+  source↔log checksum reconciliation. CI: the deterministic phase-8 gates run per-push
+  (the full `--through 8` sweep is not, to avoid the known `phase5/demux.sh` ~1/5
+  flake), plus the macOS lane and nightly soak/fuzz jobs (`schedule` cron).
+- **⚠️ Audit fixes (5 confirmed, ALL FIXED; do NOT regress).** (1) **[HIGH] packaged
+  log node faulted out-of-the-box** — the unit granted `/var/log/serialnexusd` via
+  `ReadWritePaths`, which flips the mount but does NOT chown, so the `DynamicUser`
+  couldn't create files and the example config's `cap` log node faulted on `EACCES`
+  every boot. **Fixed** with `LogsDirectory=serialnexusd` (systemd creates AND chowns
+  it); removed the README's manual `install -d` step and documented the chown caveat
+  for extra log dirs. (2) **[HIGH] `envelope_decode` fuzz target false-fired** — it
+  asserted decode→encode byte-identity, but `try_decode` consumes `frame_end`
+  (including trailing body bytes) for Open/Close while `encode` re-emits them empty, so
+  a valid Open/Close frame with trailing bytes would report as a fuzz crash. **Fixed**
+  by gating byte-identity to Data/Error and relying on decode→encode→decode STABILITY
+  for Open/Close (the `wire_hello` pattern). (3) **[HIGH] `soak.sh` loss-counter check
+  was a tautology** — `add // 0 == 0` parses as `add // (0==0)` = `add // true` (jq
+  `//` binds looser than `==`), so a nonzero drop counter output a truthy number and
+  the soak PASSED regardless. **Fixed** with `(add // 0) == 0`; verified it now fails
+  on a 4096-byte drop and passes on zero/absent. (4) **[MEDIUM] `RuntimeDirectoryMode`
+  shipped 0755** (world-traversable), undermining the design's 0700-parent
+  post-bind-window guard (the daemon's own `main.rs` comment relies on it). **Fixed** to
+  0700 (and `StateDirectoryMode` 0750→0700, added `PrivateTmp=yes`), aligning the unit
+  UP to `security.md`'s tighter claims. (5) **[LOW] `security.md`↔unit drift** (device
+  policy wording, a divergent inline unit copy missing the pty device rules). **Fixed**
+  by rewording the device-policy prose and replacing the drift-prone inline unit with a
+  pointer to the canonical `packaging/serialnexusd.service`. 0 findings refuted. All
+  gates green after fixes: 42/42 `all.sh --through 8`, 87 tests, fmt/clippy/macOS-check
+  clean.
 
 ---
 

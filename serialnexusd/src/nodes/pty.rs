@@ -39,7 +39,7 @@ use nexus_core::config::NodeConfig;
 use nix::fcntl::{OFlag, open};
 use nix::libc;
 use nix::poll::PollFlags;
-use nix::pty::{PtyMaster, grantpt, posix_openpt, ptsname_r, unlockpt};
+use nix::pty::{PtyMaster, grantpt, posix_openpt, unlockpt};
 use nix::sys::stat::Mode;
 use nix::sys::termios::{
     BaudRate, ControlFlags, LocalFlags, SetArg, cfgetospeed, cfmakeraw, cfsetspeed, tcgetattr,
@@ -154,7 +154,7 @@ impl PtyNode {
             .map_err(|e| format!("posix_openpt: {e}"))?;
         grantpt(&master).map_err(|e| format!("grantpt: {e}"))?;
         unlockpt(&master).map_err(|e| format!("unlockpt: {e}"))?;
-        let pts = ptsname_r(&master).map_err(|e| format!("ptsname: {e}"))?;
+        let pts = sys::ptsname(&master).map_err(|e| format!("ptsname: {e}"))?;
 
         apply_baseline(master.as_fd(), self.advertised_baud)?;
         sys::set_packet_mode(master.as_raw_fd(), true).map_err(|e| format!("TIOCPKT: {e}"))?;
@@ -694,7 +694,22 @@ fn standard_baud(baud: u32) -> Option<BaudRate> {
         57600 => BaudRate::B57600,
         115200 => BaudRate::B115200,
         230400 => BaudRate::B230400,
+        // macOS termios caps standard speeds at B230400; the higher rates are
+        // gated out of nix's `BaudRate` there. Advertised baud is cosmetic on a
+        // PTY, so falling through to `None` off Linux/BSD is harmless (§7.2, §13).
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
         460800 => BaudRate::B460800,
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
         921600 => BaudRate::B921600,
         _ => return None,
     })

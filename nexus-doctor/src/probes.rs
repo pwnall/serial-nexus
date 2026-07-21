@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use nix::fcntl::{OFlag, open};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use nix::pty::{PtyMaster, grantpt, posix_openpt, ptsname_r, unlockpt};
+use nix::pty::{PtyMaster, grantpt, posix_openpt, unlockpt};
 use nix::sys::stat::Mode;
 use nix::sys::termios::{LocalFlags, SetArg, cfmakeraw, tcgetattr, tcsetattr};
 use serial2::{CharSize, FlowControl, Parity, SerialPort, Settings, StopBits};
@@ -58,7 +58,7 @@ pub fn p1_extproc() -> Probe {
 
 fn p1_inner() -> anyhow::Result<(bool, bool, bool)> {
     let mut master = new_master()?;
-    let pts = ptsname_r(&master)?;
+    let pts = sys::ptsname(&master)?;
     let slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
 
     let mut base = tcgetattr(&slave)?;
@@ -166,7 +166,7 @@ fn p2_inner() -> anyhow::Result<Presence> {
     drop(never);
 
     let master = new_master()?;
-    let pts = ptsname_r(&master)?;
+    let pts = sys::ptsname(&master)?;
 
     let slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
     let while_open = hup(&master)?;
@@ -836,8 +836,18 @@ fn is_group_member(group: &str) -> Option<bool> {
     if nix::unistd::getgid() == target || nix::unistd::getegid() == target {
         return Some(true);
     }
-    let groups = nix::unistd::getgroups().ok()?;
-    Some(groups.contains(&target))
+    // `getgroups` is unavailable on Apple platforms in nix (Apple's semantics
+    // differ). Supplementary-group membership is simply unknown there → reported as
+    // skipped, matching §13's macOS best-effort environment checks.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        let groups = nix::unistd::getgroups().ok()?;
+        Some(groups.contains(&target))
+    }
 }
 
 fn device_access_check(dev: &Path) -> EnvCheck {

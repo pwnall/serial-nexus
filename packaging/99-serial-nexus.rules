@@ -1,0 +1,25 @@
+# udev rules for serial_nexus device access (design §13, §12).
+#
+# Install as /etc/udev/rules.d/99-serial-nexus.rules, then:
+#   sudo udevadm control --reload && sudo udevadm trigger
+#
+# USB serial adapters enumerate as /dev/ttyUSB* or /dev/ttyACM*, owned root:dialout
+# mode 0660 on most distros — so putting the service in the `dialout` group (see the
+# systemd unit's SupplementaryGroups) is usually enough and you may not need this
+# file at all. Use these rules when you want a NARROWER grant than "all of dialout",
+# or a stable by-id symlink for a specific adapter.
+
+# Grant a dedicated group (create it, e.g. `sudo groupadd serialnexus`, and add it to
+# the unit's SupplementaryGroups) read/write to FTDI adapters only. Adjust idVendor
+# to your silicon (0403 = FTDI, 10c4 = Silicon Labs CP210x, 1a86 = QinHeng CH34x).
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="0403", GROUP="serialnexus", MODE="0660"
+
+# The daemon addresses devices by resolver identity (usb:vid:pid:serial:iface), which
+# is derived from /dev/serial/by-id — created automatically by the default
+# 60-serial.rules on any modern systemd system. You do NOT need to recreate by-id
+# symlinks here; the line above only governs ownership/permissions of the tty node.
+
+# Example: a stable, human-named symlink for one specific adapter (matched by its
+# serial number). serial_nexus does not require this — it resolves by-id itself — but
+# it can be convenient for humans:
+# SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{serial}=="A6008isP", SYMLINK+="console-main"

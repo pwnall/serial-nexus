@@ -1,0 +1,90 @@
+# serialnexusd example configuration (serial_nexus, design §2 reference topology).
+#
+# Install as /etc/serialnexusd/config.toml. This is the FIRST-BOOT seed only: once
+# the daemon runs, its own state snapshot (/var/lib/serialnexusd/state.toml with the
+# packaged unit) is preferred at startup, and you evolve the running graph with the
+# incremental verbs (add-node/remove-node/rotate), not by editing this file (§11).
+#
+# TOML shape: each node is a [[node]] table tagged by `type`; each edge is an [[edge]]
+# joining two endpoint addresses. A bare node name addresses its default endpoint; a
+# codec/leg channel is addressed as `node/channel` (§3).
+
+# --- A physical serial console, fanned out to an operator PTY and a forensic log ---
+
+# The serial port. Prefer a resolver IDENTITY (usb:vid:pid:serial:iface) over a raw
+# /dev path: an identity survives replug, restart, and cold boot with the device
+# unplugged, and cannot be hijacked by a different adapter squatting on the old path
+# (§12). Capture it once with `serialnexusctl add-node`, which echoes the resolved
+# identity back ("bound: FTDI FT232R, serial A6008isP, interface 0"); paste it here.
+# A raw path (device = "/dev/ttyUSB0") also works but carries no identity guarantee.
+[[node]]
+type = "serial"
+name = "usb0"
+device = "usb:0403:6001:A6008isP:00"
+baud = 115200
+# parity, data_bits, stop_bits, flow_control default to 8N1 / none.
+# arbitration defaults to "exclusive": a writer must grab the lock before its bytes
+# reach the device (grab-write-release, or `send`). Set "free-for-all" for a single
+# uncoordinated console.
+arbitration = "exclusive"
+
+# The interactive pseudo-terminal an operator (or a script) attaches to. Open the
+# symlink with any terminal program (picocom, screen, minicom) or drive it over RPC.
+[[node]]
+type = "pty"
+name = "console"
+path = "/run/serialnexusd/console"
+
+# The append-only forensic log. Rotate on demand with `serialnexusctl rotate cap`
+# (renames to cap.log.000, cap.log.001, ...; higher is newer). The directory must be
+# in the unit's ReadWritePaths.
+[[node]]
+type = "log"
+name = "cap"
+directory = "/var/log/serialnexusd"
+filename = "console.log"
+# overflow defaults to drop-oldest-with-counters; set to "fault" to stop on a full
+# disk instead of dropping.
+
+# Fan-out is implicit at the serial node's host-facing endpoint: two edges, one
+# stream broadcast to both consumers (§4). The log edge is read-only (`never`); the
+# PTY edge is `on-demand` (the default) so its client can acquire the write lock.
+[[edge]]
+a = "usb0"
+b = "console"
+
+[[edge]]
+a = "usb0"
+b = "cap"
+write_mode = "never"
+
+# --- The reference topology (§2), for reference ---------------------------------
+#
+# To split one multiplexed UART into named channels and forward them to a second
+# machine, add a demux codec and a leg. Sketch (uncomment and adapt):
+#
+# [[node]]
+# type = "codec"
+# name = "mux"
+# codec = "reference"     # a compiled-in codec; or codec = "exec" with argv in
+# channels = ["console", "trace"]   # `attributes` to wrap an external protocol tool
+# faces = "target"        # demultiplexer: multiplexed side faces the device
+#
+# [[node]]
+# type = "leg"
+# name = "uplink"
+# faces = "target"        # computer A consumes local channels for transport
+# transport = "tcp"
+# role = "listen"
+# address = "127.0.0.1:7420"   # loopback-only; carry it over SSH port-forwarding.
+# channels = ["console", "trace"]
+#
+# [[edge]]                # serial (default endpoint) -> codec multiplexed side
+# a = "usb0"
+# b = "mux"
+# [[edge]]                # a channel -> the operator PTY, the log, and the uplink
+# a = "mux/console"
+# b = "console"
+# [[edge]]
+# a = "mux/console"
+# b = "uplink/console"

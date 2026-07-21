@@ -9,6 +9,12 @@ use std::os::fd::RawFd;
 nix::ioctl_write_ptr_bad!(tiocpkt, libc::TIOCPKT, libc::c_int);
 nix::ioctl_none_bad!(tiocexcl, libc::TIOCEXCL);
 nix::ioctl_none_bad!(tiocnxcl, libc::TIOCNXCL);
+// `TIOCGICOUNT` is a Linux-only ioctl (libc exports the request code only under
+// target_os = linux/android), so the binding — and only the binding — is gated to
+// Linux. On other platforms `read_icounts` is a stub returning `ENOTSUP`, which the
+// caller already maps to "driver counters unsupported → omit them" (§5, §13 macOS
+// best-effort): the same graceful path a pts takes on Linux.
+#[cfg(target_os = "linux")]
 nix::ioctl_read_bad!(tiocgicount, libc::TIOCGICOUNT, SerialIcounts);
 nix::ioctl_read_bad!(tiocmget, libc::TIOCMGET, libc::c_int);
 
@@ -40,12 +46,40 @@ pub struct SerialIcounts {
 /// Read the driver input counters (`TIOCGICOUNT`). `Err` means the fd's driver
 /// does not implement it (e.g. a pts standing in for a device in tests), which
 /// the caller surfaces as "unsupported" — never a fault (§5).
+#[cfg(target_os = "linux")]
 pub fn read_icounts(fd: RawFd) -> nix::Result<SerialIcounts> {
     let mut counts = SerialIcounts::default();
     // Safety: the ioctl writes exactly `sizeof(SerialIcounts)` bytes into
     // `counts`, whose layout mirrors the kernel struct.
     unsafe { tiocgicount(fd, &mut counts) }?;
     Ok(counts)
+}
+
+/// Non-Linux stub: no `TIOCGICOUNT`, so report "unsupported" exactly as a pts does
+/// on Linux (§5, §13). The caller (`nodes/serial.rs`) maps `Err` to omitted driver
+/// counters — a runtime degradation, never a fault.
+#[cfg(not(target_os = "linux"))]
+pub fn read_icounts(_fd: RawFd) -> nix::Result<SerialIcounts> {
+    Err(nix::errno::Errno::ENOTSUP)
+}
+
+/// Resolve a pty master's slave path. Linux/Android have the reentrant
+/// `ptsname_r(3)` (a glibc extension nix exposes safely); elsewhere only the
+/// static-buffer `ptsname(3)` exists, which nix marks `unsafe`. This wrapper hides
+/// the split so the PTY node code is platform-agnostic. On the non-reentrant path
+/// the returned `String` is copied out of the static buffer before this returns,
+/// so no dangling reference escapes.
+pub fn ptsname(master: &nix::pty::PtyMaster) -> nix::Result<String> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        nix::pty::ptsname_r(master)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // Safety: single-threaded daemon; the `String` is cloned out of the
+        // static buffer immediately, so a later `ptsname` call cannot corrupt it.
+        unsafe { nix::pty::ptsname(master) }
+    }
 }
 
 /// Read the modem-line bitmask (`TIOCMGET`): DTR/RTS outputs and CTS/DSR/DCD/RI

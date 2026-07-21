@@ -3,6 +3,10 @@ name: CI
 on:
   push:
   pull_request:
+  schedule:
+    # Nightly lane (§Phase 8): the longer soak and the fuzz battery, which are too
+    # slow for every push. 06:00 UTC daily.
+    - cron: '0 6 * * *'
 
 env:
   CARGO_TERM_COLOR: always
@@ -74,5 +78,83 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
       - name: Build workspace
         run: cargo build --workspace --locked
-      - name: Run validation scripts (through current phase)
+      - name: Run validation scripts (through phase 3)
         run: bash scripts/validate/all.sh --through 3
+      # The phase-8 release gates are deterministic, so they run per-push here even
+      # though the full --through 8 sweep is not (phase5/demux.sh has a known ~1/5
+      # presence-race flake in the test, tracked separately).
+      - name: Phase 8 release gates (quickstart, agent-task, soak smoke)
+        run: |
+          bash scripts/validate/phase8/quickstart.sh
+          bash scripts/validate/phase8/agent-task.sh
+          SOAK_SECONDS=6 bash scripts/validate/phase8/soak.sh
+
+  # macOS is best-effort (design §13): the GATING deliverable is that the workspace
+  # BUILDS and the portable property/unit tests pass; the doctor report and the
+  # phase-2 e2e run informationally (poll-only observation path), since EXTPROC and
+  # the by-id/counter mechanisms are Linux-only. Deltas are documented in docs/macos.md.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install jq
+        run: brew install jq
+      - name: Build (the macOS portability gate)
+        run: cargo build --workspace --locked
+      - name: Test the portable core (pure logic, property tests)
+        run: cargo test --locked -p nexus-core -p codec-api -p codec-reference -p nexus-rpc
+      - name: Capability report (informational — macOS is best-effort)
+        continue-on-error: true
+        run: |
+          cargo run -q --locked -p nexus-doctor -- --markdown | tee nexus-doctor-macos.md
+          cargo run -q --locked -p nexus-doctor -- --json | jq -e -f expectations/macos.jq
+      - name: Phase 2 e2e on the poll-only path (informational)
+        continue-on-error: true
+        run: bash scripts/validate/phase2/data-path.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-doctor-macos-report
+          path: nexus-doctor-macos.md
+
+  # Nightly soak (§Phase 8 item 2): the reference-topology data plane under sustained
+  # synthetic load, asserting bounded RSS, allowlisted counters, zero faults, and a
+  # final checksum reconciliation. A true 24-hour soak runs on dedicated hardware
+  # before a release; CI runs a substantial bounded slice within the runner's limits.
+  soak-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Soak (30 minutes)
+        run: SOAK_SECONDS=1800 SOAK_INTERVAL=30 bash scripts/validate/phase8/soak.sh
+
+  # Nightly fuzzing (§Phase 8): the frame and envelope parsers, on top of the
+  # existing proptest coverage. Needs a nightly toolchain and libFuzzer.
+  fuzz-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust nightly
+        run: rustup toolchain install nightly --profile minimal && rustup default nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build fuzz targets
+        working-directory: fuzz
+        run: cargo +nightly fuzz build
+      - name: Fuzz each target briefly
+        working-directory: fuzz
+        run: |
+          for t in envelope_decode frame_decoder wire_hello reference_demux; do
+            echo "=== fuzzing $t ==="
+            cargo +nightly fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=4096
+          done

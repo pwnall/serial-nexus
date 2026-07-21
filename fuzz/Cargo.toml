@@ -1,0 +1,53 @@
+# cargo-fuzz harness for serial_nexus' frame and envelope parsers (design plan
+# §Phase 8: "fuzzing of frame and envelope parsers ... on top of the existing
+# proptest coverage"). This crate is EXCLUDED from the workspace (root Cargo.toml
+# `[workspace] exclude`) because it needs a nightly toolchain and libFuzzer:
+#
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz build                       # build all targets
+#   cargo +nightly fuzz run envelope_decode         # fuzz one
+#
+# The parsers under test are pure, total functions over &[u8] — the ideal fuzz
+# surface — and each target asserts a decode/re-encode invariant beyond "no panic".
+[package]
+name = "serial-nexus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+codec-api = { path = "../codec-api" }
+codec-reference = { path = "../codecs/reference" }
+
+# Fuzz targets are their own binaries; keep them out of docs/tests/benches.
+[[bin]]
+name = "envelope_decode"
+path = "fuzz_targets/envelope_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_decoder"
+path = "fuzz_targets/frame_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_hello"
+path = "fuzz_targets/wire_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reference_demux"
+path = "fuzz_targets/reference_demux.rs"
+test = false
+doc = false
+bench = false
