@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use nexus_core::Chunk;
 use nexus_core::config::GraphConfig;
-use nexus_core::graph::WriteMode;
+use nexus_core::graph::{EndpointAddr, WriteMode};
 use nexus_core::lock::{Acquire, Arbitration, OriginId, Steal};
 use nexus_rpc::{Notification, RpcError, error_codes};
 use serde_json::{Value, json};
@@ -61,14 +61,16 @@ pub mod app_errors {
 struct GraphState {
     config: GraphConfig,
     nodes: Vec<Node>,
-    /// Host-facing endpoint (serial node name) → its write lock (§6), shared with
-    /// the origin read tasks. The daemon mutates it on `lock`/`unlock`/`send`.
+    /// Host-facing endpoint **display** (`usb0`, or a codec channel `mux/console`)
+    /// → its write lock (§6), shared with the origin read tasks. The daemon mutates
+    /// it on `lock`/`unlock`/`send` and reports it in `state`.
     endpoint_locks: HashMap<String, SharedLock>,
-    /// Host-facing endpoint → a targetward sender into it, so `send` can inject a
-    /// line as a transient origin (§6).
+    /// Host-facing endpoint display → a targetward sender into it, so `send` can
+    /// inject a line as a transient origin (§6).
     endpoint_targetward: HashMap<String, mpsc::Sender<Chunk>>,
-    /// Writing origin (PTY node name) → (its endpoint's lock, its origin id), for
-    /// resolving a `lock`/`unlock` by origin name to the right lock (§6).
+    /// Writing origin **display** (a PTY node name, or a codec's multiplexed side by
+    /// its node name) → (its endpoint's lock, its origin id), for resolving a
+    /// `lock`/`unlock` by origin name to the right lock (§6).
     origin_locks: HashMap<String, (SharedLock, OriginId)>,
     /// Monotonic allocator for transient `send` origin ids (§6).
     next_send_origin: Cell<u64>,
@@ -169,8 +171,9 @@ impl Daemon {
             ));
         }
 
-        // Full structural validation before anything is created (§4, §11).
-        let errors = config.to_model().validate();
+        // Full structural validation before anything is created (§4, §11):
+        // duplicate node names plus the three graph rules and name checks.
+        let errors = config.validate();
         if !errors.is_empty() {
             let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
             return Err(RpcError::new(
@@ -207,10 +210,24 @@ impl Daemon {
         let mut wiring = crate::runtime::Wiring::build(&config, &self.notifier);
         // Keep clones of the write locks (§6) and per-endpoint targetward senders
         // so the control plane can acquire, release, and `send`; the same `Rc`s are
-        // handed to the origin read tasks below.
-        st.endpoint_locks = wiring.endpoint_locks.clone();
-        st.endpoint_targetward = wiring.endpoint_targetward.clone();
-        st.origin_locks = wiring.origin_locks.clone();
+        // handed to the origin read tasks below. The wiring keys by endpoint address
+        // (a codec has many); the RPC surface addresses by display string
+        // (`usb0`, `mux/console`), so convert here.
+        st.endpoint_locks = wiring
+            .endpoint_locks
+            .iter()
+            .map(|(a, l)| (a.to_string(), l.clone()))
+            .collect();
+        st.endpoint_targetward = wiring
+            .host_targetward_tx
+            .iter()
+            .map(|(a, t)| (a.to_string(), t.clone()))
+            .collect();
+        st.origin_locks = wiring
+            .origin_locks
+            .iter()
+            .map(|(a, (l, id))| (a.to_string(), (l.clone(), *id)))
+            .collect();
         st.nodes = nodes;
         st.config = config;
         for node in &mut st.nodes {
@@ -237,15 +254,34 @@ impl Daemon {
                 obj.insert("name".into(), json!(n.name()));
                 merge_into(&mut obj, serde_json::to_value(n.status()).unwrap());
                 merge_into(&mut obj, n.state_extra());
-                // A host-facing endpoint reports its write-lock state (§6: holder,
-                // waiters, per-origin purge counters, most recent steal). Observed
-                // state, disjoint from configuration (§15.8).
-                if let Some(lock) = st.endpoint_locks.get(n.name()) {
-                    obj.insert(
-                        "lock".into(),
-                        serde_json::to_value(lock.borrow().snapshot())
-                            .expect("lock snapshot serializes"),
-                    );
+                // Each of the node's host-facing endpoints reports its write-lock
+                // state (§6: holder, waiters, per-origin purge counters, most recent
+                // steal). A single-endpoint node (serial) reports it top-level as
+                // `.lock`; a codec reports each channel's lock under
+                // `.channels[channel].lock`. Observed state, disjoint from
+                // configuration (§15.8).
+                for (display, lock) in &st.endpoint_locks {
+                    let addr: EndpointAddr = display.parse().expect("address is infallible");
+                    if addr.node != n.name() {
+                        continue;
+                    }
+                    let snap = serde_json::to_value(lock.borrow().snapshot())
+                        .expect("lock snapshot serializes");
+                    if addr.is_default() {
+                        obj.insert("lock".into(), snap);
+                    } else {
+                        let channels = obj
+                            .entry("channels")
+                            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                        if let Some(chmap) = channels.as_object_mut() {
+                            let ch = chmap
+                                .entry(addr.endpoint.clone())
+                                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                            if let Some(chobj) = ch.as_object_mut() {
+                                chobj.insert("lock".into(), snap);
+                            }
+                        }
+                    }
                 }
                 Value::Object(obj)
             })

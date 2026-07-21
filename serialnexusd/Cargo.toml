@@ -14,10 +14,18 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+# Compiled-in codecs sit behind Cargo features so minimal builds can drop what
+# they don't need (§8). The registry match in `nodes/codec.rs` gates each arm on
+# its feature; an absent codec is simply an "unknown codec" at load.
+[features]
+default = ["codec-reference"]
+codec-reference = ["dep:codec-reference"]
+
 [dependencies]
 nexus-core.workspace = true
 nexus-rpc.workspace = true
 codec-api.workspace = true
+codec-reference = { workspace = true, optional = true }
 
 tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
 futures.workspace = true

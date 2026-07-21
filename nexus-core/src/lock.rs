@@ -253,6 +253,30 @@ impl EndpointLock {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    /// A `Held` origin's *priority* reclaim of a free lock (§6). Unlike
+    /// [`Self::acquire`], it bypasses the FIFO head check: a held origin holds the
+    /// lock indefinitely, so after a `--steal` transiently ousts it, it reclaims
+    /// the instant the lock frees — ahead of any on-demand `--wait` waiter, which
+    /// by design waits indefinitely behind a held lock (the demux's permanent hold,
+    /// so no other writer can corrupt the mux framing). Grants only if `id` is a
+    /// registered `Held` origin and the lock is currently free; returns whether it
+    /// took (or already effectively has, under free-for-all) the lock.
+    pub fn reclaim_held(&mut self, id: OriginId) -> bool {
+        match self.origins.get(&id) {
+            Some(o) if o.write_mode == WriteMode::Held => {}
+            _ => return false,
+        }
+        if self.arbitration == Arbitration::FreeForAll {
+            return true; // no lock to hold; the writer already may write
+        }
+        if self.holder.is_none() {
+            self.grant_to(id);
+            true
+        } else {
+            false // still held (by a stealer); wait
+        }
+    }
+
     /// Release the lock if `id` holds it. Returns true if a release happened. Does
     /// not itself grant to the queue — the daemon wakes the waiters, and the head
     /// re-attempts [`Self::acquire`] in a fresh critical section (§15.20).
@@ -603,6 +627,47 @@ mod tests {
         // When 3 releases, the queued waiter 2 is next (steal preserved the queue).
         assert!(lock.release(OriginId(3)));
         assert_eq!(lock.acquire(OriginId(2)), Acquire::Granted);
+    }
+
+    #[test]
+    fn held_origin_reclaims_a_free_lock_ahead_of_on_demand_waiters() {
+        // §6: the demux's held lock is permanent; a steal ousts it transiently, and
+        // it reclaims the instant the lock frees — ahead of an on-demand waiter,
+        // which waits indefinitely behind a held lock. reclaim_held bypasses the
+        // FIFO head so a non-held writer can never inherit the mux lock.
+        let mut lock = EndpointLock::new(Arbitration::Exclusive);
+        lock.register(OriginId(1), "demux", WriteMode::Held); // acquires on attach
+        lock.register(OriginId(2), "waiter", WriteMode::OnDemand);
+        lock.register(OriginId(3), "stealer", WriteMode::OnDemand);
+        assert_eq!(lock.holder(), Some(OriginId(1)), "held acquires on attach");
+
+        lock.enqueue(OriginId(2)); // an on-demand origin queues behind the held lock
+        lock.steal(OriginId(3)); // a steal ousts the held holder
+        assert_eq!(lock.holder(), Some(OriginId(3)));
+        assert!(
+            !lock.reclaim_held(OriginId(1)),
+            "cannot reclaim while the stealer holds it"
+        );
+
+        lock.release(OriginId(3)); // the stealer releases
+        assert!(
+            lock.reclaim_held(OriginId(1)),
+            "held reclaims the free lock with priority"
+        );
+        assert_eq!(
+            lock.holder(),
+            Some(OriginId(1)),
+            "held is back, ahead of the on-demand waiter"
+        );
+        assert_eq!(
+            lock.waiters().collect::<Vec<_>>(),
+            vec![OriginId(2)],
+            "the on-demand waiter still waits behind the held lock"
+        );
+        assert!(
+            !lock.reclaim_held(OriginId(2)),
+            "a non-held origin cannot reclaim_held"
+        );
     }
 
     #[test]

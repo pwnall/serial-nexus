@@ -144,6 +144,14 @@ pub trait Codec {
 
     /// Encode a per-channel event into multiplexed bytes appended to `out`.
     fn mux(&mut self, event: &Event, out: &mut Vec<u8>) -> Result<(), CodecError>;
+
+    /// Codec-specific resynchronization count surfaced as node state (§7.5:
+    /// framing errors / resyncs). The default is `0` for codecs that never
+    /// resynchronize (e.g. a codec over a reliable transport); a framing codec on
+    /// a lossy line overrides it.
+    fn resync_count(&self) -> u64 {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------

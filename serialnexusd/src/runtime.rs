@@ -44,7 +44,7 @@ use std::time::Duration;
 
 use nexus_core::Chunk;
 use nexus_core::config::{GraphConfig, NodeConfig};
-use nexus_core::graph::{Facing, WriteMode};
+use nexus_core::graph::{Arbitration, EndpointAddr, Facing, WriteMode};
 use nexus_core::lock::{EndpointLock, OriginId};
 use nexus_rpc::Notification;
 use nix::poll::PollFlags;
@@ -203,98 +203,105 @@ pub const IDLE_POLL: Duration = Duration::from_millis(5);
 /// where it happens (§5).
 pub type HostwardSink = (mpsc::Sender<Chunk>, Arc<DropCounters>);
 
-/// The channels the data plane hands to each node's `start`, keyed by node name.
-/// Built once from the loaded configuration; each node removes its own entries.
+/// The channels the data plane hands to each node's `start`, keyed by **endpoint
+/// address** (`node` or `node/channel`, §3). Built once from the loaded
+/// configuration; each node removes its own endpoints' entries at start.
+///
+/// The topology is no longer two-layer (serial→consumer): an interior codec node
+/// (§7.5) is a *target*-facing consumer on its multiplexed side and N *host*-facing
+/// producers on its channels, so a single node may claim entries from both halves.
+/// Keying by endpoint rather than by node makes that uniform — every host-facing
+/// endpoint (a serial, a codec channel) fans out and arbitrates; every
+/// target-facing endpoint (a PTY, a log, a codec's multiplexed side) is a single
+/// producer that may also write back.
 #[derive(Default)]
 pub struct Wiring {
-    /// serial node → one hostward sink per attached consumer (fan-out, §4 rule 2).
-    pub serial_hostward: HashMap<String, Vec<HostwardSink>>,
-    /// serial node → the single targetward receiver (all writing consumers feed it).
-    pub serial_targetward: HashMap<String, mpsc::Receiver<Chunk>>,
-    /// consumer node (PTY or log) → its hostward receiver (from its serial).
-    pub consumer_hostward: HashMap<String, mpsc::Receiver<Chunk>>,
-    /// consumer node → its [`DropCounters`] (shared with the serial hostward
-    /// sink), for drop/discard counts and state reporting (§5, §7.2, §7.3).
-    pub consumer_counters: HashMap<String, Arc<DropCounters>>,
-    /// PTY node → its targetward sender (into its serial). Only targetward-writing
-    /// consumers appear here; a log node's write mode is inherently `never` (§7.3).
-    pub pty_targetward: HashMap<String, mpsc::Sender<Chunk>>,
-    /// Host-facing endpoint (serial node name) → its write lock (§6). The daemon
-    /// keeps a clone for `lock`/`unlock`/`send` and for reporting lock state.
-    pub endpoint_locks: HashMap<String, SharedLock>,
-    /// Host-facing endpoint (serial node name) → a targetward sender into it, so
-    /// the `send` verb can inject a line as a transient origin (§6). One per host
-    /// endpoint, independent of whether any PTY writer is attached.
-    pub endpoint_targetward: HashMap<String, mpsc::Sender<Chunk>>,
-    /// Writing origin (PTY node name) → (its endpoint's lock, its origin id). The
-    /// origin's read task consults this to gate its targetward drain (§6). Only
-    /// origins that can write appear here; a `never` spy or a log never does.
-    pub origin_locks: HashMap<String, (SharedLock, OriginId)>,
+    // --- host-facing endpoints (serial sole endpoint, codec channels) ---
+    /// Host-facing endpoint → its write lock (§6). The daemon keeps a clone for
+    /// `lock`/`unlock`/`send` and for reporting lock state.
+    pub endpoint_locks: HashMap<EndpointAddr, SharedLock>,
+    /// Host-facing endpoint → one hostward sink per attached consumer (fan-out,
+    /// §4 rule 2).
+    pub host_sinks: HashMap<EndpointAddr, Vec<HostwardSink>>,
+    /// Host-facing endpoint → the single targetward receiver it drains (all its
+    /// writing origins feed this one channel, arbitrated by the lock).
+    pub host_targetward_rx: HashMap<EndpointAddr, mpsc::Receiver<Chunk>>,
+    /// Host-facing endpoint → a targetward sender into it, so the `send` verb can
+    /// inject a line as a transient origin even with no writer attached (§6).
+    pub host_targetward_tx: HashMap<EndpointAddr, mpsc::Sender<Chunk>>,
+    // --- target-facing endpoints (PTY, log, codec multiplexed side) ---
+    /// Target-facing endpoint → its hostward receiver (from its one host endpoint).
+    pub target_hostward_rx: HashMap<EndpointAddr, mpsc::Receiver<Chunk>>,
+    /// Target-facing endpoint → its [`DropCounters`] (shared with the host sink),
+    /// for drop/discard counts and state reporting (§5, §7.2, §7.3).
+    pub target_counters: HashMap<EndpointAddr, Arc<DropCounters>>,
+    /// Writing target-facing endpoint → its targetward sender into its host
+    /// endpoint. Only origins that can write (mode ≠ never) appear here.
+    pub target_targetward_tx: HashMap<EndpointAddr, mpsc::Sender<Chunk>>,
+    /// Writing target-facing endpoint → (its host endpoint's lock, its origin id).
+    /// The origin gates its targetward drain on this (§6); only writers appear.
+    pub origin_locks: HashMap<EndpointAddr, (SharedLock, OriginId)>,
 }
 
 impl Wiring {
-    /// Build the channel plan for the phase-2/3 topology: serial (host-facing)
-    /// endpoints fanning out to target-facing consumers (PTY and log). The graph
-    /// is already structurally valid here (load validates first, §11), so each
-    /// edge joins exactly one host and one target endpoint. Every consumer gets a
-    /// hostward channel; only targetward-writing consumers (PTY) get a targetward
-    /// sender — a log's write mode is inherently `never` (§7.3).
+    /// Build the channel plan from the validated graph (load validates first,
+    /// §11), keyed by endpoint. Every host-facing endpoint gets a lock, a fan-out
+    /// sink list, and one arbitrated targetward channel; every edge wires one
+    /// host↔target pair. A log target's write mode is inherently `never` (§7.3),
+    /// so it gets no targetward path; every other target keeps its declared mode.
     pub fn build(config: &GraphConfig, notifier: &broadcast::Sender<Notification>) -> Wiring {
-        let mut facing: HashMap<&str, Facing> = HashMap::new();
+        // Every endpoint's facing + arbitration, keyed by its address (§4). Derived
+        // from each node's shape, so codec channels and multiplexed sides appear
+        // alongside single-endpoint boundary nodes.
+        let mut facing: HashMap<EndpointAddr, (Facing, Arbitration)> = HashMap::new();
         let mut is_log: HashMap<&str, bool> = HashMap::new();
         for n in &config.nodes {
-            let f = match n {
-                NodeConfig::Serial { faces, .. } => *faces,
-                NodeConfig::Pty { .. } | NodeConfig::Log { .. } => Facing::Target,
-            };
-            facing.insert(n.name(), f);
+            for ep in &n.shape().endpoints {
+                facing.insert(
+                    EndpointAddr::new(n.name(), ep.name.clone()),
+                    (ep.facing, ep.arbitration),
+                );
+            }
             is_log.insert(n.name(), matches!(n, NodeConfig::Log { .. }));
         }
 
         let mut wiring = Wiring::default();
-        // One targetward sender per serial (host endpoint), cloned to each writing
-        // consumer.
-        let mut serial_targetward_tx: HashMap<String, mpsc::Sender<Chunk>> = HashMap::new();
-        // One write lock per host-facing endpoint (§6), carrying the node's
-        // configured arbitration policy (exclusive by default), plus one targetward
-        // channel up front — the serial drains it, and the daemon keeps a sender
-        // clone so `send` can inject a line even with no PTY writer attached (§6).
-        for n in &config.nodes {
-            if facing.get(n.name()) == Some(&Facing::Host) {
+        // One write lock + one arbitrated targetward channel per host-facing
+        // endpoint (§6). The daemon keeps a sender clone so `send` works even with
+        // no writer attached; each writer gets its own clone below.
+        for (addr, (f, arb)) in &facing {
+            if *f == Facing::Host {
                 wiring.endpoint_locks.insert(
-                    n.name().to_owned(),
+                    addr.clone(),
                     Rc::new(LockCell::new(
-                        n.name().to_owned(),
-                        EndpointLock::new(n.arbitration()),
+                        addr.to_string(),
+                        EndpointLock::new(*arb),
                         notifier.clone(),
                     )),
                 );
                 let (tx, rx) = mpsc::channel(CHANNEL_CAP);
-                wiring.serial_targetward.insert(n.name().to_owned(), rx);
-                wiring
-                    .endpoint_targetward
-                    .insert(n.name().to_owned(), tx.clone());
-                serial_targetward_tx.insert(n.name().to_owned(), tx);
+                wiring.host_targetward_rx.insert(addr.clone(), rx);
+                wiring.host_targetward_tx.insert(addr.clone(), tx);
             }
         }
 
         let mut next_origin = 0u64;
-
         for edge in &config.edges {
-            let a = facing.get(edge.a.node.as_str()).copied();
-            let b = facing.get(edge.b.node.as_str()).copied();
-            // Identify the host (serial) and target (consumer) ends. Same-facing
-            // or dangling edges can't occur post-validation; skip defensively.
-            let (host, target) = match (a, b) {
-                (Some(Facing::Host), Some(Facing::Target)) => (&edge.a.node, &edge.b.node),
-                (Some(Facing::Target), Some(Facing::Host)) => (&edge.b.node, &edge.a.node),
+            let fa = facing.get(&edge.a).map(|(f, _)| *f);
+            let fb = facing.get(&edge.b).map(|(f, _)| *f);
+            // Identify the host and target ends. Same-facing or dangling edges
+            // can't occur post-validation; skip defensively.
+            let (host, target) = match (fa, fb) {
+                (Some(Facing::Host), Some(Facing::Target)) => (&edge.a, &edge.b),
+                (Some(Facing::Target), Some(Facing::Host)) => (&edge.b, &edge.a),
                 _ => continue,
             };
 
             // Register this attachment as an origin on the host endpoint's lock
-            // (§6). A log's write mode is inherently `never` (§7.3) regardless of
-            // what the edge declares; every other edge carries its declared mode.
-            let mode = if is_log.get(target.as_str()).copied().unwrap_or(false) {
+            // (§6), labelled by the target's address so `lock`/`unlock` can name
+            // it. A log target is inherently `never`; every other edge carries its
+            // declared mode. The origin's label is its display address.
+            let mode = if is_log.get(target.node.as_str()).copied().unwrap_or(false) {
                 WriteMode::Never
             } else {
                 edge.write_mode
@@ -302,16 +309,17 @@ impl Wiring {
             let origin_id = OriginId(next_origin);
             next_origin += 1;
             if let Some(lock) = wiring.endpoint_locks.get(host) {
-                lock.borrow_mut().register(origin_id, target.clone(), mode);
+                lock.borrow_mut()
+                    .register(origin_id, target.to_string(), mode);
             }
 
-            // Targetward: only origins that can write (mode != never) get a path
-            // to the port and a lock handle to gate their drain (§6). A `never`
-            // spy or a log has neither, so it can never write. The per-endpoint
-            // targetward sender was created above; clone it to each writer.
+            // Targetward: only origins that can write (mode ≠ never) get a path to
+            // the host endpoint and a lock handle to gate their drain (§6).
             if mode != WriteMode::Never {
-                if let Some(ttx) = serial_targetward_tx.get(host) {
-                    wiring.pty_targetward.insert(target.clone(), ttx.clone());
+                if let Some(ttx) = wiring.host_targetward_tx.get(host) {
+                    wiring
+                        .target_targetward_tx
+                        .insert(target.clone(), ttx.clone());
                 }
                 if let Some(lock) = wiring.endpoint_locks.get(host) {
                     wiring
@@ -320,19 +328,19 @@ impl Wiring {
                 }
             }
 
-            // Hostward: one dedicated channel per (serial, consumer) edge, so a
-            // slow consumer's drops are isolated to its own channel (§5). One
-            // shared DropCounters rides with both ends — the serial reader counts
-            // full-buffer drops, the consumer counts its own boundary discards.
+            // Hostward: one dedicated channel per (host, target) edge, so a slow
+            // consumer's drops are isolated to its own channel (§5). One shared
+            // DropCounters rides with both ends — the producer counts full-buffer
+            // drops, the consumer counts its own boundary discards.
             let (htx, hrx) = mpsc::channel(CHANNEL_CAP);
             let counters = Arc::new(DropCounters::default());
             wiring
-                .serial_hostward
+                .host_sinks
                 .entry(host.clone())
                 .or_default()
                 .push((htx, counters.clone()));
-            wiring.consumer_hostward.insert(target.clone(), hrx);
-            wiring.consumer_counters.insert(target.clone(), counters);
+            wiring.target_hostward_rx.insert(target.clone(), hrx);
+            wiring.target_counters.insert(target.clone(), counters);
         }
 
         wiring

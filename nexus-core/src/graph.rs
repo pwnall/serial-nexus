@@ -247,6 +247,16 @@ pub enum ValidationError {
         node: String,
         endpoint: Option<String>,
     },
+    /// Two of a node's endpoints share a local name — a multi-endpoint node (a
+    /// codec) with a duplicate channel identity, or a channel identity colliding
+    /// with the reserved multiplexed-side default endpoint (an empty identity,
+    /// §3). The second endpoint would be permanently shadowed (endpoint resolution
+    /// returns the first match), so it is a structural error naming the offender.
+    DuplicateEndpoint { node: String, endpoint: String },
+    /// Two nodes share a name. Node names key the graph (and the endpoint-addressed
+    /// data-plane wiring), so a duplicate would silently collapse one node into the
+    /// other — a structural error naming the offender (§3, §4).
+    DuplicateNodeName { node: String },
     /// An edge references a node that does not exist.
     UnknownNode { edge: usize, node: String },
     /// An edge references an endpoint the node does not expose.
@@ -281,6 +291,25 @@ impl fmt::Display for ValidationError {
                     f,
                     "channel identity {channel:?} on node {node:?} contains '/', which names and channel identities may not (§3)"
                 )
+            }
+            ValidationError::DuplicateNodeName { node } => {
+                write!(
+                    f,
+                    "node name {node:?} is declared more than once (node names must be unique, §4)"
+                )
+            }
+            ValidationError::DuplicateEndpoint { node, endpoint } => {
+                if endpoint.is_empty() {
+                    write!(
+                        f,
+                        "node {node:?} has a channel identity colliding with its multiplexed-side default endpoint (an empty channel identity is not allowed, §3)"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "node {node:?} declares endpoint {endpoint:?} more than once (a duplicate channel identity would be shadowed, §3)"
+                    )
+                }
             }
             ValidationError::UnknownNode { edge, node } => {
                 write!(f, "edge {edge} references unknown node {node:?}")
@@ -352,11 +381,23 @@ impl GraphModel {
                     endpoint: None,
                 });
             }
+            // Endpoint names must be locally unique: a codec is the first node kind
+            // with multiple endpoints, so a duplicate channel identity — or a
+            // channel identity colliding with the reserved multiplexed-side default
+            // endpoint (an empty identity) — would leave the second endpoint dead
+            // (resolution returns the first match). Report it, naming the offender.
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
             for ep in &shape.endpoints {
                 if ep.name.contains('/') {
                     errors.push(ValidationError::InvalidName {
                         node: node.clone(),
                         endpoint: Some(ep.name.clone()),
+                    });
+                }
+                if !seen.insert(ep.name.as_str()) {
+                    errors.push(ValidationError::DuplicateEndpoint {
+                        node: node.clone(),
+                        endpoint: ep.name.clone(),
                     });
                 }
             }
@@ -689,6 +730,75 @@ mod tests {
                     if node == "mux" && c == "con/sole"
             )),
             "expected InvalidName for a slashed channel identity, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_channel_identity_is_rejected() {
+        // A codec (the first multi-endpoint node kind) with two channels named the
+        // same: the second would be shadowed, so it is a structural error.
+        let mut g = GraphModel::new();
+        g.add_node(
+            "mux",
+            NodeShape::new(vec![
+                EndpointSpec::target(DEFAULT_ENDPOINT),
+                EndpointSpec::host("con"),
+                EndpointSpec::host("con"),
+            ]),
+        );
+        let errs = g.validate();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::DuplicateEndpoint { node, endpoint }
+                    if node == "mux" && endpoint == "con"
+            )),
+            "expected DuplicateEndpoint for a repeated channel identity, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn empty_channel_identity_collides_with_the_mux_default_endpoint() {
+        // A codec's multiplexed side is the default (empty) endpoint; an empty
+        // channel identity collides with it and must be rejected, naming the node.
+        let mut g = GraphModel::new();
+        g.add_node(
+            "mux",
+            NodeShape::new(vec![
+                EndpointSpec::target(DEFAULT_ENDPOINT),
+                EndpointSpec::host(DEFAULT_ENDPOINT),
+            ]),
+        );
+        let errs = g.validate();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::DuplicateEndpoint { node, endpoint }
+                    if node == "mux" && endpoint.is_empty()
+            )),
+            "expected DuplicateEndpoint for an empty channel identity, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_codec_endpoints_pass() {
+        // The legitimate demux shape — mux default endpoint plus distinct named
+        // channels — must not trip the duplicate check.
+        let mut g = GraphModel::new();
+        g.add_node(
+            "mux",
+            NodeShape::new(vec![
+                EndpointSpec::target(DEFAULT_ENDPOINT),
+                EndpointSpec::host("console"),
+                EndpointSpec::host("trace"),
+            ]),
+        );
+        let errs = g.validate();
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::DuplicateEndpoint { .. })),
+            "distinct codec endpoints must not trip the duplicate check, got {errs:?}"
         );
     }
 

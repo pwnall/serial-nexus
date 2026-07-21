@@ -6,18 +6,23 @@
 //! operation that created it (§15.8). Slice 2 wires the data plane so bytes flow
 //! serial↔PTY and adds presence gating.
 
+pub mod codec;
+pub mod exec;
 pub mod log;
 pub mod pty;
 pub mod serial;
 
 use nexus_core::NodeStatus;
 use nexus_core::config::NodeConfig;
+use nexus_core::graph::EndpointAddr;
 
 /// A live node: its operator-facing name and its environment-owned status.
 pub enum Node {
     Serial(serial::SerialNode),
     Pty(pty::PtyNode),
     Log(log::LogNode),
+    Codec(codec::CodecNode),
+    Exec(exec::ExecCodecNode),
 }
 
 impl Node {
@@ -29,6 +34,26 @@ impl Node {
             NodeConfig::Serial { .. } => Node::Serial(serial::SerialNode::create(config)),
             NodeConfig::Pty { .. } => Node::Pty(pty::PtyNode::create(config)),
             NodeConfig::Log { .. } => Node::Log(log::LogNode::create(config)),
+            // A codec node (§7.5/§7.6). The exec codec is a child process, hosted
+            // separately; every other codec is an in-process transform built from
+            // the registry. A bad codec name or attribute schema is structural — it
+            // aborts the load with nothing created (§8, §11), returning `Err` here.
+            NodeConfig::Codec {
+                codec: codec_name,
+                attributes,
+                ..
+            } if codec_name == "exec" => {
+                exec::parse_attributes(attributes)?;
+                Node::Exec(exec::ExecCodecNode::create(config))
+            }
+            NodeConfig::Codec {
+                codec: codec_name,
+                attributes,
+                ..
+            } => Node::Codec(codec::CodecNode::create(
+                config,
+                codec::build_codec(codec_name, attributes)?,
+            )),
         })
     }
 
@@ -37,6 +62,8 @@ impl Node {
             Node::Serial(n) => &n.name,
             Node::Pty(n) => &n.name,
             Node::Log(n) => &n.name,
+            Node::Codec(n) => &n.name,
+            Node::Exec(n) => &n.name,
         }
     }
 
@@ -45,6 +72,8 @@ impl Node {
             Node::Serial(n) => n.status(),
             Node::Pty(n) => n.status(),
             Node::Log(n) => n.status(),
+            Node::Codec(n) => n.status(),
+            Node::Exec(n) => n.status(),
         }
     }
 
@@ -55,30 +84,40 @@ impl Node {
             Node::Serial(n) => n.state_extra(),
             Node::Pty(n) => n.state_extra(),
             Node::Log(n) => n.state_extra(),
+            Node::Codec(n) => n.state_extra(),
+            Node::Exec(n) => n.state_extra(),
         }
     }
 
-    /// Start this node's data-plane tasks, taking its channels out of the
-    /// wiring plan (§5). Called from `load` after instantiation and validation.
+    /// Start this node's data-plane tasks, taking its endpoints' channels out of
+    /// the wiring plan (§5). Called from `load` after instantiation and validation.
+    /// Single-endpoint boundary nodes (serial, pty, log) claim their sole endpoint
+    /// (the node's default address); the interior codec claims its multiplexed side
+    /// and every channel itself.
     pub fn start(&mut self, wiring: &mut crate::runtime::Wiring) {
         match self {
             Node::Serial(n) => {
-                let hostward = wiring.serial_hostward.remove(&n.name).unwrap_or_default();
-                let targetward = wiring.serial_targetward.remove(&n.name);
+                let addr = EndpointAddr::node(&n.name);
+                let hostward = wiring.host_sinks.remove(&addr).unwrap_or_default();
+                let targetward = wiring.host_targetward_rx.remove(&addr);
                 n.start(hostward, targetward);
             }
             Node::Pty(n) => {
-                let hostward = wiring.consumer_hostward.remove(&n.name);
-                let targetward = wiring.pty_targetward.remove(&n.name);
-                let counters = wiring.consumer_counters.remove(&n.name);
-                let lock = wiring.origin_locks.remove(&n.name);
+                let addr = EndpointAddr::node(&n.name);
+                let hostward = wiring.target_hostward_rx.remove(&addr);
+                let targetward = wiring.target_targetward_tx.remove(&addr);
+                let counters = wiring.target_counters.remove(&addr);
+                let lock = wiring.origin_locks.remove(&addr);
                 n.start(hostward, targetward, counters, lock);
             }
             Node::Log(n) => {
-                let hostward = wiring.consumer_hostward.remove(&n.name);
-                let counters = wiring.consumer_counters.remove(&n.name);
+                let addr = EndpointAddr::node(&n.name);
+                let hostward = wiring.target_hostward_rx.remove(&addr);
+                let counters = wiring.target_counters.remove(&addr);
                 n.start(hostward, counters);
             }
+            Node::Codec(n) => n.start(wiring),
+            Node::Exec(n) => n.start(wiring),
         }
     }
 
@@ -108,6 +147,8 @@ impl Node {
             Node::Serial(n) => n.teardown(),
             Node::Pty(n) => n.teardown(),
             Node::Log(n) => n.teardown(),
+            Node::Codec(n) => n.teardown(),
+            Node::Exec(n) => n.teardown(),
         }
     }
 }

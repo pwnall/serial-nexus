@@ -1,0 +1,18 @@
+[package]
+name = "codec-reference"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The reference framing codec: the v1 envelope format as a demux/remux codec, and the link codec's core (§7.5, §9)."
+
+[lints]
+workspace = true
+
+[dependencies]
+codec-api.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

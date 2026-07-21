@@ -16,10 +16,14 @@ use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
+use codec_api::{Event, FrameDecoder, encode};
 use nix::fcntl::OFlag;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::pty::{PtyMaster, grantpt, posix_openpt, ptsname_r, unlockpt};
@@ -43,6 +47,13 @@ enum Mode {
     Pty(PtyArgs),
     /// Open an existing PTY like an operator would and drive it.
     Client(ClientArgs),
+    /// Emit (or manifest) reference-framed multichannel streams for a demux node
+    /// to split, with per-channel checksums and a computed expected-loss set under
+    /// `--corrupt-every` (§8, phase 5).
+    Mux(MuxArgs),
+    /// Drive an external codec child through the golden-vector envelope battery,
+    /// proving any-language envelope conformance (§8, phase 5).
+    Envelope(EnvelopeArgs),
 }
 
 #[derive(Args)]
@@ -124,11 +135,61 @@ struct ClientArgs {
     timeout_ms: u64,
 }
 
+#[derive(Args)]
+struct MuxArgs {
+    /// Channel identity to emit (repeatable). Must match the demux node's
+    /// configured channel list, in the same order.
+    #[arg(long = "channel")]
+    channels: Vec<String>,
+    /// Bytes of seeded data per channel (e.g. `8MiB`).
+    #[arg(long, default_value = "1MiB")]
+    bytes: String,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    /// Corrupt one in every N emitted frames (0 = none) by mangling its type byte,
+    /// keeping the length prefix intact so the decoder resyncs exactly (§7.5).
+    #[arg(long, default_value_t = 0)]
+    corrupt_every: u64,
+    /// Maximum data payload per frame.
+    #[arg(long, default_value_t = 4096)]
+    frame_size: usize,
+    /// Compute and print the per-channel manifest (expected delivered bytes and
+    /// checksums) without touching a PTY, then exit — the deterministic oracle the
+    /// channel clients check against.
+    #[arg(long)]
+    manifest: bool,
+    /// Feed mode: create a PTY pair, maintain this symlink to the pts node (the
+    /// device path the demux's serial opens), write the framed stream, then hold
+    /// the device present until `--timeout-ms`.
+    #[arg(long)]
+    link: Option<PathBuf>,
+    /// Feed mode: before writing the framed stream, wait until this file exists
+    /// (up to `--timeout-ms`). Lets a harness attach the hostward channel clients
+    /// first, so the presence-gated PTYs do not discard the initial burst.
+    #[arg(long)]
+    wait_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 10_000)]
+    timeout_ms: u64,
+}
+
+#[derive(Args)]
+struct EnvelopeArgs {
+    /// The external codec child to drive, as a shell command
+    /// (e.g. `python3 tests/ext-codec/passthrough.py`). It must read envelope
+    /// frames on stdin and re-emit them on stdout (a passthrough codec).
+    #[arg(long)]
+    exec: String,
+    #[arg(long, default_value_t = 5_000)]
+    timeout_ms: u64,
+}
+
 fn main() {
     let cli = Cli::parse();
     let verdict = match cli.mode {
         Mode::Pty(a) => run_pty(a),
         Mode::Client(a) => run_client(a),
+        Mode::Mux(a) => run_mux(a),
+        Mode::Envelope(a) => run_envelope(a),
     };
     println!("{verdict}");
     let pass = verdict
@@ -578,4 +639,291 @@ fn recv_loop<F: AsFd + Read>(
             .map(|b| format!("{b:02x}"))
             .collect(),
     ))
+}
+
+// --- mux mode --------------------------------------------------------------
+
+/// One channel's slice of the manifest: how many bytes the demux node should
+/// deliver on it (the source stream minus any corrupted frames' payloads) and the
+/// checksum of exactly those bytes — the oracle a channel client checks against.
+struct ChannelManifest {
+    id: String,
+    delivered: u64,
+    sha256: String,
+}
+
+/// The full framed stream plus the manifest it satisfies. Built deterministically
+/// from `(seed, channels, bytes, corrupt_every, frame_size)`, so `--manifest`
+/// (pure) and the feed path agree byte for byte.
+struct MuxPlan {
+    wire: Vec<u8>,
+    channels: Vec<ChannelManifest>,
+    frames: u64,
+    corrupted: u64,
+}
+
+/// Round-robin seeded per-channel data into reference-framed envelope frames,
+/// corrupting one in every `corrupt_every` frames (0 = none) by mangling its type
+/// byte while leaving the length prefix intact — so the demux codec resyncs by
+/// frame length and drops exactly the corrupt frame (§7.5). Tracks per channel the
+/// bytes that survive (are delivered) and their checksum.
+fn build_mux(
+    channels: &[String],
+    bytes_per_channel: usize,
+    seed: u64,
+    corrupt_every: u64,
+    frame_size: usize,
+) -> anyhow::Result<MuxPlan> {
+    if channels.is_empty() {
+        anyhow::bail!("mux: at least one --channel is required");
+    }
+    let frame_size = frame_size.max(1);
+    let streams: Vec<Vec<u8>> = (0..channels.len())
+        .map(|i| seeded_bytes(seed.wrapping_add(i as u64), bytes_per_channel))
+        .collect();
+    let mut cursors = vec![0usize; channels.len()];
+    let mut delivered = vec![Vec::<u8>::new(); channels.len()];
+    let mut wire = Vec::new();
+    let mut frame_no: u64 = 0;
+    let mut corrupted: u64 = 0;
+
+    // Emit one frame per channel per round until every stream is exhausted.
+    loop {
+        let mut any = false;
+        for (i, chan) in channels.iter().enumerate() {
+            if cursors[i] >= streams[i].len() {
+                continue;
+            }
+            any = true;
+            let end = (cursors[i] + frame_size).min(streams[i].len());
+            let payload = streams[i][cursors[i]..end].to_vec();
+            cursors[i] = end;
+
+            let frame_start = wire.len();
+            let ev = Event::data(chan.as_str(), Bytes::from(payload.clone()));
+            encode(&ev, &mut wire).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+
+            if corrupt_every > 0 && (frame_no + 1) % corrupt_every == 0 {
+                // The type byte is the first body byte, at frame_start + 4.
+                wire[frame_start + 4] = 0xFF;
+                corrupted += 1;
+            } else {
+                delivered[i].extend_from_slice(&payload);
+            }
+            frame_no += 1;
+        }
+        if !any {
+            break;
+        }
+    }
+
+    let channels = channels
+        .iter()
+        .enumerate()
+        .map(|(i, id)| ChannelManifest {
+            id: id.clone(),
+            delivered: delivered[i].len() as u64,
+            sha256: sha256_hex(&delivered[i]),
+        })
+        .collect();
+    Ok(MuxPlan {
+        wire,
+        channels,
+        frames: frame_no,
+        corrupted,
+    })
+}
+
+fn manifest_json(plan: &MuxPlan, behavior: &str, extra: Value) -> Value {
+    let channels: Vec<Value> = plan
+        .channels
+        .iter()
+        .map(|c| json!({"id": c.id, "delivered": c.delivered, "sha256": c.sha256}))
+        .collect();
+    let mut obj = json!({
+        "tool": "nexus-sim", "mode": "mux", "behavior": behavior,
+        "channels": channels, "frames": plan.frames, "corrupted": plan.corrupted,
+        "pass": true,
+    });
+    if let (Value::Object(o), Value::Object(e)) = (&mut obj, extra) {
+        o.extend(e);
+    }
+    obj
+}
+
+fn run_mux(a: MuxArgs) -> Value {
+    match run_mux_inner(&a) {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(link) = &a.link {
+                let _ = std::fs::remove_file(link);
+            }
+            err_verdict("mux", &e)
+        }
+    }
+}
+
+fn run_mux_inner(a: &MuxArgs) -> anyhow::Result<Value> {
+    let bytes_per_channel = parse_size(&a.bytes)?;
+    let plan = build_mux(
+        &a.channels,
+        bytes_per_channel,
+        a.seed,
+        a.corrupt_every,
+        a.frame_size,
+    )?;
+
+    // Manifest mode: print the oracle and exit, without a PTY.
+    if a.manifest {
+        return Ok(manifest_json(&plan, "manifest", json!({})));
+    }
+
+    // Feed mode: create the PTY, write the framed stream, hold the device present.
+    let link = a
+        .link
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("mux feed needs --link (or use --manifest)"))?;
+    let mut master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY)?;
+    grantpt(&master)?;
+    unlockpt(&master)?;
+    let pts = ptsname_r(&master)?;
+    set_raw(&master)?;
+    let _ = std::fs::remove_file(link);
+    std::os::unix::fs::symlink(&pts, link)?;
+
+    // Optionally wait for the harness's go-signal (the channel clients attached)
+    // before feeding, so the presence-gated demux PTYs do not discard the burst.
+    if let Some(go) = &a.wait_file {
+        let deadline = Instant::now() + Duration::from_millis(a.timeout_ms);
+        while !go.exists() {
+            if Instant::now() >= deadline {
+                anyhow::bail!("wait-file {} never appeared", go.display());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // Write the whole framed stream. A blocking master write backpressures against
+    // the daemon's serial reader, so this returns only once the daemon has drained
+    // all but the last kernel-buffer-full.
+    master.write_all(&plan.wire)?;
+    master.flush()?;
+
+    // Hold the device present (draining and discarding any targetward bytes so the
+    // daemon's serial writer never blocks) until the timeout, then unlink.
+    let deadline = Instant::now() + Duration::from_millis(a.timeout_ms);
+    let mut buf = [0u8; 8192];
+    while Instant::now() < deadline {
+        let re = wait_readable(&master, 200)?;
+        if re.contains(PollFlags::POLLIN) {
+            match master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if is_eio(&e) => break,
+                Err(e) => return Err(e.into()),
+            }
+        } else if re.contains(PollFlags::POLLHUP) {
+            break;
+        }
+    }
+    let _ = std::fs::remove_file(link);
+    Ok(manifest_json(
+        &plan,
+        "feed",
+        json!({"bytes_written": plan.wire.len()}),
+    ))
+}
+
+// --- envelope mode ---------------------------------------------------------
+
+/// The golden-vector battery: every event kind plus edge cases (empty payload,
+/// binary payload, a long channel id, back-to-back frames on one channel). A
+/// conforming child re-emits exactly this sequence.
+fn golden_battery() -> Vec<Event> {
+    vec![
+        Event::open("console"),
+        Event::data("console", Bytes::from_static(b"hi")),
+        Event::data("console", Bytes::from_static(b"")),
+        Event::data("bin", Bytes::from_static(b"\x00\x01\xff\xfe binary\n")),
+        Event::data("a-long-channel-identity-name", Bytes::from_static(b"x")),
+        Event::error("c0", "framing error: resync"),
+        Event::close("console"),
+        Event::data("t", Bytes::from_static(b"1")),
+        Event::data("t", Bytes::from_static(b"22")),
+        Event::data("t", Bytes::from_static(b"333")),
+    ]
+}
+
+fn run_envelope(a: EnvelopeArgs) -> Value {
+    match run_envelope_inner(&a) {
+        Ok(v) => v,
+        Err(e) => err_verdict("envelope", &e),
+    }
+}
+
+fn run_envelope_inner(a: &EnvelopeArgs) -> anyhow::Result<Value> {
+    let battery = golden_battery();
+    let mut input = Vec::new();
+    for ev in &battery {
+        encode(ev, &mut input).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+    }
+
+    // Drive the child as a shell command so `--exec "python3 x.py"` works verbatim.
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&a.exec)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn {:?}: {e}", a.exec))?;
+
+    // Feed stdin from a thread and close it (EOF), so a child that writes as it
+    // reads cannot deadlock against a full stdout pipe.
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let writer = thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+        // Dropping `stdin` here closes the child's stdin.
+    });
+    let mut stdout = child.stdout.take().expect("piped stdout");
+
+    // Read stdout to EOF on a thread, bounded by the timeout.
+    let (tx, rx) = std_mpsc::channel();
+    thread::spawn(move || {
+        let mut out = Vec::new();
+        let res = stdout.read_to_end(&mut out).map(|_| out);
+        let _ = tx.send(res);
+    });
+    let output = match rx.recv_timeout(Duration::from_millis(a.timeout_ms)) {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            let _ = child.kill();
+            anyhow::bail!("reading child stdout: {e}");
+        }
+        Err(_) => {
+            let _ = child.kill();
+            anyhow::bail!("child did not complete within {} ms", a.timeout_ms);
+        }
+    };
+    let _ = writer.join();
+    let _ = child.wait();
+
+    // Decode what the child re-emitted and compare to the battery.
+    let mut dec = FrameDecoder::new();
+    dec.push(&output);
+    let mut got = Vec::new();
+    loop {
+        match dec.next_event() {
+            Ok(Some(ev)) => got.push(ev),
+            Ok(None) => break,
+            Err(e) => anyhow::bail!("child emitted a malformed frame: {e}"),
+        }
+    }
+    let trailing = dec.buffered();
+    let pass = got == battery && trailing == 0;
+    Ok(json!({
+        "tool": "nexus-sim", "mode": "envelope",
+        "sent_frames": battery.len(), "received_frames": got.len(),
+        "trailing_bytes": trailing, "pass": pass,
+    }))
 }

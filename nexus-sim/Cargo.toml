@@ -18,3 +18,8 @@ nix = { workspace = true, features = ["term", "fs", "poll", "ioctl"] }
 libc.workspace = true
 anyhow.workspace = true
 sha2.workspace = true
+# The `mux`/`envelope` modes (phase 5) produce and verify reference-framed
+# streams and drive external codec children through the golden-vector battery —
+# both speak the shared envelope, so the double links codec-api directly (§8).
+codec-api.workspace = true
+bytes.workspace = true

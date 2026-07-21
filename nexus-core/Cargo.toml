@@ -14,8 +14,10 @@ workspace = true
 serde.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
+# The codec node's opaque attribute table (§8) is a `toml::Table` — a config
+# type, so toml is a regular dependency, not test-only.
+toml.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
-toml.workspace = true
 proptest.workspace = true

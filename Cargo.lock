@@ -172,6 +172,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-reference"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "codec-api",
+ "proptest",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -477,7 +486,9 @@ name = "nexus-sim"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
+ "codec-api",
  "libc",
  "nix",
  "serde_json",
@@ -760,6 +771,7 @@ dependencies = [
  "bytes",
  "clap",
  "codec-api",
+ "codec-reference",
  "futures",
  "libc",
  "nexus-core",
