@@ -1,7 +1,9 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-20 (phase 0-3 done and audited against v4). **Branch:**
-`implementation` (off `main`).
+**As of:** 2026-07-20 (phase 0-3 done + audited against v4; phase 4 slices A & B
+done — arbitration lock, purge, detach-release, free-for-all). **Stopped before
+phase 4 slice C** (`send`/`--steal`/`--lease`/`--wait` + lock notifications) — see
+§6b for the exact next step. **Branch:** `implementation` (off `main`).
 **Normative docs:** `docs/09-design-claude-fable-v4.md` (design) and
 `docs/10-implementation-plan-claude-fable-v4.md` (plan). v1/v2/v3 docs (03–08) are
 in `docs/historical/`. Section references (§) point at the v4 design.
@@ -49,14 +51,15 @@ the items below are refinements consistent with the design, none contradict it.
 | 1 | Contracts in the small | **done** — nexus-core, codec-api, nexus-sim |
 | 2 | Walking skeleton | **done** — control plane + node lifecycle + data plane (serial↔PTY byte flow, presence gating, backpressure) |
 | 3 | Boundaries & logging | **done** — drop counters, log node, `rotate`/`subscribe`, client-termios, high-throughput data plane + benchmark (§3.11) |
-| 4 | Arbitration | **in progress** — slice A done: per-endpoint exclusive write lock, `lock`/`unlock`, the `may_write` gate on the PTY targetward drain, lock state in `state` (§3.12). Slices B (purge/detach-release/free-for-all) and C (send/steal/lease/wait/notifications) pending |
+| 4 | Arbitration | **in progress** — slices A & B done: per-endpoint exclusive write lock, `lock`/`unlock`, the `may_write` gate, purge-on-acquire/-detach with counters, detach-release, held mode, free-for-all, lock state in `state` (§3.12, §6b). **Slice C pending:** the `send` verb, `--steal`/`--lease`/`--wait` (needs async dispatch), lock-change `subscribe` notifications |
 | 5–8 | Codecs, wire, identity, hardening | not started |
 
 **Quality gates (all green):** `cargo fmt --all --check`, `cargo clippy
 --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace`,
-and `bash scripts/validate/all.sh --through 3` (phase 3 adds `counters.sh`,
+and `bash scripts/validate/all.sh --through 4` (16 pass, 0 fail). Phase 4 adds
+`phase4/{exclusivity,purge,free-for-all,held}.sh`; phase 3 added `counters.sh`,
 `log.sh`, `log-enospc.sh`, `subscribe.sh`, `firehose.sh`, `exact-loss.sh`,
-`benchmark.sh`).
+`benchmark.sh`.
 
 **Kernel matrix:** every kernel-behavior probe is `supported` on **Linux 7.0.0**
 (dev box, Ubuntu 26.04) and **Linux 6.18.14** (Debian rodete) with **zero
@@ -405,20 +408,42 @@ serial endpoint is a legal §4 fan-out).
   transition is handled once, post-drain, by `handle_last_close` — the holder
   releases (detach-release), an **exclusive non-holder's** buffered backlog is
   drained+counted (purge-on-detach), and a free-for-all writer keeps its bytes.
-  Purge-on-acquire fires on the `may_write` false→true transition (exclusive only),
-  draining+counting the pre-grant backlog via `drain_and_discard`. Purge counters
-  surface in `state` as `.lock.origins[].purged`. Two subtle bugs were caught in
-  build-out and fixed: a closing free-for-all writer's residual was purged instead
-  of forwarded (fixed by the drain-regardless-of-POLLHUP restructure + purge-only-
-  exclusive-non-holder); and a lingering `TIOCPKT_IOCTL` packet re-populated
-  `client_termios` after last-close cleared it (fixed by gating the termios
-  reconcile on `now`). Validated by `phase4/purge.sh` (purge-on-detach and
-  purge-on-acquire count exactly, device receives nothing) and
-  `phase4/free-for-all.sh` (two writers both reach the device — stable over many
-  runs after the fix); `exclusivity.sh` now also asserts detach-release.
-- **Slice C PENDING:** the atomic `send` verb, `--steal`/`--lease`/`--wait` (async
-  dispatch), and lock-change `subscribe` notifications (periodic snapshots already
-  surface `.lock`, so changes are visible at 200 ms granularity today).
+  Purge-on-acquire runs **synchronously in `daemon::lock`** at grant time
+  (exclusive only), draining+counting the pre-grant backlog via `Node::purge_origin`
+  *before the grant reply returns*; a held holder keeps the lock across a client
+  detach. Purge counters surface in `state` as `.lock.origins[].purged`. Bugs caught
+  & fixed during build-out and an adversarial multi-agent review (details in §3.12):
+  a closing free-for-all writer's residual was purged not forwarded; a lingering
+  `TIOCPKT_IOCTL` re-populated `client_termios` after last-close; the purge-on-acquire
+  drain was initially in the async reader and raced a correct acquire-then-write
+  client (moved to the daemon); a held holder was wrongly detach-released. Validated
+  by `phase4/{purge,free-for-all,held}.sh` (purge counts exact, post-grant survives,
+  two free-for-all writers both reach the device, held keeps its lock);
+  `exclusivity.sh` now also asserts detach-release.
+
+- **Slice C — NEXT (where this session stopped).** The remaining §6 surface:
+  - **`send <endpoint> --line` (atomic acquire-with-timeout → write → release):**
+    the CLI is a *transient targetward origin* on the named host-facing endpoint
+    (not a PTY). The serial already exposes a targetward `mpsc::Sender`
+    (`runtime::Wiring::pty_targetward` / `serial_targetward`); register a synthetic
+    origin in that endpoint's `EndpointLock`, acquire it (reusing the `daemon::lock`
+    purge path), push the line, release.
+  - **`--steal`** (transfer the lock; record the theft in state so the prior holder
+    sees it; emit a notification), **`--lease`** (auto-release after a duration —
+    the lock machine has `holder`/`release` but no lease/expiry field yet),
+    **`--wait`** (block until the lock frees).
+  - **Async dispatch (the architectural step):** `--wait` and `send`'s
+    acquire-with-timeout must not block the runtime thread. `Daemon::dispatch` is
+    **synchronous** today (`daemon.rs`, called from `control.rs::handle_line`). Make
+    the lock/send methods async (await a per-endpoint `tokio::sync::Notify` woken on
+    release), and **never hold a `RefCell` borrow across an `.await`** — the daemon
+    is `Rc<RefCell<GraphState>>` on one thread, and each `EndpointLock` is
+    `Rc<RefCell<_>>`: borrow, compute, drop, *then* await.
+  - **Notifications:** lock changes already appear in the 200 ms periodic `state`
+    snapshot; add an *immediate* id-less notification on acquire/release/steal.
+  - Maps to plan §Phase 4 items 4 (steal/lease) and 5 (`send` semantics); test
+    topology is two PTYs on one exclusive serial (as `exclusivity.sh`) plus the CLI
+    `send`.
 
 ---
 
