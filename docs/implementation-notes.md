@@ -1,11 +1,37 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-21 (phase 0-4 done; **phase 5 COMPLETE** — slices A/B/C, all six
-validation items green, audited against v5 with 14 findings fixed). **Next: phase 6**
-(the wire / leg node). **Branch:** `implementation` (off `main`). **Normative docs:**
-`docs/11-design-claude-fable-v5.md` (design) and
+**As of:** 2026-07-21 (phase 0-5 done; **phase 6 COMPLETE** — the leg node + v1 wire
+protocol, all six validation items green, audited against v5 with 17 findings fixed).
+**Next: phase 7** (identity & resilience). **Branch:** `implementation` (off `main`).
+**Normative docs:** `docs/11-design-claude-fable-v5.md` (design) and
 `docs/12-implementation-plan-claude-fable-v5.md` (plan). v1–v4 docs (03–10) are in
 `docs/historical/`. Section references (§) point at the v5 design.
+
+**Phase 6 (2026-07-21).** The cross-daemon transport (§7.4/§9): a new **leg node**
+(`nodes/leg.rs`) carrying N channels multiplexed over a tcp|unix socket by the
+built-in **link codec** (the shared envelope, §8). `codec-api` grew the **v1 wire
+hello** (`WIRE_MAGIC` "SNXL", `WIRE_VERSION` distinct from `ENVELOPE_VERSION`, a `u32`
+capability bitset with `CAP_LOCK_RELAY` reserved, `Hello`/`encode_hello`/
+`try_decode_hello`, `WireError`) — a distinct wire construct, not a fifth event kind,
+so the four golden vectors stay frozen. `nexus-core` gained the `NodeConfig::Leg`
+variant (+ `Transport`/`LegRole`), the leg `shape()` (N channel endpoints, no default
+endpoint), and config-level validation (loopback-only unless `insecure_bind`, empty
+channel/list rejection → new `ValidationError::{NonLoopbackBind,EmptyLeg}`). The leg
+plugs into the §15.23 endpoint-keyed `Wiring` with **zero `Wiring::build` change** —
+purely via `shape()`. `nexus-sim` grew `wire` (hostile-or-conforming peer / §9
+conformance driver) and `tcp-proxy` (outage injection) modes, plus `pty --stall`. One
+new ADR landed — **§15.24** (the leg node, the hello frame, fragmentation-not-drop,
+faulted-and-wait); §7.5/§15.23/§14 were touched for the re-multiplexer scoping. A
+multi-agent adversarial audit of the built phase 6 found **17 confirmed issues, all
+fixed** — most importantly a **critical §5/§9 targetward-no-drop violation** (the leg's
+write half `continue`d on an oversize-frame encode error, silently dropping any chunk
+whose framed size exceeded `MAX_FRAME_SIZE` — reachable because `READ_BUF ==
+MAX_FRAME_SIZE` and the `send` verb line is uncapped; **fixed** by fragmenting oversize
+chunks across consecutive `data` frames, verified with a 100 001-byte `send`
+round-trip) and a **stale-status wedge** (a `faces=target` leg whose local producers
+closed returned `SourceClosed` and left status `Active`/"connected" forever; **fixed**
+by parking the write half so the independent read direction and the wire stay live).
+See §6d below.
 
 **Phase 5 (2026-07-21).** The codec runtime (§7.5/§7.6/§8): a new `codecs/reference`
 crate (the v1 envelope framing as a `Codec`, with length-guided resync); the
@@ -85,13 +111,15 @@ the items below are refinements consistent with the design, none contradict it.
 | 3 | Boundaries & logging | **done** — drop counters, log node, `rotate`/`subscribe`, client-termios, high-throughput data plane + benchmark (§3.11) |
 | 4 | Arbitration | **done** — slices A & B (exclusive write lock, `lock`/`unlock`, `may_write` gate, purge-on-acquire/-detach, detach-release, held, free-for-all) plus **slice C**: the FIFO waiter queue + two-lane async dispatch, `send`, `--steal`/`--wait`/`--lease-ms`, lease generation-guard, immediate lock notifications (§3.12, §6b, §15.20) |
 | 5 | Codecs | **done** — codec runtime + registry (§8), the `codecs/reference` framing codec (resync), the interior codec node + exec codec (§7.5/§7.6), endpoint-keyed wiring, `nexus-sim` `mux`/`envelope`; audited (§6c, §15.22, §15.23) |
-| 6–8 | Wire, identity, hardening | not started |
+| 6 | The wire | **done** — leg node (§7.4) + v1 wire hello (§9), fragmentation, binding, faulted-and-wait/purge-on-reconnect, `nexus-sim` `wire`/`tcp-proxy`, §9 conformance scripts; audited (§6d, §15.24) |
+| 7–8 | Identity, hardening | not started |
 
 **Quality gates (all green):** `cargo fmt --all --check`, `cargo clippy
---workspace --all-targets --locked -- -D warnings`, `cargo test --workspace` (64
-pass), and `bash scripts/validate/all.sh --through 5` (**26 pass, 0 fail**). Phase 5
-scripts: `phase5/{envelope,demux,resync,held,bad-attributes,exec-crash}.sh`; phase 4
-scripts: `phase4/{exclusivity,purge,free-for-all,held,send,steal-lease,waiting}.sh`;
+--workspace --all-targets --locked -- -D warnings`, `cargo test --workspace` (76
+pass), and `bash scripts/validate/all.sh --through 6` (**32 pass, 0 fail**). Phase 6
+scripts: `phase6/{reference,binding,hostility,insecure-bind,outage,head-of-line}.sh`;
+phase 5 scripts: `phase5/{envelope,demux,resync,held,bad-attributes,exec-crash}.sh`;
+phase 4 scripts: `phase4/{exclusivity,purge,free-for-all,held,send,steal-lease,waiting}.sh`;
 phase 3 added `counters.sh`, `log.sh`, `log-enospc.sh`, `subscribe.sh`,
 `firehose.sh`, `exact-loss.sh`, `benchmark.sh`.
 
@@ -106,22 +134,23 @@ are de-risked across the support matrix.
 
 | Crate | Role | State |
 |-------|------|-------|
-| `codec-api` | codec trait (+ `resync_count`), event vocabulary, envelope frame codec + golden vectors (§8/§9) | done |
+| `codec-api` | codec trait (+ `resync_count`), event vocabulary, envelope frame codec + golden vectors, **v1 wire hello** (`WIRE_MAGIC`/`WIRE_VERSION`/`Hello`/`WireError`) (§8/§9) | done |
 | `codecs/reference` (`codec-reference`) | the v1 envelope framing as a `Codec`, with length-guided resync (§7.5/§9) | done (phase 5) |
-| `nexus-core` | graph model + validator (§4: 3 rules + name/duplicate checks), data-plane deliver contracts + holdover (§5), lock state machine incl. `reclaim_held` (§6), config/state split (§15.8) | done |
+| `nexus-core` | graph model + validator (§4: 3 rules + name/duplicate + leg loopback/empty checks), data-plane deliver contracts + holdover (§5), lock state machine incl. `reclaim_held` (§6), config/state split incl. `NodeConfig::Leg` (§15.8) | done |
 | `nexus-rpc` | JSON-RPC 2.0 wire types — the stable §15.16 surface | done |
-| `nexus-sim` | test double: `pty`/`client`/`mux`/`envelope` modes (§3) | done through phase 5; `wire`/`tcp-proxy` in phase 6 |
+| `nexus-sim` | test double: `pty`/`client`/`mux`/`envelope`/`wire`/`tcp-proxy` modes (§3) | done through phase 6 |
 | `nexus-doctor` | shipping capability checker: probes P1–P4 + env checks (§15.17) | done |
-| `serialnexusd` | the daemon | control plane + node lifecycle + data plane + codecs done |
+| `serialnexusd` | the daemon | control plane + node lifecycle + data plane + codecs + leg/wire done |
 | `serialnexusctl` | the CLI (thin RPC client + `--json`) | `load`/`dump`/`state`/`subscribe`/`rotate`/`lock`/`unlock`/`send`/`teardown`/`shutdown` |
 
 `serialnexusd` modules: `main.rs` (runtime, socket policy, shutdown),
 `control.rs` (JSON-RPC over UDS), `daemon.rs` (graph state + method impls),
 `runtime.rs` (endpoint-keyed data-plane `Wiring` + `LockCell` + poll-based I/O helpers),
-`nodes/{mod,serial,pty,log,codec,exec}.rs` (node runtimes; `codec` = the in-process
-demux/remux + registry, `exec` = the child-process codec), `sys.rs` (the single
-unsafe-bearing module: `TIOCEXCL`/`TIOCPKT` ioctls, raw `read`/`write`/`fcntl`, and
-the non-blocking `poll_ready`).
+`nodes/{mod,serial,pty,log,codec,exec,leg}.rs` (node runtimes; `codec` = the in-process
+demux/remux + registry, `exec` = the child-process codec, `leg` = the cross-daemon
+socket transport + link codec, §15.24), `sys.rs` (the single unsafe-bearing module:
+`TIOCEXCL`/`TIOCPKT` ioctls, raw `read`/`write`/`fcntl`, and the non-blocking
+`poll_ready`).
 
 Validation scripts are the canonical exit criteria (plan §3):
 `scripts/validate/phaseN/*.sh`, each self-judging with a JSON verdict and exit
@@ -579,6 +608,79 @@ findings.
   docstrings). Two audit findings were **rejected** on verification (an oversize-mux
   drop that can't be constructed since `MAX_FRAME_SIZE == READ_BUF`, and a
   resync-as-link-codec worry that doesn't apply — the link codec never resyncs).
+  **Note:** the phase-6 audit re-examined the first rejection and found the oversize
+  drop *is* reachable for a non-codec-bounded producer (the leg's `send` verb, and
+  the exec node's raw device stream) — see §6d; both are now fixed by fragmentation.
+
+## 6d. Phase 6 (the wire / leg node) — COMPLETE
+
+The cross-daemon transport (§7.4/§9/§15.24). Built as one coherent slice (config +
+wire contracts, then the leg node, then the six validation scripts), then an
+adversarial audit fixed 17 findings.
+
+- **Wire contracts (`codec-api`).** The v1 **hello** frame: `WIRE_MAGIC` (`0x534E584C`
+  "SNXL"), `WIRE_VERSION = 1` (versioned independently of `ENVELOPE_VERSION`), a `u32`
+  capability bitset (`CAP_LOCK_RELAY = 1<<0` reserved, negotiated none in v1),
+  `Hello{version,capabilities,channels}`, `encode_hello`/`try_decode_hello`,
+  `WireError`. A distinct wire construct (not a fifth `EventKind`), so the four golden
+  vectors stay byte-frozen; it reuses the envelope's `u32` length prefix, and its body
+  begins with the magic so it never collides with a data frame. `try_decode_hello`
+  validates the version-stable magic+version prefix *before* the v1 12-byte header, so
+  a version mismatch is always refused as such (audit fix).
+- **Config (`nexus-core`).** `NodeConfig::Leg` (+ `Transport`/`LegRole`); `shape()`
+  emits one endpoint per channel, all facing `faces`, **no default endpoint** (the
+  socket is off-graph); host-facing channels carry the leg's arbitration.
+  `GraphConfig::validate` gained the loopback-only check (tcp non-loopback needs
+  `insecure_bind`; unix exempt), empty-channel-identity and empty-channel-*list*
+  rejection → `ValidationError::{NonLoopbackBind, EmptyLeg}` (+ the existing
+  `DuplicateEndpoint` for empty identities). `is_loopback_addr` handles `host:port`,
+  bracketed/ bare IPv6, `localhost`, and wildcard binds. The leg plugs into the
+  §15.23 endpoint-keyed `Wiring` with **zero `Wiring::build` change** — via `shape()`.
+- **The leg node (`nodes/leg.rs`).** A supervisor task (mirroring the exec supervisor)
+  does connect-with-backoff / listen-accept-one, the hello handshake (both send then
+  read, under one overall deadline), binding, and per-connection pump. The pump runs
+  the socket **read and write halves concurrently** (the §15.22 lesson). `faces=target`
+  (sender): drains the local hostward stream onto the wire and writes wire-arriving
+  targetward as an **on-demand origin** (implicit acquire; release on idle *or*
+  disconnect via a shared `Notify`; never `held`, exempt from purge-on-acquire).
+  `faces=host` (receiver): fans wire data hostward (lossy `try_send`+counters) and
+  drains the arbitrated targetward stream onto the wire. **The link codec fragments,
+  never drops** an oversize chunk. Binding: `bound`/`waiting`/`unbound` are
+  leg-internal state; a `waiting` channel's targetward writers backpressure (not sent
+  to be dropped at the peer). Outage = faulted-and-wait: reconnect backoff, listen
+  reject-extras, park the receivers, purge-on-reconnect (faces=host targetward
+  backlog), and park the SEND half — not tear down — when local producers close.
+- **`nexus-sim`.** `wire` (hostile-or-conforming peer: crafted `--hello-version`,
+  `--bad-magic`, `--oversize-frame`, `--unknown-type`, `--echo`, `--send`, `--stall`)
+  and `tcp-proxy` (`--drop-after`/`--restore-after` outage injection) modes; `pty
+  --stall`.
+- **Validated:** `phase6/{reference,binding,hostility,insecure-bind,outage,
+  head-of-line}.sh` (plan items 1–6): two-daemon reference topology (per-channel
+  bidirectional checksums), bound/waiting/unbound, the §9 clean-refusal battery +
+  heal, the loopback gate + insecure marker, tcp-proxy outage + purge-on-reconnect,
+  and the whole-connection head-of-line property (targetward freezes together,
+  hostward advances).
+- **⚠️ Audit fixes (17 confirmed; do NOT regress).** (1) **CRITICAL §5/§9
+  targetward-no-drop violation** — the write half `continue`d on an oversize-frame
+  encode error, silently dropping (uncounted) any chunk whose framed size exceeded
+  `MAX_FRAME_SIZE`; reachable via the uncapped `send` verb and codec-emitted chunks
+  (`READ_BUF == MAX_FRAME_SIZE`). **Fixed** by fragmenting oversize chunks across
+  consecutive `data` frames in `leg.rs` (and the same idiom in `exec.rs`'s stdin feed
+  for the raw device stream); verified with a 100 001-byte `send` round-trip
+  (byte-exact, `discarded_hostward == 0`). Do NOT reinstate the `continue`-on-encode-
+  error drop. (2) **Stale-status wedge** — a `faces=target` leg whose local producers
+  all closed returned `SourceClosed` and left status `Active` forever, killing the
+  independent targetward direction; **fixed** by parking the write half (removed
+  `PumpEnd::SourceClosed`) so the wire/read half stay live. (3) On-demand lock
+  **released on peer disconnect** now, not only after idle (a `Notify` the supervisor
+  pulses). (4) Handshake bounded by **one overall deadline** (a trickling peer no
+  longer wedges a listen leg). (5) `waiting`-channel targetward is **gated (not
+  muxed-then-dropped-at-peer)** — `next_send` skips unbound channels so their writers
+  backpressure. Plus: `insecure_bind` surfaced in `state`; configured-but-unattached
+  channel drops counted (`discarded_hostward`); empty-channel-list rejected; the
+  hello magic/version-first decode order; and test-fidelity fixes (head-of-line
+  positive lower bound + honest comment; sim wire hello honors `--timeout-ms`). No
+  findings were rejected.
 
 ---
 
@@ -602,3 +704,11 @@ findings.
 - **`nexus-doctor` never gates the daemon:** runtime degradation paths (e.g.
   §7.2's poll) are unconditional, so a wrong probe misleads a developer but never
   the data plane. Keep it that way.
+- **Known pre-existing flake — `phase5/demux.sh` (~1 in 5 under load).** A timing
+  race in the *test*, not the daemon: the mux feed is released (`--wait-file` GO)
+  once every channel client reports `client_present==true`, but a client's slave
+  can be open (present) a beat before its read loop is draining, so under machine
+  load the initial burst can outrun the consumer and the presence-gated PTY drops
+  it, failing the byte-exact manifest check. Untouched by phase 6 (the demux path
+  is unchanged). A robust fix would gate GO on the clients actually reading (a
+  first-byte handshake), not just presence — a phase-5 test-fidelity follow-up.
