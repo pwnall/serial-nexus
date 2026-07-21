@@ -65,6 +65,15 @@ pub struct SerialNode {
     reader: Option<ThreadHandle<()>>,
     /// The async targetward writer task, if any.
     tasks: Vec<JoinHandle<()>>,
+    /// Targetward receiver held **unread** while the port is `waiting`/`faulted`
+    /// (none present). Retaining it — rather than draining it — lets the bounded
+    /// channel fill and backpressure the origin (its `send().await` suspends, the
+    /// client's kernel buffers), so a locked writer's commands are *delayed, never
+    /// dropped* (§5). Draining-and-discarding here would silently vaporize them,
+    /// violating the never-drop-targetward invariant; dropping the receiver would
+    /// error the origin's send and exit its reader. Phase 7's reopen ritual hands
+    /// this receiver to a fresh writer.
+    parked_targetward: Option<mpsc::Receiver<Chunk>>,
     status: NodeStatus,
 }
 
@@ -93,6 +102,7 @@ impl SerialNode {
             reader_stop: Arc::new(AtomicBool::new(false)),
             reader: None,
             tasks: Vec::new(),
+            parked_targetward: None,
             status: NodeStatus::Active,
         };
 
@@ -125,20 +135,21 @@ impl SerialNode {
     }
 
     /// Start the data plane for this port: broadcast hostward to the attached
-    /// PTYs, drain targetward from them. A `waiting`/`faulted` port (none
-    /// present) still drains its targetward channel so paused PTY writers don't
-    /// spin on a dropped receiver.
+    /// PTYs, drain targetward from them. A `waiting`/`faulted` port (none present)
+    /// *parks* its targetward receiver unread, so the bounded channel fills and
+    /// backpressures the origin (§5: commands are delayed, never dropped) rather
+    /// than draining-and-discarding them.
     pub fn start(
         &mut self,
         hostward: Vec<HostwardSink>,
         targetward: Option<mpsc::Receiver<Chunk>>,
     ) {
         let Some(port) = self.port.clone() else {
-            if let Some(mut rx) = targetward {
-                self.tasks.push(tokio::task::spawn_local(async move {
-                    while rx.recv().await.is_some() {}
-                }));
-            }
+            // Hold the receiver without reading it: a full channel suspends the
+            // origin's send().await (§5 backpressure). Dropping it instead would
+            // error the origin's send and exit its reader; draining it would
+            // silently discard commands. Phase 7's reopen hands this on.
+            self.parked_targetward = targetward;
             return;
         };
 
@@ -230,6 +241,10 @@ impl SerialNode {
         for t in self.tasks.drain(..) {
             t.abort();
         }
+        // Drop any parked targetward receiver so its channel closes and a
+        // backpressured origin's send() unblocks (with an error) rather than
+        // hanging past teardown.
+        drop(self.parked_targetward.take());
         self.port = None;
     }
 }
