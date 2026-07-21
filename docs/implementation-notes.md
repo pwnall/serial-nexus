@@ -1,11 +1,40 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-21 (phase 0-5 done; **phase 6 COMPLETE** — the leg node + v1 wire
-protocol, all six validation items green, audited against v5 with 17 findings fixed).
-**Next: phase 7** (identity & resilience). **Branch:** `implementation` (off `main`).
-**Normative docs:** `docs/11-design-claude-fable-v5.md` (design) and
-`docs/12-implementation-plan-claude-fable-v5.md` (plan). v1–v4 docs (03–10) are in
-`docs/historical/`. Section references (§) point at the v5 design.
+**As of:** 2026-07-21 (phase 0-6 done; **phase 0-4 re-aligned to the revised v6
+design**). **Next: phase 7** (identity & resilience). **Branch:** `implementation`
+(off `main`).
+**Normative docs are now v6:** `docs/13-design-claude-fable-v6.md` (design) and
+`docs/14-implementation-plan-claude-fable-v6.md` (plan). v1–v5 docs (03–12) are in
+`docs/historical/`. Section references (§) point at the v6 design.
+
+**v6 revision + phase 0-4 alignment (2026-07-21).** The v6 docs are v5 with the
+phase-5/6 ADRs (§15.22–15.24) *condensed* and their refinements folded forward into
+§§3–11 as normative text plus forward-references; the plan gained two doc-only
+sentences (endpoint-keyed wiring §15.23; the "presence is not readiness" §4 test note).
+The normative additions touching phases 0-4: §6 now states *held-priority reclaim* as
+first-class arbitration text (was §15.23-only); §11's structural-atomicity clause now
+lists *name/identity legality* ("no `/`, no empties, no duplicate node names or channel
+identities"); §3/§5 boundary taxonomy now names *child stdio pipes*. A multi-agent
+adversarial audit of the **built** phase 0-4 code against v6 (one auditor per design
+area, every finding independently verified) surfaced **5 confirmed deviations** (7
+rejected as phase-7/8 scope, sanctioned poll-latency, or code-smell-not-design-text):
+- **§11 empty node name accepted** (v6-introduced "no empties"): empty *channel
+  identities* were rejected but empty *node names* were not. **Fixed** —
+  `ValidationError::EmptyName`, checked in `GraphModel::validate` (covers `load` and
+  incremental add-node), with `empty_node_name_is_rejected`.
+- **`data.rs` comment said "four boundary types"** (v6 expanded to five, +child stdio
+  pipes). **Fixed** — comment now enumerates the five, noting the exec pipe arrives in
+  phase 5.
+- **Four pre-existing config/CLI-surface gaps** (identical text in v5; the design lists
+  a v1 attribute never built — **the user chose to build all now**): (a) serial
+  `hostward_buffer` (§7.1 hostward-consumer drop policy → the fan-out channel depth,
+  default 256), (b) serial `modem` initial DTR/RTS assertions (§7.1, applied at open,
+  retained for phase-7 reopen), (c) PTY `hostward_buffer` (§7.2 → the writer-bridge
+  depth, default 32), (d) daemon `--socket-group` (§10 "flags to widen to a group" →
+  chgrp + mode 0660). All default to today's behavior, round-trip through dump/load
+  (`serial_and_pty_hostward_and_modem_round_trip` + the config proptest), and were
+  verified end-to-end (load→dump, `--socket-group` → `660 <group>`). See §3.13.
+All gates green: 78 workspace tests, fmt/clippy clean, `all.sh --through 6` = 32/32.
 
 **Phase 6 (2026-07-21).** The cross-daemon transport (§7.4/§9): a new **leg node**
 (`nodes/leg.rs`) carrying N channels multiplexed over a tcp|unix socket by the
@@ -112,10 +141,11 @@ the items below are refinements consistent with the design, none contradict it.
 | 4 | Arbitration | **done** — slices A & B (exclusive write lock, `lock`/`unlock`, `may_write` gate, purge-on-acquire/-detach, detach-release, held, free-for-all) plus **slice C**: the FIFO waiter queue + two-lane async dispatch, `send`, `--steal`/`--wait`/`--lease-ms`, lease generation-guard, immediate lock notifications (§3.12, §6b, §15.20) |
 | 5 | Codecs | **done** — codec runtime + registry (§8), the `codecs/reference` framing codec (resync), the interior codec node + exec codec (§7.5/§7.6), endpoint-keyed wiring, `nexus-sim` `mux`/`envelope`; audited (§6c, §15.22, §15.23) |
 | 6 | The wire | **done** — leg node (§7.4) + v1 wire hello (§9), fragmentation, binding, faulted-and-wait/purge-on-reconnect, `nexus-sim` `wire`/`tcp-proxy`, §9 conformance scripts; audited (§6d, §15.24) |
+| — | **v6 alignment** | **done** — phase 0-4 re-audited against the revised v6 design; 5 deviations fixed (empty-node-name §11, boundary comment §5, serial/PTY `hostward_buffer` + serial `modem` §7.1/§7.2, `--socket-group` §10) (§3.13) |
 | 7–8 | Identity, hardening | not started |
 
 **Quality gates (all green):** `cargo fmt --all --check`, `cargo clippy
---workspace --all-targets --locked -- -D warnings`, `cargo test --workspace` (76
+--workspace --all-targets --locked -- -D warnings`, `cargo test --workspace` (78
 pass), and `bash scripts/validate/all.sh --through 6` (**32 pass, 0 fail**). Phase 6
 scripts: `phase6/{reference,binding,hostility,insecure-bind,outage,head-of-line}.sh`;
 phase 5 scripts: `phase5/{envelope,demux,resync,held,bad-attributes,exec-crash}.sh`;
@@ -337,6 +367,37 @@ is inherent to poll-based presence (the §15.18/§15.19 tradeoff), not a logic b
 it affects only the detach-release path (an explicit `unlock` is unaffected) and
 never lets a *different endpoint's* origin write (exclusion still holds). A
 per-open generation/epoch would close it if it ever matters; deferred.
+
+### 3.13 Node config surface completed to match §7.1/§7.2/§10 (v6 alignment)
+**Design:** §7.1 lists a serial node's Configuration as including *initial modem-line
+assertions* and a *hostward-consumer drop policy*; §7.2 lists a PTY's as including a
+*hostward drop policy*; §10 lists *flags to widen the control socket to a group*. These
+attributes were specified in v1 but never built (the text is identical in v5/v6); a v6
+alignment audit flagged the config-surface gap and the user directed building them.
+**Decision (mapping each design attribute to the real boundary buffer):**
+- **Serial `hostward_buffer`** (`usize`, default 256) — the depth of the per-consumer
+  *fan-out channel* the serial reader `try_send`s into (§5 "bounded buffering where
+  configured"). Plumbed in `runtime::Wiring::build` (a serial node's depth overrides
+  `CHANNEL_CAP` for edges it produces; other producers keep the default). Hostward is
+  always lossy-with-counters, never `fault` — a slow spy must cost only itself (§5) — so
+  the only tunable is depth (a scalar), unlike the log node's `{drop-oldest|fault}`.
+- **Serial `modem`** (`ModemLines { dtr: Option<bool>, rts: Option<bool> }`, default both
+  `None` = untouched) — initial DTR/RTS assertions applied in `open_port` after
+  `TIOCEXCL` (serial2 `set_dtr`/`set_rts`); a `None` line keeps the driver's power-on
+  state, so the default is exactly today's behavior. Stored on `SerialNode` so phase 7's
+  reopen ritual restores it against auto-reset adapters (§7.1). Serialized as a *trailing
+  table* (after the scalar fields, like a codec's `attributes`) and skipped when unset.
+- **PTY `hostward_buffer`** (`usize`, default 32) — the depth of the PTY's internal
+  *writer-bridge* `sync_channel` (§5); replaces the former `WRITER_QUEUE` const.
+- **`--socket-group <name>`** — resolves the group (hard error if absent), chgrps the
+  control socket, and relaxes its mode to 0660; unset keeps the 0600 owner-only default
+  (§10). Mirrors the PTY slave's group logic (§7.2).
+The three drop-policy mentions (serial §7.1, PTY §7.2, log §7.3) thus map to three
+*distinct* real buffers — producer fan-out, consumer writer-bridge, and the log file
+queue — so listing a policy on both producer and consumer is not redundant. All default
+to current behavior; validation is unchanged; round-trip is pinned by
+`serial_and_pty_hostward_and_modem_round_trip` and the config proptest (generators now
+vary `hostward_buffer` and `modem`).
 
 ---
 

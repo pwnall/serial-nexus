@@ -30,7 +30,8 @@ use std::thread::JoinHandle as ThreadHandle;
 use nexus_core::Chunk;
 use nexus_core::NodeStatus;
 use nexus_core::config::{
-    DataBits, FlowControl as CfgFlow, NodeConfig, Parity as CfgParity, StopBits as CfgStop,
+    DataBits, FlowControl as CfgFlow, ModemLines, NodeConfig, Parity as CfgParity,
+    StopBits as CfgStop,
 };
 use nix::poll::PollFlags;
 use serde_json::json;
@@ -51,6 +52,10 @@ pub struct SerialNode {
     pub name: String,
     device: PathBuf,
     baud: u32,
+    /// Initial modem-line assertions applied at open (§7.1), so line states are
+    /// deterministic against auto-reset adapters. Retained so phase 7's reopen
+    /// ritual can restore the configured lines after a replug.
+    modem: ModemLines,
     /// The open port, retained for the targetward writer and future control verbs
     /// (modem lines, break — phase 7). `None` while `waiting`/`faulted`. The
     /// reader thread borrows only its raw fd, so the port must outlive the thread
@@ -87,6 +92,7 @@ impl SerialNode {
             parity,
             stop_bits,
             flow_control,
+            modem,
             ..
         } = config
         else {
@@ -97,6 +103,7 @@ impl SerialNode {
             name: name.clone(),
             device: PathBuf::from(device),
             baud: *baud,
+            modem: *modem,
             port: None,
             discarded_unattached: Arc::new(AtomicU64::new(0)),
             reader_stop: Arc::new(AtomicBool::new(false)),
@@ -113,6 +120,7 @@ impl SerialNode {
             *parity,
             *stop_bits,
             *flow_control,
+            node.modem,
         ) {
             Ok(port) => {
                 node.port = Some(Rc::new(port));
@@ -321,6 +329,7 @@ fn open_port(
     parity: CfgParity,
     stop_bits: CfgStop,
     flow: CfgFlow,
+    modem: ModemLines,
 ) -> std::io::Result<SerialPort> {
     let port = SerialPort::open(device, |mut s: Settings| {
         s.set_raw();
@@ -335,6 +344,17 @@ fn open_port(
     // share the port (§7.1, P3 finding).
     sys::set_exclusive(port.as_raw_fd(), true)
         .map_err(|e| std::io::Error::other(format!("TIOCEXCL: {e}")))?;
+    // Initial modem-line assertions (§7.1): a line left unset (None) keeps the
+    // driver's power-on state; an asserted/deasserted line is made deterministic
+    // here (and reapplied by phase 7's reopen ritual against auto-reset adapters).
+    if let Some(dtr) = modem.dtr {
+        port.set_dtr(dtr)
+            .map_err(|e| std::io::Error::other(format!("set DTR: {e}")))?;
+    }
+    if let Some(rts) = modem.rts {
+        port.set_rts(rts)
+            .map_err(|e| std::io::Error::other(format!("set RTS: {e}")))?;
+    }
     Ok(port)
 }
 

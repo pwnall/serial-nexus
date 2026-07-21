@@ -43,6 +43,11 @@ struct Cli {
     /// TOML configuration file to load at startup (load-on-empty, §11).
     #[arg(long, short)]
     config: Option<PathBuf>,
+    /// Widen the control socket to a group (§10: "flags to widen to a group"):
+    /// chgrp the socket to this group and relax its mode to 0660. Unset keeps the
+    /// 0600 owner-only default — whoever can open the socket owns every console.
+    #[arg(long)]
+    socket_group: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -67,8 +72,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("binding control socket {}", socket_path.display()))?;
-    // Socket permissions ARE the authorization model (§10): 0600 by default.
-    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+    // Socket permissions ARE the authorization model (§10): 0600 by default,
+    // widened to a group by --socket-group. The parent runtime dir (0700) bounds
+    // the brief post-bind window before this applies (v4 audit).
+    apply_socket_perms(&socket_path, cli.socket_group.as_deref())?;
     tracing::info!(socket = %socket_path.display(), "control socket listening");
 
     let daemon = Rc::new(Daemon::new());
@@ -117,6 +124,26 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     daemon.teardown_all();
     let _ = std::fs::remove_file(&socket_path);
     tracing::info!("stopped");
+    Ok(())
+}
+
+/// Apply the §10 control-socket authorization policy: mode 0600 by default, or
+/// mode 0660 owned by `group` when one is configured (`--socket-group`). The
+/// group is resolved first, so a name that cannot be found is a hard error before
+/// anything is changed; mirrors the PTY slave's group logic (§7.2).
+fn apply_socket_perms(path: &Path, group: Option<&str>) -> anyhow::Result<()> {
+    if let Some(group) = group {
+        let gid = nix::unistd::Group::from_name(group)
+            .ok()
+            .flatten()
+            .map(|g| g.gid)
+            .ok_or_else(|| anyhow::anyhow!("socket group {group:?} not found"))?;
+        nix::unistd::chown(path, None, Some(gid))
+            .with_context(|| format!("chgrp {} to {group}", path.display()))?;
+    }
+    let mode = if group.is_some() { 0o660 } else { 0o600 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("setting mode on control socket {}", path.display()))?;
     Ok(())
 }
 

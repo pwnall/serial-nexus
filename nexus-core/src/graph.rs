@@ -247,6 +247,13 @@ pub enum ValidationError {
         node: String,
         endpoint: Option<String>,
     },
+    /// A node name is the empty string. The empty local name is reserved for a
+    /// node's *default* endpoint (whose display form is just the node name), so
+    /// an empty node name would render as the empty string and collide with that
+    /// reservation — forbidden by the §11 legality rule ("no empties"). Node
+    /// names must be non-empty; channel identities are barred from emptiness by
+    /// the default-endpoint collision ([`Self::DuplicateEndpoint`]).
+    EmptyName { node: String },
     /// Two of a node's endpoints share a local name — a multi-endpoint node (a
     /// codec) with a duplicate channel identity, or a channel identity colliding
     /// with the reserved multiplexed-side default endpoint (an empty identity,
@@ -300,6 +307,12 @@ impl fmt::Display for ValidationError {
                 write!(
                     f,
                     "channel identity {channel:?} on node {node:?} contains '/', which names and channel identities may not (§3)"
+                )
+            }
+            ValidationError::EmptyName { .. } => {
+                write!(
+                    f,
+                    "a node has an empty name, which is reserved for default endpoints and forbidden as a node name (§3, §11)"
                 )
             }
             ValidationError::DuplicateNodeName { node } => {
@@ -397,6 +410,14 @@ impl GraphModel {
         // a structural error. Checked on declared names (shape keys and endpoint
         // names); malformed *references* in edges surface as UnknownNode/Endpoint.
         for (node, shape) in &self.shapes {
+            if node.is_empty() {
+                // §11 legality ("no empties"): an empty node name collides with
+                // the empty local name reserved for default endpoints (§3), so it
+                // is a structural error — symmetric with the empty-channel-identity
+                // rejection. Covers both `load` (via GraphConfig::validate) and the
+                // incremental add-node path, which both validate a model.
+                errors.push(ValidationError::EmptyName { node: node.clone() });
+            }
             if node.contains('/') {
                 errors.push(ValidationError::InvalidName {
                     node: node.clone(),

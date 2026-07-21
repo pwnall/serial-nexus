@@ -255,6 +255,10 @@ impl Wiring {
         // alongside single-endpoint boundary nodes.
         let mut facing: HashMap<EndpointAddr, (Facing, Arbitration)> = HashMap::new();
         let mut is_log: HashMap<&str, bool> = HashMap::new();
+        // A serial node's configured hostward-consumer drop policy (§5, §7.1): the
+        // fan-out buffer depth to each of its consumers. Other producers (codec
+        // channels) use the built-in default.
+        let mut host_hostward_depth: HashMap<&str, usize> = HashMap::new();
         for n in &config.nodes {
             for ep in &n.shape().endpoints {
                 facing.insert(
@@ -263,6 +267,12 @@ impl Wiring {
                 );
             }
             is_log.insert(n.name(), matches!(n, NodeConfig::Log { .. }));
+            if let NodeConfig::Serial {
+                hostward_buffer, ..
+            } = n
+            {
+                host_hostward_depth.insert(n.name(), *hostward_buffer);
+            }
         }
 
         let mut wiring = Wiring::default();
@@ -331,8 +341,13 @@ impl Wiring {
             // Hostward: one dedicated channel per (host, target) edge, so a slow
             // consumer's drops are isolated to its own channel (§5). One shared
             // DropCounters rides with both ends — the producer counts full-buffer
-            // drops, the consumer counts its own boundary discards.
-            let (htx, hrx) = mpsc::channel(CHANNEL_CAP);
+            // drops, the consumer counts its own boundary discards. Depth is the
+            // producing serial's configured hostward buffer (§7.1), else default.
+            let depth = host_hostward_depth
+                .get(host.node.as_str())
+                .copied()
+                .unwrap_or(CHANNEL_CAP);
+            let (htx, hrx) = mpsc::channel(depth);
             let counters = Arc::new(DropCounters::default());
             wiring
                 .host_sinks

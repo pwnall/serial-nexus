@@ -1,7 +1,9 @@
 //! The data-plane contracts (design §5, §15.5).
 //!
 //! The interior is queue-free and policy-free; all buffering, dropping, and
-//! flow control lives at the four boundary types. This module encodes the two
+//! flow control lives at the boundary types — serial ports, PTY masters,
+//! sockets, files, and the exec codec's child stdio pipes (§3/§5/§15.22; the
+//! last arrives with the phase-5 exec node). This module encodes the two
 //! delivery contracts and the single-chunk holdover slot as pure, testable
 //! types, with mock boundaries standing in for the real kernel objects that
 //! arrive in later phases.

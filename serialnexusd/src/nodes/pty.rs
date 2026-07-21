@@ -54,11 +54,11 @@ use tokio::task::JoinHandle;
 /// A few seconds; one ioctl, effectively free.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Depth (in chunks) of the bounded bridge between the async pump and the blocking
-/// writer thread. This is the PTY boundary's buffer for a slow consumer (§5):
-/// bounded, so memory can't grow, and full-buffer drops are counted where they
-/// happen. At [`READ_BUF`]-sized chunks this is ~2 MiB.
-const WRITER_QUEUE: usize = 32;
+// The bounded bridge between the async pump and the blocking writer thread is the
+// PTY boundary's buffer for a slow consumer (§5): bounded, so memory can't grow,
+// and full-buffer drops are counted where they happen. Its depth is the node's
+// configured `hostward_buffer` (§7.2), defaulting to 32 chunks (~2 MiB at
+// [`READ_BUF`]-sized chunks) in `nexus_core::config`.
 
 use nexus_core::lock::{Arbitration, OriginId, WriteMode};
 
@@ -72,6 +72,9 @@ pub struct PtyNode {
     owner: Option<String>,
     group: Option<String>,
     advertised_baud: u32,
+    /// Hostward drop policy (§5, §7.2): the depth (in chunks) of this PTY's writer
+    /// bridge, past which a slow client's bytes are dropped-with-counters.
+    hostward_buffer: usize,
     /// The master, shared between the read+presence and writer tasks. `None`
     /// once torn down (or if setup faulted).
     master: Option<Rc<PtyMaster>>,
@@ -110,6 +113,7 @@ impl PtyNode {
             group,
             mode,
             advertised_baud,
+            hostward_buffer,
             ..
         } = config
         else {
@@ -125,6 +129,7 @@ impl PtyNode {
             owner: owner.clone(),
             group: group.clone(),
             advertised_baud: *advertised_baud,
+            hostward_buffer: *hostward_buffer,
             master: None,
             pts_path: None,
             symlink_installed: false,
@@ -271,7 +276,8 @@ impl PtyNode {
             // Bounded bridge: the pump moves chunks into it and drops-with-count
             // when it is full (a slow consumer shedding at its own boundary, §5),
             // so the writer thread's blocking recv can also observe the stop flag.
-            let (btx, brx) = std_mpsc::sync_channel::<Chunk>(WRITER_QUEUE);
+            // Depth is this PTY's configured hostward drop policy (§7.2).
+            let (btx, brx) = std_mpsc::sync_channel::<Chunk>(self.hostward_buffer);
             let pump_counters = self.counters.clone();
             self.tasks.push(tokio::task::spawn_local(async move {
                 while let Some(chunk) = rx.recv().await {

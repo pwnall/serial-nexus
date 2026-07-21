@@ -179,6 +179,17 @@ pub enum NodeConfig {
         /// machine-to-machine links coordinated elsewhere.
         #[serde(default)]
         arbitration: Arbitration,
+        /// Hostward-consumer drop policy (§5, §7.1): the bounded buffer depth (in
+        /// chunks) the serial's fan-out to each consumer absorbs before
+        /// dropping-with-counters — a slow spy costs only itself, never faults.
+        /// Defaults to the built-in depth.
+        #[serde(default = "default_serial_hostward_buffer")]
+        hostward_buffer: usize,
+        /// Initial modem-line assertions applied at open (§7.1). Declared last so
+        /// it serializes after the scalar fields (a nested table must follow them
+        /// in TOML's array-of-tables syntax); omitted when unset.
+        #[serde(default, skip_serializing_if = "ModemLines::is_unset")]
+        modem: ModemLines,
     },
     /// PTY node (§7.2). Always faces target.
     Pty {
@@ -194,6 +205,12 @@ pub enum NodeConfig {
         /// Cosmetic baud reported to clients via tcgetattr (§7.2).
         #[serde(default = "default_baud")]
         advertised_baud: u32,
+        /// Hostward drop policy (§5, §7.2): the bounded buffer depth (in chunks)
+        /// this PTY's writer bridge absorbs before dropping-with-counters when a
+        /// slow client cannot keep up — never faults (a slow client costs only
+        /// itself). Defaults to the built-in depth.
+        #[serde(default = "default_pty_hostward_buffer")]
+        hostward_buffer: usize,
     },
     /// Log node (§7.3). Always faces target; write mode is inherently `never`.
     Log {
@@ -442,6 +459,28 @@ pub enum FlowControl {
     RtsCts,
 }
 
+/// Initial modem-line assertions for a serial node (§7.1). Applied at open and
+/// (in phase 7) re-applied on reopen, so line states are deterministic against
+/// auto-reset adapters. Each line may be asserted (`true`), deasserted (`false`),
+/// or left untouched (omitted — the default, which keeps the driver's power-on
+/// state). `set-modem`/`pulse-dtr` control verbs (§7.1) act on the live port
+/// later; these are the *initial* states configuration owns and round-trips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ModemLines {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dtr: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rts: Option<bool>,
+}
+
+impl ModemLines {
+    /// Whether no line assertion is configured (both untouched) — the default,
+    /// skipped in serialization so an unset config stays clean and round-trips.
+    pub fn is_unset(&self) -> bool {
+        self.dtr.is_none() && self.rts.is_none()
+    }
+}
+
 /// Boundary overflow policy for bounded queues (log nodes, §7.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -455,6 +494,20 @@ pub enum OverflowPolicy {
 
 fn default_baud() -> u32 {
     115_200
+}
+
+/// Default hostward buffer depth (in chunks) for a serial node's fan-out to each
+/// consumer (§5, §7.1). Matches the data plane's built-in `CHANNEL_CAP`, so an
+/// unset config keeps today's behavior.
+fn default_serial_hostward_buffer() -> usize {
+    256
+}
+
+/// Default hostward buffer depth (in chunks) for a PTY node's writer bridge
+/// (§5, §7.2). Matches the data plane's built-in `WRITER_QUEUE`, so an unset
+/// config keeps today's behavior.
+fn default_pty_hostward_buffer() -> usize {
+    32
 }
 
 fn default_rotation_padding() -> u8 {
@@ -508,6 +561,8 @@ mod tests {
                     flow_control: FlowControl::None,
                     faces: Facing::Host,
                     arbitration: Arbitration::Exclusive,
+                    hostward_buffer: 256,
+                    modem: ModemLines::default(),
                 },
                 NodeConfig::Pty {
                     name: "console".into(),
@@ -516,6 +571,7 @@ mod tests {
                     group: Some("dialout".into()),
                     mode: Some(0o660),
                     advertised_baud: 115_200,
+                    hostward_buffer: 32,
                 },
                 NodeConfig::Log {
                     name: "log".into(),
@@ -565,6 +621,8 @@ mod tests {
                     flow_control: FlowControl::None,
                     faces: Facing::Host,
                     arbitration: Arbitration::Exclusive,
+                    hostward_buffer: 256,
+                    modem: ModemLines::default(),
                 },
                 NodeConfig::Codec {
                     name: "mux".into(),
@@ -585,6 +643,7 @@ mod tests {
                     group: None,
                     mode: None,
                     advertised_baud: 115_200,
+                    hostward_buffer: 32,
                 },
                 NodeConfig::Log {
                     name: "trace-log".into(),
@@ -642,6 +701,7 @@ mod tests {
                     group: None,
                     mode: None,
                     advertised_baud: 115_200,
+                    hostward_buffer: 32,
                 },
                 NodeConfig::Log {
                     name: "dup".into(),
@@ -660,6 +720,104 @@ mod tests {
             "expected DuplicateNodeName, got {:?}",
             cfg.validate()
         );
+    }
+
+    #[test]
+    fn empty_node_name_is_rejected() {
+        // §11 legality ("no empties"): an empty node name collides with the empty
+        // local name reserved for default endpoints (§3), so load must refuse it —
+        // symmetric with empty_leg_channel_identity_is_rejected on the identity side.
+        let cfg = GraphConfig {
+            nodes: vec![NodeConfig::Log {
+                name: String::new(),
+                directory: "/tmp".into(),
+                filename: "l.log".into(),
+                overflow: OverflowPolicy::DropOldest,
+                rotation_padding: 3,
+            }],
+            edges: vec![],
+        };
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|e| matches!(e, ValidationError::EmptyName { node } if node.is_empty())),
+            "expected EmptyName, got {:?}",
+            cfg.validate()
+        );
+    }
+
+    #[test]
+    fn serial_and_pty_hostward_and_modem_round_trip() {
+        // §7.1/§7.2 config surface: a serial's hostward buffer + initial modem-line
+        // assertions and a PTY's hostward buffer round-trip through TOML (the modem
+        // table serializes after the scalar fields, like a codec's attributes).
+        let cfg = GraphConfig {
+            nodes: vec![
+                NodeConfig::Serial {
+                    name: "usb0".into(),
+                    device: "usb:0403:6001:ABSCDJ6O:00".into(),
+                    baud: 115_200,
+                    data_bits: DataBits::Eight,
+                    parity: Parity::None,
+                    stop_bits: StopBits::One,
+                    flow_control: FlowControl::None,
+                    faces: Facing::Host,
+                    arbitration: Arbitration::Exclusive,
+                    hostward_buffer: 512,
+                    modem: ModemLines {
+                        dtr: Some(true),
+                        rts: Some(false),
+                    },
+                },
+                NodeConfig::Pty {
+                    name: "console".into(),
+                    path: "/run/serial_nexus/console".into(),
+                    owner: None,
+                    group: None,
+                    mode: None,
+                    advertised_baud: 115_200,
+                    hostward_buffer: 64,
+                },
+            ],
+            edges: vec![],
+        };
+        let toml = toml::to_string(&cfg).expect("serialize");
+        let back: GraphConfig = toml::from_str(&toml).expect("deserialize");
+        assert_eq!(cfg, back, "custom hostward + modem must round-trip\n{toml}");
+
+        // Omitted attributes fall back to the built-in defaults — so today's
+        // behavior is preserved for configs that never mention them.
+        let minimal = r#"
+            [[node]]
+            type = "serial"
+            name = "usb0"
+            device = "/dev/ttyUSB0"
+            [[node]]
+            type = "pty"
+            name = "console"
+            path = "/tmp/c"
+        "#;
+        let parsed: GraphConfig = toml::from_str(minimal).expect("parse minimal");
+        match &parsed.nodes[0] {
+            NodeConfig::Serial {
+                hostward_buffer,
+                modem,
+                ..
+            } => {
+                assert_eq!(*hostward_buffer, 256, "serial default hostward buffer");
+                assert!(
+                    modem.is_unset(),
+                    "modem defaults to unset (lines untouched)"
+                );
+            }
+            other => panic!("expected serial, got {other:?}"),
+        }
+        match &parsed.nodes[1] {
+            NodeConfig::Pty {
+                hostward_buffer, ..
+            } => assert_eq!(*hostward_buffer, 32, "pty default hostward buffer"),
+            other => panic!("expected pty, got {other:?}"),
+        }
     }
 
     #[test]
@@ -690,6 +848,7 @@ mod tests {
                     group: None,
                     mode: None,
                     advertised_baud: 115_200,
+                    hostward_buffer: 32,
                 },
             ],
             edges: vec![EdgeConfig {
@@ -859,6 +1018,13 @@ mod tests {
             Just(WriteMode::Held),
         ]
     }
+    fn any_modem() -> impl Strategy<Value = ModemLines> {
+        (
+            proptest::option::of(any::<bool>()),
+            proptest::option::of(any::<bool>()),
+        )
+            .prop_map(|(dtr, rts)| ModemLines { dtr, rts })
+    }
 
     fn node_strategy() -> impl Strategy<Value = NodeConfig> {
         prop_oneof![
@@ -872,6 +1038,8 @@ mod tests {
                 any_flow(),
                 any_facing(),
                 any_arbitration(),
+                1usize..2048,
+                any_modem(),
             )
                 .prop_map(
                     |(
@@ -884,6 +1052,8 @@ mod tests {
                         flow_control,
                         faces,
                         arbitration,
+                        hostward_buffer,
+                        modem,
                     )| {
                         NodeConfig::Serial {
                             name,
@@ -895,6 +1065,8 @@ mod tests {
                             flow_control,
                             faces,
                             arbitration,
+                            hostward_buffer,
+                            modem,
                         }
                     }
                 ),
@@ -905,17 +1077,21 @@ mod tests {
                 proptest::option::of(ident()),
                 proptest::option::of(0u32..0o777),
                 1u32..4_000_000,
+                1usize..2048,
             )
-                .prop_map(|(name, path, owner, group, mode, advertised_baud)| {
-                    NodeConfig::Pty {
-                        name,
-                        path,
-                        owner,
-                        group,
-                        mode,
-                        advertised_baud,
-                    }
-                }),
+                .prop_map(
+                    |(name, path, owner, group, mode, advertised_baud, hostward_buffer)| {
+                        NodeConfig::Pty {
+                            name,
+                            path,
+                            owner,
+                            group,
+                            mode,
+                            advertised_baud,
+                            hostward_buffer,
+                        }
+                    },
+                ),
             (ident(), ident(), ident(), any_overflow(), 1u8..9).prop_map(
                 |(name, directory, filename, overflow, rotation_padding)| NodeConfig::Log {
                     name,
