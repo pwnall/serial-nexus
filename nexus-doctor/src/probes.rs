@@ -7,7 +7,7 @@
 use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nix::fcntl::{OFlag, open};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -225,36 +225,9 @@ fn new_master() -> anyhow::Result<PtyMaster> {
 // P4 — by-id resolution ground truth (§12)
 // ---------------------------------------------------------------------------
 
-pub struct Adapter {
-    pub by_id_name: String,
-    pub dev_path: String,
-    pub identity: Option<String>,
-}
-
-pub fn discover_adapters(dev_root: &Path, sys_root: &Path) -> Vec<Adapter> {
-    let by_id = dev_root.join("dev/serial/by-id");
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&by_id) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(target) = std::fs::read_link(entry.path()) else {
-            continue;
-        };
-        let dev_name = target
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let identity = sysfs_identity(sys_root, &dev_name);
-        out.push(Adapter {
-            by_id_name: name,
-            dev_path: format!("/dev/{dev_name}"),
-            identity,
-        });
-    }
-    out
-}
+// The by-id + sysfs walk that produces `usb:vid:pid:serial:iface` lives in
+// `nexus_core::resolver` (the daemon and the doctor share one implementation,
+// §12); the doctor observes what that resolver reports.
 
 pub fn p4_resolver(dev_root: &Path, sys_root: &Path) -> Probe {
     let p = Probe::new(
@@ -269,7 +242,7 @@ pub fn p4_resolver(dev_root: &Path, sys_root: &Path) -> Probe {
             "No USB-serial adapter present; identity resolution untested here (run on an adapter-equipped box).",
         );
     }
-    let adapters = discover_adapters(dev_root, sys_root);
+    let adapters = nexus_core::Resolver::with_roots(dev_root, sys_root).discover_adapters();
     if adapters.is_empty() {
         return p.verdict(
             Status::skipped("by-id tree present but empty"),
@@ -298,32 +271,366 @@ pub fn p4_resolver(dev_root: &Path, sys_root: &Path) -> Probe {
     }
 }
 
-fn sysfs_identity(sys_root: &Path, dev_name: &str) -> Option<String> {
-    let device_link = sys_root.join("class/tty").join(dev_name).join("device");
-    let start = std::fs::canonicalize(&device_link).ok()?;
-    let mut interface = None;
-    let mut cur: &Path = &start;
-    for _ in 0..12 {
-        if interface.is_none() {
-            interface = read_trimmed(&cur.join("bInterfaceNumber"));
-        }
-        if cur.join("idVendor").exists() {
-            let vid = read_trimmed(&cur.join("idVendor"))?;
-            let pid = read_trimmed(&cur.join("idProduct"))?;
-            let serial = read_trimmed(&cur.join("serial")).unwrap_or_else(|| "-".into());
-            let iface = interface.unwrap_or_else(|| "-".into());
-            return Some(format!("usb:{vid}:{pid}:{serial}:{iface}"));
-        }
-        match cur.parent() {
-            Some(parent) if parent != cur && parent.starts_with(sys_root) => cur = parent,
-            _ => break,
-        }
-    }
-    None
-}
-
 fn read_trimmed(p: &Path) -> Option<String> {
     std::fs::read_to_string(p).ok().map(|s| s.trim().to_owned())
+}
+
+// ---------------------------------------------------------------------------
+// P5 — rig discovery and certification (§13, §15.21). Opt-in like every
+// TX-emitting probe: it transmits a nonce, so it runs only on explicitly named
+// --ports (a listed port could be wired to live equipment). Discovery classifies
+// each named port (dangling / loopback / paired, both directions, so a
+// half-crossed pair is named); characterization certifies real UARTs and reports
+// `skipped (not a UART)` for the sim pts used in CI. The doctor certifies the
+// rig and stops — it never drives the daemon through it.
+// ---------------------------------------------------------------------------
+
+/// A unique, distinctive nonce for the port at index `i` — the index makes it
+/// unique across ports without any RNG (the doctor is deterministic).
+fn p5_nonce(i: usize) -> Vec<u8> {
+    format!("\x02SNX-P5-RIG-{i:03}\x03").into_bytes()
+}
+
+fn contains_sub(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && needle.len() <= hay.len()
+        && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Open a port for P5 (raw, 8N1 at a standard baud) with short read/write timeouts
+/// so the continuous discovery scan neither blocks on a stalled/dangling port nor
+/// misses a reply.
+fn p5_open(port: &Path, baud: u32, parity: Parity) -> std::io::Result<SerialPort> {
+    let mut sp = SerialPort::open(port, |mut s: Settings| {
+        s.set_raw();
+        s.set_baud_rate(baud)?;
+        s.set_char_size(CharSize::Bits8);
+        s.set_stop_bits(StopBits::One);
+        s.set_parity(parity);
+        s.set_flow_control(FlowControl::None);
+        Ok(s)
+    })?;
+    sp.set_read_timeout(Duration::from_millis(20))?;
+    // A write timeout keeps a dangling/stalled port (buffer never drained) from
+    // blocking the whole exchange — it times out and is classified dangling.
+    sp.set_write_timeout(Duration::from_millis(200))?;
+    Ok(sp)
+}
+
+/// Best-effort write of the whole nonce. A timeout/would-block (a stalled port)
+/// stops rather than blocking the exchange.
+fn p5_write_all(sp: &SerialPort, mut data: &[u8]) -> std::io::Result<()> {
+    while !data.is_empty() {
+        match sp.write(data) {
+            Ok(0) => break,
+            Ok(n) => data = &data[n..],
+            Err(e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// One read (up to the port's short read timeout): the bytes available now, or
+/// empty on timeout.
+fn p5_read_once(sp: &SerialPort) -> Vec<u8> {
+    let mut buf = [0u8; 4096];
+    match sp.read(&mut buf) {
+        Ok(n) => buf[..n].to_vec(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Drain everything readable from `sp` within `window` (raw non-blocking reads,
+/// sleeping briefly when idle so it does not busy-spin).
+fn p5_drain(sp: &SerialPort, window: Duration) -> Vec<u8> {
+    let deadline = Instant::now() + window;
+    let mut out = Vec::new();
+    while Instant::now() < deadline {
+        let got = p5_read_once(sp);
+        if got.is_empty() {
+            std::thread::sleep(Duration::from_millis(10));
+        } else {
+            out.extend_from_slice(&got);
+        }
+    }
+    out
+}
+
+/// A rig-certificate port name: the resolver identity where the port resolves
+/// (so the certificate survives renumbering, §15.21), else the raw path.
+fn p5_name(port: &Path, resolver: &nexus_core::Resolver) -> String {
+    for a in resolver.discover_adapters() {
+        if a.dev_path == port {
+            if let Some(id) = a.identity {
+                return id;
+            }
+        }
+    }
+    port.display().to_string()
+}
+
+/// Whether a fd is a real UART: a pts (the CI sim) fails `TIOCGICOUNT`.
+fn p5_is_uart(sp: &SerialPort) -> bool {
+    sys::read_icounter(sp.as_raw_fd()).is_ok()
+}
+
+/// A single-port certificate line for a real UART: break capability, the
+/// modem-line map (input levels), custom-baud acceptance, and counter support.
+fn p5_certify_port(port: &Path) -> String {
+    let Ok(sp) = p5_open(port, CUSTOM_BAUD, Parity::None) else {
+        return "unavailable for characterization".into();
+    };
+    let baud = sp.get_configuration().and_then(|c| c.get_baud_rate()).ok();
+    let custom_baud_ok = baud
+        .map(|b| {
+            (b as i64 - CUSTOM_BAUD as i64).unsigned_abs() as f64 / CUSTOM_BAUD as f64 <= 0.025
+        })
+        .unwrap_or(false);
+    let break_ok = sp.set_break(true).is_ok() && sp.set_break(false).is_ok();
+    let modem = format!(
+        "cts={} dsr={} dcd={} ri={}",
+        sp.read_cts().map(|b| b.to_string()).unwrap_or("?".into()),
+        sp.read_dsr().map(|b| b.to_string()).unwrap_or("?".into()),
+        sp.read_cd().map(|b| b.to_string()).unwrap_or("?".into()),
+        sp.read_ri().map(|b| b.to_string()).unwrap_or("?".into()),
+    );
+    let icounter = sys::read_icounter(sp.as_raw_fd()).is_ok();
+    format!("custom_baud={custom_baud_ok} break={break_ok} modem[{modem}] icounter={icounter}")
+}
+
+/// The paired-rig certificate (§15.21), only meaningful on independently clocked
+/// UARTs: a rate ladder including a nonstandard rate (all must round-trip), and a
+/// deliberate baud mismatch that must corrupt the nonce and raise the frame-error
+/// counter — proving the error counters are observable. Returns a summary line.
+fn p5_certify_pair(port_a: &Path, port_b: &Path) -> String {
+    // Rate ladder: reconfigure both ports to each rate and exchange a nonce.
+    let rates = [9600u32, 115_200, CUSTOM_BAUD];
+    let mut ladder_ok = true;
+    for &baud in &rates {
+        let (Ok(a), Ok(b)) = (
+            p5_open(port_a, baud, Parity::None),
+            p5_open(port_b, baud, Parity::None),
+        ) else {
+            return "pair reopen failed".into();
+        };
+        let nonce = format!("\x02LADDER-{baud}\x03").into_bytes();
+        let _ = p5_write_all(&a, &nonce);
+        std::thread::sleep(Duration::from_millis(120));
+        let got = p5_drain(&b, Duration::from_millis(300));
+        if !contains_sub(&got, &nonce) {
+            ladder_ok = false;
+        }
+    }
+    // Deliberate baud mismatch: TX at 115200, RX at 9600 — the nonce must NOT
+    // arrive intact, and the frame-error counter must rise (observable, §15.21).
+    let mismatch_observed = {
+        let (Ok(a), Ok(b)) = (
+            p5_open(port_a, 115_200, Parity::None),
+            p5_open(port_b, 9600, Parity::None),
+        ) else {
+            return format!("rate_ladder={ladder_ok} mismatch=reopen-failed");
+        };
+        let before = sys::read_icounter(b.as_raw_fd())
+            .map(|c| c.frame)
+            .unwrap_or(0);
+        let nonce = b"\x02MISMATCH-PROBE-PATTERN\x03";
+        let _ = p5_write_all(&a, nonce);
+        std::thread::sleep(Duration::from_millis(150));
+        let got = p5_drain(&b, Duration::from_millis(300));
+        let after = sys::read_icounter(b.as_raw_fd())
+            .map(|c| c.frame)
+            .unwrap_or(before);
+        !contains_sub(&got, nonce) && after > before
+    };
+    format!("rate_ladder={ladder_ok} deliberate_mismatch_observed={mismatch_observed}")
+}
+
+pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
+    let mut p = Probe::new(
+        "P5",
+        "rig discovery and certification",
+        "Classify each named port (dangling/loopback/paired, both directions) and certify the rig for a tiered checklist run (§13, §15.21).",
+    );
+
+    // Open every port for discovery.
+    let mut sps: Vec<Option<SerialPort>> = Vec::new();
+    let mut perm_denied = false;
+    for port in ports {
+        match p5_open(port, 115_200, Parity::None) {
+            Ok(sp) => sps.push(Some(sp)),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                perm_denied = true;
+                sps.push(None);
+            }
+            Err(e) => {
+                p = p.observe(&port.display().to_string(), format!("open error: {e}"));
+                sps.push(None);
+            }
+        }
+    }
+    if sps.iter().all(Option::is_none) {
+        let reason = if perm_denied {
+            "permission denied"
+        } else {
+            "no port opened"
+        };
+        return p.verdict(
+            Status::skipped(reason),
+            "Grant access (udev GROUP=plugdev, or dialout) and re-run with the rig's --ports.",
+        );
+    }
+
+    // Discovery: transmit each port's nonce and CONTINUOUSLY scan every port for a
+    // few seconds, re-sending the nonce periodically. A gapped write-then-drain
+    // races a software echo/bridge peer that is CPU-starved on a loaded box (it may
+    // echo only after the drain window closes); a continuous scan instead catches
+    // the echo whenever it lands, and the re-sends give a slow peer repeated
+    // triggers — while a truly dangling port hears nothing across the whole window.
+    // The doctor is a diagnostic, not a data path, so the seconds cost nothing.
+    let mut bufs: Vec<Vec<u8>> = vec![Vec::new(); ports.len()];
+    let deadline = Instant::now() + Duration::from_millis(4000);
+    let mut next_send = Instant::now();
+    while Instant::now() < deadline {
+        if Instant::now() >= next_send {
+            for (i, sp) in sps.iter().enumerate() {
+                if let Some(sp) = sp {
+                    let _ = p5_write_all(sp, &p5_nonce(i));
+                }
+            }
+            next_send = Instant::now() + Duration::from_millis(500);
+        }
+        // Block on poll for readability across all live ports (like the daemon's
+        // reader and the nullmodem bridge) — a short-timeout read scan races a
+        // CPU-starved echo peer and misses the reply; poll wakes the instant any
+        // port has data. Read every ready port.
+        let live: Vec<(usize, &SerialPort)> = sps
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|sp| (i, sp)))
+            .collect();
+        let mut pfds: Vec<PollFd> = live
+            .iter()
+            .map(|(_, sp)| PollFd::new(sp.as_fd(), PollFlags::POLLIN))
+            .collect();
+        let _ = poll(&mut pfds, PollTimeout::from(200u16));
+        for (idx, (i, sp)) in live.iter().enumerate() {
+            let ready = pfds[idx]
+                .revents()
+                .map(|r| r.intersects(PollFlags::POLLIN | PollFlags::POLLHUP))
+                .unwrap_or(false);
+            if ready {
+                bufs[*i].extend_from_slice(&p5_read_once(sp));
+            }
+        }
+        // Yield the CPU each pass. A port stuck poll-ready (e.g. a `POLLHUP` on a
+        // stalled/half-open peer) would otherwise busy-spin this loop and starve a
+        // software echo/bridge peer of the CPU it needs to reply (the bug this
+        // guards against — without it the loopback reply is never captured).
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let heard = |listener: usize, sender: usize| contains_sub(&bufs[listener], &p5_nonce(sender));
+
+    // Classify, and remember verified UART pairs (i<j) for characterization. The
+    // index loops are the who-heard-whom matrix — `heard(i, j)` needs both indices,
+    // so an iterator loop does not fit.
+    let mut clean = true;
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..ports.len() {
+        if sps[i].is_none() {
+            continue;
+        }
+        let name = p5_name(&ports[i], resolver);
+        let classification = if heard(i, i) {
+            "loopback (TX↔RX jumpered)".to_string()
+        } else {
+            let mut partner = None;
+            let mut asym = None;
+            for j in 0..ports.len() {
+                if j == i || sps[j].is_none() {
+                    continue;
+                }
+                match (heard(i, j), heard(j, i)) {
+                    (true, true) => partner = Some(j),
+                    (a, b) if a != b => asym = Some(j),
+                    _ => {}
+                }
+            }
+            if let Some(j) = partner {
+                if i < j {
+                    pairs.push((i, j));
+                }
+                format!("paired with {}", p5_name(&ports[j], resolver))
+            } else if let Some(j) = asym {
+                clean = false;
+                format!(
+                    "HALF-CROSSED with {} (asymmetric — check TX/RX wiring)",
+                    p5_name(&ports[j], resolver)
+                )
+            } else {
+                "dangling (nothing wired to it)".to_string()
+            }
+        };
+        p = p.observe(&name, classification);
+    }
+
+    // Release the discovery opens before characterization reopens the ports.
+    drop(sps);
+
+    // Characterize each port; a non-UART (the CI sim) skips cleanly.
+    let mut any_uart = false;
+    for port in ports {
+        if let Ok(sp) = p5_open(port, 115_200, Parity::None) {
+            let name = p5_name(port, resolver);
+            if p5_is_uart(&sp) {
+                any_uart = true;
+                drop(sp);
+                p = p.observe(format!("{name} cert").as_str(), p5_certify_port(port));
+            } else {
+                p = p.observe(format!("{name} cert").as_str(), "skipped (not a UART)");
+            }
+        }
+    }
+    // Paired UARTs get the independent-clock certificate (rate ladder + mismatch).
+    for (i, j) in pairs {
+        let (Ok(a_uart), Ok(b_uart)) = (
+            p5_open(&ports[i], 115_200, Parity::None).map(|sp| p5_is_uart(&sp)),
+            p5_open(&ports[j], 115_200, Parity::None).map(|sp| p5_is_uart(&sp)),
+        ) else {
+            continue;
+        };
+        if a_uart && b_uart {
+            let name = format!(
+                "{} ↔ {} cert",
+                p5_name(&ports[i], resolver),
+                p5_name(&ports[j], resolver)
+            );
+            p = p.observe(name.as_str(), p5_certify_pair(&ports[i], &ports[j]));
+        }
+    }
+
+    if !clean {
+        p.verdict(
+            Status::Degraded,
+            "A rig is miswired (asymmetric/half-crossed) — named above; fix it before a tiered run so a tier failure is attributable to serial_nexus, not a loose wire (§15.21).",
+        )
+    } else if any_uart {
+        p.verdict(
+            Status::Supported,
+            "Rig discovered and certified; every tiered checklist run starts from this certificate (§15.21).",
+        )
+    } else {
+        p.verdict(
+            Status::Supported,
+            "Rig discovered and classified (above); characterization skipped on non-UART sims — the certificate populates on real adapters (§13, no-target doctrine).",
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -460,7 +767,7 @@ pub fn environment(dev_root: &Path, sys_root: &Path, named_ports: &[PathBuf]) ->
 
     // by-id tree.
     let by_id = dev_root.join("dev/serial/by-id");
-    let adapters = discover_adapters(dev_root, sys_root);
+    let adapters = nexus_core::Resolver::with_roots(dev_root, sys_root).discover_adapters();
     if by_id.is_dir() {
         checks.push(EnvCheck::new(
             "/dev/serial/by-id",
@@ -487,10 +794,7 @@ pub fn environment(dev_root: &Path, sys_root: &Path, named_ports: &[PathBuf]) ->
     }
 
     // Access to each discovered or named serial device node.
-    let mut ports: Vec<PathBuf> = adapters
-        .iter()
-        .map(|a| PathBuf::from(&a.dev_path))
-        .collect();
+    let mut ports: Vec<PathBuf> = adapters.iter().map(|a| a.dev_path.clone()).collect();
     for p in named_ports {
         if !ports.contains(p) {
             ports.push(p.clone());

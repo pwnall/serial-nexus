@@ -10,6 +10,7 @@ nix::ioctl_write_ptr_bad!(tiocpkt, libc::TIOCPKT, libc::c_int);
 nix::ioctl_none_bad!(tiocexcl, libc::TIOCEXCL);
 nix::ioctl_none_bad!(tiocnxcl, libc::TIOCNXCL);
 nix::ioctl_read_bad!(tiocgicount, libc::TIOCGICOUNT, SerialIcounts);
+nix::ioctl_read_bad!(tiocmget, libc::TIOCMGET, libc::c_int);
 
 /// The kernel's `serial_icounter_struct` (TIOCGICOUNT): driver-maintained input
 /// counters the design surfaces in serial state *where supported* (§5, §7.1) —
@@ -45,6 +46,17 @@ pub fn read_icounts(fd: RawFd) -> nix::Result<SerialIcounts> {
     // `counts`, whose layout mirrors the kernel struct.
     unsafe { tiocgicount(fd, &mut counts) }?;
     Ok(counts)
+}
+
+/// Read the modem-line bitmask (`TIOCMGET`): DTR/RTS outputs and CTS/DSR/DCD/RI
+/// inputs, masked with `libc::TIOCM_*` (§7.1 "current modem-line readings"). `Err`
+/// means the fd's driver does not implement it (a pts in tests), which callers
+/// surface as `null` rather than a fault.
+pub fn read_modem_bits(fd: RawFd) -> nix::Result<libc::c_int> {
+    let mut bits: libc::c_int = 0;
+    // Safety: TIOCMGET writes one int through the pointer; `bits` outlives it.
+    unsafe { tiocmget(fd, &mut bits) }?;
+    Ok(bits)
 }
 
 /// Packet-mode data marker: a master read whose leading control byte is

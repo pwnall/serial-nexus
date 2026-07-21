@@ -55,6 +55,12 @@ pub mod app_errors {
     /// A `lock`/`send` was refused because another origin holds the endpoint's
     /// write lock (§6) — a plain contended acquire, or a `send` at its deadline.
     pub const LOCKED: i64 = APP_ERROR_BASE - 3;
+    /// `remove-node` refused because the node still has attached edges and
+    /// `--cascade` was not given (§11).
+    pub const HAS_EDGES: i64 = APP_ERROR_BASE - 4;
+    /// `add-node` by raw path or serial number failed because the device is not
+    /// present, so its identity cannot be captured (§12).
+    pub const DEVICE_ABSENT: i64 = APP_ERROR_BASE - 5;
 }
 
 #[derive(Default)]
@@ -82,6 +88,14 @@ pub struct Daemon {
     state: RefCell<GraphState>,
     pub shutdown: Notify,
     notifier: broadcast::Sender<Notification>,
+    /// Device-identity resolver (§12), rooted at `--dev-root` (a fixture seam in
+    /// tests; `/` in production). Shared read-only with every serial node.
+    resolver: nexus_core::Resolver,
+    /// The configuration snapshot path (§11): after every successful *config*
+    /// mutation the daemon writes the current config here (atomically), and startup
+    /// prefers it, so incremental surgery survives a daemon restart. `None` disables
+    /// persistence (unit tests via [`Daemon::default`]).
+    state_file: Option<std::path::PathBuf>,
 }
 
 /// The outcome of a (possibly waiting) acquisition attempt (§15.20). Distinguishes
@@ -102,7 +116,7 @@ enum WaitOutcome {
 }
 
 impl Daemon {
-    pub fn new() -> Self {
+    pub fn new(resolver: nexus_core::Resolver, state_file: Option<std::path::PathBuf>) -> Self {
         let (notifier, _) = broadcast::channel(NOTIFY_CAPACITY);
         Daemon {
             state: RefCell::new(GraphState {
@@ -111,6 +125,33 @@ impl Daemon {
             }),
             shutdown: Notify::new(),
             notifier,
+            resolver,
+            state_file,
+        }
+    }
+
+    /// Snapshot the current configuration to the state file (§11/§15.9), atomically
+    /// (tmp + rename) so a crash mid-write cannot corrupt it. Called after every
+    /// successful config mutation. A write failure is logged but never fails the
+    /// mutation or corrupts the running graph — the graph is authoritative; the
+    /// file is a convenience for the next start (§15.9).
+    fn snapshot_config(&self) {
+        let Some(path) = &self.state_file else {
+            return;
+        };
+        // Serialize under the borrow, then drop it before touching the filesystem.
+        let text = {
+            let st = self.state.borrow();
+            match toml::to_string(&st.config) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("state snapshot serialize failed: {e}");
+                    return;
+                }
+            }
+        };
+        if let Err(e) = atomic_write(path, text.as_bytes()) {
+            tracing::warn!(path = %path.display(), "state snapshot write failed: {e}");
         }
     }
 
@@ -139,14 +180,27 @@ impl Daemon {
     /// because the arbitration verbs may wait (`lock --wait`, `send`); every other
     /// verb resolves without awaiting, so their cost is unchanged.
     pub async fn dispatch(&self, method: &str, params: Option<Value>) -> Result<Value, RpcError> {
-        match method {
-            "load" => self.load(parse_config_param(params)?),
+        let result = match method {
+            "load" => {
+                // `replace` (§11) is read before the params move into the config parse.
+                let replace = params
+                    .as_ref()
+                    .and_then(|p| p.get("replace"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.load(parse_config_param(params)?, replace)
+            }
+            "add-node" => self.add_node(params),
+            "remove-node" => self.remove_node(params),
             "dump" => Ok(self.dump()),
             "state" => Ok(self.state()),
             // The stream itself is served by the connection task (control.rs);
             // dispatch just acknowledges the subscription (§10).
             "subscribe" => Ok(json!({ "subscribed": true })),
             "rotate" => self.rotate(params),
+            "send-break" => self.send_break(params).await,
+            "set-modem" => self.set_modem(params),
+            "pulse-dtr" => self.pulse_dtr(params).await,
             "lock" => self.lock(params).await,
             "unlock" => self.unlock(params),
             "send" => self.send(params).await,
@@ -156,23 +210,27 @@ impl Daemon {
                 Ok(json!({ "shutting_down": true }))
             }
             other => Err(RpcError::method_not_found(other)),
+        };
+        // Persist configuration after a successful config mutation (§11). Read-only
+        // verbs and the arbitration/rotate traffic never touch config, so they are
+        // not snapshotted; clean shutdown (SIGTERM → `teardown_all`) bypasses
+        // dispatch, so it preserves the graph for the next start rather than
+        // persisting an empty one.
+        if result.is_ok() && is_config_mutation(method) {
+            self.snapshot_config();
         }
+        result
     }
 
-    /// `load` (§11): accepted only on an empty graph, structurally atomic. A
-    /// structural error creates nothing; environmental failures fault nodes
+    /// `load` (§11): structurally atomic. Accepted only on an empty graph unless
+    /// `replace`, which composes teardown-then-load (§11) so a full-file edit needs
+    /// no manual teardown. A structural error creates nothing (and, under
+    /// `replace`, is caught *before* the running graph is torn down, so a bad
+    /// config never destroys a good one); environmental failures fault nodes
     /// without failing the load (§15.8).
-    fn load(&self, config: GraphConfig) -> Result<Value, RpcError> {
-        let mut st = self.state.borrow_mut();
-        if !st.nodes.is_empty() {
-            return Err(RpcError::new(
-                app_errors::LOAD_NONEMPTY,
-                "load requires an empty graph — teardown first (or use load --replace)",
-            ));
-        }
-
-        // Full structural validation before anything is created (§4, §11):
-        // duplicate node names plus the three graph rules and name checks.
+    fn load(&self, config: GraphConfig, replace: bool) -> Result<Value, RpcError> {
+        // Full structural validation before anything is created or torn down (§4,
+        // §11): duplicate node names plus the three graph rules and name checks.
         let errors = config.validate();
         if !errors.is_empty() {
             let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
@@ -183,12 +241,27 @@ impl Daemon {
             .with_data(json!({ "errors": messages })));
         }
 
+        // `--replace` clears the running graph first (teardown-then-load, §11). The
+        // config is already validated, so this only fires for a config that will
+        // load. `teardown` takes its own borrow, so run it before ours.
+        if replace {
+            self.teardown();
+        }
+
+        let mut st = self.state.borrow_mut();
+        if !st.nodes.is_empty() {
+            return Err(RpcError::new(
+                app_errors::LOAD_NONEMPTY,
+                "load requires an empty graph — teardown first (or use load --replace)",
+            ));
+        }
+
         // Instantiate nodes. An environmental failure faults the node (kept);
         // only an unimplemented node kind aborts the load, and then nothing is
         // committed.
         let mut nodes = Vec::with_capacity(config.nodes.len());
         for nc in &config.nodes {
-            match Node::instantiate(nc) {
+            match Node::instantiate(nc, &self.resolver) {
                 Ok(node) => nodes.push(node),
                 Err(reason) => {
                     for mut n in nodes {
@@ -234,6 +307,204 @@ impl Daemon {
             node.start(&mut wiring);
         }
         Ok(json!({ "loaded": st.nodes.len() }))
+    }
+
+    /// `add-node` (§10/§11): add one node to a running graph. The node arrives with
+    /// no edges (wiring edges is the separate `connect` verb); its endpoints are
+    /// wired self-contained — a host-facing endpoint gets its lock and targetward
+    /// channel, a target-facing endpoint sits idle until connected. For a serial
+    /// node, the device is resolved to a canonical identity at add time and echoed
+    /// back (§12): a raw-path/serial add requires the device present; an identity
+    /// add never does. Validated against the same structural rules as `load`
+    /// (§11) — a duplicate name or illegal identity creates nothing.
+    fn add_node(&self, params: Option<Value>) -> Result<Value, RpcError> {
+        let node_val = params
+            .as_ref()
+            .and_then(|p| p.get("node"))
+            .ok_or_else(|| RpcError::invalid_params("missing 'node' in params"))?;
+        let mut node_cfg: nexus_core::config::NodeConfig = serde_json::from_value(node_val.clone())
+            .map_err(|e| RpcError::invalid_params(format!("invalid node config: {e}")))?;
+
+        // Resolve a serial node's device to a canonical identity at add time (§12),
+        // before taking the state borrow (the resolver does filesystem I/O). The
+        // captured identity replaces the operator input in config, so `dump`
+        // round-trips it and the config survives a cold start.
+        let mut echo = serde_json::Map::new();
+        if let nexus_core::config::NodeConfig::Serial { device, .. } = &mut node_cfg {
+            match self.resolver.resolve_input(device) {
+                Ok(resolved) => {
+                    *device = resolved.identity.clone();
+                    echo.insert("identity".into(), json!(resolved.identity));
+                    echo.insert("description".into(), json!(resolved.description));
+                    echo.insert("kind".into(), json!(resolved.kind.label()));
+                    echo.insert(
+                        "resolved_path".into(),
+                        json!(resolved.path.map(|p| p.display().to_string())),
+                    );
+                    if let Some(w) = resolved.warning {
+                        echo.insert("warning".into(), json!(w));
+                    }
+                }
+                Err(nexus_core::ResolveError::NotPresent { input }) => {
+                    return Err(RpcError::new(
+                        app_errors::DEVICE_ABSENT,
+                        format!(
+                            "device {input:?} is not present; add by a usb:/by-path: identity to configure it while absent (§12)"
+                        ),
+                    ));
+                }
+                Err(nexus_core::ResolveError::Malformed { input, reason }) => {
+                    return Err(RpcError::invalid_params(format!(
+                        "device {input:?}: {reason}"
+                    )));
+                }
+            }
+        }
+        let node_name = node_cfg.name().to_owned();
+
+        let mut st = self.state.borrow_mut();
+        // Validate the candidate graph (current + new node, edges unchanged) with
+        // the same rules as `load` (§11): duplicate name, name/identity legality,
+        // leg/codec config. Nothing is created on a structural error.
+        let mut candidate = st.config.clone();
+        candidate.nodes.push(node_cfg.clone());
+        let errors = candidate.validate();
+        if !errors.is_empty() {
+            let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+            return Err(RpcError::new(
+                app_errors::STRUCTURAL,
+                format!("structural error: {}", messages[0]),
+            )
+            .with_data(json!({ "errors": messages })));
+        }
+
+        // Instantiate the node (environmental failure faults it, §15.8; only a bad
+        // codec kind/schema Errs, and then nothing is committed).
+        let mut node = Node::instantiate(&node_cfg, &self.resolver)
+            .map_err(|reason| RpcError::invalid_params(format!("node {node_name}: {reason}")))?;
+
+        // Wire the node's own endpoints (no edges): build a partial plan from a
+        // single-node config and merge its host-endpoint lock + targetward sender
+        // into the daemon maps. `start` claims its endpoints from the plan.
+        let mini = GraphConfig {
+            nodes: vec![node_cfg.clone()],
+            edges: Vec::new(),
+        };
+        let mut wiring = crate::runtime::Wiring::build(&mini, &self.notifier);
+        for (a, l) in wiring.endpoint_locks.iter() {
+            st.endpoint_locks.insert(a.to_string(), l.clone());
+        }
+        for (a, t) in wiring.host_targetward_tx.iter() {
+            st.endpoint_targetward.insert(a.to_string(), t.clone());
+        }
+        node.start(&mut wiring);
+        st.nodes.push(node);
+        st.config.nodes.push(node_cfg);
+
+        let mut result = serde_json::Map::new();
+        result.insert("added".into(), json!(node_name));
+        result.append(&mut echo);
+        Ok(Value::Object(result))
+    }
+
+    /// `remove-node [--cascade]` (§10/§11): remove one node. Refused while edges are
+    /// attached unless `--cascade`, which also removes those edges; removal tears
+    /// down the node's environment (flushing a log queue within the bounded wait,
+    /// §7.3), closes its endpoint locks so parked waiters leave with the defined
+    /// error (§6/§15.20), and prunes it from the wiring maps. Surviving neighbors
+    /// self-heal: a dropped channel simply stops delivering (a closed `try_send`).
+    fn remove_node(&self, params: Option<Value>) -> Result<Value, RpcError> {
+        let name = params
+            .as_ref()
+            .and_then(|p| p.get("node"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("missing 'node' in params"))?
+            .to_owned();
+        let cascade = params
+            .as_ref()
+            .and_then(|p| p.get("cascade"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let mut st = self.state.borrow_mut();
+        let idx = st
+            .nodes
+            .iter()
+            .position(|n| n.name() == name)
+            .ok_or_else(|| RpcError::invalid_params(format!("unknown node {name:?}")))?;
+
+        // Edges touching this node (either endpoint). Refuse a non-cascade removal
+        // while any remain (§11).
+        let attached = st
+            .config
+            .edges
+            .iter()
+            .filter(|e| e.a.node == name || e.b.node == name)
+            .count();
+        if attached > 0 && !cascade {
+            return Err(RpcError::new(
+                app_errors::HAS_EDGES,
+                format!("node {name:?} has {attached} attached edge(s); use --cascade"),
+            ));
+        }
+
+        // The node's endpoint display addresses, from its config shape.
+        let endpoints: Vec<String> = st
+            .config
+            .nodes
+            .iter()
+            .find(|n| n.name() == name)
+            .map(|n| {
+                n.shape()
+                    .endpoints
+                    .iter()
+                    .map(|ep| EndpointAddr::new(&name, ep.name.clone()).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Tear the node down (release env, flush log) and drop it.
+        let mut node = st.nodes.remove(idx);
+        node.teardown();
+
+        // Close and prune the node's host-endpoint locks (wake parked waiters), and
+        // prune its targetward/origin entries. Keep the removed locks to also evict
+        // surviving origins that fed them (their target is gone).
+        let mut removed_locks: Vec<SharedLock> = Vec::new();
+        for disp in &endpoints {
+            if let Some(lock) = st.endpoint_locks.remove(disp) {
+                lock.close();
+                removed_locks.push(lock);
+            }
+            st.endpoint_targetward.remove(disp);
+            // If this endpoint is a *writer* (a PTY/codec side that fed a
+            // surviving host endpoint's lock), unregister it from that lock so it
+            // does not linger as a phantom origin — or, if it held the lock,
+            // permanently wedge the surviving endpoint as locked with no recovery
+            // (§6/§15.20: a torn-down origin leaves the lock cleanly).
+            if let Some((host_lock, origin_id)) = st.origin_locks.remove(disp) {
+                let released = { host_lock.borrow_mut().unregister(origin_id) };
+                if released {
+                    // It held the lock; releasing must wake the queue and notify,
+                    // exactly like a normal detach-release.
+                    host_lock.wake_waiters();
+                    host_lock.emit_change();
+                }
+            }
+        }
+        // A surviving origin whose target endpoint was this node keeps a clone of
+        // that (now-removed) lock; evict it so `lock`/`send` no longer resolve to a
+        // dead endpoint.
+        st.origin_locks
+            .retain(|_, (lock, _)| !removed_locks.iter().any(|rl| std::rc::Rc::ptr_eq(rl, lock)));
+
+        // Drop the node's edges and the node itself from configuration.
+        st.config
+            .edges
+            .retain(|e| e.a.node != name && e.b.node != name);
+        st.config.nodes.retain(|n| n.name() != name);
+
+        Ok(json!({ "removed": name, "cascaded_edges": attached }))
     }
 
     /// `dump` (§11): configuration only, in exactly the load format. Returns the
@@ -307,6 +578,62 @@ impl Daemon {
             Ok(rotated_to) => Ok(json!({ "node": node, "rotated_to": rotated_to })),
             Err(reason) => Err(RpcError::invalid_params(reason)),
         }
+    }
+
+    /// Resolve a named serial node to its open port for a signal verb (§7.1),
+    /// dropping the state borrow before the caller awaits (§15.20). Errors if the
+    /// node is missing, not a serial node, or its device is not currently open.
+    fn serial_port(&self, node: &str) -> Result<std::rc::Rc<serial2::SerialPort>, RpcError> {
+        let st = self.state.borrow();
+        let target = st
+            .nodes
+            .iter()
+            .find(|n| n.name() == node)
+            .ok_or_else(|| RpcError::invalid_params(format!("unknown node {node:?}")))?;
+        let serial = target.as_serial().ok_or_else(|| {
+            RpcError::invalid_params(format!("node {node:?} is not a serial node"))
+        })?;
+        serial.port().ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "serial node {node:?} has no open port (device absent/faulted)"
+            ))
+        })
+    }
+
+    /// `send-break` (§7.1): assert a serial break on the named node for a duration.
+    async fn send_break(&self, params: Option<Value>) -> Result<Value, RpcError> {
+        let node = node_param(&params)?.to_owned();
+        let ms = u64_param(&params, "ms").unwrap_or(250);
+        let port = self.serial_port(&node)?;
+        crate::nodes::serial::send_break(&port, ms)
+            .await
+            .map_err(|e| RpcError::invalid_params(format!("send-break on {node:?}: {e}")))?;
+        Ok(json!({ "node": node, "break_ms": ms }))
+    }
+
+    /// `set-modem` (§7.1): drive DTR and/or RTS on the live port (a `null` line is
+    /// left untouched). Acts on the live port only, not configuration (§15.8).
+    fn set_modem(&self, params: Option<Value>) -> Result<Value, RpcError> {
+        let node = node_param(&params)?.to_owned();
+        let dtr = bool_param(&params, "dtr");
+        let rts = bool_param(&params, "rts");
+        let port = self.serial_port(&node)?;
+        crate::nodes::serial::set_modem(&port, dtr, rts)
+            .map_err(|e| RpcError::invalid_params(format!("set-modem on {node:?}: {e}")))?;
+        Ok(json!({ "node": node, "dtr": dtr, "rts": rts }))
+    }
+
+    /// `pulse-dtr` (§7.1): pulse DTR to `assert` for a duration, then to `!assert`
+    /// — the classic auto-reset toggle.
+    async fn pulse_dtr(&self, params: Option<Value>) -> Result<Value, RpcError> {
+        let node = node_param(&params)?.to_owned();
+        let ms = u64_param(&params, "ms").unwrap_or(100);
+        let assert = bool_param(&params, "assert").unwrap_or(true);
+        let port = self.serial_port(&node)?;
+        crate::nodes::serial::pulse_dtr(&port, ms, assert)
+            .await
+            .map_err(|e| RpcError::invalid_params(format!("pulse-dtr on {node:?}: {e}")))?;
+        Ok(json!({ "node": node, "pulse_ms": ms, "assert": assert }))
     }
 
     /// `lock` (§6): a named origin acquires its endpoint's exclusive write lock.
@@ -688,7 +1015,9 @@ impl Daemon {
 
 impl Default for Daemon {
     fn default() -> Self {
-        Self::new()
+        // Production `/` resolver and no persistence; tests that need a fixture
+        // root or a state file call `Daemon::new(..)` explicitly.
+        Self::new(nexus_core::Resolver::new("/"), None)
     }
 }
 
@@ -814,6 +1143,60 @@ fn merge_into(target: &mut serde_json::Map<String, Value>, source: Value) {
             target.insert(k, v);
         }
     }
+}
+
+/// Whether a verb changes configuration and so warrants a state-file snapshot
+/// (§11). Read-only verbs (`state`, `dump`, `subscribe`), arbitration (`lock`/
+/// `unlock`/`send`), `rotate`, and `shutdown` never touch config.
+fn is_config_mutation(method: &str) -> bool {
+    matches!(
+        method,
+        "load" | "load-replace" | "teardown" | "add-node" | "remove-node"
+    )
+}
+
+/// Write `bytes` to `path` atomically: create the parent directory, write a
+/// sibling temp file, then rename over the target (atomic on one filesystem), so a
+/// crash mid-write leaves the previous snapshot intact (§11/§15.9).
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    let tmp = {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".tmp");
+        path.with_file_name(name)
+    };
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Extract the required `node` string from a node-targeted verb's params.
+fn node_param(params: &Option<Value>) -> Result<&str, RpcError> {
+    params
+        .as_ref()
+        .and_then(|p| p.get("node"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::invalid_params("missing 'node' in params"))
+}
+
+/// An optional `u64` params field.
+fn u64_param(params: &Option<Value>, key: &str) -> Option<u64> {
+    params
+        .as_ref()
+        .and_then(|p| p.get(key))
+        .and_then(Value::as_u64)
+}
+
+/// An optional `bool` params field.
+fn bool_param(params: &Option<Value>, key: &str) -> Option<bool> {
+    params
+        .as_ref()
+        .and_then(|p| p.get(key))
+        .and_then(Value::as_bool)
 }
 
 /// Extract the required `origin` string from an `unlock` request's params.

@@ -128,13 +128,16 @@ bash "$WAIT" "test \"\$(stat -c %s '$LOGDIR/rot.log' 2>/dev/null || echo 0)\" -g
 [ "$(sha "$LOGDIR/rot.log")" = "$Cc" ] || fail "live rot.log != batch C"
 
 # ---- Check 3: rotation counter recovered by directory scan on restart -------
-# Kill the daemon hard; a fresh daemon loading the same directory must continue
-# numbering from the scan (higher is newer), not restart at 000 (§7.3).
+# Kill the daemon hard; a fresh daemon must continue numbering from the directory
+# scan (higher is newer), not restart at 000 (§7.3). Since phase 7 the daemon
+# also persists config after each mutation and auto-recovers it on restart
+# (§11/§15.9), so the log node reappears without a manual reload and rescans the
+# directory itself — crash recovery is now one code path.
 kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; DPID=
 # The hard kill skips the clean-shutdown unlink; the daemon's own stale-socket
-# dance (§10) reclaims the leftover socket on the next start.
+# dance (§10) reclaims the leftover socket on the next start, and the persisted
+# state file (next to the socket) is preferred over any --config.
 start_daemon
-"$C" load "$TMPD/c2.toml" >/dev/null || { cat "$TMPD/daemon.log"; fail "reload c2 failed"; }
 # Existing rotations are rot.log.000 and rot.log.001, so state must show 1...
 bash "$WAIT" "\"$C\" --json state | jq -e '.nodes[]|select(.name==\"rot\")|.rotation==1'" 5 0.05 \
   || fail "rotation counter not recovered from directory scan (got $(nstate rot rotation))"

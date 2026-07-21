@@ -32,7 +32,10 @@ start_daemon
 
 # ---- Check 1: the stream carries node status and counter snapshots ----------
 DEV1="$TMPD/dev1"
-"$SIM" pty --source --bytes 256KiB --seed 7 --link "$DEV1" >"$TMPD/src1.json" 2>&1 &
+# --hold-ms keeps the device "plugged in" after the finite source completes, so
+# usb0 stays active while we observe the stream (a closed device now correctly
+# faults-and-waits, §7.1); this test observes the subscribe stream, not reconnect.
+"$SIM" pty --source --bytes 256KiB --seed 7 --hold-ms 30000 --link "$DEV1" >"$TMPD/src1.json" 2>&1 &
 PIDS+=($!)
 bash "$WAIT" "test -e '$DEV1'" 5 0.05 || fail "dev1 never appeared"
 

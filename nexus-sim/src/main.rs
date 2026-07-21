@@ -70,6 +70,24 @@ enum Mode {
     /// Sit between two daemons on loopback and forward both directions, with
     /// `--drop-after`/`--restore-after` link-outage injection (§7.4, phase 6).
     TcpProxy(TcpProxyArgs),
+    /// Bridge two PTY pairs in-process as a software null modem (`--link-a` ↔
+    /// `--link-b`): a crossed pair with no hardware, for CI-testing doctor P5's
+    /// discovery/classification without a bench (§3, plan validation item 7).
+    #[command(name = "nullmodem")]
+    NullModem(NullModemArgs),
+}
+
+#[derive(Args)]
+struct NullModemArgs {
+    /// Stable symlink to the first pts (one "port" of the crossed pair).
+    #[arg(long)]
+    link_a: PathBuf,
+    /// Stable symlink to the second pts (the other "port").
+    #[arg(long)]
+    link_b: PathBuf,
+    /// Exit after this many milliseconds with no traffic in either direction.
+    #[arg(long, default_value_t = 10_000)]
+    timeout_ms: u64,
 }
 
 #[derive(Args)]
@@ -106,6 +124,11 @@ struct PtyArgs {
     rate: Option<u64>,
     #[arg(long, default_value_t = 5000)]
     timeout_ms: u64,
+    /// After the exchange completes, keep the master (and thus the pts) open this
+    /// long (ms) before exiting, so the device reads as still "plugged in" — a
+    /// real serial port stays present when it stops transmitting (§7.1).
+    #[arg(long)]
+    hold_ms: Option<u64>,
 }
 
 #[derive(Args)]
@@ -285,6 +308,7 @@ fn main() {
         Mode::Envelope(a) => run_envelope(a),
         Mode::Wire(a) => run_wire(a),
         Mode::TcpProxy(a) => run_tcp_proxy(a),
+        Mode::NullModem(a) => run_nullmodem(a),
     };
     println!("{verdict}");
     let pass = verdict
@@ -442,10 +466,110 @@ fn run_pty_inner(a: &PtyArgs) -> anyhow::Result<Value> {
         anyhow::bail!("pty: pick one of --echo/--source/--sink/--report-termios/--stall")
     };
 
+    // Keep the master (and thus the pts) open so the device reads as still
+    // "plugged in" after a finite source/sink completes — a real serial device
+    // stays present when it stops transmitting; only an unplug closes it, which
+    // the daemon now reads as faulted-and-wait (§7.1). Tests that want the unplug
+    // simply omit --hold-ms (or kill the sim).
+    if let Some(ms) = a.hold_ms {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+
     if let Some(link) = &a.link {
         let _ = std::fs::remove_file(link);
     }
     result
+}
+
+fn run_nullmodem(a: NullModemArgs) -> Value {
+    let out = run_nullmodem_inner(&a);
+    let _ = std::fs::remove_file(&a.link_a);
+    let _ = std::fs::remove_file(&a.link_b);
+    match out {
+        Ok(v) => v,
+        Err(e) => err_verdict("nullmodem", &e),
+    }
+}
+
+/// Open a raw PTY master and publish its pts under `link`. Returns the master.
+fn nullmodem_master(link: &std::path::Path) -> anyhow::Result<PtyMaster> {
+    let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY)?;
+    grantpt(&master)?;
+    unlockpt(&master)?;
+    let pts = ptsname_r(&master)?;
+    set_raw(&master)?;
+    let _ = std::fs::remove_file(link);
+    std::os::unix::fs::symlink(&pts, link)?;
+    Ok(master)
+}
+
+/// Bridge two PTY masters: bytes written to either pts slave are forwarded to the
+/// other, so the two slaves behave as a cross-wired null modem (a device with no
+/// hardware). Exits after `timeout_ms` of no traffic in either direction. Slave
+/// closures are tolerated (a client may reopen), so a probe that opens, exchanges,
+/// and closes each side leaves the bridge available for the next.
+fn run_nullmodem_inner(a: &NullModemArgs) -> anyhow::Result<Value> {
+    let mut ma = nullmodem_master(&a.link_a)?;
+    let mut mb = nullmodem_master(&a.link_b)?;
+    let mut a_to_b: u64 = 0;
+    let mut b_to_a: u64 = 0;
+    let mut buf = [0u8; 8192];
+    let mut last_activity = Instant::now();
+
+    while last_activity.elapsed() < Duration::from_millis(a.timeout_ms) {
+        let mut fds = [
+            PollFd::new(ma.as_fd(), PollFlags::POLLIN),
+            PollFd::new(mb.as_fd(), PollFlags::POLLIN),
+        ];
+        // A short poll timeout bounds how quickly the idle-exit check fires.
+        let _ = poll(&mut fds, PollTimeout::from(100u16));
+        let a_ready = fds[0]
+            .revents()
+            .map(|r| r.contains(PollFlags::POLLIN))
+            .unwrap_or(false);
+        let b_ready = fds[1]
+            .revents()
+            .map(|r| r.contains(PollFlags::POLLIN))
+            .unwrap_or(false);
+
+        if a_ready {
+            match ma.read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => {
+                    // A slave may not be open; ignore a transient write error.
+                    let _ = mb.write_all(&buf[..n]);
+                    let _ = mb.flush();
+                    a_to_b += n as u64;
+                    last_activity = Instant::now();
+                }
+                Err(e) if is_eio(&e) => {} // slave (client) closed; tolerate
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if b_ready {
+            match mb.read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => {
+                    let _ = ma.write_all(&buf[..n]);
+                    let _ = ma.flush();
+                    b_to_a += n as u64;
+                    last_activity = Instant::now();
+                }
+                Err(e) if is_eio(&e) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    Ok(json!({
+        "tool": "nexus-sim",
+        "mode": "nullmodem",
+        "pass": true,
+        "a_to_b": a_to_b,
+        "b_to_a": b_to_a,
+    }))
 }
 
 fn pty_echo(master: &mut PtyMaster, timeout_ms: u64) -> anyhow::Result<Value> {

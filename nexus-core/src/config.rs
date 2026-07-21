@@ -185,6 +185,13 @@ pub enum NodeConfig {
         /// Defaults to the built-in depth.
         #[serde(default = "default_serial_hostward_buffer")]
         hostward_buffer: usize,
+        /// On faulted-and-wait reconnect (the device reappearing after an
+        /// unplug/power-cycle), discard the targetward backlog buffered during
+        /// the outage rather than firing minutes-old commands into a booting
+        /// device (§7.1). Default on; the one sanctioned drain of the otherwise
+        /// never-drop targetward path, always counted.
+        #[serde(default = "default_true")]
+        purge_on_reconnect: bool,
         /// Initial modem-line assertions applied at open (§7.1). Declared last so
         /// it serializes after the scalar fields (a nested table must follow them
         /// in TOML's array-of-tables syntax); omitted when unset.
@@ -562,6 +569,7 @@ mod tests {
                     faces: Facing::Host,
                     arbitration: Arbitration::Exclusive,
                     hostward_buffer: 256,
+                    purge_on_reconnect: true,
                     modem: ModemLines::default(),
                 },
                 NodeConfig::Pty {
@@ -622,6 +630,7 @@ mod tests {
                     faces: Facing::Host,
                     arbitration: Arbitration::Exclusive,
                     hostward_buffer: 256,
+                    purge_on_reconnect: true,
                     modem: ModemLines::default(),
                 },
                 NodeConfig::Codec {
@@ -764,6 +773,7 @@ mod tests {
                     faces: Facing::Host,
                     arbitration: Arbitration::Exclusive,
                     hostward_buffer: 512,
+                    purge_on_reconnect: true,
                     modem: ModemLines {
                         dtr: Some(true),
                         rts: Some(false),
@@ -801,10 +811,12 @@ mod tests {
         match &parsed.nodes[0] {
             NodeConfig::Serial {
                 hostward_buffer,
+                purge_on_reconnect,
                 modem,
                 ..
             } => {
                 assert_eq!(*hostward_buffer, 256, "serial default hostward buffer");
+                assert!(*purge_on_reconnect, "purge_on_reconnect defaults on (§7.1)");
                 assert!(
                     modem.is_unset(),
                     "modem defaults to unset (lines untouched)"
@@ -1040,6 +1052,7 @@ mod tests {
                 any_arbitration(),
                 1usize..2048,
                 any_modem(),
+                any::<bool>(),
             )
                 .prop_map(
                     |(
@@ -1054,6 +1067,7 @@ mod tests {
                         arbitration,
                         hostward_buffer,
                         modem,
+                        purge_on_reconnect,
                     )| {
                         NodeConfig::Serial {
                             name,
@@ -1066,6 +1080,7 @@ mod tests {
                             faces,
                             arbitration,
                             hostward_buffer,
+                            purge_on_reconnect,
                             modem,
                         }
                     }

@@ -36,8 +36,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Load a TOML configuration onto an empty graph.
-    Load { file: PathBuf },
+    /// Load a TOML configuration onto an empty graph, or `--replace` a running one
+    /// (teardown-then-load, §11).
+    Load {
+        file: PathBuf,
+        /// Tear down any running graph first (§11).
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Add one node (no edges) to a running graph (§11). The file is a TOML
+    /// configuration containing a single `[[node]]`. For a serial node the device
+    /// is resolved and its captured identity echoed back (§12).
+    AddNode { file: PathBuf },
+    /// Remove one node (§11). Refused while edges are attached unless `--cascade`,
+    /// which removes those edges too (flushing a log queue first, §7.3).
+    RemoveNode {
+        node: String,
+        #[arg(long)]
+        cascade: bool,
+    },
     /// Dump the current configuration (TOML by default).
     Dump,
     /// Report observed node state.
@@ -51,6 +68,30 @@ enum Cmd {
     },
     /// Rotate a log node's file on demand.
     Rotate { node: String },
+    /// Assert a serial break on a node for `--ms` milliseconds (§7.1).
+    SendBreak {
+        node: String,
+        #[arg(long, default_value_t = 250)]
+        ms: u64,
+    },
+    /// Drive DTR and/or RTS on a serial node's live port (§7.1). Omitted lines are
+    /// left untouched.
+    SetModem {
+        node: String,
+        #[arg(long)]
+        dtr: Option<bool>,
+        #[arg(long)]
+        rts: Option<bool>,
+    },
+    /// Pulse DTR (the auto-reset toggle, §7.1): drive it to `--assert` for `--ms`
+    /// milliseconds, then to the opposite level.
+    PulseDtr {
+        node: String,
+        #[arg(long, default_value_t = 100)]
+        ms: u64,
+        #[arg(long, default_value_t = true)]
+        assert: bool,
+    },
     /// Acquire the exclusive write lock for an origin (§6): only its bytes are
     /// then read targetward through the endpoint it feeds. A plain contended
     /// acquire fails fast; `--wait` joins the FIFO queue; `--steal` takes the lock
@@ -123,19 +164,46 @@ fn main() -> anyhow::Result<()> {
 
 fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
     Ok(match cmd {
-        Cmd::Load { file } => {
+        Cmd::Load { file, replace } => {
             let text = std::fs::read_to_string(file)?;
             let config: GraphConfig = toml::from_str(&text)
                 .map_err(|e| anyhow::anyhow!("parsing {}: {e}", file.display()))?;
             (
                 "load",
-                Some(json!({ "config": serde_json::to_value(&config)? })),
+                Some(json!({ "config": serde_json::to_value(&config)?, "replace": replace })),
             )
         }
+        Cmd::AddNode { file } => {
+            // A single-node TOML configuration; take its one node.
+            let text = std::fs::read_to_string(file)?;
+            let config: GraphConfig = toml::from_str(&text)
+                .map_err(|e| anyhow::anyhow!("parsing {}: {e}", file.display()))?;
+            let node = config
+                .nodes
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("{}: no [[node]] to add", file.display()))?;
+            (
+                "add-node",
+                Some(json!({ "node": serde_json::to_value(node)? })),
+            )
+        }
+        Cmd::RemoveNode { node, cascade } => (
+            "remove-node",
+            Some(json!({ "node": node, "cascade": cascade })),
+        ),
         Cmd::Dump => ("dump", None),
         Cmd::State => ("state", None),
         Cmd::Subscribe { .. } => unreachable!("subscribe is handled before dispatch"),
         Cmd::Rotate { node } => ("rotate", Some(json!({ "node": node }))),
+        Cmd::SendBreak { node, ms } => ("send-break", Some(json!({ "node": node, "ms": ms }))),
+        Cmd::SetModem { node, dtr, rts } => (
+            "set-modem",
+            Some(json!({ "node": node, "dtr": dtr, "rts": rts })),
+        ),
+        Cmd::PulseDtr { node, ms, assert } => (
+            "pulse-dtr",
+            Some(json!({ "node": node, "ms": ms, "assert": assert })),
+        ),
         Cmd::Lock {
             origin,
             steal,
@@ -201,6 +269,29 @@ fn render(cmd: &Cmd, result: &Value) -> anyhow::Result<()> {
             let n = result.get("loaded").and_then(Value::as_u64).unwrap_or(0);
             println!("loaded {n} node(s)");
         }
+        Cmd::AddNode { .. } => {
+            let name = result.get("added").and_then(Value::as_str).unwrap_or("?");
+            print!("added {name}");
+            if let Some(desc) = result.get("description").and_then(Value::as_str) {
+                print!(" — bound: {desc}");
+            }
+            println!();
+            if let Some(w) = result.get("warning").and_then(Value::as_str) {
+                eprintln!("warning: {w}");
+            }
+        }
+        Cmd::RemoveNode { .. } => {
+            let name = result.get("removed").and_then(Value::as_str).unwrap_or("?");
+            let edges = result
+                .get("cascaded_edges")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if edges > 0 {
+                println!("removed {name} (and {edges} edge(s))");
+            } else {
+                println!("removed {name}");
+            }
+        }
         Cmd::Rotate { node } => {
             let n = result.get("rotated_to").and_then(Value::as_u64);
             match n {
@@ -208,6 +299,9 @@ fn render(cmd: &Cmd, result: &Value) -> anyhow::Result<()> {
                 None => println!("{node}: rotation requested"),
             }
         }
+        Cmd::SendBreak { node, ms } => println!("{node}: break asserted for {ms}ms"),
+        Cmd::SetModem { node, .. } => println!("{node}: modem lines set"),
+        Cmd::PulseDtr { node, ms, .. } => println!("{node}: DTR pulsed for {ms}ms"),
         Cmd::Lock { origin, .. } => {
             let acquired = result
                 .get("acquired")

@@ -2,8 +2,11 @@
 
 //! `nexus-core` — the graph model and data-plane contracts (design §3–§5).
 //!
-//! Pure logic, no kernel calls. This crate is the load-bearing foundation the
-//! rest of the system builds on:
+//! Pure logic, no kernel calls — with one deliberate exception, [`resolver`],
+//! which reads `/dev/serial/by-id` and sysfs to translate device identities
+//! (§12); it is dependency-free (no libudev, §15.10) and parameterized by root
+//! prefixes so it too is fixture-testable. This crate is the load-bearing
+//! foundation the rest of the system builds on:
 //!
 //! * [`graph`] — endpoint/facing/edge types and the three structural rules
 //!   (§4, §15.2–§15.4), validated on load and every incremental operation.
@@ -20,6 +23,7 @@ pub mod config;
 pub mod data;
 pub mod graph;
 pub mod lock;
+pub mod resolver;
 pub mod state;
 
 pub use config::GraphConfig;
@@ -29,4 +33,5 @@ pub use graph::{
     ValidationError, WriteMode,
 };
 pub use lock::{Acquire, EndpointLock, LockSnapshot, OriginId};
+pub use resolver::{Adapter, DeviceKind, ResolveError, Resolved, Resolver};
 pub use state::{NodeState, NodeStatus};

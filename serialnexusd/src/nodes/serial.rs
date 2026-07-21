@@ -1,43 +1,51 @@
 //! Serial port node (design §7.1). Faces host in the normal role.
 //!
-//! Slice 1 opened the device (raw path for now — the resolver lands in phase 7
-//! without a config-format change), applied configured termios, and took
-//! `TIOCEXCL` on the raw fd (serial2 sets `O_NOCTTY` but not `TIOCEXCL`, per the
-//! nexus-doctor P3 finding). A missing device does not fail the load — the node
-//! comes up `waiting` and heals later (§7.1 faulted-and-wait, phase 7).
+//! The device is named by a resolver identity (`usb:vid:pid:serial:iface`, a
+//! `by-path:` topology port, or a `raw:`/`/dev` path) — [`nexus_core::Resolver`]
+//! turns that into the current `/dev` path at every open and every reconnect
+//! recheck (§12). A missing device does not fail the load: the node comes up
+//! `waiting` and heals when its device reappears (§7.1 faulted-and-wait).
 //!
 //! Byte flow: the blocking `serial2` fd is set non-blocking (for the drain loop)
 //! and *not* driven by `serial2-tokio` (which hides the fd we need for
 //! `TIOCEXCL`/`TIOCGICOUNT`) nor `tokio::io::unix::AsyncFd` (whose epoll readiness
 //! busy-loops on pty masters, §15.18). The **hostward reader runs on a dedicated
 //! blocking thread** — a `poll(2)` blocking wait wakes it the instant the device
-//! has data, so it drains at line rate (a non-blocking poll-plus-sleep on the
-//! runtime thread capped hostward throughput at ~1 MB/s) and costs zero CPU while
-//! parked. This is §15.18's reserved "spawn_blocking reader threads" hatch, which
-//! the phase-3 benchmark cashed and §15.19 made normative (the hybrid data plane).
-//! It broadcasts to every attached consumer (lossy `try_send`, §5).
-//! The low-rate **targetward writer** stays an async task draining the bounded
-//! channel to the port (backpressure via the channel, §5); read and write on the
-//! shared fd are independent directions.
+//! has data, so it drains at line rate and costs zero CPU while parked (§15.19).
+//! It broadcasts to every attached consumer (lossy `try_send`, §5). The low-rate
+//! **targetward writer** and the **reconnect supervisor** share one async task on
+//! the runtime thread; read and write on the shared fd are independent directions.
+//!
+//! **Faulted-and-wait (§7.1).** The reader thread signals device loss (an exit on
+//! `POLLHUP`/EOF/error) by pulsing a `Notify`; the supervisor then joins it, drops
+//! the port, transitions to `waiting`, and polls the resolver for the device's
+//! reappearance *by the same identity* (a squatter on the old `/dev` path resolves
+//! to a different identity and is refused, §12). On reappearance it runs the
+//! **reopen ritual** — reapply termios, retake `TIOCEXCL`, restore the configured
+//! modem lines against auto-reset adapters, set non-blocking — then purges the
+//! outage-era targetward backlog (`purge_on_reconnect`, the one sanctioned drain
+//! of the never-drop targetward path, counted) and re-arms the reader and writer.
 
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle as ThreadHandle;
+use std::time::Duration;
 
 use nexus_core::Chunk;
-use nexus_core::NodeStatus;
 use nexus_core::config::{
     DataBits, FlowControl as CfgFlow, ModemLines, NodeConfig, Parity as CfgParity,
     StopBits as CfgStop,
 };
+use nexus_core::resolver::{DeviceKind, Resolver};
+use nexus_core::state::NodeStatus;
 use nix::poll::PollFlags;
 use serde_json::json;
 use serial2::{CharSize, FlowControl, Parity, SerialPort, Settings, StopBits};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{Notify, mpsc::error::TryRecvError};
 use tokio::task::JoinHandle;
 
 use crate::runtime::{self, HostwardSink, READ_BUF};
@@ -48,42 +56,67 @@ use crate::sys;
 /// flag within this bound, so `join` returns promptly.
 const READ_POLL_TIMEOUT_MS: u16 = 200;
 
+/// How often the supervisor rechecks the resolver for a `waiting`/`faulted`
+/// device's reappearance (§7.1 "a stat every second or two"). Cheap and portable
+/// (by-id readlink + sysfs walk), free of libudev/LGPL linkage (§15.10).
+const RECONNECT_POLL: Duration = Duration::from_millis(1000);
+
+/// The termios + modem parameters an open (initial or reopen) applies (§7.1).
+#[derive(Clone, Copy)]
+struct OpenParams {
+    baud: u32,
+    data_bits: DataBits,
+    parity: CfgParity,
+    stop_bits: CfgStop,
+    flow: CfgFlow,
+    /// Initial/retained modem-line assertions, restored on every (re)open so line
+    /// states stay deterministic against auto-reset adapters (§7.1).
+    modem: ModemLines,
+    /// Discard the outage-era targetward backlog on reconnect (default on, §7.1).
+    purge_on_reconnect: bool,
+}
+
+/// State the reconnect supervisor mutates and the node's `&self` methods read,
+/// shared on the single runtime thread (Rc/RefCell — the reader thread touches
+/// only atomics, never this).
+struct SerialShared {
+    status: NodeStatus,
+    /// The currently-open port, or `None` while `waiting`/`faulted`. Retained for
+    /// `state_extra` (driver counters) and the serial-signal verbs.
+    port: Option<Rc<SerialPort>>,
+}
+
+/// The live reader thread's stop flag and join handle, shared so the supervisor
+/// can join the old reader before re-arming and `teardown` can join it before the
+/// port drops (the fd must outlive the thread — an fd-reuse race otherwise).
+#[derive(Default)]
+struct ReaderSlot {
+    stop: Arc<AtomicBool>,
+    handle: Option<ThreadHandle<()>>,
+}
+
 pub struct SerialNode {
     pub name: String,
-    device: PathBuf,
-    baud: u32,
-    /// Initial modem-line assertions applied at open (§7.1), so line states are
-    /// deterministic against auto-reset adapters. Retained so phase 7's reopen
-    /// ritual can restore the configured lines after a replug.
-    modem: ModemLines,
-    /// The open port, retained for the targetward writer and future control verbs
-    /// (modem lines, break — phase 7). `None` while `waiting`/`faulted`. The
-    /// reader thread borrows only its raw fd, so the port must outlive the thread
-    /// (teardown joins the thread before dropping it).
-    port: Option<Rc<SerialPort>>,
+    /// The resolver identity this node is configured for (config, round-trips).
+    device: String,
+    resolver: Resolver,
+    params: OpenParams,
+    shared: Rc<RefCell<SerialShared>>,
+    reader_slot: Rc<RefCell<ReaderSlot>>,
     /// Bytes read from the port and discarded because nothing was attached to
     /// consume them (§5). Shared with the reader thread, hence atomic.
     discarded_unattached: Arc<AtomicU64>,
-    /// Set on teardown to stop the reader thread at its next poll timeout.
-    reader_stop: Arc<AtomicBool>,
-    /// The dedicated hostward reader thread (§15.19).
-    reader: Option<ThreadHandle<()>>,
-    /// The async targetward writer task, if any.
+    /// Bytes drained from the targetward backlog and discarded on reconnect
+    /// (§7.1 purge-on-reconnect). The one sanctioned targetward drop, counted.
+    purged_reconnect: Arc<AtomicU64>,
+    /// The supervisor task (drives the targetward writer and the reconnect poll).
     tasks: Vec<JoinHandle<()>>,
-    /// Targetward receiver held **unread** while the port is `waiting`/`faulted`
-    /// (none present). Retaining it — rather than draining it — lets the bounded
-    /// channel fill and backpressure the origin (its `send().await` suspends, the
-    /// client's kernel buffers), so a locked writer's commands are *delayed, never
-    /// dropped* (§5). Draining-and-discarding here would silently vaporize them,
-    /// violating the never-drop-targetward invariant; dropping the receiver would
-    /// error the origin's send and exit its reader. Phase 7's reopen ritual hands
-    /// this receiver to a fresh writer.
-    parked_targetward: Option<mpsc::Receiver<Chunk>>,
-    status: NodeStatus,
 }
 
+use std::cell::RefCell;
+
 impl SerialNode {
-    pub fn create(config: &NodeConfig) -> SerialNode {
+    pub fn create(config: &NodeConfig, resolver: &Resolver) -> SerialNode {
         let NodeConfig::Serial {
             name,
             device,
@@ -92,6 +125,7 @@ impl SerialNode {
             parity,
             stop_bits,
             flow_control,
+            purge_on_reconnect,
             modem,
             ..
         } = config
@@ -99,125 +133,98 @@ impl SerialNode {
             unreachable!("SerialNode::create called with non-Serial config");
         };
 
-        let mut node = SerialNode {
-            name: name.clone(),
-            device: PathBuf::from(device),
+        let params = OpenParams {
             baud: *baud,
+            data_bits: *data_bits,
+            parity: *parity,
+            stop_bits: *stop_bits,
+            flow: *flow_control,
             modem: *modem,
-            port: None,
-            discarded_unattached: Arc::new(AtomicU64::new(0)),
-            reader_stop: Arc::new(AtomicBool::new(false)),
-            reader: None,
-            tasks: Vec::new(),
-            parked_targetward: None,
-            status: NodeStatus::Active,
+            purge_on_reconnect: *purge_on_reconnect,
         };
 
-        match open_port(
-            &node.device,
-            *baud,
-            *data_bits,
-            *parity,
-            *stop_bits,
-            *flow_control,
-            node.modem,
-        ) {
-            Ok(port) => {
-                node.port = Some(Rc::new(port));
-                node.status = NodeStatus::Active;
-            }
-            // A device that isn't present yet is `waiting` (it will heal when it
-            // reappears, §7.1); any other open error is `faulted`.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                node.status = NodeStatus::Waiting {
-                    reason: format!("device {} not present", node.device.display()),
-                };
-            }
-            Err(e) => {
-                node.status = NodeStatus::Faulted {
-                    reason: format!("open {}: {e}", node.device.display()),
-                };
-            }
+        // Initial open, synchronous so `state` is accurate the instant `load`
+        // returns. Identity → current path (squatter-safe for identity forms,
+        // §12); absence is `waiting`, any other open error is `faulted` — neither
+        // fails the load (§15.8).
+        let (status, port) = match resolver.resolve_current_path(device) {
+            Some(path) => match open_port(&path, &params) {
+                Ok(p) => (NodeStatus::Active, Some(Rc::new(p))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+                    NodeStatus::Waiting {
+                        reason: format!("device {device} vanished during open"),
+                    },
+                    None,
+                ),
+                Err(e) => (
+                    NodeStatus::Faulted {
+                        reason: format!("open {device}: {e}"),
+                    },
+                    None,
+                ),
+            },
+            None => (
+                NodeStatus::Waiting {
+                    reason: format!("device {device} not present"),
+                },
+                None,
+            ),
+        };
+
+        SerialNode {
+            name: name.clone(),
+            device: device.clone(),
+            resolver: resolver.clone(),
+            params,
+            shared: Rc::new(RefCell::new(SerialShared { status, port })),
+            reader_slot: Rc::new(RefCell::new(ReaderSlot::default())),
+            discarded_unattached: Arc::new(AtomicU64::new(0)),
+            purged_reconnect: Arc::new(AtomicU64::new(0)),
+            tasks: Vec::new(),
         }
-        node
     }
 
-    /// Start the data plane for this port: broadcast hostward to the attached
-    /// PTYs, drain targetward from them. A `waiting`/`faulted` port (none present)
-    /// *parks* its targetward receiver unread, so the bounded channel fills and
-    /// backpressures the origin (§5: commands are delayed, never dropped) rather
-    /// than draining-and-discarding them.
+    /// Start the data plane: broadcast hostward to the attached consumers, drain
+    /// targetward from them, and supervise faulted-and-wait reconnect (§7.1). A
+    /// single async supervisor owns the targetward receiver across outages, so a
+    /// `waiting` port backpressures its origins (channel fills, §5) rather than
+    /// dropping their commands; only the sanctioned purge-on-reconnect drains it.
     pub fn start(
         &mut self,
         hostward: Vec<HostwardSink>,
         targetward: Option<mpsc::Receiver<Chunk>>,
     ) {
-        let Some(port) = self.port.clone() else {
-            // Hold the receiver without reading it: a full channel suspends the
-            // origin's send().await (§5 backpressure). Dropping it instead would
-            // error the origin's send and exit its reader; draining it would
-            // silently discard commands. Phase 7's reopen hands this on.
-            self.parked_targetward = targetward;
-            return;
+        let ctx = SuperviseCtx {
+            name: self.name.clone(),
+            device: self.device.clone(),
+            resolver: self.resolver.clone(),
+            params: self.params,
+            hostward,
+            targetward,
+            shared: self.shared.clone(),
+            reader_slot: self.reader_slot.clone(),
+            discarded: self.discarded_unattached.clone(),
+            purged: self.purged_reconnect.clone(),
         };
-
-        if let Err(e) = sys::set_nonblocking(port.as_raw_fd()) {
-            self.status = NodeStatus::Faulted {
-                reason: format!("set_nonblocking: {e}"),
-            };
-            self.port = None;
-            return;
-        }
-
-        // Hostward: a dedicated thread reads the device continuously (blocking
-        // poll → line rate, §15.19) and broadcasts to every attached consumer.
-        // The read happens whether or not a client is attached downstream — a
-        // full consumer channel drops at ingest, never here (§5).
-        let fd = port.as_raw_fd();
-        let stop = self.reader_stop.clone();
-        let discarded = self.discarded_unattached.clone();
-        self.reader = Some(
-            std::thread::Builder::new()
-                .name(format!("serial-rx-{}", self.name))
-                .spawn(move || reader_thread(fd, hostward, discarded, stop))
-                .expect("spawn serial reader thread"),
-        );
-
-        // Targetward: drain the bounded channel to the port at line rate; a full
-        // channel backpressures to the origin (§5). Human-scale command entry, so
-        // it stays an async task.
-        if let Some(mut rx) = targetward {
-            let port_w = port;
-            self.tasks.push(tokio::task::spawn_local(async move {
-                while let Some(chunk) = rx.recv().await {
-                    if runtime::write_all(port_w.as_raw_fd(), &chunk)
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }));
-        }
-    }
-
-    /// Stop the reader thread and join it within the poll-timeout bound.
-    fn stop_reader(&mut self) {
-        self.reader_stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.reader.take() {
-            let _ = h.join();
-        }
+        self.tasks.push(tokio::task::spawn_local(supervise(ctx)));
     }
 
     pub fn status(&self) -> NodeStatus {
-        self.status.clone()
+        self.shared.borrow().status.clone()
+    }
+
+    /// The open port, for the serial-signal verbs (§7.1). `None` while the node is
+    /// `waiting`/`faulted`. Borrow-clone-drop before any `.await` (§15.20).
+    pub(crate) fn port(&self) -> Option<Rc<SerialPort>> {
+        self.shared.borrow().port.clone()
     }
 
     pub fn state_extra(&self) -> serde_json::Value {
+        let sh = self.shared.borrow();
         // Driver input counters (TIOCGICOUNT) surface framing/parity/overrun loss
         // "where supported" (§5, §7.1); a pts (test device) returns an error, so
         // report null rather than faulting or fabricating zeros.
-        let driver_counters = self
+        let driver_counters = sh
             .port
             .as_ref()
             .and_then(|p| sys::read_icounts(p.as_raw_fd()).ok())
@@ -232,47 +239,262 @@ impl SerialNode {
                     "buf_overrun": c.buf_overrun,
                 })
             });
+        // The current resolved /dev path is state (§12); the configured identity is
+        // config. Report both so an operator sees which device answered.
+        let resolved_path = self
+            .resolver
+            .resolve_current_path(&self.device)
+            .map(|p| p.display().to_string());
+        let modem_lines = sh.port.as_ref().map(|p| read_modem_lines(p.as_raw_fd()));
         json!({
-            "resolved_path": self.device.display().to_string(),
-            "baud": self.baud,
-            "open": self.port.is_some(),
+            "identity": self.device,
+            "identity_kind": DeviceKind::of(&self.device).label(),
+            "resolved_path": resolved_path,
+            "baud": self.params.baud,
+            "open": sh.port.is_some(),
             "discarded_unattached": self.discarded_unattached.load(Ordering::Relaxed),
+            "purged_on_reconnect": self.purged_reconnect.load(Ordering::Relaxed),
+            "modem_lines": modem_lines,
             "driver_counters": driver_counters,
         })
     }
 
-    /// Stop the reader thread and the targetward task, then drop the port. The
-    /// reader is joined *before* the port drops, so its fd stays valid throughout
-    /// (avoiding an fd-reuse race). Called on teardown/shutdown.
+    /// Stop the supervisor and the reader thread, then drop the port. The reader is
+    /// joined *before* the port drops so its fd stays valid throughout (fd-reuse
+    /// race). Called on teardown/shutdown.
     pub fn teardown(&mut self) {
-        self.stop_reader();
+        // Abort the supervisor first so it cannot re-arm a reader after we join.
+        // Sync teardown holds the runtime thread, so the aborted task will not run
+        // again before we finish; its dropped future releases its port clone after
+        // the reader is already joined.
         for t in self.tasks.drain(..) {
             t.abort();
         }
-        // Drop any parked targetward receiver so its channel closes and a
-        // backpressured origin's send() unblocks (with an error) rather than
-        // hanging past teardown.
-        drop(self.parked_targetward.take());
-        self.port = None;
+        stop_join_reader(&self.reader_slot);
+        self.shared.borrow_mut().port = None;
     }
+}
+
+/// Everything the reconnect supervisor owns for one node's lifetime.
+struct SuperviseCtx {
+    name: String,
+    device: String,
+    resolver: Resolver,
+    params: OpenParams,
+    hostward: Vec<HostwardSink>,
+    targetward: Option<mpsc::Receiver<Chunk>>,
+    shared: Rc<RefCell<SerialShared>>,
+    reader_slot: Rc<RefCell<ReaderSlot>>,
+    discarded: Arc<AtomicU64>,
+    purged: Arc<AtomicU64>,
+}
+
+/// One step of the Active loop: drive the targetward writer and watch for loss.
+enum Step {
+    /// Keep running Active (a chunk was written, or a quiescent wait elapsed).
+    Continue,
+    /// The device was lost (reader exited, or a write failed) — reconnect.
+    Lost,
+    /// The targetward channel closed (origins gone / teardown); keep hostward
+    /// alive but stop driving the writer.
+    WriterClosed,
+}
+
+/// The reconnect supervisor (§7.1): adopts the create-opened port, drives the
+/// targetward writer, and on device loss polls the resolver until the *same*
+/// identity reappears, then runs the reopen ritual.
+async fn supervise(mut ctx: SuperviseCtx) {
+    // Adopt the port `create` opened, if any: arm a reader on it.
+    let mut lost: Option<Arc<Notify>> = None;
+    if ctx.shared.borrow().port.is_some() {
+        let port = ctx.shared.borrow().port.clone().unwrap();
+        match arm_reader(&port, &ctx) {
+            Ok(notify) => lost = Some(notify),
+            Err(e) => fault(&ctx, format!("set_nonblocking: {e}")),
+        }
+    }
+
+    loop {
+        match &lost {
+            // Active: a live port with an armed reader.
+            Some(notify) => {
+                let port = match ctx.shared.borrow().port.clone() {
+                    Some(p) => p,
+                    None => {
+                        lost = None;
+                        continue;
+                    }
+                };
+                match active_step(&port, notify, &mut ctx.targetward).await {
+                    Step::Continue => {}
+                    Step::WriterClosed => {
+                        // No more targetward; keep the reader running (hostward
+                        // survives, §15.24) and wait for loss only.
+                        ctx.targetward = None;
+                    }
+                    Step::Lost => {
+                        stop_join_reader(&ctx.reader_slot);
+                        set_waiting(&ctx, format!("device {} lost", ctx.device));
+                        lost = None;
+                    }
+                }
+            }
+            // Waiting/faulted: poll for the device's reappearance.
+            None => {
+                tokio::time::sleep(RECONNECT_POLL).await;
+                if let Some(path) = ctx.resolver.resolve_current_path(&ctx.device) {
+                    match open_port(&path, &ctx.params) {
+                        Ok(port) => {
+                            let port = Rc::new(port);
+                            purge_on_reconnect(&mut ctx);
+                            match arm_reader(&port, &ctx) {
+                                Ok(notify) => {
+                                    set_active(&ctx, port);
+                                    lost = Some(notify);
+                                }
+                                Err(e) => fault(&ctx, format!("set_nonblocking: {e}")),
+                            }
+                        }
+                        // Vanished again between the resolve and the open: stay
+                        // waiting and retry. Any other error faults but keeps polling.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => fault(&ctx, format!("reopen {}: {e}", ctx.device)),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Drive one targetward chunk to the port, or wait for loss (§7.1/§5). Returns as
+/// soon as either fires so the supervisor can react promptly.
+async fn active_step(
+    port: &Rc<SerialPort>,
+    lost: &Notify,
+    targetward: &mut Option<mpsc::Receiver<Chunk>>,
+) -> Step {
+    match targetward {
+        Some(rx) => {
+            tokio::select! {
+                biased;
+                _ = lost.notified() => Step::Lost,
+                got = rx.recv() => match got {
+                    Some(chunk) => {
+                        if runtime::write_all(port.as_raw_fd(), &chunk).await.is_err() {
+                            Step::Lost
+                        } else {
+                            Step::Continue
+                        }
+                    }
+                    None => Step::WriterClosed,
+                }
+            }
+        }
+        // No writer: wait only for device loss, at zero CPU.
+        None => {
+            lost.notified().await;
+            Step::Lost
+        }
+    }
+}
+
+/// Purge the outage-era targetward backlog on reconnect (§7.1). The parked
+/// receiver's buffered chunks are the daemon-side backlog that accumulated while
+/// the node was `waiting`; draining them with a counter is the one sanctioned
+/// targetward drop. Post-reconnect commands (arriving after this) are kept.
+fn purge_on_reconnect(ctx: &mut SuperviseCtx) {
+    if !ctx.params.purge_on_reconnect {
+        return;
+    }
+    let Some(rx) = ctx.targetward.as_mut() else {
+        return;
+    };
+    let mut purged = 0u64;
+    loop {
+        match rx.try_recv() {
+            Ok(chunk) => purged += chunk.len() as u64,
+            Err(TryRecvError::Empty) => break,
+            // The senders are gone; the writer will observe close next.
+            Err(TryRecvError::Disconnected) => break,
+        }
+    }
+    if purged > 0 {
+        ctx.purged.fetch_add(purged, Ordering::Relaxed);
+    }
+}
+
+/// Set the port non-blocking and spawn a fresh reader thread, recording its
+/// stop flag and handle in the shared slot (any previous reader must already be
+/// joined). Returns the `Notify` the reader pulses on device loss.
+fn arm_reader(port: &Rc<SerialPort>, ctx: &SuperviseCtx) -> std::io::Result<Arc<Notify>> {
+    sys::set_nonblocking(port.as_raw_fd())?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let lost = Arc::new(Notify::new());
+    let fd = port.as_raw_fd();
+    let hostward = ctx.hostward.clone();
+    let discarded = ctx.discarded.clone();
+    let stop_c = stop.clone();
+    let lost_c = lost.clone();
+    let handle = std::thread::Builder::new()
+        .name(format!("serial-rx-{}", ctx.name))
+        .spawn(move || reader_thread(fd, hostward, discarded, stop_c, lost_c))
+        .expect("spawn serial reader thread");
+    *ctx.reader_slot.borrow_mut() = ReaderSlot {
+        stop,
+        handle: Some(handle),
+    };
+    Ok(lost)
+}
+
+/// Stop the current reader thread and join it within the poll-timeout bound. On
+/// the loss path the thread has already exited, so this returns at once; on
+/// teardown of a live device it costs at most one poll interval.
+fn stop_join_reader(reader_slot: &Rc<RefCell<ReaderSlot>>) {
+    let (stop, handle) = {
+        let mut slot = reader_slot.borrow_mut();
+        (slot.stop.clone(), slot.handle.take())
+    };
+    stop.store(true, Ordering::Relaxed);
+    if let Some(h) = handle {
+        let _ = h.join();
+    }
+}
+
+fn set_active(ctx: &SuperviseCtx, port: Rc<SerialPort>) {
+    let mut sh = ctx.shared.borrow_mut();
+    sh.port = Some(port);
+    sh.status = NodeStatus::Active;
+}
+
+fn set_waiting(ctx: &SuperviseCtx, reason: String) {
+    let mut sh = ctx.shared.borrow_mut();
+    sh.port = None;
+    sh.status = NodeStatus::Waiting { reason };
+}
+
+fn fault(ctx: &SuperviseCtx, reason: String) {
+    let mut sh = ctx.shared.borrow_mut();
+    sh.port = None;
+    sh.status = NodeStatus::Faulted { reason };
 }
 
 /// Hostward reader thread (§15.19): a blocking `poll(2)` waits for readability —
 /// waking the instant the device has data (line rate) and parking at zero CPU
 /// otherwise — then the loop drains fully and broadcasts each chunk to every
-/// attached consumer. Exits on device close, stop flag, or a fatal error (phase 7
-/// restructures this into faulted-and-wait with re-open).
+/// attached consumer. On device loss (`POLLHUP`, EOF, or a read error) it pulses
+/// `lost` so the supervisor enters faulted-and-wait; a clean stop (teardown)
+/// exits without pulsing.
 ///
 /// Loss is always counted at the boundary that drops it: with nothing attached,
-/// bytes are discarded against `discarded_unattached` (§5, so a first consumer
-/// starts on fresh data, not a stale kernel burst); with a consumer attached but
-/// its bounded buffer full, the drop is counted against that consumer's
-/// [`DropCounters`] (a slow spy costs only itself).
+/// bytes are discarded against `discarded_unattached` (§5); with a consumer
+/// attached but its bounded buffer full, the drop is counted against that
+/// consumer's [`DropCounters`] (a slow spy costs only itself).
 fn reader_thread(
     fd: std::os::fd::RawFd,
     hostward: Vec<HostwardSink>,
     discarded_unattached: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    lost: Arc<Notify>,
 ) {
     let mut buf = vec![0u8; READ_BUF];
     while !stop.load(Ordering::Relaxed) {
@@ -284,7 +506,10 @@ fn reader_thread(
         if re.contains(PollFlags::POLLIN) {
             loop {
                 match sys::read_fd(fd, &mut buf) {
-                    Ok(0) => return, // device closed
+                    Ok(0) => {
+                        lost.notify_one(); // device closed
+                        return;
+                    }
                     Ok(n) => {
                         if hostward.is_empty() {
                             // Nothing attached: read-and-discard with a counter.
@@ -303,11 +528,15 @@ fn reader_thread(
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => return,
+                    Err(_) => {
+                        lost.notify_one();
+                        return;
+                    }
                 }
             }
         } else if re.contains(PollFlags::POLLHUP) {
-            return; // device gone
+            lost.notify_one(); // device gone
+            return;
         }
         // Bare timeout (empty revents): re-check the stop flag and re-arm.
     }
@@ -315,43 +544,123 @@ fn reader_thread(
 
 impl Drop for SerialNode {
     fn drop(&mut self) {
-        self.stop_reader();
         for t in self.tasks.drain(..) {
             t.abort();
         }
+        stop_join_reader(&self.reader_slot);
     }
 }
 
-fn open_port(
-    device: &std::path::Path,
-    baud: u32,
-    data_bits: DataBits,
-    parity: CfgParity,
-    stop_bits: CfgStop,
-    flow: CfgFlow,
-    modem: ModemLines,
-) -> std::io::Result<SerialPort> {
+// ---------------------------------------------------------------------------
+// Serial-signal operations (§7.1) — driven on the runtime thread from the
+// control plane, operating on the retained `Rc<SerialPort>`. `send-break` and
+// `pulse-dtr` hold a line for a bounded interval; a restore guard deasserts even
+// if the dispatch future is cancelled (a dropped control connection, §15.20), so
+// a line is never left stuck. Each returns the driver error unchanged, so a fd
+// that does not support the operation (a pts) surfaces cleanly rather than
+// pretending success.
+// ---------------------------------------------------------------------------
+
+/// Restores a break/modem line on drop (including cancellation), so a bounded
+/// assertion never leaks past the verb.
+struct RestoreGuard<'a> {
+    port: &'a SerialPort,
+    op: RestoreOp,
+}
+
+enum RestoreOp {
+    ClearBreak,
+    SetDtr(bool),
+}
+
+impl Drop for RestoreGuard<'_> {
+    fn drop(&mut self) {
+        let _ = match self.op {
+            RestoreOp::ClearBreak => self.port.set_break(false),
+            RestoreOp::SetDtr(level) => self.port.set_dtr(level),
+        };
+    }
+}
+
+/// Assert a serial break for `ms` milliseconds, then clear it (§7.1). The clear
+/// runs even on cancellation.
+pub(crate) async fn send_break(port: &SerialPort, ms: u64) -> std::io::Result<()> {
+    port.set_break(true)?;
+    let _guard = RestoreGuard {
+        port,
+        op: RestoreOp::ClearBreak,
+    };
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+    Ok(())
+}
+
+/// Pulse DTR: drive it to `assert` for `ms` milliseconds, then to `!assert` — the
+/// classic auto-reset toggle (§7.1). The final level is set even on cancellation.
+pub(crate) async fn pulse_dtr(port: &SerialPort, ms: u64, assert: bool) -> std::io::Result<()> {
+    port.set_dtr(assert)?;
+    let _guard = RestoreGuard {
+        port,
+        op: RestoreOp::SetDtr(!assert),
+    };
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+    Ok(())
+}
+
+/// Set DTR and/or RTS on the live port (§7.1). A `None` line is left untouched.
+/// This acts on the live port only; the configuration's initial modem lines are
+/// what a reopen restores (§15.8), so a live change does not survive a replug.
+pub(crate) fn set_modem(
+    port: &SerialPort,
+    dtr: Option<bool>,
+    rts: Option<bool>,
+) -> std::io::Result<()> {
+    if let Some(dtr) = dtr {
+        port.set_dtr(dtr)?;
+    }
+    if let Some(rts) = rts {
+        port.set_rts(rts)?;
+    }
+    Ok(())
+}
+
+/// Read the current modem-line levels for state (§7.1), or `null` where the fd
+/// does not support `TIOCMGET` (a pts). DTR/RTS are outputs, the rest inputs.
+fn read_modem_lines(fd: std::os::fd::RawFd) -> serde_json::Value {
+    match sys::read_modem_bits(fd) {
+        Ok(bits) => json!({
+            "dtr": bits & libc::TIOCM_DTR != 0,
+            "rts": bits & libc::TIOCM_RTS != 0,
+            "cts": bits & libc::TIOCM_CTS != 0,
+            "dsr": bits & libc::TIOCM_DSR != 0,
+            "dcd": bits & libc::TIOCM_CAR != 0,
+            "ri": bits & libc::TIOCM_RI != 0,
+        }),
+        Err(_) => serde_json::Value::Null,
+    }
+}
+
+fn open_port(device: &std::path::Path, params: &OpenParams) -> std::io::Result<SerialPort> {
     let port = SerialPort::open(device, |mut s: Settings| {
         s.set_raw();
-        s.set_baud_rate(baud)?;
-        s.set_char_size(char_size(data_bits));
-        s.set_parity(map_parity(parity));
-        s.set_stop_bits(map_stop(stop_bits));
-        s.set_flow_control(map_flow(flow));
+        s.set_baud_rate(params.baud)?;
+        s.set_char_size(char_size(params.data_bits));
+        s.set_parity(map_parity(params.parity));
+        s.set_stop_bits(map_stop(params.stop_bits));
+        s.set_flow_control(map_flow(params.flow));
         Ok(s)
     })?;
     // serial2 does not take TIOCEXCL; the daemon does, so stray processes cannot
-    // share the port (§7.1, P3 finding).
+    // share the port (§7.1, P3 finding). Re-taken on every reopen.
     sys::set_exclusive(port.as_raw_fd(), true)
         .map_err(|e| std::io::Error::other(format!("TIOCEXCL: {e}")))?;
-    // Initial modem-line assertions (§7.1): a line left unset (None) keeps the
-    // driver's power-on state; an asserted/deasserted line is made deterministic
-    // here (and reapplied by phase 7's reopen ritual against auto-reset adapters).
-    if let Some(dtr) = modem.dtr {
+    // Modem-line assertions (§7.1): a line left unset (None) keeps the driver's
+    // power-on state; an asserted/deasserted line is made deterministic here and
+    // reapplied by the reopen ritual against auto-reset adapters.
+    if let Some(dtr) = params.modem.dtr {
         port.set_dtr(dtr)
             .map_err(|e| std::io::Error::other(format!("set DTR: {e}")))?;
     }
-    if let Some(rts) = modem.rts {
+    if let Some(rts) = params.modem.rts {
         port.set_rts(rts)
             .map_err(|e| std::io::Error::other(format!("set RTS: {e}")))?;
     }

@@ -48,6 +48,19 @@ struct Cli {
     /// 0600 owner-only default — whoever can open the socket owns every console.
     #[arg(long)]
     socket_group: Option<String>,
+    /// Root prefix for device-identity resolution (§12) — a test seam for fixture
+    /// `/dev/serial/by-id` and sysfs trees (`sys_root` is `<dev-root>/sys`).
+    /// Defaults to `/`.
+    #[arg(long, default_value = "/")]
+    dev_root: PathBuf,
+    /// Configuration snapshot path (§11): the daemon writes the current config here
+    /// after each successful config mutation and prefers it at startup, so
+    /// incremental surgery survives a restart. Defaults to a file next to the
+    /// control socket (`<socket>.state.toml`), which shares the socket's lifecycle
+    /// — under /run or $XDG_RUNTIME_DIR it is cleared on reboot, so pass an explicit
+    /// path (e.g. /var/lib/serialnexusd/state.toml) for reboot-durable persistence.
+    #[arg(long)]
+    state_file: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -78,7 +91,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     apply_socket_perms(&socket_path, cli.socket_group.as_deref())?;
     tracing::info!(socket = %socket_path.display(), "control socket listening");
 
-    let daemon = Rc::new(Daemon::new());
+    let state_file = resolve_state_file(cli.state_file.clone(), &socket_path);
+    let daemon = Rc::new(Daemon::new(
+        nexus_core::Resolver::new(cli.dev_root.clone()),
+        Some(state_file.clone()),
+    ));
 
     // Periodic state snapshots power `subscribe` (§10): status transitions and
     // counter snapshots. The tick no-ops when nobody is subscribed, so it costs
@@ -93,7 +110,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         });
     }
 
-    if let Some(config_path) = &cli.config {
+    // Startup config preference (§11/§15.9): a persisted state file, if present,
+    // is the source of truth (it captured incremental surgery a `--config` file
+    // never saw); otherwise fall back to the CLI `--config`. Restart, replug, and
+    // first boot become one code path.
+    if state_file.exists() {
+        startup_load(&daemon, &state_file)
+            .await
+            .with_context(|| format!("loading state file {}", state_file.display()))?;
+    } else if let Some(config_path) = &cli.config {
         startup_load(&daemon, config_path)
             .await
             .with_context(|| format!("loading {}", config_path.display()))?;
@@ -161,6 +186,23 @@ fn resolve_socket(override_path: Option<PathBuf>) -> PathBuf {
         }
     }
     PathBuf::from(format!("/tmp/serialnexusd-{}.sock", nix::unistd::getuid()))
+}
+
+/// The §11/§15.9 state-file path policy: CLI-overridable, else derived from the
+/// control-socket path so it shares the socket's uniqueness (one daemon per
+/// socket) and lifecycle. The daemon owns this writable path and prefers it over
+/// `--config` at startup, so a restart recovers incremental surgery. A deployment
+/// that wants the snapshot to survive a *reboot* (the runtime dir is cleared then)
+/// passes `--state-file` pointing at a persistent path (e.g. /var/lib).
+fn resolve_state_file(override_path: Option<PathBuf>, socket_path: &Path) -> PathBuf {
+    if let Some(p) = override_path {
+        return p;
+    }
+    let stem = socket_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("serialnexusd");
+    socket_path.with_file_name(format!("{stem}.state.toml"))
 }
 
 /// The standard stale-socket unlink dance (§10): if the path exists, a live

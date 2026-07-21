@@ -9,6 +9,10 @@
 #   - P1 (EXTPROC/TIOCPKT) may be `supported` OR `degraded` — the §7.2
 #     reconciliation poll is an unconditional backstop.
 #   - P4 may be `supported` or `skipped` (skipped when no adapter is present).
+#   - P5 (rig discovery/certification) may be `supported` or `skipped` — it is
+#     opt-in (transmits), so a run without --port skips; a run against a rig must
+#     not report `unsupported` (a miswired rig is `degraded`, named, not a doctor
+#     failure — §15.21).
 #
 # Evaluates to `true` (exit 0) only when every clause holds.
 
@@ -16,3 +20,4 @@
 and (any(.probes[]; .id == "P2" and .status == "supported"))
 and (any(.probes[]; .id == "P1" and (.status == "supported" or .status == "degraded")))
 and (any(.probes[]; .id == "P4" and (.status == "supported" or .status == "skipped")))
+and (any(.probes[]; .id == "P5" and (.status == "supported" or .status == "skipped")))

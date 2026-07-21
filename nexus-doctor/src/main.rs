@@ -42,15 +42,16 @@ struct Cli {
     /// port — passive by default (§3).
     #[arg(long = "port")]
     ports: Vec<PathBuf>,
-    /// Root prefix for /dev resolution — a test seam for fixture by-id trees
-    /// (§3). Defaults to `/`.
+    /// Root prefix for /dev and /sys resolution — a test seam for fixture by-id
+    /// and sysfs trees (§3); `sys_root` is derived as `<dev-root>/sys`, so a
+    /// single flag selects a self-contained fixture. Defaults to `/`.
     #[arg(long, default_value = "/")]
     dev_root: PathBuf,
 }
 
 fn main() {
     let cli = Cli::parse();
-    let sys_root = PathBuf::from("/sys");
+    let sys_root = cli.dev_root.join("sys");
 
     let generated_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -77,6 +78,25 @@ fn main() {
         for port in &cli.ports {
             probe_list.push(probes::p3_serial(port));
         }
+    }
+
+    // P5 rig discovery + certification (§15.21). Opt-in like P3 — it transmits, so
+    // it runs only on explicitly named ports; it classifies them collectively.
+    if cli.ports.is_empty() {
+        probe_list.push(
+            report::Probe::new(
+                "P5",
+                "rig discovery and certification",
+                "Classify named ports (dangling/loopback/paired) and certify the rig (§15.21).",
+            )
+            .verdict(
+                report::Status::skipped("no --port named"),
+                "Re-run with the rig's --ports (dangling converters and jumper wires suffice — no target device, §13).",
+            ),
+        );
+    } else {
+        let resolver = nexus_core::Resolver::with_roots(&cli.dev_root, &sys_root);
+        probe_list.push(probes::p5_rig(&cli.ports, &resolver));
     }
 
     let report = Report::new(generated_unix_ms, environment, probe_list);

@@ -467,6 +467,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "nexus-core",
  "nix",
  "serde",
  "serde_json",

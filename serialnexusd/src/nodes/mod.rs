@@ -16,6 +16,7 @@ pub mod serial;
 use nexus_core::NodeStatus;
 use nexus_core::config::NodeConfig;
 use nexus_core::graph::EndpointAddr;
+use nexus_core::resolver::Resolver;
 
 /// A live node: its operator-facing name and its environment-owned status.
 pub enum Node {
@@ -31,9 +32,9 @@ impl Node {
     /// Instantiate a node from configuration. Never returns `Err` for an
     /// environmental problem — the node comes up faulted instead (§15.8); `Err`
     /// is reserved for a node kind not yet implemented in this phase.
-    pub fn instantiate(config: &NodeConfig) -> Result<Node, String> {
+    pub fn instantiate(config: &NodeConfig, resolver: &Resolver) -> Result<Node, String> {
         Ok(match config {
-            NodeConfig::Serial { .. } => Node::Serial(serial::SerialNode::create(config)),
+            NodeConfig::Serial { .. } => Node::Serial(serial::SerialNode::create(config, resolver)),
             NodeConfig::Pty { .. } => Node::Pty(pty::PtyNode::create(config)),
             NodeConfig::Log { .. } => Node::Log(log::LogNode::create(config)),
             // A codec node (§7.5/§7.6). The exec codec is a child process, hosted
@@ -58,6 +59,14 @@ impl Node {
             )),
             NodeConfig::Leg { .. } => Node::Leg(leg::LegNode::create(config)),
         })
+    }
+
+    /// The serial node behind this handle, for the serial-signal verbs (§7.1).
+    pub fn as_serial(&self) -> Option<&serial::SerialNode> {
+        match self {
+            Node::Serial(n) => Some(n),
+            _ => None,
+        }
     }
 
     pub fn name(&self) -> &str {
