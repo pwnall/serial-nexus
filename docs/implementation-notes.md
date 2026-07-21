@@ -1,8 +1,7 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-21 (phase 0-6 done; **phase 0-4 re-aligned to the revised v6
-design**). **Next: phase 7** (identity & resilience). **Branch:** `implementation`
-(off `main`).
+**As of:** 2026-07-21 (phases 0-7 done; **phase 7 built + adversarially audited**).
+**Next: phase 8** (hardening & release). **Branch:** `implementation` (off `main`).
 **Normative docs are now v6:** `docs/13-design-claude-fable-v6.md` (design) and
 `docs/14-implementation-plan-claude-fable-v6.md` (plan). v1–v5 docs (03–12) are in
 `docs/historical/`. Section references (§) point at the v6 design.
@@ -142,12 +141,14 @@ the items below are refinements consistent with the design, none contradict it.
 | 5 | Codecs | **done** — codec runtime + registry (§8), the `codecs/reference` framing codec (resync), the interior codec node + exec codec (§7.5/§7.6), endpoint-keyed wiring, `nexus-sim` `mux`/`envelope`; audited (§6c, §15.22, §15.23) |
 | 6 | The wire | **done** — leg node (§7.4) + v1 wire hello (§9), fragmentation, binding, faulted-and-wait/purge-on-reconnect, `nexus-sim` `wire`/`tcp-proxy`, §9 conformance scripts; audited (§6d, §15.24) |
 | — | **v6 alignment** | **done** — phase 0-4 re-audited against the revised v6 design; 5 deviations fixed (empty-node-name §11, boundary comment §5, serial/PTY `hostward_buffer` + serial `modem` §7.1/§7.2, `--socket-group` §10) (§3.13) |
-| 7–8 | Identity, hardening | not started |
+| 7 | Identity & resilience | **done** — resolver (§12) + faulted-and-wait/reopen (§7.1) + state file (§11) + `add-node`/`remove-node --cascade`/`load --replace` + serial-signal verbs (§7.1) + doctor P5 + `nexus-sim nullmodem`; audited (§6e, §15.25) |
+| 8 | Hardening & release | not started |
 
 **Quality gates (all green):** `cargo fmt --all --check`, `cargo clippy
---workspace --all-targets --locked -- -D warnings`, `cargo test --workspace` (78
-pass), and `bash scripts/validate/all.sh --through 6` (**32 pass, 0 fail**). Phase 6
-scripts: `phase6/{reference,binding,hostility,insecure-bind,outage,head-of-line}.sh`;
+--workspace --all-targets --locked -- -D warnings`, `cargo test --workspace` (87
+pass), and `bash scripts/validate/all.sh --through 7` (**39 pass, 0 fail**). Phase 7
+scripts: `phase7/{unplug,replug,squatter,matrix,crash-recovery,signals,p5}.sh`;
+phase 6 scripts: `phase6/{reference,binding,hostility,insecure-bind,outage,head-of-line}.sh`;
 phase 5 scripts: `phase5/{envelope,demux,resync,held,bad-attributes,exec-crash}.sh`;
 phase 4 scripts: `phase4/{exclusivity,purge,free-for-all,held,send,steal-lease,waiting}.sh`;
 phase 3 added `counters.sh`, `log.sh`, `log-enospc.sh`, `subscribe.sh`,
@@ -166,12 +167,12 @@ are de-risked across the support matrix.
 |-------|------|-------|
 | `codec-api` | codec trait (+ `resync_count`), event vocabulary, envelope frame codec + golden vectors, **v1 wire hello** (`WIRE_MAGIC`/`WIRE_VERSION`/`Hello`/`WireError`) (§8/§9) | done |
 | `codecs/reference` (`codec-reference`) | the v1 envelope framing as a `Codec`, with length-guided resync (§7.5/§9) | done (phase 5) |
-| `nexus-core` | graph model + validator (§4: 3 rules + name/duplicate + leg loopback/empty checks), data-plane deliver contracts + holdover (§5), lock state machine incl. `reclaim_held` (§6), config/state split incl. `NodeConfig::Leg` (§15.8) | done |
+| `nexus-core` | graph model + validator (§4), data-plane deliver contracts + holdover (§5), lock state machine incl. `reclaim_held` (§6), config/state split (§15.8), **device-identity `resolver` (§12)** | done |
 | `nexus-rpc` | JSON-RPC 2.0 wire types — the stable §15.16 surface | done |
-| `nexus-sim` | test double: `pty`/`client`/`mux`/`envelope`/`wire`/`tcp-proxy` modes (§3) | done through phase 6 |
+| `nexus-sim` | test double: `pty`/`client`/`mux`/`envelope`/`wire`/`tcp-proxy`/`nullmodem` modes (§3) | done through phase 7 |
 | `nexus-doctor` | shipping capability checker: probes P1–P4 + env checks (§15.17) | done |
 | `serialnexusd` | the daemon | control plane + node lifecycle + data plane + codecs + leg/wire done |
-| `serialnexusctl` | the CLI (thin RPC client + `--json`) | `load`/`dump`/`state`/`subscribe`/`rotate`/`lock`/`unlock`/`send`/`teardown`/`shutdown` |
+| `serialnexusctl` | the CLI (thin RPC client + `--json`) | `load [--replace]`/`add-node`/`remove-node [--cascade]`/`dump`/`state`/`subscribe`/`rotate`/`lock`/`unlock`/`send`/`send-break`/`set-modem`/`pulse-dtr`/`teardown`/`shutdown` |
 
 `serialnexusd` modules: `main.rs` (runtime, socket policy, shutdown),
 `control.rs` (JSON-RPC over UDS), `daemon.rs` (graph state + method impls),
@@ -742,6 +743,99 @@ adversarial audit fixed 17 findings.
   hello magic/version-first decode order; and test-fidelity fixes (head-of-line
   positive lower bound + honest comment; sim wire hello honors `--timeout-ms`). No
   findings were rejected.
+
+## 6e. Phase 7 (identity & resilience) — COMPLETE
+
+Built in seven slices (§12/§7.1/§11/§10 + doctor P5), then an adversarial audit
+fixed 5 findings. New ADR **§15.25**; §11/§14 touched (state-file path policy,
+deferred `connect`/`disconnect`/`set-attribute`).
+
+- **The resolver (`nexus-core/src/resolver.rs`, §12).** A dependency-free (no
+  libudev) module lifting the doctor's P4 sysfs walk into shared code — the doctor
+  P4 probe now consumes it (`Resolver::with_roots(...).discover_adapters()`). Rooted
+  by a `dev_root` whose `sys_root = dev_root/sys`, so a single `--dev-root` selects a
+  self-contained fixture (`/` → `/sys` in production). Two directions:
+  `resolve_input` (add-time: raw path / bare serial capture requires presence;
+  `usb:`/`by-path:`/`raw:` identities never do) and `resolve_current_path`
+  (open/recheck; a `usb:` identity resolves only to a device whose sysfs identity
+  matches exactly → **squatter refusal by construction**). Fallback chain
+  usb→by-path→raw with instability warnings; **absent OR duplicated non-empty
+  serials degrade to by-path** (the §15.10 wrong-device guard, made concrete).
+- **Serial faulted-and-wait + reopen ritual (`nodes/serial.rs`, §7.1).** Rewritten
+  around `SerialShared{status,port}` (`Rc<RefCell>`, read by `&self`) + a `ReaderSlot`.
+  **One async supervisor per node** drives the targetward writer AND the reconnect
+  poll; the dedicated blocking-thread reader (§15.19) pulses a `Notify` on device
+  loss (POLLHUP/EOF/error), the supervisor joins it, transitions to `waiting`, and
+  polls `resolve_current_path` (~1 s) for the **same identity**. On reappearance the
+  reopen ritual reapplies termios, retakes `TIOCEXCL`, restores modem lines, sets
+  non-blocking, and re-arms; **purge-on-reconnect** drains the parked targetward
+  channel with a counter (the one sanctioned targetward drop; origin buffers stay
+  the lock-purge's job, §6). fd-reuse-safe (reader joined before the port drops);
+  `WriterClosed` keeps hostward alive when targetward senders drop (§15.24 lesson).
+  New serial config field `purge_on_reconnect` (default on). **Test-fidelity:** a
+  finite `nexus-sim pty --source` now CORRECTLY faults-and-waits when it closes —
+  `pty --hold-ms` was wired to keep the device "plugged in"; `subscribe.sh` uses it;
+  `log.sh` Check 3 now relies on **auto-recovery** (below) instead of a manual reload.
+- **State file (`daemon.rs`/`main.rs`, §11/§15.9).** `Daemon::snapshot_config` writes
+  config (TOML, atomic tmp+rename) after every config-mutating verb (dispatch-gated by
+  `is_config_mutation`, NOT on read/arbitration traffic). Startup **prefers the state
+  file** over `--config`. Default path is **socket-adjacent** (`<socket>.state.toml`)
+  — session-durable + restart-recovering, and per-daemon-unique so it never leaks
+  across test daemons or into `$HOME`; `--state-file` gives reboot durability. Clean
+  shutdown (`teardown_all`) does NOT persist an empty graph (preserves it for restart);
+  the `teardown` VERB does. Write failure is logged, never corrupts the running graph.
+- **Incremental verbs (`daemon.rs` + CLI).** `add-node` (resolver echo-back
+  `{identity,description,kind,warning}`; path/serial absent → `DEVICE_ABSENT`; identity
+  absent → waiting; wires an edgeless node via a partial `Wiring::build`),
+  `remove-node [--cascade]` (refuses attached edges without cascade → `HAS_EDGES`;
+  cascade flushes the log, closes+wakes the removed node's endpoint locks, prunes all
+  maps, **unregisters a removed writer's origin from the surviving host lock** — audit
+  fix), `load --replace` (validates BEFORE teardown so a bad config never destroys a
+  good graph). New codes `HAS_EDGES=-32004`, `DEVICE_ABSENT=-32005`. **Deferred**
+  (§14, §15.25): `connect`/`disconnect`/`set-attribute` (live-graph surgery; not in
+  the Phase 7 Implements line, not validated).
+- **Serial-signal verbs (`nodes/serial.rs`/`daemon.rs`/`sys.rs`/CLI, §7.1).**
+  `send-break`, `set-modem`, `pulse-dtr` on the retained `Rc<SerialPort>`; `send_break`/
+  `pulse_dtr` are **cancel-safe** (a `RestoreGuard` deasserts even if the dispatch
+  future is dropped on client disconnect), and `serial_port()` clones the Rc and drops
+  the borrow before the awaited sleep (RefCell-never-across-await). `set-modem` is
+  ephemeral (does not rewrite config, §15.8). Modem-line readings surface in state via
+  a new `sys::read_modem_bits` (TIOCMGET). **No-target doctrine:** a pts genuinely
+  lacks modem lines, so `set-modem`/`pulse-dtr` return `ENOTTY` there (the exact
+  Tier-3 boundary — the verb reached the live port); `send-break` latches on a pts;
+  true master-side DTR/break observation is a Tier-3 hardware checklist item.
+- **Doctor P5 + nexus-sim nullmodem (§13/§15.21).** P5 (`probes.rs`) classifies each
+  named port dangling/loopback/paired (both directions, so a half-crossed rig is named
+  Degraded, never Unsupported) and certifies real UARTs, reporting `skipped (not a
+  UART)` for the sim pts. Passive: `--port`-gated like P3. Discovery is a **poll-driven
+  continuous scan** with periodic nonce re-sends + a 5 ms yield (a busy-spin on a
+  perpetually-ready port would starve a software echo peer — a real bug found while
+  hardening). `nexus-sim nullmodem --link-a/--link-b` bridges two PTY pairs as a
+  crossed pair. `expectations/linux.jq` gained a P5 `{supported,skipped}` clause.
+  **Test note:** `phase7/p5.sh` runs the doctor twice (pair+dangling in one, loopback
+  in its own) — a software `pty --echo` peer competing for CPU with other active peers
+  in the SAME run is timing-sensitive on a loaded box (a sim/scheduling artifact, not a
+  P5 logic issue: a real TX↔RX jumper reflects in hardware). Verified 8/8 under 4×CPU
+  load after the split.
+- **Validation:** `scripts/validate/phase7/*.sh` (items 1–7) + a reusable
+  `scripts/lib/fixture-tree.sh` that builds `/dev/serial/by-id` + `/dev/serial/by-path`
+  + sysfs trees under `--dev-root` (the resolver seam, plan §3). `all.sh --through 7`
+  = 39/39; 87 workspace unit/property tests.
+- **⚠️ Adversarial audit found 5 confirmed (2 high, 1 medium, 2 low), ALL FIXED; do
+  NOT regress:** (1) **[HIGH] duplicated non-empty serials** were captured as an
+  ambiguous `usb:` identity (only the absent `-` half of §12 was implemented) →
+  `usb_identity_ambiguous` degrades duplicates to by-path (test
+  `duplicated_serial_degrades_to_by_path`). (2) **[HIGH] `remove-node --cascade` of a
+  lock-HOLDING writer** left its origin registered/holding on the surviving host lock
+  → a phantom holder wedged the endpoint forever; now `unregister` + wake/emit on
+  release (regression in `signals.sh`). (3) **[MEDIUM] `--state-file` help** advertised
+  a `/var/lib` default the code never uses → corrected to describe the socket-adjacent
+  default + the reboot-durability caveat. (4) **[LOW] `find_usb`** aborted the whole
+  by-id scan on one odd symlink (`file_name()?`) → skip the entry, continue. (5)
+  **[LOW] empty `raw:`** input resolved to the dev-root dir → rejected as `Malformed`
+  (test in `empty_input_is_malformed`). Two findings were REFUTED on verification (a
+  `linux.jq` degraded-clause worry that misread intent; a reader POLLERR busy-spin
+  unreachable for these fds).
 
 ---
 
