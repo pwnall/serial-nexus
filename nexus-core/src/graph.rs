@@ -269,6 +269,16 @@ pub enum ValidationError {
     TargetEndpointOversubscribed { addr: EndpointAddr, count: usize },
     /// A directed cycle through the graph — rule 3.
     Cycle { nodes: Vec<String> },
+    /// A leg node binds or dials a non-loopback address without `insecure_bind`
+    /// (§7.4, §9): loopback-only is the v1 security posture, and a remote bind
+    /// requires a visible, greppable confession. Checked at the config level
+    /// (the model sees only shapes, not transport/address), naming the offender.
+    NonLoopbackBind { node: String, address: String },
+    /// A leg node declares no channels — a degenerate, zero-endpoint transport that
+    /// can carry nothing (§7.4). A leg must declare at least one channel. Checked at
+    /// the config level, since a leg is the only node kind that can shape to zero
+    /// endpoints.
+    EmptyLeg { node: String },
 }
 
 impl fmt::Display for ValidationError {
@@ -302,7 +312,7 @@ impl fmt::Display for ValidationError {
                 if endpoint.is_empty() {
                     write!(
                         f,
-                        "node {node:?} has a channel identity colliding with its multiplexed-side default endpoint (an empty channel identity is not allowed, §3)"
+                        "node {node:?} declares an empty channel identity, which is reserved for a default endpoint and forbidden as a real channel (§3)"
                     )
                 } else {
                     write!(
@@ -331,6 +341,18 @@ impl fmt::Display for ValidationError {
             }
             ValidationError::Cycle { nodes } => {
                 write!(f, "graph contains a cycle through {}", nodes.join(" -> "))
+            }
+            ValidationError::NonLoopbackBind { node, address } => {
+                write!(
+                    f,
+                    "leg node {node:?} binds/dials non-loopback address {address:?} without insecure_bind=true (§7.4)"
+                )
+            }
+            ValidationError::EmptyLeg { node } => {
+                write!(
+                    f,
+                    "leg node {node:?} declares no channels (a leg must carry at least one, §7.4)"
+                )
             }
         }
     }

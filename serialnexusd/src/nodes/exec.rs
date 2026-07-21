@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use codec_api::{Event, EventKind, FrameDecoder, encode};
+use codec_api::{Event, EventKind, FrameDecoder, MAX_FRAME_SIZE, encode};
 use nexus_core::Chunk;
 use nexus_core::NodeStatus;
 use nexus_core::config::NodeConfig;
@@ -361,15 +361,29 @@ async fn pump_child(
     routing: &Routing<'_>,
 ) -> PumpEnd {
     tokio::select! {
-        // stdin: frame each tagged chunk and write it to the child.
+        // stdin: frame each tagged chunk and write it to the child. A chunk larger
+        // than one frame — the raw device stream on the reserved mux channel is a
+        // full serial read, up to READ_BUF == MAX_FRAME_SIZE, so it overflows the
+        // envelope header — is fragmented into consecutive data frames rather than
+        // dropped (the child reassembles per channel), preserving §5's no-drop /
+        // all-loss-counted invariant just as the leg does (§15.24).
         end = async {
             while let Some((channel, bytes)) = src_rx.recv().await {
-                let mut frame = Vec::new();
-                if encode(&Event::data(channel.as_str(), bytes), &mut frame).is_err() {
-                    continue; // an oversize frame is dropped rather than desyncing
-                }
-                if stdin.write_all(&frame).await.is_err() || stdin.flush().await.is_err() {
-                    return PumpEnd::ChildDied; // child stdin broke
+                let cap = MAX_FRAME_SIZE.saturating_sub(3 + channel.len()).max(1);
+                let total = bytes.len();
+                let mut off = 0;
+                while off < total {
+                    let stop = (off + cap).min(total);
+                    let mut frame = Vec::new();
+                    if encode(&Event::data(channel.as_str(), bytes.slice(off..stop)), &mut frame)
+                        .is_err()
+                    {
+                        break; // defensive; unreachable for a sane channel id
+                    }
+                    if stdin.write_all(&frame).await.is_err() || stdin.flush().await.is_err() {
+                        return PumpEnd::ChildDied; // child stdin broke
+                    }
+                    off = stop;
                 }
             }
             PumpEnd::SourceClosed

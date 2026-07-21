@@ -297,6 +297,172 @@ impl FrameDecoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The wire hello: the connection-opening handshake frame (§9).
+// ---------------------------------------------------------------------------
+//
+// The daemon-to-daemon wire (§7.4, §9) is the envelope stream preceded by one
+// `hello` frame that identifies the protocol and announces channels. The hello
+// is a *distinct wire construct*, not a fifth [`EventKind`] — the envelope's
+// four event kinds and golden vectors are frozen (the exec-codec contract,
+// §15.15), and the exec child never sends a hello. The hello reuses the
+// envelope's `u32` length-prefix discipline so a single reader frames both, but
+// its body is a hello, distinguished by a leading magic number.
+//
+// Layout (all integers big-endian):
+//
+//   u32  body_len            length of everything after this field
+//   ---- body ----
+//   u32  magic               WIRE_MAGIC ("SNXL")
+//   u16  wire_version        WIRE_VERSION
+//   u32  capabilities        capability bitset (v1: 0)
+//   u16  announcement_count  number of announced channel identities
+//   ...  announcements       announcement_count × (u16 chan_len | chan UTF-8)
+//
+// `body_len` is bounded by MAX_FRAME_SIZE so a hello with many announcements
+// stays bounded-memory (§9 clause 4).
+
+/// The wire hello magic ("SNXL" — serial_nexus link), distinguishing a hello
+/// frame from an envelope data frame at connection start.
+pub const WIRE_MAGIC: u32 = 0x534E_584C;
+
+/// The wire protocol version, versioned independently of [`ENVELOPE_VERSION`]
+/// (§8, §15.15): wire evolution must never break the exec-codec envelope. A peer
+/// announcing a different wire version is refused cleanly (§9 clause 6).
+pub const WIRE_VERSION: u16 = 1;
+
+/// Reserved capability bit for the deferred cross-machine lock request/grant
+/// relay (§6, §9 clause 2, §14). Not negotiated in v1; defined so the bit is
+/// claimed and a future daemon can light it up additively.
+pub const CAP_LOCK_RELAY: u32 = 1 << 0;
+
+/// The connection-opening handshake (§9 clause 3/6): protocol version,
+/// negotiated capabilities, and the sender's channel announcements. Binding
+/// announced identities to configured channels is the leg's job and never grows
+/// the graph (§8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hello {
+    pub version: u16,
+    pub capabilities: u32,
+    pub channels: Vec<ChannelId>,
+}
+
+/// A wire-handshake decode error (§9 clause 6: refuse a mismatch cleanly, with
+/// the reason surfaced in leg state). Distinct from [`EnvelopeError`] because the
+/// hello is a wire-only construct the shared envelope contract knows nothing of.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WireError {
+    #[error("bad wire magic {got:#010x} (expected {WIRE_MAGIC:#010x})")]
+    BadMagic { got: u32 },
+    #[error("unsupported wire protocol version {got} (this daemon speaks {WIRE_VERSION})")]
+    UnsupportedVersion { got: u16 },
+    #[error("hello frame body length {0} exceeds the maximum {MAX_FRAME_SIZE}")]
+    FrameTooLarge(usize),
+    #[error("truncated hello: {0}")]
+    Truncated(&'static str),
+    #[error("announced channel identity is not valid UTF-8")]
+    BadChannelId,
+}
+
+/// Encode a [`Hello`] into the wire format, appending to `out`.
+///
+/// Returns [`WireError::FrameTooLarge`] if the body would exceed
+/// [`MAX_FRAME_SIZE`] — the encoder never emits a hello the decoder must reject.
+pub fn encode_hello(hello: &Hello, out: &mut Vec<u8>) -> Result<(), WireError> {
+    // magic(4) + version(2) + capabilities(4) + count(2)
+    let mut body_len = 12usize;
+    for ch in &hello.channels {
+        body_len += 2 + ch.0.len();
+    }
+    if body_len > MAX_FRAME_SIZE {
+        return Err(WireError::FrameTooLarge(body_len));
+    }
+    let count =
+        u16::try_from(hello.channels.len()).map_err(|_| WireError::FrameTooLarge(body_len))?;
+
+    out.extend_from_slice(&(body_len as u32).to_be_bytes());
+    out.extend_from_slice(&WIRE_MAGIC.to_be_bytes());
+    out.extend_from_slice(&hello.version.to_be_bytes());
+    out.extend_from_slice(&hello.capabilities.to_be_bytes());
+    out.extend_from_slice(&count.to_be_bytes());
+    for ch in &hello.channels {
+        let ch_len = u16::try_from(ch.0.len()).map_err(|_| WireError::FrameTooLarge(ch.0.len()))?;
+        out.extend_from_slice(&ch_len.to_be_bytes());
+        out.extend_from_slice(ch.0.as_bytes());
+    }
+    Ok(())
+}
+
+/// Attempt to decode the opening [`Hello`] from the front of `buf`.
+///
+/// Mirrors [`try_decode`]'s partial-vs-error contract: `Ok(None)` means need
+/// more bytes; `Err` means a malformed/oversize/mismatched hello to be refused
+/// cleanly (§9 clause 6). Magic is checked first (a bad magic means "not our
+/// protocol"), then the version: a version mismatch returns
+/// [`WireError::UnsupportedVersion`] carrying the peer's value *without* parsing
+/// the rest, since a different version may lay its body out differently.
+pub fn try_decode_hello(buf: &[u8]) -> Result<Option<(Hello, usize)>, WireError> {
+    if buf.len() < 4 {
+        return Ok(None);
+    }
+    let body_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if body_len > MAX_FRAME_SIZE {
+        return Err(WireError::FrameTooLarge(body_len));
+    }
+    let frame_end = 4 + body_len;
+    if buf.len() < frame_end {
+        return Ok(None);
+    }
+    let body = &buf[4..frame_end];
+    // The magic(4) + version(2) prefix is version-stable by protocol design (it is
+    // how negotiation works across differing future layouts), so validate it before
+    // the v1-specific 12-byte header gate: a short-bodied hello with the right magic
+    // and a wrong version is still reported as UnsupportedVersion, not a generic
+    // truncation (§9 clause 6, and this function's contract).
+    if body.len() < 6 {
+        return Err(WireError::Truncated("header"));
+    }
+    let magic = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    if magic != WIRE_MAGIC {
+        return Err(WireError::BadMagic { got: magic });
+    }
+    let version = u16::from_be_bytes([body[4], body[5]]);
+    if version != WIRE_VERSION {
+        return Err(WireError::UnsupportedVersion { got: version });
+    }
+    // The rest of the v1 header (capabilities + announcement count) needs 12 bytes.
+    if body.len() < 12 {
+        return Err(WireError::Truncated("header"));
+    }
+    let capabilities = u32::from_be_bytes([body[6], body[7], body[8], body[9]]);
+    let count = u16::from_be_bytes([body[10], body[11]]) as usize;
+    let mut channels = Vec::with_capacity(count);
+    let mut off = 12;
+    for _ in 0..count {
+        if body.len() < off + 2 {
+            return Err(WireError::Truncated("announcement length"));
+        }
+        let ch_len = u16::from_be_bytes([body[off], body[off + 1]]) as usize;
+        off += 2;
+        if body.len() < off + ch_len {
+            return Err(WireError::Truncated("announcement identity"));
+        }
+        let ch = std::str::from_utf8(&body[off..off + ch_len])
+            .map_err(|_| WireError::BadChannelId)?
+            .to_owned();
+        off += ch_len;
+        channels.push(ChannelId(ch));
+    }
+    Ok(Some((
+        Hello {
+            version,
+            capabilities,
+            channels,
+        },
+        frame_end,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +594,128 @@ mod tests {
         assert_eq!(events[1], Event::data("a", Bytes::from_static(b"12345")));
         assert_eq!(events[2], Event::close("a"));
         assert_eq!(dec.buffered(), 0);
+    }
+
+    // ---- wire hello (§9) ----
+
+    #[test]
+    fn hello_round_trips_with_announcements() {
+        let hello = Hello {
+            version: WIRE_VERSION,
+            capabilities: 0,
+            channels: vec![ChannelId::new("console"), ChannelId::new("trace")],
+        };
+        let mut out = Vec::new();
+        encode_hello(&hello, &mut out).unwrap();
+        let (decoded, consumed) = try_decode_hello(&out).unwrap().unwrap();
+        assert_eq!(decoded, hello);
+        assert_eq!(consumed, out.len());
+    }
+
+    #[test]
+    fn hello_with_no_channels_round_trips() {
+        let hello = Hello {
+            version: WIRE_VERSION,
+            capabilities: CAP_LOCK_RELAY,
+            channels: vec![],
+        };
+        let mut out = Vec::new();
+        encode_hello(&hello, &mut out).unwrap();
+        // body = 12 bytes (magic+version+caps+count), body_len prefix = 4.
+        assert_eq!(out.len(), 16);
+        let (decoded, consumed) = try_decode_hello(&out).unwrap().unwrap();
+        assert_eq!(decoded, hello);
+        assert_eq!(consumed, 16);
+    }
+
+    #[test]
+    fn hello_partial_needs_more() {
+        let hello = Hello {
+            version: WIRE_VERSION,
+            capabilities: 0,
+            channels: vec![ChannelId::new("a"), ChannelId::new("bb")],
+        };
+        let mut out = Vec::new();
+        encode_hello(&hello, &mut out).unwrap();
+        for cut in 0..out.len() {
+            assert_eq!(
+                try_decode_hello(&out[..cut]).unwrap(),
+                None,
+                "prefix {cut} should need more"
+            );
+        }
+        assert!(try_decode_hello(&out).unwrap().is_some());
+    }
+
+    #[test]
+    fn hello_bad_magic_is_refused() {
+        // A well-formed length prefix but a non-hello body (envelope-shaped).
+        let mut buf = Vec::new();
+        encode(&Event::data("console", Bytes::from_static(b"hi")), &mut buf).unwrap();
+        // The envelope body starts with type byte 0, not the magic.
+        match try_decode_hello(&buf) {
+            Err(WireError::BadMagic { got }) => assert_ne!(got, WIRE_MAGIC),
+            other => panic!("expected BadMagic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_version_mismatch_is_refused_with_value() {
+        // Hand-craft a hello with version 999.
+        let mut body = Vec::new();
+        body.extend_from_slice(&WIRE_MAGIC.to_be_bytes());
+        body.extend_from_slice(&999u16.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes()); // caps
+        body.extend_from_slice(&0u16.to_be_bytes()); // count
+        let mut buf = (body.len() as u32).to_be_bytes().to_vec();
+        buf.extend_from_slice(&body);
+        assert_eq!(
+            try_decode_hello(&buf),
+            Err(WireError::UnsupportedVersion { got: 999 })
+        );
+    }
+
+    #[test]
+    fn hello_short_body_still_reports_magic_and_version() {
+        // A hello whose body carries only the version-stable magic(4)+version(2)
+        // prefix (6 bytes, shorter than the v1 12-byte header) is still refused as a
+        // version mismatch, not a generic truncation — the negotiation contract.
+        let mut body = Vec::new();
+        body.extend_from_slice(&WIRE_MAGIC.to_be_bytes());
+        body.extend_from_slice(&2u16.to_be_bytes());
+        let mut buf = (body.len() as u32).to_be_bytes().to_vec();
+        buf.extend_from_slice(&body);
+        assert_eq!(
+            try_decode_hello(&buf),
+            Err(WireError::UnsupportedVersion { got: 2 })
+        );
+        // A short body with a *bad* magic reports BadMagic (not truncation).
+        let mut body = Vec::new();
+        body.extend_from_slice(&(!WIRE_MAGIC).to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        let mut buf = (body.len() as u32).to_be_bytes().to_vec();
+        buf.extend_from_slice(&body);
+        assert!(matches!(
+            try_decode_hello(&buf),
+            Err(WireError::BadMagic { .. })
+        ));
+    }
+
+    #[test]
+    fn hello_oversize_is_refused_before_buffering() {
+        let mut buf = ((MAX_FRAME_SIZE + 1) as u32).to_be_bytes().to_vec();
+        buf.extend_from_slice(&[0, 0, 0]); // partial body only
+        assert_eq!(
+            try_decode_hello(&buf),
+            Err(WireError::FrameTooLarge(MAX_FRAME_SIZE + 1))
+        );
+    }
+
+    #[test]
+    fn hello_does_not_disturb_the_envelope_golden_vectors() {
+        // Sanity: adding the hello left the envelope encoding byte-identical.
+        let mut out = Vec::new();
+        encode(&Event::data("console", Bytes::from_static(b"hi")), &mut out).unwrap();
+        assert_eq!(hex(&out), "0000000c000007636f6e736f6c656869");
     }
 }

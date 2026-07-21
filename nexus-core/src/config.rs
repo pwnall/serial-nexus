@@ -65,9 +65,75 @@ impl GraphConfig {
                     node: node.name().to_owned(),
                 });
             }
+            // Leg-specific config-level checks the shape/topology model cannot make
+            // (it sees only endpoints, not transport/address, and cannot tell a
+            // leg's illegitimate empty channel from a codec's legitimate default
+            // endpoint, §7.4).
+            if let NodeConfig::Leg {
+                name,
+                transport,
+                address,
+                insecure_bind,
+                channels,
+                ..
+            } = node
+            {
+                // Loopback-only unless insecure_bind; unix is inherently local (§9).
+                if *transport == Transport::Tcp && !*insecure_bind && !is_loopback_addr(address) {
+                    errors.push(ValidationError::NonLoopbackBind {
+                        node: name.clone(),
+                        address: address.clone(),
+                    });
+                }
+                // A leg has no default endpoint, so an empty channel identity is a
+                // real channel with a reserved name — forbidden (§3). (A codec's
+                // empty channel is instead caught as a collision with its default
+                // endpoint by the model.)
+                if channels.iter().any(|ch| ch.is_empty()) {
+                    errors.push(ValidationError::DuplicateEndpoint {
+                        node: name.clone(),
+                        endpoint: String::new(),
+                    });
+                }
+                // A leg is the only node kind that can shape to zero endpoints; an
+                // empty channel list is a degenerate transport that carries nothing
+                // and would otherwise load and report "connected" while dead (§7.4).
+                if channels.is_empty() {
+                    errors.push(ValidationError::EmptyLeg { node: name.clone() });
+                }
+            }
         }
         errors.extend(self.to_model().validate());
         errors
+    }
+}
+
+/// Whether an address's host is loopback (§7.4/§9 loopback-only rule). Accepts a
+/// `host:port` (tcp) form; a bare host also works. A host that parses as an IP
+/// uses [`std::net::IpAddr::is_loopback`]; the literal `localhost` is loopback;
+/// everything else — other hostnames and the wildcard binds `0.0.0.0` / `::` —
+/// is treated as non-loopback, so a remote exposure needs the explicit
+/// `insecure_bind` confession.
+fn is_loopback_addr(address: &str) -> bool {
+    // Split off the port. Bracketed IPv6 (`[::1]:port`) and bare IPv6 both need
+    // care: rsplit_once(':') on a bare `::1` would wrongly split the address.
+    let host = if let Some(rest) = address.strip_prefix('[') {
+        // `[ipv6]` or `[ipv6]:port`
+        match rest.split_once(']') {
+            Some((inner, _)) => inner,
+            None => rest,
+        }
+    } else if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+        // A bare IP (including bare IPv6 with no port) parses directly.
+        return ip.is_loopback();
+    } else {
+        // `host:port` (host is a name or IPv4) — take everything before the port.
+        address.rsplit_once(':').map(|(h, _)| h).unwrap_or(address)
+    };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        ip.is_loopback()
+    } else {
+        host.eq_ignore_ascii_case("localhost")
     }
 }
 
@@ -172,6 +238,75 @@ pub enum NodeConfig {
         #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
         attributes: toml::Table,
     },
+    /// Leg node (§7.4): the cross-daemon transport. A socket carrying all of its
+    /// channels multiplexed by the built-in link codec (§8, §9). One endpoint per
+    /// configured channel identity; all channel endpoints face target on the
+    /// sending side (`faces = "target"`, computer A: the leg consumes local
+    /// channels) or host on the receiving side (`faces = "host"`, computer B: the
+    /// leg offers arriving channels). There is no multiplexed-side default
+    /// endpoint — the socket is off-graph.
+    Leg {
+        name: String,
+        /// Orientation of every channel endpoint. Required (no default): `target`
+        /// consumes local channels for transport; `host` offers arriving channels
+        /// to local consumers. A wrong orientation must not be silent.
+        faces: Facing,
+        /// Socket substrate. `unix` is inherently local; `tcp` is loopback-only
+        /// unless `insecure_bind` (§9).
+        #[serde(default)]
+        transport: Transport,
+        /// `listen` binds and accepts one peer; `connect` dials with backoff.
+        /// Required (no default).
+        role: LegRole,
+        /// The bind (listen) or dial (connect) address: `host:port` for tcp, a
+        /// filesystem path for unix.
+        address: String,
+        /// A non-loopback tcp bind/dial requires this deliberately ugly flag
+        /// (§9): a named footgun beats a patched binary.
+        #[serde(default, skip_serializing_if = "is_false")]
+        insecure_bind: bool,
+        /// Reconnect backoff for the `connect` role: initial and maximum delay in
+        /// milliseconds (exponential in between).
+        #[serde(default = "default_reconnect_initial_ms")]
+        reconnect_initial_ms: u64,
+        #[serde(default = "default_reconnect_max_ms")]
+        reconnect_max_ms: u64,
+        /// Idle-release interval (ms) for implicit lock acquisition on the sending
+        /// side's targetward writes (§6, §7.4).
+        #[serde(default = "default_idle_release_ms")]
+        idle_release_ms: u64,
+        /// Discard outage-era targetward backlogs on reconnect (default on, §7.4).
+        #[serde(default = "default_true")]
+        purge_on_reconnect: bool,
+        /// Arbitration policy for host-facing channel endpoints (`faces = "host"`),
+        /// as for a codec's host-facing endpoints (§6).
+        #[serde(default)]
+        arbitration: Arbitration,
+        /// The channel identities carried over this leg; each is a channel
+        /// endpoint. A `/` in any identity — or an empty identity — is a
+        /// structural error (§3). Declared last so it serializes after the scalar
+        /// fields, which TOML's array-of-tables syntax requires.
+        channels: Vec<String>,
+    },
+}
+
+/// Leg socket substrate (§7.4). `unix` is inherently local; `tcp` is
+/// loopback-only unless `insecure_bind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    #[default]
+    Tcp,
+    Unix,
+}
+
+/// Leg connection role (§7.4). `listen` binds and accepts one peer; `connect`
+/// dials and retries with backoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LegRole {
+    Listen,
+    Connect,
 }
 
 impl NodeConfig {
@@ -180,7 +315,8 @@ impl NodeConfig {
             NodeConfig::Serial { name, .. }
             | NodeConfig::Pty { name, .. }
             | NodeConfig::Log { name, .. }
-            | NodeConfig::Codec { name, .. } => name,
+            | NodeConfig::Codec { name, .. }
+            | NodeConfig::Leg { name, .. } => name,
         }
     }
 
@@ -224,6 +360,31 @@ impl NodeConfig {
                 }
                 NodeShape::new(endpoints)
             }
+            // A leg exposes one endpoint per channel identity — and no default
+            // endpoint (the socket is off-graph, §7.4). All channels face the same
+            // direction (`faces`); host-facing channels carry the node's
+            // arbitration policy (§6).
+            NodeConfig::Leg {
+                faces,
+                channels,
+                arbitration,
+                ..
+            } => {
+                let arb = if *faces == Facing::Host {
+                    *arbitration
+                } else {
+                    Arbitration::default()
+                };
+                let endpoints = channels
+                    .iter()
+                    .map(|ch| EndpointSpec {
+                        name: ch.clone(),
+                        facing: *faces,
+                        arbitration: arb,
+                    })
+                    .collect();
+                NodeShape::new(endpoints)
+            }
         }
     }
 
@@ -232,9 +393,9 @@ impl NodeConfig {
     /// of its host-facing endpoints uniformly.
     pub fn arbitration(&self) -> Arbitration {
         match self {
-            NodeConfig::Serial { arbitration, .. } | NodeConfig::Codec { arbitration, .. } => {
-                *arbitration
-            }
+            NodeConfig::Serial { arbitration, .. }
+            | NodeConfig::Codec { arbitration, .. }
+            | NodeConfig::Leg { arbitration, .. } => *arbitration,
             NodeConfig::Pty { .. } | NodeConfig::Log { .. } => Arbitration::default(),
         }
     }
@@ -306,6 +467,26 @@ fn default_faces_host() -> Facing {
 
 fn default_faces_target() -> Facing {
     Facing::Target
+}
+
+fn default_reconnect_initial_ms() -> u64 {
+    200
+}
+
+fn default_reconnect_max_ms() -> u64 {
+    5_000
+}
+
+fn default_idle_release_ms() -> u64 {
+    1_000
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[cfg(test)]
@@ -481,6 +662,148 @@ mod tests {
         );
     }
 
+    #[test]
+    fn leg_config_round_trips_and_validates() {
+        // A receiving leg (computer B, §2): two host-facing channels fanning out
+        // to local consumers, bound to loopback. Exercises the leg config through
+        // TOML and structural validation.
+        let cfg = GraphConfig {
+            nodes: vec![
+                NodeConfig::Leg {
+                    name: "downlink".into(),
+                    faces: Facing::Host,
+                    transport: Transport::Tcp,
+                    role: LegRole::Listen,
+                    address: "127.0.0.1:7000".into(),
+                    insecure_bind: false,
+                    reconnect_initial_ms: 200,
+                    reconnect_max_ms: 5_000,
+                    idle_release_ms: 1_000,
+                    purge_on_reconnect: true,
+                    arbitration: Arbitration::Exclusive,
+                    channels: vec!["console".into(), "trace".into()],
+                },
+                NodeConfig::Pty {
+                    name: "console-pty".into(),
+                    path: "/run/serial_nexus/console".into(),
+                    owner: None,
+                    group: None,
+                    mode: None,
+                    advertised_baud: 115_200,
+                },
+            ],
+            edges: vec![EdgeConfig {
+                a: EndpointAddr::channel("downlink", "console"),
+                b: EndpointAddr::node("console-pty"),
+                write_mode: WriteMode::OnDemand,
+            }],
+        };
+        let toml = toml::to_string(&cfg).expect("serialize");
+        let back: GraphConfig = toml::from_str(&toml).expect("deserialize");
+        assert_eq!(cfg, back, "leg config must round-trip through TOML\n{toml}");
+        assert!(
+            cfg.validate().is_empty(),
+            "loopback leg must be structurally valid: {:?}",
+            cfg.validate()
+        );
+    }
+
+    #[test]
+    fn non_loopback_leg_without_insecure_bind_is_rejected() {
+        let leg = |address: &str, insecure_bind: bool, transport: Transport| NodeConfig::Leg {
+            name: "uplink".into(),
+            faces: Facing::Target,
+            transport,
+            role: LegRole::Connect,
+            address: address.into(),
+            insecure_bind,
+            reconnect_initial_ms: 200,
+            reconnect_max_ms: 5_000,
+            idle_release_ms: 1_000,
+            purge_on_reconnect: true,
+            arbitration: Arbitration::Exclusive,
+            channels: vec!["a".into()],
+        };
+        let rejected = |node: NodeConfig| {
+            GraphConfig {
+                nodes: vec![node],
+                edges: vec![],
+            }
+            .validate()
+            .iter()
+            .any(|e| matches!(e, ValidationError::NonLoopbackBind { .. }))
+        };
+        // Non-loopback tcp without the flag: rejected.
+        assert!(rejected(leg("10.0.0.5:7000", false, Transport::Tcp)));
+        assert!(rejected(leg("0.0.0.0:7000", false, Transport::Tcp)));
+        assert!(rejected(leg("example.com:7000", false, Transport::Tcp)));
+        // With the flag: accepted.
+        assert!(!rejected(leg("10.0.0.5:7000", true, Transport::Tcp)));
+        // Loopback forms: accepted without the flag.
+        assert!(!rejected(leg("127.0.0.1:7000", false, Transport::Tcp)));
+        assert!(!rejected(leg("localhost:7000", false, Transport::Tcp)));
+        assert!(!rejected(leg("[::1]:7000", false, Transport::Tcp)));
+        // Unix transport is inherently local: never a NonLoopbackBind.
+        assert!(!rejected(leg("/run/snx/leg.sock", false, Transport::Unix)));
+    }
+
+    #[test]
+    fn empty_leg_channel_list_is_rejected() {
+        let cfg = GraphConfig {
+            nodes: vec![NodeConfig::Leg {
+                name: "uplink".into(),
+                faces: Facing::Target,
+                transport: Transport::Unix,
+                role: LegRole::Connect,
+                address: "/run/snx/leg.sock".into(),
+                insecure_bind: false,
+                reconnect_initial_ms: 200,
+                reconnect_max_ms: 5_000,
+                idle_release_ms: 1_000,
+                purge_on_reconnect: true,
+                arbitration: Arbitration::Exclusive,
+                channels: vec![],
+            }],
+            edges: vec![],
+        };
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|e| matches!(e, ValidationError::EmptyLeg { node } if node == "uplink")),
+            "expected EmptyLeg, got {:?}",
+            cfg.validate()
+        );
+    }
+
+    #[test]
+    fn empty_leg_channel_identity_is_rejected() {
+        let cfg = GraphConfig {
+            nodes: vec![NodeConfig::Leg {
+                name: "uplink".into(),
+                faces: Facing::Target,
+                transport: Transport::Unix,
+                role: LegRole::Connect,
+                address: "/run/snx/leg.sock".into(),
+                insecure_bind: false,
+                reconnect_initial_ms: 200,
+                reconnect_max_ms: 5_000,
+                idle_release_ms: 1_000,
+                purge_on_reconnect: true,
+                arbitration: Arbitration::Exclusive,
+                channels: vec!["".into()],
+            }],
+            edges: vec![],
+        };
+        assert!(
+            cfg.validate().iter().any(|e| matches!(
+                e,
+                ValidationError::DuplicateEndpoint { node, endpoint } if node == "uplink" && endpoint.is_empty()
+            )),
+            "expected empty-channel rejection, got {:?}",
+            cfg.validate()
+        );
+    }
+
     // Proptest strategies producing well-typed (not necessarily graph-valid)
     // configurations, to prove serde round-trips. Every enum variant, every
     // Some/None option, non-default numerics, and edges are all reachable, so a
@@ -516,6 +839,12 @@ mod tests {
     }
     fn any_arbitration() -> impl Strategy<Value = Arbitration> {
         prop_oneof![Just(Arbitration::Exclusive), Just(Arbitration::FreeForAll)]
+    }
+    fn any_transport() -> impl Strategy<Value = Transport> {
+        prop_oneof![Just(Transport::Tcp), Just(Transport::Unix)]
+    }
+    fn any_leg_role() -> impl Strategy<Value = LegRole> {
+        prop_oneof![Just(LegRole::Listen), Just(LegRole::Connect)]
     }
     fn any_overflow() -> impl Strategy<Value = OverflowPolicy> {
         prop_oneof![
@@ -616,6 +945,51 @@ mod tests {
                         attributes: toml::Table::new(),
                     }
                 }),
+            (
+                ident(),
+                any_facing(),
+                any_transport(),
+                any_leg_role(),
+                "127\\.0\\.0\\.1:[0-9]{2,5}",
+                any::<bool>(),
+                0u64..30_000,
+                0u64..30_000,
+                0u64..30_000,
+                any::<bool>(),
+                any_arbitration(),
+                prop::collection::vec(ident(), 0..4),
+            )
+                .prop_map(
+                    |(
+                        name,
+                        faces,
+                        transport,
+                        role,
+                        address,
+                        insecure_bind,
+                        reconnect_initial_ms,
+                        reconnect_max_ms,
+                        idle_release_ms,
+                        purge_on_reconnect,
+                        arbitration,
+                        channels,
+                    )| {
+                        NodeConfig::Leg {
+                            name,
+                            faces,
+                            transport,
+                            role,
+                            address,
+                            insecure_bind,
+                            reconnect_initial_ms,
+                            reconnect_max_ms,
+                            idle_release_ms,
+                            purge_on_reconnect,
+                            arbitration,
+                            channels,
+                        }
+                    },
+                ),
         ]
     }
 

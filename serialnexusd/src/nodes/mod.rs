@@ -8,6 +8,7 @@
 
 pub mod codec;
 pub mod exec;
+pub mod leg;
 pub mod log;
 pub mod pty;
 pub mod serial;
@@ -23,6 +24,7 @@ pub enum Node {
     Log(log::LogNode),
     Codec(codec::CodecNode),
     Exec(exec::ExecCodecNode),
+    Leg(leg::LegNode),
 }
 
 impl Node {
@@ -54,6 +56,7 @@ impl Node {
                 config,
                 codec::build_codec(codec_name, attributes)?,
             )),
+            NodeConfig::Leg { .. } => Node::Leg(leg::LegNode::create(config)),
         })
     }
 
@@ -64,6 +67,7 @@ impl Node {
             Node::Log(n) => &n.name,
             Node::Codec(n) => &n.name,
             Node::Exec(n) => &n.name,
+            Node::Leg(n) => &n.name,
         }
     }
 
@@ -74,6 +78,7 @@ impl Node {
             Node::Log(n) => n.status(),
             Node::Codec(n) => n.status(),
             Node::Exec(n) => n.status(),
+            Node::Leg(n) => n.status(),
         }
     }
 
@@ -86,6 +91,7 @@ impl Node {
             Node::Log(n) => n.state_extra(),
             Node::Codec(n) => n.state_extra(),
             Node::Exec(n) => n.state_extra(),
+            Node::Leg(n) => n.state_extra(),
         }
     }
 
@@ -118,6 +124,7 @@ impl Node {
             }
             Node::Codec(n) => n.start(wiring),
             Node::Exec(n) => n.start(wiring),
+            Node::Leg(n) => n.start(wiring),
         }
     }
 
@@ -149,6 +156,7 @@ impl Node {
             Node::Log(n) => n.teardown(),
             Node::Codec(n) => n.teardown(),
             Node::Exec(n) => n.teardown(),
+            Node::Leg(n) => n.teardown(),
         }
     }
 }

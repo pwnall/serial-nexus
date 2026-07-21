@@ -9,21 +9,30 @@
 //!
 //! Phase 1 lands the `pty` and `client` modes plus the verdict plumbing, so the
 //! judges exist before anything they will judge. `mux`/`envelope` arrive in
-//! phase 5 and `wire`/`tcp-proxy` in phase 6.
+//! phase 5. Phase 6 adds `wire` (the §9 conformance driver / hostile-or-conforming
+//! peer for a daemon leg) and `tcp-proxy` (a link-outage injector between two
+//! daemons).
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
-use codec_api::{Event, FrameDecoder, encode};
+use codec_api::{
+    Event, EventKind, FrameDecoder, Hello, MAX_FRAME_SIZE, WIRE_MAGIC, WIRE_VERSION, encode,
+    encode_hello, try_decode_hello,
+};
 use nix::fcntl::OFlag;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::pty::{PtyMaster, grantpt, posix_openpt, ptsname_r, unlockpt};
@@ -54,6 +63,13 @@ enum Mode {
     /// Drive an external codec child through the golden-vector envelope battery,
     /// proving any-language envelope conformance (§8, phase 5).
     Envelope(EnvelopeArgs),
+    /// Speak the v1 wire protocol to a daemon leg as a hostile-or-conforming peer
+    /// — the §9 conformance driver (crafted hellos, bad magic, oversize/unknown
+    /// frames, unbound channels) and an echo peer for a single-daemon round-trip.
+    Wire(WireArgs),
+    /// Sit between two daemons on loopback and forward both directions, with
+    /// `--drop-after`/`--restore-after` link-outage injection (§7.4, phase 6).
+    TcpProxy(TcpProxyArgs),
 }
 
 #[derive(Args)]
@@ -73,6 +89,11 @@ struct PtyArgs {
     /// Report the termios the far side applied to the pair, then exit.
     #[arg(long)]
     report_termios: bool,
+    /// Hold the master open but never read it — the targetward input buffer fills
+    /// and the daemon's writer backpressures (a stalled target, for the §9
+    /// head-of-line property). Stays present until `--timeout-ms`.
+    #[arg(long)]
+    stall: bool,
     #[arg(long, default_value_t = 0)]
     seed: u64,
     /// Size for source/sink, e.g. `1MiB`, `64KiB`, `512`.
@@ -183,6 +204,78 @@ struct EnvelopeArgs {
     timeout_ms: u64,
 }
 
+#[derive(Args)]
+struct WireArgs {
+    /// `tcp` or `unix`.
+    #[arg(long, default_value = "tcp")]
+    transport: String,
+    /// The daemon leg's listen address to dial (`host:port` or a unix path).
+    #[arg(long)]
+    address: String,
+    /// Channel identity to announce in our hello (repeatable).
+    #[arg(long = "announce")]
+    announce: Vec<String>,
+    /// The wire version to claim (default the real one). `--hello-version 999`
+    /// drives the §9 clause-6 version-mismatch refusal.
+    #[arg(long, default_value_t = WIRE_VERSION)]
+    hello_version: u16,
+    /// Send a hello with a wrong magic number (a not-our-protocol peer).
+    #[arg(long)]
+    bad_magic: bool,
+    /// The capability bitset to advertise.
+    #[arg(long, default_value_t = 0)]
+    capabilities: u32,
+    /// After the handshake, send a frame whose length prefix exceeds the maximum
+    /// (§9 clause 4) — the daemon must refuse cleanly.
+    #[arg(long)]
+    oversize_frame: bool,
+    /// After the handshake, send a frame with an unknown type byte — the daemon
+    /// must refuse cleanly (§9 clause 6).
+    #[arg(long)]
+    unknown_type: bool,
+    /// Echo every targetward `data` frame back hostward on the same channel — a
+    /// device stand-in for a single-daemon round-trip through a leg.
+    #[arg(long)]
+    echo: bool,
+    /// After the handshake, stream sustained seeded hostward data on the announced
+    /// channels while NEVER reading the socket — the peer's targetward backs up
+    /// into the socket buffer (the §9 head-of-line stall), yet hostward keeps
+    /// flowing. Holds for `--hold-ms`.
+    #[arg(long)]
+    stall: bool,
+    /// Send `<channel>=<size>` seeded hostward data after the handshake
+    /// (repeatable), e.g. `--send c0=64KiB`.
+    #[arg(long = "send")]
+    send: Vec<String>,
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Stay connected this long (ms) after the scripted actions, so the harness can
+    /// inspect leg state and drain the data path.
+    #[arg(long, default_value_t = 1_500)]
+    hold_ms: u64,
+    #[arg(long, default_value_t = 10_000)]
+    timeout_ms: u64,
+}
+
+#[derive(Args)]
+struct TcpProxyArgs {
+    /// Bind here; the `connect`-role daemon dials this (`host:port`).
+    #[arg(long)]
+    listen: String,
+    /// Dial here; the `listen`-role daemon is bound here (`host:port`).
+    #[arg(long)]
+    connect: String,
+    /// Sever the link after forwarding this many bytes from the dialing daemon,
+    /// injecting an outage (e.g. `256KiB`).
+    #[arg(long)]
+    drop_after: Option<String>,
+    /// After severing, wait this long (ms) before re-establishing the link.
+    #[arg(long, default_value_t = 500)]
+    restore_after_ms: u64,
+    #[arg(long, default_value_t = 30_000)]
+    timeout_ms: u64,
+}
+
 fn main() {
     let cli = Cli::parse();
     let verdict = match cli.mode {
@@ -190,6 +283,8 @@ fn main() {
         Mode::Client(a) => run_client(a),
         Mode::Mux(a) => run_mux(a),
         Mode::Envelope(a) => run_envelope(a),
+        Mode::Wire(a) => run_wire(a),
+        Mode::TcpProxy(a) => run_tcp_proxy(a),
     };
     println!("{verdict}");
     let pass = verdict
@@ -341,8 +436,10 @@ fn run_pty_inner(a: &PtyArgs) -> anyhow::Result<Value> {
         pty_sink(&mut master, n, a.timeout_ms)
     } else if a.report_termios {
         pty_report_termios(&master)
+    } else if a.stall {
+        pty_stall(&master, a.timeout_ms)
     } else {
-        anyhow::bail!("pty: pick one of --echo/--source/--sink/--report-termios")
+        anyhow::bail!("pty: pick one of --echo/--source/--sink/--report-termios/--stall")
     };
 
     if let Some(link) = &a.link {
@@ -417,6 +514,16 @@ fn pty_sink(master: &mut PtyMaster, n: usize, timeout_ms: u64) -> anyhow::Result
         "tool": "nexus-sim", "mode": "pty", "behavior": "sink",
         "received": got.len(), "sha256": sha256_hex(&got), "pass": got.len() == n
     }))
+}
+
+/// Hold the master open without ever reading it: the targetward (master input)
+/// buffer fills and the daemon's writer backpressures — a stalled target for the
+/// §9 head-of-line-blocking property. Stays present (no HUP) until the timeout.
+fn pty_stall(_master: &PtyMaster, timeout_ms: u64) -> anyhow::Result<Value> {
+    // Hold the master fd open (present) but never read it, so the targetward input
+    // buffer fills and stays full; just sleep until the timeout.
+    thread::sleep(Duration::from_millis(timeout_ms));
+    Ok(json!({"tool": "nexus-sim", "mode": "pty", "behavior": "stall", "pass": true}))
 }
 
 fn pty_report_termios(master: &PtyMaster) -> anyhow::Result<Value> {
@@ -926,4 +1033,458 @@ fn run_envelope_inner(a: &EnvelopeArgs) -> anyhow::Result<Value> {
         "sent_frames": battery.len(), "received_frames": got.len(),
         "trailing_bytes": trailing, "pass": pass,
     }))
+}
+
+// --- wire / tcp-proxy sockets ----------------------------------------------
+
+/// A blocking duplex socket over tcp or unix, so the wire/proxy modes exercise
+/// the same OS calls the daemon's leg uses (§3), transport-agnostically.
+enum SimStream {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+impl SimStream {
+    fn connect(transport: &str, address: &str) -> anyhow::Result<SimStream> {
+        match transport {
+            "tcp" => Ok(SimStream::Tcp(TcpStream::connect(address)?)),
+            "unix" => Ok(SimStream::Unix(UnixStream::connect(address)?)),
+            other => anyhow::bail!("unknown transport {other:?}"),
+        }
+    }
+    fn set_read_timeout(&self, d: Option<Duration>) -> anyhow::Result<()> {
+        match self {
+            SimStream::Tcp(s) => s.set_read_timeout(d)?,
+            SimStream::Unix(s) => s.set_read_timeout(d)?,
+        }
+        Ok(())
+    }
+}
+
+impl Read for SimStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            SimStream::Tcp(s) => s.read(buf),
+            SimStream::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for SimStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            SimStream::Tcp(s) => s.write(buf),
+            SimStream::Unix(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            SimStream::Tcp(s) => s.flush(),
+            SimStream::Unix(s) => s.flush(),
+        }
+    }
+}
+
+/// Whether a read error is a timeout (the socket read deadline elapsed) rather
+/// than a real failure.
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+// --- wire mode -------------------------------------------------------------
+
+fn run_wire(a: WireArgs) -> Value {
+    match run_wire_inner(&a) {
+        Ok(v) => v,
+        Err(e) => err_verdict("wire", &e),
+    }
+}
+
+fn run_wire_inner(a: &WireArgs) -> anyhow::Result<Value> {
+    let mut stream = SimStream::connect(&a.transport, &a.address)?;
+    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+
+    // Send our hello (§9). A hostile peer sends a bad magic or a mismatched
+    // version; both must be refused cleanly by the daemon.
+    let mut hello_bytes = Vec::new();
+    if a.bad_magic {
+        write_bad_magic_hello(&mut hello_bytes, &a.announce);
+    } else {
+        let hello = Hello {
+            version: a.hello_version,
+            capabilities: a.capabilities,
+            channels: a.announce.iter().map(|c| c.as_str().into()).collect(),
+        };
+        // Force the requested version even when it differs from ours (the
+        // struct carries it, so encode_hello emits it verbatim).
+        encode_hello(&hello, &mut hello_bytes).map_err(|e| anyhow::anyhow!("encode hello: {e}"))?;
+    }
+    stream.write_all(&hello_bytes)?;
+    stream.flush()?;
+
+    // Read the daemon's hello (it speaks first on accept).
+    let deadline = Instant::now() + Duration::from_millis(a.timeout_ms);
+    let mut inbuf: Vec<u8> = Vec::new();
+    let mut peer_hello: Option<Hello> = None;
+    let mut peer_closed = false;
+    'hello: loop {
+        match try_decode_hello(&inbuf) {
+            Ok(Some((h, consumed))) => {
+                inbuf.drain(..consumed);
+                peer_hello = Some(h);
+                break 'hello;
+            }
+            Ok(None) => {}
+            Err(e) => anyhow::bail!("daemon sent a malformed hello: {e}"),
+        }
+        match read_more(&mut stream, &mut inbuf, deadline)? {
+            ReadOutcome::Bytes => {}
+            ReadOutcome::Eof => {
+                peer_closed = true;
+                break 'hello;
+            }
+            // A socket-level read timeout is not terminal — keep waiting until the
+            // configured --timeout-ms deadline actually elapses (read_more's own
+            // guard returns Timeout again once it does).
+            ReadOutcome::Timeout => {
+                if Instant::now() >= deadline {
+                    break 'hello;
+                }
+            }
+        }
+    }
+
+    // Post-handshake hostility: an oversize length prefix or an unknown type byte.
+    if a.oversize_frame {
+        let mut f = ((MAX_FRAME_SIZE + 1) as u32).to_be_bytes().to_vec();
+        f.extend_from_slice(&[0, 0, 0]); // a few body bytes; the daemon refuses on the prefix
+        stream.write_all(&f)?;
+        stream.flush()?;
+    }
+    if a.unknown_type {
+        // A well-framed body whose type byte is 9 (>3): a clean-refusal case.
+        let body: &[u8] = &[9, 0, 1, b'x'];
+        let mut f = (body.len() as u32).to_be_bytes().to_vec();
+        f.extend_from_slice(body);
+        stream.write_all(&f)?;
+        stream.flush()?;
+    }
+
+    // Stall mode: stream sustained hostward on the announced channels but never
+    // read, so the peer's whole-connection targetward backs up (§9 head-of-line)
+    // while hostward keeps advancing. Holds the connection open the whole time.
+    if a.stall {
+        let deadline = Instant::now() + Duration::from_millis(a.hold_ms);
+        let mut streamed: u64 = 0;
+        let mut round: u64 = 0;
+        let block = seeded_bytes(a.seed, 16 * 1024);
+        while Instant::now() < deadline {
+            for ch in &a.announce {
+                let mut frame = Vec::new();
+                if encode(
+                    &Event::data(ch.as_str(), Bytes::from(block.clone())),
+                    &mut frame,
+                )
+                .is_ok()
+                    && stream.write_all(&frame).is_ok()
+                {
+                    streamed += block.len() as u64;
+                }
+            }
+            round += 1;
+            // Do NOT read the socket. A tiny pause bounds the hostward rate.
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = round;
+        return Ok(json!({
+            "tool": "nexus-sim", "mode": "wire",
+            "behavior": "stall",
+            "peer_version": peer_hello.as_ref().map(|h| h.version),
+            "streamed_hostward": streamed,
+            "pass": peer_hello.is_some(),
+        }));
+    }
+
+    // Send seeded hostward data on the requested channels.
+    let mut sent: u64 = 0;
+    for spec in &a.send {
+        let (chan, size) = parse_chan_size(spec)?;
+        let payload = seeded_bytes(a.seed, size);
+        let mut frame = Vec::new();
+        encode(
+            &Event::data(chan.as_str(), Bytes::from(payload)),
+            &mut frame,
+        )
+        .map_err(|e| anyhow::anyhow!("encode data: {e}"))?;
+        stream.write_all(&frame)?;
+        sent += size as u64;
+    }
+    if !a.send.is_empty() {
+        stream.flush()?;
+    }
+
+    // Echo / hold: drain frames until the hold window elapses, echoing targetward
+    // data back hostward when requested. Also notices a peer close (refusal).
+    let mut echoed: u64 = 0;
+    let mut decoder = FrameDecoder::new();
+    decoder.push(&inbuf);
+    let hold_deadline = Instant::now() + Duration::from_millis(a.hold_ms);
+    let run_deadline = if a.echo { deadline } else { hold_deadline };
+    loop {
+        loop {
+            match decoder.next_event() {
+                Ok(Some(ev)) => {
+                    if a.echo
+                        && let EventKind::Data(bytes) = &ev.kind
+                    {
+                        let n = bytes.len() as u64;
+                        let mut frame = Vec::new();
+                        if encode(&Event::data(ev.channel.as_str(), bytes.clone()), &mut frame)
+                            .is_ok()
+                            && stream.write_all(&frame).is_ok()
+                        {
+                            echoed += n;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => anyhow::bail!("daemon emitted a malformed frame: {e}"),
+            }
+        }
+        if Instant::now() >= run_deadline {
+            break;
+        }
+        let mut chunk = Vec::new();
+        match read_more(&mut stream, &mut chunk, run_deadline)? {
+            ReadOutcome::Bytes => decoder.push(&chunk),
+            ReadOutcome::Eof => {
+                peer_closed = true;
+                break;
+            }
+            ReadOutcome::Timeout => {
+                if !a.echo {
+                    break;
+                }
+            }
+        }
+    }
+
+    // A hostile peer expects a refusal (the daemon closes); a conforming peer
+    // expects a valid hello. The script adds the daemon-side state assertion.
+    let hostile =
+        a.bad_magic || a.hello_version != WIRE_VERSION || a.oversize_frame || a.unknown_type;
+    let pass = if hostile {
+        peer_closed
+    } else {
+        peer_hello.is_some()
+    };
+    Ok(json!({
+        "tool": "nexus-sim", "mode": "wire",
+        "peer_version": peer_hello.as_ref().map(|h| h.version),
+        "peer_channels": peer_hello.as_ref().map(|h| h.channels.iter().map(|c| c.0.clone()).collect::<Vec<_>>()),
+        "peer_closed": peer_closed,
+        "sent": sent, "echoed": echoed,
+        "pass": pass,
+    }))
+}
+
+enum ReadOutcome {
+    Bytes,
+    Eof,
+    Timeout,
+}
+
+/// Read one chunk into `buf`, distinguishing bytes / clean EOF / (deadline)
+/// timeout. The socket carries a short read timeout, so a quiet peer surfaces as
+/// `Timeout` rather than blocking.
+fn read_more(
+    stream: &mut SimStream,
+    buf: &mut Vec<u8>,
+    deadline: Instant,
+) -> anyhow::Result<ReadOutcome> {
+    if Instant::now() >= deadline {
+        return Ok(ReadOutcome::Timeout);
+    }
+    let mut tmp = [0u8; 8192];
+    match stream.read(&mut tmp) {
+        Ok(0) => Ok(ReadOutcome::Eof),
+        Ok(k) => {
+            buf.extend_from_slice(&tmp[..k]);
+            Ok(ReadOutcome::Bytes)
+        }
+        Err(e) if is_timeout(&e) => Ok(ReadOutcome::Timeout),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Craft a hello frame with a deliberately wrong magic number (a peer speaking
+/// some other protocol), for the §9 clean-refusal case.
+fn write_bad_magic_hello(out: &mut Vec<u8>, announce: &[String]) {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(!WIRE_MAGIC).to_be_bytes()); // definitely not the magic
+    body.extend_from_slice(&WIRE_VERSION.to_be_bytes());
+    body.extend_from_slice(&0u32.to_be_bytes()); // capabilities
+    body.extend_from_slice(&(announce.len() as u16).to_be_bytes());
+    for ch in announce {
+        body.extend_from_slice(&(ch.len() as u16).to_be_bytes());
+        body.extend_from_slice(ch.as_bytes());
+    }
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+}
+
+fn parse_chan_size(spec: &str) -> anyhow::Result<(String, usize)> {
+    let (chan, size) = spec
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--send expects <channel>=<size>, got {spec:?}"))?;
+    Ok((chan.to_owned(), parse_size(size)?))
+}
+
+// --- tcp-proxy mode --------------------------------------------------------
+
+fn run_tcp_proxy(a: TcpProxyArgs) -> Value {
+    match run_tcp_proxy_inner(&a) {
+        Ok(v) => v,
+        Err(e) => err_verdict("tcp-proxy", &e),
+    }
+}
+
+fn run_tcp_proxy_inner(a: &TcpProxyArgs) -> anyhow::Result<Value> {
+    let drop_after = a.drop_after.as_deref().map(parse_size).transpose()?;
+    let listener = TcpListener::bind(&a.listen)?;
+    let overall_deadline = Instant::now() + Duration::from_millis(a.timeout_ms);
+
+    // Phase 1: forward until the outage trigger (or, with no --drop-after, until
+    // the overall deadline), counting the dialing daemon's outward bytes.
+    let (before, severed) = proxy_once(&listener, &a.connect, drop_after, overall_deadline)?;
+
+    if severed && a.restore_after_ms > 0 {
+        thread::sleep(Duration::from_millis(a.restore_after_ms));
+    }
+
+    // Phase 2 (only if we injected an outage): forward cleanly until the deadline,
+    // so post-restore traffic reconciles.
+    let after = if severed {
+        let (n, _) = proxy_once(&listener, &a.connect, None, overall_deadline)?;
+        n
+    } else {
+        0
+    };
+
+    Ok(json!({
+        "tool": "nexus-sim", "mode": "tcp-proxy",
+        "forwarded_before_outage": before, "forwarded_after_restore": after,
+        "outage_injected": severed, "pass": true,
+    }))
+}
+
+/// Accept one dialing daemon, dial the other, and forward both directions until
+/// `drop_after` bytes flow outward (then sever, returning `severed = true`) or the
+/// deadline passes. Returns (outward bytes forwarded, severed).
+fn proxy_once(
+    listener: &TcpListener,
+    connect_to: &str,
+    drop_after: Option<usize>,
+    deadline: Instant,
+) -> anyhow::Result<(u64, bool)> {
+    listener.set_nonblocking(false).ok();
+    // Bounded accept so we don't hang forever if no daemon dials.
+    let inbound = accept_before(listener, deadline)?;
+    let outbound = TcpStream::connect(connect_to)?;
+    inbound.set_read_timeout(Some(Duration::from_millis(200)))?;
+    outbound.set_read_timeout(Some(Duration::from_millis(200)))?;
+
+    let severed = Arc::new(AtomicBool::new(false));
+    let outward = Arc::new(AtomicU64::new(0));
+
+    let in_read = inbound.try_clone()?;
+    let out_write = outbound.try_clone()?;
+    let in_shut = inbound.try_clone()?;
+    let out_shut = outbound.try_clone()?;
+
+    // Dialing-daemon → other daemon, counting bytes and severing at the trigger.
+    let sev1 = severed.clone();
+    let outw = outward.clone();
+    let t1 = thread::spawn(move || {
+        pump_dir(in_read, out_write, &sev1, Some(&outw), drop_after, deadline);
+        // Whatever ends this direction, sever both so the peers see the outage.
+        sev1.store(true, Ordering::SeqCst);
+        let _ = in_shut.shutdown(Shutdown::Both);
+        let _ = out_shut.shutdown(Shutdown::Both);
+    });
+
+    let out_read = outbound.try_clone()?;
+    let in_write = inbound.try_clone()?;
+    let sev2 = severed.clone();
+    let t2 = thread::spawn(move || {
+        pump_dir(out_read, in_write, &sev2, None, None, deadline);
+    });
+
+    let _ = t1.join();
+    let _ = t2.join();
+    let did_sever =
+        drop_after.is_some() && outward.load(Ordering::SeqCst) >= drop_after.unwrap() as u64;
+    Ok((outward.load(Ordering::SeqCst), did_sever))
+}
+
+/// Accept a connection before the deadline (the dialing daemon may still be
+/// backing off).
+fn accept_before(listener: &TcpListener, deadline: Instant) -> anyhow::Result<TcpStream> {
+    listener.set_nonblocking(true)?;
+    loop {
+        match listener.accept() {
+            Ok((s, _)) => {
+                s.set_nonblocking(false)?;
+                return Ok(s);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    anyhow::bail!("no daemon dialed the proxy before the deadline");
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Copy one direction until severed, EOF/error, the byte trigger, or the
+/// deadline. Counts bytes into `counter` when given; sets `severed` at the
+/// trigger.
+fn pump_dir(
+    mut src: TcpStream,
+    mut dst: TcpStream,
+    severed: &AtomicBool,
+    counter: Option<&AtomicU64>,
+    drop_after: Option<usize>,
+    deadline: Instant,
+) {
+    let mut buf = [0u8; 16384];
+    loop {
+        if severed.load(Ordering::SeqCst) || Instant::now() >= deadline {
+            return;
+        }
+        match src.read(&mut buf) {
+            Ok(0) => return, // EOF
+            Ok(k) => {
+                if dst.write_all(&buf[..k]).is_err() {
+                    return;
+                }
+                if let Some(c) = counter {
+                    let total = c.fetch_add(k as u64, Ordering::SeqCst) + k as u64;
+                    if let Some(limit) = drop_after
+                        && total >= limit as u64
+                    {
+                        severed.store(true, Ordering::SeqCst);
+                        return; // the trigger: end this direction to sever
+                    }
+                }
+            }
+            Err(ref e) if is_timeout(e) => {} // poll again (checks deadline/severed)
+            Err(_) => return,
+        }
+    }
 }
