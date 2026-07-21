@@ -1,10 +1,28 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-20 (phase 0-3 done; **phase 4 COMPLETE** — slices A, B & C, all
-audited against v5). **Next: phase 5** (codecs). **Branch:** `implementation` (off
-`main`). **Normative docs:** `docs/11-design-claude-fable-v5.md` (design) and
+**As of:** 2026-07-21 (phase 0-4 done; **phase 5 COMPLETE** — slices A/B/C, all six
+validation items green, audited against v5 with 14 findings fixed). **Next: phase 6**
+(the wire / leg node). **Branch:** `implementation` (off `main`). **Normative docs:**
+`docs/11-design-claude-fable-v5.md` (design) and
 `docs/12-implementation-plan-claude-fable-v5.md` (plan). v1–v4 docs (03–10) are in
 `docs/historical/`. Section references (§) point at the v5 design.
+
+**Phase 5 (2026-07-21).** The codec runtime (§7.5/§7.6/§8): a new `codecs/reference`
+crate (the v1 envelope framing as a `Codec`, with length-guided resync); the
+interior **codec node** (`nodes/codec.rs`) and **exec codec node** (`nodes/exec.rs`)
+on a **generalized endpoint-keyed data-plane wiring** (interior nodes have N+1
+endpoints — the first non-two-layer topology); `nexus-sim` grew `mux`/`envelope`
+modes; two new ADRs landed — **§15.22** (exec child protocol: the multiplexed side
+is a reserved empty channel; the exec codec is a child-pipe boundary, not a pure §5
+interior node) and **§15.23** (endpoint-keyed wiring, length-guided resync,
+held-priority reclaim); §3/§7.5/§7.6 were touched. A multi-agent adversarial audit of
+the built phase 5 found **14 confirmed issues, all fixed** — most importantly a
+**critical exec-pump deadlock** (the single `select!` coupled stdin-write and
+stdout-read; under sustained flow the child filled its stdout pipe and blocked on
+stdin while the daemon blocked writing stdin — fixed by running the two directions as
+*concurrently-polled* futures) and **held-lock re-acquire** (was FIFO, letting a
+non-held `--wait` waiter inherit the mux lock; now a `reclaim_held` primitive with
+priority over on-demand waiters). See §6c below.
 
 **v3 revision (2026-07-20).** The v3 docs folded the refinements below (§3.1–3.10)
 into the design text and added two new normative requirements that phase 0-2 code
@@ -66,11 +84,13 @@ the items below are refinements consistent with the design, none contradict it.
 | 2 | Walking skeleton | **done** — control plane + node lifecycle + data plane (serial↔PTY byte flow, presence gating, backpressure) |
 | 3 | Boundaries & logging | **done** — drop counters, log node, `rotate`/`subscribe`, client-termios, high-throughput data plane + benchmark (§3.11) |
 | 4 | Arbitration | **done** — slices A & B (exclusive write lock, `lock`/`unlock`, `may_write` gate, purge-on-acquire/-detach, detach-release, held, free-for-all) plus **slice C**: the FIFO waiter queue + two-lane async dispatch, `send`, `--steal`/`--wait`/`--lease-ms`, lease generation-guard, immediate lock notifications (§3.12, §6b, §15.20) |
-| 5–8 | Codecs, wire, identity, hardening | not started |
+| 5 | Codecs | **done** — codec runtime + registry (§8), the `codecs/reference` framing codec (resync), the interior codec node + exec codec (§7.5/§7.6), endpoint-keyed wiring, `nexus-sim` `mux`/`envelope`; audited (§6c, §15.22, §15.23) |
+| 6–8 | Wire, identity, hardening | not started |
 
 **Quality gates (all green):** `cargo fmt --all --check`, `cargo clippy
---workspace --all-targets --locked -- -D warnings`, `cargo test --workspace` (53
-pass), and `bash scripts/validate/all.sh --through 4` (**20 pass, 0 fail**). Phase 4
+--workspace --all-targets --locked -- -D warnings`, `cargo test --workspace` (64
+pass), and `bash scripts/validate/all.sh --through 5` (**26 pass, 0 fail**). Phase 5
+scripts: `phase5/{envelope,demux,resync,held,bad-attributes,exec-crash}.sh`; phase 4
 scripts: `phase4/{exclusivity,purge,free-for-all,held,send,steal-lease,waiting}.sh`;
 phase 3 added `counters.sh`, `log.sh`, `log-enospc.sh`, `subscribe.sh`,
 `firehose.sh`, `exact-loss.sh`, `benchmark.sh`.
@@ -86,19 +106,22 @@ are de-risked across the support matrix.
 
 | Crate | Role | State |
 |-------|------|-------|
-| `codec-api` | codec trait, event vocabulary, envelope frame codec + golden vectors (§8/§9) | done for phase 1; reference codec is phase 5 |
-| `nexus-core` | graph model + 3-rule validator (§4), data-plane deliver contracts + holdover (§5), config/state split (§15.8) | done for phase 1 |
+| `codec-api` | codec trait (+ `resync_count`), event vocabulary, envelope frame codec + golden vectors (§8/§9) | done |
+| `codecs/reference` (`codec-reference`) | the v1 envelope framing as a `Codec`, with length-guided resync (§7.5/§9) | done (phase 5) |
+| `nexus-core` | graph model + validator (§4: 3 rules + name/duplicate checks), data-plane deliver contracts + holdover (§5), lock state machine incl. `reclaim_held` (§6), config/state split (§15.8) | done |
 | `nexus-rpc` | JSON-RPC 2.0 wire types — the stable §15.16 surface | done |
-| `nexus-sim` | test double: `pty`/`client` modes (§3) | phase 1 modes done + `client --report-termios`; `mux`/`envelope`/`wire`/`tcp-proxy` later |
+| `nexus-sim` | test double: `pty`/`client`/`mux`/`envelope` modes (§3) | done through phase 5; `wire`/`tcp-proxy` in phase 6 |
 | `nexus-doctor` | shipping capability checker: probes P1–P4 + env checks (§15.17) | done |
-| `serialnexusd` | the daemon | control plane + node lifecycle + data plane done |
-| `serialnexusctl` | the CLI (thin RPC client + `--json`) | `load`/`dump`/`state`/`teardown`/`shutdown` done |
+| `serialnexusd` | the daemon | control plane + node lifecycle + data plane + codecs done |
+| `serialnexusctl` | the CLI (thin RPC client + `--json`) | `load`/`dump`/`state`/`subscribe`/`rotate`/`lock`/`unlock`/`send`/`teardown`/`shutdown` |
 
 `serialnexusd` modules: `main.rs` (runtime, socket policy, shutdown),
 `control.rs` (JSON-RPC over UDS), `daemon.rs` (graph state + method impls),
-`runtime.rs` (data-plane wiring + poll-based I/O helpers), `nodes/{mod,pty,serial}.rs`
-(node runtimes), `sys.rs` (the single unsafe-bearing module: `TIOCEXCL`/`TIOCPKT`
-ioctls, raw `read`/`write`/`fcntl`, and the non-blocking `poll_ready`).
+`runtime.rs` (endpoint-keyed data-plane `Wiring` + `LockCell` + poll-based I/O helpers),
+`nodes/{mod,serial,pty,log,codec,exec}.rs` (node runtimes; `codec` = the in-process
+demux/remux + registry, `exec` = the child-process codec), `sys.rs` (the single
+unsafe-bearing module: `TIOCEXCL`/`TIOCPKT` ioctls, raw `read`/`write`/`fcntl`, and
+the non-blocking `poll_ready`).
 
 Validation scripts are the canonical exit criteria (plan §3):
 `scripts/validate/phaseN/*.sh`, each self-judging with a JSON verdict and exit
@@ -488,6 +511,74 @@ serial endpoint is a legal §4 fan-out).
     auto-release, stale-timer-never-fires, and renewal-extends; FIFO across an unlock
     **and** a detach-release with byte-exact purge-on-acquire on the queued grant,
     kill-waiter-dequeues, deadline-send-queue-intact, teardown-wakes-waiter.
+
+## 6c. Phase 5 (codecs) — COMPLETE
+
+The interior codec node — the first node with more than one endpoint and the first
+non-two-layer topology. Built in three slices, then an adversarial audit fixed 14
+findings.
+
+- **Slice A — pure contracts + reference codec + sim modes.** `nexus-core` gained the
+  `NodeConfig::Codec` variant (codec name, `faces`, channel list, opaque `attributes`
+  table; multiplexed side = the default/empty endpoint, channels = identities) and the
+  shape/validation; `Eq` was dropped from `GraphConfig`/`NodeConfig` (a `toml::Table`
+  carries floats — only `PartialEq`; nothing needed `Eq`). New crate
+  **`codecs/reference`** (`codec-reference`): the v1 envelope framing as a `Codec`,
+  with **length-guided resync** — on a body-decode error with an intact length prefix,
+  skip exactly `4 + body_len` and count one framing error; only a mangled length prefix
+  is unrecoverable, and the reliable-transport link codec (phase 6) never hits it, so
+  §8's one shared frame format holds. `nexus-sim` grew **`mux`** (round-robin
+  seeded per-channel data → reference frames, `--corrupt-every`, a deterministic
+  `--manifest` oracle, and a `--wait-file` feed gate so presence-gated channel PTYs
+  don't miss the burst) and **`envelope`** (drives an external codec child through the
+  golden-vector battery). Fixture: `tests/ext-codec/passthrough.py`. Validated by
+  `phase5/envelope.sh` (item 3). The graph validator gained `DuplicateEndpoint`
+  (empty/duplicate channel identity) — a slice-A adversarial review found the codec was
+  the first node that could hit it.
+- **Slice B — endpoint-keyed wiring + codec node (demux/resync/held).** `Wiring` was
+  generalized from node-keyed (serial→consumer) to **endpoint-keyed** (`EndpointAddr`):
+  every host-facing endpoint gets a lock + fan-out + one arbitrated targetward channel;
+  every target-facing endpoint is a single-producer consumer that may write back. Only
+  the `Node::start` dispatcher and `Wiring` changed — serial/pty/log `start` signatures
+  are untouched. The daemon converts the endpoint-keyed maps to display-string keys for
+  the RPC surface (`usb0`, `mux/console`) and reports each host endpoint's lock as
+  `.lock` (serial) or `.channels[ch].lock` (codec). `nodes/codec.rs`: a hostward demux
+  task (raw → per-channel `data` → fan-out) and one targetward mux task per channel
+  (frame → serial, gated on the codec holding the serial lock). The demux edge holds
+  the serial lock (`held`); a steal ousts it, and the channel task **reclaims with
+  priority** once the stealer releases. Registry `build_codec` (match-on-name behind a
+  `codec-reference` Cargo feature); a bad codec name / attribute schema is structural
+  (aborts the load, nothing created). Validated by `phase5/{demux,resync,held,
+  bad-attributes}.sh` (items 1, 2, 6, 5). **Remux (`faces = host`) is deferred to
+  phase 6** — it needs a leg to drive; such a node loads and comes up faulted.
+- **Slice C — exec codec.** `nodes/exec.rs`: a child process speaking the envelope on
+  stdin/stdout, the multiplexed side on the **reserved empty channel** (ADR §15.22). A
+  supervisor spawns the child, pumps both directions, and restarts with backoff on
+  crash (restart count is observable); stderr → tracing. Validated by
+  `phase5/exec-crash.sh` (item 4): a 256 KiB echo round-trip through the codec, `kill
+  -9`, restart, clean resume, with an unrelated serial echo healthy throughout.
+- **⚠️ Audit fixes (14 confirmed; do NOT regress).** (1) **CRITICAL exec-pump
+  deadlock** — the single `select!` coupled stdin-write and stdout-read; under
+  sustained flow (>64 KB) the child filled stdout and blocked on stdin while the daemon
+  blocked writing stdin. **Fixed:** `pump_child` runs stdin-feeding and stdout-reading
+  (and stderr) as **concurrently-polled** futures in one `select!`, so a blocked
+  `write_all` never starves the stdout reader. The 256 KiB round-trip in `exec-crash.sh`
+  is the regression guard — do NOT collapse the two directions back into one branch.
+  (2) **Held re-acquire was FIFO** — a non-held `--wait` waiter could inherit the mux
+  lock and corrupt framing. **Fixed:** `EndpointLock::reclaim_held` grants a held origin
+  the free lock ahead of on-demand waiters (§6 "held indefinitely"); `ensure_holds`
+  uses it. (3) **Duplicate node names** silently collapsed in the shape map →
+  `ValidationError::DuplicateNodeName` + `GraphConfig::validate()` (checks the node
+  *list* before the model's HashMap collapses it; `load` calls it). (4) Mux-side
+  hostward drop counter now surfaced as `.multiplexed.dropped_slow_consumer` (§5 loss
+  attribution). (5) A configured-but-unattached channel discards-with-count
+  (`discarded_unattached`) instead of over-counting `delivered_hostward`. Plus the
+  exec teardown-vs-crash discriminator is now an explicit `PumpEnd` outcome (not a
+  `src_rx.is_closed()` heuristic), the stderr reader is a pump future (no leaked task),
+  and doc corrections (§3 default endpoint, §15.22/§15.23, `daemon.rs`/`codec.rs`
+  docstrings). Two audit findings were **rejected** on verification (an oversize-mux
+  drop that can't be constructed since `MAX_FRAME_SIZE == READ_BUF`, and a
+  resync-as-link-codec worry that doesn't apply — the link codec never resyncs).
 
 ---
 
