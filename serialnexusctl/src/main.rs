@@ -52,10 +52,39 @@ enum Cmd {
     /// Rotate a log node's file on demand.
     Rotate { node: String },
     /// Acquire the exclusive write lock for an origin (§6): only its bytes are
-    /// then read targetward through the endpoint it feeds.
-    Lock { origin: String },
+    /// then read targetward through the endpoint it feeds. A plain contended
+    /// acquire fails fast; `--wait` joins the FIFO queue; `--steal` takes the lock
+    /// from the current holder; `--lease-ms` auto-releases after a duration.
+    Lock {
+        origin: String,
+        /// Take the lock from whoever holds it (recorded in state, §6).
+        #[arg(long)]
+        steal: bool,
+        /// Block until the lock is granted instead of failing fast.
+        #[arg(long)]
+        wait: bool,
+        /// Auto-release the lock this many milliseconds after the grant.
+        #[arg(long)]
+        lease_ms: Option<u64>,
+    },
     /// Release the write lock held by an origin.
     Unlock { origin: String },
+    /// Send one line targetward through an endpoint (§6): the CLI acquires the
+    /// endpoint's write lock (with a timeout), writes the line, and releases —
+    /// one atomic operation. `--steal` takes the lock rather than waiting.
+    Send {
+        /// The host-facing endpoint to write to (e.g. `usb0` or `mux/ch2`).
+        endpoint: String,
+        /// The line to send (a trailing newline is appended).
+        #[arg(long)]
+        line: String,
+        /// Give up with the locked error after this long if the lock is held.
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+        /// Take the lock from the current holder instead of waiting.
+        #[arg(long)]
+        steal: bool,
+    },
     /// Tear down the whole graph.
     Teardown,
     /// Ask the daemon to shut down.
@@ -107,8 +136,35 @@ fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
         Cmd::State => ("state", None),
         Cmd::Subscribe { .. } => unreachable!("subscribe is handled before dispatch"),
         Cmd::Rotate { node } => ("rotate", Some(json!({ "node": node }))),
-        Cmd::Lock { origin } => ("lock", Some(json!({ "origin": origin }))),
+        Cmd::Lock {
+            origin,
+            steal,
+            wait,
+            lease_ms,
+        } => (
+            "lock",
+            Some(json!({
+                "origin": origin,
+                "steal": steal,
+                "wait": wait,
+                "lease_ms": lease_ms,
+            })),
+        ),
         Cmd::Unlock { origin } => ("unlock", Some(json!({ "origin": origin }))),
+        Cmd::Send {
+            endpoint,
+            line,
+            timeout_ms,
+            steal,
+        } => (
+            "send",
+            Some(json!({
+                "endpoint": endpoint,
+                "line": line,
+                "timeout_ms": timeout_ms,
+                "steal": steal,
+            })),
+        ),
         Cmd::Teardown => ("teardown", None),
         Cmd::Shutdown => ("shutdown", None),
     })
@@ -152,7 +208,7 @@ fn render(cmd: &Cmd, result: &Value) -> anyhow::Result<()> {
                 None => println!("{node}: rotation requested"),
             }
         }
-        Cmd::Lock { origin } => {
+        Cmd::Lock { origin, .. } => {
             let acquired = result
                 .get("acquired")
                 .and_then(Value::as_bool)
@@ -165,7 +221,24 @@ fn render(cmd: &Cmd, result: &Value) -> anyhow::Result<()> {
             } else {
                 "not held"
             };
-            println!("{origin}: {msg}");
+            let stole = result
+                .get("stole_from")
+                .and_then(Value::as_str)
+                .map(|f| format!(" (stolen from {f})"))
+                .unwrap_or_default();
+            println!("{origin}: {msg}{stole}");
+        }
+        Cmd::Send { endpoint, .. } => {
+            let sent = result.get("sent").and_then(Value::as_u64).unwrap_or(0);
+            let delivered = result
+                .get("delivered")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if delivered {
+                println!("{endpoint}: sent {sent} byte(s)");
+            } else {
+                println!("{endpoint}: not delivered");
+            }
         }
         Cmd::Unlock { origin } => {
             let released = result

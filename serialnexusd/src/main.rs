@@ -88,6 +88,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     if let Some(config_path) = &cli.config {
         startup_load(&daemon, config_path)
+            .await
             .with_context(|| format!("loading {}", config_path.display()))?;
     }
 
@@ -150,12 +151,13 @@ async fn prepare_socket(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn startup_load(daemon: &Daemon, config_path: &Path) -> anyhow::Result<()> {
+async fn startup_load(daemon: &Daemon, config_path: &Path) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(config_path)?;
     let config: GraphConfig = toml::from_str(&text).context("parsing TOML configuration")?;
     let params = json!({ "config": serde_json::to_value(&config)? });
     daemon
         .dispatch("load", Some(params))
+        .await
         .map_err(|e| anyhow::anyhow!("load failed: {} (code {})", e.message, e.code))?;
     tracing::info!(nodes = config.nodes.len(), "startup configuration loaded");
     Ok(())

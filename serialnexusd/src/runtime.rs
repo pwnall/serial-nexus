@@ -34,7 +34,7 @@
 //!   is the hatch §15.18 reserved and §15.19 cashed. Cross-thread counters are
 //!   therefore atomic ([`DropCounters`]).
 
-use std::cell::RefCell;
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::rc::Rc;
@@ -46,16 +46,101 @@ use nexus_core::Chunk;
 use nexus_core::config::{GraphConfig, NodeConfig};
 use nexus_core::graph::{Facing, WriteMode};
 use nexus_core::lock::{EndpointLock, OriginId};
+use nexus_rpc::Notification;
 use nix::poll::PollFlags;
-use tokio::sync::mpsc;
+use serde_json::json;
+use tokio::sync::futures::Notified;
+use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::sys;
 
 /// A shared, single-threaded handle to one host-facing endpoint's write lock
-/// (§6). The daemon's control-plane methods mutate it (acquire/release) and each
-/// attached origin's read task consults [`EndpointLock::may_write`]; all run on
-/// the one runtime thread, so `Rc<RefCell<_>>` needs no synchronization.
-pub type SharedLock = Rc<RefCell<EndpointLock>>;
+/// (§6): the pure [`EndpointLock`] state machine plus the two async signals the
+/// two-lane control plane needs (§15.20) — a [`Notify`] that wakes queued waiters
+/// to re-attempt, and the `subscribe` broadcast so every lock transition emits an
+/// immediate id-less notification (§10). All mutation is on the one runtime
+/// thread, so the inner `RefCell` needs no synchronization; the discipline that
+/// replaces a lock is the review tripwire "a `RefCell` borrow never crosses an
+/// `.await`" (§15.20) — every borrow below is taken and dropped inside a
+/// synchronous critical section.
+pub struct LockCell {
+    endpoint: String,
+    lock: RefCell<EndpointLock>,
+    wake: Notify,
+    notifier: broadcast::Sender<Notification>,
+    /// Set when the endpoint is torn down or removed while the cell may still be
+    /// kept alive by a parked waiter's `Rc` clone (§6/§15.20). A woken waiter that
+    /// sees this leaves the queue with a defined error instead of re-parking.
+    closed: Cell<bool>,
+}
+
+impl LockCell {
+    pub fn new(
+        endpoint: impl Into<String>,
+        lock: EndpointLock,
+        notifier: broadcast::Sender<Notification>,
+    ) -> Self {
+        LockCell {
+            endpoint: endpoint.into(),
+            lock: RefCell::new(lock),
+            wake: Notify::new(),
+            notifier,
+            closed: Cell::new(false),
+        }
+    }
+
+    /// Mark the cell closed (its endpoint is gone) and wake any parked waiters so
+    /// they observe the closure and return the defined teardown error (§6/§15.20).
+    pub fn close(&self) {
+        self.closed.set(true);
+        self.wake.notify_waiters();
+    }
+
+    /// Whether the endpoint behind this cell has been torn down or removed.
+    pub fn is_closed(&self) -> bool {
+        self.closed.get()
+    }
+
+    /// Borrow the state machine for a synchronous critical section. Never hold the
+    /// returned guard across an `.await` (§15.20).
+    pub fn borrow(&self) -> Ref<'_, EndpointLock> {
+        self.lock.borrow()
+    }
+
+    pub fn borrow_mut(&self) -> RefMut<'_, EndpointLock> {
+        self.lock.borrow_mut()
+    }
+
+    /// Wake every suspended waiter so the FIFO head re-attempts `acquire` in a
+    /// fresh critical section (§15.20). Called on every release path.
+    pub fn wake_waiters(&self) {
+        self.wake.notify_waiters();
+    }
+
+    /// A future that completes on the next [`Self::wake_waiters`]. The wait loop
+    /// enables it *before* the acquire check, so a wake landing between the check
+    /// and the await is not lost.
+    pub fn notified(&self) -> Notified<'_> {
+        self.wake.notified()
+    }
+
+    /// Emit an immediate id-less `lock` notification to subscribers on a lock
+    /// transition (§10: acquire, release, steal, lease expiry, detach-release). A
+    /// no-op when nobody is subscribed. Must be called with no outstanding borrow.
+    pub fn emit_change(&self) {
+        if self.notifier.receiver_count() == 0 {
+            return;
+        }
+        let snapshot = self.lock.borrow().snapshot();
+        let _ = self.notifier.send(Notification::new(
+            "lock",
+            Some(json!({ "endpoint": self.endpoint, "lock": snapshot })),
+        ));
+    }
+}
+
+/// A shared, single-threaded handle to one endpoint's [`LockCell`].
+pub type SharedLock = Rc<LockCell>;
 
 /// Hostward drop counters for one consuming boundary (§5). All hostward loss is
 /// counted at the boundary that drops it, so it is always located, counted, and
@@ -137,6 +222,10 @@ pub struct Wiring {
     /// Host-facing endpoint (serial node name) → its write lock (§6). The daemon
     /// keeps a clone for `lock`/`unlock`/`send` and for reporting lock state.
     pub endpoint_locks: HashMap<String, SharedLock>,
+    /// Host-facing endpoint (serial node name) → a targetward sender into it, so
+    /// the `send` verb can inject a line as a transient origin (§6). One per host
+    /// endpoint, independent of whether any PTY writer is attached.
+    pub endpoint_targetward: HashMap<String, mpsc::Sender<Chunk>>,
     /// Writing origin (PTY node name) → (its endpoint's lock, its origin id). The
     /// origin's read task consults this to gate its targetward drain (§6). Only
     /// origins that can write appear here; a `never` spy or a log never does.
@@ -150,7 +239,7 @@ impl Wiring {
     /// edge joins exactly one host and one target endpoint. Every consumer gets a
     /// hostward channel; only targetward-writing consumers (PTY) get a targetward
     /// sender — a log's write mode is inherently `never` (§7.3).
-    pub fn build(config: &GraphConfig) -> Wiring {
+    pub fn build(config: &GraphConfig, notifier: &broadcast::Sender<Notification>) -> Wiring {
         let mut facing: HashMap<&str, Facing> = HashMap::new();
         let mut is_log: HashMap<&str, bool> = HashMap::new();
         for n in &config.nodes {
@@ -163,19 +252,32 @@ impl Wiring {
         }
 
         let mut wiring = Wiring::default();
+        // One targetward sender per serial (host endpoint), cloned to each writing
+        // consumer.
+        let mut serial_targetward_tx: HashMap<String, mpsc::Sender<Chunk>> = HashMap::new();
         // One write lock per host-facing endpoint (§6), carrying the node's
-        // configured arbitration policy (exclusive by default).
+        // configured arbitration policy (exclusive by default), plus one targetward
+        // channel up front — the serial drains it, and the daemon keeps a sender
+        // clone so `send` can inject a line even with no PTY writer attached (§6).
         for n in &config.nodes {
             if facing.get(n.name()) == Some(&Facing::Host) {
                 wiring.endpoint_locks.insert(
                     n.name().to_owned(),
-                    Rc::new(RefCell::new(EndpointLock::new(n.arbitration()))),
+                    Rc::new(LockCell::new(
+                        n.name().to_owned(),
+                        EndpointLock::new(n.arbitration()),
+                        notifier.clone(),
+                    )),
                 );
+                let (tx, rx) = mpsc::channel(CHANNEL_CAP);
+                wiring.serial_targetward.insert(n.name().to_owned(), rx);
+                wiring
+                    .endpoint_targetward
+                    .insert(n.name().to_owned(), tx.clone());
+                serial_targetward_tx.insert(n.name().to_owned(), tx);
             }
         }
 
-        // One targetward sender per serial, cloned to each writing consumer.
-        let mut serial_targetward_tx: HashMap<String, mpsc::Sender<Chunk>> = HashMap::new();
         let mut next_origin = 0u64;
 
         for edge in &config.edges {
@@ -205,17 +307,12 @@ impl Wiring {
 
             // Targetward: only origins that can write (mode != never) get a path
             // to the port and a lock handle to gate their drain (§6). A `never`
-            // spy or a log has neither, so it can never write.
+            // spy or a log has neither, so it can never write. The per-endpoint
+            // targetward sender was created above; clone it to each writer.
             if mode != WriteMode::Never {
-                let ttx = serial_targetward_tx
-                    .entry(host.clone())
-                    .or_insert_with(|| {
-                        let (tx, rx) = mpsc::channel(CHANNEL_CAP);
-                        wiring.serial_targetward.insert(host.clone(), rx);
-                        tx
-                    })
-                    .clone();
-                wiring.pty_targetward.insert(target.clone(), ttx);
+                if let Some(ttx) = serial_targetward_tx.get(host) {
+                    wiring.pty_targetward.insert(target.clone(), ttx.clone());
+                }
                 if let Some(lock) = wiring.endpoint_locks.get(host) {
                     wiring
                         .origin_locks

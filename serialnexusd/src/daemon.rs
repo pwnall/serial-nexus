@@ -1,17 +1,32 @@
 //! The daemon's graph state and the RPC method implementations (design §10,
 //! §11). Mutations run on the current-thread runtime, so a `RefCell` serializes
 //! them with no locks (plan §2). Verbs: `load`/`dump`/`state`/`teardown`/
-//! `shutdown` (phase 2, load-on-empty + structural atomicity) plus `rotate` and
-//! `subscribe` (phase 3).
+//! `shutdown` (phase 2) plus `rotate`/`subscribe` (phase 3) plus the arbitration
+//! surface `lock`/`unlock`/`send` with `--steal`/`--lease`/`--wait` (phase 4).
+//!
+//! **The two-lane control plane (§15.20).** Every lock transition — acquire,
+//! release, steal, lease expiry — is a *synchronous critical section* on the
+//! runtime thread: borrow the [`EndpointLock`], mutate, drop the borrow. A verb
+//! that cannot complete immediately (`lock --wait`, `send`'s acquire-with-timeout)
+//! registers in the lock's FIFO waiter queue and suspends holding *nothing* — no
+//! borrows, no locks, only its queue slot — then re-attempts inside a fresh
+//! critical section when woken. "Mutations are serialized" (§10) therefore
+//! survives unchanged while concurrent connections flow past a parked waiter. The
+//! load-bearing discipline, with the same review status as §15.18's AsyncFd rule:
+//! **a `RefCell` borrow never crosses an `.await`** — every method below borrows,
+//! computes, drops, and only then awaits.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::time::Duration;
 
+use nexus_core::Chunk;
 use nexus_core::config::GraphConfig;
-use nexus_core::lock::{Acquire, Arbitration, OriginId};
+use nexus_core::graph::WriteMode;
+use nexus_core::lock::{Acquire, Arbitration, OriginId, Steal};
 use nexus_rpc::{Notification, RpcError, error_codes};
 use serde_json::{Value, json};
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::nodes::Node;
 use crate::runtime::SharedLock;
@@ -21,6 +36,15 @@ use crate::runtime::SharedLock;
 /// daemon — state snapshots are cumulative, so a dropped one loses nothing.
 const NOTIFY_CAPACITY: usize = 64;
 
+/// Default acquire-with-timeout for `send` when the caller names none (§6): the
+/// CLI joins the waiter queue and fails with the locked error at this deadline.
+const DEFAULT_SEND_TIMEOUT_MS: u64 = 2000;
+
+/// Base for synthetic `send` origin ids, kept clear of the wiring's edge-assigned
+/// ids (which count up from 0) so a transient CLI origin never collides with a
+/// real one on the same endpoint (§6).
+const SEND_ORIGIN_BASE: u64 = 1 << 40;
+
 /// Daemon-specific error codes, in the reserved application range (§10).
 pub mod app_errors {
     use nexus_rpc::error_codes::APP_ERROR_BASE;
@@ -29,7 +53,7 @@ pub mod app_errors {
     /// A structural validation failure (§4).
     pub const STRUCTURAL: i64 = APP_ERROR_BASE - 2;
     /// A `lock`/`send` was refused because another origin holds the endpoint's
-    /// write lock (§6).
+    /// write lock (§6) — a plain contended acquire, or a `send` at its deadline.
     pub const LOCKED: i64 = APP_ERROR_BASE - 3;
 }
 
@@ -38,11 +62,16 @@ struct GraphState {
     config: GraphConfig,
     nodes: Vec<Node>,
     /// Host-facing endpoint (serial node name) → its write lock (§6), shared with
-    /// the origin read tasks. The daemon mutates it on `lock`/`unlock`.
+    /// the origin read tasks. The daemon mutates it on `lock`/`unlock`/`send`.
     endpoint_locks: HashMap<String, SharedLock>,
+    /// Host-facing endpoint → a targetward sender into it, so `send` can inject a
+    /// line as a transient origin (§6).
+    endpoint_targetward: HashMap<String, mpsc::Sender<Chunk>>,
     /// Writing origin (PTY node name) → (its endpoint's lock, its origin id), for
     /// resolving a `lock`/`unlock` by origin name to the right lock (§6).
     origin_locks: HashMap<String, (SharedLock, OriginId)>,
+    /// Monotonic allocator for transient `send` origin ids (§6).
+    next_send_origin: Cell<u64>,
 }
 
 /// The running daemon: graph state, a shutdown signal, and the `subscribe`
@@ -53,11 +82,31 @@ pub struct Daemon {
     notifier: broadcast::Sender<Notification>,
 }
 
+/// The outcome of a (possibly waiting) acquisition attempt (§15.20). Distinguishes
+/// a fresh grant (which runs purge-on-acquire and advances the generation) from an
+/// idempotent re-acquire.
+enum WaitOutcome {
+    /// A fresh grant: the caller now holds the lock (purge-on-acquire applies).
+    Fresh,
+    /// The caller already held the lock; no purge.
+    AlreadyHeld,
+    /// The origin is `write = never` and cannot hold the lock.
+    ReadOnly,
+    /// The deadline elapsed before a grant (only reachable with a finite deadline).
+    TimedOut,
+    /// The endpoint was torn down or removed while waiting (§6/§15.20): the waiter
+    /// leaves the queue with a defined error rather than parking forever.
+    Closed,
+}
+
 impl Daemon {
     pub fn new() -> Self {
         let (notifier, _) = broadcast::channel(NOTIFY_CAPACITY);
         Daemon {
-            state: RefCell::new(GraphState::default()),
+            state: RefCell::new(GraphState {
+                next_send_origin: Cell::new(SEND_ORIGIN_BASE),
+                ..GraphState::default()
+            }),
             shutdown: Notify::new(),
             notifier,
         }
@@ -71,7 +120,9 @@ impl Daemon {
 
     /// Publish a full state snapshot to subscribers (§10: status transitions and
     /// counter snapshots). A no-op when nobody is listening, so the periodic
-    /// tick costs nothing on an unsubscribed daemon.
+    /// tick costs nothing on an unsubscribed daemon. This is the observability
+    /// *floor*; lock transitions are additionally delivered as immediate `lock`
+    /// notifications by the [`crate::runtime::LockCell`] (§10, §15.20).
     pub fn emit_state_snapshot(&self) {
         if self.notifier.receiver_count() == 0 {
             return;
@@ -82,8 +133,10 @@ impl Daemon {
             .send(Notification::new("state", Some(snapshot)));
     }
 
-    /// Route one RPC method to its implementation (§10 verb surface).
-    pub fn dispatch(&self, method: &str, params: Option<Value>) -> Result<Value, RpcError> {
+    /// Route one RPC method to its implementation (§10 verb surface). Async
+    /// because the arbitration verbs may wait (`lock --wait`, `send`); every other
+    /// verb resolves without awaiting, so their cost is unchanged.
+    pub async fn dispatch(&self, method: &str, params: Option<Value>) -> Result<Value, RpcError> {
         match method {
             "load" => self.load(parse_config_param(params)?),
             "dump" => Ok(self.dump()),
@@ -92,8 +145,9 @@ impl Daemon {
             // dispatch just acknowledges the subscription (§10).
             "subscribe" => Ok(json!({ "subscribed": true })),
             "rotate" => self.rotate(params),
-            "lock" => self.lock(params),
+            "lock" => self.lock(params).await,
             "unlock" => self.unlock(params),
+            "send" => self.send(params).await,
             "teardown" => Ok(self.teardown()),
             "shutdown" => {
                 self.shutdown.notify_one();
@@ -147,11 +201,15 @@ impl Daemon {
 
         // Wire the data plane from the validated edges, then start each node's
         // tasks (§5). Building the plan before the config moves keeps it borrow-
-        // clean; `start` spawns onto the current-thread LocalSet.
-        let mut wiring = crate::runtime::Wiring::build(&config);
-        // Keep clones of the write locks (§6) so the control plane can acquire and
-        // release them; the same `Rc`s are handed to the origin read tasks below.
+        // clean; `start` spawns onto the current-thread LocalSet. The notifier is
+        // handed to each endpoint's lock so a lock transition emits an immediate
+        // notification (§10).
+        let mut wiring = crate::runtime::Wiring::build(&config, &self.notifier);
+        // Keep clones of the write locks (§6) and per-endpoint targetward senders
+        // so the control plane can acquire, release, and `send`; the same `Rc`s are
+        // handed to the origin read tasks below.
         st.endpoint_locks = wiring.endpoint_locks.clone();
+        st.endpoint_targetward = wiring.endpoint_targetward.clone();
         st.origin_locks = wiring.origin_locks.clone();
         st.nodes = nodes;
         st.config = config;
@@ -180,8 +238,8 @@ impl Daemon {
                 merge_into(&mut obj, serde_json::to_value(n.status()).unwrap());
                 merge_into(&mut obj, n.state_extra());
                 // A host-facing endpoint reports its write-lock state (§6: holder,
-                // waiters, per-origin purge counters). Observed state, disjoint
-                // from configuration (§15.8).
+                // waiters, per-origin purge counters, most recent steal). Observed
+                // state, disjoint from configuration (§15.8).
                 if let Some(lock) = st.endpoint_locks.get(n.name()) {
                     obj.insert(
                         "lock".into(),
@@ -215,83 +273,373 @@ impl Daemon {
         }
     }
 
-    /// `lock` (§6): a named origin explicitly acquires its endpoint's exclusive
-    /// write lock. A fresh grant makes the origin the sole writer targetward;
-    /// another origin holding it is refused with [`app_errors::LOCKED`], naming
-    /// the holder. `--steal`, `--wait`, and `--lease` land in a later slice.
-    fn lock(&self, params: Option<Value>) -> Result<Value, RpcError> {
-        let origin = origin_param(&params)?;
-        let st = self.state.borrow();
-        let entry = st.origin_locks.get(origin).ok_or_else(|| {
-            RpcError::invalid_params(format!(
-                "{origin:?} is not a writable origin on any endpoint"
-            ))
-        })?;
-        let lock = &entry.0;
-        let id = entry.1;
-        // Bind the outcome so the mutable borrow is released before the purge and
-        // the label lookup below (both re-borrow the same lock).
-        let outcome = lock.borrow_mut().acquire(id);
-        // Purge-on-acquire (§6): on a fresh EXCLUSIVE grant, drain the origin's
-        // pre-grant targetward backlog NOW — synchronously, before this grant
-        // reply reaches the client, so a correct acquire-before-write client's
-        // later command is never mistaken for stale pre-grant input (draining in
-        // the async reader would race that command and discard it). Free-for-all
-        // has no acquisition, so a `lock` there must not disturb in-flight bytes.
-        if outcome == Acquire::Granted && lock.borrow().arbitration() == Arbitration::Exclusive {
-            let purged = st
-                .nodes
-                .iter()
-                .find(|n| n.name() == origin)
-                .map_or(0, |n| n.purge_origin());
-            if purged > 0 {
-                lock.borrow_mut().record_purge(id, purged);
-            }
+    /// `lock` (§6): a named origin acquires its endpoint's exclusive write lock.
+    /// `--steal` takes it from the current holder (recorded in state); `--wait`
+    /// joins the FIFO queue and suspends until granted; `--lease-ms` auto-releases
+    /// after a duration, guarded so a stale timer never releases a later grant.
+    /// A plain, un-waited contended acquire fails fast with [`app_errors::LOCKED`].
+    async fn lock(&self, params: Option<Value>) -> Result<Value, RpcError> {
+        let p = LockParams::parse(&params)?;
+        let (cell, id) = self.resolve_origin(&p.origin)?;
+
+        if p.steal {
+            return self.grant_by_steal(&cell, &p.origin, id, p.lease_ms);
         }
+
+        // Acquire, waiting in the FIFO queue if `--wait`, else fail-fast.
+        let outcome = if p.wait {
+            self.wait_for_grant(cell.clone(), id, None).await
+        } else {
+            let single = cell.borrow_mut().acquire(id);
+            match single {
+                Acquire::Granted => WaitOutcome::Fresh,
+                Acquire::AlreadyHeld => WaitOutcome::AlreadyHeld,
+                Acquire::ReadOnly => WaitOutcome::ReadOnly,
+                Acquire::Denied { held_by } => return Err(self.locked_error(&cell, held_by)),
+            }
+        };
+
         match outcome {
-            Acquire::Granted => Ok(json!({ "origin": origin, "held": true, "acquired": true })),
-            Acquire::AlreadyHeld => {
-                Ok(json!({ "origin": origin, "held": true, "acquired": false }))
+            WaitOutcome::Fresh => {
+                self.purge_on_acquire(&cell, &p.origin, id);
+                self.after_grant(&cell, id, p.lease_ms);
+                Ok(json!({ "origin": p.origin, "held": true, "acquired": true }))
             }
-            Acquire::Denied { held_by } => {
-                let holder = lock.borrow().label(held_by).map(str::to_owned);
-                Err(RpcError::new(
-                    app_errors::LOCKED,
-                    format!(
-                        "endpoint is locked by {}",
-                        holder.as_deref().unwrap_or("another origin")
-                    ),
-                )
-                .with_data(json!({ "held_by": holder })))
+            WaitOutcome::AlreadyHeld => {
+                // Re-arm a lease on the existing grant if asked; no purge. Bump the
+                // generation first (`renew`) so the *prior* lease timer can no
+                // longer fire — otherwise the earlier, shorter deadline would win
+                // and defeat the extension (§6 lease renewal).
+                if let Some(ms) = p.lease_ms {
+                    let generation = cell.borrow_mut().renew(id);
+                    if let Some(generation) = generation {
+                        cell.emit_change();
+                        self.spawn_lease(cell.clone(), id, generation, ms);
+                    }
+                }
+                Ok(json!({ "origin": p.origin, "held": true, "acquired": false }))
             }
-            Acquire::ReadOnly => Err(RpcError::invalid_params(format!(
-                "origin {origin:?} is write=never and cannot hold the lock"
+            WaitOutcome::ReadOnly => Err(RpcError::invalid_params(format!(
+                "origin {:?} is write=never and cannot hold the lock",
+                p.origin
             ))),
+            WaitOutcome::Closed => Err(RpcError::new(
+                app_errors::LOCKED,
+                format!(
+                    "endpoint behind origin {:?} was torn down while waiting",
+                    p.origin
+                ),
+            )),
+            WaitOutcome::TimedOut => unreachable!("--wait passes no deadline"),
         }
     }
 
     /// `unlock` (§6): release the endpoint's write lock if the named origin holds
-    /// it. Releasing when you do not hold it is reported, not an error.
+    /// it, then wake the FIFO head so a waiter is granted next. Releasing when you
+    /// do not hold it is reported, not an error.
     fn unlock(&self, params: Option<Value>) -> Result<Value, RpcError> {
-        let origin = origin_param(&params)?;
-        let st = self.state.borrow();
-        let (lock, id) = st.origin_locks.get(origin).ok_or_else(|| {
-            RpcError::invalid_params(format!(
-                "{origin:?} is not a writable origin on any endpoint"
-            ))
-        })?;
-        let released = lock.borrow_mut().release(*id);
+        let origin = origin_param(&params)?.to_owned();
+        let (cell, id) = self.resolve_origin(&origin)?;
+        let released = cell.borrow_mut().release(id);
+        if released {
+            cell.wake_waiters();
+            cell.emit_change();
+        }
         Ok(json!({ "origin": origin, "released": released }))
+    }
+
+    /// `send` (§6): deliver one line targetward through a named *endpoint*, with
+    /// the CLI acting as a transient origin. It registers a synthetic origin,
+    /// acquires with a timeout (or `--steal`s), writes the line, releases, and
+    /// unregisters — one atomic daemon-side operation. A contended send fails with
+    /// [`app_errors::LOCKED`] at its deadline; the transient origin is always
+    /// cleaned up, even on cancellation.
+    async fn send(&self, params: Option<Value>) -> Result<Value, RpcError> {
+        let p = SendParams::parse(&params)?;
+        let (cell, sender) = {
+            let st = self.state.borrow();
+            let cell = st.endpoint_locks.get(&p.endpoint).cloned().ok_or_else(|| {
+                RpcError::invalid_params(format!(
+                    "{:?} is not a host-facing endpoint with a write lock",
+                    p.endpoint
+                ))
+            })?;
+            let sender = st
+                .endpoint_targetward
+                .get(&p.endpoint)
+                .cloned()
+                .ok_or_else(|| RpcError::internal("endpoint has no targetward path"))?;
+            (cell, sender)
+        };
+        let id = self.next_send_origin();
+        // Register the transient origin (§6). The guard unregisters it on every
+        // exit path — success, timeout, or a dropped connection — and wakes the
+        // next waiter, so a cancelled `send` costs nothing but its queue slot.
+        cell.borrow_mut().register(id, "send", WriteMode::OnDemand);
+        let guard = TransientOrigin {
+            cell: cell.clone(),
+            id,
+            disarm: Cell::new(false),
+        };
+
+        // Acquire the floor (steal, or join the queue with a deadline).
+        if p.steal {
+            let _ = cell.borrow_mut().steal(id);
+            // Wake waiters so a parked `lock --wait` on the same origin observes it
+            // now holds and returns, rather than parking forever (a steal removed it
+            // from the queue). Other waiters simply re-check and re-park.
+            cell.wake_waiters();
+            cell.emit_change();
+        } else {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(p.timeout_ms);
+            match self.wait_for_grant(cell.clone(), id, Some(deadline)).await {
+                WaitOutcome::Fresh | WaitOutcome::AlreadyHeld => cell.emit_change(),
+                WaitOutcome::TimedOut => {
+                    return Err(RpcError::new(
+                        app_errors::LOCKED,
+                        format!("endpoint {:?} is locked; send timed out", p.endpoint),
+                    ));
+                }
+                WaitOutcome::ReadOnly => {
+                    return Err(RpcError::internal("send origin registered write=never"));
+                }
+                WaitOutcome::Closed => {
+                    return Err(RpcError::new(
+                        app_errors::LOCKED,
+                        format!("endpoint {:?} was torn down while sending", p.endpoint),
+                    ));
+                }
+            }
+        }
+
+        // Deliver the line targetward — a real backpressure point, but no `RefCell`
+        // borrow is held across this await (§15.20).
+        let mut bytes = p.line.into_bytes();
+        bytes.push(b'\n');
+        let sent = bytes.len();
+        let delivered = sender.send(Chunk::from(bytes)).await.is_ok();
+
+        // Release + unregister the transient origin, then wake the next waiter.
+        cell.borrow_mut().unregister(id);
+        cell.wake_waiters();
+        cell.emit_change();
+        guard.disarm.set(true);
+
+        if delivered {
+            Ok(json!({ "endpoint": p.endpoint, "sent": sent, "delivered": true }))
+        } else {
+            Err(RpcError::internal(format!(
+                "endpoint {:?} targetward closed",
+                p.endpoint
+            )))
+        }
+    }
+
+    // --- arbitration helpers ---------------------------------------------------
+
+    /// Resolve a `lock`/`unlock` origin name to its endpoint's lock and origin id
+    /// (§6). The origin (a target-facing writer) feeds exactly one endpoint (§4).
+    fn resolve_origin(&self, origin: &str) -> Result<(SharedLock, OriginId), RpcError> {
+        let st = self.state.borrow();
+        st.origin_locks
+            .get(origin)
+            .map(|(cell, id)| (cell.clone(), *id))
+            .ok_or_else(|| {
+                RpcError::invalid_params(format!(
+                    "{origin:?} is not a writable origin on any endpoint"
+                ))
+            })
+    }
+
+    fn next_send_origin(&self) -> OriginId {
+        let st = self.state.borrow();
+        let id = st.next_send_origin.get();
+        st.next_send_origin.set(id.wrapping_add(1));
+        OriginId(id)
+    }
+
+    /// Steal the lock for `origin` (§6): take it from the current holder, purge the
+    /// stealer's own pre-grant backlog, record the theft, and optionally set a
+    /// lease. Steal bypasses the FIFO queue without destroying it.
+    fn grant_by_steal(
+        &self,
+        cell: &SharedLock,
+        origin: &str,
+        id: OriginId,
+        lease_ms: Option<u64>,
+    ) -> Result<Value, RpcError> {
+        let outcome = cell.borrow_mut().steal(id);
+        match outcome {
+            Steal::ReadOnly => Err(RpcError::invalid_params(format!(
+                "origin {origin:?} is write=never and cannot hold the lock"
+            ))),
+            Steal::Stolen { previous } => {
+                let stole_from = previous.and_then(|p| cell.borrow().label(p).map(str::to_owned));
+                self.purge_on_acquire(cell, origin, id);
+                // Wake waiters: a `lock --wait` parked on the *stolen* origin now
+                // holds the lock and must return (the steal dropped it from the
+                // queue); other waiters re-check and re-park (§6/§15.20).
+                cell.wake_waiters();
+                self.after_grant(cell, id, lease_ms);
+                Ok(json!({
+                    "origin": origin,
+                    "held": true,
+                    "acquired": true,
+                    "stole_from": stole_from,
+                }))
+            }
+        }
+    }
+
+    /// Purge-on-acquire (§6): on a fresh EXCLUSIVE grant, drain and discard the
+    /// origin's pre-grant targetward backlog **now** — synchronously, before this
+    /// grant reply reaches the client — so a correct acquire-before-write client's
+    /// later command is never mistaken for stale pre-grant input. Free-for-all has
+    /// no acquisition, so a grant there must not disturb in-flight bytes. Draining
+    /// a fd is synchronous, so no borrow crosses an await.
+    fn purge_on_acquire(&self, cell: &SharedLock, origin: &str, id: OriginId) {
+        if cell.borrow().arbitration() != Arbitration::Exclusive {
+            return;
+        }
+        let purged = {
+            let st = self.state.borrow();
+            st.nodes
+                .iter()
+                .find(|n| n.name() == origin)
+                .map_or(0, |n| n.purge_origin())
+        };
+        if purged > 0 {
+            cell.borrow_mut().record_purge(id, purged);
+        }
+    }
+
+    /// Common tail of a fresh grant: emit the immediate lock-change notification
+    /// (§10) and, if a lease was requested, spawn a generation-guarded timer.
+    fn after_grant(&self, cell: &SharedLock, id: OriginId, lease_ms: Option<u64>) {
+        cell.emit_change();
+        if let Some(ms) = lease_ms {
+            let generation = cell.borrow().generation();
+            self.spawn_lease(cell.clone(), id, generation, ms);
+        }
+    }
+
+    /// Spawn a lease timer (§6): after `ms`, release the lock **only if this exact
+    /// grant still holds it** — guarded by the grant generation captured now, so a
+    /// stale timer can never release a later grant. Firing follows the normal
+    /// release path (wake the queue head, notify).
+    fn spawn_lease(&self, cell: SharedLock, id: OriginId, generation: u64, ms: u64) {
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            // The endpoint may have been torn down while the lease ran; do nothing
+            // (the orphaned cell has no live consumers).
+            if cell.is_closed() {
+                return;
+            }
+            let fired = {
+                let mut g = cell.borrow_mut();
+                if g.holder() == Some(id) && g.generation() == generation {
+                    g.release(id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if fired {
+                cell.wake_waiters();
+                cell.emit_change();
+            }
+        });
+    }
+
+    /// The waiting lane of the two-lane control plane (§15.20): try to acquire in a
+    /// synchronous critical section; if denied, join the FIFO queue and suspend on
+    /// the lock's `Notify` (with an optional deadline) holding **nothing**, then
+    /// re-attempt when woken. Cancel-safe: the [`WaiterGuard`] dequeues on any
+    /// early drop (deadline, dropped connection, teardown) and wakes the next head.
+    async fn wait_for_grant(
+        &self,
+        cell: SharedLock,
+        id: OriginId,
+        deadline: Option<tokio::time::Instant>,
+    ) -> WaitOutcome {
+        let guard = WaiterGuard {
+            cell: cell.clone(),
+            id,
+            disarm: Cell::new(false),
+        };
+        loop {
+            // The endpoint may have been torn down while we waited (teardown /
+            // removal); leave the queue with a defined error rather than re-parking
+            // forever (§6/§15.20). Checked each iteration, including right after a
+            // wake — teardown calls `close()` (which wakes) before the maps clear.
+            if cell.is_closed() {
+                return WaitOutcome::Closed;
+            }
+
+            // Register interest BEFORE the check so a wake landing between the
+            // check and the await is not lost (`Notify` lost-wakeup discipline).
+            let notified = cell.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let settled = {
+                let mut g = cell.borrow_mut();
+                match g.acquire(id) {
+                    Acquire::Granted => Some(WaitOutcome::Fresh),
+                    Acquire::AlreadyHeld => Some(WaitOutcome::AlreadyHeld),
+                    Acquire::ReadOnly => Some(WaitOutcome::ReadOnly),
+                    Acquire::Denied { .. } => {
+                        g.enqueue(id);
+                        None
+                    }
+                }
+            };
+            if let Some(outcome) = settled {
+                guard.disarm.set(true);
+                return outcome;
+            }
+
+            match deadline {
+                None => notified.await,
+                Some(dl) => {
+                    tokio::select! {
+                        _ = &mut notified => {}
+                        _ = tokio::time::sleep_until(dl) => return WaitOutcome::TimedOut,
+                    }
+                }
+            }
+        }
+    }
+
+    fn locked_error(&self, cell: &SharedLock, held_by: OriginId) -> RpcError {
+        let holder = cell.borrow().label(held_by).map(str::to_owned);
+        RpcError::new(
+            app_errors::LOCKED,
+            format!(
+                "endpoint is locked by {}",
+                holder.as_deref().unwrap_or("another origin")
+            ),
+        )
+        .with_data(json!({ "held_by": holder }))
     }
 
     fn teardown(&self) -> Value {
         let mut st = self.state.borrow_mut();
         let count = st.nodes.len();
+        // Close every endpoint lock first: a parked `lock --wait`/`send` waiter may
+        // hold an `Rc` clone that outlives these map entries, so `close()` (which
+        // wakes it) lets it leave the queue with the defined teardown error rather
+        // than parking forever (§6/§15.20). Done before dropping the nodes so the
+        // wake precedes any task teardown.
+        for cell in st.endpoint_locks.values() {
+            cell.close();
+        }
         for mut n in st.nodes.drain(..) {
             n.teardown();
         }
         st.config = GraphConfig::default();
         st.endpoint_locks.clear();
+        st.endpoint_targetward.clear();
         st.origin_locks.clear();
         json!({ "torn_down": count })
     }
@@ -308,6 +656,122 @@ impl Default for Daemon {
     }
 }
 
+/// A parked waiter's cleanup handle (§15.20). While armed, dropping it — a
+/// deadline, a dropped control connection, teardown, or endpoint removal —
+/// dequeues the origin and wakes the next head, so a cancelled waiter costs
+/// nothing but its queue slot. Disarmed once the wait resolves.
+struct WaiterGuard {
+    cell: SharedLock,
+    id: OriginId,
+    disarm: Cell<bool>,
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        if self.disarm.get() {
+            return;
+        }
+        let free = {
+            let mut g = self.cell.borrow_mut();
+            g.dequeue(self.id);
+            g.holder().is_none()
+        };
+        if free {
+            self.cell.wake_waiters();
+        }
+        self.cell.emit_change();
+    }
+}
+
+/// A `send`'s transient origin registration. While armed, dropping it removes the
+/// synthetic origin (releasing the lock if it held it) and wakes the next waiter —
+/// so a `send` that times out or whose connection drops leaves no phantom origin
+/// on the endpoint (§6). Disarmed once `send` cleans up on its success path.
+struct TransientOrigin {
+    cell: SharedLock,
+    id: OriginId,
+    disarm: Cell<bool>,
+}
+
+impl Drop for TransientOrigin {
+    fn drop(&mut self) {
+        if self.disarm.get() {
+            return;
+        }
+        let free = {
+            let mut g = self.cell.borrow_mut();
+            g.unregister(self.id);
+            g.holder().is_none()
+        };
+        if free {
+            self.cell.wake_waiters();
+        }
+        self.cell.emit_change();
+    }
+}
+
+/// Parsed `lock` params (§6).
+struct LockParams {
+    origin: String,
+    steal: bool,
+    wait: bool,
+    lease_ms: Option<u64>,
+}
+
+impl LockParams {
+    fn parse(params: &Option<Value>) -> Result<LockParams, RpcError> {
+        let p = params
+            .as_ref()
+            .ok_or_else(|| RpcError::invalid_params("missing params"))?;
+        let origin = p
+            .get("origin")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("missing 'origin' in params"))?
+            .to_owned();
+        Ok(LockParams {
+            origin,
+            steal: p.get("steal").and_then(Value::as_bool).unwrap_or(false),
+            wait: p.get("wait").and_then(Value::as_bool).unwrap_or(false),
+            lease_ms: p.get("lease_ms").and_then(Value::as_u64),
+        })
+    }
+}
+
+/// Parsed `send` params (§6).
+struct SendParams {
+    endpoint: String,
+    line: String,
+    timeout_ms: u64,
+    steal: bool,
+}
+
+impl SendParams {
+    fn parse(params: &Option<Value>) -> Result<SendParams, RpcError> {
+        let p = params
+            .as_ref()
+            .ok_or_else(|| RpcError::invalid_params("missing params"))?;
+        let endpoint = p
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("missing 'endpoint' in params"))?
+            .to_owned();
+        let line = p
+            .get("line")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("missing 'line' in params"))?
+            .to_owned();
+        Ok(SendParams {
+            endpoint,
+            line,
+            timeout_ms: p
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_SEND_TIMEOUT_MS),
+            steal: p.get("steal").and_then(Value::as_bool).unwrap_or(false),
+        })
+    }
+}
+
 fn merge_into(target: &mut serde_json::Map<String, Value>, source: Value) {
     if let Value::Object(m) = source {
         for (k, v) in m {
@@ -316,7 +780,7 @@ fn merge_into(target: &mut serde_json::Map<String, Value>, source: Value) {
     }
 }
 
-/// Extract the required `origin` string from a `lock`/`unlock` request's params.
+/// Extract the required `origin` string from an `unlock` request's params.
 fn origin_param(params: &Option<Value>) -> Result<&str, RpcError> {
     params
         .as_ref()

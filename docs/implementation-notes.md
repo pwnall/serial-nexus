@@ -1,12 +1,10 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-20 (phase 0-3 done + audited against v4; phase 4 slices A & B
-done — arbitration lock, purge, detach-release, free-for-all). **Stopped before
-phase 4 slice C** (`send`/`--steal`/`--lease`/`--wait` + lock notifications) — see
-§6b for the exact next step. **Branch:** `implementation` (off `main`).
-**Normative docs:** `docs/09-design-claude-fable-v4.md` (design) and
-`docs/10-implementation-plan-claude-fable-v4.md` (plan). v1/v2/v3 docs (03–08) are
-in `docs/historical/`. Section references (§) point at the v4 design.
+**As of:** 2026-07-20 (phase 0-3 done; **phase 4 COMPLETE** — slices A, B & C, all
+audited against v5). **Next: phase 5** (codecs). **Branch:** `implementation` (off
+`main`). **Normative docs:** `docs/11-design-claude-fable-v5.md` (design) and
+`docs/12-implementation-plan-claude-fable-v5.md` (plan). v1–v4 docs (03–10) are in
+`docs/historical/`. Section references (§) point at the v5 design.
 
 **v3 revision (2026-07-20).** The v3 docs folded the refinements below (§3.1–3.10)
 into the design text and added two new normative requirements that phase 0-2 code
@@ -36,6 +34,22 @@ subscription registration, against plan §3 — now a bounded `wait-for` on the 
 snapshot. Code comments that cited §15.18 for the thread/backoff decision were
 repointed to §15.19. No other phase 0-3 deviations surfaced.
 
+**v5 revision + phase 0-4 alignment audit (2026-07-20).** The v5 docs are v4 plus
+the slice-C/P5 specification: design §6 gained a "Waiting and fairness" paragraph
+(the FIFO waiter queue), lease generation-guarding, and the poll-sampled-presence
+blind-spot note; §10 gained a "Waiting verbs" paragraph; §13/§14 gained P5 (doctor
+rig certification) and the deferred per-open PTY epoch; and two new ADRs landed —
+**§15.20** ("Waiting verbs: the two-lane control plane") and **§15.21** ("The rig
+is a fixture, so the doctor certifies it"). A multi-agent adversarial audit of the
+**built** phase 0-4 code against v5 found **one genuine deviation, fixed**: a
+`waiting`/`faulted` serial node (device absent — a reachable startup state) drained
+and silently discarded every targetward chunk (`while rx.recv().await.is_some(){}`),
+violating §5's never-drop-targetward invariant. `nodes/serial.rs` now **parks the
+targetward receiver unread** (field `parked_targetward`), so the bounded channel
+fills and backpressures the origin (commands delayed, never dropped); only the
+phase-7 reopen/heal is deferred, not the invariant. Everything else in phases 0-3 +
+slice A/B verified faithful to v5.
+
 This document records where the implementation stands and every place the code
 deviates from — or refines — the design. The rule from plan §1 holds: where
 implementation reality disagrees with the design, the design gets amended first;
@@ -51,15 +65,15 @@ the items below are refinements consistent with the design, none contradict it.
 | 1 | Contracts in the small | **done** — nexus-core, codec-api, nexus-sim |
 | 2 | Walking skeleton | **done** — control plane + node lifecycle + data plane (serial↔PTY byte flow, presence gating, backpressure) |
 | 3 | Boundaries & logging | **done** — drop counters, log node, `rotate`/`subscribe`, client-termios, high-throughput data plane + benchmark (§3.11) |
-| 4 | Arbitration | **in progress** — slices A & B done: per-endpoint exclusive write lock, `lock`/`unlock`, the `may_write` gate, purge-on-acquire/-detach with counters, detach-release, held mode, free-for-all, lock state in `state` (§3.12, §6b). **Slice C pending:** the `send` verb, `--steal`/`--lease`/`--wait` (needs async dispatch), lock-change `subscribe` notifications |
+| 4 | Arbitration | **done** — slices A & B (exclusive write lock, `lock`/`unlock`, `may_write` gate, purge-on-acquire/-detach, detach-release, held, free-for-all) plus **slice C**: the FIFO waiter queue + two-lane async dispatch, `send`, `--steal`/`--wait`/`--lease-ms`, lease generation-guard, immediate lock notifications (§3.12, §6b, §15.20) |
 | 5–8 | Codecs, wire, identity, hardening | not started |
 
 **Quality gates (all green):** `cargo fmt --all --check`, `cargo clippy
---workspace --all-targets --locked -- -D warnings`, `cargo test --workspace`,
-and `bash scripts/validate/all.sh --through 4` (16 pass, 0 fail). Phase 4 adds
-`phase4/{exclusivity,purge,free-for-all,held}.sh`; phase 3 added `counters.sh`,
-`log.sh`, `log-enospc.sh`, `subscribe.sh`, `firehose.sh`, `exact-loss.sh`,
-`benchmark.sh`.
+--workspace --all-targets --locked -- -D warnings`, `cargo test --workspace` (53
+pass), and `bash scripts/validate/all.sh --through 4` (**20 pass, 0 fail**). Phase 4
+scripts: `phase4/{exclusivity,purge,free-for-all,held,send,steal-lease,waiting}.sh`;
+phase 3 added `counters.sh`, `log.sh`, `log-enospc.sh`, `subscribe.sh`,
+`firehose.sh`, `exact-loss.sh`, `benchmark.sh`.
 
 **Kernel matrix:** every kernel-behavior probe is `supported` on **Linux 7.0.0**
 (dev box, Ubuntu 26.04) and **Linux 6.18.14** (Debian rodete) with **zero
@@ -373,7 +387,7 @@ exact-loss, and throughput/idle benchmark (`c4d0e64`). All validated by
 self-judging `scripts/validate/phase3/*.sh`; `docs/benchmarks/phase3.json` records
 the throughput (~185 MiB/s) and idle (2% for 32 fds) axes.
 
-## 6b. Phase 4 (arbitration) — IN PROGRESS
+## 6b. Phase 4 (arbitration) — COMPLETE
 
 Per plan §Phase 4, built in slices; test topology needs no codec (PTYs on one
 serial endpoint is a legal §4 fan-out).
@@ -421,29 +435,59 @@ serial endpoint is a legal §4 fan-out).
   two free-for-all writers both reach the device, held keeps its lock);
   `exclusivity.sh` now also asserts detach-release.
 
-- **Slice C — NEXT (where this session stopped).** The remaining §6 surface:
-  - **`send <endpoint> --line` (atomic acquire-with-timeout → write → release):**
-    the CLI is a *transient targetward origin* on the named host-facing endpoint
-    (not a PTY). The serial already exposes a targetward `mpsc::Sender`
-    (`runtime::Wiring::pty_targetward` / `serial_targetward`); register a synthetic
-    origin in that endpoint's `EndpointLock`, acquire it (reusing the `daemon::lock`
-    purge path), push the line, release.
-  - **`--steal`** (transfer the lock; record the theft in state so the prior holder
-    sees it; emit a notification), **`--lease`** (auto-release after a duration —
-    the lock machine has `holder`/`release` but no lease/expiry field yet),
-    **`--wait`** (block until the lock frees).
-  - **Async dispatch (the architectural step):** `--wait` and `send`'s
-    acquire-with-timeout must not block the runtime thread. `Daemon::dispatch` is
-    **synchronous** today (`daemon.rs`, called from `control.rs::handle_line`). Make
-    the lock/send methods async (await a per-endpoint `tokio::sync::Notify` woken on
-    release), and **never hold a `RefCell` borrow across an `.await`** — the daemon
-    is `Rc<RefCell<GraphState>>` on one thread, and each `EndpointLock` is
-    `Rc<RefCell<_>>`: borrow, compute, drop, *then* await.
-  - **Notifications:** lock changes already appear in the 200 ms periodic `state`
-    snapshot; add an *immediate* id-less notification on acquire/release/steal.
-  - Maps to plan §Phase 4 items 4 (steal/lease) and 5 (`send` semantics); test
-    topology is two PTYs on one exclusive serial (as `exclusivity.sh`) plus the CLI
-    `send`.
+- **Slice C DONE: waiting verbs + the two-lane control plane (§6, §10, §15.20).**
+  - **Pure lock (`nexus_core::lock`):** `EndpointLock` gained a FIFO `waiters`
+    queue, a grant `generation`, `steal`, and `renew`. `acquire` is now queue-aware
+    — it grants a free lock **only to the FIFO head** (barge prevention), naming an
+    earlier waiter in `Denied { held_by }`. New pure API: `enqueue`/`dequeue`/`steal`
+    /`renew`/`generation`/`waiters`; `snapshot()` now carries `waiters` and
+    `last_steal`. 14 unit/property tests (the invariant proptest gained enqueue/
+    dequeue/steal ops, generation-monotonicity, and holder-never-queued).
+  - **`LockCell` (`runtime.rs`):** `SharedLock` is now `Rc<LockCell>` =
+    `RefCell<EndpointLock>` + a `tokio::sync::Notify` (wakes queued waiters) + the
+    `subscribe` broadcast sender + a `closed` flag. `wake_waiters`/`notified`/
+    `emit_change`/`close`/`is_closed`. `Wiring::build` takes the notifier and creates
+    **one targetward channel per host endpoint up front** (`endpoint_targetward`), so
+    `send` works even with no PTY writer attached.
+  - **Two-lane dispatch (`daemon.rs`, §15.20):** `Daemon::dispatch` is now `async`;
+    `lock`/`send` are async, `unlock` stays sync. `wait_for_grant` is the waiting
+    lane — it enables the `Notify` future **before** the acquire check (lost-wakeup-
+    free), enqueues on `Denied`, and suspends on `notified`/deadline holding no
+    borrow. The **`RefCell` borrow never crosses an `.await`** tripwire holds
+    throughout (every borrow is a `{}` block dropped before the await; purge drains
+    the fd synchronously). `WaiterGuard`/`TransientOrigin` are `Drop` guards that
+    dequeue/unregister on cancellation. Immediate id-less `lock` notifications fire
+    on every transition (acquire/release/steal/lease-expiry/detach-release) via
+    `LockCell::emit_change`; the 200 ms snapshot is only an observability floor.
+  - **`send <endpoint> --line`:** names the **endpoint**; the CLI is a transient
+    origin (synthetic id from `SEND_ORIGIN_BASE = 1<<40`). register → acquire-with-
+    timeout (default 2000 ms, `--timeout-ms`) or `--steal` → write `line + "\n"`
+    targetward → release + unregister. Always cleaned up (guard) on timeout or a
+    dropped connection.
+  - **`control.rs` cancel-on-disconnect:** `serve_connection` races the (maybe-
+    waiting) dispatch future against a second `lines.next_line()` in a
+    `tokio::select! { biased; … }` — `biased` so a ready fast verb is never pre-
+    empted by a spuriously-read next request, and a dropped connection cancels a
+    `--wait` (dropping the dispatch future runs the guard).
+  - **`nodes/pty.rs`:** `handle_last_close` now `wake_waiters()` + `emit_change()`
+    after a detach-release / purge-on-detach, so a queued `--wait` waiter is granted
+    on the detach-release path.
+  - **Three bugs caught by the slice-C adversarial review & fixed** (regression-
+    covered): (1) **lease re-arm** — a second `lock --lease-ms` hit `AlreadyHeld`
+    without advancing the generation, so the *earlier* (shorter) timer still fired
+    and released the grant; now `renew` bumps the generation on re-arm, invalidating
+    the prior timer (`steal-lease.sh` check 4). (2) **teardown stranded parked
+    waiters** — a deadline-less `lock --wait` hung forever when its endpoint was
+    torn down; `teardown` now `close()`s every lock cell (which wakes waiters) and
+    `wait_for_grant` returns a defined `Closed` error (`waiting.sh` sub-check D).
+    (3) **steal didn't wake a same-origin `--wait`** — a `lock X --steal` from one
+    connection left a `lock X --wait` on another parked; both steal paths now
+    `wake_waiters()`.
+  - **Validated:** `phase4/{send,steal-lease,waiting}.sh` (plan items 5, 4, 7):
+    send LOCKED-then-steal byte-exact; steal record + immediate notification; lease
+    auto-release, stale-timer-never-fires, and renewal-extends; FIFO across an unlock
+    **and** a detach-release with byte-exact purge-on-acquire on the queued grant,
+    kill-waiter-dequeues, deadline-send-queue-intact, teardown-wakes-waiter.
 
 ---
 

@@ -405,11 +405,18 @@ fn handle_last_close(
                 g.write_mode(*id) == Some(WriteMode::Held),
             )
         };
+        let mut changed = false;
         if held && !held_mode {
             // Detach-release: an on-demand holder's client left, so the lock
             // frees (§6). A `held` origin is held indefinitely and keeps the lock
             // across a client detach — only node removal releases it.
-            l.borrow_mut().release(*id);
+            let released = l.borrow_mut().release(*id);
+            if released {
+                // Wake the FIFO head so a `lock --wait` waiter is granted on the
+                // detach-release path (§6/§15.20); the borrow is already dropped.
+                l.wake_waiters();
+                changed = true;
+            }
         } else if !held && exclusive {
             // Purge-on-detach: a locked-out writer's un-forwarded backlog is
             // dropped and counted, so its stale commands never fire (§6). A
@@ -417,7 +424,13 @@ fn handle_last_close(
             let purged = drain_and_discard(fd, buf);
             if purged > 0 {
                 l.borrow_mut().record_purge(*id, purged);
+                changed = true;
             }
+        }
+        // Emit an immediate lock-change notification for the transition (§10),
+        // with no borrow outstanding.
+        if changed {
+            l.emit_change();
         }
     }
 }
