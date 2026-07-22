@@ -34,7 +34,7 @@
 //!   is the hatch §15.18 reserved and §15.19 cashed. Cross-thread counters are
 //!   therefore atomic ([`DropCounters`]).
 
-use std::cell::{Cell, Ref, RefCell, RefMut};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::rc::Rc;
@@ -52,6 +52,7 @@ use serde_json::json;
 use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, broadcast, mpsc};
 
+use crate::cell::CriticalCell;
 use crate::sys;
 
 /// A shared, single-threaded handle to one host-facing endpoint's write lock
@@ -59,13 +60,13 @@ use crate::sys;
 /// two-lane control plane needs (§15.20) — a [`Notify`] that wakes queued waiters
 /// to re-attempt, and the `subscribe` broadcast so every lock transition emits an
 /// immediate id-less notification (§10). All mutation is on the one runtime
-/// thread, so the inner `RefCell` needs no synchronization; the discipline that
-/// replaces a lock is the review tripwire "a `RefCell` borrow never crosses an
-/// `.await`" (§15.20) — every borrow below is taken and dropped inside a
-/// synchronous critical section.
+/// thread, so the inner [`CriticalCell`] needs no synchronization; and because its
+/// state is reachable only inside a synchronous `with`/`with_mut` closure, a borrow
+/// *cannot* cross an `.await` — the §15.20 tripwire is a compile-shape fact, not a
+/// review rule (§16.2).
 pub struct LockCell {
     endpoint: String,
-    lock: RefCell<EndpointLock>,
+    lock: CriticalCell<EndpointLock>,
     wake: Notify,
     notifier: broadcast::Sender<Notification>,
     /// Set when the endpoint is torn down or removed while the cell may still be
@@ -82,7 +83,7 @@ impl LockCell {
     ) -> Self {
         LockCell {
             endpoint: endpoint.into(),
-            lock: RefCell::new(lock),
+            lock: CriticalCell::new(lock),
             wake: Notify::new(),
             notifier,
             closed: Cell::new(false),
@@ -101,14 +102,15 @@ impl LockCell {
         self.closed.get()
     }
 
-    /// Borrow the state machine for a synchronous critical section. Never hold the
-    /// returned guard across an `.await` (§15.20).
-    pub fn borrow(&self) -> Ref<'_, EndpointLock> {
-        self.lock.borrow()
+    /// Run `f` against the state machine in a synchronous critical section (§16.2):
+    /// the borrow cannot escape the closure, so it can never cross an `.await`
+    /// (§15.20) — the tripwire is now a compile-shape fact.
+    pub fn with<R>(&self, f: impl FnOnce(&EndpointLock) -> R) -> R {
+        self.lock.with(f)
     }
 
-    pub fn borrow_mut(&self) -> RefMut<'_, EndpointLock> {
-        self.lock.borrow_mut()
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut EndpointLock) -> R) -> R {
+        self.lock.with_mut(f)
     }
 
     /// Wake every suspended waiter so the FIFO head re-attempts `acquire` in a
@@ -131,7 +133,7 @@ impl LockCell {
         if self.notifier.receiver_count() == 0 {
             return;
         }
-        let snapshot = self.lock.borrow().snapshot();
+        let snapshot = self.lock.with(|l| l.snapshot());
         let _ = self.notifier.send(Notification::new(
             "lock",
             Some(json!({ "endpoint": self.endpoint, "lock": snapshot })),
@@ -319,8 +321,7 @@ impl Wiring {
             let origin_id = OriginId(next_origin);
             next_origin += 1;
             if let Some(lock) = wiring.endpoint_locks.get(host) {
-                lock.borrow_mut()
-                    .register(origin_id, target.to_string(), mode);
+                lock.with_mut(|l| l.register(origin_id, target.to_string(), mode));
             }
 
             // Targetward: only origins that can write (mode ≠ never) get a path to

@@ -23,7 +23,7 @@
 //! lock (FIFO) once the stealer releases — the §6 stall, with commands delayed,
 //! never dropped.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -39,6 +39,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
+use crate::cell::CriticalCell;
 use crate::runtime::{DropCounters, HostwardSink, SharedLock, Wiring};
 
 /// Instantiate a compiled-in codec by registry name (§8 match-on-name — no
@@ -90,7 +91,7 @@ pub struct CodecNode {
     channels: Vec<String>,
     /// The transform, shared between the hostward demux task and each channel's
     /// targetward mux task; borrowed only synchronously, never across an await.
-    codec: Rc<RefCell<Box<dyn Codec>>>,
+    codec: Rc<CriticalCell<Box<dyn Codec>>>,
     stats: Rc<HashMap<String, Rc<ChannelStat>>>,
     /// Hostward drops the serial reader counted because this codec's multiplexed
     /// side fell behind (its bounded intake was full) — a §5 loss, surfaced so it
@@ -123,7 +124,7 @@ impl CodecNode {
             codec_name: codec_name.clone(),
             faces: *faces,
             channels: channels.clone(),
-            codec: Rc::new(RefCell::new(codec)),
+            codec: Rc::new(CriticalCell::new(codec)),
             stats: Rc::new(stats),
             mux_counters: None,
             tasks: Vec::new(),
@@ -213,7 +214,7 @@ impl CodecNode {
         // targetward channel (the device-write handoff, not device consumption), and
         // freezes while the demux does not hold the serial lock (§6). `status` is
         // `active` once any data has crossed the channel, else `waiting`.
-        let framing_errors = self.codec.borrow().resync_count();
+        let framing_errors = self.codec.with(|c| c.resync_count());
         let channels: serde_json::Map<String, Value> = self
             .channels
             .iter()
@@ -261,19 +262,18 @@ impl Drop for CodecNode {
 /// consuming boundary, §5). The codec borrow is synchronous and dropped before the
 /// fan-out and before the next `recv().await`.
 async fn hostward_demux(
-    codec: Rc<RefCell<Box<dyn Codec>>>,
+    codec: Rc<CriticalCell<Box<dyn Codec>>>,
     mut mux_rx: mpsc::Receiver<Chunk>,
     channel_sinks: HashMap<String, Vec<HostwardSink>>,
     stats: Rc<HashMap<String, Rc<ChannelStat>>>,
 ) {
     while let Some(chunk) = mux_rx.recv().await {
         let mut events = Vec::new();
-        {
-            let mut c = codec.borrow_mut();
+        codec.with_mut(|c| {
             if let Err(e) = c.demux(&chunk, &mut |ev| events.push(ev)) {
                 tracing::warn!("codec demux error: {e}");
             }
-        }
+        });
         for ev in events {
             let stat = stats.get(ev.channel.as_str());
             match ev.kind {
@@ -332,7 +332,7 @@ async fn channel_targetward(
     channel: String,
     mut rx: mpsc::Receiver<Chunk>,
     mux_tx: mpsc::Sender<Chunk>,
-    codec: Rc<RefCell<Box<dyn Codec>>>,
+    codec: Rc<CriticalCell<Box<dyn Codec>>>,
     serial_lock: SharedLock,
     mux_id: OriginId,
     stat: Rc<ChannelStat>,
@@ -340,13 +340,12 @@ async fn channel_targetward(
     while let Some(bytes) = rx.recv().await {
         let n = bytes.len() as u64;
         let mut framed = Vec::new();
-        {
-            let mut c = codec.borrow_mut();
-            if c.mux(&Event::data(channel.as_str(), bytes), &mut framed)
-                .is_err()
-            {
-                continue; // a mux error drops this chunk (unreachable for reference)
-            }
+        let muxed = codec.with_mut(|c| {
+            c.mux(&Event::data(channel.as_str(), bytes), &mut framed)
+                .is_ok()
+        });
+        if !muxed {
+            continue; // a mux error drops this chunk (unreachable for reference)
         }
         // Gate on holding the serial's write lock (the codec's held origin). A
         // `send --steal` transiently ousts it; re-acquire FIFO once the stealer
@@ -367,7 +366,7 @@ async fn channel_targetward(
 /// The fast path (the normal held case) is a single borrow; the slow path parks on
 /// the lock's `Notify`, holding no borrow across the await (§15.20).
 async fn ensure_holds(lock: &SharedLock, id: OriginId) -> bool {
-    if lock.borrow().may_write(id) {
+    if lock.with(|g| g.may_write(id)) {
         return true; // already holds it
     }
     loop {
@@ -381,8 +380,7 @@ async fn ensure_holds(lock: &SharedLock, id: OriginId) -> bool {
 
         // Already holds (re-granted), or reclaim as a held origin ahead of any
         // on-demand waiter (§6 held priority). Only a fresh reclaim emits a change.
-        let outcome = {
-            let mut g = lock.borrow_mut();
+        let outcome = lock.with_mut(|g| {
             if g.may_write(id) {
                 Some(false)
             } else if g.reclaim_held(id) {
@@ -390,7 +388,7 @@ async fn ensure_holds(lock: &SharedLock, id: OriginId) -> bool {
             } else {
                 None
             }
-        };
+        });
         match outcome {
             Some(fresh) => {
                 if fresh {

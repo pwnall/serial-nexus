@@ -22,7 +22,6 @@
 //!   gated** — written only while a client holds the slave, discarded-with-count
 //!   otherwise (§7.2).
 
-use std::cell::RefCell;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
@@ -62,6 +61,7 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
 
 use nexus_core::lock::{Arbitration, OriginId, WriteMode};
 
+use crate::cell::CriticalCell;
 use crate::runtime::{ACTIVE_POLL, DropCounters, READ_BUF, SharedLock, back_off};
 use crate::sys;
 
@@ -99,7 +99,7 @@ pub struct PtyNode {
     /// `tcsetattr` notification and by the slow reconciliation backstop; `None`
     /// while no client has touched the settings this session. The daemon only
     /// *observes* — propagation to hardware is deferred (§14).
-    client_termios: Rc<RefCell<Option<Value>>>,
+    client_termios: Rc<CriticalCell<Option<Value>>>,
     tasks: Vec<JoinHandle<()>>,
     status: NodeStatus,
 }
@@ -137,7 +137,7 @@ impl PtyNode {
             writer: None,
             writer_stop: Arc::new(AtomicBool::new(false)),
             counters: Arc::new(DropCounters::default()),
-            client_termios: Rc::new(RefCell::new(None)),
+            client_termios: Rc::new(CriticalCell::new(None)),
             tasks: Vec::new(),
             status: NodeStatus::Active,
         };
@@ -318,7 +318,7 @@ impl PtyNode {
             "discarded_no_client": self.counters.discarded_absent(),
             "dropped_slow_consumer": self.counters.dropped_full(),
             // Observed client termios (§7.2), null until a client touches it.
-            "client_termios": self.client_termios.borrow().clone(),
+            "client_termios": self.client_termios.with(|c| c.clone()),
         })
     }
 
@@ -397,26 +397,25 @@ fn handle_last_close(
     buf: &mut [u8],
     master: &Rc<PtyMaster>,
     advertised_baud: u32,
-    client_termios: &RefCell<Option<Value>>,
+    client_termios: &CriticalCell<Option<Value>>,
     lock: &Option<(SharedLock, OriginId)>,
 ) {
     let _ = apply_baseline(master.as_fd(), advertised_baud);
-    *client_termios.borrow_mut() = None;
+    client_termios.with_mut(|c| *c = None);
     if let Some((l, id)) = lock {
-        let (held, exclusive, held_mode) = {
-            let g = l.borrow();
+        let (held, exclusive, held_mode) = l.with(|g| {
             (
                 g.holder() == Some(*id),
                 g.arbitration() == Arbitration::Exclusive,
                 g.write_mode(*id) == Some(WriteMode::Held),
             )
-        };
+        });
         let mut changed = false;
         if held && !held_mode {
             // Detach-release: an on-demand holder's client left, so the lock
             // frees (§6). A `held` origin is held indefinitely and keeps the lock
             // across a client detach — only node removal releases it.
-            let released = l.borrow_mut().release(*id);
+            let released = l.with_mut(|g| g.release(*id));
             if released {
                 // Wake the FIFO head so a `lock --wait` waiter is granted on the
                 // detach-release path (§6/§15.20); the borrow is already dropped.
@@ -429,7 +428,7 @@ fn handle_last_close(
             // free-for-all writer was drained above and has nothing to purge.
             let purged = drain_and_discard(fd, buf);
             if purged > 0 {
-                l.borrow_mut().record_purge(*id, purged);
+                l.with_mut(|g| g.record_purge(*id, purged));
                 changed = true;
             }
         }
@@ -471,7 +470,7 @@ fn drain_and_discard(fd: RawFd, buf: &mut [u8]) -> u64 {
 async fn read_and_poll(
     master: Rc<PtyMaster>,
     present: Arc<AtomicBool>,
-    client_termios: Rc<RefCell<Option<Value>>>,
+    client_termios: Rc<CriticalCell<Option<Value>>>,
     tx: Option<mpsc::Sender<Chunk>>,
     advertised_baud: u32,
     lock: Option<(SharedLock, OriginId)>,
@@ -491,7 +490,7 @@ async fn read_and_poll(
         // has no `tx`, so its stray writes go nowhere. Each borrow below is dropped
         // before any await.
         let may_write = match &lock {
-            Some((l, id)) => l.borrow().may_write(*id),
+            Some((l, id)) => l.with(|g| g.may_write(*id)),
             None => true,
         };
 
@@ -592,7 +591,7 @@ async fn read_and_poll(
 /// Read the client's current termios through the master and store it in state;
 /// re-assert EXTPROC if the client cleared it, so the daemon keeps observing
 /// subsequent changes (§7.2). Observe-only — never propagated to hardware (§14).
-fn reconcile_termios(master: &PtyMaster, store: &RefCell<Option<Value>>) {
+fn reconcile_termios(master: &PtyMaster, store: &CriticalCell<Option<Value>>) {
     let Ok(t) = tcgetattr(master) else { return };
     if !t.local_flags.contains(LocalFlags::EXTPROC) {
         let mut re = t.clone();
@@ -612,14 +611,16 @@ fn reconcile_termios(master: &PtyMaster, store: &RefCell<Option<Value>>) {
     } else {
         "even"
     };
-    *store.borrow_mut() = Some(json!({
-        "baud": format!("{:?}", cfgetospeed(&t)),
-        "char_bits": char_bits,
-        "parity": parity,
-        "echo": t.local_flags.contains(LocalFlags::ECHO),
-        "icanon": t.local_flags.contains(LocalFlags::ICANON),
-        "extproc": t.local_flags.contains(LocalFlags::EXTPROC),
-    }));
+    store.with_mut(|s| {
+        *s = Some(json!({
+            "baud": format!("{:?}", cfgetospeed(&t)),
+            "char_bits": char_bits,
+            "parity": parity,
+            "echo": t.local_flags.contains(LocalFlags::ECHO),
+            "icanon": t.local_flags.contains(LocalFlags::ICANON),
+            "extproc": t.local_flags.contains(LocalFlags::EXTPROC),
+        }))
+    });
 }
 
 /// Blocking hostward writer thread (§15.19): drain the bridged channel to the

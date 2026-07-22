@@ -1,0 +1,9 @@
+# Ban raw `std::cell::RefCell` in the daemon (design §16.2, plan §9.2). Daemon
+# state lives in `crate::cell::CriticalCell`, whose state is reachable only inside
+# a synchronous `with`/`with_mut` closure — so a borrow physically cannot cross an
+# `.await`, making §15.20's "a RefCell borrow never crosses an .await" tripwire a
+# compile-shape fact instead of a review item. `CriticalCell`'s own single internal
+# RefCell carries a localized `#[allow(clippy::disallowed_types)]`.
+disallowed-types = [
+    { path = "std::cell::RefCell", reason = "use crate::cell::CriticalCell (§16.2): a borrow can't cross .await" },
+]

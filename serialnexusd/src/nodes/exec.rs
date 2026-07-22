@@ -26,7 +26,7 @@
 //! stops reading stdin) — a documented property, stronger than §9's head-of-line
 //! note (which preserves hostward), bounded by the merge queue depth.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -45,6 +45,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
 use crate::boundary;
+use crate::cell::CriticalCell;
 use crate::runtime::{CHANNEL_CAP, DropCounters, HostwardSink, READ_BUF, SharedLock, Wiring};
 
 /// The reserved wire channel identity for the multiplexed (device) side (§15.22).
@@ -99,7 +100,7 @@ pub struct ExecCodecNode {
     restart_count: Rc<Cell<u64>>,
     /// Shared with the supervisor task, which flips it to faulted on a crash and
     /// back to active once a child is running.
-    status: Rc<RefCell<NodeStatus>>,
+    status: Rc<CriticalCell<NodeStatus>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -131,23 +132,28 @@ impl ExecCodecNode {
             stats: Rc::new(stats),
             mux_counters: None,
             restart_count: Rc::new(Cell::new(0)),
-            status: Rc::new(RefCell::new(NodeStatus::Active)),
+            status: Rc::new(CriticalCell::new(NodeStatus::Active)),
             tasks: Vec::new(),
         }
     }
 
     pub fn start(&mut self, wiring: &mut Wiring) {
         if self.faces != Facing::Target {
-            *self.status.borrow_mut() = NodeStatus::Faulted {
-                reason: "exec re-multiplexer orientation (faces=host) lands in phase 6".to_owned(),
-            };
+            self.status.with_mut(|s| {
+                *s = NodeStatus::Faulted {
+                    reason: "exec re-multiplexer orientation (faces=host) lands in phase 6"
+                        .to_owned(),
+                }
+            });
             return;
         }
         let mux = EndpointAddr::node(&self.name);
         let Some(mux_hostward_rx) = wiring.target_hostward_rx.remove(&mux) else {
-            *self.status.borrow_mut() = NodeStatus::Waiting {
-                reason: "multiplexed side has no attached upstream".to_owned(),
-            };
+            self.status.with_mut(|s| {
+                *s = NodeStatus::Waiting {
+                    reason: "multiplexed side has no attached upstream".to_owned(),
+                }
+            });
             return;
         };
         let mux_targetward_tx = wiring.target_targetward_tx.remove(&mux);
@@ -212,7 +218,7 @@ impl ExecCodecNode {
     }
 
     pub fn status(&self) -> NodeStatus {
-        self.status.borrow().clone()
+        self.status.with(|s| s.clone())
     }
 
     pub fn state_extra(&self) -> Value {
@@ -265,7 +271,7 @@ struct SuperviseArgs {
     channel_sinks: HashMap<String, Vec<HostwardSink>>,
     stats: Rc<HashMap<String, Rc<ChannelStat>>>,
     restart_count: Rc<Cell<u64>>,
-    status: Rc<RefCell<NodeStatus>>,
+    status: Rc<CriticalCell<NodeStatus>>,
 }
 
 /// Supervise the child: (re)spawn it, pump envelope frames both ways until it
@@ -287,15 +293,17 @@ async fn supervise(mut a: SuperviseArgs) {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                *a.status.borrow_mut() = NodeStatus::Faulted {
-                    reason: format!("spawn {:?}: {e}", a.argv[0]),
-                };
+                a.status.with_mut(|s| {
+                    *s = NodeStatus::Faulted {
+                        reason: format!("spawn {:?}: {e}", a.argv[0]),
+                    }
+                });
                 backoff.sleep().await;
                 a.restart_count.set(a.restart_count.get() + 1);
                 continue;
             }
         };
-        *a.status.borrow_mut() = NodeStatus::Active;
+        a.status.with_mut(|s| *s = NodeStatus::Active);
 
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -318,9 +326,14 @@ async fn supervise(mut a: SuperviseArgs) {
             PumpEnd::SourceClosed => return,
             PumpEnd::ChildDied => {
                 a.restart_count.set(a.restart_count.get() + 1);
-                *a.status.borrow_mut() = NodeStatus::Faulted {
-                    reason: format!("child exited; restarting (count {})", a.restart_count.get()),
-                };
+                a.status.with_mut(|s| {
+                    *s = NodeStatus::Faulted {
+                        reason: format!(
+                            "child exited; restarting (count {})",
+                            a.restart_count.get()
+                        ),
+                    }
+                });
                 backoff.sleep().await;
             }
         }
@@ -499,7 +512,7 @@ async fn route_event(ev: Event, routing: &Routing<'_>) {
 /// Ensure the codec holds the serial's write lock, re-acquiring FIFO after a steal
 /// (§6). Mirrors the in-process codec's gate; returns false if the endpoint is gone.
 async fn ensure_holds(lock: &SharedLock, id: OriginId) -> bool {
-    if lock.borrow().may_write(id) {
+    if lock.with(|g| g.may_write(id)) {
         return true;
     }
     loop {
@@ -510,8 +523,7 @@ async fn ensure_holds(lock: &SharedLock, id: OriginId) -> bool {
         tokio::pin!(notified);
         notified.as_mut().enable();
         // Already holds, or reclaim as a held origin ahead of on-demand waiters (§6).
-        let outcome = {
-            let mut g = lock.borrow_mut();
+        let outcome = lock.with_mut(|g| {
             if g.may_write(id) {
                 Some(false)
             } else if g.reclaim_held(id) {
@@ -519,7 +531,7 @@ async fn ensure_holds(lock: &SharedLock, id: OriginId) -> bool {
             } else {
                 None
             }
-        };
+        });
         match outcome {
             Some(fresh) => {
                 if fresh {

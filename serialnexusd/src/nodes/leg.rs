@@ -39,9 +39,10 @@
 //! starves the hostward read half. Reconnect backoff is [`boundary::Backoff`], and
 //! an exhausted send half [`boundary::park`]s rather than tearing the wire down (the
 //! §15.24 stale-status fix, now structural). Every task is aborted on teardown and
-//! Drop; a `RefCell` borrow never crosses an `.await` (§15.20).
+//! Drop; a lock borrow never crosses an `.await` — now a compile-shape fact via
+//! [`CriticalCell`] rather than a review rule (§15.20, §16.2).
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::task::{Context, Poll};
@@ -64,6 +65,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
 use crate::boundary;
+use crate::cell::CriticalCell;
 use crate::runtime::{CHANNEL_CAP, HostwardSink, READ_BUF, SharedLock, Wiring};
 
 /// How long to wait for the peer's hello before treating the connection as dead.
@@ -122,14 +124,14 @@ struct ChannelStat {
 /// Node-level observed state shared with the supervisor task (which flips it as
 /// the connection comes and goes).
 struct LegShared {
-    status: RefCell<NodeStatus>,
-    peer_address: RefCell<Option<String>>,
+    status: CriticalCell<NodeStatus>,
+    peer_address: CriticalCell<Option<String>>,
     peer_version: Cell<Option<u16>>,
     peer_capabilities: Cell<u32>,
     reconnect_count: Cell<u64>,
     /// Peer-announced identities this configuration does not declare — visible
     /// state awaiting an operator, never an endpoint (§8).
-    unbound: RefCell<Vec<String>>,
+    unbound: CriticalCell<Vec<String>>,
     /// Pulsed by the supervisor when a connection drops, so each faces=target
     /// channel task promptly releases its on-demand write lock (§7.1: release on
     /// idle *or* peer disconnect), rather than holding the local floor until idle.
@@ -190,14 +192,14 @@ impl LegNode {
             channels: channels.clone(),
             stats: Rc::new(stats),
             shared: Rc::new(LegShared {
-                status: RefCell::new(NodeStatus::Waiting {
+                status: CriticalCell::new(NodeStatus::Waiting {
                     reason: "no peer connected yet".to_owned(),
                 }),
-                peer_address: RefCell::new(None),
+                peer_address: CriticalCell::new(None),
                 peer_version: Cell::new(None),
                 peer_capabilities: Cell::new(0),
                 reconnect_count: Cell::new(0),
-                unbound: RefCell::new(Vec::new()),
+                unbound: CriticalCell::new(Vec::new()),
                 disconnect: Notify::new(),
             }),
             tasks: Vec::new(),
@@ -283,7 +285,7 @@ impl LegNode {
     }
 
     pub fn status(&self) -> NodeStatus {
-        self.shared.status.borrow().clone()
+        self.shared.status.with(|s| s.clone())
     }
 
     pub fn state_extra(&self) -> Value {
@@ -306,15 +308,17 @@ impl LegNode {
             .collect();
         // Announced-but-unconfigured identities: visible state, no endpoint (§8).
         let mut channels = channels;
-        for id in self.shared.unbound.borrow().iter() {
-            channels.insert(id.clone(), json!({ "binding": "unbound" }));
-        }
+        self.shared.unbound.with(|u| {
+            for id in u {
+                channels.insert(id.clone(), json!({ "binding": "unbound" }));
+            }
+        });
         let mut obj = json!({
             "role": role_str(self.role),
             "transport": transport_str(self.transport),
             "faces": self.faces.to_string(),
-            "connection": connection_str(&self.shared.status.borrow()),
-            "peer_address": *self.shared.peer_address.borrow(),
+            "connection": self.shared.status.with(connection_str),
+            "peer_address": self.shared.peer_address.with(|p| p.clone()),
             "protocol_version": self.shared.peer_version.get(),
             "capabilities": self.shared.peer_capabilities.get(),
             "reconnect_count": self.shared.reconnect_count.get(),
@@ -465,7 +469,7 @@ async fn supervise(mut a: SuperviseArgs) {
             Ok(Ok((hello, leftover))) => {
                 bind_channels(&a.channels, &hello, &a.stats, &a.shared);
                 if let Some(addr) = peer_addr {
-                    *a.shared.peer_address.borrow_mut() = Some(addr);
+                    a.shared.peer_address.with_mut(|p| *p = Some(addr));
                 }
                 set_status(&a.shared, NodeStatus::Active);
                 backoff.reset(); // a good connection resets backoff
@@ -533,8 +537,8 @@ async fn supervise(mut a: SuperviseArgs) {
         for stat in a.stats.values() {
             stat.bound.set(false);
         }
-        a.shared.unbound.borrow_mut().clear();
-        *a.shared.peer_address.borrow_mut() = None;
+        a.shared.unbound.with_mut(|u| u.clear());
+        a.shared.peer_address.with_mut(|p| *p = None);
         a.shared.disconnect.notify_waiters();
 
         a.shared
@@ -732,10 +736,11 @@ fn note_unbound(ch: &str, stat: Option<&Rc<ChannelStat>>, n: u64, shared: &Rc<Le
         s.discarded_hostward.set(s.discarded_hostward.get() + n);
         return; // configured but unattached: dropped and counted, not "unbound"
     }
-    let mut unbound = shared.unbound.borrow_mut();
-    if !unbound.iter().any(|u| u == ch) {
-        unbound.push(ch.to_owned());
-    }
+    shared.unbound.with_mut(|unbound| {
+        if !unbound.iter().any(|u| u == ch) {
+            unbound.push(ch.to_owned());
+        }
+    });
 }
 
 /// A faces=target channel's targetward task: hand each wire-arriving chunk into the
@@ -796,7 +801,7 @@ async fn channel_targetward(
 /// contended (§6, §15.20 two-lane). Returns false if the endpoint was torn down or
 /// the origin cannot write. Holds no borrow across the await.
 async fn ensure_acquired(lock: &SharedLock, id: OriginId) -> bool {
-    if lock.borrow().may_write(id) {
+    if lock.with(|g| g.may_write(id)) {
         return true;
     }
     loop {
@@ -806,18 +811,15 @@ async fn ensure_acquired(lock: &SharedLock, id: OriginId) -> bool {
         let notified = lock.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let outcome = {
-            let mut g = lock.borrow_mut();
-            match g.acquire(id) {
-                Acquire::Granted => Some(Some(true)), // freshly granted (emit)
-                Acquire::AlreadyHeld => Some(Some(false)),
-                Acquire::ReadOnly => Some(None), // cannot write
-                Acquire::Denied { .. } => {
-                    g.enqueue(id);
-                    None
-                }
+        let outcome = lock.with_mut(|g| match g.acquire(id) {
+            Acquire::Granted => Some(Some(true)), // freshly granted (emit)
+            Acquire::AlreadyHeld => Some(Some(false)),
+            Acquire::ReadOnly => Some(None), // cannot write
+            Acquire::Denied { .. } => {
+                g.enqueue(id);
+                None
             }
-        };
+        });
         match outcome {
             Some(Some(fresh)) => {
                 if fresh {
@@ -833,7 +835,7 @@ async fn ensure_acquired(lock: &SharedLock, id: OriginId) -> bool {
 
 /// Release `id`'s lock if held, waking the next queue head (§6).
 fn release(lock: &SharedLock, id: OriginId) {
-    let freed = { lock.borrow_mut().release(id) };
+    let freed = lock.with_mut(|g| g.release(id));
     if freed {
         lock.wake_waiters();
         lock.emit_change();
@@ -940,17 +942,18 @@ fn bind_channels(
         }
     }
     let configured: std::collections::HashSet<&str> = channels.iter().map(String::as_str).collect();
-    let mut unbound = shared.unbound.borrow_mut();
-    unbound.clear();
-    for id in &hello.channels {
-        if !configured.contains(id.as_str()) {
-            unbound.push(id.0.clone());
+    shared.unbound.with_mut(|unbound| {
+        unbound.clear();
+        for id in &hello.channels {
+            if !configured.contains(id.as_str()) {
+                unbound.push(id.0.clone());
+            }
         }
-    }
+    });
 }
 
 fn set_status(shared: &Rc<LegShared>, status: NodeStatus) {
-    *shared.status.borrow_mut() = status;
+    shared.status.with_mut(|s| *s = status);
 }
 
 async fn bind_listener(transport: Transport, address: &str) -> std::io::Result<Listener> {

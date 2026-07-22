@@ -48,6 +48,7 @@ use tokio::sync::{Notify, mpsc::error::TryRecvError};
 use tokio::task::JoinHandle;
 
 use crate::boundary::BlockingReader;
+use crate::cell::CriticalCell;
 use crate::runtime::{self, HostwardSink, READ_BUF};
 use crate::sys;
 
@@ -77,8 +78,8 @@ struct OpenParams {
 }
 
 /// State the reconnect supervisor mutates and the node's `&self` methods read,
-/// shared on the single runtime thread (Rc/RefCell — the reader thread touches
-/// only atomics, never this).
+/// shared on the single runtime thread (Rc/[`CriticalCell`] — the reader thread
+/// touches only atomics, never this).
 struct SerialShared {
     status: NodeStatus,
     /// The currently-open port, or `None` while `waiting`/`faulted`. Retained for
@@ -92,8 +93,8 @@ pub struct SerialNode {
     device: String,
     resolver: Resolver,
     params: OpenParams,
-    shared: Rc<RefCell<SerialShared>>,
-    reader_slot: Rc<RefCell<BlockingReader>>,
+    shared: Rc<CriticalCell<SerialShared>>,
+    reader_slot: Rc<CriticalCell<BlockingReader>>,
     /// Bytes read from the port and discarded because nothing was attached to
     /// consume them (§5). Shared with the reader thread, hence atomic.
     discarded_unattached: Arc<AtomicU64>,
@@ -103,8 +104,6 @@ pub struct SerialNode {
     /// The supervisor task (drives the targetward writer and the reconnect poll).
     tasks: Vec<JoinHandle<()>>,
 }
-
-use std::cell::RefCell;
 
 impl SerialNode {
     pub fn create(config: &NodeConfig, resolver: &Resolver) -> SerialNode {
@@ -167,8 +166,8 @@ impl SerialNode {
             device: device.clone(),
             resolver: resolver.clone(),
             params,
-            shared: Rc::new(RefCell::new(SerialShared { status, port })),
-            reader_slot: Rc::new(RefCell::new(BlockingReader::default())),
+            shared: Rc::new(CriticalCell::new(SerialShared { status, port })),
+            reader_slot: Rc::new(CriticalCell::new(BlockingReader::default())),
             discarded_unattached: Arc::new(AtomicU64::new(0)),
             purged_reconnect: Arc::new(AtomicU64::new(0)),
             tasks: Vec::new(),
@@ -201,52 +200,53 @@ impl SerialNode {
     }
 
     pub fn status(&self) -> NodeStatus {
-        self.shared.borrow().status.clone()
+        self.shared.with(|sh| sh.status.clone())
     }
 
     /// The open port, for the serial-signal verbs (§7.1). `None` while the node is
     /// `waiting`/`faulted`. Borrow-clone-drop before any `.await` (§15.20).
     pub(crate) fn port(&self) -> Option<Rc<SerialPort>> {
-        self.shared.borrow().port.clone()
+        self.shared.with(|sh| sh.port.clone())
     }
 
     pub fn state_extra(&self) -> serde_json::Value {
-        let sh = self.shared.borrow();
-        // Driver input counters (TIOCGICOUNT) surface framing/parity/overrun loss
-        // "where supported" (§5, §7.1); a pts (test device) returns an error, so
-        // report null rather than faulting or fabricating zeros.
-        let driver_counters = sh
-            .port
-            .as_ref()
-            .and_then(|p| sys::read_icounts(p.as_raw_fd()).ok())
-            .map(|c| {
-                json!({
-                    "rx": c.rx,
-                    "tx": c.tx,
-                    "frame": c.frame,
-                    "overrun": c.overrun,
-                    "parity": c.parity,
-                    "brk": c.brk,
-                    "buf_overrun": c.buf_overrun,
-                })
-            });
-        // The current resolved /dev path is state (§12); the configured identity is
-        // config. Report both so an operator sees which device answered.
-        let resolved_path = self
-            .resolver
-            .resolve_current_path(&self.device)
-            .map(|p| p.display().to_string());
-        let modem_lines = sh.port.as_ref().map(|p| read_modem_lines(p.as_raw_fd()));
-        json!({
-            "identity": self.device,
-            "identity_kind": DeviceKind::of(&self.device).label(),
-            "resolved_path": resolved_path,
-            "baud": self.params.baud,
-            "open": sh.port.is_some(),
-            "discarded_unattached": self.discarded_unattached.load(Ordering::Relaxed),
-            "purged_on_reconnect": self.purged_reconnect.load(Ordering::Relaxed),
-            "modem_lines": modem_lines,
-            "driver_counters": driver_counters,
+        self.shared.with(|sh| {
+            // Driver input counters (TIOCGICOUNT) surface framing/parity/overrun loss
+            // "where supported" (§5, §7.1); a pts (test device) returns an error, so
+            // report null rather than faulting or fabricating zeros.
+            let driver_counters = sh
+                .port
+                .as_ref()
+                .and_then(|p| sys::read_icounts(p.as_raw_fd()).ok())
+                .map(|c| {
+                    json!({
+                        "rx": c.rx,
+                        "tx": c.tx,
+                        "frame": c.frame,
+                        "overrun": c.overrun,
+                        "parity": c.parity,
+                        "brk": c.brk,
+                        "buf_overrun": c.buf_overrun,
+                    })
+                });
+            // The current resolved /dev path is state (§12); the configured identity is
+            // config. Report both so an operator sees which device answered.
+            let resolved_path = self
+                .resolver
+                .resolve_current_path(&self.device)
+                .map(|p| p.display().to_string());
+            let modem_lines = sh.port.as_ref().map(|p| read_modem_lines(p.as_raw_fd()));
+            json!({
+                "identity": self.device,
+                "identity_kind": DeviceKind::of(&self.device).label(),
+                "resolved_path": resolved_path,
+                "baud": self.params.baud,
+                "open": sh.port.is_some(),
+                "discarded_unattached": self.discarded_unattached.load(Ordering::Relaxed),
+                "purged_on_reconnect": self.purged_reconnect.load(Ordering::Relaxed),
+                "modem_lines": modem_lines,
+                "driver_counters": driver_counters,
+            })
         })
     }
 
@@ -262,7 +262,7 @@ impl SerialNode {
             t.abort();
         }
         stop_join_reader(&self.reader_slot);
-        self.shared.borrow_mut().port = None;
+        self.shared.with_mut(|sh| sh.port = None);
     }
 }
 
@@ -274,8 +274,8 @@ struct SuperviseCtx {
     params: OpenParams,
     hostward: Vec<HostwardSink>,
     targetward: Option<mpsc::Receiver<Chunk>>,
-    shared: Rc<RefCell<SerialShared>>,
-    reader_slot: Rc<RefCell<BlockingReader>>,
+    shared: Rc<CriticalCell<SerialShared>>,
+    reader_slot: Rc<CriticalCell<BlockingReader>>,
     discarded: Arc<AtomicU64>,
     purged: Arc<AtomicU64>,
 }
@@ -297,8 +297,7 @@ enum Step {
 async fn supervise(mut ctx: SuperviseCtx) {
     // Adopt the port `create` opened, if any: arm a reader on it.
     let mut lost: Option<Arc<Notify>> = None;
-    if ctx.shared.borrow().port.is_some() {
-        let port = ctx.shared.borrow().port.clone().unwrap();
+    if let Some(port) = ctx.shared.with(|sh| sh.port.clone()) {
         match arm_reader(&port, &ctx) {
             Ok(notify) => lost = Some(notify),
             Err(e) => fault(&ctx, format!("set_nonblocking: {e}")),
@@ -309,7 +308,7 @@ async fn supervise(mut ctx: SuperviseCtx) {
         match &lost {
             // Active: a live port with an armed reader.
             Some(notify) => {
-                let port = match ctx.shared.borrow().port.clone() {
+                let port = match ctx.shared.with(|sh| sh.port.clone()) {
                     Some(p) => p,
                     None => {
                         lost = None;
@@ -425,36 +424,40 @@ fn arm_reader(port: &Rc<SerialPort>, ctx: &SuperviseCtx) -> std::io::Result<Arc<
     // The boundary-supervisor library owns the stop flag, the loss `Notify`, and
     // the join handle (§16.1 loss-notify + join-then-transition); we supply the
     // node-specific reader body.
-    let mut slot = ctx.reader_slot.borrow_mut();
-    slot.arm(format!("serial-rx-{}", ctx.name), move |stop, lost| {
-        reader_thread(fd, hostward, discarded, stop, lost)
-    });
-    Ok(slot.lost())
+    ctx.reader_slot.with_mut(|slot| {
+        slot.arm(format!("serial-rx-{}", ctx.name), move |stop, lost| {
+            reader_thread(fd, hostward, discarded, stop, lost)
+        });
+        Ok(slot.lost())
+    })
 }
 
 /// Stop the current reader thread and join it within the poll-timeout bound. On
 /// the loss path the thread has already exited, so this returns at once; on
 /// teardown of a live device it costs at most one poll interval.
-fn stop_join_reader(reader_slot: &Rc<RefCell<BlockingReader>>) {
-    reader_slot.borrow_mut().stop_join();
+fn stop_join_reader(reader_slot: &Rc<CriticalCell<BlockingReader>>) {
+    reader_slot.with_mut(|slot| slot.stop_join());
 }
 
 fn set_active(ctx: &SuperviseCtx, port: Rc<SerialPort>) {
-    let mut sh = ctx.shared.borrow_mut();
-    sh.port = Some(port);
-    sh.status = NodeStatus::Active;
+    ctx.shared.with_mut(|sh| {
+        sh.port = Some(port);
+        sh.status = NodeStatus::Active;
+    });
 }
 
 fn set_waiting(ctx: &SuperviseCtx, reason: String) {
-    let mut sh = ctx.shared.borrow_mut();
-    sh.port = None;
-    sh.status = NodeStatus::Waiting { reason };
+    ctx.shared.with_mut(|sh| {
+        sh.port = None;
+        sh.status = NodeStatus::Waiting { reason };
+    });
 }
 
 fn fault(ctx: &SuperviseCtx, reason: String) {
-    let mut sh = ctx.shared.borrow_mut();
-    sh.port = None;
-    sh.status = NodeStatus::Faulted { reason };
+    ctx.shared.with_mut(|sh| {
+        sh.port = None;
+        sh.status = NodeStatus::Faulted { reason };
+    });
 }
 
 /// Hostward reader thread (§15.19): a blocking `poll(2)` waits for readability —

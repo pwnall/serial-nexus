@@ -1,22 +1,24 @@
 //! The daemon's graph state and the RPC method implementations (design §10,
-//! §11). Mutations run on the current-thread runtime, so a `RefCell` serializes
-//! them with no locks (plan §2). Verbs: `load`/`dump`/`state`/`teardown`/
-//! `shutdown` (phase 2) plus `rotate`/`subscribe` (phase 3) plus the arbitration
-//! surface `lock`/`unlock`/`send` with `--steal`/`--lease`/`--wait` (phase 4).
+//! §11). Mutations run on the current-thread runtime, so a single-threaded cell
+//! serializes them with no locks (plan §2). Verbs: `load`/`dump`/`state`/
+//! `teardown`/`shutdown` (phase 2) plus `rotate`/`subscribe` (phase 3) plus the
+//! arbitration surface `lock`/`unlock`/`send` with `--steal`/`--lease`/`--wait`
+//! (phase 4).
 //!
 //! **The two-lane control plane (§15.20).** Every lock transition — acquire,
 //! release, steal, lease expiry — is a *synchronous critical section* on the
-//! runtime thread: borrow the [`EndpointLock`], mutate, drop the borrow. A verb
-//! that cannot complete immediately (`lock --wait`, `send`'s acquire-with-timeout)
-//! registers in the lock's FIFO waiter queue and suspends holding *nothing* — no
-//! borrows, no locks, only its queue slot — then re-attempts inside a fresh
-//! critical section when woken. "Mutations are serialized" (§10) therefore
-//! survives unchanged while concurrent connections flow past a parked waiter. The
-//! load-bearing discipline, with the same review status as §15.18's AsyncFd rule:
-//! **a `RefCell` borrow never crosses an `.await`** — every method below borrows,
-//! computes, drops, and only then awaits.
+//! runtime thread: `with_mut` the [`EndpointLock`] and mutate. A verb that cannot
+//! complete immediately (`lock --wait`, `send`'s acquire-with-timeout) registers
+//! in the lock's FIFO waiter queue and suspends holding *nothing* — no borrows, no
+//! locks, only its queue slot — then re-attempts inside a fresh critical section
+//! when woken. "Mutations are serialized" (§10) therefore survives unchanged while
+//! concurrent connections flow past a parked waiter. The load-bearing discipline —
+//! **a state borrow never crosses an `.await`** — is no longer a review rule but a
+//! compile-shape fact: all daemon state lives in [`CriticalCell`], reachable only
+//! inside a synchronous `with`/`with_mut` closure, so a borrow *cannot* span an
+//! await (§16.2). Raw `std::cell::RefCell` is banned in this crate by clippy.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -28,6 +30,7 @@ use nexus_rpc::{Notification, RpcError, error_codes};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast, mpsc};
 
+use crate::cell::CriticalCell;
 use crate::nodes::Node;
 use crate::runtime::SharedLock;
 
@@ -85,7 +88,7 @@ struct GraphState {
 /// The running daemon: graph state, a shutdown signal, and the `subscribe`
 /// notification broadcast.
 pub struct Daemon {
-    state: RefCell<GraphState>,
+    state: CriticalCell<GraphState>,
     pub shutdown: Notify,
     notifier: broadcast::Sender<Notification>,
     /// Device-identity resolver (§12), rooted at `--dev-root` (a fixture seam in
@@ -119,7 +122,7 @@ impl Daemon {
     pub fn new(resolver: nexus_core::Resolver, state_file: Option<std::path::PathBuf>) -> Self {
         let (notifier, _) = broadcast::channel(NOTIFY_CAPACITY);
         Daemon {
-            state: RefCell::new(GraphState {
+            state: CriticalCell::new(GraphState {
                 next_send_origin: Cell::new(SEND_ORIGIN_BASE),
                 ..GraphState::default()
             }),
@@ -139,15 +142,12 @@ impl Daemon {
         let Some(path) = &self.state_file else {
             return;
         };
-        // Serialize under the borrow, then drop it before touching the filesystem.
-        let text = {
-            let st = self.state.borrow();
-            match toml::to_string(&st.config) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("state snapshot serialize failed: {e}");
-                    return;
-                }
+        // Serialize inside the critical section; the borrow can't escape the closure.
+        let text = match self.state.with(|st| toml::to_string(&st.config)) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("state snapshot serialize failed: {e}");
+                return;
             }
         };
         if let Err(e) = atomic_write(path, text.as_bytes()) {
@@ -248,65 +248,66 @@ impl Daemon {
             self.teardown();
         }
 
-        let mut st = self.state.borrow_mut();
-        if !st.nodes.is_empty() {
-            return Err(RpcError::new(
-                app_errors::LOAD_NONEMPTY,
-                "load requires an empty graph — teardown first (or use load --replace)",
-            ));
-        }
+        self.state.with_mut(|st| {
+            if !st.nodes.is_empty() {
+                return Err(RpcError::new(
+                    app_errors::LOAD_NONEMPTY,
+                    "load requires an empty graph — teardown first (or use load --replace)",
+                ));
+            }
 
-        // Instantiate nodes. An environmental failure faults the node (kept);
-        // only an unimplemented node kind aborts the load, and then nothing is
-        // committed.
-        let mut nodes = Vec::with_capacity(config.nodes.len());
-        for nc in &config.nodes {
-            match Node::instantiate(nc, &self.resolver) {
-                Ok(node) => nodes.push(node),
-                Err(reason) => {
-                    for mut n in nodes {
-                        n.teardown();
+            // Instantiate nodes. An environmental failure faults the node (kept);
+            // only an unimplemented node kind aborts the load, and then nothing is
+            // committed.
+            let mut nodes = Vec::with_capacity(config.nodes.len());
+            for nc in &config.nodes {
+                match Node::instantiate(nc, &self.resolver) {
+                    Ok(node) => nodes.push(node),
+                    Err(reason) => {
+                        for mut n in nodes {
+                            n.teardown();
+                        }
+                        return Err(RpcError::invalid_params(format!(
+                            "node {}: {reason}",
+                            nc.name()
+                        )));
                     }
-                    return Err(RpcError::invalid_params(format!(
-                        "node {}: {reason}",
-                        nc.name()
-                    )));
                 }
             }
-        }
 
-        // Wire the data plane from the validated edges, then start each node's
-        // tasks (§5). Building the plan before the config moves keeps it borrow-
-        // clean; `start` spawns onto the current-thread LocalSet. The notifier is
-        // handed to each endpoint's lock so a lock transition emits an immediate
-        // notification (§10).
-        let mut wiring = crate::runtime::Wiring::build(&config, &self.notifier);
-        // Keep clones of the write locks (§6) and per-endpoint targetward senders
-        // so the control plane can acquire, release, and `send`; the same `Rc`s are
-        // handed to the origin read tasks below. The wiring keys by endpoint address
-        // (a codec has many); the RPC surface addresses by display string
-        // (`usb0`, `mux/console`), so convert here.
-        st.endpoint_locks = wiring
-            .endpoint_locks
-            .iter()
-            .map(|(a, l)| (a.to_string(), l.clone()))
-            .collect();
-        st.endpoint_targetward = wiring
-            .host_targetward_tx
-            .iter()
-            .map(|(a, t)| (a.to_string(), t.clone()))
-            .collect();
-        st.origin_locks = wiring
-            .origin_locks
-            .iter()
-            .map(|(a, (l, id))| (a.to_string(), (l.clone(), *id)))
-            .collect();
-        st.nodes = nodes;
-        st.config = config;
-        for node in &mut st.nodes {
-            node.start(&mut wiring);
-        }
-        Ok(json!({ "loaded": st.nodes.len() }))
+            // Wire the data plane from the validated edges, then start each node's
+            // tasks (§5). Building the plan before the config moves keeps it borrow-
+            // clean; `start` spawns onto the current-thread LocalSet. The notifier is
+            // handed to each endpoint's lock so a lock transition emits an immediate
+            // notification (§10).
+            let mut wiring = crate::runtime::Wiring::build(&config, &self.notifier);
+            // Keep clones of the write locks (§6) and per-endpoint targetward senders
+            // so the control plane can acquire, release, and `send`; the same `Rc`s are
+            // handed to the origin read tasks below. The wiring keys by endpoint address
+            // (a codec has many); the RPC surface addresses by display string
+            // (`usb0`, `mux/console`), so convert here.
+            st.endpoint_locks = wiring
+                .endpoint_locks
+                .iter()
+                .map(|(a, l)| (a.to_string(), l.clone()))
+                .collect();
+            st.endpoint_targetward = wiring
+                .host_targetward_tx
+                .iter()
+                .map(|(a, t)| (a.to_string(), t.clone()))
+                .collect();
+            st.origin_locks = wiring
+                .origin_locks
+                .iter()
+                .map(|(a, (l, id))| (a.to_string(), (l.clone(), *id)))
+                .collect();
+            st.nodes = nodes;
+            st.config = config;
+            for node in &mut st.nodes {
+                node.start(&mut wiring);
+            }
+            Ok(json!({ "loaded": st.nodes.len() }))
+        })
     }
 
     /// `add-node` (§10/§11): add one node to a running graph. The node arrives with
@@ -362,49 +363,51 @@ impl Daemon {
         }
         let node_name = node_cfg.name().to_owned();
 
-        let mut st = self.state.borrow_mut();
-        // Validate the candidate graph (current + new node, edges unchanged) with
-        // the same rules as `load` (§11): duplicate name, name/identity legality,
-        // leg/codec config. Nothing is created on a structural error.
-        let mut candidate = st.config.clone();
-        candidate.nodes.push(node_cfg.clone());
-        let errors = candidate.validate();
-        if !errors.is_empty() {
-            let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
-            return Err(RpcError::new(
-                app_errors::STRUCTURAL,
-                format!("structural error: {}", messages[0]),
-            )
-            .with_data(json!({ "errors": messages })));
-        }
+        self.state.with_mut(|st| {
+            // Validate the candidate graph (current + new node, edges unchanged) with
+            // the same rules as `load` (§11): duplicate name, name/identity legality,
+            // leg/codec config. Nothing is created on a structural error.
+            let mut candidate = st.config.clone();
+            candidate.nodes.push(node_cfg.clone());
+            let errors = candidate.validate();
+            if !errors.is_empty() {
+                let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+                return Err(RpcError::new(
+                    app_errors::STRUCTURAL,
+                    format!("structural error: {}", messages[0]),
+                )
+                .with_data(json!({ "errors": messages })));
+            }
 
-        // Instantiate the node (environmental failure faults it, §15.8; only a bad
-        // codec kind/schema Errs, and then nothing is committed).
-        let mut node = Node::instantiate(&node_cfg, &self.resolver)
-            .map_err(|reason| RpcError::invalid_params(format!("node {node_name}: {reason}")))?;
+            // Instantiate the node (environmental failure faults it, §15.8; only a bad
+            // codec kind/schema Errs, and then nothing is committed).
+            let mut node = Node::instantiate(&node_cfg, &self.resolver).map_err(|reason| {
+                RpcError::invalid_params(format!("node {node_name}: {reason}"))
+            })?;
 
-        // Wire the node's own endpoints (no edges): build a partial plan from a
-        // single-node config and merge its host-endpoint lock + targetward sender
-        // into the daemon maps. `start` claims its endpoints from the plan.
-        let mini = GraphConfig {
-            nodes: vec![node_cfg.clone()],
-            edges: Vec::new(),
-        };
-        let mut wiring = crate::runtime::Wiring::build(&mini, &self.notifier);
-        for (a, l) in wiring.endpoint_locks.iter() {
-            st.endpoint_locks.insert(a.to_string(), l.clone());
-        }
-        for (a, t) in wiring.host_targetward_tx.iter() {
-            st.endpoint_targetward.insert(a.to_string(), t.clone());
-        }
-        node.start(&mut wiring);
-        st.nodes.push(node);
-        st.config.nodes.push(node_cfg);
+            // Wire the node's own endpoints (no edges): build a partial plan from a
+            // single-node config and merge its host-endpoint lock + targetward sender
+            // into the daemon maps. `start` claims its endpoints from the plan.
+            let mini = GraphConfig {
+                nodes: vec![node_cfg.clone()],
+                edges: Vec::new(),
+            };
+            let mut wiring = crate::runtime::Wiring::build(&mini, &self.notifier);
+            for (a, l) in wiring.endpoint_locks.iter() {
+                st.endpoint_locks.insert(a.to_string(), l.clone());
+            }
+            for (a, t) in wiring.host_targetward_tx.iter() {
+                st.endpoint_targetward.insert(a.to_string(), t.clone());
+            }
+            node.start(&mut wiring);
+            st.nodes.push(node);
+            st.config.nodes.push(node_cfg);
 
-        let mut result = serde_json::Map::new();
-        result.insert("added".into(), json!(node_name));
-        result.append(&mut echo);
-        Ok(Value::Object(result))
+            let mut result = serde_json::Map::new();
+            result.insert("added".into(), json!(node_name));
+            result.append(&mut echo);
+            Ok(Value::Object(result))
+        })
     }
 
     /// `remove-node [--cascade]` (§10/§11): remove one node. Refused while edges are
@@ -426,138 +429,142 @@ impl Daemon {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        let mut st = self.state.borrow_mut();
-        let idx = st
-            .nodes
-            .iter()
-            .position(|n| n.name() == name)
-            .ok_or_else(|| RpcError::invalid_params(format!("unknown node {name:?}")))?;
+        self.state.with_mut(|st| {
+            let idx = st
+                .nodes
+                .iter()
+                .position(|n| n.name() == name)
+                .ok_or_else(|| RpcError::invalid_params(format!("unknown node {name:?}")))?;
 
-        // Edges touching this node (either endpoint). Refuse a non-cascade removal
-        // while any remain (§11).
-        let attached = st
-            .config
-            .edges
-            .iter()
-            .filter(|e| e.a.node == name || e.b.node == name)
-            .count();
-        if attached > 0 && !cascade {
-            return Err(RpcError::new(
-                app_errors::HAS_EDGES,
-                format!("node {name:?} has {attached} attached edge(s); use --cascade"),
-            ));
-        }
-
-        // The node's endpoint display addresses, from its config shape.
-        let endpoints: Vec<String> = st
-            .config
-            .nodes
-            .iter()
-            .find(|n| n.name() == name)
-            .map(|n| {
-                n.shape()
-                    .endpoints
-                    .iter()
-                    .map(|ep| EndpointAddr::new(&name, ep.name.clone()).to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Tear the node down (release env, flush log) and drop it.
-        let mut node = st.nodes.remove(idx);
-        node.teardown();
-
-        // Close and prune the node's host-endpoint locks (wake parked waiters), and
-        // prune its targetward/origin entries. Keep the removed locks to also evict
-        // surviving origins that fed them (their target is gone).
-        let mut removed_locks: Vec<SharedLock> = Vec::new();
-        for disp in &endpoints {
-            if let Some(lock) = st.endpoint_locks.remove(disp) {
-                lock.close();
-                removed_locks.push(lock);
+            // Edges touching this node (either endpoint). Refuse a non-cascade removal
+            // while any remain (§11).
+            let attached = st
+                .config
+                .edges
+                .iter()
+                .filter(|e| e.a.node == name || e.b.node == name)
+                .count();
+            if attached > 0 && !cascade {
+                return Err(RpcError::new(
+                    app_errors::HAS_EDGES,
+                    format!("node {name:?} has {attached} attached edge(s); use --cascade"),
+                ));
             }
-            st.endpoint_targetward.remove(disp);
-            // If this endpoint is a *writer* (a PTY/codec side that fed a
-            // surviving host endpoint's lock), unregister it from that lock so it
-            // does not linger as a phantom origin — or, if it held the lock,
-            // permanently wedge the surviving endpoint as locked with no recovery
-            // (§6/§15.20: a torn-down origin leaves the lock cleanly).
-            if let Some((host_lock, origin_id)) = st.origin_locks.remove(disp) {
-                let released = { host_lock.borrow_mut().unregister(origin_id) };
-                if released {
-                    // It held the lock; releasing must wake the queue and notify,
-                    // exactly like a normal detach-release.
-                    host_lock.wake_waiters();
-                    host_lock.emit_change();
+
+            // The node's endpoint display addresses, from its config shape.
+            let endpoints: Vec<String> = st
+                .config
+                .nodes
+                .iter()
+                .find(|n| n.name() == name)
+                .map(|n| {
+                    n.shape()
+                        .endpoints
+                        .iter()
+                        .map(|ep| EndpointAddr::new(&name, ep.name.clone()).to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Tear the node down (release env, flush log) and drop it.
+            let mut node = st.nodes.remove(idx);
+            node.teardown();
+
+            // Close and prune the node's host-endpoint locks (wake parked waiters), and
+            // prune its targetward/origin entries. Keep the removed locks to also evict
+            // surviving origins that fed them (their target is gone).
+            let mut removed_locks: Vec<SharedLock> = Vec::new();
+            for disp in &endpoints {
+                if let Some(lock) = st.endpoint_locks.remove(disp) {
+                    lock.close();
+                    removed_locks.push(lock);
+                }
+                st.endpoint_targetward.remove(disp);
+                // If this endpoint is a *writer* (a PTY/codec side that fed a
+                // surviving host endpoint's lock), unregister it from that lock so it
+                // does not linger as a phantom origin — or, if it held the lock,
+                // permanently wedge the surviving endpoint as locked with no recovery
+                // (§6/§15.20: a torn-down origin leaves the lock cleanly).
+                if let Some((host_lock, origin_id)) = st.origin_locks.remove(disp) {
+                    let released = host_lock.with_mut(|g| g.unregister(origin_id));
+                    if released {
+                        // It held the lock; releasing must wake the queue and notify,
+                        // exactly like a normal detach-release.
+                        host_lock.wake_waiters();
+                        host_lock.emit_change();
+                    }
                 }
             }
-        }
-        // A surviving origin whose target endpoint was this node keeps a clone of
-        // that (now-removed) lock; evict it so `lock`/`send` no longer resolve to a
-        // dead endpoint.
-        st.origin_locks
-            .retain(|_, (lock, _)| !removed_locks.iter().any(|rl| std::rc::Rc::ptr_eq(rl, lock)));
+            // A surviving origin whose target endpoint was this node keeps a clone of
+            // that (now-removed) lock; evict it so `lock`/`send` no longer resolve to a
+            // dead endpoint.
+            st.origin_locks.retain(|_, (lock, _)| {
+                !removed_locks.iter().any(|rl| std::rc::Rc::ptr_eq(rl, lock))
+            });
 
-        // Drop the node's edges and the node itself from configuration.
-        st.config
-            .edges
-            .retain(|e| e.a.node != name && e.b.node != name);
-        st.config.nodes.retain(|n| n.name() != name);
+            // Drop the node's edges and the node itself from configuration.
+            st.config
+                .edges
+                .retain(|e| e.a.node != name && e.b.node != name);
+            st.config.nodes.retain(|n| n.name() != name);
 
-        Ok(json!({ "removed": name, "cascaded_edges": attached }))
+            Ok(json!({ "removed": name, "cascaded_edges": attached }))
+        })
     }
 
     /// `dump` (§11): configuration only, in exactly the load format. Returns the
     /// structured config; the CLI renders TOML.
     fn dump(&self) -> Value {
-        serde_json::to_value(&self.state.borrow().config).expect("config serializes")
+        self.state
+            .with(|st| serde_json::to_value(&st.config).expect("config serializes"))
     }
 
     /// `state` (§10): observed status per node — never persisted, and disjoint
     /// from configuration by construction (§15.8).
     fn state(&self) -> Value {
-        let st = self.state.borrow();
-        let nodes: Vec<Value> = st
-            .nodes
-            .iter()
-            .map(|n| {
-                let mut obj = serde_json::Map::new();
-                obj.insert("name".into(), json!(n.name()));
-                merge_into(&mut obj, serde_json::to_value(n.status()).unwrap());
-                merge_into(&mut obj, n.state_extra());
-                // Each of the node's host-facing endpoints reports its write-lock
-                // state (§6: holder, waiters, per-origin purge counters, most recent
-                // steal). A single-endpoint node (serial) reports it top-level as
-                // `.lock`; a codec reports each channel's lock under
-                // `.channels[channel].lock`. Observed state, disjoint from
-                // configuration (§15.8).
-                for (display, lock) in &st.endpoint_locks {
-                    let addr: EndpointAddr = display.parse().expect("address is infallible");
-                    if addr.node != n.name() {
-                        continue;
-                    }
-                    let snap = serde_json::to_value(lock.borrow().snapshot())
-                        .expect("lock snapshot serializes");
-                    if addr.is_default() {
-                        obj.insert("lock".into(), snap);
-                    } else {
-                        let channels = obj
-                            .entry("channels")
-                            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                        if let Some(chmap) = channels.as_object_mut() {
-                            let ch = chmap
-                                .entry(addr.endpoint.clone())
+        self.state.with(|st| {
+            let nodes: Vec<Value> = st
+                .nodes
+                .iter()
+                .map(|n| {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("name".into(), json!(n.name()));
+                    merge_into(&mut obj, serde_json::to_value(n.status()).unwrap());
+                    merge_into(&mut obj, n.state_extra());
+                    // Each of the node's host-facing endpoints reports its write-lock
+                    // state (§6: holder, waiters, per-origin purge counters, most recent
+                    // steal). A single-endpoint node (serial) reports it top-level as
+                    // `.lock`; a codec reports each channel's lock under
+                    // `.channels[channel].lock`. Observed state, disjoint from
+                    // configuration (§15.8).
+                    for (display, lock) in &st.endpoint_locks {
+                        let addr: EndpointAddr = display.parse().expect("address is infallible");
+                        if addr.node != n.name() {
+                            continue;
+                        }
+                        let snap = serde_json::to_value(lock.with(|l| l.snapshot()))
+                            .expect("lock snapshot serializes");
+                        if addr.is_default() {
+                            obj.insert("lock".into(), snap);
+                        } else {
+                            let channels = obj
+                                .entry("channels")
                                 .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                            if let Some(chobj) = ch.as_object_mut() {
-                                chobj.insert("lock".into(), snap);
+                            if let Some(chmap) = channels.as_object_mut() {
+                                let ch = chmap
+                                    .entry(addr.endpoint.clone())
+                                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                                if let Some(chobj) = ch.as_object_mut() {
+                                    chobj.insert("lock".into(), snap);
+                                }
                             }
                         }
                     }
-                }
-                Value::Object(obj)
-            })
-            .collect();
-        json!({ "nodes": nodes })
+                    Value::Object(obj)
+                })
+                .collect();
+            json!({ "nodes": nodes })
+        })
     }
 
     /// `rotate` (§7.3): rotate a log node's file on demand. Names the node in
@@ -568,35 +575,37 @@ impl Daemon {
             .and_then(|p| p.get("node"))
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::invalid_params("missing 'node' in params"))?;
-        let st = self.state.borrow();
-        let target = st
-            .nodes
-            .iter()
-            .find(|n| n.name() == node)
-            .ok_or_else(|| RpcError::invalid_params(format!("unknown node {node:?}")))?;
-        match target.rotate() {
-            Ok(rotated_to) => Ok(json!({ "node": node, "rotated_to": rotated_to })),
-            Err(reason) => Err(RpcError::invalid_params(reason)),
-        }
+        self.state.with(|st| {
+            let target = st
+                .nodes
+                .iter()
+                .find(|n| n.name() == node)
+                .ok_or_else(|| RpcError::invalid_params(format!("unknown node {node:?}")))?;
+            match target.rotate() {
+                Ok(rotated_to) => Ok(json!({ "node": node, "rotated_to": rotated_to })),
+                Err(reason) => Err(RpcError::invalid_params(reason)),
+            }
+        })
     }
 
     /// Resolve a named serial node to its open port for a signal verb (§7.1),
     /// dropping the state borrow before the caller awaits (§15.20). Errors if the
     /// node is missing, not a serial node, or its device is not currently open.
     fn serial_port(&self, node: &str) -> Result<std::rc::Rc<serial2::SerialPort>, RpcError> {
-        let st = self.state.borrow();
-        let target = st
-            .nodes
-            .iter()
-            .find(|n| n.name() == node)
-            .ok_or_else(|| RpcError::invalid_params(format!("unknown node {node:?}")))?;
-        let serial = target.as_serial().ok_or_else(|| {
-            RpcError::invalid_params(format!("node {node:?} is not a serial node"))
-        })?;
-        serial.port().ok_or_else(|| {
-            RpcError::invalid_params(format!(
-                "serial node {node:?} has no open port (device absent/faulted)"
-            ))
+        self.state.with(|st| {
+            let target = st
+                .nodes
+                .iter()
+                .find(|n| n.name() == node)
+                .ok_or_else(|| RpcError::invalid_params(format!("unknown node {node:?}")))?;
+            let serial = target.as_serial().ok_or_else(|| {
+                RpcError::invalid_params(format!("node {node:?} is not a serial node"))
+            })?;
+            serial.port().ok_or_else(|| {
+                RpcError::invalid_params(format!(
+                    "serial node {node:?} has no open port (device absent/faulted)"
+                ))
+            })
         })
     }
 
@@ -653,7 +662,7 @@ impl Daemon {
         let outcome = if p.wait {
             self.wait_for_grant(cell.clone(), id, None).await
         } else {
-            let single = cell.borrow_mut().acquire(id);
+            let single = cell.with_mut(|g| g.acquire(id));
             match single {
                 Acquire::Granted => WaitOutcome::Fresh,
                 Acquire::AlreadyHeld => WaitOutcome::AlreadyHeld,
@@ -674,7 +683,7 @@ impl Daemon {
                 // longer fire — otherwise the earlier, shorter deadline would win
                 // and defeat the extension (§6 lease renewal).
                 if let Some(ms) = p.lease_ms {
-                    let generation = cell.borrow_mut().renew(id);
+                    let generation = cell.with_mut(|g| g.renew(id));
                     if let Some(generation) = generation {
                         cell.emit_change();
                         self.spawn_lease(cell.clone(), id, generation, ms);
@@ -703,7 +712,7 @@ impl Daemon {
     fn unlock(&self, params: Option<Value>) -> Result<Value, RpcError> {
         let origin = origin_param(&params)?.to_owned();
         let (cell, id) = self.resolve_origin(&origin)?;
-        let released = cell.borrow_mut().release(id);
+        let released = cell.with_mut(|g| g.release(id));
         if released {
             cell.wake_waiters();
             cell.emit_change();
@@ -719,8 +728,7 @@ impl Daemon {
     /// cleaned up, even on cancellation.
     async fn send(&self, params: Option<Value>) -> Result<Value, RpcError> {
         let p = SendParams::parse(&params)?;
-        let (cell, sender) = {
-            let st = self.state.borrow();
+        let (cell, sender) = self.state.with(|st| {
             let cell = st.endpoint_locks.get(&p.endpoint).cloned().ok_or_else(|| {
                 RpcError::invalid_params(format!(
                     "{:?} is not a host-facing endpoint with a write lock",
@@ -732,13 +740,13 @@ impl Daemon {
                 .get(&p.endpoint)
                 .cloned()
                 .ok_or_else(|| RpcError::internal("endpoint has no targetward path"))?;
-            (cell, sender)
-        };
+            Ok::<_, RpcError>((cell, sender))
+        })?;
         let id = self.next_send_origin();
         // Register the transient origin (§6). The guard unregisters it on every
         // exit path — success, timeout, or a dropped connection — and wakes the
         // next waiter, so a cancelled `send` costs nothing but its queue slot.
-        cell.borrow_mut().register(id, "send", WriteMode::OnDemand);
+        cell.with_mut(|g| g.register(id, "send", WriteMode::OnDemand));
         let guard = TransientOrigin {
             cell: cell.clone(),
             id,
@@ -747,7 +755,7 @@ impl Daemon {
 
         // Acquire the floor (steal, or join the queue with a deadline).
         if p.steal {
-            let _ = cell.borrow_mut().steal(id);
+            let _ = cell.with_mut(|g| g.steal(id));
             // Wake waiters so a parked `lock --wait` on the same origin observes it
             // now holds and returns, rather than parking forever (a steal removed it
             // from the queue). Other waiters simply re-check and re-park.
@@ -775,15 +783,15 @@ impl Daemon {
             }
         }
 
-        // Deliver the line targetward — a real backpressure point, but no `RefCell`
-        // borrow is held across this await (§15.20).
+        // Deliver the line targetward — a real backpressure point, but no state
+        // borrow is held across this await (structurally, via `CriticalCell`; §16.2).
         let mut bytes = p.line.into_bytes();
         bytes.push(b'\n');
         let sent = bytes.len();
         let delivered = sender.send(Chunk::from(bytes)).await.is_ok();
 
         // Release + unregister the transient origin, then wake the next waiter.
-        cell.borrow_mut().unregister(id);
+        cell.with_mut(|g| g.unregister(id));
         cell.wake_waiters();
         cell.emit_change();
         guard.disarm.set(true);
@@ -803,22 +811,24 @@ impl Daemon {
     /// Resolve a `lock`/`unlock` origin name to its endpoint's lock and origin id
     /// (§6). The origin (a target-facing writer) feeds exactly one endpoint (§4).
     fn resolve_origin(&self, origin: &str) -> Result<(SharedLock, OriginId), RpcError> {
-        let st = self.state.borrow();
-        st.origin_locks
-            .get(origin)
-            .map(|(cell, id)| (cell.clone(), *id))
-            .ok_or_else(|| {
-                RpcError::invalid_params(format!(
-                    "{origin:?} is not a writable origin on any endpoint"
-                ))
-            })
+        self.state.with(|st| {
+            st.origin_locks
+                .get(origin)
+                .map(|(cell, id)| (cell.clone(), *id))
+                .ok_or_else(|| {
+                    RpcError::invalid_params(format!(
+                        "{origin:?} is not a writable origin on any endpoint"
+                    ))
+                })
+        })
     }
 
     fn next_send_origin(&self) -> OriginId {
-        let st = self.state.borrow();
-        let id = st.next_send_origin.get();
-        st.next_send_origin.set(id.wrapping_add(1));
-        OriginId(id)
+        self.state.with(|st| {
+            let id = st.next_send_origin.get();
+            st.next_send_origin.set(id.wrapping_add(1));
+            OriginId(id)
+        })
     }
 
     /// Steal the lock for `origin` (§6): take it from the current holder, purge the
@@ -831,13 +841,14 @@ impl Daemon {
         id: OriginId,
         lease_ms: Option<u64>,
     ) -> Result<Value, RpcError> {
-        let outcome = cell.borrow_mut().steal(id);
+        let outcome = cell.with_mut(|g| g.steal(id));
         match outcome {
             Steal::ReadOnly => Err(RpcError::invalid_params(format!(
                 "origin {origin:?} is write=never and cannot hold the lock"
             ))),
             Steal::Stolen { previous } => {
-                let stole_from = previous.and_then(|p| cell.borrow().label(p).map(str::to_owned));
+                let stole_from =
+                    previous.and_then(|p| cell.with(|g| g.label(p).map(str::to_owned)));
                 self.purge_on_acquire(cell, origin, id);
                 // Wake waiters: a `lock --wait` parked on the *stolen* origin now
                 // holds the lock and must return (the steal dropped it from the
@@ -861,18 +872,17 @@ impl Daemon {
     /// no acquisition, so a grant there must not disturb in-flight bytes. Draining
     /// a fd is synchronous, so no borrow crosses an await.
     fn purge_on_acquire(&self, cell: &SharedLock, origin: &str, id: OriginId) {
-        if cell.borrow().arbitration() != Arbitration::Exclusive {
+        if cell.with(|g| g.arbitration()) != Arbitration::Exclusive {
             return;
         }
-        let purged = {
-            let st = self.state.borrow();
+        let purged = self.state.with(|st| {
             st.nodes
                 .iter()
                 .find(|n| n.name() == origin)
                 .map_or(0, |n| n.purge_origin())
-        };
+        });
         if purged > 0 {
-            cell.borrow_mut().record_purge(id, purged);
+            cell.with_mut(|g| g.record_purge(id, purged));
         }
     }
 
@@ -881,7 +891,7 @@ impl Daemon {
     fn after_grant(&self, cell: &SharedLock, id: OriginId, lease_ms: Option<u64>) {
         cell.emit_change();
         if let Some(ms) = lease_ms {
-            let generation = cell.borrow().generation();
+            let generation = cell.with(|g| g.generation());
             self.spawn_lease(cell.clone(), id, generation, ms);
         }
     }
@@ -898,15 +908,14 @@ impl Daemon {
             if cell.is_closed() {
                 return;
             }
-            let fired = {
-                let mut g = cell.borrow_mut();
+            let fired = cell.with_mut(|g| {
                 if g.holder() == Some(id) && g.generation() == generation {
                     g.release(id);
                     true
                 } else {
                     false
                 }
-            };
+            });
             if fired {
                 cell.wake_waiters();
                 cell.emit_change();
@@ -945,18 +954,15 @@ impl Daemon {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let settled = {
-                let mut g = cell.borrow_mut();
-                match g.acquire(id) {
-                    Acquire::Granted => Some(WaitOutcome::Fresh),
-                    Acquire::AlreadyHeld => Some(WaitOutcome::AlreadyHeld),
-                    Acquire::ReadOnly => Some(WaitOutcome::ReadOnly),
-                    Acquire::Denied { .. } => {
-                        g.enqueue(id);
-                        None
-                    }
+            let settled = cell.with_mut(|g| match g.acquire(id) {
+                Acquire::Granted => Some(WaitOutcome::Fresh),
+                Acquire::AlreadyHeld => Some(WaitOutcome::AlreadyHeld),
+                Acquire::ReadOnly => Some(WaitOutcome::ReadOnly),
+                Acquire::Denied { .. } => {
+                    g.enqueue(id);
+                    None
                 }
-            };
+            });
             if let Some(outcome) = settled {
                 guard.disarm.set(true);
                 return outcome;
@@ -975,7 +981,7 @@ impl Daemon {
     }
 
     fn locked_error(&self, cell: &SharedLock, held_by: OriginId) -> RpcError {
-        let holder = cell.borrow().label(held_by).map(str::to_owned);
+        let holder = cell.with(|g| g.label(held_by).map(str::to_owned));
         RpcError::new(
             app_errors::LOCKED,
             format!(
@@ -987,24 +993,25 @@ impl Daemon {
     }
 
     fn teardown(&self) -> Value {
-        let mut st = self.state.borrow_mut();
-        let count = st.nodes.len();
-        // Close every endpoint lock first: a parked `lock --wait`/`send` waiter may
-        // hold an `Rc` clone that outlives these map entries, so `close()` (which
-        // wakes it) lets it leave the queue with the defined teardown error rather
-        // than parking forever (§6/§15.20). Done before dropping the nodes so the
-        // wake precedes any task teardown.
-        for cell in st.endpoint_locks.values() {
-            cell.close();
-        }
-        for mut n in st.nodes.drain(..) {
-            n.teardown();
-        }
-        st.config = GraphConfig::default();
-        st.endpoint_locks.clear();
-        st.endpoint_targetward.clear();
-        st.origin_locks.clear();
-        json!({ "torn_down": count })
+        self.state.with_mut(|st| {
+            let count = st.nodes.len();
+            // Close every endpoint lock first: a parked `lock --wait`/`send` waiter may
+            // hold an `Rc` clone that outlives these map entries, so `close()` (which
+            // wakes it) lets it leave the queue with the defined teardown error rather
+            // than parking forever (§6/§15.20). Done before dropping the nodes so the
+            // wake precedes any task teardown.
+            for cell in st.endpoint_locks.values() {
+                cell.close();
+            }
+            for mut n in st.nodes.drain(..) {
+                n.teardown();
+            }
+            st.config = GraphConfig::default();
+            st.endpoint_locks.clear();
+            st.endpoint_targetward.clear();
+            st.origin_locks.clear();
+            json!({ "torn_down": count })
+        })
     }
 
     /// Tear down all nodes on clean shutdown (unlink PTY symlinks, drop ports).
@@ -1036,11 +1043,10 @@ impl Drop for WaiterGuard {
         if self.disarm.get() {
             return;
         }
-        let free = {
-            let mut g = self.cell.borrow_mut();
+        let free = self.cell.with_mut(|g| {
             g.dequeue(self.id);
             g.holder().is_none()
-        };
+        });
         if free {
             self.cell.wake_waiters();
         }
@@ -1063,11 +1069,10 @@ impl Drop for TransientOrigin {
         if self.disarm.get() {
             return;
         }
-        let free = {
-            let mut g = self.cell.borrow_mut();
+        let free = self.cell.with_mut(|g| {
             g.unregister(self.id);
             g.holder().is_none()
-        };
+        });
         if free {
             self.cell.wake_waiters();
         }

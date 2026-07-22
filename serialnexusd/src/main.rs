@@ -11,6 +11,7 @@
 //! serial and PTY node lifecycle. Byte flow and presence gating land next.
 
 mod boundary;
+mod cell;
 mod control;
 mod daemon;
 mod nodes;
