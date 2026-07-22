@@ -157,6 +157,21 @@ phase 4 scripts: `phase4/{exclusivity,purge,free-for-all,held,send,steal-lease,w
 phase 3 added `counters.sh`, `log.sh`, `log-enospc.sh`, `subscribe.sh`,
 `firehose.sh`, `exact-loss.sh`, `benchmark.sh`.
 
+**Hardware integration test (Tier-3, opt-in):**
+`scripts/validate/hardware/crossover-rig.sh` — the first end-to-end test on *real*
+silicon (design §13/§15.17/§15.21, plan §5). It requires exactly two USB-serial
+adapters wired together with a crossover UART cable (else it SKIPs, exit 0, a valid
+verdict) and self-judges with the usual `{"check":...,"pass":...}` line. It runs
+`nexus-doctor` P5 to certify the rig FIRST (the §15.21 precondition — a failure is
+attributed to a loose wire, not the daemon), then drives the daemon through the
+physical rig: identity resolution both directions (§12), byte-exact bidirectional
+data path (§4/§5/§7.1), the `send` verb, far-side break reception, TIOCEXCL
+exclusivity, exclusive arbitration (lock→LOCKED→steal, §6), slow-consumer
+drop-with-counters isolation (§5, exact `received+dropped==sent` accounting), and
+observable framing/parity error counters under deliberate baud/parity mismatch. Not
+in the per-push `all.sh` sweep (no hardware there); wire into a hardware CI lane if a
+rig exists. Verified passing on a cross-wired FTDI FT232R pair (~47s, deterministic).
+
 **Kernel matrix:** every kernel-behavior probe is `supported` on **Linux 7.0.0**
 (dev box, Ubuntu 26.04) and **Linux 6.18.14** (Debian rodete) with **zero
 deltas** — see `docs/nexus-doctor.md`. The kernel-sensitive PTY/serial mechanics
