@@ -895,8 +895,10 @@ ADR (nothing contradicted the design); the additions are all §13/§Phase-8 plan
   parameterized (`SOAK_SECONDS`, default 8 smoke / nightly 1800+) asserting bounded
   VmRSS, an allowlist of loss counters staying zero, zero faults, and a final
   source↔log checksum reconciliation. CI: the deterministic phase-8 gates run per-push
-  (the full `--through 8` sweep is not, to avoid the known `phase5/demux.sh` ~1/5
-  flake), plus the macOS lane and nightly soak/fuzz jobs (`schedule` cron).
+  (the full `--through 8` sweep is not, to keep per-push CI lean — the heavy phase-3
+  firehose/benchmark and multi-daemon topologies stay in the local suite), plus the
+  macOS lane and nightly soak/fuzz jobs (`schedule` cron). *(The `phase5/demux.sh`
+  flake that once justified capping the sweep is now fixed — see §7.)*
 - **⚠️ Audit fixes (5 confirmed, ALL FIXED; do NOT regress).** (1) **[HIGH] packaged
   log node faulted out-of-the-box** — the unit granted `/var/log/serialnexusd` via
   `ReadWritePaths`, which flips the mount but does NOT chown, so the `DynamicUser`
@@ -945,11 +947,28 @@ ADR (nothing contradicted the design); the additions are all §13/§Phase-8 plan
 - **`nexus-doctor` never gates the daemon:** runtime degradation paths (e.g.
   §7.2's poll) are unconditional, so a wrong probe misleads a developer but never
   the data plane. Keep it that way.
-- **Known pre-existing flake — `phase5/demux.sh` (~1 in 5 under load).** A timing
-  race in the *test*, not the daemon: the mux feed is released (`--wait-file` GO)
-  once every channel client reports `client_present==true`, but a client's slave
-  can be open (present) a beat before its read loop is draining, so under machine
-  load the initial burst can outrun the consumer and the presence-gated PTY drops
-  it, failing the byte-exact manifest check. Untouched by phase 6 (the demux path
-  is unchanged). A robust fix would gate GO on the clients actually reading (a
-  first-byte handshake), not just presence — a phase-5 test-fidelity follow-up.
+- **`phase5/demux.sh` presence-vs-readiness flake — FIXED (test-fidelity only; no
+  daemon change).** The former ~1-in-5-under-load flake was a race in the *test*: the
+  mux burst was released once every channel client reported `client_present==true`,
+  but a slave can be open (present) a beat before its read loop is draining, so under
+  load the burst outran the not-yet-reading consumer and the lossy presence-gated PTY
+  shed the head, failing the byte-exact manifest check. The fix is entirely in the
+  test double and the harness (plan §3's "presence is not readiness"):
+  - **First-byte handshake (the prescribed fix).** `nexus-sim mux` gained
+    `--prime-file`/`--prime-bytes` and `client` gained `--skip`/`--ready-file`. Two
+    phases: once the clients are present, the mux sends a small primer per channel
+    (small enough that a present-but-not-yet-draining PTY buffers rather than drops
+    it, so it reliably arrives); each client discards the primer and creates its
+    ready-file *on the first byte it reads back* — proof it is draining, not merely
+    present; only then does the harness release the payload burst, which can no longer
+    outrun a parked reader.
+  - **Isolate correctness from drop policy.** The channel PTYs set `hostward_buffer =
+    512` so the whole burst is held (this test checks demux *correctness*, not the
+    §5 drop policy — that is `exact-loss.sh`/`counters.sh`), and the client read
+    buffer grew to 64 KiB so a fast, well-buffered stream drains in few syscalls.
+  - **Right-sized for CPU starvation.** The burst dropped to 256 KiB/channel (256
+    round-robin frames — full demux coverage) with a 90 s ceiling, so the
+    single-threaded daemon completes it comfortably even when heavily CPU-starved,
+    rather than the test being hostage to scheduling. Verified: **0 failures in 35
+    runs under a fully CPU-saturated box (8 `yes` hogs on 8 cores) and under the
+    fair ~4×CPU-load bar** — where the pre-fix test failed ~20-40%.

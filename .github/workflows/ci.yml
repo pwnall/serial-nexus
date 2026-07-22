@@ -80,9 +80,9 @@ jobs:
         run: cargo build --workspace --locked
       - name: Run validation scripts (through phase 3)
         run: bash scripts/validate/all.sh --through 3
-      # The phase-8 release gates are deterministic, so they run per-push here even
-      # though the full --through 8 sweep is not (phase5/demux.sh has a known ~1/5
-      # presence-race flake in the test, tracked separately).
+      # The phase-8 release gates are deterministic, so they run per-push here. The
+      # full --through 8 sweep stays out of per-push CI to keep it lean (the heavy
+      # phase-3 firehose/benchmark and multi-daemon topologies run in the local suite).
       - name: Phase 8 release gates (quickstart, agent-task, soak smoke)
         run: |
           bash scripts/validate/phase8/quickstart.sh

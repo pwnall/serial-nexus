@@ -19,7 +19,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -179,6 +179,17 @@ struct ClientArgs {
     /// send. Mutually exclusive with `--drain`.
     #[arg(long)]
     recv: Option<String>,
+    /// Handshake for the demux burst (plan §3, presence != readiness): read and
+    /// DISCARD this many leading "primer" bytes before counting/checksumming the
+    /// `--recv` payload. Paired with the mux's `--prime-bytes`. 0 = no primer.
+    #[arg(long, default_value_t = 0)]
+    skip: usize,
+    /// Handshake: create this file the instant the read loop reads its first byte
+    /// (the primer) — proof the client is actively draining, not merely present. The
+    /// harness gates the payload burst on this, closing the presence-vs-readiness
+    /// race that made the initial burst outrun a not-yet-reading client.
+    #[arg(long)]
+    ready_file: Option<PathBuf>,
     /// Read the hostward stream until it goes quiet (no bytes for `--quiet-ms`),
     /// counting every byte — the fully-draining reader for exact loss accounting.
     /// Combine with `--read-rate` to be a slow consumer. Does not send.
@@ -230,6 +241,17 @@ struct MuxArgs {
     /// first, so the presence-gated PTYs do not discard the initial burst.
     #[arg(long)]
     wait_file: Option<PathBuf>,
+    /// Feed handshake (plan §3, presence != readiness): once this file exists (the
+    /// clients are present), send a small `--prime-bytes` primer per channel BEFORE
+    /// waiting on `--wait-file`. A primer small enough never to overflow a
+    /// presence-gated PTY reliably reaches each client and lets it prove it is
+    /// draining (its `--ready-file`), so the payload burst (gated on `--wait-file`)
+    /// cannot outrun a not-yet-reading client. Requires `--prime-bytes > 0`.
+    #[arg(long)]
+    prime_file: Option<PathBuf>,
+    /// Bytes of primer to send per channel before the payload (0 = no primer).
+    #[arg(long, default_value_t = 0)]
+    prime_bytes: usize,
     #[arg(long, default_value_t = 10_000)]
     timeout_ms: u64,
 }
@@ -734,6 +756,8 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
                 None
             },
             a.timeout_ms,
+            a.skip,
+            a.ready_file.as_deref(),
         )?;
         let pass = target.is_none_or(|t| received as usize == t);
         return Ok(json!({
@@ -837,12 +861,21 @@ fn recv_loop<F: AsFd + Read>(
     read_rate: Option<u64>,
     quiet_ms: Option<u64>,
     timeout_ms: u64,
+    skip: usize,
+    ready_file: Option<&Path>,
 ) -> anyhow::Result<(u64, String)> {
     let start = Instant::now();
     let deadline = start + Duration::from_millis(timeout_ms);
+    // `received`/`hasher` cover the PAYLOAD only; the leading `to_skip` primer bytes
+    // are read and discarded (the presence-vs-readiness handshake, plan §3).
     let mut received: u64 = 0;
+    let mut to_skip = skip;
+    let mut ready_signalled = false;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8192];
+    // A generous read buffer so a fast, well-buffered hostward stream drains in few
+    // syscalls — under heavy CPU contention a per-frame (4 KiB) read cadence is
+    // scheduling-bound, so grabbing up to 64 KiB per read keeps a demux burst moving.
+    let mut buf = vec![0u8; 64 * 1024];
     let mut last_data = Instant::now();
     loop {
         if target.is_some_and(|t| received as usize >= t) {
@@ -864,13 +897,34 @@ fn recv_loop<F: AsFd + Read>(
         // Short poll timeout so the quiet/deadline checks keep making progress.
         let re = wait_readable(&fd, 200)?;
         if re.contains(PollFlags::POLLIN) {
-            // Never overshoot a fixed target.
-            let cap = target.map_or(buf.len(), |t| (t - received as usize).min(buf.len()));
+            // While still skipping the primer, read a full buffer (we must consume
+            // the whole primer, which may straddle a read into the payload); once
+            // past it, never overshoot the target.
+            let cap = if to_skip > 0 {
+                buf.len()
+            } else {
+                target.map_or(buf.len(), |t| (t - received as usize).min(buf.len()))
+            };
             match fd.read(&mut buf[..cap]) {
                 Ok(0) => break,
                 Ok(k) => {
-                    hasher.update(&buf[..k]);
-                    received += k as u64;
+                    // The first byte back proves the read loop is live and draining —
+                    // signal readiness so the harness can release the payload burst.
+                    if !ready_signalled {
+                        if let Some(rf) = ready_file {
+                            std::fs::File::create(rf)?;
+                        }
+                        ready_signalled = true;
+                    }
+                    // Discard up to `to_skip` primer bytes; the remainder is payload.
+                    let d = to_skip.min(k);
+                    to_skip -= d;
+                    let payload = &buf[d..k];
+                    let take = payload
+                        .len()
+                        .min(target.map_or(usize::MAX, |t| t - received as usize));
+                    hasher.update(&payload[..take]);
+                    received += take as u64;
                     last_data = Instant::now();
                 }
                 Err(e) if is_eio(&e) => break,
@@ -983,6 +1037,17 @@ fn build_mux(
     })
 }
 
+/// Poll until `path` exists or `deadline` passes (the feed handshake gates, §3).
+fn wait_for_file(path: &Path, deadline: Instant) -> anyhow::Result<()> {
+    while !path.exists() {
+        if Instant::now() >= deadline {
+            anyhow::bail!("wait-file {} never appeared", path.display());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
 fn manifest_json(plan: &MuxPlan, behavior: &str, extra: Value) -> Value {
     let channels: Vec<Value> = plan
         .channels
@@ -1040,16 +1105,29 @@ fn run_mux_inner(a: &MuxArgs) -> anyhow::Result<Value> {
     let _ = std::fs::remove_file(link);
     std::os::unix::fs::symlink(&pts, link)?;
 
-    // Optionally wait for the harness's go-signal (the channel clients attached)
-    // before feeding, so the presence-gated demux PTYs do not discard the burst.
+    // Two-phase feed handshake (plan §3 — presence is not readiness). When a primer
+    // is configured, first wait for the clients to be present (`--prime-file`) and
+    // send a small primer per channel: small enough that a present-but-not-yet-
+    // draining PTY buffers rather than drops it, so every client reads a byte and
+    // proves it is draining (creating its `--ready-file`). Only then does the harness
+    // release the real burst via `--wait-file`, which can no longer outrun a reader
+    // that is already parked in its read loop.
+    if a.prime_bytes > 0 {
+        let deadline = Instant::now() + Duration::from_millis(a.timeout_ms);
+        if let Some(prime) = &a.prime_file {
+            wait_for_file(prime, deadline)?;
+        }
+        let mut primer = Vec::new();
+        for ch in &a.channels {
+            let ev = Event::data(ch.as_str(), Bytes::from(vec![0u8; a.prime_bytes]));
+            encode(&ev, &mut primer).map_err(|e| anyhow::anyhow!("encode primer: {e}"))?;
+        }
+        master.write_all(&primer)?;
+        master.flush()?;
+    }
     if let Some(go) = &a.wait_file {
         let deadline = Instant::now() + Duration::from_millis(a.timeout_ms);
-        while !go.exists() {
-            if Instant::now() >= deadline {
-                anyhow::bail!("wait-file {} never appeared", go.display());
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+        wait_for_file(go, deadline)?;
     }
 
     // Write the whole framed stream. A blocking master write backpressures against
