@@ -42,7 +42,7 @@ bash "$WAIT" "test -S '$SOCK'" 5 0.05 || { cat "$TMPD/daemon.log"; fail "socket 
 
 SIZE_B=$((256 * 1024 * 1024))
 "$SIM" pty --source --bytes 256MiB --seed 7 --link "$TMPD/dev" --timeout-ms 120000 >"$TMPD/src.json" 2>&1 & SRC=$!
-PIDS+=($SRC)
+PIDS+=("$SRC")
 bash "$WAIT" "test -e '$TMPD/dev'" 5 0.05 || fail "device never appeared"
 printf '[[node]]\ntype="serial"\nname="usb0"\ndevice="%s"\n[[node]]\ntype="log"\nname="sink"\ndirectory="%s"\nfilename="bench.log"\n[[edge]]\na="usb0"\nb="sink"\n' "$TMPD/dev" "$TMPD" > "$TMPD/tp.toml"
 T0=$(date +%s.%N)
@@ -61,9 +61,9 @@ MBPS=$(echo "scale=1; $SIZE_B / 1048576 / ($T1 - $T0)" | bc)
 "$C" load "$TMPD/idle.toml" >/dev/null || { cat "$TMPD/daemon.log"; fail "idle load failed"; }
 [ "$("$C" --json state | jq '.nodes|length')" = "$IDLE_FDS" ] || fail "expected $IDLE_FDS idle nodes"
 CLK=$(getconf CLK_TCK)
-read u1 s1 < <(awk '{print $14, $15}' "/proc/$DPID/stat")
+read -r u1 s1 < <(awk '{print $14, $15}' "/proc/$DPID/stat")
 sleep 3
-read u2 s2 < <(awk '{print $14, $15}' "/proc/$DPID/stat")
+read -r u2 s2 < <(awk '{print $14, $15}' "/proc/$DPID/stat")
 IDLE_CPU=$(echo "scale=2; (($u2 + $s2) - ($u1 + $s1)) / ($CLK * 3) * 100" | bc)
 
 "$C" shutdown >/dev/null

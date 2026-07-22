@@ -37,7 +37,7 @@ start_daemon
 # ---- Check 1: the log captures the whole hostward stream, no loss (§7.3) ----
 DEV1="$TMPD/dev1"; SRCJSON="$TMPD/src1.json"
 "$SIM" pty --source --bytes 256KiB --seed 7 --link "$DEV1" >"$SRCJSON" 2>"$TMPD/src1.err" &
-SRCPID=$!; PIDS+=($SRCPID)
+SRCPID=$!; PIDS+=("$SRCPID")
 bash "$WAIT" "test -e '$DEV1'" 5 0.05 || fail "dev1 never appeared"
 
 cat > "$TMPD/c1.toml" <<EOF
@@ -98,7 +98,6 @@ b = "rot"
 EOF
 "$C" load "$TMPD/c2.toml" >/dev/null || { cat "$TMPD/daemon.log"; fail "load c2 failed"; }
 
-declare -a BATCHSHA
 send_batch() { # $1=seed  -> echoes 32KiB, returns after the log has it
   local seed=$1 v
   v=$("$SIM" client --path "$TTY2" --send seeded:32KiB --expect echo --seed "$seed" --timeout-ms 15000)

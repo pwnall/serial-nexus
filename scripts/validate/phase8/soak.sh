@@ -20,6 +20,8 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
+# shellcheck source=scripts/lib/assert.sh
+source "$REPO_ROOT/scripts/lib/assert.sh"
 fail() { echo "{\"check\":\"phase8-soak\",\"pass\":false,\"reason\":\"$*\"}"; exit 1; }
 
 SOAK_SECONDS=${SOAK_SECONDS:-8}
@@ -98,9 +100,11 @@ while [ $(( SECONDS - START )) -lt "$SOAK_SECONDS" ]; do
   # (3) no unexplained faulted nodes.
   echo "$st" | jq -e '[.nodes[]|select(.status=="faulted")]|length==0' >/dev/null \
     || { echo "$st" | jq -c '[.nodes[]|select(.status=="faulted")|{name,reason}]' >&2; fail "a node faulted mid-soak"; }
-  # (2) allowlist: every drop/discard/purge counter across the graph stays at zero.
-  echo "$st" | jq -e '([.. | objects | to_entries[] | select(.key|test("drop|discard|purge")) | .value | numbers] | add // 0) == 0' >/dev/null \
-    || { echo "$st" | jq -c '[.. | objects | to_entries[] | select((.key|test("drop|discard|purge")) and (.value|numbers) and .value>0)]' >&2; fail "a loss counter grew on the keep-up baseline"; }
+  # (2) allowlist: every drop/discard/purge counter across the graph stays at zero,
+  # via the shared, self-tested helper (§16.5) — no hand-inlined jq that could carry
+  # the precedence tautology the phase-8 audit caught.
+  echo "$st" | assert_loss_counters_zero \
+    || { echo "$st" | loss_counters_nonzero >&2; fail "a loss counter grew on the keep-up baseline"; }
 
   samples=$(( samples + 1 ))
   sleep "$SOAK_INTERVAL"

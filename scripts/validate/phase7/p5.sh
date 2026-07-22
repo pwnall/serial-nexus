@@ -41,13 +41,13 @@ sleep 0.3
 jq -e '.probes[]|select(.id=="P5")|.status=="supported"' "$TMPD/r1.json" >/dev/null \
   || { jq -c '.probes[]|select(.id=="P5")' "$TMPD/r1.json"; fail "P5 run 1 not supported"; }
 obs1() { jq -r --arg k "$TMPD/$1" '.probes[]|select(.id=="P5")|.observations[]|select(.key==$k)|.value' "$TMPD/r1.json"; }
-echo "$(obs1 pair_a)" | grep -q "paired with $TMPD/pair_b" || fail "pair_a not paired (got: $(obs1 pair_a))"
-echo "$(obs1 pair_b)" | grep -q "paired with $TMPD/pair_a" || fail "pair_b not paired both-directions (got: $(obs1 pair_b))"
-echo "$(obs1 dangle)" | grep -qi 'dangling' || fail "dangle not classified dangling (got: $(obs1 dangle))"
+obs1 pair_a | grep -q "paired with $TMPD/pair_b" || fail "pair_a not paired (got: $(obs1 pair_a))"
+obs1 pair_b | grep -q "paired with $TMPD/pair_a" || fail "pair_b not paired both-directions (got: $(obs1 pair_b))"
+obs1 dangle | grep -qi 'dangling' || fail "dangle not classified dangling (got: $(obs1 dangle))"
 # Characterization skips the non-UART pts.
 cert1() { jq -r --arg k "$TMPD/$1 cert" '.probes[]|select(.id=="P5")|.observations[]|select(.key==$k)|.value' "$TMPD/r1.json"; }
 for f in pair_a pair_b dangle; do
-  echo "$(cert1 "$f")" | grep -qi 'not a UART' || fail "$f characterization not skipped(not a UART) (got: $(cert1 "$f"))"
+  cert1 "$f" | grep -qi 'not a UART' || fail "$f characterization not skipped(not a UART) (got: $(cert1 "$f"))"
 done
 
 # ---- Run 2: loopback ---------------------------------------------------------

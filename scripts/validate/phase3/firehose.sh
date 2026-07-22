@@ -37,7 +37,7 @@ bash "$WAIT" "test -S '$SOCK'" 5 0.05 || { cat "$TMPD/daemon.log"; fail "socket 
 
 DEV="$TMPD/dev"
 "$SIM" pty --source --bytes "$SIZE_H" --seed 7 --link "$DEV" --timeout-ms 120000 >"$TMPD/src.json" 2>"$TMPD/src.err" &
-SRCPID=$!; PIDS+=($SRCPID)
+SRCPID=$!; PIDS+=("$SRCPID")
 bash "$WAIT" "test -e '$DEV'" 5 0.05 || fail "device never appeared"
 
 cat > "$TMPD/c.toml" <<EOF

@@ -39,7 +39,7 @@ DEV="$TMPD/dev"
 # present while the boundary sheds, so drops are slow-consumer drops, not
 # discards-while-absent — and still far faster than the client's 4 MB/s.
 "$SIM" pty --source --bytes "$SIZE_H" --seed 7 --rate 20000000 --link "$DEV" --timeout-ms 120000 >"$TMPD/src.json" 2>"$TMPD/src.err" &
-SRCPID=$!; PIDS+=($SRCPID)
+SRCPID=$!; PIDS+=("$SRCPID")
 bash "$WAIT" "test -e '$DEV'" 5 0.05 || fail "device never appeared"
 
 TTY="$TMPD/console"

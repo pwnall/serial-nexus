@@ -43,6 +43,22 @@ jobs:
       - name: Prove the gate rejects a banned crate
         run: bash scripts/validate/phase0/license-gate.sh
 
+  # Harness hygiene (post-1.0 §9.4, design §16.5): shellcheck every validation
+  # script, run the jq-lint, and run the assertion-helper self-test (which pins the
+  # soak's jq-precedence tautology dead). Fast — no workspace build.
+  harness-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck and jq
+        run: sudo apt-get update && sudo apt-get install -y shellcheck jq
+      - name: shellcheck the validation scripts
+        run: find scripts -name '*.sh' -print0 | xargs -0 shellcheck
+      - name: jq-lint
+        run: bash scripts/validate/phase0/jq-lint.sh
+      - name: Assertion-helper self-test
+        run: bash scripts/validate/phase0/harness-selftest.sh
+
   # Capability report (design §15.17): run every probe on the runner, assert the
   # platform expectation, and archive the Markdown so every capability claim has
   # a dated report behind it. `skipped(no adapter)` is a valid CI verdict.
@@ -135,6 +151,33 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
       - name: Soak (30 minutes)
         run: SOAK_SECONDS=1800 SOAK_INTERVAL=30 bash scripts/validate/phase8/soak.sh
+
+  # Nightly full sweep (post-1.0 §9.5, design §16.5): the complete deterministic
+  # `--through 8` validation suite, promoted from local-only to CI — "a validation
+  # suite that only runs on the author's machine is a reliability claim on the honor
+  # system." Its aggregated verdict JSON is archived as the run's evidence.
+  sweep-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install jq, shellcheck, cargo-deny
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq shellcheck
+          cargo install cargo-deny --locked
+      - name: Build workspace
+        run: cargo build --workspace --locked
+      - name: Full deterministic sweep (--through 8)
+        run: bash scripts/validate/all.sh --through 8 --json-summary sweep-verdicts.json
+      - name: Assert the sweep passed
+        run: jq -e '.failed == 0 and .total >= 42' sweep-verdicts.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweep-verdicts
+          path: sweep-verdicts.json
 
   # Nightly fuzzing (§Phase 8): the frame and envelope parsers, on top of the
   # existing proptest coverage. Needs a nightly toolchain and libFuzzer.
