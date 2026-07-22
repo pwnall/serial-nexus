@@ -404,6 +404,17 @@ fn p5_certify_port(port: &Path) -> String {
     format!("custom_baud={custom_baud_ok} break={break_ok} modem[{modem}] icounter={icounter}")
 }
 
+/// After (re)opening a port at a new baud, wait for the adapter to apply the new
+/// line rate before the first byte. Real-hardware finding (first live P5 pair-cert
+/// run, §15.21 "recalibrate the doctor against real adapters"): an FTDI transmits
+/// or samples the very first bytes after `open`+`set_baud_rate` at a transitional
+/// rate, so a single-shot exchange with no settle sees GARBLED bytes at 115200 and
+/// above (9600 is forgiving). Discovery is immune only by accident — it opens once
+/// and re-sends every 500 ms, so later sends land after the line settles; the
+/// single-shot certificate has no such cushion and must settle explicitly. The
+/// doctor is a diagnostic, not a data path, so the milliseconds cost nothing.
+const P5_OPEN_SETTLE: Duration = Duration::from_millis(150);
+
 /// The paired-rig certificate (§15.21), only meaningful on independently clocked
 /// UARTs: a rate ladder including a nonstandard rate (all must round-trip), and a
 /// deliberate baud mismatch that must corrupt the nonce and raise the frame-error
@@ -419,12 +430,18 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> String {
         ) else {
             return "pair reopen failed".into();
         };
-        let nonce = format!("\x02LADDER-{baud}\x03").into_bytes();
-        let _ = p5_write_all(&a, &nonce);
-        std::thread::sleep(Duration::from_millis(120));
-        let got = p5_drain(&b, Duration::from_millis(300));
-        if !contains_sub(&got, &nonce) {
-            ladder_ok = false;
+        std::thread::sleep(P5_OPEN_SETTLE); // let both adapters apply the new baud
+        // §15.21 "all must round-trip": certify BOTH directions at each rate, not
+        // just a→b. A one-way ladder leaves 9600/nonstandard uncertified b→a (and
+        // discovery runs only at 115200), so a half-working reverse path would pass.
+        for (tx, rx, dir) in [(&a, &b, "AB"), (&b, &a, "BA")] {
+            let nonce = format!("\x02LADDER-{baud}-{dir}\x03").into_bytes();
+            let _ = p5_write_all(tx, &nonce);
+            std::thread::sleep(Duration::from_millis(120));
+            let got = p5_drain(rx, Duration::from_millis(300));
+            if !contains_sub(&got, &nonce) {
+                ladder_ok = false;
+            }
         }
     }
     // Deliberate baud mismatch: TX at 115200, RX at 9600 — the nonce must NOT
@@ -436,17 +453,23 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> String {
         ) else {
             return format!("rate_ladder={ladder_ok} mismatch=reopen-failed");
         };
+        std::thread::sleep(P5_OPEN_SETTLE); // settle both ends before the mismatch probe
         let before = sys::read_icounter(b.as_raw_fd())
             .map(|c| c.frame)
             .unwrap_or(0);
-        let nonce = b"\x02MISMATCH-PROBE-PATTERN\x03";
-        let _ = p5_write_all(&a, nonce);
+        // A single ~24-byte nonce raises the frame counter only probabilistically
+        // (few mismatched frames land in the window), which made this observation
+        // flaky on real hardware. Send the pattern repeated to ~768 bytes so many
+        // mismatched frames reach the 9600 receiver and the counter reliably rises.
+        let unit = b"\x02MISMATCH-PROBE-PATTERN\x03";
+        let bulk: Vec<u8> = unit.iter().cycle().take(unit.len() * 32).copied().collect();
+        let _ = p5_write_all(&a, &bulk);
         std::thread::sleep(Duration::from_millis(150));
         let got = p5_drain(&b, Duration::from_millis(300));
         let after = sys::read_icounter(b.as_raw_fd())
             .map(|c| c.frame)
             .unwrap_or(before);
-        !contains_sub(&got, nonce) && after > before
+        !contains_sub(&got, unit) && after > before
     };
     format!("rate_ladder={ladder_ok} deliberate_mismatch_observed={mismatch_observed}")
 }
