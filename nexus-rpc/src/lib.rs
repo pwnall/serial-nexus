@@ -279,8 +279,131 @@ pub mod error_codes {
 
     /// Application errors live in the reserved implementation-defined range
     /// [-32099, -32000]; the daemon assigns specific meanings (e.g. a locked
-    /// endpoint) within it.
+    /// endpoint) within it — see [`super::AppError`], the single registry (§16.8).
     pub const APP_ERROR_BASE: i64 = -32000;
+}
+
+/// Every **application** error code the daemon can emit, in the reserved
+/// implementation-defined range [-32099, -32000] (§10). This enum is the single
+/// registry (§16.8): a new code is a new variant, so it cannot be emitted without a
+/// stable name and a one-line meaning, and the `docs/rpc` error table plus the
+/// no-duplicate-codes invariant are asserted from it. Application codes had grown
+/// ad hoc to five and a docs audit caught an undocumented one; defining them once
+/// here makes drift a test-time fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppError {
+    /// `load` attempted on a non-empty graph (§11 load-on-empty).
+    LoadNonEmpty,
+    /// A structural validation failure (§4); `data.errors` lists the messages.
+    Structural,
+    /// A contended `lock`/`send` was refused (§6); `data.held_by` names the holder.
+    Locked,
+    /// `remove-node` refused because edges are attached and `--cascade` was absent.
+    HasEdges,
+    /// `add-node` by raw path/serial with the device absent (§12).
+    DeviceAbsent,
+}
+
+impl AppError {
+    /// Every application error, in code order — the registry's application half.
+    pub const ALL: &'static [AppError] = &[
+        AppError::LoadNonEmpty,
+        AppError::Structural,
+        AppError::Locked,
+        AppError::HasEdges,
+        AppError::DeviceAbsent,
+    ];
+
+    /// The numeric code, offset from [`error_codes::APP_ERROR_BASE`].
+    pub const fn code(self) -> i64 {
+        error_codes::APP_ERROR_BASE
+            - match self {
+                AppError::LoadNonEmpty => 1,
+                AppError::Structural => 2,
+                AppError::Locked => 3,
+                AppError::HasEdges => 4,
+                AppError::DeviceAbsent => 5,
+            }
+    }
+
+    /// The stable short name shown in the docs table.
+    pub const fn name(self) -> &'static str {
+        match self {
+            AppError::LoadNonEmpty => "load on non-empty graph",
+            AppError::Structural => "structural error",
+            AppError::Locked => "locked",
+            AppError::HasEdges => "has edges",
+            AppError::DeviceAbsent => "device absent",
+        }
+    }
+
+    /// A one-line meaning for the docs table.
+    pub const fn summary(self) -> &'static str {
+        match self {
+            AppError::LoadNonEmpty => "`load` without `replace` while a graph is already loaded",
+            AppError::Structural => {
+                "configuration failed validation; `data.errors` is the list of messages"
+            }
+            AppError::Locked => {
+                "a contended `lock`/`send` was refused; `data.held_by` names the holder when known"
+            }
+            AppError::HasEdges => {
+                "`remove-node` refused because edges are still attached and `--cascade` was not given"
+            }
+            AppError::DeviceAbsent => {
+                "`add-node` by raw path or serial number, but the device is not present so its identity cannot be captured (§12)"
+            }
+        }
+    }
+}
+
+/// One documented error code: its number, a stable short name, and a one-line
+/// meaning. [`error_code_registry`] assembles these for the `docs/rpc` table and
+/// the docs↔behavior test (§16.8).
+pub struct ErrorCodeDoc {
+    pub code: i64,
+    pub name: &'static str,
+    pub summary: &'static str,
+}
+
+/// Every code the daemon can emit — the standard JSON-RPC codes followed by the
+/// application codes — as the single source for the `docs/rpc` error table. A test
+/// asserts the table matches this registry, so an unregistered or undocumented code
+/// is caught at test time (§16.8).
+pub fn error_code_registry() -> Vec<ErrorCodeDoc> {
+    let mut v = vec![
+        ErrorCodeDoc {
+            code: error_codes::PARSE_ERROR,
+            name: "parse error",
+            summary: "the line was not valid JSON (`id: null`)",
+        },
+        ErrorCodeDoc {
+            code: error_codes::INVALID_REQUEST,
+            name: "invalid request",
+            summary: "not a valid request object, wrong `jsonrpc` version, or a rejected batch array (`id: null`)",
+        },
+        ErrorCodeDoc {
+            code: error_codes::METHOD_NOT_FOUND,
+            name: "method not found",
+            summary: "unknown method — the graceful version-skew signal (§15.16)",
+        },
+        ErrorCodeDoc {
+            code: error_codes::INVALID_PARAMS,
+            name: "invalid params",
+            summary: "missing or malformed params for a known method",
+        },
+        ErrorCodeDoc {
+            code: error_codes::INTERNAL_ERROR,
+            name: "internal error",
+            summary: "an unexpected daemon-side failure",
+        },
+    ];
+    v.extend(AppError::ALL.iter().map(|&e| ErrorCodeDoc {
+        code: e.code(),
+        name: e.name(),
+        summary: e.summary(),
+    }));
+    v
 }
 
 /// A message read from the daemon by a client: either a correlated [`Response`]
@@ -451,5 +574,71 @@ mod tests {
             let parsed = parse_incoming_request(&to_line(&req)).unwrap();
             assert_eq!(parsed.id, id);
         }
+    }
+
+    // --- error-code registry (§16.8) ---------------------------------------------
+
+    #[test]
+    fn registry_has_no_duplicate_codes() {
+        let mut seen = std::collections::BTreeSet::new();
+        for d in error_code_registry() {
+            assert!(
+                seen.insert(d.code),
+                "duplicate error code {} in the registry",
+                d.code
+            );
+        }
+    }
+
+    #[test]
+    fn app_codes_are_in_the_reserved_range() {
+        // JSON-RPC 2.0 reserves [-32099, -32000] for implementation-defined errors.
+        for &e in AppError::ALL {
+            let c = e.code();
+            assert!(
+                (-32099..=-32000).contains(&c),
+                "app code {c} ({}) is outside the reserved range",
+                e.name()
+            );
+        }
+    }
+
+    /// The `docs/rpc` error table is asserted from the registry: the set of codes
+    /// documented there must equal the set the daemon can emit. This is the test the
+    /// §16.8 docs audit motivated — it fails if a code exists but is undocumented
+    /// (the original `-32001` bug) or if the docs list a code the daemon cannot emit.
+    #[test]
+    fn docs_rpc_table_matches_the_registry() {
+        let readme = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../docs/rpc/README.md"
+        ))
+        .expect("docs/rpc/README.md is readable from the workspace");
+
+        let registry: std::collections::BTreeSet<i64> =
+            error_code_registry().iter().map(|d| d.code).collect();
+
+        // Every registry code must be documented as a backtick-wrapped literal in
+        // the table (the JSON example uses bare `"code":-32003`, so backticks
+        // distinguish table rows).
+        for &code in &registry {
+            assert!(
+                readme.contains(&format!("`{code}`")),
+                "error code {code} is in the registry but not documented in docs/rpc/README.md"
+            );
+        }
+
+        // Every backtick-wrapped error code in the docs must be a real registry code
+        // — the reserved [-32768, -32000] range picks out error codes and excludes
+        // the mode literals (`0600`, `0660`) elsewhere in the page.
+        let documented: std::collections::BTreeSet<i64> = readme
+            .split('`')
+            .filter_map(|t| t.trim().parse::<i64>().ok())
+            .filter(|c| (-32768..=-32000).contains(c))
+            .collect();
+        assert_eq!(
+            documented, registry,
+            "docs/rpc/README.md documents a code set that differs from the registry"
+        );
     }
 }

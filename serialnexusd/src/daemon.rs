@@ -48,22 +48,17 @@ const DEFAULT_SEND_TIMEOUT_MS: u64 = 2000;
 /// real one on the same endpoint (§6).
 const SEND_ORIGIN_BASE: u64 = 1 << 40;
 
-/// Daemon-specific error codes, in the reserved application range (§10).
+/// Daemon-specific error codes, in the reserved application range (§10). Defined
+/// once in [`nexus_rpc::AppError`] (§16.8); these are const projections of that
+/// single registry, so the call sites keep naming `app_errors::X` while the codes,
+/// names, and docs table all derive from one source.
 pub mod app_errors {
-    use nexus_rpc::error_codes::APP_ERROR_BASE;
-    /// `load` attempted on a non-empty graph (§11 load-on-empty).
-    pub const LOAD_NONEMPTY: i64 = APP_ERROR_BASE - 1;
-    /// A structural validation failure (§4).
-    pub const STRUCTURAL: i64 = APP_ERROR_BASE - 2;
-    /// A `lock`/`send` was refused because another origin holds the endpoint's
-    /// write lock (§6) — a plain contended acquire, or a `send` at its deadline.
-    pub const LOCKED: i64 = APP_ERROR_BASE - 3;
-    /// `remove-node` refused because the node still has attached edges and
-    /// `--cascade` was not given (§11).
-    pub const HAS_EDGES: i64 = APP_ERROR_BASE - 4;
-    /// `add-node` by raw path or serial number failed because the device is not
-    /// present, so its identity cannot be captured (§12).
-    pub const DEVICE_ABSENT: i64 = APP_ERROR_BASE - 5;
+    use nexus_rpc::AppError;
+    pub const LOAD_NONEMPTY: i64 = AppError::LoadNonEmpty.code();
+    pub const STRUCTURAL: i64 = AppError::Structural.code();
+    pub const LOCKED: i64 = AppError::Locked.code();
+    pub const HAS_EDGES: i64 = AppError::HasEdges.code();
+    pub const DEVICE_ABSENT: i64 = AppError::DeviceAbsent.code();
 }
 
 #[derive(Default)]
