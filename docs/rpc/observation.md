@@ -4,10 +4,10 @@ Methods that report *observed* state — the environment-owned half of the stric
 split (§15.8). Observed state is never persisted and, by construction, absent
 from every configuration type: the fields here simply do not exist in `dump`.
 
-Methods on this page: [`state`](#state), [`subscribe`](#subscribe). This page
-also documents the [notification stream](#notifications) `subscribe` opens and
-the [`LockSnapshot`](#locksnapshot) shape shared by `state`, the `lock`
-notification, and the arbitration verbs.
+Methods on this page: [`state`](#state), [`subscribe`](#subscribe),
+[`info`](#info). This page also documents the [notification
+stream](#notifications) `subscribe` opens and the [`LockSnapshot`](#locksnapshot)
+shape shared by `state`, the `lock` notification, and the arbitration verbs.
 
 ---
 
@@ -119,6 +119,59 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"subscribe"}' | nc -U "$SOCK"
 
 The first line is the correlated response; every line after it is an id-less
 notification.
+
+---
+
+## `info`
+
+Report the daemon's **capability surface** (§10, §15.26): its version, the wire
+and envelope protocol versions, and the names of every codec it can instantiate.
+Tools — and a version-skewed CLI — use it to *discover* what a daemon supports
+rather than assume it, which matters because the daemon is embeddable: a
+closed-source binary built on the `nexus-daemon` library registers its own codecs
+(§15.26), and `info` is how the unchanged `serialnexusctl`, `nexus-sim`, and
+`nexus-doctor` learn that daemon's codec set. The same list appears in an
+unknown-codec load error's `data.available` (see
+[configuration.md](configuration.md)), so a misconfiguration names the codecs
+that *would* have worked.
+
+Pure observation; touches no graph state.
+
+### Params
+
+None.
+
+### Result
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `daemon_version` | string | the `nexus-daemon` library (engine) version — what determines wire and behavior compatibility |
+| `wire_version` | integer | the daemon-to-daemon wire protocol version (§9) |
+| `envelope_version` | integer | the exec-codec envelope version (§8/§15.15) — a codec author pins against this |
+| `codecs` | array of string | the registered in-process codec names, sorted (the `exec` child-process codec is always available and is not listed here) |
+
+### CLI
+
+```console
+$ serialnexusctl info          # rendered: version, wire/envelope, codec list
+$ serialnexusctl --json info   # the raw object
+```
+
+### Errors
+
+None beyond the transport-level codes.
+
+### Example
+
+```console
+$ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"info"}' | nc -U "$SOCK" | jq .result
+{
+  "daemon_version": "0.2.0",
+  "wire_version": 1,
+  "envelope_version": 1,
+  "codecs": ["reference"]
+}
+```
 
 ---
 

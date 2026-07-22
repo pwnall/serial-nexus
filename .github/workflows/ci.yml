@@ -28,6 +28,11 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The minimal daemon build §8 supports (every built-in codec dropped) must
+      # also be warning-clean — the registry-as-value path is easy to leave with an
+      # unused binding when no codec is registered.
+      - name: Clippy (minimal daemon, no built-in codecs)
+        run: cargo clippy -p serialnexusd -p nexus-daemon --no-default-features --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
 
@@ -104,6 +109,29 @@ jobs:
           bash scripts/validate/phase8/quickstart.sh
           bash scripts/validate/phase8/agent-task.sh
           SOAK_SECONDS=6 bash scripts/validate/phase8/soak.sh
+      # Extension-track gates (§15.26 / plan §10): the `info` verb + unknown-codec
+      # structural error, and the exec-conformance harness (golden/liveness/frag/
+      # restart). Deterministic and fast, so they run per push.
+      - name: Extension gates (info verb, exec conformance)
+        run: |
+          bash scripts/validate/phase5/info.sh
+          bash scripts/validate/phase5/exec-conformance.sh
+
+  # Out-of-tree codec template (§15.26 / plan §10.3): build the closed-repo stand-in
+  # from the CONSUMER's own position (its own workspace manifest, path deps standing
+  # in for version pins) and prove the custom daemon serves its `acme` codec. This is
+  # the embedding pattern proven to compile per push rather than promised.
+  external-codec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Build and exercise the out-of-tree template
+        run: bash scripts/validate/phase8/external-codec.sh
 
   # macOS is best-effort (design §13): the GATING deliverable is that the workspace
   # BUILDS and the portable property/unit tests pass; the doctor report and the

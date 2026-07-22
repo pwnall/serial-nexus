@@ -68,6 +68,12 @@ enum Mode {
     /// Drive an external codec child through the golden-vector envelope battery,
     /// proving any-language envelope conformance (§8, phase 5).
     Envelope(EnvelopeArgs),
+    /// Drive an external codec child through the full exec-conformance battery
+    /// (§15.26 / plan §10.5): golden vectors, full-duplex liveness (the §15.22
+    /// deadlock class), fragmented-frame reassembly, and kill-and-restart
+    /// cleanliness. The closed-repo CI entry point for an exec codec.
+    #[command(name = "exec-conformance")]
+    ExecConformance(ExecConformanceArgs),
     /// Speak the v1 wire protocol to a daemon leg as a hostile-or-conforming peer
     /// — the §9 conformance driver (crafted hellos, bad magic, oversize/unknown
     /// frames, unbound channels) and an echo peer for a single-daemon round-trip.
@@ -255,6 +261,23 @@ struct EnvelopeArgs {
 }
 
 #[derive(Args)]
+struct ExecConformanceArgs {
+    /// The external codec child to drive, as a shell command
+    /// (e.g. `python3 tests/ext-codec/passthrough.py`). It must speak the envelope
+    /// on stdin/stdout and echo each frame it reads (a passthrough).
+    #[arg(long)]
+    exec: String,
+    /// Per-frame echo timeout (ms). The full-duplex liveness check requires each
+    /// frame's echo within this bound, so a half-duplex child (reads all before
+    /// writing) trips it — the §15.22 deadlock class, made a test.
+    #[arg(long, default_value_t = 2_000)]
+    frame_timeout_ms: u64,
+    /// How many frames the full-duplex liveness check interleaves.
+    #[arg(long, default_value_t = 64)]
+    liveness_frames: usize,
+}
+
+#[derive(Args)]
 struct WireArgs {
     /// `tcp` or `unix`.
     #[arg(long, default_value = "tcp")]
@@ -333,6 +356,7 @@ fn main() {
         Mode::Client(a) => run_client(a),
         Mode::Mux(a) => run_mux(a),
         Mode::Envelope(a) => run_envelope(a),
+        Mode::ExecConformance(a) => run_exec_conformance(a),
         Mode::Wire(a) => run_wire(a),
         Mode::TcpProxy(a) => run_tcp_proxy(a),
         Mode::NullModem(a) => run_nullmodem(a),
@@ -1240,6 +1264,276 @@ fn run_envelope_inner(a: &EnvelopeArgs) -> anyhow::Result<Value> {
         "sent_frames": battery.len(), "received_frames": got.len(),
         "trailing_bytes": trailing, "pass": pass,
     }))
+}
+
+// --- exec conformance (§15.26 / plan §10.5) --------------------------------
+
+/// A spawned external codec child, with concurrent stdin feeding and a
+/// frame-decoded stdout stream — the harness's half of the §7.6 child-pipe
+/// boundary. stdout is drained on a thread and decoded as frames arrive, so a
+/// blocked stdin write can never starve stdout (the very coupling §15.22 forbids);
+/// requiring the *child* to interleave is what the liveness check probes.
+struct ExecChild {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    frames: std_mpsc::Receiver<FrameMsg>,
+}
+
+/// One decoded item from the child's stdout stream (or a terminal condition).
+enum FrameMsg {
+    Event(Event),
+    Malformed(String),
+    Closed,
+}
+
+/// The outcome of waiting for one echoed frame.
+enum Recv {
+    Event(Event),
+    Timeout,
+    Closed,
+    Malformed,
+}
+
+impl ExecChild {
+    fn spawn(exec: &str) -> anyhow::Result<ExecChild> {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(exec)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("spawn {exec:?}: {e}"))?;
+        let stdin = child.stdin.take().expect("piped stdin");
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let (tx, rx) = std_mpsc::channel();
+        thread::spawn(move || {
+            let mut dec = FrameDecoder::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = tx.send(FrameMsg::Closed);
+                        break;
+                    }
+                    Ok(n) => {
+                        dec.push(&buf[..n]);
+                        loop {
+                            match dec.next_event() {
+                                Ok(Some(ev)) => {
+                                    if tx.send(FrameMsg::Event(ev)).is_err() {
+                                        return;
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    let _ = tx.send(FrameMsg::Malformed(e.to_string()));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let _ = tx.send(FrameMsg::Closed);
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(ExecChild {
+            child,
+            stdin: Some(stdin),
+            frames: rx,
+        })
+    }
+
+    /// Encode and write one event frame to the child's stdin, flushed immediately.
+    fn send(&mut self, event: &Event) -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        encode(event, &mut buf).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        self.write_raw(&buf)
+    }
+
+    /// Write raw bytes to the child's stdin (used to deliver a frame in pieces).
+    fn write_raw(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("stdin already closed"))?;
+        stdin.write_all(bytes)?;
+        stdin.flush()?;
+        Ok(())
+    }
+
+    /// Close the child's stdin (EOF), so a child that batches until end-of-input
+    /// flushes. Idempotent.
+    fn close_stdin(&mut self) {
+        self.stdin = None;
+    }
+
+    /// Wait for the next echoed frame, bounded by `timeout`.
+    fn recv(&self, timeout: Duration) -> Recv {
+        match self.frames.recv_timeout(timeout) {
+            Ok(FrameMsg::Event(ev)) => Recv::Event(ev),
+            Ok(FrameMsg::Malformed(reason)) => {
+                eprintln!("exec-conformance: child emitted a malformed frame: {reason}");
+                Recv::Malformed
+            }
+            Ok(FrameMsg::Closed) => Recv::Closed,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => Recv::Timeout,
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => Recv::Closed,
+        }
+    }
+}
+
+impl Drop for ExecChild {
+    fn drop(&mut self) {
+        // Kill and reap: the harness owns the child's lifetime, and the
+        // kill-and-restart check depends on a killed child actually dying.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn run_exec_conformance(a: ExecConformanceArgs) -> Value {
+    match run_exec_conformance_inner(&a) {
+        Ok(v) => v,
+        Err(e) => err_verdict("exec-conformance", &e),
+    }
+}
+
+fn run_exec_conformance_inner(a: &ExecConformanceArgs) -> anyhow::Result<Value> {
+    let per_frame = Duration::from_millis(a.frame_timeout_ms);
+    let golden = check_golden(&a.exec, per_frame)?;
+    let liveness = check_liveness(&a.exec, per_frame, a.liveness_frames)?;
+    let fragmentation = check_fragmentation(&a.exec, per_frame)?;
+    let restart = check_restart(&a.exec, per_frame)?;
+    let pass = golden && liveness && fragmentation && restart;
+    Ok(json!({
+        "tool": "nexus-sim", "mode": "exec-conformance",
+        "checks": {
+            "golden": golden,
+            "liveness": liveness,
+            "fragmentation": fragmentation,
+            "restart": restart,
+        },
+        "pass": pass,
+    }))
+}
+
+/// Golden vectors: the child re-emits the whole battery byte-for-byte (correctness,
+/// independent of timing — stdin is closed so a batching child still flushes).
+fn check_golden(exec: &str, timeout: Duration) -> anyhow::Result<bool> {
+    let battery = golden_battery();
+    let mut child = ExecChild::spawn(exec)?;
+    for ev in &battery {
+        child.send(ev)?;
+    }
+    child.close_stdin();
+    let mut got = Vec::new();
+    loop {
+        match child.recv(timeout) {
+            Recv::Event(ev) => got.push(ev),
+            Recv::Closed | Recv::Timeout => break,
+            Recv::Malformed => return Ok(false),
+        }
+    }
+    Ok(got == battery)
+}
+
+/// Full-duplex liveness (the §15.22 deadlock class). Sends a sustained pipeline of
+/// N frames WITHOUT closing stdin, then requires that a healthy majority of echoes
+/// flow back *before* EOF — proving the child interleaves read and write. A child
+/// that reads all input before writing (the half-duplex antipattern) emits nothing
+/// until EOF and fails this. A *correct* codec that lags its output a bounded few
+/// frames behind its input still passes: it echoes continuously and the tail it
+/// holds is drained after stdin closes. Only read-all-first / hoarding shapes fail
+/// (§15.26; see docs/codec-authors.md). This is NOT a lock-step ping-pong — that
+/// would false-fail any legitimately buffering codec.
+fn check_liveness(exec: &str, per_frame: Duration, frames: usize) -> anyhow::Result<bool> {
+    let mut child = ExecChild::spawn(exec)?;
+    let sent: Vec<Event> = (0..frames)
+        .map(|i| Event::data("live", Bytes::from(seeded_bytes(1000 + i as u64, 512))))
+        .collect();
+    for ev in &sent {
+        child.send(ev)?;
+    }
+
+    // Phase 1 — interleaving proof: with stdin still open, collect whatever the
+    // child emits. A full-duplex child echoes (most of) the pipeline; a half-duplex
+    // one emits nothing until EOF (which has not come).
+    let mut received: Vec<Event> = Vec::new();
+    while received.len() < frames {
+        match child.recv(per_frame) {
+            Recv::Event(ev) => received.push(ev),
+            _ => break, // nothing more arrives without EOF
+        }
+    }
+    // Fewer than half the frames echoed before EOF ⇒ the child is not interleaving
+    // (read-all-first, or hoarding more than a bounded lag). Liveness fails.
+    if received.len() * 2 < frames {
+        return Ok(false);
+    }
+
+    // Phase 2 — completeness: close stdin so a bounded-lag child flushes its held
+    // tail, then drain the rest and require an exact, in-order match.
+    child.close_stdin();
+    while received.len() < frames {
+        match child.recv(per_frame) {
+            Recv::Event(ev) => received.push(ev),
+            _ => break,
+        }
+    }
+    Ok(received == sent)
+}
+
+/// Fragmentation: a large frame whose wire bytes are delivered to stdin in small
+/// pieces must still be reassembled and echoed whole. A child that assumes a whole
+/// frame arrives per `read()` fails.
+fn check_fragmentation(exec: &str, timeout: Duration) -> anyhow::Result<bool> {
+    // A near-maximum frame, so the wire bytes span many pipe reads.
+    let payload = seeded_bytes(7, MAX_FRAME_SIZE - 128);
+    let sent = Event::data("frag", Bytes::from(payload));
+    let mut wire = Vec::new();
+    encode(&sent, &mut wire).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+
+    let mut child = ExecChild::spawn(exec)?;
+    for piece in wire.chunks(97) {
+        child.write_raw(piece)?;
+    }
+    child.close_stdin();
+    // Generous total bound for a big frame; scale off the per-frame timeout.
+    let bound = timeout.max(Duration::from_secs(5));
+    match child.recv(bound) {
+        Recv::Event(got) => Ok(got == sent),
+        _ => Ok(false),
+    }
+}
+
+/// Kill-and-restart cleanliness: a running child is killed mid-session and a fresh
+/// one is spawned; the new child echoes cleanly, proving no reliance on state that
+/// a `kill -9` would strand (the §7.6 restart-with-backoff contract, child side).
+/// stdin is closed before the echo is required, so a batching or bounded-lag child
+/// flushes at EOF — this check tests restart cleanliness, not liveness.
+fn check_restart(exec: &str, timeout: Duration) -> anyhow::Result<bool> {
+    let probe = Event::data("c0", Bytes::from_static(b"probe"));
+
+    // First child: prove it echoes (stdin closed → it flushes), then drop it (Drop
+    // kills and reaps).
+    {
+        let mut first = ExecChild::spawn(exec)?;
+        first.send(&probe)?;
+        first.close_stdin();
+        if !matches!(first.recv(timeout), Recv::Event(ref got) if *got == probe) {
+            return Ok(false);
+        }
+    }
+
+    // A freshly spawned child must echo cleanly with no shared state.
+    let mut second = ExecChild::spawn(exec)?;
+    second.send(&probe)?;
+    second.close_stdin();
+    Ok(matches!(second.recv(timeout), Recv::Event(got) if got == probe))
 }
 
 // --- wire / tcp-proxy sockets ----------------------------------------------

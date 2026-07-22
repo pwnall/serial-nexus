@@ -1,0 +1,9 @@
+# A self-contained workspace standing in for a *closed-source* codec repository
+# (§15.26). It is excluded from the main serial_nexus workspace (see the root
+# `[workspace] exclude`) and builds from the consumer's own position: its path
+# dependencies point back at the open crates exactly where a real consumer would
+# pin them by version tag. CI builds this per push, so the embedding pattern is
+# proven to compile rather than merely promised (plan §10.3).
+[workspace]
+resolver = "2"
+members = ["codec", "daemon"]

@@ -31,8 +31,15 @@ pub enum Node {
 impl Node {
     /// Instantiate a node from configuration. Never returns `Err` for an
     /// environmental problem — the node comes up faulted instead (§15.8); `Err`
-    /// is reserved for a node kind not yet implemented in this phase.
-    pub fn instantiate(config: &NodeConfig, resolver: &Resolver) -> Result<Node, String> {
+    /// is reserved for a structural failure the daemon aborts the load on (a bad
+    /// codec attribute schema, or — defensively — an unknown codec the daemon's
+    /// pre-check did not already catch). `registry` is the compiled-in codec set
+    /// (§8/§15.26), consulted to build codec nodes.
+    pub fn instantiate(
+        config: &NodeConfig,
+        resolver: &Resolver,
+        registry: &crate::registry::Registry,
+    ) -> Result<Node, String> {
         Ok(match config {
             NodeConfig::Serial { .. } => Node::Serial(serial::SerialNode::create(config, resolver)),
             NodeConfig::Pty { .. } => Node::Pty(pty::PtyNode::create(config)),
@@ -55,7 +62,7 @@ impl Node {
                 ..
             } => Node::Codec(codec::CodecNode::create(
                 config,
-                codec::build_codec(codec_name, attributes)?,
+                registry.build(codec_name, attributes)?,
             )),
             NodeConfig::Leg { .. } => Node::Leg(leg::LegNode::create(config)),
         })

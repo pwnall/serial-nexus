@@ -225,6 +225,25 @@ mod tests {
         assert_eq!(codec.framing_errors(), 1);
     }
 
+    /// The reference codec satisfies the generic `codec-api` conformance kit
+    /// (§15.26 / plan §10.4) — the same suites an out-of-tree codec runs from the
+    /// consumer position. This is the reference implementation exercising the kit
+    /// it must be honest against; the bespoke resync/streaming tests above cover
+    /// what the generic kit deliberately cannot (exact resync accounting).
+    #[test]
+    fn satisfies_the_conformance_kit() {
+        use codec_api::test_support as kit;
+        let channels = ["console", "trace", "ctrl"];
+        kit::round_trip_identity(ReferenceCodec::new, &channels);
+        kit::fragmentation_tolerance(ReferenceCodec::new, "console");
+        kit::handles_garbage(ReferenceCodec::new, "console");
+        kit::bounded_parser_state(ReferenceCodec::new);
+        // The reference codec exposes its accumulation buffer, so it can also prove
+        // the property the trait-only suite cannot see: length-guided resync keeps
+        // the buffer within one frame even on undecodable input (§5).
+        kit::assert_buffer_bounded(ReferenceCodec::new, ReferenceCodec::buffered);
+    }
+
     proptest! {
         /// Any sequence of events survives mux→demux unchanged, with no spurious
         /// framing errors and nothing left buffered.

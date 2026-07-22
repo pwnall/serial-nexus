@@ -9,9 +9,9 @@ program in any language becomes a codec.
 
 Everything below is grounded in the code. The envelope format is defined in
 [`codec-api/src/lib.rs`](../codec-api/src/lib.rs); the exec host is
-[`serialnexusd/src/nodes/exec.rs`](../serialnexusd/src/nodes/exec.rs); the
+[`nexus-daemon/src/nodes/exec.rs`](../nexus-daemon/src/nodes/exec.rs); the
 compiled-in registry is
-[`serialnexusd/src/nodes/codec.rs`](../serialnexusd/src/nodes/codec.rs); the
+[`nexus-daemon/src/registry.rs`](../nexus-daemon/src/registry.rs); the
 reference codec is [`codecs/reference/src/lib.rs`](../codecs/reference/src/lib.rs).
 The canonical working exec codecs live under
 [`tests/ext-codec/`](../tests/ext-codec/).
@@ -72,24 +72,44 @@ multiplexed bytes. Your resync policy is your own: the reference codec resyncs b
 length-guidance and counts one framing error; a codec on a reliable transport can
 treat any violation as fatal and never resync (§15.23).
 
-Register it in **one explicit `match`-on-name** — there is no linker-magic
-auto-registration — in `serialnexusd/src/nodes/codec.rs`, behind a Cargo feature
-so minimal builds can drop it. The `reference` arm is the example to copy:
+Register it **by value** in the codec `Registry` (§8/§15.26) — there is no
+linker-magic auto-registration and no dynamic loading. A factory is an ordinary
+closure `Fn(&toml::Table) -> Result<Box<dyn Codec>, String>`; a duplicate or
+reserved name (`exec`) is a **startup error**, before any configuration is read.
+Two ways to register:
+
+**In-tree** — add one line to `Registry::with_builtins()` in `nexus-daemon`,
+behind a Cargo feature so a minimal build can drop it (the `reference` codec is the
+example to copy).
+
+**Out-of-tree (closed source)** — keep your codec crate in its own repository
+depending only on `codec-api`, and ship a **dozen-line custom daemon** that links
+the `nexus-daemon` library and registers your codec before calling `run`:
 
 ```rust
-pub fn build_codec(name: &str, attributes: &toml::Table) -> Result<Box<dyn Codec>, String> {
-    match name {
-        #[cfg(feature = "codec-reference")]
-        "reference" => { /* validate attributes, construct */ }
-        other => Err(format!("unknown codec {other:?}")),
-    }
-}
+let registry = nexus_daemon::Registry::with_builtins()
+    .register("myproto", |_attrs| {
+        Ok(Box::new(MyCodec::new()) as Box<dyn codec_api::Codec>)
+    })?;                              // duplicate / reserved name → startup error
+nexus_daemon::run(options, registry)
 ```
+
+Everything else in the ecosystem — `serialnexusctl`, `nexus-sim`, `nexus-doctor`,
+the validation scripts — works against your custom binary **unchanged**, because
+they speak the RPC surface and the envelope, never the codec list (§15.16); the
+daemon advertises your codec through the [`info`](rpc/observation.md#info) verb,
+and an unknown codec in configuration fails structurally with the available list in
+`data.available`. The supported extension surface is exactly two semver'd contracts
+— `codec-api` and the narrow `nexus-daemon` entry API — and everything else in the
+daemon is private, so it can change beneath you without breaking your build. A
+complete worked example lives in
+[`examples/external-codec/`](../examples/external-codec/), built from a consumer's
+position by CI on every push.
 
 Attributes arrive as an opaque `toml::Table` that your codec deserializes via
 serde into its own type and validates itself; a schema failure is **structural**
 and aborts the load with nothing created (§8, §11). The reference codec takes no
-attributes. Net cost of a new built-in codec: a crate, one registry line, and a
+attributes. Net cost of a new codec: a crate, one `register` line, and (in-tree) a
 feature flag — accepted as a recompile per codec (§15.11).
 
 ### (b) The exec codec — the escape hatch
@@ -374,22 +394,71 @@ it with `serialnexusctl state` (or `--json` for the codec's per-channel
 `delivered_hostward` / `discarded_unattached` counters and the exec node's
 `restart_count`).
 
-## 6. Testing your codec through a pipe
+## 6. Testing your codec
 
-Because the child is a plain program on stdin/stdout, you can test it without the
-daemon. `nexus-sim` ships a conformance battery that drives an exec child through
-the golden vectors and checks it re-emits them intact:
+### In-process Rust codecs — the conformance kit
 
-```console
-$ ./target/debug/nexus-sim envelope --exec "python3 tests/ext-codec/passthrough.py"
-{"mode":"envelope","pass":true,"received_frames":10,"sent_frames":10,"tool":"nexus-sim","trailing_bytes":0}
+`codec-api` ships a generic conformance kit behind its `test-support` feature
+(§15.26). Enable it as a dev-dependency and run the suites against your codec from
+your **own** crate's tests — including a closed-source one, which is the point: you
+prove conformance from the consumer position without forking serial_nexus.
+
+```rust
+// Cargo.toml:  [dev-dependencies]
+//              codec-api = { version = "…", features = ["test-support"] }
+#[test]
+fn conforms() {
+    use codec_api::test_support as kit;
+    kit::round_trip_identity(MyCodec::new, &["console", "trace"]);  // the channels you serve
+    kit::fragmentation_tolerance(MyCodec::new, "console");
+    kit::handles_garbage(MyCodec::new, "console");
+    kit::bounded_parser_state(MyCodec::new);
+    // If your codec can report its buffered byte count, also assert it never
+    // exceeds one frame, even on garbage — the property the trait alone can't see:
+    kit::assert_buffer_bounded(MyCodec::new, |c| c.buffered());
+}
 ```
 
-Point `--exec` at *your* passthrough during development to confirm your framing
-before wiring it into a graph. (The battery expects an identity passthrough, so
-run it against a passthrough build of your codec, not a channel-swapping demux.)
-You can also feed your codec crafted frames by hand — the format is pipe-testable
-with any tool that speaks bytes.
+The suites check mux↔demux round-trip identity, byte-at-a-time fragmentation
+tolerance, garbage/resync termination, and no output amplification — a broken
+codec fails exactly the suite whose property it violates. `bounded_parser_state`
+verifies bounded *work* and no amplification, but it cannot see your codec's
+*internal* buffer through the trait, so it does **not** catch a decoder that
+silently hoards undecodable input (the classic non-resyncing `while let Ok(Some(..))`
+accumulator — a memory leak on a lossy line). If your codec exposes its buffered
+byte count, `assert_buffer_bounded` *does* catch that; the reference codec runs it.
+The reference codec runs the full kit, and `examples/external-codec/` runs it from
+the consumer position.
+
+### Exec codecs — the pipe harness
+
+Because the child is a plain program on stdin/stdout, you can test it without the
+daemon. `nexus-sim` ships two modes:
+
+- **`envelope`** — the golden-vector battery: drives the child through every event
+  kind and checks it re-emits them intact.
+
+  ```console
+  $ ./target/debug/nexus-sim envelope --exec "python3 tests/ext-codec/passthrough.py"
+  {"mode":"envelope","pass":true,"received_frames":10,"sent_frames":10,"tool":"nexus-sim","trailing_bytes":0}
+  ```
+
+- **`exec-conformance`** — the full behavioral battery, and the **recommended CI
+  entry point for a closed-repo exec codec** (§15.26): golden vectors, **full-duplex
+  liveness** (send-and-echo under one bound — the §15.22 deadlock class, so a child
+  that reads all input before writing is *caught here* rather than in production),
+  **fragmented-frame reassembly** (a big frame delivered to stdin in pieces must
+  still be echoed whole), and **kill-and-restart cleanliness**.
+
+  ```console
+  $ ./target/debug/nexus-sim exec-conformance --exec "python3 my_codec.py"
+  {"checks":{"fragmentation":true,"golden":true,"liveness":true,"restart":true},"mode":"exec-conformance","pass":true,"tool":"nexus-sim"}
+  ```
+
+Both exec modes expect an identity passthrough, so run them against a passthrough
+build of your codec, not a channel-swapping demux. You can also feed your codec
+crafted frames by hand — the format is pipe-testable with any tool that speaks
+bytes.
 
 ## 7. The envelope contract versus the wire protocol
 

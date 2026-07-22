@@ -53,7 +53,10 @@ The CLI reads the TOML file, parses it into a `GraphConfig`, and sends it as the
 * `-32002` — structural validation failed; `data.errors` lists every message
   (duplicate node names, the three graph rules, illegal names/identities, codec
   tables). Caught *before* any teardown under `--replace`, so a bad config never
-  destroys a good running graph.
+  destroys a good running graph. **An unknown codec name is structural too**
+  (§8/§15.26): the error additionally carries `data.available`, the list of codecs
+  this daemon *does* have — the same list the [`info`](observation.md#info) verb
+  reports — so a misconfiguration names the codecs that would have worked.
 * `-32602` — the params were missing, `config` was absent, or the config did not
   deserialize; also an unimplementable node kind.
 

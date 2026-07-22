@@ -1,5 +1,6 @@
-//! Codec node (design §7.5): the interior demux/remux protocol transform, and
-//! the compiled-in codec registry (§8).
+//! Codec node (design §7.5): the interior demux/remux protocol transform. The
+//! compiled-in codec registry that instantiates these (§8/§15.26) lives in
+//! [`crate::registry`]; this module is the running node.
 //!
 //! **Orientation.** Phase 5 implements the **demultiplexer** (`faces = target`):
 //! the multiplexed side is the node's default endpoint, facing the device across
@@ -41,30 +42,6 @@ use tokio::task::JoinHandle;
 
 use crate::cell::CriticalCell;
 use crate::runtime::{DropCounters, HostwardSink, SharedLock, Wiring};
-
-/// Instantiate a compiled-in codec by registry name (§8 match-on-name — no
-/// linker-magic auto-registration). Attribute-schema validation is the codec's
-/// own, and a failure here is structural: it aborts the load, nothing created
-/// (§8, §11). The reference framing codec takes no attributes. The exec codec
-/// (§7.6) is not a [`Codec`] transform — it is a child process — so it is hosted
-/// separately (phase 5 slice C), not built here.
-pub fn build_codec(name: &str, attributes: &toml::Table) -> Result<Box<dyn Codec>, String> {
-    match name {
-        #[cfg(feature = "codec-reference")]
-        "reference" => {
-            if !attributes.is_empty() {
-                let keys: Vec<&String> = attributes.keys().collect();
-                return Err(format!(
-                    "codec \"reference\" takes no attributes; got {keys:?}"
-                ));
-            }
-            Ok(Box::new(codec_reference::ReferenceCodec::new()))
-        }
-        // "exec" is not an in-process transform (it is a child process); it is
-        // routed to the exec node at instantiate and never reaches here.
-        other => Err(format!("unknown codec {other:?}")),
-    }
-}
 
 /// Per-channel observed counters (§7.5). All access is on the one runtime thread,
 /// so `Cell` suffices.

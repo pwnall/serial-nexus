@@ -8,12 +8,16 @@ members = [
     "nexus-sim",
     "nexus-sys",
     "nexus-doctor",
+    "nexus-daemon",
     "serialnexusd",
     "serialnexusctl",
 ]
 # The cargo-fuzz harness (fuzz/) is a separate crate: it needs a nightly toolchain
 # and libFuzzer, so it is excluded from the normal workspace build/test (§Phase 8).
-exclude = ["fuzz"]
+# The out-of-tree codec template (examples/external-codec/) is its own workspace by
+# design (§15.26): it must build from a *consumer's* position, so it is excluded
+# here and built separately by its own validation job (plan §10.3).
+exclude = ["fuzz", "examples/external-codec"]
 
 [workspace.package]
 edition = "2024"
@@ -68,6 +72,9 @@ codec-reference = { path = "codecs/reference" }
 nexus-core = { path = "nexus-core" }
 nexus-rpc = { path = "nexus-rpc" }
 nexus-sys = { path = "nexus-sys" }
+# default-features off so the thin binary chooses its built-in codec set by
+# forwarding features (§8); only serialnexusd inherits this dependency.
+nexus-daemon = { path = "nexus-daemon", default-features = false }
 
 # Lints applied to every crate that opts in with `[lints] workspace = true`.
 # The unsafe-code policy is expressed per-crate at the source level (§2): pure

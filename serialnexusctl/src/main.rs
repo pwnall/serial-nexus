@@ -59,6 +59,10 @@ enum Cmd {
     Dump,
     /// Report observed node state.
     State,
+    /// Report the daemon's capability surface (§10/§15.26): its version, the wire
+    /// and envelope protocol versions, and the registered codec names — so you can
+    /// discover what a possibly-custom daemon supports rather than assume it.
+    Info,
     /// Stream node status and counter snapshots as they change. Prints one JSON
     /// notification per line; exits after `--count` of them (default: run until
     /// the connection closes).
@@ -193,6 +197,7 @@ fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
         ),
         Cmd::Dump => ("dump", None),
         Cmd::State => ("state", None),
+        Cmd::Info => ("info", None),
         Cmd::Subscribe { .. } => unreachable!("subscribe is handled before dispatch"),
         Cmd::Rotate { node } => ("rotate", Some(json!({ "node": node }))),
         Cmd::SendBreak { node, ms } => ("send-break", Some(json!({ "node": node, "ms": ms }))),
@@ -264,6 +269,27 @@ fn render(cmd: &Cmd, result: &Value) -> anyhow::Result<()> {
                     .unwrap_or_default();
                 println!("{name:<16} {status}{reason}");
             }
+        }
+        Cmd::Info => {
+            let daemon = result
+                .get("daemon_version")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let wire = result.get("wire_version").and_then(Value::as_u64);
+            let envelope = result.get("envelope_version").and_then(Value::as_u64);
+            let empty = vec![];
+            let codecs: Vec<&str> = result
+                .get("codecs")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty)
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            println!("daemon {daemon}");
+            if let (Some(w), Some(e)) = (wire, envelope) {
+                println!("wire v{w}, envelope v{e}");
+            }
+            println!("codecs: {}", codecs.join(", "));
         }
         Cmd::Load { .. } => {
             let n = result.get("loaded").and_then(Value::as_u64).unwrap_or(0);

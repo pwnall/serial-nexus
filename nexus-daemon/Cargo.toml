@@ -1,0 +1,47 @@
+[package]
+name = "nexus-daemon"
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The serial_nexus daemon as an embeddable library (§15.26): boundary nodes, the data-plane runtime, the control plane, the state file, and the codec registry. A custom daemon binary registers its own codecs and calls `run`."
+
+[lib]
+name = "nexus_daemon"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# Compiled-in codecs sit behind Cargo features so minimal builds can drop what
+# they don't need (§8). `with_builtins()` registers each built-in gated on its
+# feature; an out-of-tree embedder registers its own factories on top.
+[features]
+default = ["codec-reference"]
+codec-reference = ["dep:codec-reference"]
+
+[dependencies]
+nexus-core.workspace = true
+nexus-rpc.workspace = true
+nexus-sys.workspace = true
+codec-api.workspace = true
+codec-reference = { workspace = true, optional = true }
+
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
+futures.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+serial2.workspace = true
+nix = { workspace = true, features = ["term", "fs", "poll", "ioctl", "process", "signal", "user"] }
+libc.workspace = true
+
+[dev-dependencies]
+# Property tests for the pure boundary-supervisor primitives (§16.1 / plan §9.1).
+proptest.workspace = true

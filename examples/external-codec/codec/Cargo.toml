@@ -1,0 +1,17 @@
+[package]
+name = "acme-codec"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# A closed-source codec crate depends on ONE open contract — `codec-api` — and
+# never on the daemon (§8/§15.26). The path here stands in for a version pin.
+[dependencies]
+codec-api = { path = "../../../codec-api" }
+
+[features]
+# Pull in the `codec-api` conformance kit for this crate's own tests (§15.26 /
+# plan §10.4): `cargo test --features conformance` runs the generic suites against
+# `AcmeCodec`, proving an out-of-tree codec is testable from the consumer position.
+conformance = ["codec-api/test-support"]

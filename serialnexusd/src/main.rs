@@ -1,38 +1,18 @@
 #![forbid(unsafe_code)]
 
-//! `serialnexusd` — the serial_nexus daemon.
+//! `serialnexusd` — the in-tree serial_nexus daemon binary.
 //!
-//! Unsafe is *forbidden* crate-wide: every raw ioctl/`ptsname`/`poll(2)` wrapper
-//! lives in the shared `nexus-sys` crate (§16.3), so the daemon holds none. The
-//! data plane runs on a current-thread tokio runtime; control-plane connections
-//! are tasks on the same runtime, so mutations serialize for free (§5, plan §2).
-//!
-//! Phase 2 walking skeleton: control socket + JSON-RPC (`load`/`dump`/`state`),
-//! serial and PTY node lifecycle. Byte flow and presence gating land next.
+//! Deliberately thin (§15.26): it parses flags, installs a tracing subscriber, and
+//! calls [`nexus_daemon::run`] with the built-in codec [`Registry`]. Everything
+//! that makes the daemon a daemon — boundary nodes, the data plane, the control
+//! plane, the state file, the codec registry — lives in the `nexus-daemon` library,
+//! so a closed-source daemon can register its own codecs and reuse all of it with
+//! the same dozen lines. Nothing here may depend on how those internals work.
 
-mod boundary;
-mod cell;
-mod control;
-mod daemon;
-mod nodes;
-mod runtime;
+use std::path::PathBuf;
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
-
-use anyhow::Context;
 use clap::Parser;
-use nexus_core::config::GraphConfig;
-use serde_json::json;
-use tokio::net::{UnixListener, UnixStream};
-use tokio::signal::unix::{SignalKind, signal};
-
-use daemon::Daemon;
-
-/// How often the daemon publishes a state snapshot to `subscribe` streams (§10).
-/// Fine-grained enough to observe counter movement, coarse enough to stay cheap.
-const SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+use nexus_daemon::{Registry, RunOptions};
 
 #[derive(Parser)]
 #[command(name = "serialnexusd", version, about = "serial_nexus daemon (§10)")]
@@ -73,162 +53,15 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, run(cli))
-}
-
-async fn run(cli: Cli) -> anyhow::Result<()> {
-    let socket_path = resolve_socket(cli.socket);
-    prepare_socket(&socket_path).await?;
-
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("binding control socket {}", socket_path.display()))?;
-    // Socket permissions ARE the authorization model (§10): 0600 by default,
-    // widened to a group by --socket-group. The parent runtime dir (0700) bounds
-    // the brief post-bind window before this applies (v4 audit).
-    apply_socket_perms(&socket_path, cli.socket_group.as_deref())?;
-    tracing::info!(socket = %socket_path.display(), "control socket listening");
-
-    let state_file = resolve_state_file(cli.state_file.clone(), &socket_path);
-    let daemon = Rc::new(Daemon::new(
-        nexus_core::Resolver::new(cli.dev_root.clone()),
-        Some(state_file.clone()),
-    ));
-
-    // Periodic state snapshots power `subscribe` (§10): status transitions and
-    // counter snapshots. The tick no-ops when nobody is subscribed, so it costs
-    // nothing on an idle daemon.
-    {
-        let daemon = daemon.clone();
-        tokio::task::spawn_local(async move {
-            loop {
-                tokio::time::sleep(SNAPSHOT_INTERVAL).await;
-                daemon.emit_state_snapshot();
-            }
-        });
-    }
-
-    // Startup config preference (§11/§15.9): a persisted state file, if present,
-    // is the source of truth (it captured incremental surgery a `--config` file
-    // never saw); otherwise fall back to the CLI `--config`. Restart, replug, and
-    // first boot become one code path.
-    if state_file.exists() {
-        startup_load(&daemon, &state_file)
-            .await
-            .with_context(|| format!("loading state file {}", state_file.display()))?;
-    } else if let Some(config_path) = &cli.config {
-        startup_load(&daemon, config_path)
-            .await
-            .with_context(|| format!("loading {}", config_path.display()))?;
-    }
-
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
-
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _addr)) => {
-                    tokio::task::spawn_local(control::serve_connection(daemon.clone(), stream));
-                }
-                Err(e) => tracing::warn!("accept error: {e}"),
-            },
-            _ = daemon.shutdown.notified() => {
-                tracing::info!("shutdown requested over RPC");
-                break;
-            }
-            _ = sigint.recv() => { tracing::info!("SIGINT"); break; }
-            _ = sigterm.recv() => { tracing::info!("SIGTERM"); break; }
-        }
-    }
-
-    // Clean shutdown: release node environment (PTY symlinks, ports) and the
-    // control socket (§10).
-    daemon.teardown_all();
-    let _ = std::fs::remove_file(&socket_path);
-    tracing::info!("stopped");
-    Ok(())
-}
-
-/// Apply the §10 control-socket authorization policy: mode 0600 by default, or
-/// mode 0660 owned by `group` when one is configured (`--socket-group`). The
-/// group is resolved first, so a name that cannot be found is a hard error before
-/// anything is changed; mirrors the PTY slave's group logic (§7.2).
-fn apply_socket_perms(path: &Path, group: Option<&str>) -> anyhow::Result<()> {
-    if let Some(group) = group {
-        let gid = nix::unistd::Group::from_name(group)
-            .ok()
-            .flatten()
-            .map(|g| g.gid)
-            .ok_or_else(|| anyhow::anyhow!("socket group {group:?} not found"))?;
-        nix::unistd::chown(path, None, Some(gid))
-            .with_context(|| format!("chgrp {} to {group}", path.display()))?;
-    }
-    let mode = if group.is_some() { 0o660 } else { 0o600 };
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .with_context(|| format!("setting mode on control socket {}", path.display()))?;
-    Ok(())
-}
-
-/// The §10 socket path policy: privilege-based default, CLI-overridable.
-fn resolve_socket(override_path: Option<PathBuf>) -> PathBuf {
-    if let Some(p) = override_path {
-        return p;
-    }
-    if nix::unistd::geteuid().is_root() {
-        return PathBuf::from("/run/serialnexusd.sock");
-    }
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir).join("serialnexusd.sock");
-        }
-    }
-    PathBuf::from(format!("/tmp/serialnexusd-{}.sock", nix::unistd::getuid()))
-}
-
-/// The §11/§15.9 state-file path policy: CLI-overridable, else derived from the
-/// control-socket path so it shares the socket's uniqueness (one daemon per
-/// socket) and lifecycle. The daemon owns this writable path and prefers it over
-/// `--config` at startup, so a restart recovers incremental surgery. A deployment
-/// that wants the snapshot to survive a *reboot* (the runtime dir is cleared then)
-/// passes `--state-file` pointing at a persistent path (e.g. /var/lib).
-fn resolve_state_file(override_path: Option<PathBuf>, socket_path: &Path) -> PathBuf {
-    if let Some(p) = override_path {
-        return p;
-    }
-    let stem = socket_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("serialnexusd");
-    socket_path.with_file_name(format!("{stem}.state.toml"))
-}
-
-/// The standard stale-socket unlink dance (§10): if the path exists, a live
-/// daemon there is an error; a dead one is cleaned up.
-async fn prepare_socket(path: &Path) -> anyhow::Result<()> {
-    if path.exists() {
-        match UnixStream::connect(path).await {
-            Ok(_) => anyhow::bail!("a daemon is already listening on {}", path.display()),
-            Err(_) => {
-                std::fs::remove_file(path)
-                    .with_context(|| format!("removing stale socket {}", path.display()))?;
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn startup_load(daemon: &Daemon, config_path: &Path) -> anyhow::Result<()> {
-    let text = std::fs::read_to_string(config_path)?;
-    let config: GraphConfig = toml::from_str(&text).context("parsing TOML configuration")?;
-    let params = json!({ "config": serde_json::to_value(&config)? });
-    daemon
-        .dispatch("load", Some(params))
-        .await
-        .map_err(|e| anyhow::anyhow!("load failed: {} (code {})", e.message, e.code))?;
-    tracing::info!(nodes = config.nodes.len(), "startup configuration loaded");
-    Ok(())
+    let options = RunOptions {
+        socket: cli.socket,
+        config: cli.config,
+        socket_group: cli.socket_group,
+        dev_root: cli.dev_root,
+        state_file: cli.state_file,
+    };
+    // The built-in codec registry (§8/§15.26). A closed-source daemon replaces this
+    // one line with `Registry::with_builtins().register("myproto", factory)?`.
+    let registry = Registry::with_builtins();
+    nexus_daemon::run(options, registry)
 }

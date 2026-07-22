@@ -1,11 +1,91 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-22 (**phases 0-8 done + validated on a real Tier-3 rig**, then the
-**post-1.0 simplification track (plan §9 / design §16) executed in full**).
+**As of:** 2026-07-22 (**phases 0-8 + post-1.0 simplification track done**, then the
+**v8 design revision + the extension track (plan §10 / design §15.26) executed in
+full**).
 **Branch:** `implementation` (off `main`).
-**Normative docs are now v7:** `docs/15-design-claude-fable-v7.md` (design) and
-`docs/16-implementation-plan-claude-fable-v7.md` (plan). v1–v6 docs (03–14) are in
-`docs/historical/`. Section references (§) point at the v7 design.
+**Normative docs are now v8:** `docs/17-design-claude-fable-v8.md` (design) and
+`docs/18-implementation-plan-claude-fable-v8.md` (plan). v1–v7 docs (03–16) are in
+`docs/historical/`. Section references (§) point at the v8 design.
+
+---
+
+**v8 REVISION + EXTENSION TRACK (plan §10) — DONE (this session).** v8 = v7 with a
+new normative extension surface — **ADR §15.26** ("out-of-tree codecs: embed the
+daemon, don't load plugins"), §8 rewritten to registry-as-value, §10 gaining the
+`info` verb — whose executable form is the NEW **plan §10** (five items). None of it
+existed in the code; all five are now built + validated + adversarially audited.
+(The v8 §16 dispositions reverted to "(adopt)" phrasing vs v7's "(done)"; that is
+annotation only — plan §9 remains built, no code change there.)
+
+1. **Library/binary split + registry-as-value (§10.1).** New crate **`nexus-daemon`**
+   (library) holds every former `serialnexusd` internal (`git mv` of boundary/cell/
+   control/daemon/nodes/runtime + new `lib.rs`/`registry.rs`); `serialnexusd` is now a
+   ~dozen-line binary that parses flags, installs tracing, and calls
+   `nexus_daemon::run(RunOptions, Registry)`. The codec registry is a **value**:
+   `Registry::with_builtins().register(name, factory)` — a factory is
+   `Rc<dyn Fn(&toml::Table)->Result<Box<dyn Codec>,String>>`; a **duplicate or
+   reserved (`exec`) name is a startup error**. Public API is exactly `{run, RunOptions,
+   Registry, CodecFactory, RegistryError, VERSION, WIRE_VERSION, ENVELOPE_VERSION}` —
+   verified with `cargo doc` (every internal module is private). `Daemon` gained an
+   `Rc<Registry>`, threaded into `Node::instantiate` in `load`/`add-node`.
+2. **`info` verb (§10.2).** `{daemon_version, wire_version, envelope_version, codecs}`;
+   `serialnexusctl info`. An **unknown codec is a structural error** carrying
+   `data.available`. (Fix #1 below extended this to codec *attribute* schemas.)
+3. **External-consumer template (§10.3).** `examples/external-codec/` (workspace-
+   excluded, its own workspace): `acme-codec` (against `codec-api` only) + `acme-daemon`
+   (a custom binary against `nexus-daemon`). Built from the consumer position by
+   `scripts/validate/phase8/external-codec.sh` + a per-push CI job.
+4. **Conformance kit (§10.4).** `codec-api` `test-support` feature →
+   `codec_api::test_support`: `round_trip_identity` / `fragmentation_tolerance` /
+   `handles_garbage` / `bounded_parser_state` / `assert_buffer_bounded`. Reference
+   codec + acme run it; four deliberately-broken codecs prove each suite bites.
+5. **Exec-conformance harness (§10.5).** `nexus-sim exec-conformance` (an `ExecChild`
+   with a concurrent stdout-decoding thread): golden vectors, **full-duplex liveness**
+   (the §15.22 deadlock class), fragmented reassembly, kill/restart. Fixtures
+   `tests/ext-codec/{passthrough.py (pass), lag.py (bounded-lag, pass), half-duplex.py
+   (fail)}`.
+
+Docs: `docs/rpc/observation.md` (info verb), `docs/rpc/configuration.md` (unknown-codec
+`data.available`), `docs/codec-authors.md` (registry-as-value + embedding + kit +
+exec-conformance), `docs/rpc/README.md`. CI (`.github/workflows/ci.yml`): a per-push
+`external-codec` job, extension gates in the integration lane, and a **minimal-build
+clippy** (`--no-default-features`) step.
+
+**⚠️ Adversarial audit (5 dimensions) found 6 confirmed (5 distinct), ALL FIXED; do
+NOT regress:**
+- **[MED] `load --replace` destroyed a good graph on a KNOWN codec's bad *attributes*.**
+  `codec_unknown_error` only caught unknown *names* before teardown; a bad attribute
+  table for a registered codec was caught inside `instantiate` (after teardown). **Fixed:**
+  `Daemon::precheck_codecs` validates every codec node's name AND attribute schema
+  **purely** (`registry.build` / `exec::parse_attributes`, discarded) **before** teardown,
+  in both `load` and `add-node`. Bad codec attrs are now structural (`-32002`), graph
+  preserved under `--replace` (verified: state stays `[console]`).
+- **[MED] `bounded_parser_state` was a false-negative** — it only summed *emitted* bytes,
+  so a non-resyncing `while let Ok(Some(..)){}` accumulator that hoards undecodable input
+  (unbounded §5 buffer) PASSED all four trait-only suites. The trait can't see internal
+  buffers, so **fixed** by (a) honest docs on `bounded_parser_state` and codec-authors.md,
+  and (b) a new `assert_buffer_bounded(make, buffered_fn)` that feeds a `0xFF` oversize-
+  prefix blob and asserts the reported buffer stays ≤ `MAX_FRAME_SIZE` — catches the
+  `Hoarder` (negative test), passes resyncing codecs; wired into the reference codec's kit
+  test.
+- **[MED] exec-conformance liveness/restart falsely FAILED a valid bounded-lag codec.**
+  The old lock-step (send frame N, block for echo N before N+1) deadlocks against a codec
+  that emits one frame behind. **Fixed:** liveness now sends the whole pipeline, requires a
+  majority of echoes to flow *before* EOF (catches half-duplex: 0 echoes), then closes
+  stdin and requires an exact in-order match (bounded-lag flushes its tail). `restart`
+  closes stdin before requiring the echo. Regression fixture `lag.py` (1-behind) now passes;
+  `half-duplex.py` still fails liveness.
+- **[LOW] `Registry::with_builtins()` `unused_mut` under `--no-default-features`** broke the
+  §8 minimal build's `-D warnings`. **Fixed:** `#[cfg_attr(not(feature="codec-reference"),
+  allow(unused_mut))]` + a CI minimal-build clippy step.
+- **[LOW] `codec-authors.md` linked to moved source paths** (`serialnexusd/src/nodes/…`).
+  **Fixed** to `nexus-daemon/src/{nodes/exec.rs,registry.rs}`.
+0 findings refuted. Gates after fixes: `all.sh --through 8` = **48/48** (45 prior + info/
+exec-conformance/external-codec), fmt/clippy(+minimal)/macOS-cross-check/shellcheck clean.
+Not committed; no `main` merge.
+
+---
 
 **Post-1.0 simplification track — DONE (design §16 / plan §9).** All seven items
 executed as seven commits on `implementation`, each behavior-preserving item

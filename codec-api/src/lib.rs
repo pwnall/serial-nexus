@@ -19,6 +19,13 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+/// The codec conformance kit (§15.26 / plan §10.4): generic suites any [`Codec`]
+/// implementation runs in its own tests. Behind the `test-support` feature so it
+/// is compiled only where a consumer opts in (a dev-dependency), never into a
+/// shipping build.
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 /// The envelope frame format version. Bumping it is a breaking change to the
 /// exec-codec child-process contract (§15.15) and must be deliberate.
 pub const ENVELOPE_VERSION: u16 = 1;

@@ -16,7 +16,7 @@ directory documents that surface method by method.
 | Page | Methods |
 | --- | --- |
 | [configuration.md](configuration.md) | `load`, `add-node`, `remove-node`, `dump` |
-| [observation.md](observation.md) | `state`, `subscribe` (+ the `state` / `lock` notifications and `LockSnapshot`) |
+| [observation.md](observation.md) | `state`, `subscribe`, `info` (+ the `state` / `lock` notifications and `LockSnapshot`) |
 | [arbitration.md](arbitration.md) | `lock`, `unlock`, `send` |
 | [logging.md](logging.md) | `rotate` |
 | [serial-signals.md](serial-signals.md) | `send-break`, `set-modem`, `pulse-dtr` |

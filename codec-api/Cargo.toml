@@ -10,6 +10,12 @@ description = "Codec trait, per-channel event vocabulary, and envelope frame typ
 [lints]
 workspace = true
 
+# The conformance kit (§15.26 / plan §10.4): generic suites any `Codec` runs in
+# its own tests. Off by default (it is test scaffolding), enabled by a consumer's
+# dev-dependency `codec-api = { features = ["test-support"] }`.
+[features]
+test-support = []
+
 [dependencies]
 serde.workspace = true
 bytes.workspace = true

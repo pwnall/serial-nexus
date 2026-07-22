@@ -20,6 +20,7 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 
 use nexus_core::Chunk;
@@ -32,6 +33,7 @@ use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::cell::CriticalCell;
 use crate::nodes::Node;
+use crate::registry::Registry;
 use crate::runtime::SharedLock;
 
 /// Depth of the notification broadcast buffer (§10 `subscribe`). A subscriber
@@ -89,6 +91,11 @@ pub struct Daemon {
     /// Device-identity resolver (§12), rooted at `--dev-root` (a fixture seam in
     /// tests; `/` in production). Shared read-only with every serial node.
     resolver: nexus_core::Resolver,
+    /// The compiled-in codec registry (§8/§15.26): the set of codecs this daemon
+    /// can instantiate. Shared read-only with the graph so `load`/`add-node` build
+    /// codec nodes from it and `info` reports its names. An embedding binary passes
+    /// its own registry (built-ins plus registered codecs) into [`crate::run`].
+    registry: Rc<Registry>,
     /// The configuration snapshot path (§11): after every successful *config*
     /// mutation the daemon writes the current config here (atomically), and startup
     /// prefers it, so incremental surgery survives a daemon restart. `None` disables
@@ -114,7 +121,11 @@ enum WaitOutcome {
 }
 
 impl Daemon {
-    pub fn new(resolver: nexus_core::Resolver, state_file: Option<std::path::PathBuf>) -> Self {
+    pub fn new(
+        resolver: nexus_core::Resolver,
+        state_file: Option<std::path::PathBuf>,
+        registry: Rc<Registry>,
+    ) -> Self {
         let (notifier, _) = broadcast::channel(NOTIFY_CAPACITY);
         Daemon {
             state: CriticalCell::new(GraphState {
@@ -124,6 +135,7 @@ impl Daemon {
             shutdown: Notify::new(),
             notifier,
             resolver,
+            registry,
             state_file,
         }
     }
@@ -189,6 +201,7 @@ impl Daemon {
             "remove-node" => self.remove_node(params),
             "dump" => Ok(self.dump()),
             "state" => Ok(self.state()),
+            "info" => Ok(self.info()),
             // The stream itself is served by the connection task (control.rs);
             // dispatch just acknowledges the subscription (§10).
             "subscribe" => Ok(json!({ "subscribed": true })),
@@ -217,6 +230,50 @@ impl Daemon {
         result
     }
 
+    /// Structural pre-check for every codec node's *name and attribute schema*
+    /// (§8/§11/§15.26). Codec attributes are opaque to `GraphConfig::validate`, so
+    /// this validates them here — **purely** (a codec factory / `exec::parse_attributes`
+    /// only constructs and checks; no fds, no tasks) and **before** anything is
+    /// created or torn down. That makes both an unknown codec name *and* a bad
+    /// attribute table structural, nothing created, and — critically — caught
+    /// before a `--replace` teardown, so a structurally-invalid config never
+    /// destroys a good running graph (§15.26, and this method's caller in `load`).
+    /// An unknown codec's error carries `data.available` so tools discover
+    /// capabilities; a known codec's schema error carries the codec's own message.
+    fn precheck_codecs(&self, nodes: &[nexus_core::config::NodeConfig]) -> Result<(), RpcError> {
+        for nc in nodes {
+            let nexus_core::config::NodeConfig::Codec {
+                codec,
+                name,
+                attributes,
+                ..
+            } = nc
+            else {
+                continue;
+            };
+            // The exec codec is a child process, not a registry entry (§7.6); its
+            // argv/env schema is validated here so a bad exec table is structural too.
+            if codec == "exec" {
+                if let Err(reason) = crate::nodes::exec::parse_attributes(attributes) {
+                    return Err(structural_error(&format!("node {name:?}: {reason}"), None));
+                }
+                continue;
+            }
+            if !self.registry.contains(codec) {
+                let available = self.registry.codec_names();
+                let message =
+                    format!("node {name:?}: unknown codec {codec:?}; available: {available:?}");
+                return Err(structural_error(&message, Some(json!(available))));
+            }
+            // Known codec: validate its attribute schema by attempting to build it
+            // (the factory is the schema; construction is pure and discarded here).
+            if let Err(reason) = self.registry.build(codec, attributes) {
+                return Err(structural_error(&format!("node {name:?}: {reason}"), None));
+            }
+        }
+        Ok(())
+    }
+
     /// `load` (§11): structurally atomic. Accepted only on an empty graph unless
     /// `replace`, which composes teardown-then-load (§11) so a full-file edit needs
     /// no manual teardown. A structural error creates nothing (and, under
@@ -235,6 +292,12 @@ impl Daemon {
             )
             .with_data(json!({ "errors": messages })));
         }
+
+        // Codec names and attribute schemas are structural too (§8/§11/§15.26) but
+        // opaque to `validate()`; check them here, before anything is created or
+        // torn down, so a bad `--replace` config (unknown codec OR bad attributes)
+        // never destroys a good graph.
+        self.precheck_codecs(&config.nodes)?;
 
         // `--replace` clears the running graph first (teardown-then-load, §11). The
         // config is already validated, so this only fires for a config that will
@@ -256,7 +319,7 @@ impl Daemon {
             // committed.
             let mut nodes = Vec::with_capacity(config.nodes.len());
             for nc in &config.nodes {
-                match Node::instantiate(nc, &self.resolver) {
+                match Node::instantiate(nc, &self.resolver, &self.registry) {
                     Ok(node) => nodes.push(node),
                     Err(reason) => {
                         for mut n in nodes {
@@ -358,6 +421,10 @@ impl Daemon {
         }
         let node_name = node_cfg.name().to_owned();
 
+        // Codec name + attribute schema are structural (§8/§11/§15.26): reject
+        // before touching the running graph.
+        self.precheck_codecs(std::slice::from_ref(&node_cfg))?;
+
         self.state.with_mut(|st| {
             // Validate the candidate graph (current + new node, edges unchanged) with
             // the same rules as `load` (§11): duplicate name, name/identity legality,
@@ -376,9 +443,10 @@ impl Daemon {
 
             // Instantiate the node (environmental failure faults it, §15.8; only a bad
             // codec kind/schema Errs, and then nothing is committed).
-            let mut node = Node::instantiate(&node_cfg, &self.resolver).map_err(|reason| {
-                RpcError::invalid_params(format!("node {node_name}: {reason}"))
-            })?;
+            let mut node =
+                Node::instantiate(&node_cfg, &self.resolver, &self.registry).map_err(|reason| {
+                    RpcError::invalid_params(format!("node {node_name}: {reason}"))
+                })?;
 
             // Wire the node's own endpoints (no edges): build a partial plan from a
             // single-node config and merge its host-endpoint lock + targetward sender
@@ -559,6 +627,21 @@ impl Daemon {
                 })
                 .collect();
             json!({ "nodes": nodes })
+        })
+    }
+
+    /// `info` (§10/§15.26): the daemon's capability surface — its version, the wire
+    /// and envelope protocol versions, and the registered codec names — so tools
+    /// (and a version-skewed CLI) discover what this possibly-custom daemon supports
+    /// rather than assume it. An unknown codec in configuration fails structurally
+    /// with this same list in its `data.available` (§8). Pure observation; touches
+    /// no graph state.
+    fn info(&self) -> Value {
+        json!({
+            "daemon_version": crate::VERSION,
+            "wire_version": crate::WIRE_VERSION,
+            "envelope_version": crate::ENVELOPE_VERSION,
+            "codecs": self.registry.codec_names(),
         })
     }
 
@@ -1017,9 +1100,14 @@ impl Daemon {
 
 impl Default for Daemon {
     fn default() -> Self {
-        // Production `/` resolver and no persistence; tests that need a fixture
-        // root or a state file call `Daemon::new(..)` explicitly.
-        Self::new(nexus_core::Resolver::new("/"), None)
+        // Production `/` resolver, the built-in codec registry, and no persistence;
+        // tests that need a fixture root, a custom registry, or a state file call
+        // `Daemon::new(..)` explicitly.
+        Self::new(
+            nexus_core::Resolver::new("/"),
+            None,
+            Rc::new(Registry::with_builtins()),
+        )
     }
 }
 
@@ -1143,6 +1231,17 @@ fn merge_into(target: &mut serde_json::Map<String, Value>, source: Value) {
             target.insert(k, v);
         }
     }
+}
+
+/// Build a structural error (`app_errors::STRUCTURAL`) with `data.errors = [msg]`,
+/// plus `data.available = [...]` when the failure is an unknown codec (§8/§15.26).
+fn structural_error(message: &str, available: Option<Value>) -> RpcError {
+    let mut data = serde_json::Map::new();
+    data.insert("errors".into(), json!([message]));
+    if let Some(available) = available {
+        data.insert("available".into(), available);
+    }
+    RpcError::new(app_errors::STRUCTURAL, message.to_owned()).with_data(Value::Object(data))
 }
 
 /// Whether a verb changes configuration and so warrants a state-file snapshot
