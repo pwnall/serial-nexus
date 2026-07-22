@@ -30,7 +30,6 @@ use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread::JoinHandle as ThreadHandle;
 use std::time::Duration;
 
 use nexus_core::Chunk;
@@ -48,6 +47,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Notify, mpsc::error::TryRecvError};
 use tokio::task::JoinHandle;
 
+use crate::boundary::BlockingReader;
 use crate::runtime::{self, HostwardSink, READ_BUF};
 use crate::sys;
 
@@ -86,15 +86,6 @@ struct SerialShared {
     port: Option<Rc<SerialPort>>,
 }
 
-/// The live reader thread's stop flag and join handle, shared so the supervisor
-/// can join the old reader before re-arming and `teardown` can join it before the
-/// port drops (the fd must outlive the thread — an fd-reuse race otherwise).
-#[derive(Default)]
-struct ReaderSlot {
-    stop: Arc<AtomicBool>,
-    handle: Option<ThreadHandle<()>>,
-}
-
 pub struct SerialNode {
     pub name: String,
     /// The resolver identity this node is configured for (config, round-trips).
@@ -102,7 +93,7 @@ pub struct SerialNode {
     resolver: Resolver,
     params: OpenParams,
     shared: Rc<RefCell<SerialShared>>,
-    reader_slot: Rc<RefCell<ReaderSlot>>,
+    reader_slot: Rc<RefCell<BlockingReader>>,
     /// Bytes read from the port and discarded because nothing was attached to
     /// consume them (§5). Shared with the reader thread, hence atomic.
     discarded_unattached: Arc<AtomicU64>,
@@ -177,7 +168,7 @@ impl SerialNode {
             resolver: resolver.clone(),
             params,
             shared: Rc::new(RefCell::new(SerialShared { status, port })),
-            reader_slot: Rc::new(RefCell::new(ReaderSlot::default())),
+            reader_slot: Rc::new(RefCell::new(BlockingReader::default())),
             discarded_unattached: Arc::new(AtomicU64::new(0)),
             purged_reconnect: Arc::new(AtomicU64::new(0)),
             tasks: Vec::new(),
@@ -284,7 +275,7 @@ struct SuperviseCtx {
     hostward: Vec<HostwardSink>,
     targetward: Option<mpsc::Receiver<Chunk>>,
     shared: Rc<RefCell<SerialShared>>,
-    reader_slot: Rc<RefCell<ReaderSlot>>,
+    reader_slot: Rc<RefCell<BlockingReader>>,
     discarded: Arc<AtomicU64>,
     purged: Arc<AtomicU64>,
 }
@@ -428,36 +419,24 @@ fn purge_on_reconnect(ctx: &mut SuperviseCtx) {
 /// joined). Returns the `Notify` the reader pulses on device loss.
 fn arm_reader(port: &Rc<SerialPort>, ctx: &SuperviseCtx) -> std::io::Result<Arc<Notify>> {
     sys::set_nonblocking(port.as_raw_fd())?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let lost = Arc::new(Notify::new());
     let fd = port.as_raw_fd();
     let hostward = ctx.hostward.clone();
     let discarded = ctx.discarded.clone();
-    let stop_c = stop.clone();
-    let lost_c = lost.clone();
-    let handle = std::thread::Builder::new()
-        .name(format!("serial-rx-{}", ctx.name))
-        .spawn(move || reader_thread(fd, hostward, discarded, stop_c, lost_c))
-        .expect("spawn serial reader thread");
-    *ctx.reader_slot.borrow_mut() = ReaderSlot {
-        stop,
-        handle: Some(handle),
-    };
-    Ok(lost)
+    // The boundary-supervisor library owns the stop flag, the loss `Notify`, and
+    // the join handle (§16.1 loss-notify + join-then-transition); we supply the
+    // node-specific reader body.
+    let mut slot = ctx.reader_slot.borrow_mut();
+    slot.arm(format!("serial-rx-{}", ctx.name), move |stop, lost| {
+        reader_thread(fd, hostward, discarded, stop, lost)
+    });
+    Ok(slot.lost())
 }
 
 /// Stop the current reader thread and join it within the poll-timeout bound. On
 /// the loss path the thread has already exited, so this returns at once; on
 /// teardown of a live device it costs at most one poll interval.
-fn stop_join_reader(reader_slot: &Rc<RefCell<ReaderSlot>>) {
-    let (stop, handle) = {
-        let mut slot = reader_slot.borrow_mut();
-        (slot.stop.clone(), slot.handle.take())
-    };
-    stop.store(true, Ordering::Relaxed);
-    if let Some(h) = handle {
-        let _ = h.join();
-    }
+fn stop_join_reader(reader_slot: &Rc<RefCell<BlockingReader>>) {
+    reader_slot.borrow_mut().stop_join();
 }
 
 fn set_active(ctx: &SuperviseCtx, port: Rc<SerialPort>) {

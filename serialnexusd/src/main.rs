@@ -10,6 +10,7 @@
 //! Phase 2 walking skeleton: control socket + JSON-RPC (`load`/`dump`/`state`),
 //! serial and PTY node lifecycle. Byte flow and presence gating land next.
 
+mod boundary;
 mod control;
 mod daemon;
 mod nodes;

@@ -42,3 +42,7 @@ anyhow.workspace = true
 serial2.workspace = true
 nix = { workspace = true, features = ["term", "fs", "poll", "ioctl", "process", "signal", "user"] }
 libc.workspace = true
+
+[dev-dependencies]
+# Property tests for the pure boundary-supervisor primitives (§16.1 / plan §9.1).
+proptest.workspace = true

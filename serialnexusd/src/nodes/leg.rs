@@ -34,10 +34,12 @@
 //! into a device that rebooted (§6).
 //!
 //! **Concurrency.** Like the exec codec (§15.22), the leg's socket read and write
-//! halves run as **concurrently-polled** futures in one `select!`, so a
-//! backpressured targetward write never starves the hostward read half. Every task
-//! is aborted on teardown and Drop; a `RefCell` borrow never crosses an `.await`
-//! (§15.20).
+//! halves run as **concurrently-polled** futures via the boundary-supervisor
+//! library's [`boundary::race3`] (§16.1), so a backpressured targetward write never
+//! starves the hostward read half. Reconnect backoff is [`boundary::Backoff`], and
+//! an exhausted send half [`boundary::park`]s rather than tearing the wire down (the
+//! §15.24 stale-status fix, now structural). Every task is aborted on teardown and
+//! Drop; a `RefCell` borrow never crosses an `.await` (§15.20).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -61,6 +63,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
+use crate::boundary;
 use crate::runtime::{CHANNEL_CAP, HostwardSink, READ_BUF, SharedLock, Wiring};
 
 /// How long to wait for the peer's hello before treating the connection as dead.
@@ -422,7 +425,8 @@ async fn supervise(mut a: SuperviseArgs) {
         LegRole::Connect => None,
     };
 
-    let mut backoff = a.reconnect_initial_ms;
+    // Exponential reconnect backoff (§7.4), reset on a good connection.
+    let mut backoff = boundary::Backoff::exponential(a.reconnect_initial_ms, a.reconnect_max_ms);
     let mut connected_before = false;
 
     loop {
@@ -442,7 +446,7 @@ async fn supervise(mut a: SuperviseArgs) {
                         reason: format!("connect {:?}: {e}", a.address),
                     },
                 );
-                sleep_backoff(&mut backoff, a.reconnect_max_ms).await;
+                backoff.sleep().await;
                 continue;
             }
         };
@@ -464,13 +468,13 @@ async fn supervise(mut a: SuperviseArgs) {
                     *a.shared.peer_address.borrow_mut() = Some(addr);
                 }
                 set_status(&a.shared, NodeStatus::Active);
-                backoff = a.reconnect_initial_ms; // a good connection resets backoff
+                backoff.reset(); // a good connection resets backoff
                 leftover
             }
             Ok(Err(reason)) => {
                 set_status(&a.shared, NodeStatus::Faulted { reason });
                 if a.role == LegRole::Connect {
-                    sleep_backoff(&mut backoff, a.reconnect_max_ms).await;
+                    backoff.sleep().await;
                 }
                 continue;
             }
@@ -482,7 +486,7 @@ async fn supervise(mut a: SuperviseArgs) {
                     },
                 );
                 if a.role == LegRole::Connect {
-                    sleep_backoff(&mut backoff, a.reconnect_max_ms).await;
+                    backoff.sleep().await;
                 }
                 continue;
             }
@@ -546,7 +550,7 @@ async fn supervise(mut a: SuperviseArgs) {
             PumpEnd::Protocol(reason) => set_status(&a.shared, NodeStatus::Faulted { reason }),
         }
         if a.role == LegRole::Connect {
-            sleep_backoff(&mut backoff, a.reconnect_max_ms).await;
+            backoff.sleep().await;
         }
     }
 }
@@ -568,89 +572,90 @@ async fn pump(
     listener: Option<&Listener>,
 ) -> PumpEnd {
     let mut send_start = 0usize;
-    tokio::select! {
-        // Write half: multiplex the send source onto the wire. A chunk larger than
-        // a single frame is fragmented into consecutive Data frames on the same
-        // channel (the peer reassembles transparently) — never dropped, since
-        // READ_BUF == MAX_FRAME_SIZE means a full read always overflows the header,
-        // and the `send` verb accepts arbitrary-length lines (§5 no-drop / all-loss-
-        // counted, §9 clause 5).
-        end = async {
-            loop {
-                match next_send(send_receivers, &mut send_start).await {
-                    Some((ch, bytes)) => {
+    // Write half: multiplex the send source onto the wire. A chunk larger than a
+    // single frame is fragmented into consecutive Data frames on the same channel
+    // (the peer reassembles transparently) — never dropped, since READ_BUF ==
+    // MAX_FRAME_SIZE means a full read always overflows the header, and the `send`
+    // verb accepts arbitrary-length lines (§5 no-drop / all-loss-counted, §9 clause 5).
+    let write = async {
+        loop {
+            match next_send(send_receivers, &mut send_start).await {
+                Some((ch, bytes)) => {
+                    if let Some(stat) = stats.get(&ch) {
+                        stat.active.set(true);
+                    }
+                    // Max payload per frame = MAX_FRAME_SIZE minus the envelope
+                    // header (1 type + 2 channel-len + channel bytes).
+                    let cap = MAX_FRAME_SIZE.saturating_sub(3 + ch.len()).max(1);
+                    let total = bytes.len();
+                    let mut off = 0;
+                    while off < total {
+                        let end = (off + cap).min(total);
+                        let piece_len = (end - off) as u64;
+                        let mut frame = Vec::new();
+                        if encode(&Event::data(ch.as_str(), bytes.slice(off..end)), &mut frame)
+                            .is_err()
+                        {
+                            break; // defensive; unreachable for a sane channel id
+                        }
+                        if write_half.write_all(&frame).await.is_err() {
+                            return PumpEnd::PeerGone;
+                        }
                         if let Some(stat) = stats.get(&ch) {
-                            stat.active.set(true);
+                            if send_is_hostward {
+                                stat.delivered_hostward
+                                    .set(stat.delivered_hostward.get() + piece_len);
+                            } else {
+                                stat.accepted_targetward
+                                    .set(stat.accepted_targetward.get() + piece_len);
+                            }
                         }
-                        // Max payload per frame = MAX_FRAME_SIZE minus the envelope
-                        // header (1 type + 2 channel-len + channel bytes).
-                        let cap = MAX_FRAME_SIZE.saturating_sub(3 + ch.len()).max(1);
-                        let total = bytes.len();
-                        let mut off = 0;
-                        while off < total {
-                            let end = (off + cap).min(total);
-                            let piece_len = (end - off) as u64;
-                            let mut frame = Vec::new();
-                            if encode(&Event::data(ch.as_str(), bytes.slice(off..end)), &mut frame)
-                                .is_err()
-                            {
-                                break; // defensive; unreachable for a sane channel id
-                            }
-                            if write_half.write_all(&frame).await.is_err() {
-                                return PumpEnd::PeerGone;
-                            }
-                            if let Some(stat) = stats.get(&ch) {
-                                if send_is_hostward {
-                                    stat.delivered_hostward
-                                        .set(stat.delivered_hostward.get() + piece_len);
-                                } else {
-                                    stat.accepted_targetward
-                                        .set(stat.accepted_targetward.get() + piece_len);
-                                }
-                            }
-                            off = end;
-                        }
+                        off = end;
                     }
-                    // Every send source has closed (a faces=target leg whose local
-                    // producers are all gone; a serial reopen is deferred to phase 7).
-                    // Park the write half so the independent read/targetward direction
-                    // stays alive (§15.22) — teardown aborts the task.
-                    None => std::future::pending::<()>().await,
                 }
+                // Every send source has closed (a faces=target leg whose local
+                // producers are all gone). Park the write half so the independent
+                // read/targetward direction stays alive (§16.1 park-don't-teardown) —
+                // teardown aborts the task.
+                None => boundary::park().await,
             }
-        } => end,
-        // Read half: decode envelope frames and route them into the local graph.
-        end = async {
-            let mut decoder = FrameDecoder::new();
-            decoder.push(&leftover);
-            let mut readbuf = vec![0u8; READ_BUF];
+        }
+    };
+    // Read half: decode envelope frames and route them into the local graph.
+    let read = async {
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&leftover);
+        let mut readbuf = vec![0u8; READ_BUF];
+        loop {
             loop {
-                loop {
-                    match decoder.next_event() {
-                        Ok(Some(ev)) => route_recv(ev, recv_route, stats, shared).await,
-                        Ok(None) => break,
-                        Err(e) => return PumpEnd::Protocol(e.to_string()),
-                    }
-                }
-                match read_half.read(&mut readbuf).await {
-                    Ok(0) | Err(_) => return PumpEnd::PeerGone,
-                    Ok(k) => decoder.push(&readbuf[..k]),
+                match decoder.next_event() {
+                    Ok(Some(ev)) => route_recv(ev, recv_route, stats, shared).await,
+                    Ok(None) => break,
+                    Err(e) => return PumpEnd::Protocol(e.to_string()),
                 }
             }
-        } => end,
-        // Listen role: actively reject a concurrent second peer (§7.4). Never
-        // completes, so the pump ends only via the write/read halves above.
-        _ = async {
-            match listener {
-                Some(l) => loop {
-                    if let Ok((extra, _)) = l.accept().await {
-                        drop(extra); // close it immediately
-                    }
-                },
-                None => std::future::pending::<()>().await,
+            match read_half.read(&mut readbuf).await {
+                Ok(0) | Err(_) => return PumpEnd::PeerGone,
+                Ok(k) => decoder.push(&readbuf[..k]),
             }
-        } => PumpEnd::PeerGone,
-    }
+        }
+    };
+    // Third arm: never ends the pump, so it ends only via the write/read halves
+    // above. The listen role actively rejects a concurrent second peer (§7.4); the
+    // connect role has no listener, so it parks (§16.1 park-don't-teardown).
+    let reject_extra = async {
+        match listener {
+            Some(l) => loop {
+                if let Ok((extra, _)) = l.accept().await {
+                    drop(extra); // close it immediately
+                }
+            },
+            None => boundary::park().await,
+        }
+    };
+    // Concurrently-polled halves (§15.22): a backpressured write never starves the
+    // read half.
+    boundary::race3(write, read, reject_extra).await
 }
 
 /// Route one decoded wire event into the local graph. Hostward fan-out is lossy at
@@ -946,12 +951,6 @@ fn bind_channels(
 
 fn set_status(shared: &Rc<LegShared>, status: NodeStatus) {
     *shared.status.borrow_mut() = status;
-}
-
-async fn sleep_backoff(backoff: &mut u64, max: u64) {
-    let this = (*backoff).max(1).min(max.max(1));
-    tokio::time::sleep(Duration::from_millis(this)).await;
-    *backoff = (this.saturating_mul(2)).min(max.max(1));
 }
 
 async fn bind_listener(transport: Transport, address: &str) -> std::io::Result<Listener> {

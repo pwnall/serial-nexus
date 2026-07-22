@@ -44,6 +44,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
+use crate::boundary;
 use crate::runtime::{CHANNEL_CAP, DropCounters, HostwardSink, READ_BUF, SharedLock, Wiring};
 
 /// The reserved wire channel identity for the multiplexed (device) side (§15.22).
@@ -271,6 +272,8 @@ struct SuperviseArgs {
 /// dies, then fault, back off, and restart (§7.6). The merged source and routing
 /// outputs persist across restarts, so a restarted child resumes cleanly.
 async fn supervise(mut a: SuperviseArgs) {
+    // Fixed restart backoff (§7.6): a constant wait between a crash and the respawn.
+    let mut backoff = boundary::Backoff::fixed(a.backoff_ms);
     loop {
         let mut cmd = tokio::process::Command::new(&a.argv[0]);
         cmd.args(&a.argv[1..])
@@ -287,7 +290,7 @@ async fn supervise(mut a: SuperviseArgs) {
                 *a.status.borrow_mut() = NodeStatus::Faulted {
                     reason: format!("spawn {:?}: {e}", a.argv[0]),
                 };
-                tokio::time::sleep(std::time::Duration::from_millis(a.backoff_ms)).await;
+                backoff.sleep().await;
                 a.restart_count.set(a.restart_count.get() + 1);
                 continue;
             }
@@ -318,7 +321,7 @@ async fn supervise(mut a: SuperviseArgs) {
                 *a.status.borrow_mut() = NodeStatus::Faulted {
                     reason: format!("child exited; restarting (count {})", a.restart_count.get()),
                 };
-                tokio::time::sleep(std::time::Duration::from_millis(a.backoff_ms)).await;
+                backoff.sleep().await;
             }
         }
     }
@@ -342,7 +345,7 @@ struct Routing<'a> {
 }
 
 /// Pump one child instance. The stdin-feeding and stdout-reading loops run as
-/// **concurrently-polled** futures in one `select!` — not two branches of a
+/// **concurrently-polled** futures via [`boundary::race3`] — not two branches of a
 /// single loop — so a `write_all(stdin)` blocked on a full pipe never starves the
 /// stdout reader (which keeps draining stdout, unblocking the child, which drains
 /// stdin), and a targetward `route_event` parked on backpressure or a stolen lock
@@ -360,67 +363,73 @@ async fn pump_child(
     src_rx: &mut mpsc::Receiver<(String, Chunk)>,
     routing: &Routing<'_>,
 ) -> PumpEnd {
-    tokio::select! {
-        // stdin: frame each tagged chunk and write it to the child. A chunk larger
-        // than one frame — the raw device stream on the reserved mux channel is a
-        // full serial read, up to READ_BUF == MAX_FRAME_SIZE, so it overflows the
-        // envelope header — is fragmented into consecutive data frames rather than
-        // dropped (the child reassembles per channel), preserving §5's no-drop /
-        // all-loss-counted invariant just as the leg does (§15.24).
-        end = async {
-            while let Some((channel, bytes)) = src_rx.recv().await {
-                let cap = MAX_FRAME_SIZE.saturating_sub(3 + channel.len()).max(1);
-                let total = bytes.len();
-                let mut off = 0;
-                while off < total {
-                    let stop = (off + cap).min(total);
-                    let mut frame = Vec::new();
-                    if encode(&Event::data(channel.as_str(), bytes.slice(off..stop)), &mut frame)
-                        .is_err()
-                    {
-                        break; // defensive; unreachable for a sane channel id
-                    }
-                    if stdin.write_all(&frame).await.is_err() || stdin.flush().await.is_err() {
-                        return PumpEnd::ChildDied; // child stdin broke
-                    }
-                    off = stop;
+    // stdin: frame each tagged chunk and write it to the child. A chunk larger than
+    // one frame — the raw device stream on the reserved mux channel is a full serial
+    // read, up to READ_BUF == MAX_FRAME_SIZE, so it overflows the envelope header —
+    // is fragmented into consecutive data frames rather than dropped (the child
+    // reassembles per channel), preserving §5's no-drop / all-loss-counted invariant
+    // just as the leg does (§15.24).
+    let feed = async {
+        while let Some((channel, bytes)) = src_rx.recv().await {
+            let cap = MAX_FRAME_SIZE.saturating_sub(3 + channel.len()).max(1);
+            let total = bytes.len();
+            let mut off = 0;
+            while off < total {
+                let stop = (off + cap).min(total);
+                let mut frame = Vec::new();
+                if encode(
+                    &Event::data(channel.as_str(), bytes.slice(off..stop)),
+                    &mut frame,
+                )
+                .is_err()
+                {
+                    break; // defensive; unreachable for a sane channel id
                 }
+                if stdin.write_all(&frame).await.is_err() || stdin.flush().await.is_err() {
+                    return PumpEnd::ChildDied; // child stdin broke
+                }
+                off = stop;
             }
-            PumpEnd::SourceClosed
-        } => end,
-        // stdout: decode envelope frames and route them.
-        end = async {
-            let mut decoder = FrameDecoder::new();
-            let mut readbuf = vec![0u8; READ_BUF];
-            loop {
-                match stdout.read(&mut readbuf).await {
-                    Ok(0) | Err(_) => return PumpEnd::ChildDied, // EOF/error: child died
-                    Ok(k) => {
-                        decoder.push(&readbuf[..k]);
-                        loop {
-                            match decoder.next_event() {
-                                Ok(Some(ev)) => route_event(ev, routing).await,
-                                Ok(None) => break,
-                                Err(e) => {
-                                    tracing::warn!(target: "exec-codec", "child emitted a malformed frame: {e}");
-                                    return PumpEnd::ChildDied; // protocol violation ≈ crash
-                                }
+        }
+        PumpEnd::SourceClosed
+    };
+    // stdout: decode envelope frames and route them.
+    let read = async {
+        let mut decoder = FrameDecoder::new();
+        let mut readbuf = vec![0u8; READ_BUF];
+        loop {
+            match stdout.read(&mut readbuf).await {
+                Ok(0) | Err(_) => return PumpEnd::ChildDied, // EOF/error: child died
+                Ok(k) => {
+                    decoder.push(&readbuf[..k]);
+                    loop {
+                        match decoder.next_event() {
+                            Ok(Some(ev)) => route_event(ev, routing).await,
+                            Ok(None) => break,
+                            Err(e) => {
+                                tracing::warn!(target: "exec-codec", "child emitted a malformed frame: {e}");
+                                return PumpEnd::ChildDied; // protocol violation ≈ crash
                             }
                         }
                     }
                 }
             }
-        } => end,
-        // stderr → diagnostics; drains until EOF, then parks so it never ends the
-        // pump on its own (only stdin/stdout death or a closed source does).
-        end = async {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::warn!(target: "exec-codec", "child stderr: {line}");
-            }
-            std::future::pending::<PumpEnd>().await
-        } => end,
-    }
+        }
+    };
+    // stderr → diagnostics; drains until EOF, then parks so it never ends the pump
+    // on its own — only stdin/stdout death or a closed source does (§16.1
+    // park-don't-teardown).
+    let errs = async {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::warn!(target: "exec-codec", "child stderr: {line}");
+        }
+        boundary::park().await
+    };
+    // Concurrently-polled halves (§15.22): a blocked `write_all(stdin)` never starves
+    // the stdout reader, and a targetward `route_event` parked on backpressure or a
+    // stolen lock never starves the hostward stdin feed.
+    boundary::race3(feed, read, errs).await
 }
 
 /// Route one event the child emitted: a frame on the reserved multiplexed channel
