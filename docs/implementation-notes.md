@@ -1,11 +1,39 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-21 (**phases 0-8 done; phase 8 built + adversarially audited**).
-**All planned phases complete — ready for the `0.2.0` release mark.** **Branch:**
-`implementation` (off `main`).
+**As of:** 2026-07-22 (**phases 0-8 done + validated on a real Tier-3 rig**; phase 8
+built + adversarially audited). **All planned phases complete — ready for the `0.2.0`
+release mark.** **Branch:** `implementation` (off `main`).
 **Normative docs are now v6:** `docs/13-design-claude-fable-v6.md` (design) and
 `docs/14-implementation-plan-claude-fable-v6.md` (plan). v1–v5 docs (03–12) are in
 `docs/historical/`. Section references (§) point at the v6 design.
+
+**Physical validation on a real Tier-3 rig (2026-07-22).** First end-to-end run on
+real silicon — two FTDI FT232R adapters (`usb:0403:6001:BH00L4KU:00` /dev/ttyUSB0 ↔
+`usb:0403:6001:BH00LL8O:00` /dev/ttyUSB1) cross-wired as a null modem. Device access
+is resolved (the dev user is in `dialout`; the old "S3 access pending" caveat no longer
+applies). `nexus-doctor` baseline was clean (12/12), and the rig cert surfaced **the
+first genuine real-hardware bug** — in the *doctor*, not the daemon: `p5_certify_pair`
+(§15.21) had never run against real UARTs (the sim skips it as "not a UART"), and it
+reopened both ports per rate and transmitted *before the FTDI applied the new baud
+divisor*, so the rate ladder garbled at 115200+ and reported `rate_ladder=false` while
+an independent pyserial test proved the physical link flawless 9600..921600. **Fixed
+(`nexus-doctor/src/probes.rs`, commit `8cf61d0`):** a 150 ms post-open baud settle
+before each single-shot exchange, a **both-direction** ladder (§15.21 "all must
+round-trip", closing a pre-existing one-way gap), and a bulkier mismatch pattern so the
+frame-error observation is deterministic — verified `rate_ladder=true
+deliberate_mismatch_observed=true`, 6/6. Diagnostic-only; no daemon/data-plane change,
+sim `phase7/p5.sh` CI path unaffected. The daemon was then driven through the rig and
+**every behavior passed**: identity resolution both directions (§12), byte-exact
+bidirectional data path (§4/§5/§7.1), the `send` verb, far-side break reception
+(port1.brk++), TIOCEXCL exclusivity, exclusive arbitration (lock→LOCKED→steal, §6),
+slow-consumer drop-with-counters isolation (§5, exact `received+dropped==sent`), the PTY
+symmetric config over the §15.19 writer bridge, and observable framing/parity error
+counters under a deliberate baud/parity mismatch. A 4-agent adversarial audit found **no
+false passes** and confirmed the doctor fix correct and complete. Codified as
+`scripts/validate/hardware/crossover-rig.sh` (commit `906c309`; see the hardware block
+under Quality gates). Still requires a human hand (not automatable): physical
+unplug/replug (true faulted-and-wait, §7.1/§15.25), squatter swap, and far-side modem
+lines (the 3-wire crossover carries no DTR/RTS to the peer).
 
 **v6 revision + phase 0-4 alignment (2026-07-21).** The v6 docs are v5 with the
 phase-5/6 ADRs (§15.22–15.24) *condensed* and their refinements folded forward into
@@ -834,7 +862,10 @@ deferred `connect`/`disconnect`/`set-attribute`).
   in its own) — a software `pty --echo` peer competing for CPU with other active peers
   in the SAME run is timing-sensitive on a loaded box (a sim/scheduling artifact, not a
   P5 logic issue: a real TX↔RX jumper reflects in hardware). Verified 8/8 under 4×CPU
-  load after the split.
+  load after the split. **Real-hardware follow-up (2026-07-22, commit `8cf61d0`):** the
+  paired independent-clock certificate (`p5_certify_pair` — the rate ladder + deliberate
+  mismatch) had never run on real UARTs (the sim skips it); its first live run exposed a
+  missing post-open baud settle. See the physical-validation block at the top.
 - **Validation:** `scripts/validate/phase7/*.sh` (items 1–7) + a reusable
   `scripts/lib/fixture-tree.sh` that builds `/dev/serial/by-id` + `/dev/serial/by-path`
   + sysfs trees under `--dev-root` (the resolver seam, plan §3). `all.sh --through 7`
