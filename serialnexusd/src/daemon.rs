@@ -1163,19 +1163,39 @@ fn is_config_mutation(method: &str) -> bool {
 /// Write `bytes` to `path` atomically: create the parent directory, write a
 /// sibling temp file, then rename over the target (atomic on one filesystem), so a
 /// crash mid-write leaves the previous snapshot intact (§11/§15.9).
+///
+/// Durable against power loss too (§16.6): the temp file is fsynced *before* the
+/// rename — a rename that reaches disk while the file's bytes do not would yield a
+/// truncated snapshot after an outage — and the parent directory is fsynced *after*
+/// the rename, so the rename itself is durable. Config mutations are rare, so the
+/// two fsyncs cost nothing measurable; what they remove is a corrupt state file.
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir)?;
+    use std::io::Write;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => {
+            std::fs::create_dir_all(d)?;
+            d
         }
-    }
+        // No parent (a bare filename): the directory is the current one.
+        _ => std::path::Path::new("."),
+    };
     let tmp = {
         let mut name = path.file_name().unwrap_or_default().to_os_string();
         name.push(".tmp");
         path.with_file_name(name)
     };
-    std::fs::write(&tmp, bytes)?;
+    // Write and fsync the temp file's contents to disk before the rename.
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
     std::fs::rename(&tmp, path)?;
+    // fsync the directory so the rename entry is durable. Best-effort: a filesystem
+    // that rejects a directory fsync must not fail an otherwise-successful snapshot.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
     Ok(())
 }
 
@@ -1220,4 +1240,47 @@ fn parse_config_param(params: Option<Value>) -> Result<GraphConfig, RpcError> {
         .ok_or_else(|| RpcError::invalid_params("missing 'config' in params"))?;
     serde_json::from_value(config.clone())
         .map_err(|e| RpcError::new(error_codes::INVALID_PARAMS, format!("invalid config: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir() -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("snx-atomic-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// `atomic_write` durably replaces the target: the bytes round-trip, the temp
+    /// sibling is consumed by the rename (no partial file left behind), and a second
+    /// write overwrites cleanly.
+    ///
+    /// **Comment-pinned (§16.6).** The durability path is: fsync the temp file
+    /// *before* the rename, then fsync the parent directory *after* it. Those
+    /// `sync_all` syscalls are not directly observable from a unit test, so this
+    /// asserts the observable atomic-write contract; the `sync_all` calls themselves
+    /// are pinned by this note against a future refactor that drops them (a
+    /// `strace -e trace=fsync,rename` on this test shows both fsyncs, as an optional
+    /// spot check).
+    #[test]
+    fn atomic_write_replaces_durably() {
+        let dir = scratch_dir();
+        let target = dir.join("state.toml");
+        let tmp = dir.join("state.toml.tmp");
+
+        atomic_write(&target, b"first").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"first");
+        assert!(!tmp.exists(), "the rename must consume the temp sibling");
+
+        // A second write atomically replaces the contents (different length, so a
+        // non-atomic partial write would be detectable).
+        atomic_write(&target, b"second-and-longer").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"second-and-longer");
+        assert!(!tmp.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
