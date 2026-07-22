@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 //! `nexus-sim` — the in-workspace test double (design plan §3).
 //!
@@ -42,23 +42,10 @@ use nix::sys::termios::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-/// Resolve a pty master's slave path across platforms: reentrant `ptsname_r(3)` on
-/// Linux/Android, the static-buffer `ptsname(3)` elsewhere. The daemon and doctor
-/// wrap this in their `sys` modules; the sim (which `#![deny]`s unsafe) localizes
-/// the one `unsafe` to this helper, and copies the `String` out before returning.
-#[allow(unsafe_code)]
-fn ptsname(master: &PtyMaster) -> nix::Result<String> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        nix::pty::ptsname_r(master)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        // Safety: single-threaded sim; the result is cloned out of the static
-        // buffer immediately, before any other `ptsname` call could overwrite it.
-        unsafe { nix::pty::ptsname(master) }
-    }
-}
+// The sim resolves a pty master's slave path via the shared `nexus_sys::ptsname`
+// (§16.3), so it holds no `unsafe` of its own and `#![forbid]`s it. `ptsname` here
+// is a thin alias to keep the call sites unchanged.
+use nexus_sys::ptsname;
 
 #[derive(Parser)]
 #[command(name = "nexus-sim", about = "serial_nexus test double (§3)")]

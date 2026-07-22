@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 //! `nexus-doctor` — the serial_nexus capability checker (design §15.17).
 //!
@@ -16,7 +16,6 @@
 
 mod probes;
 mod report;
-mod sys;
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};

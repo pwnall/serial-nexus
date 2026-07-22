@@ -17,7 +17,7 @@ use nix::sys::termios::{LocalFlags, SetArg, cfmakeraw, tcgetattr, tcsetattr};
 use serial2::{CharSize, FlowControl, Parity, SerialPort, Settings, StopBits};
 
 use crate::report::{EnvCheck, Probe, Status};
-use crate::sys;
+use nexus_sys as sys;
 
 const CUSTOM_BAUD: u32 = 250_000;
 
@@ -377,7 +377,7 @@ fn p5_name(port: &Path, resolver: &nexus_core::Resolver) -> String {
 
 /// Whether a fd is a real UART: a pts (the CI sim) fails `TIOCGICOUNT`.
 fn p5_is_uart(sp: &SerialPort) -> bool {
-    sys::read_icounter(sp.as_raw_fd()).is_ok()
+    sys::read_icounts(sp.as_raw_fd()).is_ok()
 }
 
 /// A single-port certificate line for a real UART: break capability, the
@@ -400,7 +400,7 @@ fn p5_certify_port(port: &Path) -> String {
         sp.read_cd().map(|b| b.to_string()).unwrap_or("?".into()),
         sp.read_ri().map(|b| b.to_string()).unwrap_or("?".into()),
     );
-    let icounter = sys::read_icounter(sp.as_raw_fd()).is_ok();
+    let icounter = sys::read_icounts(sp.as_raw_fd()).is_ok();
     format!("custom_baud={custom_baud_ok} break={break_ok} modem[{modem}] icounter={icounter}")
 }
 
@@ -454,7 +454,7 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> String {
             return format!("rate_ladder={ladder_ok} mismatch=reopen-failed");
         };
         std::thread::sleep(P5_OPEN_SETTLE); // settle both ends before the mismatch probe
-        let before = sys::read_icounter(b.as_raw_fd())
+        let before = sys::read_icounts(b.as_raw_fd())
             .map(|c| c.frame)
             .unwrap_or(0);
         // A single ~24-byte nonce raises the frame counter only probabilistically
@@ -466,7 +466,7 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> String {
         let _ = p5_write_all(&a, &bulk);
         std::thread::sleep(Duration::from_millis(150));
         let got = p5_drain(&b, Duration::from_millis(300));
-        let after = sys::read_icounter(b.as_raw_fd())
+        let after = sys::read_icounts(b.as_raw_fd())
             .map(|c| c.frame)
             .unwrap_or(before);
         !contains_sub(&got, unit) && after > before
@@ -735,7 +735,7 @@ fn p3_inner(port: &Path) -> anyhow::Result<SerialFit> {
     let break_ok = sp.set_break(true).is_ok() && sp.set_break(false).is_ok();
 
     // Driver error/edge counters (§5, §7.1: surfaced in state where supported).
-    let icounter_supported = sys::read_icounter(sp.as_raw_fd()).is_ok();
+    let icounter_supported = sys::read_icounts(sp.as_raw_fd()).is_ok();
 
     let excl_set = sys::set_exclusive(sp.as_raw_fd(), true).is_ok();
     let second = SerialPort::open(port, 9600);

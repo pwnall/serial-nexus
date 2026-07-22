@@ -53,7 +53,7 @@ use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::cell::CriticalCell;
-use crate::sys;
+use nexus_sys as sys;
 
 /// A shared, single-threaded handle to one host-facing endpoint's write lock
 /// (§6): the pure [`EndpointLock`] state machine plus the two async signals the

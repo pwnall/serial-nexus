@@ -6,6 +6,7 @@ members = [
     "nexus-core",
     "nexus-rpc",
     "nexus-sim",
+    "nexus-sys",
     "nexus-doctor",
     "serialnexusd",
     "serialnexusctl",
@@ -66,6 +67,7 @@ codec-api = { path = "codec-api" }
 codec-reference = { path = "codecs/reference" }
 nexus-core = { path = "nexus-core" }
 nexus-rpc = { path = "nexus-rpc" }
+nexus-sys = { path = "nexus-sys" }
 
 # Lints applied to every crate that opts in with `[lints] workspace = true`.
 # The unsafe-code policy is expressed per-crate at the source level (§2): pure

@@ -1,5 +1,11 @@
-//! Raw ioctls nix/serial2 don't wrap, isolated behind a localized unsafe
-//! allowance — the single `unsafe`-bearing module in the daemon (plan §2).
+//! `nexus-sys` — the one crate that carries `unsafe` (design §16.3).
+//!
+//! Every raw ioctl, `ptsname`, and `poll(2)` wrapper the daemon, the doctor, and
+//! the sim need lives here — the wrappers previously existed three times (daemon,
+//! doctor, sim), and the macOS port had to gate `TIOCGICOUNT`/`ptsname` per copy,
+//! so a missed copy was a silent platform break. Collecting them into one internal
+//! crate shrinks the audit surface for `unsafe` to a single file set with the
+//! cfg-gating written once (§16.3); every other crate `#![forbid(unsafe_code)]`.
 
 #![allow(unsafe_code)]
 
@@ -76,7 +82,7 @@ pub fn ptsname(master: &nix::pty::PtyMaster) -> nix::Result<String> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        // Safety: single-threaded daemon; the `String` is cloned out of the
+        // Safety: single-threaded callers; the `String` is cloned out of the
         // static buffer immediately, so a later `ptsname` call cannot corrupt it.
         unsafe { nix::pty::ptsname(master) }
     }

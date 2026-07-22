@@ -468,6 +468,7 @@ dependencies = [
  "clap",
  "libc",
  "nexus-core",
+ "nexus-sys",
  "nix",
  "serde",
  "serde_json",
@@ -491,9 +492,18 @@ dependencies = [
  "clap",
  "codec-api",
  "libc",
+ "nexus-sys",
  "nix",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "nexus-sys"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "nix",
 ]
 
 [[package]]
@@ -777,6 +787,7 @@ dependencies = [
  "libc",
  "nexus-core",
  "nexus-rpc",
+ "nexus-sys",
  "nix",
  "proptest",
  "serde",

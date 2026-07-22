@@ -50,7 +50,7 @@ use tokio::task::JoinHandle;
 use crate::boundary::BlockingReader;
 use crate::cell::CriticalCell;
 use crate::runtime::{self, HostwardSink, READ_BUF};
-use crate::sys;
+use nexus_sys as sys;
 
 /// Re-arm interval (ms) for the serial reader thread's blocking readiness poll.
 /// A live device wakes it far sooner; on teardown the thread observes its stop

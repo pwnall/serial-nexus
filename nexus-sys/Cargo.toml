@@ -1,0 +1,20 @@
+[package]
+name = "nexus-sys"
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "serial_nexus low-level syscall wrappers: the one crate that carries unsafe (ioctls, ptsname, poll) (design §16.3)."
+
+# The single unsafe-bearing crate in the workspace (§16.3): every raw ioctl,
+# `ptsname`, and `poll(2)` wrapper the daemon, doctor, and sim need lives here, so
+# the audit surface for unsafe is one file set and the cfg-gating is written once.
+# Every other crate `#![forbid(unsafe_code)]`.
+
+[lints]
+workspace = true
+
+[dependencies]
+nix = { workspace = true, features = ["term", "poll", "ioctl"] }
+libc.workspace = true

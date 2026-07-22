@@ -63,7 +63,7 @@ use nexus_core::lock::{Arbitration, OriginId, WriteMode};
 
 use crate::cell::CriticalCell;
 use crate::runtime::{ACTIVE_POLL, DropCounters, READ_BUF, SharedLock, back_off};
-use crate::sys;
+use nexus_sys as sys;
 
 pub struct PtyNode {
     pub name: String,

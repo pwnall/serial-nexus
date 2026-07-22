@@ -1,9 +1,9 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 //! `serialnexusd` — the serial_nexus daemon.
 //!
-//! Unsafe is denied crate-wide and localized with `#[allow(unsafe_code)]` to the
-//! `sys` module, which isolates the raw ioctls nix/serial2 don't wrap (§2). The
+//! Unsafe is *forbidden* crate-wide: every raw ioctl/`ptsname`/`poll(2)` wrapper
+//! lives in the shared `nexus-sys` crate (§16.3), so the daemon holds none. The
 //! data plane runs on a current-thread tokio runtime; control-plane connections
 //! are tasks on the same runtime, so mutations serialize for free (§5, plan §2).
 //!
@@ -16,7 +16,6 @@ mod control;
 mod daemon;
 mod nodes;
 mod runtime;
-mod sys;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

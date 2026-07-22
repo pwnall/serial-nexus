@@ -24,6 +24,7 @@ codec-reference = ["dep:codec-reference"]
 [dependencies]
 nexus-core.workspace = true
 nexus-rpc.workspace = true
+nexus-sys.workspace = true
 codec-api.workspace = true
 codec-reference = { workspace = true, optional = true }
 
