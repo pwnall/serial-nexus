@@ -1,11 +1,56 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-22 (**phases 0-8 done + validated on a real Tier-3 rig**; phase 8
-built + adversarially audited). **All planned phases complete — ready for the `0.2.0`
-release mark.** **Branch:** `implementation` (off `main`).
-**Normative docs are now v6:** `docs/13-design-claude-fable-v6.md` (design) and
-`docs/14-implementation-plan-claude-fable-v6.md` (plan). v1–v5 docs (03–12) are in
-`docs/historical/`. Section references (§) point at the v6 design.
+**As of:** 2026-07-22 (**phases 0-8 done + validated on a real Tier-3 rig**, then the
+**post-1.0 simplification track (plan §9 / design §16) executed in full**).
+**Branch:** `implementation` (off `main`).
+**Normative docs are now v7:** `docs/15-design-claude-fable-v7.md` (design) and
+`docs/16-implementation-plan-claude-fable-v7.md` (plan). v1–v6 docs (03–14) are in
+`docs/historical/`. Section references (§) point at the v7 design.
+
+**Post-1.0 simplification track — DONE (design §16 / plan §9).** All seven items
+executed as seven commits on `implementation`, each behavior-preserving item
+adversarially re-audited before commit. Final state: **102 unit/property tests**,
+`all.sh --through 8` = **45/45** (the original 42 + the new unsafe-gate, jq-lint, and
+harness self-test), fmt/clippy/`--target x86_64-apple-darwin`/shellcheck all clean.
+- **§9.1 boundary-supervisor library** (`214e237`, §16.1). New `serialnexusd::boundary`:
+  `park()` (park-don't-teardown), `race3` (concurrent halves — a *flat* 3-arm `select!`),
+  `Backoff::{exponential,fixed}`, `BlockingReader` (loss-notify + join-then-transition).
+  serial/exec/leg rebased onto it. The 3-lens audit caught a real medium bug — race3 was
+  first drafted as nested `race2`, which biases the tie-break when two halves are ready in
+  one poll (a spurious respawn on a teardown/crash race) — fixed to a flat select; plus a
+  `fixed(0)` floor divergence. 8 boundary tests.
+- **§9.2 critical-section cell** (`362a11e`, §16.2). `serialnexusd::cell::CriticalCell`
+  (closure-only `with`/`with_mut`) replaces **every** `RefCell` in serialnexusd (daemon
+  state, `LockCell`, all node shared cells); `serialnexusd/clippy.toml` bans
+  `std::cell::RefCell` via `disallowed-types` (per-crate scoping via `CARGO_MANIFEST_DIR`,
+  confirmed on clippy 0.1.97). The "borrow never crosses `.await`" tripwire is now a
+  compile-shape fact. Audit clean. Gate proven (clippy fails on a planted RefCell). 3 tests.
+- **§9.3 nexus-sys crate** (`052fb8a`, §16.3). New `nexus-sys` = all unsafe (ioctls,
+  ptsname, poll); daemon/doctor `sys.rs` deleted, sim's local unsafe removed; every other
+  crate now `#![forbid(unsafe_code)]`. `scripts/validate/phase0/unsafe-gate.sh` proves
+  confinement (detector-proven). doctor `read_icounter`/`SerialIcounter` → canonical
+  `read_icounts`/`SerialIcounts`. macOS cross-check clean.
+- **§9.4+§9.5 harness + CI hardening** (`7f097e0`, §16.5). `scripts/lib/assert.sh` (tested
+  helpers; the loss-counter check with correct `(add // 0) == 0`), `phase0/harness-selftest.sh`
+  (feeds a nonzero counter, asserts the helper *fails* — the anti-tautology regression),
+  `phase0/jq-lint.sh` (compiles .jq files + greps the `// N ==` antipattern), `.shellcheckrc`
+  + **shellcheck green** across scripts/. soak.sh uses the tested helper. CI `harness-lint`
+  (per-push) + `sweep-nightly` (full `--through 8`, archives the verdict JSON). `all.sh`
+  gained `--json-summary`.
+- **§9.6 state-file fsync** (`f129a2f`, §16.6). `atomic_write` fsyncs temp before rename +
+  dir after (strace-confirmed `fsync→rename→fsync`); comment-pinned test; crash-recovery
+  script stays green.
+- **§9.7 error-code registry** (`0756022`, §16.8). `nexus_rpc::AppError` enum = single
+  registry; daemon `app_errors` re-exports its `.code()`; `error_code_registry()`; test
+  `docs_rpc_table_matches_the_registry` asserts docs/rpc ↔ registry (catches undocumented
+  or unregistered codes — the audit's `-32001` bug).
+
+Design §16.9 (full readiness unification) stays **rejected** and §16.10 (standing §14
+deferrals) stays **deferred** — deliberately NOT implemented. §16.7 is a checklist doctrine,
+not a code task. NOT pushed; no `main` merge.
+
+---
+The remainder of this document (below) is the phase 0-8 build history, unchanged.
 
 **Physical validation on a real Tier-3 rig (2026-07-22).** First end-to-end run on
 real silicon — two FTDI FT232R adapters (`usb:0403:6001:BH00L4KU:00` /dev/ttyUSB0 ↔

@@ -1,6 +1,6 @@
 # serial_nexus — Implementation Plan
 
-**Status:** Executed — phases 0–8 complete, all gates green, validated on a real Tier-3 rig; the post-1.0 track (§9, from design §16) is the open work.
+**Status:** Executed — phases 0–8 complete and the post-1.0 track (§9, from design §16) now executed in full; all gates green, validated on a real Tier-3 rig.
 **Companion:** `serial_nexus-design.md` — section references (§) below point there. The design is normative; where implementation reality disagrees with it, the design gets a new §15 entry before the code diverges.
 **Shape:** Nine phases (0–8), each with a goal, scope traced to design sections, key tasks, testable exit criteria, and an agent-validation block of concrete commands with expected outcomes. Sizes are relative (S/M/L) because calendar mapping depends on availability, not on the work.
 
@@ -246,7 +246,7 @@ The first concrete steps, in order: initialize the workspace with the crates and
 
 ## 9. Post-1.0 simplification track
 
-Design §16 is the rationale; this section is the work, in priority order, each item agent-validated like everything else.
+Design §16 is the rationale; this section is the work, in priority order, each item agent-validated like everything else. **All seven items are executed** — each a separate commit, each behavior-preserving item adversarially re-audited (the §9.1 audit caught a real tie-break-fairness regression in a first draft, since fixed). Final state: 102 unit/property tests, `all.sh --through 8` = 45/45 (the original 42 plus the new unsafe-gate, jq-lint, and harness self-test), and fmt/clippy/macOS-cross-check/shellcheck all clean.
 
 1. **Boundary-supervisor library (§16.1).** Extract the concurrent-halves / park-don't-teardown / notify-on-loss / join-then-transition lifecycle into one abstraction; rebase serial, exec, and leg onto it. *Validation:* `all.sh --through 8` and the hardware rig script pass unchanged; the pump property tests move into the library; the exec-deadlock and stale-status regression tests now exercise library code paths.
 2. **Critical-section cell (§16.2).** Replace raw `RefCell` daemon state with a closure-only cell; add `disallowed-types` for `std::cell::RefCell` in `serialnexusd`'s clippy config. *Validation:* clippy gate fails on a planted `RefCell`; the phase 4 waiting suite passes unchanged.
