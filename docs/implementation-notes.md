@@ -31,9 +31,17 @@ symmetric config over the §15.19 writer bridge, and observable framing/parity e
 counters under a deliberate baud/parity mismatch. A 4-agent adversarial audit found **no
 false passes** and confirmed the doctor fix correct and complete. Codified as
 `scripts/validate/hardware/crossover-rig.sh` (commit `906c309`; see the hardware block
-under Quality gates). Still requires a human hand (not automatable): physical
-unplug/replug (true faulted-and-wait, §7.1/§15.25), squatter swap, and far-side modem
-lines (the 3-wire crossover carries no DTR/RTS to the peer).
+under Quality gates). A **guided physical unplug/replug** was then performed live and
+passed on every point (§7.1 faulted-and-wait + reopen ritual, §15.25): on unplug the
+node reached `waiting` while its attached PTY client stayed present (no HUP) and the
+other node stayed `active` (isolation); a command written during the outage parked
+(backpressure, never sent); on replug the node auto-healed to `active` by identity,
+the reopen ritual reapplied (modem lines reasserted, driver counters fresh, `TIOCEXCL`
+retaken), `purged_on_reconnect` equalled the parked command's length exactly (drained,
+never fired into the reconnected device), and the healed port carried data both
+directions again. Still needs a human hand (inherently interactive, not scripted):
+squatter swap (a *different* adapter appearing on the old identity's path) and far-side
+modem-line assertion (the 3-wire crossover carries no DTR/RTS to the peer).
 
 **v6 revision + phase 0-4 alignment (2026-07-21).** The v6 docs are v5 with the
 phase-5/6 ADRs (§15.22–15.24) *condensed* and their refinements folded forward into
