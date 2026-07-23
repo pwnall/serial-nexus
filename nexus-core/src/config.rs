@@ -65,6 +65,25 @@ impl GraphConfig {
                     node: node.name().to_owned(),
                 });
             }
+            // A zero-depth hostward buffer builds a rendezvous channel that drops
+            // nearly all hostward output even for a fast, fully-present consumer
+            // (§5, §7.1/§7.2): the fan-out / writer bridge can admit a chunk only in
+            // the instant a consumer is blocked in recv. Give the bounded buffer a
+            // floor of one chunk. Only serial and pty carry the tunable.
+            if let NodeConfig::Serial {
+                name,
+                hostward_buffer,
+                ..
+            }
+            | NodeConfig::Pty {
+                name,
+                hostward_buffer,
+                ..
+            } = node
+                && *hostward_buffer == 0
+            {
+                errors.push(ValidationError::ZeroHostwardBuffer { node: name.clone() });
+            }
             // Leg-specific config-level checks the shape/topology model cannot make
             // (it sees only endpoints, not transport/address, and cannot tell a
             // leg's illegitimate empty channel from a codec's legitimate default
@@ -142,6 +161,13 @@ fn is_loopback_addr(address: &str) -> bool {
 pub struct EdgeConfig {
     pub a: EndpointAddr,
     pub b: EndpointAddr,
+    /// Write-arbitration mode for this edge (§6). Note: on an edge whose target is
+    /// an inherently read-only node (a log, §7.3), the runtime forces the effective
+    /// mode to `never` regardless of the value configured here — the log origin
+    /// gets no targetward path and no lock handle (`Wiring::build`). The configured
+    /// value still round-trips verbatim through `dump`/`load`, so a persisted
+    /// `held`/`on-demand` on a log edge is cosmetic and does not reflect runtime
+    /// behavior.
     #[serde(default)]
     pub write_mode: WriteMode,
 }
@@ -914,6 +940,15 @@ mod tests {
         assert!(!rejected(leg("127.0.0.1:7000", false, Transport::Tcp)));
         assert!(!rejected(leg("localhost:7000", false, Transport::Tcp)));
         assert!(!rejected(leg("[::1]:7000", false, Transport::Tcp)));
+        // Bare IPs with no port hit the direct-parse branch (config.rs:126), the
+        // bare-IPv6 case the surrounding comment flags as hazardous. A bare `::1`
+        // would be mis-split by rsplit_once(':') without that branch. Loopback bare
+        // IPs (v4 and v6): accepted without the flag.
+        assert!(!rejected(leg("127.0.0.1", false, Transport::Tcp)));
+        assert!(!rejected(leg("::1", false, Transport::Tcp)));
+        // Non-loopback bare IPs (v4 and v6): rejected without the flag.
+        assert!(rejected(leg("10.0.0.5", false, Transport::Tcp)));
+        assert!(rejected(leg("2001:db8::1", false, Transport::Tcp)));
         // Unix transport is inherently local: never a NonLoopbackBind.
         assert!(!rejected(leg("/run/snx/leg.sock", false, Transport::Unix)));
     }
@@ -972,6 +1007,78 @@ mod tests {
             )),
             "expected empty-channel rejection, got {:?}",
             cfg.validate()
+        );
+    }
+
+    #[test]
+    fn zero_hostward_buffer_is_rejected() {
+        // §5/§7.1/§7.2: a zero-depth hostward buffer builds a rendezvous channel
+        // that drops nearly all hostward output even for a fast consumer, so
+        // validate() must refuse it for the two node kinds that carry the tunable.
+        let serial = GraphConfig {
+            nodes: vec![NodeConfig::Serial {
+                name: "usb0".into(),
+                device: "/dev/ttyUSB0".into(),
+                baud: 115_200,
+                data_bits: DataBits::Eight,
+                parity: Parity::None,
+                stop_bits: StopBits::One,
+                flow_control: FlowControl::None,
+                faces: Facing::Host,
+                arbitration: Arbitration::Exclusive,
+                hostward_buffer: 0,
+                purge_on_reconnect: true,
+                modem: ModemLines::default(),
+            }],
+            edges: vec![],
+        };
+        assert!(
+            serial.validate().iter().any(
+                |e| matches!(e, ValidationError::ZeroHostwardBuffer { node } if node == "usb0")
+            ),
+            "expected ZeroHostwardBuffer for serial, got {:?}",
+            serial.validate()
+        );
+
+        let pty = GraphConfig {
+            nodes: vec![NodeConfig::Pty {
+                name: "console".into(),
+                path: "/run/serial_nexus/console".into(),
+                owner: None,
+                group: None,
+                mode: None,
+                advertised_baud: 115_200,
+                hostward_buffer: 0,
+            }],
+            edges: vec![],
+        };
+        assert!(
+            pty.validate().iter().any(
+                |e| matches!(e, ValidationError::ZeroHostwardBuffer { node } if node == "console")
+            ),
+            "expected ZeroHostwardBuffer for pty, got {:?}",
+            pty.validate()
+        );
+
+        // A depth of 1 is the sane floor — accepted (no ZeroHostwardBuffer).
+        let ok = GraphConfig {
+            nodes: vec![NodeConfig::Pty {
+                name: "console".into(),
+                path: "/run/serial_nexus/console".into(),
+                owner: None,
+                group: None,
+                mode: None,
+                advertised_baud: 115_200,
+                hostward_buffer: 1,
+            }],
+            edges: vec![],
+        };
+        assert!(
+            !ok.validate()
+                .iter()
+                .any(|e| matches!(e, ValidationError::ZeroHostwardBuffer { .. })),
+            "hostward_buffer = 1 must be accepted, got {:?}",
+            ok.validate()
         );
     }
 

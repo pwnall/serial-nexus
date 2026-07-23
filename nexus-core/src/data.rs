@@ -476,6 +476,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn holdover_drains_on_resume_with_a_quiescent_origin() {
+        // §5 anti-stranding (§3.3 refinement): a chunk parked in the interior
+        // holdover while the boundary was busy must drain when the boundary becomes
+        // writable, even though the origin has nothing more to offer (`pending`
+        // empty). This pins the `self.sink.flush()` at the top of `Origin::pump`:
+        // without it, resume() with an empty `pending` never re-touches the
+        // holdover and the parked chunk is stranded forever behind a quiescent
+        // origin.
+        let mut origin = Origin::new(InteriorTargetward::new(BusyBoundary::new()));
+        origin.set_boundary_busy(true);
+
+        // One offer into a busy boundary: the interior consumes the input and parks
+        // its output. The origin is NOT paused (the input was accepted) and has
+        // nothing pending — the only trigger left is a resume/flush.
+        origin.offer(chunk(b"AAA"));
+        assert!(
+            !origin.is_paused(),
+            "the interior accepted the input, so the origin does not pause"
+        );
+        assert_eq!(origin.pending_bytes(), 0, "no client-side backlog");
+        assert_eq!(
+            origin.sink().held_bytes(),
+            3,
+            "output parked in the interior holdover"
+        );
+        assert_eq!(
+            origin.sink().downstream().received(),
+            b"",
+            "nothing reached the busy boundary yet"
+        );
+
+        // The boundary drains and announces writability; resume() with no further
+        // offer must flush the parked chunk through (this is the anti-stranding
+        // guarantee that would break if pump's pre-flush were removed).
+        origin.set_boundary_busy(false);
+        origin.resume();
+
+        assert_eq!(
+            origin.sink().downstream().received(),
+            b"AAA",
+            "the parked chunk must reach the boundary on resume, not be stranded"
+        );
+        assert_eq!(
+            origin.sink().held_bytes(),
+            0,
+            "the holdover is empty once drained"
+        );
+    }
+
     // --- Property tests -----------------------------------------------------
 
     proptest! {

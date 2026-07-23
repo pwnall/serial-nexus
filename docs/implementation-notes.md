@@ -579,40 +579,95 @@ to current behavior; validation is unchanged; round-trip is pinned by
 `serial_and_pty_hostward_and_modem_round_trip` and the config proptest (generators now
 vary `hostward_buffer` and `modem`).
 
-### 3.14 Justified deviations recorded from the Opus comprehensive review (2026-07-23)
+### 3.14 Opus comprehensive review remediation — DONE (2026-07-23)
 A full multi-agent, adversarially-verified code review landed at
-`docs/19-claude-opus-code-review.md` (63 verified findings). The **should-fix** items
-from that review — two criticals (the in-process codec oversize-targetward drop
-`codec.rs`, and the PTY blocking-writer teardown wedge `pty.rs`), one high (the
-empty-serial by-path degradation gap `resolver.rs`), and the mediums — are **open
-work tracked there**, not folded in here. The review's design §4 also isolated three
-deviations judged **justified** (sound refinements or harmless gaps that merely lacked
-a written record); they are documented here per plan §1, and none contradicts the
-design:
-- **`write_mode` on a log-target edge is cosmetic.** `EdgeConfig::write_mode` defaults
-  to `on-demand` and is not normalized for edges whose target is inherently read-only,
-  so `dump` faithfully round-trips whatever an operator wrote (e.g. `write_mode="held"`
-  on a `serial → log` edge). `Wiring::build` unconditionally forces `WriteMode::Never`
-  for a log target (`runtime.rs`), so the runtime behavior is always correct (no
-  targetward path, no lock handle, no wedge). The only artifact is that a dumped config
-  can show a non-`never` mode on a log edge. Accepted: the round-trip and the §5/§6
-  invariants are intact; §7.3's "log write mode is inherently `never`" is a runtime
-  fact, not a config-schema constraint. Optional hardening: normalize/reject a
-  non-`never` `write_mode` on log-target edges at validation time.
-- **Connect-role legs report `peer_address: null`.** §7.4 lists peer address as leg
-  state; only the `listen` role currently derives it (from `accept()`), while the
-  `connect` role leaves it unset even when fully connected, though the dialed address
-  is known (`a.address`). Accepted as a minor state-reporting gap; trivially closable by
-  reporting the dialed address on a successful handshake (see the review for the exact
-  site).
-- **`usb:` identity-form input validates field count only.** `resolve_usb_identity`
-  accepts any four colon-separated fields, so a hand-written degenerate identity like
-  `usb::::` (empty vid/pid/serial/iface) is stored and dumped verbatim. It is inert at
-  runtime — no real sysfs device reports an empty `idVendor`/`idProduct`, so `find_usb`
-  never matches such a stored identity — so this is an under-enforcement of §11
-  well-formedness, not a wrong-device hazard. (The *reachable-via-capture* empty-serial
-  case is the separate should-fix RESOLV-1 in the review.) Accepted; optional hardening
-  is to reject any empty field (and validate vid/pid as 4 hex digits) at add time.
+`docs/19-claude-opus-code-review.md` (63 verified findings, 56 distinct). **All of them
+have now been addressed** — every should-fix item fixed with a deterministic regression
+test, every justified deviation either hardened or documented, and the testing/doc gaps
+closed. Gates after the work: `cargo test --workspace` green (all 16 binaries),
+`cargo clippy --workspace --all-targets --locked -- -D warnings` clean,
+`cargo fmt --all --check` clean, and `bash scripts/validate/all.sh --through 8` green.
+Each fix was applied against a per-file spec produced by a 16-agent analysis workflow
+and cross-checked against the design invariants.
+
+**Criticals.** XC-NODROP-1: the in-process codec (`codec.rs channel_targetward`) now
+*fragments* an oversize targetward chunk across consecutive data frames (via `codec.mux`
+per piece, cap = `MAX_FRAME_SIZE − (3 + channel.len())`) instead of `continue`-dropping
+it, and counts any residual against a new `discarded_targetward` channel counter (§5) —
+regression `targetward_oversize_chunk_is_fragmented_never_dropped` (100 001-byte
+round-trip). PTY-1: the blocking PTY writer now observes the `stop` flag inside
+`blocking_write_all`'s poll loop, so a present-but-stalled client can no longer wedge the
+teardown join and freeze the single-threaded daemon.
+
+**High.** RESOLV-1: an empty/whitespace sysfs `serial` string now normalizes to the `-`
+absent marker at the source, so it degrades to by-path instead of being captured as a
+concrete `usb:vid:pid::iface` that would adopt the wrong second adapter (§15.10).
+*Upgrade note:* a config persisted by a pre-fix daemon may hold the old `usb:vid:pid::iface`
+form; sysfs now reports `usb:vid:pid:-:iface`, so that stored identity no longer matches
+and the node comes up `waiting` until re-added (which re-captures it as by-path). This is
+the intended retirement of the wrong-device-prone identity — the failure is safe and
+operator-recoverable — but it is a visible on-upgrade behavior change worth noting.
+
+**Deliberate deviations from a finding's literal recommendation (all sound):**
+- **PTY-1 teardown join is NOT bounded-with-detach.** The finding suggested also copying
+  the log node's `recv_timeout(FLUSH_WAIT)` + *detach* pattern. That is unsafe here: the
+  PTY writer holds only a **raw fd** (`master.as_raw_fd()`), so detaching a still-running
+  writer and then dropping the master (`self.master = None`) would close the fd out from
+  under the thread — the exact fd-reuse race `BlockingReader::stop_join` avoids. Making the
+  writer promptly stoppable (observe `stop` within one ≤500 ms poll) is the fd-safe
+  equivalent and is what was applied; the unbounded `w.join()` now always returns promptly.
+- **XC-PURGE-1 drains the in-flight backpressured chunk, not the origin kernel buffers.**
+  `purge_on_reconnect` is now `async` and drains-then-`yield_now`s until the targetward
+  pipeline is quiescent, so a producer suspended inside `tx.send().await` (holding one
+  already-read outage-era chunk) resolves and is drained+counted *before* `set_active`,
+  rather than firing into the just-reopened device on the first post-reconnect `recv`.
+  Purging bytes still sitting in an *origin's own* kernel buffer during the outage remains
+  out of scope (the same family as the documented sub-poll close/reopen blind spot §3.12);
+  a continuously-producing remote leg is likewise not drained past quiescence.
+- **RUNTIME-1 gives a defined error, it does not prune the endpoint.** A `send` to a
+  codec/exec channel whose interior node cannot route targetward now fails fast with a
+  defined `invalid_params` (the `sender.is_closed()` pre-check) instead of an opaque
+  `-32603`; the residual mid-flight teardown case maps to `app_errors::LOCKED`. `lock`
+  on such an endpoint still succeeds (a harmless, pointless lock) — out of the minimal
+  correct scope.
+- **CTRL-3 is resolved as documentation, not a code change.** The finding asked that a
+  write-half EOF (the `echo | socat` idiom) not cancel a waiting verb. But §15.20 is
+  normative — "a dropped control connection dequeues the waiter" — and `phase4/waiting.sh`
+  enforces it by *killing* a `lock --wait` client and requiring prompt dequeue. A killed
+  client and a half-close are indistinguishable at read-EOF, so a "keep awaiting on EOF"
+  policy strands the killed waiter (verified: it regressed both `waiting.sh` and, via a
+  hung control connection, `resync.sh`). The design-correct behavior — any second-lane
+  resolution (EOF/pipeline/error) cancels the wait — is therefore *kept*. `serialnexusctl`
+  holds both socket halves open across the read, so its waiting verbs are unaffected; a raw
+  `socat` waiting-verb user must likewise keep the write half open. CTRL-1 (the 1 MiB
+  request-line bound via the new `RequestLines` reader) is the substantive control.rs fix
+  and is applied.
+- **daemon-arbitration-1 is fixed in `nexus-core::lock::acquire`.** While the lock is free
+  but a registered `held` origin (a demux) exists that is not the caller, `acquire` now
+  returns `Denied { held_by }` *before* the FIFO-head check, so a woken on-demand `--wait`
+  waiter re-parks and the held origin's `reclaim_held` wins deterministically rather than
+  by tokio scheduling (§6/§15.23). Fuzzed by `prop_held_priority_invariants`.
+
+**Justified deviations — now hardened or documented (were "accepted as-is"):**
+- **GRAPH-1 (`write_mode` on a log-target edge):** kept cosmetic-but-correct; the
+  `EdgeConfig::write_mode` doc now states plainly that the runtime forces `never` for a
+  read-only (log) target regardless of the configured value, and that the value only
+  round-trips through `dump`/`load`.
+- **LEG-2 (connect-role `peer_address`):** now populated — a `connect` leg reports the
+  dialed address (`a.address`) on a successful handshake, cleared to `None` on disconnect.
+- **RESOLV-3 (`usb:` identity field count only):** `resolve_usb_identity` now rejects any
+  empty field (`usb::::`, `usb:0403:6001::00`, …) as `Malformed` at add time; an absent
+  serial/interface must be spelled `-`, never empty.
+
+**Simplifications.** OPSIMP-1 (`reacquire_held`) and OPSIMP-2 (`data_frames`) are extracted
+into `runtime.rs` and shared by codec/exec/leg; OPSIMP-4 (`GraphState::node`/`node_index`)
+and OPSIMP-5 (`GraphState::absorb_wiring`) collapse the duplicated daemon idioms; OPSIMP-6
+(state_extra Option guards) and OPSIMP-7 (CLI `read_config`) are applied. **OPSIMP-3**
+(re-keying `GraphState`'s three maps from display `String` to `EndpointAddr`, dropping the
+per-`state`-call reparse) is **deliberately deferred** — it is a cross-cutting NIT touching
+`load`/`add_node`/`remove_node`/`state`/`send`/`resolve_origin` at once, and the review
+itself recommends landing it as an isolated follow-up commit rather than bundling it with
+the correctness fixes; the mechanical dedup it enables (OPSIMP-4/5) is already in place.
 
 ---
 

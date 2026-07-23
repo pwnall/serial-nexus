@@ -49,8 +49,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use codec_api::{
-    Event, EventKind, FrameDecoder, Hello, MAX_FRAME_SIZE, WIRE_VERSION, encode, encode_hello,
-    try_decode_hello,
+    Event, EventKind, FrameDecoder, Hello, WIRE_VERSION, encode_hello, try_decode_hello,
 };
 use nexus_core::config::{LegRole, NodeConfig, Transport};
 use nexus_core::graph::{EndpointAddr, Facing};
@@ -66,7 +65,7 @@ use tokio::task::JoinHandle;
 
 use crate::boundary;
 use crate::cell::CriticalCell;
-use crate::runtime::{CHANNEL_CAP, HostwardSink, READ_BUF, SharedLock, Wiring};
+use crate::runtime::{CHANNEL_CAP, HostwardSink, READ_BUF, SharedLock, Wiring, data_frames};
 
 /// How long to wait for the peer's hello before treating the connection as dead.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -136,6 +135,11 @@ struct LegShared {
     /// channel task promptly releases its on-demand write lock (§7.1: release on
     /// idle *or* peer disconnect), rather than holding the local floor until idle.
     disconnect: Notify,
+    /// Incremented alongside every `disconnect` pulse. Because `notify_waiters`
+    /// stores no permit, a channel task blocked in a backpressured local write
+    /// misses the pulse; it snapshots this counter before the write and re-reads it
+    /// after, releasing the lock promptly when it changed (§7.1, LEG-4).
+    disconnect_epoch: Cell<u64>,
 }
 
 pub struct LegNode {
@@ -201,6 +205,7 @@ impl LegNode {
                 reconnect_count: Cell::new(0),
                 unbound: CriticalCell::new(Vec::new()),
                 disconnect: Notify::new(),
+                disconnect_epoch: Cell::new(0),
             }),
             tasks: Vec::new(),
         }
@@ -293,15 +298,14 @@ impl LegNode {
             .channels
             .iter()
             .map(|ch| {
-                let stat = self.stats.get(ch);
-                let bound = stat.is_some_and(|s| s.bound.get());
+                let stat = &self.stats[ch];
                 let obj = json!({
-                    "binding": if bound { "bound" } else { "waiting" },
-                    "active": stat.is_some_and(|s| s.active.get()),
-                    "delivered_hostward": stat.map_or(0, |s| s.delivered_hostward.get()),
-                    "accepted_targetward": stat.map_or(0, |s| s.accepted_targetward.get()),
-                    "discarded_hostward": stat.map_or(0, |s| s.discarded_hostward.get()),
-                    "purged_on_reconnect": stat.map_or(0, |s| s.purged_on_reconnect.get()),
+                    "binding": if stat.bound.get() { "bound" } else { "waiting" },
+                    "active": stat.active.get(),
+                    "delivered_hostward": stat.delivered_hostward.get(),
+                    "accepted_targetward": stat.accepted_targetward.get(),
+                    "discarded_hostward": stat.discarded_hostward.get(),
+                    "purged_on_reconnect": stat.purged_on_reconnect.get(),
                 });
                 (ch.clone(), obj)
             })
@@ -332,10 +336,23 @@ impl LegNode {
         obj
     }
 
+    /// Remove the bound `listen`+`unix` socket inode — our filesystem artifact —
+    /// so a torn-down or removed leg leaves no orphan, mirroring the PTY symlink
+    /// cleanup (§7.2) and the control-socket removal (§10). Only a `listen` leg over
+    /// `unix` owns a path; the connect role and the tcp transport have none. A
+    /// best-effort unlink: a missing file (never bound, or already removed by a
+    /// prior teardown) is fine, exactly like `bind_listener`'s stale-socket dance.
+    fn unlink_listen_socket(&self) {
+        if self.role == LegRole::Listen && self.transport == Transport::Unix {
+            let _ = std::fs::remove_file(&self.address);
+        }
+    }
+
     pub fn teardown(&mut self) {
         for t in self.tasks.drain(..) {
             t.abort();
         }
+        self.unlink_listen_socket();
     }
 }
 
@@ -344,6 +361,7 @@ impl Drop for LegNode {
         for t in self.tasks.drain(..) {
             t.abort();
         }
+        self.unlink_listen_socket();
     }
 }
 
@@ -468,9 +486,10 @@ async fn supervise(mut a: SuperviseArgs) {
         let leftover = match hs {
             Ok(Ok((hello, leftover))) => {
                 bind_channels(&a.channels, &hello, &a.stats, &a.shared);
-                if let Some(addr) = peer_addr {
-                    a.shared.peer_address.with_mut(|p| *p = Some(addr));
-                }
+                // Listen learns the peer from `accept()`; connect dialed a known
+                // endpoint, so report the dialed address (§7.4 peer address, LEG-2).
+                let addr = peer_addr.unwrap_or_else(|| a.address.clone());
+                a.shared.peer_address.with_mut(|p| *p = Some(addr));
                 set_status(&a.shared, NodeStatus::Active);
                 backoff.reset(); // a good connection resets backoff
                 leftover
@@ -536,9 +555,16 @@ async fn supervise(mut a: SuperviseArgs) {
         // on-demand write lock now rather than after the idle interval (§7.1).
         for stat in a.stats.values() {
             stat.bound.set(false);
+            stat.active.set(false);
         }
         a.shared.unbound.with_mut(|u| u.clear());
         a.shared.peer_address.with_mut(|p| *p = None);
+        // Bump the epoch before pulsing so a channel task that missed the transient
+        // pulse (blocked in a backpressured local write) detects the drop after its
+        // write completes and releases the floor promptly (§7.1, LEG-4).
+        a.shared
+            .disconnect_epoch
+            .set(a.shared.disconnect_epoch.get() + 1);
         a.shared.disconnect.notify_waiters();
 
         a.shared
@@ -588,33 +614,22 @@ async fn pump(
                     if let Some(stat) = stats.get(&ch) {
                         stat.active.set(true);
                     }
-                    // Max payload per frame = MAX_FRAME_SIZE minus the envelope
-                    // header (1 type + 2 channel-len + channel bytes).
-                    let cap = MAX_FRAME_SIZE.saturating_sub(3 + ch.len()).max(1);
-                    let total = bytes.len();
-                    let mut off = 0;
-                    while off < total {
-                        let end = (off + cap).min(total);
-                        let piece_len = (end - off) as u64;
-                        let mut frame = Vec::new();
-                        if encode(&Event::data(ch.as_str(), bytes.slice(off..end)), &mut frame)
-                            .is_err()
-                        {
-                            break; // defensive; unreachable for a sane channel id
-                        }
+                    // Fragment an over-large chunk into consecutive Data frames
+                    // rather than drop it (§15.24); the peer reassembles per channel.
+                    for (piece_len, frame) in data_frames(ch.as_str(), &bytes) {
                         if write_half.write_all(&frame).await.is_err() {
                             return PumpEnd::PeerGone;
                         }
                         if let Some(stat) = stats.get(&ch) {
+                            let n = piece_len as u64;
                             if send_is_hostward {
                                 stat.delivered_hostward
-                                    .set(stat.delivered_hostward.get() + piece_len);
+                                    .set(stat.delivered_hostward.get() + n);
                             } else {
                                 stat.accepted_targetward
-                                    .set(stat.accepted_targetward.get() + piece_len);
+                                    .set(stat.accepted_targetward.get() + n);
                             }
                         }
-                        off = end;
                     }
                 }
                 // Every send source has closed (a faces=target leg whose local
@@ -781,6 +796,13 @@ async fn channel_targetward(
             break; // source closed (torn down)
         };
         let n = bytes.len() as u64;
+        // Snapshot the disconnect epoch before the two blocking awaits below. The
+        // `disconnect` pulse (a `Notify`) stores no permit, so a drop landing while
+        // this task is parked in `ensure_acquired`/`tx.send` — outside the `holding`
+        // select — is missed; re-reading the epoch after the write recovers it, so
+        // the §7.1 disconnect-release stays prompt instead of degrading to the idle
+        // timer (LEG-4).
+        let epoch = shared.disconnect_epoch.get();
         if !ensure_acquired(&lock, id).await {
             return; // endpoint torn down or we cannot write
         }
@@ -791,6 +813,13 @@ async fn channel_targetward(
         }
         stat.accepted_targetward
             .set(stat.accepted_targetward.get() + n);
+        // The chunk is delivered (no targetward drop, §5); if the peer vanished
+        // while we acquired or wrote, yield the local floor now rather than holding
+        // it behind a vanished remote until the idle interval (§7.1, LEG-4).
+        if shared.disconnect_epoch.get() != epoch {
+            release(&lock, id);
+            holding = false;
+        }
     }
     if holding {
         release(&lock, id);

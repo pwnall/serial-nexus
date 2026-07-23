@@ -1,21 +1,24 @@
-//! The data-plane runtime (design §5). Slice 2 wires real bytes serial↔PTY.
+//! The data-plane runtime (design §5): the endpoint-keyed channel plan
+//! ([`Wiring`]) that connects every node's boundary tasks.
 //!
 //! The §5 boundary policies are realized with bounded `tokio::sync::mpsc`
 //! channels between node tasks — the channel *is* the "bounded buffering where
 //! configured" a boundary owns:
 //!
-//! * **Hostward** (serial → PTYs) is lossy at the boundary: the serial reader
-//!   `try_send`s a chunk to each attached PTY and drops on a full channel (a
-//!   slow consumer costs only itself, §5). Counters land in phase 3.
-//! * **Targetward** (PTY → serial) is backpressured to the origin: the PTY
-//!   reader `send().await`s into the serial's bounded channel; a full channel
-//!   suspends the reader, the kernel buffers on the client's side of the PTY,
-//!   and nothing is dropped (§5).
+//! * **Hostward** (a host-facing producer → its consumers) is lossy at the
+//!   boundary: the producer `try_send`s a chunk to each attached consumer and
+//!   drops on a full channel (a slow consumer costs only itself, §5), counting
+//!   the loss in the shared [`DropCounters`] so it stays located and attributable.
+//! * **Targetward** (a writing origin → its host endpoint) is backpressured to
+//!   the origin: the origin `send().await`s into the host endpoint's single
+//!   arbitrated channel; a full channel suspends the origin and nothing is
+//!   dropped (§5).
 //!
-//! The pure `nexus_core::data` contracts remain the property-tested spec of the
-//! same semantics; the interior holdover they model is exercised when codec
-//! (interior) nodes arrive in phase 5. Phase 2 has no interior nodes, so the two
-//! boundaries connect directly through these channels.
+//! The topology is endpoint-keyed (§3, [`Wiring`]), not two-layer: a serial fans
+//! out to PTYs and logs, and interior codec/exec/leg nodes (§7.4/§7.5/§7.6) are
+//! each a target-facing consumer on their multiplexed side and N host-facing
+//! producers on their channels. The pure `nexus_core::data` contracts remain the
+//! property-tested spec of these same boundary semantics.
 //!
 //! Readiness is driven by `poll(2)`, *never* `tokio::io::unix::AsyncFd`: on a pty
 //! master, `AsyncFd`'s epoll readiness spuriously and persistently fires
@@ -42,6 +45,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use codec_api::{Event, MAX_FRAME_SIZE, encode};
 use nexus_core::Chunk;
 use nexus_core::config::{GraphConfig, NodeConfig};
 use nexus_core::graph::{Arbitration, EndpointAddr, Facing, WriteMode};
@@ -143,6 +147,82 @@ impl LockCell {
 
 /// A shared, single-threaded handle to one endpoint's [`LockCell`].
 pub type SharedLock = Rc<LockCell>;
+
+/// Ensure `id` holds its endpoint's write lock, re-acquiring through the FIFO
+/// queue if a `send --steal` transiently ousted the held origin (§6 held
+/// priority). Returns `false` if the endpoint was torn down. The fast path (the
+/// normal held case) is a single synchronous borrow; the slow path parks on the
+/// lock's `Notify`, holding no borrow across the await (§15.20). Shared by the
+/// in-process codec and the exec codec — the two held-origin targetward gates.
+pub(crate) async fn reacquire_held(lock: &SharedLock, id: OriginId) -> bool {
+    if lock.with(|g| g.may_write(id)) {
+        return true; // already holds it
+    }
+    loop {
+        if lock.is_closed() {
+            return false;
+        }
+        // Enable the wake future before the reclaim attempt (lost-wakeup-free).
+        let notified = lock.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        // Already holds (re-granted), or reclaim as a held origin ahead of any
+        // on-demand waiter (§6 held priority). Only a fresh reclaim emits a change.
+        let outcome = lock.with_mut(|g| {
+            if g.may_write(id) {
+                Some(false)
+            } else if g.reclaim_held(id) {
+                Some(true)
+            } else {
+                None
+            }
+        });
+        match outcome {
+            Some(fresh) => {
+                if fresh {
+                    lock.emit_change();
+                }
+                return true;
+            }
+            None => notified.await,
+        }
+    }
+}
+
+/// Split `bytes` into consecutive envelope [`Event::data`] frames on `channel`,
+/// each at most [`MAX_FRAME_SIZE`], yielding `(piece_len, frame)` per piece
+/// (§15.24). A chunk larger than one frame — a full device read (`READ_BUF ==
+/// MAX_FRAME_SIZE` overflows the header) or an arbitrary-length `send` line — is
+/// fragmented rather than dropped; the peer/child reassembles per channel. The
+/// payload cap subtracts the envelope header (1 type byte + 2 channel-length
+/// bytes + the channel id) and floors at 1 so a pathologically long channel id
+/// still makes progress. Shared by the leg's write half and the exec codec's
+/// stdin feed (§5 no-drop / all-loss-counted).
+pub(crate) fn data_frames<'a>(
+    channel: &'a str,
+    bytes: &'a Chunk,
+) -> impl Iterator<Item = (usize, Vec<u8>)> + 'a {
+    let cap = MAX_FRAME_SIZE.saturating_sub(3 + channel.len()).max(1);
+    let total = bytes.len();
+    let mut off = 0usize;
+    std::iter::from_fn(move || {
+        if off >= total {
+            return None;
+        }
+        let end = (off + cap).min(total);
+        let mut frame = Vec::new();
+        // Encode is infallible for a sane channel id (the graph forbids the
+        // pathological ones); on the defensive error, stop fragmenting this chunk.
+        if encode(&Event::data(channel, bytes.slice(off..end)), &mut frame).is_err() {
+            off = total; // fuse: no further pieces
+            return None;
+        }
+        let piece_len = end - off;
+        off = end;
+        Some((piece_len, frame))
+    })
+}
 
 /// Hostward drop counters for one consuming boundary (§5). All hostward loss is
 /// counted at the boundary that drops it, so it is always located, counted, and

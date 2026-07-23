@@ -286,6 +286,13 @@ pub enum ValidationError {
     /// the config level, since a leg is the only node kind that can shape to zero
     /// endpoints.
     EmptyLeg { node: String },
+    /// A serial or pty node declares `hostward_buffer = 0`. A zero-depth bounded
+    /// buffer is a rendezvous channel that admits a chunk only in the instant a
+    /// consumer is blocked in `recv`, so it drops nearly all hostward output even
+    /// for a fast, fully-present consumer (§5, §7.1/§7.2). The hostward buffer must
+    /// be at least one chunk deep. Checked at the config level (the depth is a
+    /// plain scalar the topology model never sees), naming the offender.
+    ZeroHostwardBuffer { node: String },
 }
 
 impl fmt::Display for ValidationError {
@@ -365,6 +372,12 @@ impl fmt::Display for ValidationError {
                 write!(
                     f,
                     "leg node {node:?} declares no channels (a leg must carry at least one, §7.4)"
+                )
+            }
+            ValidationError::ZeroHostwardBuffer { node } => {
+                write!(
+                    f,
+                    "node {node:?} declares hostward_buffer = 0, which would drop nearly all hostward output (must be at least 1, §5)"
                 )
             }
         }

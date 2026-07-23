@@ -182,7 +182,10 @@ impl LogNode {
         if let NodeStatus::Faulted { reason } = &q.status {
             return Err(format!("log node faulted: {reason}"));
         }
-        let next = q.rotation.map_or(0, |n| n + 1) + u64::from(q.rotate_pending);
+        let next = q
+            .rotation
+            .map_or(0, |n| n.saturating_add(1))
+            .saturating_add(u64::from(q.rotate_pending));
         q.rotate_pending += 1;
         self.shared.cv.notify_all();
         Ok(next)
@@ -294,11 +297,17 @@ fn writer_loop(shared: &Shared, dir: PathBuf, filename: String, padding: usize, 
         // Write the drained batch (blocking). On error, honor the policy: fault
         // the node (and stop), or drop-and-count and keep going.
         let mut ok = true;
-        for chunk in &batch {
+        for (i, chunk) in batch.iter().enumerate() {
             if let Err(e) = file.write_all(chunk) {
                 let mut q = shared.q.lock().unwrap();
                 match q.overflow {
                     OverflowPolicy::Fault => {
+                        // The failing chunk and every remaining chunk of the
+                        // drained batch are abandoned; count them so reported
+                        // loss stays exact (§5 "all loss is counted").
+                        for lost in &batch[i..] {
+                            q.dropped_bytes += lost.len() as u64;
+                        }
                         q.status = NodeStatus::Faulted {
                             reason: format!("write {}: {e}", current.display()),
                         };
@@ -323,10 +332,22 @@ fn writer_loop(shared: &Shared, dir: PathBuf, filename: String, padding: usize, 
             let _ = file.flush();
             let next = {
                 let q = shared.q.lock().unwrap();
-                q.rotation.map_or(0, |n| n + 1)
+                q.rotation.map_or(0, |n| n.saturating_add(1))
             };
             let rotated = dir.join(format!("{filename}.{next:0padding$}"));
-            let renamed = std::fs::rename(&current, &rotated).is_ok();
+            // A failed rename means nothing rotated: no `.NNN` file was created
+            // and the writer would otherwise keep appending to the unrotated
+            // file forever. Fault the node (like a write/reopen failure) rather
+            // than silently no-op the operator's `rotate` (§7.3).
+            if let Err(e) = std::fs::rename(&current, &rotated) {
+                let mut q = shared.q.lock().unwrap();
+                q.status = NodeStatus::Faulted {
+                    reason: format!("rotate {} -> {}: {e}", current.display(), rotated.display()),
+                };
+                q.rotate_pending = q.rotate_pending.saturating_sub(1);
+                shared.cv.notify_all();
+                return;
+            }
             match open_append(&current) {
                 Ok(f) => file = f,
                 Err(e) => {
@@ -340,9 +361,7 @@ fn writer_loop(shared: &Shared, dir: PathBuf, filename: String, padding: usize, 
                 }
             }
             let mut q = shared.q.lock().unwrap();
-            if renamed {
-                q.rotation = Some(next);
-            }
+            q.rotation = Some(next);
             q.rotate_pending = q.rotate_pending.saturating_sub(1);
             shared.cv.notify_all();
         }
@@ -381,5 +400,129 @@ fn rotation_padding(config: &NodeConfig) -> usize {
             rotation_padding, ..
         } => *rotation_padding as usize,
         _ => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A fresh, unique temp directory per call (tests may run in parallel).
+    fn unique_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("snx-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // LOG-6: under overflow=fault a write(2) error abandons the whole drained
+    // batch; every byte in it must still be counted so `dropped_bytes` stays
+    // exact (§5 "all loss is counted"). A read-only File makes write_all fail.
+    #[test]
+    fn write_error_under_fault_counts_the_abandoned_batch() {
+        let tmp = unique_dir("log6");
+        let path = tmp.join("ro.log");
+        std::fs::write(&path, b"").unwrap();
+        let ro = OpenOptions::new().read(true).open(&path).unwrap();
+
+        let data: [Chunk; 3] = [
+            Chunk::from_static(b"aaaa"),
+            Chunk::from_static(b"bbbbbb"),
+            Chunk::from_static(b"cc"),
+        ];
+        let total: u64 = data.iter().map(|c| c.len() as u64).sum();
+        let queued: usize = data.iter().map(|c| c.len()).sum();
+        let chunks: VecDeque<Chunk> = data.into_iter().collect();
+
+        let shared = Shared {
+            q: Mutex::new(Queue {
+                chunks,
+                queued_bytes: queued,
+                dropped_bytes: 0,
+                rotate_pending: 0,
+                rotation: None,
+                closed: true,
+                status: NodeStatus::Active,
+                overflow: OverflowPolicy::Fault,
+            }),
+            cv: Condvar::new(),
+        };
+
+        // Synchronous: the first write_all fails, the Fault arm counts the batch
+        // and returns.
+        writer_loop(&shared, tmp.clone(), "ro.log".to_owned(), 3, ro);
+
+        let q = shared.q.lock().unwrap();
+        assert_eq!(
+            q.dropped_bytes, total,
+            "the abandoned batch must be fully counted"
+        );
+        assert!(
+            matches!(q.status, NodeStatus::Faulted { .. }),
+            "the node must fault"
+        );
+        drop(q);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // xc-panics-1 (writer site): a planted `<filename>.<u64::MAX>` makes rotation
+    // recover Some(u64::MAX); the writer's next-number arithmetic must saturate,
+    // not overflow-panic (debug) nor wrap to 0 (release, defeating §7.3).
+    #[test]
+    fn writer_rotation_number_saturates_at_u64_max() {
+        let tmp = unique_dir("panics-writer");
+        let current = tmp.join("app.log");
+        std::fs::write(&current, b"live").unwrap();
+        let file = open_append(&current).unwrap();
+
+        let shared = Shared {
+            q: Mutex::new(Queue {
+                chunks: VecDeque::new(),
+                queued_bytes: 0,
+                dropped_bytes: 0,
+                rotate_pending: 1,
+                rotation: Some(u64::MAX),
+                closed: true,
+                status: NodeStatus::Active,
+                overflow: OverflowPolicy::DropOldest,
+            }),
+            cv: Condvar::new(),
+        };
+
+        // Synchronous: performs the one pending rotation, then returns on
+        // `closed`. Without the fix this panics at the `n + 1` in debug builds.
+        writer_loop(&shared, tmp.clone(), "app.log".to_owned(), 3, file);
+
+        let q = shared.q.lock().unwrap();
+        assert_eq!(
+            q.rotation,
+            Some(u64::MAX),
+            "rotation must pin at u64::MAX, not wrap"
+        );
+        assert_eq!(q.rotate_pending, 0);
+        drop(q);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // xc-panics-1 (rotate RPC site): the operator-facing `rotate` computes the
+    // next number from the directory-recovered counter; a planted
+    // `<filename>.<u64::MAX>` must make it saturate rather than overflow-panic.
+    #[test]
+    fn rotate_rpc_number_saturates_at_u64_max() {
+        let tmp = unique_dir("panics-rpc");
+        std::fs::write(tmp.join(format!("app.log.{}", u64::MAX)), b"").unwrap();
+        let config = NodeConfig::Log {
+            name: "lg".to_owned(),
+            directory: tmp.to_string_lossy().into_owned(),
+            filename: "app.log".to_owned(),
+            overflow: OverflowPolicy::DropOldest,
+            rotation_padding: 3,
+        };
+        let mut node = LogNode::create(&config);
+        assert_eq!(node.rotate().unwrap(), u64::MAX);
+        node.teardown();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

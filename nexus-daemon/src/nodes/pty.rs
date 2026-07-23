@@ -162,7 +162,7 @@ impl PtyNode {
         self.install_symlink(&pts)?;
         self.symlink_installed = true;
         self.apply_perms(&pts)?;
-        prime_slave(&pts);
+        prime_slave(&pts)?;
 
         self.master = Some(Rc::new(master));
         self.pts_path = Some(pts);
@@ -277,7 +277,7 @@ impl PtyNode {
             // when it is full (a slow consumer shedding at its own boundary, §5),
             // so the writer thread's blocking recv can also observe the stop flag.
             // Depth is this PTY's configured hostward drop policy (§7.2).
-            let (btx, brx) = std_mpsc::sync_channel::<Chunk>(self.hostward_buffer);
+            let (btx, brx) = std_mpsc::sync_channel::<Chunk>(self.hostward_buffer.max(1));
             let pump_counters = self.counters.clone();
             self.tasks.push(tokio::task::spawn_local(async move {
                 while let Some(chunk) = rx.recv().await {
@@ -293,12 +293,21 @@ impl PtyNode {
             let present = self.present.clone();
             let counters = self.counters.clone();
             let stop = self.writer_stop.clone();
-            self.writer = Some(
-                std::thread::Builder::new()
-                    .name(format!("pty-tx-{}", self.name))
-                    .spawn(move || writer_thread(fd, present, counters, stop, brx))
-                    .expect("spawn pty writer thread"),
-            );
+            match std::thread::Builder::new()
+                .name(format!("pty-tx-{}", self.name))
+                .spawn(move || writer_thread(fd, present, counters, stop, brx))
+            {
+                Ok(w) => self.writer = Some(w),
+                Err(e) => {
+                    // Thread/PID exhaustion (EAGAIN) is an environmental failure
+                    // (§15.8): fault the node rather than panicking the runtime
+                    // thread, matching setup()/apply_perms/the set_nonblocking path.
+                    // The reader and pump tasks spawned above are aborted by teardown.
+                    self.status = NodeStatus::Faulted {
+                        reason: format!("spawn pty writer thread: {e}"),
+                    };
+                }
+            }
         }
     }
 
@@ -636,12 +645,21 @@ fn writer_thread(
     rx: std_mpsc::Receiver<Chunk>,
 ) {
     loop {
+        // Observe teardown before touching a buffered chunk, so a writer that just
+        // broke out of `blocking_write_all` on the stop flag does not then drain the
+        // remaining bridged backlog chunk-by-chunk — teardown ends within one poll
+        // interval regardless of buffer depth (§15.19).
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(chunk) => {
                 if present.load(Ordering::Relaxed) {
-                    if blocking_write_all(fd, &chunk).is_err() {
-                        // Peer hung up mid-write; presence will flip and the next
-                        // chunks are discarded-and-counted until a client returns.
+                    if blocking_write_all(fd, &chunk, &stop).is_err() {
+                        // Peer hung up mid-write (or teardown set `stop` mid-write);
+                        // presence will flip and the next chunks are discarded-and-
+                        // counted until a client returns, or the loop-top stop check
+                        // ends the thread on teardown.
                     }
                 } else {
                     counters.add_absent(chunk.len() as u64);
@@ -659,8 +677,16 @@ fn writer_thread(
 
 /// Write every byte of `data` to the master, blocking the *thread* (not the async
 /// runtime) on `poll(2)` for writability between partial writes — line rate for a
-/// fast consumer, no busy loop. `Err` means the peer hung up.
-fn blocking_write_all(fd: std::os::fd::RawFd, mut data: &[u8]) -> std::io::Result<()> {
+/// fast consumer, no busy loop. `Err` means the peer hung up, or teardown set
+/// `stop` while the write was blocked (§15.19): a present-but-stalled client keeps
+/// the pts buffer full with no POLLHUP, so this observes `stop` within one poll
+/// interval and returns instead of spinning on EAGAIN forever — the writer's join
+/// then never wedges the single runtime thread.
+fn blocking_write_all(
+    fd: std::os::fd::RawFd,
+    mut data: &[u8],
+    stop: &AtomicBool,
+) -> std::io::Result<()> {
     while !data.is_empty() {
         match sys::write_fd(fd, data) {
             Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
@@ -669,6 +695,11 @@ fn blocking_write_all(fd: std::os::fd::RawFd, mut data: &[u8]) -> std::io::Resul
                 let re = sys::poll_blocking(fd, PollFlags::POLLOUT | PollFlags::POLLHUP, 500);
                 if re.contains(PollFlags::POLLHUP) && !re.contains(PollFlags::POLLOUT) {
                     return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                // Teardown/removal asked us to stop while the peer stalled; bail
+                // within the poll interval so the supervisor's join returns promptly.
+                if stop.load(Ordering::Relaxed) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
                 }
             }
             Err(e) => return Err(e),
@@ -679,10 +710,15 @@ fn blocking_write_all(fd: std::os::fd::RawFd, mut data: &[u8]) -> std::io::Resul
 
 /// Open then immediately close the slave once, priming the master's HUP state to
 /// "absent" (nexus-doctor P2: a never-opened master does not report POLLHUP).
-fn prime_slave(pts: &str) {
-    if let Ok(fd) = open(pts, OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty()) {
-        drop(fd);
-    }
+/// Priming is load-bearing for presence (§7.2): without it the master would never
+/// enter the "absent" HUP state and presence would invert to phantom-present, so an
+/// open failure faults the node (an environmental failure, §15.8) rather than being
+/// swallowed.
+fn prime_slave(pts: &str) -> Result<(), String> {
+    let fd = open(pts, OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())
+        .map_err(|e| format!("prime open {pts}: {e}"))?;
+    drop(fd);
+    Ok(())
 }
 
 /// Map a baud to the nearest standard `BaudRate` for the cosmetic advertised
@@ -714,4 +750,46 @@ fn standard_baud(baud: u32) -> Option<BaudRate> {
         921600 => BaudRate::B921600,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::time::Instant;
+
+    /// PTY-1: a present-but-stalled client (paused terminal / XOFF) leaves the
+    /// kernel buffer full so `write_fd` spins on EAGAIN with no POLLHUP. A
+    /// socketpair reproduces that — fill the send buffer while the peer never
+    /// reads, so POLLOUT never arrives and the peer stays open (no hangup). The
+    /// writer must observe the teardown `stop` flag and return `Interrupted` within
+    /// a poll interval instead of looping forever.
+    #[test]
+    fn blocking_write_all_bails_when_stop_is_set_on_a_stalled_fd() {
+        let (peer, sender) = UnixStream::pair().expect("socketpair");
+        let wfd = sender.as_raw_fd();
+        sys::set_nonblocking(wfd).expect("nonblocking");
+        // Fill the send buffer until a write would block.
+        let filler = vec![0u8; 4096];
+        loop {
+            match sys::write_fd(wfd, &filler) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("unexpected fill error: {e}"),
+            }
+        }
+        let stop = AtomicBool::new(true);
+        let start = Instant::now();
+        let r = blocking_write_all(wfd, b"cannot be written while the peer stalls", &stop);
+        assert!(
+            matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::Interrupted),
+            "a stalled write with stop set must return Interrupted, got {r:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must bail within one poll interval, took {:?}",
+            start.elapsed()
+        );
+        drop(peer); // keep the peer open across the assertion (no POLLHUP)
+    }
 }

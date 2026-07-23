@@ -92,6 +92,84 @@ pub fn round_trip_identity<C: Codec>(make: impl Fn() -> C, channels: &[&str]) {
     );
 }
 
+/// **Control-event round-trip.** `mux` an `open → data → close → error` sequence
+/// per channel, `demux` the framed bytes, and assert every event survives with its
+/// channel and kind intact — the *full* §8 vocabulary, not just `data`. Runs of
+/// `data` events are concatenated so a codec that legitimately splits one payload
+/// still compares equal, but a codec that drops, reorders, misroutes, or corrupts
+/// an `open`/`close`/`error` fails here — the gap [`round_trip_identity`] cannot see.
+///
+/// **Opt-in, unlike the four universal suites.** Only a codec whose `demux`
+/// *surfaces* control events runs this: a passthrough codec that carries opaque
+/// bytes and drops control events legitimately cannot, and must not, be tested with
+/// it. Call it from `#[cfg(test)]` only for a codec that transports the vocabulary:
+///
+/// ```ignore
+/// kit::control_event_round_trip(MyCodec::new, &["console", "trace"]);
+/// ```
+pub fn control_event_round_trip<C: Codec>(make: impl Fn() -> C, channels: &[&str]) {
+    assert!(!channels.is_empty(), "give the kit at least one channel");
+    let mut enc = make();
+    let mut wire = Vec::new();
+    let mut expected: std::collections::BTreeMap<String, Vec<EventKind>> =
+        std::collections::BTreeMap::new();
+    for (i, channel) in channels.iter().enumerate() {
+        let payload = seeded_bytes(i as u64 + 1, 64);
+        let reason = format!("reason-{i}");
+        for ev in [
+            Event::open(*channel),
+            Event::data(*channel, payload.clone()),
+            Event::close(*channel),
+            Event::error(*channel, reason.clone()),
+        ] {
+            enc.mux(&ev, &mut wire)
+                .expect("mux of a control event must succeed");
+        }
+        expected.insert(
+            (*channel).to_owned(),
+            vec![
+                EventKind::Open,
+                EventKind::Data(payload.into()),
+                EventKind::Close,
+                EventKind::Error(reason),
+            ],
+        );
+    }
+
+    let mut dec = make();
+    let mut got: std::collections::BTreeMap<String, Vec<EventKind>> =
+        std::collections::BTreeMap::new();
+    dec.demux(&wire, &mut |event| {
+        got.entry(event.channel.to_string())
+            .or_default()
+            .push(event.kind);
+    })
+    .expect("demux of the codec's own framing must succeed");
+
+    // Fold consecutive `data` events so a codec that splits one payload across
+    // several frames still matches; control events are left in order.
+    for kinds in got.values_mut() {
+        let mut folded: Vec<EventKind> = Vec::new();
+        for kind in kinds.drain(..) {
+            if let (Some(EventKind::Data(acc)), EventKind::Data(bytes)) = (folded.last_mut(), &kind)
+            {
+                let mut merged = acc.to_vec();
+                merged.extend_from_slice(bytes);
+                *acc = merged.into();
+            } else {
+                folded.push(kind);
+            }
+        }
+        *kinds = folded;
+    }
+
+    assert_eq!(
+        got, expected,
+        "control-event round-trip failed: an open/data/close/error event was \
+         dropped, misrouted, or corrupted"
+    );
+}
+
 /// **Fragmentation tolerance.** Frame a payload, then feed the framed bytes to
 /// `demux` one byte at a time, asserting the reassembled channel data still
 /// matches. A codec that assumes a whole frame arrives per `demux` call fails here
@@ -182,8 +260,9 @@ pub fn bounded_parser_state<C: Codec>(make: impl Fn() -> C) {
 /// hostile line. A codec that can report its buffered byte count passes a
 /// `buffered` accessor; this feeds a deterministic oversize-length blob (`0xFF`
 /// bytes, so every framing codec reads an oversize `body_len`) and asserts the
-/// buffer never exceeds [`MAX_FRAME_SIZE`]. A resyncing codec (which drains) passes;
-/// a hoarding one fails.
+/// buffer never exceeds one whole frame — [`MAX_FRAME_SIZE`] plus the 4-byte length
+/// prefix (a legitimately near-max partial frame retains up to that). A resyncing
+/// codec (which drains) passes; a hoarding one fails.
 ///
 /// ```ignore
 /// kit::assert_buffer_bounded(MyCodec::new, MyCodec::buffered);
@@ -196,9 +275,11 @@ pub fn assert_buffer_bounded<C: Codec>(make: impl Fn() -> C, buffered: impl Fn(&
         let _ = codec.demux(&chunk, &mut |_| {});
         let held = buffered(&codec);
         assert!(
-            held <= MAX_FRAME_SIZE,
+            held <= MAX_FRAME_SIZE + 4,
             "codec retained {held} buffered bytes, past the one-frame bound \
-             MAX_FRAME_SIZE={MAX_FRAME_SIZE} (§5): it hoards undecodable input"
+             MAX_FRAME_SIZE + 4 (a MAX_FRAME_SIZE body plus its 4-byte length \
+             prefix), MAX_FRAME_SIZE={MAX_FRAME_SIZE} (§5): it hoards undecodable \
+             input"
         );
     }
 }
@@ -263,6 +344,9 @@ mod tests {
     #[test]
     fn good_framing_codec_passes_every_suite() {
         round_trip_identity(GoodFraming::default, &["console", "trace", "ctrl"]);
+        // GoodFraming carries the full §8 vocabulary (it rides the envelope), so it
+        // also passes the opt-in control-event round-trip.
+        control_event_round_trip(GoodFraming::default, &["console", "trace", "ctrl"]);
         fragmentation_tolerance(GoodFraming::default, "console");
         handles_garbage(GoodFraming::default, "console");
         bounded_parser_state(GoodFraming::default);
@@ -346,6 +430,43 @@ mod tests {
     #[should_panic(expected = "round-trip identity failed")]
     fn a_lossy_codec_fails_round_trip() {
         round_trip_identity(DropsLastByte::default, &["console"]);
+    }
+
+    /// Silently drops every `open` event it muxes → the far side never sees the
+    /// open, so it breaks the control-event round-trip (but not the data-only one).
+    #[derive(Default)]
+    struct DropsOpen {
+        buf: Vec<u8>,
+    }
+    impl Codec for DropsOpen {
+        fn name(&self) -> &str {
+            "drops-open"
+        }
+        fn demux(
+            &mut self,
+            input: &[u8],
+            emit: &mut dyn FnMut(Event),
+        ) -> Result<(), crate::CodecError> {
+            self.buf.extend_from_slice(input);
+            while let Ok(Some((event, consumed))) = crate::try_decode(&self.buf) {
+                self.buf.drain(..consumed);
+                emit(event);
+            }
+            Ok(())
+        }
+        fn mux(&mut self, event: &Event, out: &mut Vec<u8>) -> Result<(), crate::CodecError> {
+            if matches!(event.kind, EventKind::Open) {
+                return Ok(()); // drop the open — never framed
+            }
+            crate::encode(event, out)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "control-event round-trip failed")]
+    fn a_codec_dropping_open_fails_control_round_trip() {
+        control_event_round_trip(DropsOpen::default, &["console"]);
     }
 
     /// Panics when it sees a `0xFF` byte → breaks garbage tolerance.

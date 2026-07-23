@@ -26,7 +26,7 @@ stable contract is a JSON-RPC method set over a Unix socket (design §10):
 operators and AI agents drive `serialnexusctl` or speak JSON-RPC directly, and
 the whole surface is debuggable with `socat` and `jq`.
 
-> **Maturity:** 0.1.0, pre-1.0. Lab-usable on Linux. macOS is best-effort;
+> **Maturity:** 0.2.0, pre-1.0. Lab-usable on Linux. macOS is best-effort;
 > Windows is out of scope. Interfaces may still shift before 1.0.
 
 ## Architecture
@@ -44,7 +44,7 @@ attached edge, and one exclusive write lock arbitrates who may write back.
 | **codec** | Interior protocol transform: splits one multiplexed stream into N named channels (or re-multiplexes them), framing knowledge staying inside the node (§7.5). |
 | **exec-codec** | The escape hatch: a `codec` node with `codec = "exec"` that runs an external child process speaking a documented envelope protocol on stdin/stdout, so protocol tools under any license can be wrapped without linking (§7.6). |
 | **leg** | Cross-daemon transport: carries every channel multiplexed over one TCP or Unix socket to a peer daemon, loopback-only unless explicitly opted out (§7.4). |
-| **existing-terminal** | *(design-specified, §7.7; not yet implemented in 0.1.0)* connects to a pre-existing PTY or tty by path — a QEMU console, a simulator, a mock device. |
+| **existing-terminal** | *(design-specified, §7.7; not yet implemented in 0.2.0)* connects to a pre-existing PTY or tty by path — a QEMU console, a simulator, a mock device. |
 
 ## Five-minute quickstart
 
@@ -158,7 +158,7 @@ hardening guidance.
 
 ## Documentation
 
-- [`docs/13-design-claude-fable-v6.md`](docs/13-design-claude-fable-v6.md) — the normative design document (concepts, node types, RPC contract, and the reasoning behind each decision).
+- [`docs/17-design-claude-fable-v8.md`](docs/17-design-claude-fable-v8.md) — the normative design document (concepts, node types, RPC contract, and the reasoning behind each decision).
 - [`docs/rpc/`](docs/rpc/) — the JSON-RPC method reference (the stable contract of §10).
 - [`docs/codec-authors.md`](docs/codec-authors.md) — writing a codec: the trait, the event vocabulary, and the envelope protocol for external (any-language) codecs.
 - [`docs/security.md`](docs/security.md) — threat model and hardening.

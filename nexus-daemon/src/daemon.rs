@@ -82,6 +82,45 @@ struct GraphState {
     next_send_origin: Cell<u64>,
 }
 
+impl GraphState {
+    /// Find a node by name, or the shared `unknown node` error (§10) — the lookup
+    /// idiom used by every node-targeted verb.
+    fn node(&self, name: &str) -> Result<&Node, RpcError> {
+        self.nodes
+            .iter()
+            .find(|n| n.name() == name)
+            .ok_or_else(|| RpcError::invalid_params(format!("unknown node {name:?}")))
+    }
+
+    /// The index of a node by name, or the shared `unknown node` error — the
+    /// removal path needs the position to `remove` it.
+    fn node_index(&self, name: &str) -> Result<usize, RpcError> {
+        self.nodes
+            .iter()
+            .position(|n| n.name() == name)
+            .ok_or_else(|| RpcError::invalid_params(format!("unknown node {name:?}")))
+    }
+
+    /// Fold a freshly-built [`Wiring`](crate::runtime::Wiring)'s host-endpoint
+    /// locks, per-endpoint targetward senders, and writer-origin locks into the
+    /// display-keyed state maps (§6). The RPC surface addresses endpoints by display
+    /// string (`usb0`, `mux/console`) while the wiring keys by `EndpointAddr`, so the
+    /// keys are converted here — one place for both `load` (on an empty graph) and
+    /// `add-node` (`origin_locks` is empty for an edgeless node, so its loop is a
+    /// no-op there). Must run before each node's `start`, which drains the wiring.
+    fn absorb_wiring(&mut self, wiring: &crate::runtime::Wiring) {
+        for (a, l) in &wiring.endpoint_locks {
+            self.endpoint_locks.insert(a.to_string(), l.clone());
+        }
+        for (a, t) in &wiring.host_targetward_tx {
+            self.endpoint_targetward.insert(a.to_string(), t.clone());
+        }
+        for (a, (l, id)) in &wiring.origin_locks {
+            self.origin_locks.insert(a.to_string(), (l.clone(), *id));
+        }
+    }
+}
+
 /// The running daemon: graph state, a shutdown signal, and the `subscribe`
 /// notification broadcast.
 pub struct Daemon {
@@ -341,24 +380,12 @@ impl Daemon {
             let mut wiring = crate::runtime::Wiring::build(&config, &self.notifier);
             // Keep clones of the write locks (§6) and per-endpoint targetward senders
             // so the control plane can acquire, release, and `send`; the same `Rc`s are
-            // handed to the origin read tasks below. The wiring keys by endpoint address
-            // (a codec has many); the RPC surface addresses by display string
-            // (`usb0`, `mux/console`), so convert here.
-            st.endpoint_locks = wiring
-                .endpoint_locks
-                .iter()
-                .map(|(a, l)| (a.to_string(), l.clone()))
-                .collect();
-            st.endpoint_targetward = wiring
-                .host_targetward_tx
-                .iter()
-                .map(|(a, t)| (a.to_string(), t.clone()))
-                .collect();
-            st.origin_locks = wiring
-                .origin_locks
-                .iter()
-                .map(|(a, (l, id))| (a.to_string(), (l.clone(), *id)))
-                .collect();
+            // handed to the origin read tasks below. Clear first so this stays a
+            // replace (load runs on an empty graph, but the clears make that explicit).
+            st.endpoint_locks.clear();
+            st.endpoint_targetward.clear();
+            st.origin_locks.clear();
+            st.absorb_wiring(&wiring);
             st.nodes = nodes;
             st.config = config;
             for node in &mut st.nodes {
@@ -456,12 +483,7 @@ impl Daemon {
                 edges: Vec::new(),
             };
             let mut wiring = crate::runtime::Wiring::build(&mini, &self.notifier);
-            for (a, l) in wiring.endpoint_locks.iter() {
-                st.endpoint_locks.insert(a.to_string(), l.clone());
-            }
-            for (a, t) in wiring.host_targetward_tx.iter() {
-                st.endpoint_targetward.insert(a.to_string(), t.clone());
-            }
+            st.absorb_wiring(&wiring);
             node.start(&mut wiring);
             st.nodes.push(node);
             st.config.nodes.push(node_cfg);
@@ -493,11 +515,7 @@ impl Daemon {
             .unwrap_or(false);
 
         self.state.with_mut(|st| {
-            let idx = st
-                .nodes
-                .iter()
-                .position(|n| n.name() == name)
-                .ok_or_else(|| RpcError::invalid_params(format!("unknown node {name:?}")))?;
+            let idx = st.node_index(&name)?;
 
             // Edges touching this node (either endpoint). Refuse a non-cascade removal
             // while any remain (§11).
@@ -549,13 +567,16 @@ impl Daemon {
                 // permanently wedge the surviving endpoint as locked with no recovery
                 // (§6/§15.20: a torn-down origin leaves the lock cleanly).
                 if let Some((host_lock, origin_id)) = st.origin_locks.remove(disp) {
-                    let released = host_lock.with_mut(|g| g.unregister(origin_id));
-                    if released {
-                        // It held the lock; releasing must wake the queue and notify,
-                        // exactly like a normal detach-release.
-                        host_lock.wake_waiters();
-                        host_lock.emit_change();
-                    }
+                    // Unregister the removed writer from the surviving host lock. It may
+                    // have been the holder (detach-release) *or* a queued `lock --wait`
+                    // waiter — `unregister` drops it from the FIFO queue either way. Wake
+                    // unconditionally so a parked waiter for this now-gone origin
+                    // re-evaluates and leaves with the defined error, rather than parking
+                    // until the next unrelated wake of this surviving lock (§6/§15.20).
+                    // Other waiters simply re-check `acquire` and re-park.
+                    host_lock.with_mut(|g| g.unregister(origin_id));
+                    host_lock.wake_waiters();
+                    host_lock.emit_change();
                 }
             }
             // A surviving origin whose target endpoint was this node keeps a clone of
@@ -654,11 +675,7 @@ impl Daemon {
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::invalid_params("missing 'node' in params"))?;
         self.state.with(|st| {
-            let target = st
-                .nodes
-                .iter()
-                .find(|n| n.name() == node)
-                .ok_or_else(|| RpcError::invalid_params(format!("unknown node {node:?}")))?;
+            let target = st.node(node)?;
             match target.rotate() {
                 Ok(rotated_to) => Ok(json!({ "node": node, "rotated_to": rotated_to })),
                 Err(reason) => Err(RpcError::invalid_params(reason)),
@@ -671,11 +688,7 @@ impl Daemon {
     /// node is missing, not a serial node, or its device is not currently open.
     fn serial_port(&self, node: &str) -> Result<std::rc::Rc<serial2::SerialPort>, RpcError> {
         self.state.with(|st| {
-            let target = st
-                .nodes
-                .iter()
-                .find(|n| n.name() == node)
-                .ok_or_else(|| RpcError::invalid_params(format!("unknown node {node:?}")))?;
+            let target = st.node(node)?;
             let serial = target.as_serial().ok_or_else(|| {
                 RpcError::invalid_params(format!("node {node:?} is not a serial node"))
             })?;
@@ -818,6 +831,18 @@ impl Daemon {
                 .get(&p.endpoint)
                 .cloned()
                 .ok_or_else(|| RpcError::internal("endpoint has no targetward path"))?;
+            // The endpoint advertises a targetward path, but an interior codec/exec
+            // channel whose multiplexed side is read-only or unattached drops its
+            // receiver at start (§7.5). A closed sender means that dead path: fail
+            // with a defined, meaningful error here rather than registering the
+            // transient origin, running the lock dance, and then failing opaquely at
+            // delivery with a -32603 (RUNTIME-1).
+            if sender.is_closed() {
+                return Err(RpcError::invalid_params(format!(
+                    "endpoint {:?} cannot accept targetward writes (its interior node has no writable path to the device)",
+                    p.endpoint
+                )));
+            }
             Ok::<_, RpcError>((cell, sender))
         })?;
         let id = self.next_send_origin();
@@ -877,10 +902,13 @@ impl Daemon {
         if delivered {
             Ok(json!({ "endpoint": p.endpoint, "sent": sent, "delivered": true }))
         } else {
-            Err(RpcError::internal(format!(
-                "endpoint {:?} targetward closed",
-                p.endpoint
-            )))
+            // The endpoint was torn down between the pre-flight serviceability check
+            // and delivery (e.g. a concurrent `remove-node`). Report the same defined
+            // teardown error the wait path uses, not an opaque -32603 (RUNTIME-1).
+            Err(RpcError::new(
+                app_errors::LOCKED,
+                format!("endpoint {:?} was torn down while sending", p.endpoint),
+            ))
         }
     }
 
@@ -1248,10 +1276,7 @@ fn structural_error(message: &str, available: Option<Value>) -> RpcError {
 /// (§11). Read-only verbs (`state`, `dump`, `subscribe`), arbitration (`lock`/
 /// `unlock`/`send`), `rotate`, and `shutdown` never touch config.
 fn is_config_mutation(method: &str) -> bool {
-    matches!(
-        method,
-        "load" | "load-replace" | "teardown" | "add-node" | "remove-node"
-    )
+    matches!(method, "load" | "teardown" | "add-node" | "remove-node")
 }
 
 /// Write `bytes` to `path` atomically: create the parent directory, write a
@@ -1346,6 +1371,55 @@ mod tests {
         let d = std::env::temp_dir().join(format!("snx-atomic-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// RUNTIME-1 regression: a `send` to a host endpoint whose targetward receiver
+    /// has been dropped — the state an interior codec/exec channel leaves behind
+    /// when it cannot route targetward (read-only or unattached mux) — fails fast
+    /// with a *defined* `invalid_params` error, not an opaque `-32603` internal
+    /// error, and without running the lock dance first.
+    #[test]
+    fn send_to_unserviceable_endpoint_fails_with_defined_error() {
+        use crate::runtime::LockCell;
+        use nexus_core::lock::EndpointLock;
+
+        let daemon = Daemon::new(
+            nexus_core::Resolver::new("/"),
+            None,
+            Rc::new(Registry::with_builtins()),
+        );
+
+        // Advertise a host endpoint (a lock + a targetward sender) whose receiver is
+        // already gone — exactly what codec.start leaves when it drops the per-channel
+        // rx on the Waiting / read-only path.
+        let (notifier, _keep) = broadcast::channel::<Notification>(4);
+        let lock = Rc::new(LockCell::new(
+            "mux/console",
+            EndpointLock::new(Arbitration::Exclusive),
+            notifier,
+        ));
+        let (tx, targetward_rx) = mpsc::channel::<Chunk>(1);
+        drop(targetward_rx); // interior node dropped its receiver: tx.is_closed()
+        daemon.state.with_mut(|st| {
+            st.endpoint_locks.insert("mux/console".to_owned(), lock);
+            st.endpoint_targetward.insert("mux/console".to_owned(), tx);
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(daemon.dispatch(
+                "send",
+                Some(json!({ "endpoint": "mux/console", "line": "reboot" })),
+            ))
+            .expect_err("send to a closed targetward endpoint must fail");
+        assert_eq!(
+            err.code,
+            error_codes::INVALID_PARAMS,
+            "expected a defined invalid_params error, not an opaque internal (-32603)"
+        );
     }
 
     /// `atomic_write` durably replaces the target: the bytes round-trip, the temp

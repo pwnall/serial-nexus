@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use codec_api::{Event, EventKind, FrameDecoder, MAX_FRAME_SIZE, encode};
+use codec_api::{Event, EventKind, FrameDecoder};
 use nexus_core::Chunk;
 use nexus_core::NodeStatus;
 use nexus_core::config::NodeConfig;
@@ -39,14 +39,17 @@ use nexus_core::graph::{EndpointAddr, Facing};
 use nexus_core::lock::OriginId;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
 use crate::boundary;
 use crate::cell::CriticalCell;
-use crate::runtime::{CHANNEL_CAP, DropCounters, HostwardSink, READ_BUF, SharedLock, Wiring};
+use crate::runtime::{
+    CHANNEL_CAP, DropCounters, HostwardSink, READ_BUF, SharedLock, Wiring, data_frames,
+    reacquire_held,
+};
 
 /// The reserved wire channel identity for the multiplexed (device) side (§15.22).
 /// The graph forbids an empty real channel identity, so this never collides.
@@ -96,8 +99,14 @@ pub struct ExecCodecNode {
     /// The multiplexed side's own hostward drops (the codec falling behind the
     /// serial), surfaced so the §5 loss stays located. Claimed at start.
     mux_counters: Option<Arc<DropCounters>>,
-    /// Times the child has been (re)started after a crash — observable state (§7.6).
+    /// Restart attempts since the first start — both a failed spawn and a post-crash
+    /// respawn bump it, so a child that can never spawn (bad argv / ENOENT) is visibly
+    /// retrying rather than reporting a frozen zero (observable state, §7.6).
     restart_count: Rc<Cell<u64>>,
+    /// Bytes the child emitted device-bound on the reserved mux channel that had no
+    /// targetward serial path (a read-only / hostward-only edge) and were dropped —
+    /// a §5 loss kept located and attributable rather than silently lost.
+    mux_discarded_targetward: Rc<Cell<u64>>,
     /// Shared with the supervisor task, which flips it to faulted on a crash and
     /// back to active once a child is running.
     status: Rc<CriticalCell<NodeStatus>>,
@@ -132,6 +141,7 @@ impl ExecCodecNode {
             stats: Rc::new(stats),
             mux_counters: None,
             restart_count: Rc::new(Cell::new(0)),
+            mux_discarded_targetward: Rc::new(Cell::new(0)),
             status: Rc::new(CriticalCell::new(NodeStatus::Active)),
             tasks: Vec::new(),
         }
@@ -213,6 +223,7 @@ impl ExecCodecNode {
                 channel_sinks,
                 stats: self.stats.clone(),
                 restart_count: self.restart_count.clone(),
+                mux_discarded_targetward: self.mux_discarded_targetward.clone(),
                 status: self.status.clone(),
             })));
     }
@@ -222,15 +233,16 @@ impl ExecCodecNode {
     }
 
     pub fn state_extra(&self) -> Value {
+        // `self.stats` is built from `self.channels` in `create`, so every channel has
+        // exactly one stat — iterate it directly, no `Option` dance.
         let channels: serde_json::Map<String, Value> = self
-            .channels
+            .stats
             .iter()
-            .map(|ch| {
-                let stat = self.stats.get(ch);
+            .map(|(ch, stat)| {
                 let obj = json!({
-                    "status": if stat.is_some_and(|s| s.active.get()) { "active" } else { "waiting" },
-                    "delivered_hostward": stat.map_or(0, |s| s.delivered_hostward.get()),
-                    "discarded_unattached": stat.map_or(0, |s| s.discarded_unattached.get()),
+                    "status": if stat.active.get() { "active" } else { "waiting" },
+                    "delivered_hostward": stat.delivered_hostward.get(),
+                    "discarded_unattached": stat.discarded_unattached.get(),
                 });
                 (ch.clone(), obj)
             })
@@ -241,6 +253,7 @@ impl ExecCodecNode {
             "restart_count": self.restart_count.get(),
             "multiplexed": {
                 "dropped_slow_consumer": self.mux_counters.as_ref().map_or(0, |c| c.dropped_full()),
+                "discarded_targetward": self.mux_discarded_targetward.get(),
             },
             "channels": channels,
         })
@@ -271,6 +284,7 @@ struct SuperviseArgs {
     channel_sinks: HashMap<String, Vec<HostwardSink>>,
     stats: Rc<HashMap<String, Rc<ChannelStat>>>,
     restart_count: Rc<Cell<u64>>,
+    mux_discarded_targetward: Rc<Cell<u64>>,
     status: Rc<CriticalCell<NodeStatus>>,
 }
 
@@ -293,13 +307,17 @@ async fn supervise(mut a: SuperviseArgs) {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
+                a.restart_count.set(a.restart_count.get() + 1);
                 a.status.with_mut(|s| {
                     *s = NodeStatus::Faulted {
-                        reason: format!("spawn {:?}: {e}", a.argv[0]),
+                        reason: format!(
+                            "spawn {:?}: {e}; retrying (count {})",
+                            a.argv[0],
+                            a.restart_count.get()
+                        ),
                     }
                 });
                 backoff.sleep().await;
-                a.restart_count.set(a.restart_count.get() + 1);
                 continue;
             }
         };
@@ -316,6 +334,7 @@ async fn supervise(mut a: SuperviseArgs) {
             serial_lock: &a.serial_lock,
             channel_sinks: &a.channel_sinks,
             stats: &a.stats,
+            mux_discarded_targetward: &a.mux_discarded_targetward,
         };
         let end = pump_child(stdin, stdout, stderr, &mut a.src_rx, &routing).await;
 
@@ -355,6 +374,7 @@ struct Routing<'a> {
     serial_lock: &'a Option<(SharedLock, OriginId)>,
     channel_sinks: &'a HashMap<String, Vec<HostwardSink>>,
     stats: &'a Rc<HashMap<String, Rc<ChannelStat>>>,
+    mux_discarded_targetward: &'a Rc<Cell<u64>>,
 }
 
 /// Pump one child instance. The stdin-feeding and stdout-reading loops run as
@@ -372,7 +392,7 @@ struct Routing<'a> {
 async fn pump_child(
     mut stdin: tokio::process::ChildStdin,
     mut stdout: tokio::process::ChildStdout,
-    stderr: tokio::process::ChildStderr,
+    mut stderr: tokio::process::ChildStderr,
     src_rx: &mut mpsc::Receiver<(String, Chunk)>,
     routing: &Routing<'_>,
 ) -> PumpEnd {
@@ -384,24 +404,10 @@ async fn pump_child(
     // just as the leg does (§15.24).
     let feed = async {
         while let Some((channel, bytes)) = src_rx.recv().await {
-            let cap = MAX_FRAME_SIZE.saturating_sub(3 + channel.len()).max(1);
-            let total = bytes.len();
-            let mut off = 0;
-            while off < total {
-                let stop = (off + cap).min(total);
-                let mut frame = Vec::new();
-                if encode(
-                    &Event::data(channel.as_str(), bytes.slice(off..stop)),
-                    &mut frame,
-                )
-                .is_err()
-                {
-                    break; // defensive; unreachable for a sane channel id
-                }
+            for (_len, frame) in data_frames(channel.as_str(), &bytes) {
                 if stdin.write_all(&frame).await.is_err() || stdin.flush().await.is_err() {
                     return PumpEnd::ChildDied; // child stdin broke
                 }
-                off = stop;
             }
         }
         PumpEnd::SourceClosed
@@ -429,13 +435,24 @@ async fn pump_child(
             }
         }
     };
-    // stderr → diagnostics; drains until EOF, then parks so it never ends the pump
-    // on its own — only stdin/stdout death or a closed source does (§16.1
-    // park-don't-teardown).
+    // stderr → diagnostics, drained in bounded fixed-size reads (never `.lines()`:
+    // a child that emits no newline — a `\r` progress spinner, binary/hex output,
+    // `cat /dev/urandom 1>&2` — would grow one String without bound and drive the
+    // long-lived daemon toward OOM, and the escape hatch runs arbitrary third-party
+    // tools, §7.6/§13). Capped at READ_BUF like stdout; each chunk is logged lossily.
+    // Then the stream drains to EOF and parks so it never ends the pump on its own —
+    // only stdin/stdout death or a closed source does (§16.1 park-don't-teardown).
     let errs = async {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            tracing::warn!(target: "exec-codec", "child stderr: {line}");
+        let mut buf = vec![0u8; READ_BUF];
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) | Err(_) => break, // EOF/error: stop draining, then park
+                Ok(k) => tracing::warn!(
+                    target: "exec-codec",
+                    "child stderr: {}",
+                    String::from_utf8_lossy(&buf[..k]).trim_end()
+                ),
+            }
         }
         boundary::park().await
     };
@@ -454,6 +471,7 @@ async fn route_event(ev: Event, routing: &Routing<'_>) {
         serial_lock,
         channel_sinks,
         stats,
+        mux_discarded_targetward,
     } = routing;
     match ev.kind {
         EventKind::Data(bytes) => {
@@ -461,10 +479,16 @@ async fn route_event(ev: Event, routing: &Routing<'_>) {
                 // Targetward remux output → the device, backpressured (§5). Gated on
                 // the exec codec holding the serial lock (§6).
                 if let (Some(tx), Some((lock, id))) = (mux_targetward_tx, serial_lock) {
-                    if !ensure_holds(lock, *id).await {
+                    if !reacquire_held(lock, *id).await {
                         return;
                     }
                     let _ = tx.send(bytes).await;
+                } else {
+                    // No targetward serial path (a read-only / hostward-only mux edge):
+                    // the child's device-bound bytes have nowhere to go. Count the loss
+                    // so it stays located and attributable, never silently dropped (§5).
+                    mux_discarded_targetward
+                        .set(mux_discarded_targetward.get() + bytes.len() as u64);
                 }
             } else {
                 let n = bytes.len() as u64;
@@ -509,37 +533,31 @@ async fn route_event(ev: Event, routing: &Routing<'_>) {
     }
 }
 
-/// Ensure the codec holds the serial's write lock, re-acquiring FIFO after a steal
-/// (§6). Mirrors the in-process codec's gate; returns false if the endpoint is gone.
-async fn ensure_holds(lock: &SharedLock, id: OriginId) -> bool {
-    if lock.with(|g| g.may_write(id)) {
-        return true;
-    }
-    loop {
-        if lock.is_closed() {
-            return false;
-        }
-        let notified = lock.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        // Already holds, or reclaim as a held origin ahead of on-demand waiters (§6).
-        let outcome = lock.with_mut(|g| {
-            if g.may_write(id) {
-                Some(false)
-            } else if g.reclaim_held(id) {
-                Some(true)
-            } else {
-                None
-            }
-        });
-        match outcome {
-            Some(fresh) => {
-                if fresh {
-                    lock.emit_change();
-                }
-                return true;
-            }
-            None => notified.await,
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mux_targetward_drop_is_counted_when_no_serial_path() {
+        // A child emits device-bound data on the reserved mux channel, but the
+        // multiplexed side has no targetward serial path (a read-only / hostward-only
+        // edge). The bytes have nowhere to go and must be counted, not silently
+        // dropped (§5 all-loss-counted; CODEXEC-3 regression guard).
+        let no_tx: Option<mpsc::Sender<Chunk>> = None;
+        let no_lock: Option<(SharedLock, OriginId)> = None;
+        let sinks: HashMap<String, Vec<HostwardSink>> = HashMap::new();
+        let stats: Rc<HashMap<String, Rc<ChannelStat>>> = Rc::new(HashMap::new());
+        let discarded = Rc::new(Cell::new(0u64));
+        let routing = Routing {
+            mux_targetward_tx: &no_tx,
+            serial_lock: &no_lock,
+            channel_sinks: &sinks,
+            stats: &stats,
+            mux_discarded_targetward: &discarded,
+        };
+        let payload = Chunk::from_static(b"device-bound bytes");
+        let n = payload.len() as u64;
+        route_event(Event::data(MUX_CHANNEL, payload), &routing).await;
+        assert_eq!(discarded.get(), n);
     }
 }

@@ -160,10 +160,23 @@ impl Resolver {
     /// Validate a `usb:` identity and locate its current path (absent is legal).
     fn resolve_usb_identity(&self, input: &str, rest: &str) -> Result<Resolved, ResolveError> {
         // `usb:vid:pid:serial:iface` — four `:`-separated fields after the scheme.
-        if rest.split(':').count() != 4 {
+        let fields: Vec<&str> = rest.split(':').collect();
+        if fields.len() != 4 {
             return Err(ResolveError::Malformed {
                 input: input.to_owned(),
                 reason: "expected usb:<vid>:<pid>:<serial>:<iface>".into(),
+            });
+        }
+        // A structurally meaningless identity — any empty field (`usb::::`,
+        // `usb:0403:6001::00`) — is rejected at add time rather than stored and
+        // dumped as a canonical `device` (§11). An absent serial/interface is
+        // spelled with the `-` marker, never empty.
+        if fields.iter().any(|f| f.is_empty()) {
+            return Err(ResolveError::Malformed {
+                input: input.to_owned(),
+                reason:
+                    "usb identity fields must be non-empty (use - for an absent serial/interface)"
+                        .into(),
             });
         }
         // Prefer a live sysfs description when the device is present; otherwise
@@ -220,6 +233,16 @@ impl Resolver {
 
     /// Capture an identity from a present raw `/dev` path: usb → by-path → raw.
     fn capture_from_path(&self, input: &str) -> Result<Resolved, ResolveError> {
+        // An all-slash / empty-after-trim path is malformed — `rooted("/")` joins
+        // to the dev-root directory itself, which always exists and would be
+        // captured as `raw:/` bound to a directory (§11 rejects ill-formed
+        // resolver input up front), so reject it as the `raw:` form does.
+        if input.trim_start_matches('/').is_empty() {
+            return Err(ResolveError::Malformed {
+                input: input.to_owned(),
+                reason: "empty path".into(),
+            });
+        }
         let rooted = self.rooted(input);
         if !rooted.exists() {
             return Err(ResolveError::NotPresent {
@@ -433,7 +456,9 @@ impl Resolver {
             if cur.join("idVendor").exists() {
                 let vid = read_trimmed(&cur.join("idVendor"))?;
                 let pid = read_trimmed(&cur.join("idProduct"))?;
-                let serial = read_trimmed(&cur.join("serial")).unwrap_or_else(|| "-".into());
+                let serial = read_trimmed(&cur.join("serial"))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "-".into());
                 let iface = interface.unwrap_or_else(|| "-".into());
                 let identity = format!("usb:{vid}:{pid}:{serial}:{iface}");
                 let manufacturer = read_trimmed(&cur.join("manufacturer"));
@@ -765,6 +790,16 @@ mod tests {
             r.resolve_input("raw:/"),
             Err(ResolveError::Malformed { .. })
         ));
+        // A bare all-slash path must be rejected, not captured as `raw:/` bound
+        // to the dev-root directory.
+        assert!(matches!(
+            r.resolve_input("/"),
+            Err(ResolveError::Malformed { .. })
+        ));
+        assert!(matches!(
+            r.resolve_input("//"),
+            Err(ResolveError::Malformed { .. })
+        ));
     }
 
     #[test]
@@ -813,5 +848,65 @@ mod tests {
         assert_eq!(DeviceKind::of("by-path:pci-0000"), DeviceKind::ByPath);
         assert_eq!(DeviceKind::of("raw:/dev/ttyUSB0"), DeviceKind::Raw);
         assert_eq!(DeviceKind::of("/dev/ttyUSB0"), DeviceKind::Raw);
+    }
+
+    #[test]
+    fn empty_serial_string_degrades_to_by_path() {
+        // A cheap adapter exposes an EMPTY iSerialNumber descriptor: the sysfs
+        // `serial` file exists but is blank. It must be treated as absent
+        // (§12/§15.10) — a concrete `usb:vid:pid::iface` would match a second
+        // identical adapter on another port and reopen the wrong device.
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        add_usb_device(
+            t.path(),
+            "1-1",
+            "ttyUSB0",
+            "usb-1a86_USB_Serial-if00-port0",
+            "1a86",
+            "7523",
+            Some(""), // present-but-empty serial string
+            "00",
+            None,
+        );
+        // by-path tree covering the same device node.
+        let by_path = t.path().join("dev/serial/by-path");
+        std::fs::create_dir_all(&by_path).unwrap();
+        std::os::unix::fs::symlink(
+            "../../ttyUSB0",
+            by_path.join("pci-0000:00:14.0-usb-0:1:1.0-port0"),
+        )
+        .unwrap();
+
+        // Empty serial → absent marker → degrades to by-path with the warning.
+        let got = r.resolve_input("/dev/ttyUSB0").unwrap();
+        assert_eq!(got.kind, DeviceKind::ByPath);
+        assert_eq!(got.identity, "by-path:pci-0000:00:14.0-usb-0:1:1.0-port0");
+        assert!(got.warning.is_some());
+    }
+
+    #[test]
+    fn usb_identity_empty_field_is_malformed() {
+        // A usb: identity with the right field COUNT but an empty field is
+        // structurally meaningless and must be rejected at add time, not stored
+        // and dumped as a canonical device (§11). An absent serial/interface is
+        // spelled `-`, never empty.
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        for input in [
+            "usb::::",           // all empty
+            "usb::6001:S:00",    // empty vid
+            "usb:0403::S:00",    // empty pid
+            "usb:0403:6001::00", // empty serial
+            "usb:0403:6001:S:",  // empty iface
+        ] {
+            assert!(
+                matches!(r.resolve_input(input), Err(ResolveError::Malformed { .. })),
+                "expected {input:?} to be malformed"
+            );
+        }
+        // The canonical absent-serial/iface form (with `-`) is still accepted
+        // (device absent → path None, no by-id tree in the fixture).
+        assert!(r.resolve_input("usb:0403:6001:-:-").is_ok());
     }
 }

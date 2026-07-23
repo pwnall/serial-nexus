@@ -15,7 +15,7 @@
 //! The primitives, mapped to the four invariants §16.1 names:
 //! * **park-don't-teardown** → [`park`]: a direction whose producer is exhausted
 //!   awaits this instead of returning, so its independent sibling stays live.
-//! * **concurrent halves** → [`race2`]/[`race3`]: run the directions as
+//! * **concurrent halves** → [`race3`]: run the directions as
 //!   concurrently-polled futures and return the first *session-ending* outcome —
 //!   deadlock-free by construction, since a parked half never blocks its sibling.
 //! * **loss notification + join-then-transition** → [`BlockingReader`]: a hostward
@@ -150,22 +150,28 @@ impl BlockingReader {
     /// Spawn `body` on a named blocking thread, handing it the stop flag (poll it
     /// each iteration; exit promptly when set) and the loss `Notify` (pulse it on
     /// device loss, then return). Any previously-armed reader must already be joined
-    /// via [`Self::stop_join`].
+    /// via [`Self::stop_join`]. Returns the OS error if the thread cannot be spawned
+    /// (e.g. `EAGAIN` under a thread/PID limit), for the caller to fault the node
+    /// rather than panic its supervisor.
     pub fn arm(
         &mut self,
         name: String,
         body: impl FnOnce(Arc<AtomicBool>, Arc<Notify>) + Send + 'static,
-    ) {
+    ) -> std::io::Result<()> {
+        debug_assert!(
+            self.handle.is_none(),
+            "arm called on an un-joined reader; call stop_join first"
+        );
         let stop = Arc::new(AtomicBool::new(false));
         let lost = Arc::new(Notify::new());
         let (stop_c, lost_c) = (stop.clone(), lost.clone());
         let handle = std::thread::Builder::new()
             .name(name)
-            .spawn(move || body(stop_c, lost_c))
-            .expect("spawn blocking reader thread");
+            .spawn(move || body(stop_c, lost_c))?;
         self.stop = stop;
         self.lost = lost;
         self.handle = Some(handle);
+        Ok(())
     }
 
     /// The loss signal the current reader pulses, for the supervisor to await.
@@ -267,7 +273,8 @@ mod tests {
         let mut r = BlockingReader::default();
         r.arm("test-loss".into(), |_stop, lost| {
             lost.notify_one(); // device loss
-        });
+        })
+        .expect("arm reader");
         // `lost()` is read after `arm` (as the supervisor does), so it observes the
         // reader's own signal. The pulse is durable — notify_one leaves a permit for
         // a later waiter.
@@ -285,7 +292,22 @@ mod tests {
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(1));
             }
-        });
+        })
+        .expect("arm reader");
         r.stop_join(); // sets the flag, the thread exits, join succeeds
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "un-joined reader")]
+    async fn arm_without_stop_join_trips_the_precondition() {
+        // Re-arming without an intervening `stop_join` would silently detach the
+        // previous reader (the fd-reuse hazard the module claims to make
+        // unrepresentable); the debug_assert catches it in debug/test builds.
+        let mut r = BlockingReader::default();
+        r.arm("first".into(), |_stop, _lost| {}).expect("arm first");
+        // No `stop_join` here: the second arm must trip the precondition rather
+        // than drop the still-joinable handle.
+        let _ = r.arm("second".into(), |_stop, _lost| {});
     }
 }

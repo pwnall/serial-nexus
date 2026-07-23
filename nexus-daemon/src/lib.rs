@@ -65,7 +65,7 @@ const SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(
 /// The options a daemon binary hands to [`run`] — the library twin of the CLI
 /// flags (§10). Flag parsing itself stays in the binary (§15.16/§15.26), so an
 /// embedder is free to expose a different flag surface, a config file, or none.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RunOptions {
     /// Override the control socket path (§10). `None` selects the privilege-based
     /// default (`/run/serialnexusd.sock` as root, else `$XDG_RUNTIME_DIR/…`).
@@ -82,6 +82,21 @@ pub struct RunOptions {
     /// Configuration snapshot path (§11). `None` derives it from the socket path
     /// (`<socket>.state.toml`); an explicit path buys reboot durability.
     pub state_file: Option<PathBuf>,
+}
+
+impl Default for RunOptions {
+    /// `dev_root` defaults to `/` (the production root), not `PathBuf::default()`
+    /// (empty): an embedder calling `RunOptions::default()` gets a resolver rooted at
+    /// the real filesystem, not one silently rooted at the daemon's CWD (§12/§15.26).
+    fn default() -> Self {
+        RunOptions {
+            socket: None,
+            config: None,
+            socket_group: None,
+            dev_root: PathBuf::from("/"),
+            state_file: None,
+        }
+    }
 }
 
 /// Run the daemon to completion: bind the control socket, apply the §10 auth
@@ -272,4 +287,16 @@ async fn startup_load(daemon: &Daemon, config_path: &Path) -> anyhow::Result<()>
         .map_err(|e| anyhow::anyhow!("load failed: {} (code {})", e.message, e.code))?;
     tracing::info!(nodes = config.nodes.len(), "startup configuration loaded");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_dev_root_is_the_filesystem_root_not_cwd() {
+        // An embedder writing `RunOptions::default()` must get a resolver rooted at
+        // `/`, not one silently rooted at the daemon's CWD (CTRL-2 / §12).
+        assert_eq!(RunOptions::default().dev_root, PathBuf::from("/"));
+    }
 }

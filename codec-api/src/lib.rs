@@ -92,29 +92,35 @@ impl EventKind {
 /// unit the envelope frames and the codec vocabulary carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
+    /// The channel this event belongs to.
     pub channel: ChannelId,
+    /// What happened on the channel — one of the four §8 event kinds.
     pub kind: EventKind,
 }
 
 impl Event {
+    /// A `data` event carrying opaque channel bytes.
     pub fn data(channel: impl Into<ChannelId>, bytes: impl Into<Bytes>) -> Self {
         Event {
             channel: channel.into(),
             kind: EventKind::Data(bytes.into()),
         }
     }
+    /// An `open` event announcing the channel is active.
     pub fn open(channel: impl Into<ChannelId>) -> Self {
         Event {
             channel: channel.into(),
             kind: EventKind::Open,
         }
     }
+    /// A `close` event marking the channel closed.
     pub fn close(channel: impl Into<ChannelId>) -> Self {
         Event {
             channel: channel.into(),
             kind: EventKind::Close,
         }
     }
+    /// An `error` event carrying a human-readable, channel-scoped reason.
     pub fn error(channel: impl Into<ChannelId>, msg: impl Into<String>) -> Self {
         Event {
             channel: channel.into(),
@@ -443,7 +449,13 @@ pub fn try_decode_hello(buf: &[u8]) -> Result<Option<(Hello, usize)>, WireError>
     }
     let capabilities = u32::from_be_bytes([body[6], body[7], body[8], body[9]]);
     let count = u16::from_be_bytes([body[10], body[11]]) as usize;
-    let mut channels = Vec::with_capacity(count);
+    // `count` is untrusted wire input: do not size the allocation from it (a
+    // 16-byte hello can claim count=0xFFFF with zero announcement bytes and drive
+    // a ~1.5 MB reservation — CODECAPI-1). Each real announcement needs >=2 bytes
+    // (its u16 length prefix), so the body itself caps how many can follow; clamp
+    // to that so growth stays proportional to bytes actually received. `body.len()
+    // >= 12` is guaranteed by the header gate above, so the subtraction is safe.
+    let mut channels = Vec::with_capacity(count.min((body.len() - 12) / 2));
     let mut off = 12;
     for _ in 0..count {
         if body.len() < off + 2 {
@@ -578,6 +590,66 @@ mod tests {
         buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
         buf.extend_from_slice(body);
         assert_eq!(try_decode(&buf), Err(EnvelopeError::UnknownType(9)));
+    }
+
+    // ---- hostile-decode clean-refusal paths (§9 clause 6) ----
+
+    /// Frame a raw `body` behind a satisfied `u32` length prefix.
+    fn frame_body(body: &[u8]) -> Vec<u8> {
+        let mut buf = (body.len() as u32).to_be_bytes().to_vec();
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    #[test]
+    fn truncated_header_is_refused() {
+        // body_len is satisfied but the body is shorter than the 3-byte header.
+        assert_eq!(
+            try_decode(&frame_body(&[0, 0])),
+            Err(EnvelopeError::Truncated("header"))
+        );
+    }
+
+    #[test]
+    fn channel_len_overrunning_body_is_refused() {
+        // type=0, chan_len=5, but zero channel bytes present in the body.
+        assert_eq!(
+            try_decode(&frame_body(&[0, 0, 5])),
+            Err(EnvelopeError::Truncated("channel id"))
+        );
+    }
+
+    #[test]
+    fn non_utf8_channel_id_is_refused() {
+        // type=0 (data), chan_len=2, channel bytes 0xFF 0xFE (invalid UTF-8).
+        assert_eq!(
+            try_decode(&frame_body(&[0, 0, 2, 0xFF, 0xFE])),
+            Err(EnvelopeError::BadChannelId)
+        );
+    }
+
+    #[test]
+    fn non_utf8_error_message_is_refused() {
+        // type=3 (error), chan_len=1, channel "x", payload 0xFF (invalid UTF-8).
+        assert_eq!(
+            try_decode(&frame_body(&[3, 0, 1, b'x', 0xFF])),
+            Err(EnvelopeError::BadErrorMessage)
+        );
+    }
+
+    #[test]
+    fn encode_oversize_data_is_refused_and_appends_nothing() {
+        // body = type(1) + chan_len(2) + "x"(1) + payload(MAX) = MAX + 4.
+        let event = Event::data("x", vec![0u8; MAX_FRAME_SIZE]);
+        let mut out = Vec::new();
+        assert_eq!(
+            encode(&event, &mut out),
+            Err(EnvelopeError::FrameTooLarge(MAX_FRAME_SIZE + 4))
+        );
+        assert!(
+            out.is_empty(),
+            "encoder must append nothing when it refuses"
+        );
     }
 
     #[test]
@@ -715,6 +787,78 @@ mod tests {
         assert_eq!(
             try_decode_hello(&buf),
             Err(WireError::FrameTooLarge(MAX_FRAME_SIZE + 1))
+        );
+    }
+
+    /// Frame a raw hello `body` behind a satisfied `u32` length prefix.
+    fn frame_hello_body(body: &[u8]) -> Vec<u8> {
+        let mut buf = (body.len() as u32).to_be_bytes().to_vec();
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    /// A v1 hello header (magic + WIRE_VERSION + caps=0) followed by `count`.
+    fn hello_header(count: u16) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&WIRE_MAGIC.to_be_bytes());
+        body.extend_from_slice(&WIRE_VERSION.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes()); // capabilities
+        body.extend_from_slice(&count.to_be_bytes());
+        body
+    }
+
+    #[test]
+    fn hello_announcement_count_exceeding_body_is_refused() {
+        // Header claims 2 announcements, but only one is present.
+        let mut body = hello_header(2);
+        body.extend_from_slice(&1u16.to_be_bytes()); // announcement 0 length = 1
+        body.push(b'a'); // announcement 0 = "a"
+        assert_eq!(
+            try_decode_hello(&frame_hello_body(&body)),
+            Err(WireError::Truncated("announcement length"))
+        );
+    }
+
+    #[test]
+    fn hello_announcement_identity_overrunning_body_is_refused() {
+        // One announcement whose declared length runs past the body.
+        let mut body = hello_header(1);
+        body.extend_from_slice(&5u16.to_be_bytes()); // announcement length = 5
+        body.extend_from_slice(b"ab"); // only 2 identity bytes, not 5
+        assert_eq!(
+            try_decode_hello(&frame_hello_body(&body)),
+            Err(WireError::Truncated("announcement identity"))
+        );
+    }
+
+    #[test]
+    fn hello_non_utf8_announcement_is_refused() {
+        // A well-framed announcement whose bytes are not valid UTF-8.
+        let mut body = hello_header(1);
+        body.extend_from_slice(&2u16.to_be_bytes()); // announcement length = 2
+        body.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
+        assert_eq!(
+            try_decode_hello(&frame_hello_body(&body)),
+            Err(WireError::BadChannelId)
+        );
+    }
+
+    #[test]
+    fn encode_hello_oversize_is_refused_and_appends_nothing() {
+        // body = header(12) + announcement len(2) + identity(MAX) = MAX + 14.
+        let hello = Hello {
+            version: WIRE_VERSION,
+            capabilities: 0,
+            channels: vec![ChannelId::new("c".repeat(MAX_FRAME_SIZE))],
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            encode_hello(&hello, &mut out),
+            Err(WireError::FrameTooLarge(MAX_FRAME_SIZE + 14))
+        );
+        assert!(
+            out.is_empty(),
+            "encoder must append nothing when it refuses"
         );
     }
 

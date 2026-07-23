@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use codec_api::{Codec, Event, EventKind};
+use codec_api::{Codec, Event, EventKind, MAX_FRAME_SIZE};
 use nexus_core::Chunk;
 use nexus_core::NodeStatus;
 use nexus_core::config::NodeConfig;
@@ -41,7 +41,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
 use crate::cell::CriticalCell;
-use crate::runtime::{DropCounters, HostwardSink, SharedLock, Wiring};
+use crate::runtime::{DropCounters, HostwardSink, SharedLock, Wiring, reacquire_held};
 
 /// Per-channel observed counters (§7.5). All access is on the one runtime thread,
 /// so `Cell` suffices.
@@ -57,6 +57,11 @@ struct ChannelStat {
     /// does not hold the serial's write lock — the observable §6 stall on a stolen
     /// held lock (item 6).
     accepted_targetward: Cell<u64>,
+    /// Channel bytes that could not be framed targetward and were therefore dropped
+    /// — a §5 loss counted where it happens. Unreachable for the envelope codec
+    /// (each oversize chunk is fragmented so every piece provably fits a frame); a
+    /// defensive count for a custom transform whose `mux` refuses a piece.
+    discarded_targetward: Cell<u64>,
     /// Whether the channel has been seen active (an `open`, or any `data`).
     active: Cell<bool>,
 }
@@ -196,12 +201,15 @@ impl CodecNode {
             .channels
             .iter()
             .map(|ch| {
-                let stat = self.stats.get(ch);
+                // `self.stats` is built from `self.channels` in `create`, so every
+                // channel has a stat — index directly (no Option handling).
+                let stat = &self.stats[ch];
                 let obj = json!({
-                    "status": if stat.is_some_and(|s| s.active.get()) { "active" } else { "waiting" },
-                    "delivered_hostward": stat.map_or(0, |s| s.delivered_hostward.get()),
-                    "discarded_unattached": stat.map_or(0, |s| s.discarded_unattached.get()),
-                    "accepted_targetward": stat.map_or(0, |s| s.accepted_targetward.get()),
+                    "status": if stat.active.get() { "active" } else { "waiting" },
+                    "delivered_hostward": stat.delivered_hostward.get(),
+                    "discarded_unattached": stat.discarded_unattached.get(),
+                    "accepted_targetward": stat.accepted_targetward.get(),
+                    "discarded_targetward": stat.discarded_targetward.get(),
                 });
                 (ch.clone(), obj)
             })
@@ -303,8 +311,13 @@ async fn hostward_demux(
 
 /// Targetward task for one channel: frame each write into the multiplexed stream
 /// and forward it to the device, gated on the codec holding the serial's write
-/// lock (§6). The framed chunk parks here (bounded: one chunk) while the lock is
-/// stolen, and is delivered once the codec re-acquires — delayed, never dropped.
+/// lock (§6). A write larger than one frame — an uncapped `send` line or a
+/// packet-mode PTY read up to READ_BUF == MAX_FRAME_SIZE, which the channel-id
+/// header pushes over the frame bound — is fragmented into consecutive data frames
+/// rather than dropped, mirroring the leg and the exec codec (§5 no-drop /
+/// all-loss-counted, §15.24). Each framed piece parks here (bounded: one chunk)
+/// while the lock is stolen, and is delivered once the codec re-acquires — delayed,
+/// never dropped.
 async fn channel_targetward(
     channel: String,
     mut rx: mpsc::Receiver<Chunk>,
@@ -314,66 +327,124 @@ async fn channel_targetward(
     mux_id: OriginId,
     stat: Rc<ChannelStat>,
 ) {
+    // Max payload per frame = MAX_FRAME_SIZE minus the envelope header (1 type byte
+    // + 2 channel-length bytes + the channel id). `channel` is fixed for this task.
+    let cap = MAX_FRAME_SIZE.saturating_sub(3 + channel.len()).max(1);
     while let Some(bytes) = rx.recv().await {
-        let n = bytes.len() as u64;
-        let mut framed = Vec::new();
-        let muxed = codec.with_mut(|c| {
-            c.mux(&Event::data(channel.as_str(), bytes), &mut framed)
+        let total = bytes.len();
+        let mut off = 0;
+        while off < total {
+            let end = (off + cap).min(total);
+            let piece_len = (end - off) as u64;
+            let mut framed = Vec::new();
+            let muxed = codec.with_mut(|c| {
+                c.mux(
+                    &Event::data(channel.as_str(), bytes.slice(off..end)),
+                    &mut framed,
+                )
                 .is_ok()
-        });
-        if !muxed {
-            continue; // a mux error drops this chunk (unreachable for reference)
+            });
+            if !muxed {
+                // Defensive: each fragment provably fits the frame bound for the
+                // envelope codec, so this is unreachable there; a custom transform
+                // that still refuses a piece must not drop silently — count the
+                // undelivered residual (§5 all-loss-is-counted).
+                stat.discarded_targetward
+                    .set(stat.discarded_targetward.get() + (total - off) as u64);
+                break;
+            }
+            // Gate on holding the serial's write lock (the codec's held origin). A
+            // `send --steal` transiently ousts it; re-acquire FIFO once the stealer
+            // releases. The framed piece is parked in `framed` meanwhile.
+            if !reacquire_held(&serial_lock, mux_id).await {
+                return; // the serial endpoint was torn down
+            }
+            if mux_tx.send(Chunk::from(framed)).await.is_err() {
+                return; // serial gone
+            }
+            stat.accepted_targetward
+                .set(stat.accepted_targetward.get() + piece_len);
+            off = end;
         }
-        // Gate on holding the serial's write lock (the codec's held origin). A
-        // `send --steal` transiently ousts it; re-acquire FIFO once the stealer
-        // releases. The framed chunk is parked in `framed` meanwhile.
-        if !ensure_holds(&serial_lock, mux_id).await {
-            return; // the serial endpoint was torn down
-        }
-        if mux_tx.send(Chunk::from(framed)).await.is_err() {
-            return; // serial gone
-        }
-        stat.accepted_targetward
-            .set(stat.accepted_targetward.get() + n);
     }
 }
 
-/// Ensure the codec holds `id`'s serial write lock, re-acquiring through the FIFO
-/// queue if a steal ousted it (§6). Returns `false` if the endpoint was torn down.
-/// The fast path (the normal held case) is a single borrow; the slow path parks on
-/// the lock's `Notify`, holding no borrow across the await (§15.20).
-async fn ensure_holds(lock: &SharedLock, id: OriginId) -> bool {
-    if lock.with(|g| g.may_write(id)) {
-        return true; // already holds it
-    }
-    loop {
-        if lock.is_closed() {
-            return false;
-        }
-        // Enable the wake future before the reclaim attempt (lost-wakeup-free).
-        let notified = lock.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
+#[cfg(all(test, feature = "codec-reference"))]
+mod tests {
+    use super::*;
+    use nexus_core::lock::{Arbitration, EndpointLock, WriteMode};
+    use tokio::sync::broadcast;
 
-        // Already holds (re-granted), or reclaim as a held origin ahead of any
-        // on-demand waiter (§6 held priority). Only a fresh reclaim emits a change.
-        let outcome = lock.with_mut(|g| {
-            if g.may_write(id) {
-                Some(false)
-            } else if g.reclaim_held(id) {
-                Some(true)
-            } else {
-                None
-            }
-        });
-        match outcome {
-            Some(fresh) => {
-                if fresh {
-                    lock.emit_change();
-                }
-                return true;
-            }
-            None => notified.await,
+    /// A serial lock whose held demux origin already owns the write lock, so the
+    /// codec's `reacquire_held` fast path returns immediately (no parking).
+    fn held_lock() -> (SharedLock, OriginId) {
+        let id = OriginId(1);
+        let mut lock = EndpointLock::new(Arbitration::Exclusive);
+        lock.register(id, "demux", WriteMode::Held); // acquires the lock on attach
+        let (notifier, _rx) = broadcast::channel(16);
+        (
+            Rc::new(crate::runtime::LockCell::new("mux", lock, notifier)),
+            id,
+        )
+    }
+
+    /// XC-NODROP-1: a targetward chunk larger than one frame (once the channel-id
+    /// header is added) is fragmented into consecutive data frames and reassembled
+    /// byte-exact by `demux`, with nothing dropped — the codec mirror of the leg's
+    /// no-drop round-trip (§5 all-loss-counted, §15.24).
+    #[tokio::test]
+    async fn targetward_oversize_chunk_is_fragmented_never_dropped() {
+        // A 7-byte channel id: the envelope header pushes a READ_BUF-sized read over
+        // MAX_FRAME_SIZE, so a single `mux` would fail — the task must fragment.
+        let channel = "console".to_owned();
+        let payload: Vec<u8> = (0..100_001u32).map(|i| (i % 251) as u8).collect();
+
+        let (in_tx, in_rx) = mpsc::channel::<Chunk>(4);
+        let (mux_tx, mut mux_rx) = mpsc::channel::<Chunk>(64);
+        let codec: Rc<CriticalCell<Box<dyn Codec>>> = Rc::new(CriticalCell::new(Box::new(
+            codec_reference::ReferenceCodec::new(),
+        )));
+        let (lock, id) = held_lock();
+        let stat = Rc::new(ChannelStat::default());
+
+        in_tx.send(Chunk::from(payload.clone())).await.unwrap();
+        drop(in_tx); // close the source so the task drains its one chunk and returns
+
+        channel_targetward(
+            channel,
+            in_rx,
+            mux_tx,
+            codec.clone(),
+            lock,
+            id,
+            stat.clone(),
+        )
+        .await;
+
+        // Every framed piece round-trips through `demux` byte-exact, with no loss.
+        let mut reassembled: Vec<u8> = Vec::new();
+        let mut frames = 0usize;
+        while let Ok(frame) = mux_rx.try_recv() {
+            frames += 1;
+            codec.with_mut(|c| {
+                c.demux(&frame, &mut |ev| {
+                    assert_eq!(ev.channel.as_str(), "console");
+                    if let EventKind::Data(bytes) = ev.kind {
+                        reassembled.extend_from_slice(&bytes);
+                    }
+                })
+                .unwrap();
+            });
         }
+        assert!(
+            frames >= 2,
+            "an oversize chunk must span multiple frames (got {frames})"
+        );
+        assert_eq!(
+            reassembled, payload,
+            "reassembled targetward bytes must be byte-exact"
+        );
+        assert_eq!(stat.accepted_targetward.get(), payload.len() as u64);
+        assert_eq!(stat.discarded_targetward.get(), 0);
     }
 }

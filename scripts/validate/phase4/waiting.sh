@@ -158,6 +158,30 @@ kill "$WB" 2>/dev/null; wait "$WB" 2>/dev/null || true; WB=
 "$C" unlock ptya >/dev/null
 
 # ============================================================================
+# E — remove-node --cascade of a WAITING writer's node wakes its parked --wait
+# (§6/§15.20, DLC-1): unregistering a queued waiter from a SURVIVING host lock
+# must wake it so it leaves with a defined error, not park until an unrelated wake.
+# ============================================================================
+"$C" --json lock ptya | jq -e '.acquired==true' >/dev/null || fail "lock ptya (E) failed"
+( timeout 12 "$C" lock ptyc --wait >"$TMPD/we.json" 2>&1; echo "exit:$?" >>"$TMPD/we.json" ) &
+WC=$!
+wait_waiters '["ptyc"]' || { cat "$TMPD/daemon.log"; fail "ptyc did not enqueue (E)"; }
+# Remove the *waiting* writer's node while ptya still holds usb0's lock. usb0
+# survives; ptyc's origin is unregistered from usb0's lock and its parked --wait
+# must return promptly rather than hang until its own 12 s timeout.
+"$C" remove-node ptyc --cascade >/dev/null \
+  || { cat "$TMPD/daemon.log"; fail "remove-node ptyc --cascade (E) failed"; }
+bash "$WAIT" "grep -q 'exit:' '$TMPD/we.json'" 4 0.05 \
+  || { cat "$TMPD/daemon.log" "$TMPD/we.json"; fail "the --wait did not return after the waiter's node was cascade-removed (stuck waiter)"; }
+# It returned an ERROR (non-zero exit), not a spurious grant.
+grep -q 'exit:0' "$TMPD/we.json" && { cat "$TMPD/we.json"; fail "the --wait wrongly succeeded after its origin was removed"; }
+wait "$WC" 2>/dev/null || true; WC=
+# usb0 is unharmed: ptya still holds it and the queue is empty.
+[ "$(holder)" = "ptya" ] || fail "usb0 holder not ptya after cascade-remove of waiter (got $(holder))"
+wait_waiters '[]' || fail "usb0 queue not empty after cascade-remove of waiter (got $(waiters))"
+"$C" unlock ptya >/dev/null
+
+# ============================================================================
 # D — teardown wakes a parked waiter with a defined error (§6/§15.20): a
 # deadline-less `lock --wait` must not hang forever when its endpoint vanishes.
 # ============================================================================

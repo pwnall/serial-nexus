@@ -189,14 +189,26 @@ impl EndpointLock {
         match self.holder {
             Some(h) if h == id => Acquire::AlreadyHeld,
             Some(h) => Acquire::Denied { held_by: h },
-            None => match self.waiters.front().copied() {
-                // FIFO fairness: while free-but-queued, only the head may take it.
-                Some(front) if front != id => Acquire::Denied { held_by: front },
-                _ => {
-                    self.grant_to(id);
-                    Acquire::Granted
+            None => {
+                // Held priority outranks the FIFO queue (§6/§15.23): while the lock
+                // is momentarily free (a steal transiently ousted the demux, or it
+                // has yet to reclaim), a registered `held` origin reclaims ahead of
+                // every on-demand contender — granting a queued waiter a
+                // demultiplexer's lock would corrupt the framing the hold protects.
+                // Deferring here makes that deterministic instead of a race between
+                // the reclaim task and the woken waiter on the shared `Notify`.
+                if let Some(held) = self.held_origin_other_than(id) {
+                    return Acquire::Denied { held_by: held };
                 }
-            },
+                match self.waiters.front().copied() {
+                    // FIFO fairness: while free-but-queued, only the head may take it.
+                    Some(front) if front != id => Acquire::Denied { held_by: front },
+                    _ => {
+                        self.grant_to(id);
+                        Acquire::Granted
+                    }
+                }
+            }
         }
     }
 
@@ -251,6 +263,16 @@ impl EndpointLock {
         self.holder = Some(id);
         self.waiters.retain(|w| *w != id);
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// The registered `held` origin other than `except`, if any (§6/§15.23): the
+    /// demultiplexer whose permanent hold outranks the on-demand FIFO queue. Used
+    /// by [`Self::acquire`] to defer an on-demand contender while the lock is
+    /// momentarily free, so the held origin's [`Self::reclaim_held`] always wins.
+    fn held_origin_other_than(&self, except: OriginId) -> Option<OriginId> {
+        self.origins
+            .iter()
+            .find_map(|(id, o)| (*id != except && o.write_mode == WriteMode::Held).then_some(*id))
     }
 
     /// A `Held` origin's *priority* reclaim of a free lock (§6). Unlike
@@ -351,14 +373,14 @@ impl EndpointLock {
             holder: self.holder.and_then(|h| self.label(h)).map(str::to_owned),
             origins: self
                 .origins
-                .values()
-                .map(|o| OriginState {
+                .iter()
+                .map(|(id, o)| OriginState {
                     origin: o.label.clone(),
                     write_mode: o.write_mode,
-                    holds_lock: self
-                        .holder
-                        .and_then(|h| self.label(h))
-                        .is_some_and(|l| l == o.label),
+                    // Holder identity is the OriginId (the map key), not the label:
+                    // two origins may share a label (concurrent `send`, §6), so a
+                    // label compare would mark both as holder (LOCK-1).
+                    holds_lock: self.holder == Some(*id),
                     purged: o.purged,
                 })
                 .collect(),
@@ -706,6 +728,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn snapshot_marks_exactly_one_holder_with_duplicate_labels() {
+        // Two distinct origins sharing a label — the reachable concurrent-`send`
+        // case: the daemon registers every transient send origin as "send" with a
+        // distinct OriginId (§6). The holder flag must track the id, not the label
+        // string, or both same-labelled origins report as holder (LOCK-1).
+        let mut lock = EndpointLock::new(Arbitration::Exclusive);
+        lock.register(OriginId(1), "send", WriteMode::OnDemand);
+        lock.register(OriginId(2), "send", WriteMode::OnDemand);
+        assert_eq!(lock.acquire(OriginId(1)), Acquire::Granted);
+        // The second same-labelled origin is denied and queues (the FIFO waiter).
+        assert!(matches!(lock.acquire(OriginId(2)), Acquire::Denied { .. }));
+
+        let snap = lock.snapshot();
+        assert_eq!(snap.holder.as_deref(), Some("send"));
+        assert_eq!(
+            snap.origins.len(),
+            2,
+            "both same-labelled origins are reported"
+        );
+        let holders = snap.origins.iter().filter(|o| o.holds_lock).count();
+        assert_eq!(
+            holders, 1,
+            "exactly one origin holds the lock despite the shared label"
+        );
+    }
+
     // --- Property: at most one holder, and may_write matches the holder --------
 
     #[derive(Debug, Clone)]
@@ -776,6 +825,114 @@ mod tests {
                     }
                     None => prop_assert!(writers.is_empty()),
                 }
+                // Invariant 4: the generation never decreases.
+                let g = lock.generation();
+                prop_assert!(g >= last_gen, "generation went backwards");
+                last_gen = g;
+            }
+        }
+    }
+
+    // --- Property: held priority outranks the on-demand FIFO across schedules ---
+
+    #[derive(Debug, Clone)]
+    enum HeldOp {
+        Acquire(u8),
+        Release(u8),
+        Detach(u8),
+        Reattach(u8),
+        Enqueue(u8),
+        Dequeue(u8),
+        Steal(u8),
+        ReclaimHeld(u8),
+        Renew(u8),
+    }
+
+    fn held_op_strategy() -> impl Strategy<Value = HeldOp> {
+        prop_oneof![
+            (0u8..4).prop_map(HeldOp::Acquire),
+            (0u8..4).prop_map(HeldOp::Release),
+            (0u8..4).prop_map(HeldOp::Detach),
+            (0u8..4).prop_map(HeldOp::Reattach),
+            (0u8..4).prop_map(HeldOp::Enqueue),
+            (0u8..4).prop_map(HeldOp::Dequeue),
+            (0u8..4).prop_map(HeldOp::Steal),
+            (0u8..4).prop_map(HeldOp::ReclaimHeld),
+            (0u8..4).prop_map(HeldOp::Renew),
+        ]
+    }
+
+    proptest! {
+        /// A `held` origin (id 0, the demux) mixed with three on-demand origins
+        /// under any interleaving of acquire/release/detach/reattach/enqueue/
+        /// dequeue/steal/reclaim_held/renew. Alongside the single-holder /
+        /// may_write / holder-never-queued / monotonic-generation invariants, this
+        /// fuzzes held priority (§6/§15.23): while the held origin is attached, an
+        /// on-demand `acquire` can never win the lock — it defers so the demux's
+        /// reclaim outranks the FIFO queue, whatever the schedule. It also checks
+        /// the snapshot flags exactly the holder by OriginId (LOCK-1).
+        #[test]
+        fn prop_held_priority_invariants(ops in prop::collection::vec(held_op_strategy(), 0..96)) {
+            let mode = |i: u8| if i == 0 { WriteMode::Held } else { WriteMode::OnDemand };
+            let mut lock = EndpointLock::new(Arbitration::Exclusive);
+            let mut attached = [true; 4];
+            for i in 0..4u8 {
+                lock.register(OriginId(i as u64), format!("o{i}"), mode(i));
+            }
+            let mut last_gen = lock.generation();
+            for op in ops {
+                match op {
+                    HeldOp::Acquire(i) => {
+                        let result = lock.acquire(OriginId(i as u64));
+                        // Held priority: an on-demand acquire never wins while the
+                        // held origin (0) is attached — it defers to the demux's
+                        // reclaim rather than racing it (daemon-arbitration-1).
+                        if i != 0 && attached[0] {
+                            prop_assert_ne!(
+                                result,
+                                Acquire::Granted,
+                                "on-demand {} was granted while held origin 0 is attached",
+                                i
+                            );
+                        }
+                    }
+                    HeldOp::Release(i) => { lock.release(OriginId(i as u64)); }
+                    HeldOp::Detach(i) => {
+                        lock.unregister(OriginId(i as u64));
+                        attached[i as usize] = false;
+                    }
+                    HeldOp::Reattach(i) => {
+                        if !attached[i as usize] {
+                            lock.register(OriginId(i as u64), format!("o{i}"), mode(i));
+                            attached[i as usize] = true;
+                        }
+                    }
+                    HeldOp::Enqueue(i) => { lock.enqueue(OriginId(i as u64)); }
+                    HeldOp::Dequeue(i) => { lock.dequeue(OriginId(i as u64)); }
+                    HeldOp::Steal(i) => { if attached[i as usize] { lock.steal(OriginId(i as u64)); } }
+                    HeldOp::ReclaimHeld(i) => { lock.reclaim_held(OriginId(i as u64)); }
+                    HeldOp::Renew(i) => { lock.renew(OriginId(i as u64)); }
+                }
+
+                // Invariant 1: at most one origin may write.
+                let writers: Vec<u64> = (0..4u64).filter(|&i| lock.may_write(OriginId(i))).collect();
+                prop_assert!(writers.len() <= 1, "two writers: {:?}", writers);
+                // Invariant 2: whoever may write is exactly the holder, and the
+                // holder is always still attached and never simultaneously queued.
+                match lock.holder() {
+                    Some(h) => {
+                        prop_assert_eq!(&writers, &vec![h.0]);
+                        prop_assert!(attached[h.0 as usize], "holder detached but still holds");
+                        prop_assert!(!lock.waiters().any(|w| w == h), "holder is also a waiter");
+                    }
+                    None => prop_assert!(writers.is_empty()),
+                }
+                // Invariant 3: the snapshot flags exactly the holder by OriginId —
+                // one `holds_lock` when held, none when free (LOCK-1).
+                let snap = lock.snapshot();
+                let flagged = snap.origins.iter().filter(|o| o.holds_lock).count();
+                let expected = usize::from(lock.holder().is_some());
+                prop_assert_eq!(flagged, expected, "holds_lock count != holder presence");
                 // Invariant 4: the generation never decreases.
                 let g = lock.generation();
                 prop_assert!(g >= last_gen, "generation went backwards");

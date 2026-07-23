@@ -24,8 +24,9 @@ use codec_api::{Codec, CodecError, Event, MAX_FRAME_SIZE, encode, try_decode};
 pub const NAME: &str = "reference";
 
 /// The v1 framing codec. Holds at most one partial frame in its accumulation
-/// buffer, bounded by [`MAX_FRAME_SIZE`] — the §5 interior contract (parser state
-/// plus, at the boundaries, one holdover; a codec holds only parser state).
+/// buffer, bounded by [`MAX_FRAME_SIZE`] + 4 — one body plus its 4-byte length
+/// prefix, which is not counted in `body_len` — the §5 interior contract (parser
+/// state plus, at the boundaries, one holdover; a codec holds only parser state).
 #[derive(Debug, Default)]
 pub struct ReferenceCodec {
     /// Accumulated multiplexed-side bytes awaiting a whole frame.
@@ -50,34 +51,33 @@ impl ReferenceCodec {
         self.buf.len()
     }
 
-    /// On a decode error, skip one frame and count a resync. Returns `true` if it
-    /// advanced (retry decoding), `false` if it needs more bytes first.
+    /// On a decode error at the front of `rest`, return how many bytes to skip to
+    /// resync past one frame — `Some(skip)` to advance (retry decoding), `None` if
+    /// it needs more bytes first. Nothing is drained here: the caller advances a
+    /// cursor and counts the resync, so a run of undecodable frames costs one
+    /// front-drain per `demux` call, not one per frame (O(n), not O(n^2)).
     ///
     /// A valid `body_len` prefix (`<= MAX_FRAME_SIZE`) means the whole frame is
     /// buffered — [`try_decode`] returns `Ok(None)`, not `Err`, when it is not —
     /// so the frame can be skipped exactly, keeping alignment. An oversize prefix
     /// is itself corrupt with an unknown boundary: drop the 4-byte prefix and
     /// re-scan.
-    fn resync(&mut self) -> bool {
-        if self.buf.len() < 4 {
-            return false; // need the length prefix before we can skip a frame
+    fn resync_skip(rest: &[u8]) -> Option<usize> {
+        if rest.len() < 4 {
+            return None; // need the length prefix before we can skip a frame
         }
-        let body_len =
-            u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
-        let skip = if body_len <= MAX_FRAME_SIZE {
+        let body_len = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        if body_len <= MAX_FRAME_SIZE {
             let frame_end = 4 + body_len;
-            if self.buf.len() < frame_end {
+            if rest.len() < frame_end {
                 // Unreachable on the error path (try_decode returns None here), but
                 // defend against skipping past the buffer.
-                return false;
+                return None;
             }
-            frame_end
+            Some(frame_end)
         } else {
-            4 // corrupt length prefix: boundary unknown, drop it and re-scan
-        };
-        self.buf.drain(..skip);
-        self.framing_errors += 1;
-        true
+            Some(4) // corrupt length prefix: boundary unknown, drop it and re-scan
+        }
     }
 }
 
@@ -88,21 +88,28 @@ impl Codec for ReferenceCodec {
 
     fn demux(&mut self, input: &[u8], emit: &mut dyn FnMut(Event)) -> Result<(), CodecError> {
         self.buf.extend_from_slice(input);
+        // Advance a cursor over consumed/skipped frames and front-drain the whole
+        // consumed prefix once at the end, so a run of undecodable frames costs one
+        // O(n) drain rather than one O(remaining) `drain(..)` per frame (§7.5).
+        let mut pos = 0;
         loop {
-            match try_decode(&self.buf) {
+            match try_decode(&self.buf[pos..]) {
                 Ok(Some((event, consumed))) => {
-                    self.buf.drain(..consumed);
+                    pos += consumed;
                     emit(event);
                 }
                 Ok(None) => break, // partial frame: wait for more bytes
                 // A malformed frame: resync past it rather than wedge (§7.5).
                 Err(_) => {
-                    if !self.resync() {
+                    let Some(skip) = Self::resync_skip(&self.buf[pos..]) else {
                         break;
-                    }
+                    };
+                    pos += skip;
+                    self.framing_errors += 1;
                 }
             }
         }
+        self.buf.drain(..pos);
         Ok(())
     }
 
@@ -223,6 +230,56 @@ mod tests {
         let got = demux_all(&mut codec, &wire);
         assert_eq!(got, vec![f0]);
         assert_eq!(codec.framing_errors(), 1);
+    }
+
+    #[test]
+    fn oversize_length_prefix_resyncs_and_recovers_following_frame() {
+        // A mangled length prefix (body_len > MAX_FRAME_SIZE) has an unknown frame
+        // boundary, so resync drops only the 4-byte prefix and re-scans (the
+        // oversize `else { 4 }` branch). Prepend one such prefix ahead of a valid
+        // frame: demux must drop exactly those 4 bytes, count one framing error,
+        // and re-align on the following frame.
+        let good = Event::data("c0", Bytes::from_static(b"payload"));
+        let valid = mux_all(std::slice::from_ref(&good));
+
+        let mut wire = ((MAX_FRAME_SIZE + 1) as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(&valid);
+
+        let mut codec = ReferenceCodec::new();
+        let got = demux_all(&mut codec, &wire);
+        assert_eq!(
+            got,
+            vec![good],
+            "the frame after the mangled prefix survives"
+        );
+        assert_eq!(codec.framing_errors(), 1, "one 4-byte-prefix drop counted");
+        assert_eq!(codec.buffered(), 0);
+    }
+
+    #[test]
+    fn truncated_header_length_prefix_resyncs_and_recovers() {
+        // A body_len that is <= MAX_FRAME_SIZE but structurally impossible (a whole
+        // frame needs a 3-byte header: type + u16 channel_len) makes try_decode
+        // return Err(Truncated) once 4 + body_len bytes are present. resync skips
+        // exactly 4 + body_len and re-aligns. Use body_len = 2: a 6-byte runt frame
+        // ahead of a valid one.
+        let good = Event::data("c0", Bytes::from_static(b"payload"));
+        let valid = mux_all(std::slice::from_ref(&good));
+
+        // 4-byte length prefix declaring body_len = 2, then 2 filler body bytes.
+        let mut wire = 2u32.to_be_bytes().to_vec();
+        wire.extend_from_slice(&[0x00, 0x00]);
+        wire.extend_from_slice(&valid);
+
+        let mut codec = ReferenceCodec::new();
+        let got = demux_all(&mut codec, &wire);
+        assert_eq!(got, vec![good], "the frame after the runt header survives");
+        assert_eq!(
+            codec.framing_errors(),
+            1,
+            "one runt frame (4 + body_len) skipped"
+        );
+        assert_eq!(codec.buffered(), 0);
     }
 
     /// The reference codec satisfies the generic `codec-api` conformance kit

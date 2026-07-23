@@ -169,9 +169,7 @@ fn main() -> anyhow::Result<()> {
 fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
     Ok(match cmd {
         Cmd::Load { file, replace } => {
-            let text = std::fs::read_to_string(file)?;
-            let config: GraphConfig = toml::from_str(&text)
-                .map_err(|e| anyhow::anyhow!("parsing {}: {e}", file.display()))?;
+            let config = read_config(file)?;
             (
                 "load",
                 Some(json!({ "config": serde_json::to_value(&config)?, "replace": replace })),
@@ -179,9 +177,7 @@ fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
         }
         Cmd::AddNode { file } => {
             // A single-node TOML configuration; take its one node.
-            let text = std::fs::read_to_string(file)?;
-            let config: GraphConfig = toml::from_str(&text)
-                .map_err(|e| anyhow::anyhow!("parsing {}: {e}", file.display()))?;
+            let config = read_config(file)?;
             let node = config
                 .nodes
                 .first()
@@ -241,6 +237,13 @@ fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
         Cmd::Teardown => ("teardown", None),
         Cmd::Shutdown => ("shutdown", None),
     })
+}
+
+/// Read and parse a `GraphConfig` from a TOML file, mapping a parse error to a
+/// message that names the file (shared by `load` and `add-node`).
+fn read_config(file: &Path) -> anyhow::Result<GraphConfig> {
+    let text = std::fs::read_to_string(file)?;
+    toml::from_str(&text).map_err(|e| anyhow::anyhow!("parsing {}: {e}", file.display()))
 }
 
 /// Render a successful result for humans (the `--json` path bypasses this).

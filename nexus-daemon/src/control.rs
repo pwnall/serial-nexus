@@ -11,14 +11,107 @@
 //! `biased` select so an immediately-ready fast verb is never pre-empted by a
 //! spuriously-read next line.
 
+use std::io;
 use std::rc::Rc;
 
-use nexus_rpc::{Response, parse_incoming_request};
+use nexus_rpc::{Response, RpcError, error_codes, parse_incoming_request};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::net::unix::OwnedReadHalf;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::daemon::Daemon;
+
+/// Hard cap on the length, in bytes, of a single control-plane request line
+/// (§10). [`RequestLines::next_line`] refuses a longer line rather than letting
+/// one connection grow the shared daemon's read buffer without bound (CTRL-1) —
+/// the read-path analogue of the `SUN_LEN` socket-path bound (implementation-notes
+/// §7). One MiB sits far above any real control verb, including a `load`'s inline
+/// graph JSON, and far below memory-pressure territory.
+const MAX_REQUEST_LINE: usize = 1 << 20;
+
+/// The outcome of reading one request line.
+#[derive(Debug)]
+enum LineRead {
+    /// A complete `\n`-terminated line (trailing `\r` stripped).
+    Line(String),
+    /// A clean end-of-stream on the read half (the peer closed or half-closed it).
+    Eof,
+    /// A line that reached [`MAX_REQUEST_LINE`] with no newline; the caller must
+    /// refuse it and close the connection.
+    TooLong,
+}
+
+/// A newline-delimited request reader with a hard per-line length cap (§10).
+/// Unlike [`tokio::io::Lines`], whose accumulator grows without bound until it
+/// sees a newline, this refuses a line once it passes [`MAX_REQUEST_LINE`] so one
+/// connection cannot exhaust the shared daemon's memory (CTRL-1). The in-progress
+/// line lives in `self.buf` (not on the future's stack), which — together with
+/// `fill_buf`'s own cancel-safety — keeps `next_line` cancel-safe: a partially
+/// read line survives the biased select dropping the read future mid-line, so a
+/// pipelined request is never truncated (§15.20).
+struct RequestLines {
+    reader: BufReader<OwnedReadHalf>,
+    buf: Vec<u8>,
+}
+
+impl RequestLines {
+    fn new(read_half: OwnedReadHalf) -> Self {
+        RequestLines {
+            reader: BufReader::new(read_half),
+            buf: Vec::new(),
+        }
+    }
+
+    /// Read the next `\n`-terminated line, capped at [`MAX_REQUEST_LINE`] bytes.
+    /// Cancel-safe: dropping the returned future retains any partial line in
+    /// `self.buf`. A trailing `\r` is stripped to match `Lines`; invalid UTF-8
+    /// surfaces as an `InvalidData` error (closing the connection, as before).
+    async fn next_line(&mut self) -> io::Result<LineRead> {
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                // Clean EOF. Any buffered bytes without a trailing newline are the
+                // final line (matching `Lines`); an empty buffer is end-of-stream.
+                if self.buf.is_empty() {
+                    return Ok(LineRead::Eof);
+                }
+                return self.take_line();
+            }
+            if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                if self.buf.len() + pos > MAX_REQUEST_LINE {
+                    self.reader.consume(pos + 1);
+                    self.buf.clear();
+                    return Ok(LineRead::TooLong);
+                }
+                self.buf.extend_from_slice(&available[..pos]);
+                self.reader.consume(pos + 1);
+                return self.take_line();
+            }
+            // No newline in this chunk. Stop the moment the line would pass the cap
+            // — refusing before the buffer can grow unbounded.
+            let chunk = available.len();
+            if self.buf.len() + chunk > MAX_REQUEST_LINE {
+                self.reader.consume(chunk);
+                self.buf.clear();
+                return Ok(LineRead::TooLong);
+            }
+            self.buf.extend_from_slice(available);
+            self.reader.consume(chunk);
+        }
+    }
+
+    /// Move the accumulated bytes out as a `String`, stripping one trailing `\r`.
+    fn take_line(&mut self) -> io::Result<LineRead> {
+        let mut bytes = std::mem::take(&mut self.buf);
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        String::from_utf8(bytes)
+            .map(LineRead::Line)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.utf8_error()))
+    }
+}
 
 /// Serve one client connection until it closes: read newline-delimited requests,
 /// dispatch each, and write back one response line. Once the client issues
@@ -26,7 +119,7 @@ use crate::daemon::Daemon;
 /// while still handling further requests on the same connection.
 pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
+    let mut lines = RequestLines::new(read_half);
     let mut notes = daemon.subscribe();
     let mut subscribed = false;
 
@@ -34,8 +127,25 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
         tokio::select! {
             line = lines.next_line() => {
                 let line = match line {
-                    Ok(Some(line)) => line,
-                    Ok(None) | Err(_) => break, // client closed or read error
+                    Ok(LineRead::Line(line)) => line,
+                    Ok(LineRead::Eof) | Err(_) => break, // client closed or read error
+                    Ok(LineRead::TooLong) => {
+                        // One connection streaming a line with no newline would
+                        // otherwise grow the shared daemon's read buffer without
+                        // bound and OOM every console it serves (CTRL-1). Refuse the
+                        // over-cap line with the null id the spec mandates for an
+                        // unparseable request, then close.
+                        let err = RpcError::new(
+                            error_codes::INVALID_REQUEST,
+                            format!("request line exceeds the {MAX_REQUEST_LINE}-byte limit"),
+                        );
+                        let _ = write_half
+                            .write_all(
+                                nexus_rpc::to_line(&Response::error_without_id(err)).as_bytes(),
+                            )
+                            .await;
+                        break;
+                    }
                 };
                 if line.trim().is_empty() {
                     continue;
@@ -69,6 +179,16 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                 // future runs the waiter's cleanup guard (§15.20). `biased` polls the
                 // dispatch first, so a fast verb (ready on first poll) is taken
                 // without ever reading — and possibly losing — a following request.
+                //
+                // Any resolution of the second lane — a dropped/half-closed connection
+                // (EOF), a pipelined request (unsupported while a verb waits), an
+                // over-cap line, or a read error — abandons the in-flight verb and
+                // closes: the design's §15.20 cancel-on-disconnect is normative (a
+                // killed `lock --wait` client must dequeue promptly), so a bare
+                // write-half half-close is treated as a disconnect. `serialnexusctl`
+                // keeps both halves open across the read, so its waiting verbs are
+                // unaffected; a raw `socat` waiting-verb user must likewise keep the
+                // write half open (CTRL-3: current behavior is design-correct).
                 let dispatch = daemon.dispatch(&method, params);
                 tokio::pin!(dispatch);
                 let response = tokio::select! {
@@ -77,13 +197,7 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                         Ok(value) => Response::success(id, value),
                         Err(err) => Response::error(id, err),
                     },
-                    _ = lines.next_line() => {
-                        // The client disconnected, or pipelined another request while
-                        // this one was still waiting (unsupported). Either way abandon
-                        // the in-flight verb: dropping `dispatch` cancels any wait and
-                        // its guard leaves the FIFO queue.
-                        break;
-                    }
+                    _ = lines.next_line() => break,
                 };
 
                 if write_half
@@ -111,5 +225,61 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                 Err(RecvError::Closed) => break,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+
+    // Two CR/LF- and LF-terminated requests then a half-close: each line comes back
+    // with its trailing CR stripped (matching `tokio::io::Lines`), and the write-half
+    // EOF surfaces as the distinct `LineRead::Eof` the dispatch race relies on to keep
+    // a waiting verb alive (CTRL-3).
+    #[tokio::test]
+    async fn reads_delimited_lines_then_reports_clean_eof() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (read_half, _write_half) = server.into_split();
+        let mut lines = RequestLines::new(read_half);
+
+        client.write_all(b"{\"a\":1}\r\n{\"b\":2}\n").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        match lines.next_line().await.unwrap() {
+            LineRead::Line(l) => assert_eq!(l, "{\"a\":1}"),
+            _ => panic!("expected the first line"),
+        }
+        match lines.next_line().await.unwrap() {
+            LineRead::Line(l) => assert_eq!(l, "{\"b\":2}"),
+            _ => panic!("expected the second line"),
+        }
+        assert!(matches!(lines.next_line().await.unwrap(), LineRead::Eof));
+    }
+
+    // A connection streaming past the cap with no newline must not grow the read
+    // buffer without bound: `next_line` stops and reports `TooLong` (CTRL-1) rather
+    // than accumulating the whole stream.
+    #[tokio::test]
+    async fn over_cap_line_is_refused_not_buffered() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (read_half, _write_half) = server.into_split();
+        let mut lines = RequestLines::new(read_half);
+
+        // Feed the over-cap run from a separate task so writer and draining reader
+        // both make progress on the single-threaded runtime; tolerate the read half
+        // dropping once we bail out.
+        tokio::spawn(async move {
+            let mut client = client;
+            let blob = vec![b'x'; MAX_REQUEST_LINE + 16];
+            let _ = client.write_all(&blob).await;
+            let _ = client.write_all(b"\n").await;
+        });
+
+        assert!(matches!(
+            lines.next_line().await.unwrap(),
+            LineRead::TooLong
+        ));
     }
 }

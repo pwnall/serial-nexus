@@ -640,5 +640,18 @@ mod tests {
             documented, registry,
             "docs/rpc/README.md documents a code set that differs from the registry"
         );
+
+        // Beyond the code column, each registry row's name and summary must appear
+        // verbatim in the README's markdown table row for that code (§16.8). This
+        // makes `ErrorCodeDoc.name`/`.summary` load-bearing: editing a description in
+        // either the registry or the docs without matching the other fails the gate.
+        for d in error_code_registry() {
+            let row = format!("| `{}` | {} | {} |", d.code, d.name, d.summary);
+            assert!(
+                readme.contains(&row),
+                "docs/rpc/README.md is missing the exact table row for error code {}:\n{row}",
+                d.code
+            );
+        }
     }
 }
