@@ -579,6 +579,41 @@ to current behavior; validation is unchanged; round-trip is pinned by
 `serial_and_pty_hostward_and_modem_round_trip` and the config proptest (generators now
 vary `hostward_buffer` and `modem`).
 
+### 3.14 Justified deviations recorded from the Opus comprehensive review (2026-07-23)
+A full multi-agent, adversarially-verified code review landed at
+`docs/19-claude-opus-code-review.md` (63 verified findings). The **should-fix** items
+from that review — two criticals (the in-process codec oversize-targetward drop
+`codec.rs`, and the PTY blocking-writer teardown wedge `pty.rs`), one high (the
+empty-serial by-path degradation gap `resolver.rs`), and the mediums — are **open
+work tracked there**, not folded in here. The review's design §4 also isolated three
+deviations judged **justified** (sound refinements or harmless gaps that merely lacked
+a written record); they are documented here per plan §1, and none contradicts the
+design:
+- **`write_mode` on a log-target edge is cosmetic.** `EdgeConfig::write_mode` defaults
+  to `on-demand` and is not normalized for edges whose target is inherently read-only,
+  so `dump` faithfully round-trips whatever an operator wrote (e.g. `write_mode="held"`
+  on a `serial → log` edge). `Wiring::build` unconditionally forces `WriteMode::Never`
+  for a log target (`runtime.rs`), so the runtime behavior is always correct (no
+  targetward path, no lock handle, no wedge). The only artifact is that a dumped config
+  can show a non-`never` mode on a log edge. Accepted: the round-trip and the §5/§6
+  invariants are intact; §7.3's "log write mode is inherently `never`" is a runtime
+  fact, not a config-schema constraint. Optional hardening: normalize/reject a
+  non-`never` `write_mode` on log-target edges at validation time.
+- **Connect-role legs report `peer_address: null`.** §7.4 lists peer address as leg
+  state; only the `listen` role currently derives it (from `accept()`), while the
+  `connect` role leaves it unset even when fully connected, though the dialed address
+  is known (`a.address`). Accepted as a minor state-reporting gap; trivially closable by
+  reporting the dialed address on a successful handshake (see the review for the exact
+  site).
+- **`usb:` identity-form input validates field count only.** `resolve_usb_identity`
+  accepts any four colon-separated fields, so a hand-written degenerate identity like
+  `usb::::` (empty vid/pid/serial/iface) is stored and dumped verbatim. It is inert at
+  runtime — no real sysfs device reports an empty `idVendor`/`idProduct`, so `find_usb`
+  never matches such a stored identity — so this is an under-enforcement of §11
+  well-formedness, not a wrong-device hazard. (The *reachable-via-capture* empty-serial
+  case is the separate should-fix RESOLV-1 in the review.) Accepted; optional hardening
+  is to reject any empty field (and validate vid/pid as 4 hex digits) at add time.
+
 ---
 
 ## 4. Findings carried forward (from nexus-doctor)
