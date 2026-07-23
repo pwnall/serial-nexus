@@ -237,10 +237,10 @@ fn resolve_socket(override_path: Option<PathBuf>) -> PathBuf {
     if nix::unistd::geteuid().is_root() {
         return PathBuf::from("/run/serialnexusd.sock");
     }
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir).join("serialnexusd.sock");
-        }
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir).join("serialnexusd.sock");
     }
     PathBuf::from(format!("/tmp/serialnexusd-{}.sock", nix::unistd::getuid()))
 }

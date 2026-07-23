@@ -185,10 +185,10 @@ pub fn fragmentation_tolerance<C: Codec>(make: impl Fn() -> C, channel: &str) {
     let mut got: Vec<u8> = Vec::new();
     for byte in &wire {
         dec.demux(std::slice::from_ref(byte), &mut |event| {
-            if event.channel.as_str() == channel {
-                if let EventKind::Data(bytes) = event.kind {
-                    got.extend_from_slice(&bytes);
-                }
+            if event.channel.as_str() == channel
+                && let EventKind::Data(bytes) = event.kind
+            {
+                got.extend_from_slice(&bytes);
             }
         })
         .expect("demux of a single byte must succeed");

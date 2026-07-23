@@ -14,15 +14,18 @@ env:
 
 jobs:
   # Unprivileged lane: builds, lints, unit/property tests, license gate.
-  # Runs on every push (§3). MSRV is pinned to edition-2024's floor.
+  # Runs on every push (§3). MSRV is pinned to the development toolchain: the code
+  # uses let-chains and other post-1.85 idioms freely, so the floor is the compiler
+  # it is built with, not edition 2024's minimum. Bump this in lockstep with the
+  # workspace Cargo.toml's `rust-version`.
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
         run: |
-          rustup toolchain install 1.85 --profile minimal --component rustfmt,clippy
-          rustup default 1.85
+          rustup toolchain install 1.97 --profile minimal --component rustfmt,clippy
+          rustup default 1.97
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
@@ -55,8 +58,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install shellcheck and jq
-        run: sudo apt-get update && sudo apt-get install -y shellcheck jq
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      # Pin shellcheck to the version the scripts are developed against. Ubuntu's
+      # apt ships an older build (0.9.0 on noble) whose SC2015/SC2317 info-level
+      # heuristics fire on this codebase's assert-or-fail and trap-cleanup idioms;
+      # 0.11.0 dropped those false positives. Pinning keeps CI's linter identical
+      # to the dev toolchain instead of drifting with the runner image.
+      - name: Install shellcheck 0.11.0
+        run: |
+          ver=0.11.0
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/v${ver}/shellcheck-v${ver}.linux.x86_64.tar.xz" | tar -xJ
+          sudo install "shellcheck-v${ver}/shellcheck" /usr/local/bin/shellcheck
+          rm -rf "shellcheck-v${ver}"
+          shellcheck --version
       - name: shellcheck the validation scripts
         run: find scripts -name '*.sh' -print0 | xargs -0 shellcheck
       - name: jq-lint

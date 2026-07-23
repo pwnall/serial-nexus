@@ -401,10 +401,10 @@ impl Resolver {
             else {
                 continue;
             };
-            if let Some(info) = self.sysfs_lookup(&dev_name) {
-                if info.identity == identity {
-                    return Some((self.dev_root.join("dev").join(&dev_name), info));
-                }
+            if let Some(info) = self.sysfs_lookup(&dev_name)
+                && info.identity == identity
+            {
+                return Some((self.dev_root.join("dev").join(&dev_name), info));
             }
         }
         None
@@ -424,10 +424,10 @@ impl Resolver {
         let by_path = self.dev_root.join("dev/serial/by-path");
         let entries = std::fs::read_dir(&by_path).ok()?;
         for entry in entries.flatten() {
-            if let Ok(target) = std::fs::read_link(entry.path()) {
-                if target.file_name().and_then(|s| s.to_str()) == Some(dev_name) {
-                    return Some(entry.file_name().to_string_lossy().into_owned());
-                }
+            if let Ok(target) = std::fs::read_link(entry.path())
+                && target.file_name().and_then(|s| s.to_str()) == Some(dev_name)
+            {
+                return Some(entry.file_name().to_string_lossy().into_owned());
             }
         }
         None

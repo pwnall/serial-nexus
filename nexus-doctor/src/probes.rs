@@ -366,10 +366,10 @@ fn p5_drain(sp: &SerialPort, window: Duration) -> Vec<u8> {
 /// (so the certificate survives renumbering, §15.21), else the raw path.
 fn p5_name(port: &Path, resolver: &nexus_core::Resolver) -> String {
     for a in resolver.discover_adapters() {
-        if a.dev_path == port {
-            if let Some(id) = a.identity {
-                return id;
-            }
+        if a.dev_path == port
+            && let Some(id) = a.identity
+        {
+            return id;
         }
     }
     port.display().to_string()

@@ -1017,7 +1017,7 @@ fn build_mux(
             let ev = Event::data(chan.as_str(), Bytes::from(payload.clone()));
             encode(&ev, &mut wire).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
 
-            if corrupt_every > 0 && (frame_no + 1) % corrupt_every == 0 {
+            if corrupt_every > 0 && (frame_no + 1).is_multiple_of(corrupt_every) {
                 // The type byte is the first body byte, at frame_start + 4.
                 wire[frame_start + 4] = 0xFF;
                 corrupted += 1;
