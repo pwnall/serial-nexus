@@ -69,8 +69,17 @@ boots `serialnexusd`, drives it with a small in-Rust JSON-RPC client (replacing 
 `/dev/serial/by-id` bash portability hazards (all of which break the old scripts on macOS).
 `serial_rig()`/`crossover_ports()` yield a serial device (macOS: the real crossover rig; Linux: a
 sim pty double; otherwise `None` → the test self-skips, the §5 skip discipline). **Verified on
-macOS: 6/6** — `tests/control_plane.rs` and `tests/serial_hardware.rs` (the real-hardware crossover byte-exact
-test, exercising the macOS-fixed PTY injector).
+macOS: 6/6** — `tests/control_plane.rs` and `tests/serial_hardware.rs`.
+
+**Real-hardware validation (macOS, two FTDI FT232R adapters cross-wired).** `serial_hardware.rs`
+(one `#[test]`, auto-detected via `crossover_ports()`, self-skips when absent) certifies end to
+end through the daemon + the macOS-fixed PTY injector: **bidirectional 32 KiB byte-exact** across
+the physical wire (each way, SHA-256), the `send` verb reaching hardware on the far port, and
+**TIOCEXCL** exclusivity (a second open of a daemon-held port is refused). Confirmed green on the
+rig `/dev/cu.usbserial-BH00L4KU ↔ …BH00LL8O` (~6.9 s of real serial transfer); driver counters are
+gracefully `null` (TIOCGICOUNT is Linux-only). This is the macOS serial gate — a pty cannot be a
+serial device there, so every other serial test self-skips and this exercises the real path via the
+daemon's own fast, lossless reader.
 
 **Migration COMPLETE.** All of phases 0–8 (58 bash scripts) are ported to 43 `nexus-itest/tests/*.rs`
 files (**83 tests**, 1 `#[ignore]`d endurance soak), across three batches (0–4, 5–6, 7–8), each
