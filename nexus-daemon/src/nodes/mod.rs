@@ -122,7 +122,8 @@ impl Node {
                 let addr = EndpointAddr::node(&n.name);
                 let hostward = wiring.host_sinks.remove(&addr).unwrap_or_default();
                 let targetward = wiring.host_targetward_rx.remove(&addr);
-                n.start(hostward, targetward);
+                let tap_feed = wiring.tap_feeds.remove(&addr);
+                n.start(hostward, targetward, tap_feed);
             }
             Node::Pty(n) => {
                 let addr = EndpointAddr::node(&n.name);

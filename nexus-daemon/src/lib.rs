@@ -30,6 +30,7 @@ mod daemon;
 mod nodes;
 mod registry;
 mod runtime;
+mod tap;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

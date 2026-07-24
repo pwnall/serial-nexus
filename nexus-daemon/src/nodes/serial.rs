@@ -50,6 +50,7 @@ use tokio::task::JoinHandle;
 use crate::boundary::BlockingReader;
 use crate::cell::CriticalCell;
 use crate::runtime::{self, HostwardSink, READ_BUF};
+use crate::tap::TapFeed;
 use nexus_sys as sys;
 
 /// Re-arm interval (ms) for the serial reader thread's blocking readiness poll.
@@ -183,6 +184,7 @@ impl SerialNode {
         &mut self,
         hostward: Vec<HostwardSink>,
         targetward: Option<mpsc::Receiver<Chunk>>,
+        tap_feed: Option<TapFeed>,
     ) {
         let ctx = SuperviseCtx {
             name: self.name.clone(),
@@ -191,6 +193,7 @@ impl SerialNode {
             params: self.params,
             hostward,
             targetward,
+            tap_feed,
             shared: self.shared.clone(),
             reader_slot: self.reader_slot.clone(),
             discarded: self.discarded_unattached.clone(),
@@ -274,6 +277,9 @@ struct SuperviseCtx {
     params: OpenParams,
     hostward: Vec<HostwardSink>,
     targetward: Option<mpsc::Receiver<Chunk>>,
+    /// The tap-feed mirror for this endpoint (§17): the reader mirrors each
+    /// hostward chunk here while a tap or ring wants it. `None` only in unit tests.
+    tap_feed: Option<TapFeed>,
     shared: Rc<CriticalCell<SerialShared>>,
     reader_slot: Rc<CriticalCell<BlockingReader>>,
     discarded: Arc<AtomicU64>,
@@ -461,12 +467,13 @@ fn arm_reader(port: &Rc<SerialPort>, ctx: &SuperviseCtx) -> std::io::Result<Arc<
     let fd = port.as_raw_fd();
     let hostward = ctx.hostward.clone();
     let discarded = ctx.discarded.clone();
+    let tap_feed = ctx.tap_feed.clone();
     // The boundary-supervisor library owns the stop flag, the loss `Notify`, and
     // the join handle (§16.1 loss-notify + join-then-transition); we supply the
     // node-specific reader body.
     ctx.reader_slot.with_mut(|slot| {
         slot.arm(format!("serial-rx-{}", ctx.name), move |stop, lost| {
-            reader_thread(fd, hostward, discarded, stop, lost)
+            reader_thread(fd, hostward, tap_feed, discarded, stop, lost)
         })?;
         Ok(slot.lost())
     })
@@ -514,6 +521,7 @@ fn fault(ctx: &SuperviseCtx, reason: String) {
 fn reader_thread(
     fd: std::os::fd::RawFd,
     hostward: Vec<HostwardSink>,
+    tap_feed: Option<TapFeed>,
     discarded_unattached: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     lost: Arc<Notify>,
@@ -533,13 +541,28 @@ fn reader_thread(
                         return;
                     }
                     Ok(n) => {
-                        if hostward.is_empty() {
-                            // Nothing attached: read-and-discard with a counter.
+                        // The tap/ring mirror is a spy *out of the graph* with its own
+                        // accounting; it never counts as a graph consumer for the §5
+                        // discard counter, which must report bytes that reached no live
+                        // graph consumer regardless of any tap — exactly as the codec,
+                        // exec, and leg producers do (audit finding, §5 "loss is always
+                        // visible and attributable"; the ring "never substitutes for a
+                        // log node"). `tap_wanted` only decides whether to spend a chunk
+                        // allocation on the mirror when nothing else needs one.
+                        let tap_wanted = tap_feed.as_ref().is_some_and(TapFeed::wanted);
+                        if hostward.is_empty() && !tap_wanted {
+                            // Nothing attached at all: read-and-discard with a counter.
                             discarded_unattached.fetch_add(n as u64, Ordering::Relaxed);
                             continue;
                         }
                         let chunk = Chunk::copy_from_slice(&buf[..n]);
-                        // Whether the chunk reached any live boundary. A consumer
+                        // Mirror to the tap hub (lossy, never backpressures the
+                        // device — §5); excluded from the `any_live` accounting so a
+                        // spy tap never masks a real consumer's absence.
+                        if let Some(feed) = &tap_feed {
+                            feed.mirror(&chunk);
+                        }
+                        // Whether the chunk reached any live *graph* boundary. A consumer
                         // cascade-removed while this node survives leaves a
                         // permanently-Closed sink in this snapshot (never rebuilt);
                         // if every sink is Closed the chunk would vanish uncounted,
@@ -561,10 +584,11 @@ fn reader_thread(
                                 Err(TrySendError::Closed(_)) => {}
                             }
                         }
-                        // Every sink was Closed: the chunk reached no live boundary
-                        // (e.g. this node's only consumer was removed with no reader
-                        // re-arm). Count it as unattached loss so §5's "loss is
-                        // always visible and attributable" holds.
+                        // No live graph consumer took the chunk (empty/all-Closed sinks):
+                        // count it as unattached loss so §5's "loss is always visible and
+                        // attributable" holds — independent of whether a tap or ring
+                        // mirrored a copy (that mirror has its own drop accounting, and
+                        // the ring keeps only its last bytes, so the loss is real).
                         if !any_live {
                             discarded_unattached.fetch_add(n as u64, Ordering::Relaxed);
                         }
@@ -766,6 +790,7 @@ mod tests {
             },
             hostward: Vec::new(),
             targetward,
+            tap_feed: None,
             shared: Rc::new(CriticalCell::new(SerialShared {
                 status: NodeStatus::Waiting {
                     reason: "test".into(),
@@ -883,6 +908,7 @@ mod tests {
             reader_thread(
                 rfd,
                 hostward,
+                None,
                 discarded_thread,
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(Notify::new()),
@@ -896,5 +922,47 @@ mod tests {
         // the dead consumer is not mis-charged a full-buffer drop.
         assert_eq!(discarded.load(Ordering::Relaxed), 5);
         assert_eq!(counters.dropped_full(), 0);
+    }
+
+    /// SERIAL-4 (audit regression): a configured replay ring / open tap makes the
+    /// tap feed `active`, but it is a spy *out of the graph* — it must NOT suppress
+    /// `discarded_unattached` when no graph consumer is present (§5 "loss is always
+    /// visible", the ring "never substitutes for a log node"). With an active feed
+    /// and no hostward sink, the bytes are mirrored to the tap AND counted as loss.
+    #[test]
+    fn active_tap_feed_does_not_hide_unattached_loss() {
+        use std::os::fd::AsRawFd;
+        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+        let discarded = Arc::new(AtomicU64::new(0));
+        // An active tap feed (as a ring or a live tap would make it), with a receiver
+        // kept alive so the mirror's try_send succeeds.
+        let (feed_tx, _feed_rx) = mpsc::channel::<Chunk>(8);
+        let feed = TapFeed {
+            tx: feed_tx,
+            active: Arc::new(AtomicBool::new(true)),
+            feed_dropped: Arc::new(AtomicU64::new(0)),
+        };
+
+        nix::unistd::write(&write_fd, b"hello").unwrap();
+        drop(write_fd);
+
+        let rfd = read_fd.as_raw_fd();
+        let discarded_thread = discarded.clone();
+        std::thread::spawn(move || {
+            reader_thread(
+                rfd,
+                Vec::new(), // no graph consumer
+                Some(feed), // but a ring/tap is watching
+                discarded_thread,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Notify::new()),
+            );
+        })
+        .join()
+        .unwrap();
+        drop(read_fd);
+
+        // No graph consumer took the bytes → counted, even though a tap mirrored them.
+        assert_eq!(discarded.load(Ordering::Relaxed), 5);
     }
 }

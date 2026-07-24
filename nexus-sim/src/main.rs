@@ -133,6 +133,13 @@ struct PtyArgs {
     /// drops are attributable to backpressure rather than absence.
     #[arg(long)]
     rate: Option<u64>,
+    /// Gate `--source`: wait until this file exists before writing the payload
+    /// (plan §3, presence != readiness). The harness creates it only once every
+    /// consumer — a co-attached client and an open tap — is present and draining, so
+    /// the seeded stream cannot outrun a not-yet-ready consumer and a byte-exact
+    /// comparison is deterministic. Waits up to `--timeout-ms`.
+    #[arg(long)]
+    wait_file: Option<PathBuf>,
     #[arg(long, default_value_t = 5000)]
     timeout_ms: u64,
     /// After the exchange completes, keep the master (and thus the pts) open this
@@ -505,7 +512,14 @@ fn run_pty_inner(a: &PtyArgs) -> anyhow::Result<Value> {
         pty_echo(&mut master, a.timeout_ms)
     } else if a.source {
         let n = parse_size(a.bytes.as_deref().unwrap_or("0"))?;
-        pty_source(&mut master, a.seed, n, a.rate)
+        pty_source(
+            &mut master,
+            a.seed,
+            n,
+            a.rate,
+            a.wait_file.as_deref(),
+            a.timeout_ms,
+        )
     } else if a.sink {
         let n = parse_size(a.bytes.as_deref().unwrap_or("0"))?;
         pty_sink(&mut master, n, a.timeout_ms)
@@ -655,7 +669,20 @@ fn pty_source(
     seed: u64,
     n: usize,
     rate: Option<u64>,
+    wait_file: Option<&std::path::Path>,
+    timeout_ms: u64,
 ) -> anyhow::Result<Value> {
+    // Gate on the harness's readiness file so the payload never outruns a
+    // not-yet-draining consumer (plan §3, presence != readiness).
+    if let Some(gate) = wait_file {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        while !gate.exists() {
+            if Instant::now() >= deadline {
+                anyhow::bail!("wait-file {} never appeared", gate.display());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
     let payload = seeded_bytes(seed, n);
     match rate.filter(|r| *r > 0) {
         // Unpaced: one write_all at line rate.

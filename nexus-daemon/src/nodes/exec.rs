@@ -50,6 +50,7 @@ use crate::runtime::{
     CHANNEL_CAP, DropCounters, HostwardSink, READ_BUF, SharedLock, Wiring, data_frames,
     reacquire_held,
 };
+use crate::tap::TapFeed;
 
 /// The reserved wire channel identity for the multiplexed (device) side (§15.22).
 /// The graph forbids an empty real channel identity, so this never collides.
@@ -171,11 +172,15 @@ impl ExecCodecNode {
         self.mux_counters = wiring.target_counters.remove(&mux);
 
         let mut channel_sinks: HashMap<String, Vec<HostwardSink>> = HashMap::new();
+        let mut channel_feeds: HashMap<String, TapFeed> = HashMap::new();
         let mut channel_rxs: Vec<(String, mpsc::Receiver<Chunk>)> = Vec::new();
         for ch in &self.channels {
             let addr = EndpointAddr::channel(&self.name, ch);
             if let Some(sinks) = wiring.host_sinks.remove(&addr) {
                 channel_sinks.insert(ch.clone(), sinks);
+            }
+            if let Some(feed) = wiring.tap_feeds.remove(&addr) {
+                channel_feeds.insert(ch.clone(), feed);
             }
             if let Some(rx) = wiring.host_targetward_rx.remove(&addr) {
                 channel_rxs.push((ch.clone(), rx));
@@ -221,6 +226,7 @@ impl ExecCodecNode {
                 mux_targetward_tx,
                 serial_lock,
                 channel_sinks,
+                channel_feeds,
                 stats: self.stats.clone(),
                 restart_count: self.restart_count.clone(),
                 mux_discarded_targetward: self.mux_discarded_targetward.clone(),
@@ -282,6 +288,7 @@ struct SuperviseArgs {
     mux_targetward_tx: Option<mpsc::Sender<Chunk>>,
     serial_lock: Option<(SharedLock, OriginId)>,
     channel_sinks: HashMap<String, Vec<HostwardSink>>,
+    channel_feeds: HashMap<String, TapFeed>,
     stats: Rc<HashMap<String, Rc<ChannelStat>>>,
     restart_count: Rc<Cell<u64>>,
     mux_discarded_targetward: Rc<Cell<u64>>,
@@ -333,6 +340,7 @@ async fn supervise(mut a: SuperviseArgs) {
             mux_targetward_tx: &a.mux_targetward_tx,
             serial_lock: &a.serial_lock,
             channel_sinks: &a.channel_sinks,
+            channel_feeds: &a.channel_feeds,
             stats: &a.stats,
             mux_discarded_targetward: &a.mux_discarded_targetward,
         };
@@ -373,6 +381,7 @@ struct Routing<'a> {
     mux_targetward_tx: &'a Option<mpsc::Sender<Chunk>>,
     serial_lock: &'a Option<(SharedLock, OriginId)>,
     channel_sinks: &'a HashMap<String, Vec<HostwardSink>>,
+    channel_feeds: &'a HashMap<String, TapFeed>,
     stats: &'a Rc<HashMap<String, Rc<ChannelStat>>>,
     mux_discarded_targetward: &'a Rc<Cell<u64>>,
 }
@@ -470,6 +479,7 @@ async fn route_event(ev: Event, routing: &Routing<'_>) {
         mux_targetward_tx,
         serial_lock,
         channel_sinks,
+        channel_feeds,
         stats,
         mux_discarded_targetward,
     } = routing;
@@ -495,6 +505,11 @@ async fn route_event(ev: Event, routing: &Routing<'_>) {
                 let stat = stats.get(ev.channel.as_str());
                 if let Some(s) = stat {
                     s.active.set(true);
+                }
+                // Mirror to this channel's tap hub for taps and the replay ring
+                // (§17), independent of whether a graph consumer is bound.
+                if let Some(feed) = channel_feeds.get(ev.channel.as_str()) {
+                    feed.mirror(&bytes);
                 }
                 match channel_sinks.get(ev.channel.as_str()) {
                     Some(sinks) => {
@@ -546,12 +561,14 @@ mod tests {
         let no_tx: Option<mpsc::Sender<Chunk>> = None;
         let no_lock: Option<(SharedLock, OriginId)> = None;
         let sinks: HashMap<String, Vec<HostwardSink>> = HashMap::new();
+        let feeds: HashMap<String, TapFeed> = HashMap::new();
         let stats: Rc<HashMap<String, Rc<ChannelStat>>> = Rc::new(HashMap::new());
         let discarded = Rc::new(Cell::new(0u64));
         let routing = Routing {
             mux_targetward_tx: &no_tx,
             serial_lock: &no_lock,
             channel_sinks: &sinks,
+            channel_feeds: &feeds,
             stats: &stats,
             mux_discarded_targetward: &discarded,
         };

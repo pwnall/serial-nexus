@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use codec_api::{Codec, Event, EventKind, MAX_FRAME_SIZE};
+use codec_api::{Codec, Event, EventKind};
 use nexus_core::Chunk;
 use nexus_core::NodeStatus;
 use nexus_core::config::NodeConfig;
@@ -41,7 +41,10 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
 use crate::cell::CriticalCell;
-use crate::runtime::{DropCounters, HostwardSink, SharedLock, Wiring, reacquire_held};
+use crate::runtime::{
+    DropCounters, HostwardSink, SharedLock, Wiring, frame_ranges, reacquire_held,
+};
+use crate::tap::TapFeed;
 
 /// Per-channel observed counters (§7.5). All access is on the one runtime thread,
 /// so `Cell` suffices.
@@ -141,24 +144,30 @@ impl CodecNode {
         let serial_lock = wiring.origin_locks.remove(&mux);
         self.mux_counters = wiring.target_counters.remove(&mux);
 
-        // Per-channel hostward fan-out sinks and targetward receivers.
+        // Per-channel hostward fan-out sinks, targetward receivers, and tap feeds.
         let mut channel_sinks: HashMap<String, Vec<HostwardSink>> = HashMap::new();
+        let mut channel_feeds: HashMap<String, TapFeed> = HashMap::new();
         let mut channel_rxs: Vec<(String, mpsc::Receiver<Chunk>)> = Vec::new();
         for ch in &self.channels {
             let addr = EndpointAddr::channel(&self.name, ch);
             if let Some(sinks) = wiring.host_sinks.remove(&addr) {
                 channel_sinks.insert(ch.clone(), sinks);
             }
+            if let Some(feed) = wiring.tap_feeds.remove(&addr) {
+                channel_feeds.insert(ch.clone(), feed);
+            }
             if let Some(rx) = wiring.host_targetward_rx.remove(&addr) {
                 channel_rxs.push((ch.clone(), rx));
             }
         }
 
-        // Hostward: demux the multiplexed stream and fan each channel out (§5).
+        // Hostward: demux the multiplexed stream and fan each channel out (§5),
+        // mirroring to each channel's tap hub for taps and the replay ring (§17).
         self.tasks.push(tokio::task::spawn_local(hostward_demux(
             self.codec.clone(),
             mux_hostward_rx,
             channel_sinks,
+            channel_feeds,
             self.stats.clone(),
         )));
 
@@ -250,6 +259,7 @@ async fn hostward_demux(
     codec: Rc<CriticalCell<Box<dyn Codec>>>,
     mut mux_rx: mpsc::Receiver<Chunk>,
     channel_sinks: HashMap<String, Vec<HostwardSink>>,
+    channel_feeds: HashMap<String, TapFeed>,
     stats: Rc<HashMap<String, Rc<ChannelStat>>>,
 ) {
     while let Some(chunk) = mux_rx.recv().await {
@@ -266,6 +276,12 @@ async fn hostward_demux(
                     let n = bytes.len() as u64;
                     if let Some(s) = stat {
                         s.active.set(true);
+                    }
+                    // Mirror to this channel's tap hub for taps and the replay ring
+                    // (§17), independent of whether a graph consumer is bound — a
+                    // tapped-but-unconsumed channel still reaches its observer.
+                    if let Some(feed) = channel_feeds.get(ev.channel.as_str()) {
+                        feed.mirror(&bytes);
                     }
                     // Fan out to this channel's consumers. A configured channel with
                     // no consumer bound discards-with-count (§5); data on an
@@ -327,14 +343,13 @@ async fn channel_targetward(
     mux_id: OriginId,
     stat: Rc<ChannelStat>,
 ) {
-    // Max payload per frame = MAX_FRAME_SIZE minus the envelope header (1 type byte
-    // + 2 channel-length bytes + the channel id). `channel` is fixed for this task.
-    let cap = MAX_FRAME_SIZE.saturating_sub(3 + channel.len()).max(1);
     while let Some(bytes) = rx.recv().await {
         let total = bytes.len();
-        let mut off = 0;
-        while off < total {
-            let end = (off + cap).min(total);
+        // Fragment on the shared boundary helper (§5/§15.27): identical piece
+        // ranges to the envelope framers, but each range is framed through this
+        // codec's pluggable `mux` and lock-gated per piece rather than encoded
+        // eagerly like `data_frames`.
+        for (off, end) in frame_ranges(channel.as_str(), total) {
             let piece_len = (end - off) as u64;
             let mut framed = Vec::new();
             let muxed = codec.with_mut(|c| {
@@ -364,7 +379,6 @@ async fn channel_targetward(
             }
             stat.accepted_targetward
                 .set(stat.accepted_targetward.get() + piece_len);
-            off = end;
         }
     }
 }

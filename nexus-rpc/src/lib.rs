@@ -453,6 +453,84 @@ pub fn parse_incoming_request(line: &str) -> Result<Request, RpcError> {
     })
 }
 
+/// The standard base64 alphabet (RFC 4648).
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 encode (RFC 4648), dependency-free. Used to carry arbitrary
+/// console bytes inside a JSON string — the `tap.data` notification payload (§10,
+/// §17); the browser decodes with native `atob`, and [`base64_decode`] is the
+/// round-trip inverse for Rust clients (`serialnexusctl tap`).
+pub fn base64_encode(input: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(BASE64_ALPHABET[(n >> 18 & 0x3f) as usize] as char);
+        out.push(BASE64_ALPHABET[(n >> 12 & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            BASE64_ALPHABET[(n >> 6 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            BASE64_ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Standard base64 decode (RFC 4648), dependency-free — the inverse of
+/// [`base64_encode`]. Ignores ASCII whitespace; returns `None` on any other invalid
+/// character or a malformed length. Used by `serialnexusctl tap` to reconstruct the
+/// hostward byte stream from `tap.data` notifications (§17).
+pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut symbols = Vec::with_capacity(input.len());
+    let mut pad = 0usize;
+    for &c in input.as_bytes() {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        if c == b'=' {
+            pad += 1;
+            continue;
+        }
+        if pad > 0 {
+            return None; // data after padding
+        }
+        symbols.push(val(c)?);
+    }
+    if !(symbols.len() + pad).is_multiple_of(4) || pad > 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(symbols.len() / 4 * 3);
+    for group in symbols.chunks(4) {
+        let n = group.iter().fold(0u32, |acc, &s| (acc << 6) | s) << ((4 - group.len()) * 6);
+        out.push((n >> 16 & 0xff) as u8);
+        if group.len() >= 3 {
+            out.push((n >> 8 & 0xff) as u8);
+        }
+        if group.len() >= 4 {
+            out.push((n & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +545,34 @@ mod tests {
         assert_eq!(parsed.method, "state");
         assert_eq!(parsed.id, Id::Number(7));
         assert_eq!(parsed.params, Some(json!({"node": "usb0"})));
+    }
+
+    #[test]
+    fn base64_known_vectors_and_round_trip() {
+        // RFC 4648 §10 test vectors.
+        for (raw, enc) in [
+            (&b""[..], ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+            (b"fooba", "Zm9vYmE="),
+            (b"foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(raw), enc);
+            assert_eq!(base64_decode(enc).as_deref(), Some(raw));
+        }
+        // Round-trip over all byte values, including the tap.data payload shape.
+        let all: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        assert_eq!(
+            base64_decode(&base64_encode(&all)).as_deref(),
+            Some(&all[..])
+        );
+        // Whitespace is ignored; junk, short length, and data-after-pad are rejected.
+        assert_eq!(base64_decode("Zm9v\nYmFy").as_deref(), Some(&b"foobar"[..]));
+        assert_eq!(base64_decode("Zm9v!"), None); // invalid character
+        assert_eq!(base64_decode("abc"), None); // length not a multiple of 4
+        assert_eq!(base64_decode("ab=c"), None); // data after padding
     }
 
     #[test]

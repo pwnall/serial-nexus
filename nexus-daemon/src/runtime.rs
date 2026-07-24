@@ -57,6 +57,7 @@ use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::cell::CriticalCell;
+use crate::tap::{SharedTapHub, TAP_FEED_CAP, TapFeed, TapHub};
 use nexus_sys as sys;
 
 /// A shared, single-threaded handle to one host-facing endpoint's write lock
@@ -190,37 +191,59 @@ pub(crate) async fn reacquire_held(lock: &SharedLock, id: OriginId) -> bool {
     }
 }
 
-/// Split `bytes` into consecutive envelope [`Event::data`] frames on `channel`,
-/// each at most [`MAX_FRAME_SIZE`], yielding `(piece_len, frame)` per piece
-/// (§15.24). A chunk larger than one frame — a full device read (`READ_BUF ==
-/// MAX_FRAME_SIZE` overflows the header) or an arbitrary-length `send` line — is
-/// fragmented rather than dropped; the peer/child reassembles per channel. The
-/// payload cap subtracts the envelope header (1 type byte + 2 channel-length
-/// bytes + the channel id) and floors at 1 so a pathologically long channel id
-/// still makes progress. Shared by the leg's write half and the exec codec's
-/// stdin feed (§5 no-drop / all-loss-counted).
-pub(crate) fn data_frames<'a>(
-    channel: &'a str,
-    bytes: &'a Chunk,
-) -> impl Iterator<Item = (usize, Vec<u8>)> + 'a {
-    let cap = MAX_FRAME_SIZE.saturating_sub(3 + channel.len()).max(1);
-    let total = bytes.len();
+/// The maximum envelope payload per frame carrying `channel`: [`MAX_FRAME_SIZE`]
+/// minus the envelope header (1 type byte + 2 channel-length bytes + the channel
+/// id), floored at 1 so a pathologically long channel id still makes progress.
+pub(crate) fn frame_payload_cap(channel: &str) -> usize {
+    MAX_FRAME_SIZE.saturating_sub(3 + channel.len()).max(1)
+}
+
+/// Split `total` bytes into consecutive `(off, end)` payload ranges, each at most
+/// [`frame_payload_cap`] wide (§15.24). This is the **one** shared helper where the
+/// targetward fragmentation boundary is computed — the error-prone off-by-one /
+/// underflow logic §15.27 moved into a single place so every targetward framer
+/// fragments on identical boundaries: the envelope framers via [`data_frames`]
+/// (which encodes each range through the fixed envelope), and the in-process codec
+/// via its pluggable-`mux` loop (which frames each range through the configured
+/// transform, then parks and re-acquires the held lock per piece). A chunk larger
+/// than one frame — a full device read (`READ_BUF == MAX_FRAME_SIZE` overflows the
+/// header) or an arbitrary-length `send` line — is thereby fragmented rather than
+/// dropped (§5 no-drop / all-loss-counted).
+pub(crate) fn frame_ranges(
+    channel: &str,
+    total: usize,
+) -> impl Iterator<Item = (usize, usize)> + use<> {
+    let cap = frame_payload_cap(channel);
     let mut off = 0usize;
     std::iter::from_fn(move || {
         if off >= total {
             return None;
         }
+        let start = off;
         let end = (off + cap).min(total);
+        off = end;
+        Some((start, end))
+    })
+}
+
+/// Split `bytes` into consecutive envelope [`Event::data`] frames on `channel`,
+/// yielding `(piece_len, frame)` per piece — the envelope-framing wrapper over the
+/// shared [`frame_ranges`] boundary helper (§15.24). The peer/child reassembles per
+/// channel. Shared by the leg's write half and the exec codec's stdin feed (§5
+/// no-drop / all-loss-counted).
+pub(crate) fn data_frames<'a>(
+    channel: &'a str,
+    bytes: &'a Chunk,
+) -> impl Iterator<Item = (usize, Vec<u8>)> + 'a {
+    frame_ranges(channel, bytes.len()).map_while(move |(off, end)| {
         let mut frame = Vec::new();
         // Encode is infallible for a sane channel id (the graph forbids the
-        // pathological ones); on the defensive error, stop fragmenting this chunk.
+        // pathological ones); on the defensive error, stop fragmenting this chunk
+        // (`map_while` fuses the range iterator, matching the pre-refactor behavior).
         if encode(&Event::data(channel, bytes.slice(off..end)), &mut frame).is_err() {
-            off = total; // fuse: no further pieces
             return None;
         }
-        let piece_len = end - off;
-        off = end;
-        Some((piece_len, frame))
+        Some((end - off, frame))
     })
 }
 
@@ -323,6 +346,23 @@ pub struct Wiring {
     /// Writing target-facing endpoint → (its host endpoint's lock, its origin id).
     /// The origin gates its targetward drain on this (§6); only writers appear.
     pub origin_locks: HashMap<EndpointAddr, (SharedLock, OriginId)>,
+    // --- taps and the replay ring (§5 ring, §17 taps) ---
+    /// Host-facing endpoint → the producer-side tap feed it mirrors hostward bytes
+    /// into (only while a tap or ring wants them). Each producer claims its own
+    /// endpoints' feeds at `start`.
+    pub tap_feeds: HashMap<EndpointAddr, TapFeed>,
+    /// Host-facing endpoint → its tap hub plus the feed receiver a hub task drains
+    /// (§17). The daemon consumes this to spawn the hub tasks and keep the hub
+    /// handles for `tap.open`/`tap.close`/`state`.
+    pub tap_hub_setup: HashMap<EndpointAddr, TapHubSetup>,
+}
+
+/// The daemon's per-endpoint tap-hub startup bundle: the shared hub handle it keeps
+/// (for registering taps and reporting state) and the feed receiver a spawned hub
+/// task drains into [`TapHub::ingest`] (§17).
+pub struct TapHubSetup {
+    pub hub: SharedTapHub,
+    pub feed_rx: mpsc::Receiver<Chunk>,
 }
 
 impl Wiring {
@@ -341,6 +381,12 @@ impl Wiring {
         // fan-out buffer depth to each of its consumers. Other producers (codec
         // channels) use the built-in default.
         let mut host_hostward_depth: HashMap<&str, usize> = HashMap::new();
+        // A host-facing endpoint's configured replay-ring depth in bytes (§5, §17).
+        // Only a serial node's single host endpoint carries the attribute today;
+        // codec/leg host-facing channels default to 0 (their per-channel ring config
+        // is deferred work, §14). Every host endpoint still gets a hub — a tap can
+        // attach to any of them — but only a configured one keeps a ring.
+        let mut host_ring_cap: HashMap<EndpointAddr, usize> = HashMap::new();
         for n in &config.nodes {
             for ep in &n.shape().endpoints {
                 facing.insert(
@@ -350,10 +396,13 @@ impl Wiring {
             }
             is_log.insert(n.name(), matches!(n, NodeConfig::Log { .. }));
             if let NodeConfig::Serial {
-                hostward_buffer, ..
+                hostward_buffer,
+                replay_ring,
+                ..
             } = n
             {
                 host_hostward_depth.insert(n.name(), *hostward_buffer);
+                host_ring_cap.insert(EndpointAddr::node(n.name()), *replay_ring);
             }
         }
 
@@ -374,6 +423,25 @@ impl Wiring {
                 let (tx, rx) = mpsc::channel(CHANNEL_CAP);
                 wiring.host_targetward_rx.insert(addr.clone(), rx);
                 wiring.host_targetward_tx.insert(addr.clone(), tx);
+
+                // One tap hub per host-facing endpoint (§17): a tap can attach to
+                // any of them. The hub owns the endpoint's replay ring (§5) — sized
+                // from config, 0 = off — and its `active` flag gates the producer's
+                // mirror so an untapped, ring-less endpoint pays only an atomic load.
+                let ring_cap = host_ring_cap.get(addr).copied().unwrap_or(0);
+                let (hub, active, feed_dropped) = TapHub::new(addr.to_string(), ring_cap);
+                let (feed_tx, feed_rx) = mpsc::channel(TAP_FEED_CAP);
+                wiring.tap_feeds.insert(
+                    addr.clone(),
+                    TapFeed {
+                        tx: feed_tx,
+                        active,
+                        feed_dropped,
+                    },
+                );
+                wiring
+                    .tap_hub_setup
+                    .insert(addr.clone(), TapHubSetup { hub, feed_rx });
             }
         }
 

@@ -14,13 +14,18 @@
 use std::io;
 use std::rc::Rc;
 
-use nexus_rpc::{Response, RpcError, error_codes, parse_incoming_request};
+use nexus_rpc::{
+    Notification, Response, RpcError, base64_encode, error_codes, parse_incoming_request,
+};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedReadHalf;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::mpsc;
 
 use crate::daemon::Daemon;
+use crate::tap::{OpenTap, TAP_QUEUE_CAP, TapMsg};
 
 /// Hard cap on the length, in bytes, of a single control-plane request line
 /// (§10). [`RequestLines::next_line`] refuses a longer line rather than letting
@@ -123,6 +128,14 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
     let mut notes = daemon.subscribe();
     let mut subscribed = false;
 
+    // Per-connection tap plumbing (§17): the hubs of every tapped endpoint deliver
+    // this connection's tap bytes into one bounded channel (the §5 boundary — a slow
+    // tab fills it and its taps count drops), which the loop drains into `tap.data`
+    // notifications. `open_taps` tracks the taps this connection opened so they close
+    // on `tap.close` and, via `OpenTap`'s drop, when the connection ends.
+    let (tap_tx, mut tap_rx) = mpsc::channel::<TapMsg>(TAP_QUEUE_CAP);
+    let mut open_taps: Vec<OpenTap> = Vec::new();
+
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -174,30 +187,68 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                 let params = req.params;
                 let is_subscribe = method == "subscribe";
 
-                // Dispatch may wait (`lock --wait`, `send`). Race it against a
-                // disconnect so a dropped connection cancels the wait — dropping the
-                // future runs the waiter's cleanup guard (§15.20). `biased` polls the
-                // dispatch first, so a fast verb (ready on first poll) is taken
-                // without ever reading — and possibly losing — a following request.
-                //
-                // Any resolution of the second lane — a dropped/half-closed connection
-                // (EOF), a pipelined request (unsupported while a verb waits), an
-                // over-cap line, or a read error — abandons the in-flight verb and
-                // closes: the design's §15.20 cancel-on-disconnect is normative (a
-                // killed `lock --wait` client must dequeue promptly), so a bare
-                // write-half half-close is treated as a disconnect. `serialnexusctl`
-                // keeps both halves open across the read, so its waiting verbs are
-                // unaffected; a raw `socat` waiting-verb user must likewise keep the
-                // write half open (CTRL-3: current behavior is design-correct).
-                let dispatch = daemon.dispatch(&method, params);
-                tokio::pin!(dispatch);
-                let response = tokio::select! {
-                    biased;
-                    result = &mut dispatch => match result {
-                        Ok(value) => Response::success(id, value),
+                // Taps are connection-scoped (§17): handle `tap.open`/`tap.close`
+                // here, where the connection's outbound tap channel and open-tap
+                // list live, rather than in the shared dispatch. Both complete
+                // synchronously, with no waiting lane.
+                let response = if method == "tap.open" {
+                    match daemon.tap_open(params, tap_tx.clone()) {
+                        Ok((value, handle)) => {
+                            open_taps.push(handle);
+                            Response::success(id, value)
+                        }
                         Err(err) => Response::error(id, err),
-                    },
-                    _ = lines.next_line() => break,
+                    }
+                } else if method == "tap.close" {
+                    match params
+                        .as_ref()
+                        .and_then(|p| p.get("tap"))
+                        .and_then(Value::as_u64)
+                    {
+                        Some(tap_id) => match open_taps.iter().position(|t| t.tap_id == tap_id) {
+                            // Dropping the removed `OpenTap` detaches it from its hub.
+                            Some(pos) => {
+                                drop(open_taps.remove(pos));
+                                Response::success(id, json!({ "closed": tap_id }))
+                            }
+                            None => Response::error(
+                                id,
+                                RpcError::invalid_params(format!(
+                                    "no open tap {tap_id} on this connection"
+                                )),
+                            ),
+                        },
+                        None => Response::error(
+                            id,
+                            RpcError::invalid_params("missing 'tap' in params"),
+                        ),
+                    }
+                } else {
+                    // Dispatch may wait (`lock --wait`, `send`). Race it against a
+                    // disconnect so a dropped connection cancels the wait — dropping the
+                    // future runs the waiter's cleanup guard (§15.20). `biased` polls the
+                    // dispatch first, so a fast verb (ready on first poll) is taken
+                    // without ever reading — and possibly losing — a following request.
+                    //
+                    // Any resolution of the second lane — a dropped/half-closed connection
+                    // (EOF), a pipelined request (unsupported while a verb waits), an
+                    // over-cap line, or a read error — abandons the in-flight verb and
+                    // closes: the design's §15.20 cancel-on-disconnect is normative (a
+                    // killed `lock --wait` client must dequeue promptly), so a bare
+                    // write-half half-close is treated as a disconnect. `serialnexusctl`
+                    // keeps both halves open across the read, so its waiting verbs are
+                    // unaffected; a raw `socat` waiting-verb user must likewise keep the
+                    // write half open (CTRL-3: current behavior is design-correct).
+                    let dispatch = daemon.dispatch(&method, params);
+                    tokio::pin!(dispatch);
+                    tokio::select! {
+                        biased;
+                        result = &mut dispatch => match result {
+                            Ok(value) => Response::success(id, value),
+                            Err(err) => Response::error(id, err),
+                        },
+                        _ = lines.next_line() => break,
+                    }
                 };
 
                 if write_half
@@ -223,6 +274,23 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                 }
                 Err(RecvError::Lagged(_)) => {} // skipped snapshots; the next is current
                 Err(RecvError::Closed) => break,
+            },
+            // Tap bytes for this connection (§17): base64-frame each into a `tap.data`
+            // notification and write it. `recv` yields `None` only when every sender
+            // is gone; the connection holds `tap_tx` for its whole life, so this only
+            // pends (no tap data) rather than firing spuriously.
+            tap = tap_rx.recv() => if let Some(msg) = tap {
+                let note = Notification::new(
+                    "tap.data",
+                    Some(json!({ "tap": msg.tap_id, "data": base64_encode(&msg.bytes) })),
+                );
+                if write_half
+                    .write_all(nexus_rpc::to_line(&note).as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             },
         }
     }

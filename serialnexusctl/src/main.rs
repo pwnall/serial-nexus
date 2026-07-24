@@ -70,6 +70,28 @@ enum Cmd {
         #[arg(long)]
         count: Option<usize>,
     },
+    /// Watch a host-facing endpoint's hostward stream over a connection-scoped tap
+    /// (§17): the raw decoded bytes are written to stdout as they arrive. With
+    /// `--replay` the endpoint's replay ring (§5) is delivered first (ring-then-live,
+    /// exact splice). Exits after `--bytes` decoded bytes, or when the connection
+    /// closes. Read-only: a tap never writes to the device and never touches config.
+    Tap {
+        /// The host-facing endpoint to observe (e.g. `usb0` or `mux/ch2`).
+        endpoint: String,
+        /// Prefix the live stream with the endpoint's replay ring, if configured.
+        #[arg(long)]
+        replay: bool,
+        /// Stop after this many decoded bytes have been written (default: run until
+        /// the connection closes).
+        #[arg(long)]
+        bytes: Option<u64>,
+        /// Open the tap but then stop reading for this many milliseconds — a paused
+        /// browser tab (§17). The daemon's bounded per-tap queue fills and drops
+        /// with a counter, so a slow tab costs only its own tap. Used to exercise
+        /// the drop path; the ack is still consumed so the open is confirmed.
+        #[arg(long)]
+        stall_ms: Option<u64>,
+    },
     /// Rotate a log node's file on demand.
     Rotate { node: String },
     /// Assert a serial break on a node for `--ms` milliseconds (§7.1).
@@ -140,10 +162,19 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let socket = resolve_socket(cli.socket.clone());
 
-    // `subscribe` is a stream, not a single request/response — handle it apart
-    // from the one-shot verbs below.
+    // `subscribe` and `tap` are streams, not single request/response — handle them
+    // apart from the one-shot verbs below.
     if let Cmd::Subscribe { count } = &cli.cmd {
         return subscribe_stream(&socket, *count);
+    }
+    if let Cmd::Tap {
+        endpoint,
+        replay,
+        bytes,
+        stall_ms,
+    } = &cli.cmd
+    {
+        return tap_stream(&socket, endpoint, *replay, *bytes, *stall_ms);
     }
 
     let (method, params) = build_request(&cli.cmd)?;
@@ -195,6 +226,7 @@ fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
         Cmd::State => ("state", None),
         Cmd::Info => ("info", None),
         Cmd::Subscribe { .. } => unreachable!("subscribe is handled before dispatch"),
+        Cmd::Tap { .. } => unreachable!("tap is handled before dispatch"),
         Cmd::Rotate { node } => ("rotate", Some(json!({ "node": node }))),
         Cmd::SendBreak { node, ms } => ("send-break", Some(json!({ "node": node, "ms": ms }))),
         Cmd::SetModem { node, dtr, rts } => (
@@ -383,6 +415,7 @@ fn render(cmd: &Cmd, result: &Value) -> anyhow::Result<()> {
         }
         Cmd::Shutdown => println!("shutdown requested"),
         Cmd::Subscribe { .. } => unreachable!("subscribe is handled before dispatch"),
+        Cmd::Tap { .. } => unreachable!("tap is handled before dispatch"),
     }
     Ok(())
 }
@@ -426,6 +459,91 @@ fn subscribe_stream(socket: &Path, count: Option<usize>) -> anyhow::Result<()> {
                 stdout.flush()?;
                 printed += 1;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Open the socket, `tap.open` the endpoint, and write each `tap.data`
+/// notification's decoded bytes to stdout as they arrive (§17). The connection's
+/// write half stays open for the tap's lifetime (so the daemon does not treat it
+/// as a dropped waiter, §15.20). Exits after `stop_bytes` decoded bytes or when the
+/// daemon closes the connection. The `tap.open` acknowledgement (carrying the tap
+/// id and `replay_bytes`) is reported on stderr, keeping stdout a clean byte stream.
+fn tap_stream(
+    socket: &Path,
+    endpoint: &str,
+    replay: bool,
+    stop_bytes: Option<u64>,
+    stall_ms: Option<u64>,
+) -> anyhow::Result<()> {
+    let stream = UnixStream::connect(socket)
+        .map_err(|e| anyhow::anyhow!("connecting to {}: {e}", socket.display()))?;
+    // Hold the write half open for the whole tap so the daemon keeps the connection
+    // alive (a half-close reads as a dropped connection, §15.20).
+    let mut writer = stream.try_clone()?;
+    let params = json!({ "endpoint": endpoint, "replay": replay });
+    writer.write_all(nexus_rpc::to_line(&Request::new(1, "tap.open", Some(params))).as_bytes())?;
+    writer.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let mut written = 0u64;
+    let limit = stop_bytes.unwrap_or(u64::MAX);
+    let mut stdout = std::io::stdout().lock();
+
+    // Read the tap.open acknowledgement FIRST — before any byte loop — so a failed
+    // open (unknown or non-host-facing endpoint) exits non-zero, and `--bytes 0` is a
+    // clean confirmed no-op rather than a silent success (audit finding). The daemon
+    // replies to tap.open before it streams any tap.data, so the ack is the first
+    // line; tolerate a stray notification ahead of it defensively.
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            anyhow::bail!("connection closed before the tap.open acknowledgement");
+        }
+        if let Ok(Incoming::Response(resp)) = serde_json::from_str::<Incoming>(line.trim()) {
+            if let Some(err) = resp.error {
+                anyhow::bail!("tap.open failed: {} ({})", err.message, err.code);
+            }
+            eprintln!("tap opened: {}", resp.result.unwrap_or(Value::Null));
+            break;
+        }
+    }
+
+    // A paused tab (§17): hold the tap open without reading for the stall window so
+    // the daemon's bounded queue fills and drops with a counter, then exit.
+    if let Some(ms) = stall_ms {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        return Ok(());
+    }
+
+    // Stream tap.data (base64) to stdout until the byte limit or the connection close.
+    while written < limit {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break; // daemon closed the connection
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(Incoming::Notification(note)) = serde_json::from_str::<Incoming>(trimmed) {
+            if note.method != "tap.data" {
+                continue; // ignore other id-less notifications
+            }
+            let data = note
+                .params
+                .as_ref()
+                .and_then(|p| p.get("data"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("tap.data missing 'data' field"))?;
+            let bytes = nexus_rpc::base64_decode(data)
+                .ok_or_else(|| anyhow::anyhow!("tap.data 'data' is not valid base64"))?;
+            let take = ((limit - written) as usize).min(bytes.len());
+            stdout.write_all(&bytes[..take])?;
+            stdout.flush()?;
+            written += take as u64;
         }
     }
     Ok(())

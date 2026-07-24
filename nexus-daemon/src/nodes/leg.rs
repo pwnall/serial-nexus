@@ -66,6 +66,7 @@ use tokio::task::JoinHandle;
 use crate::boundary;
 use crate::cell::CriticalCell;
 use crate::runtime::{CHANNEL_CAP, HostwardSink, READ_BUF, SharedLock, Wiring, data_frames};
+use crate::tap::TapFeed;
 
 /// How long to wait for the peer's hello before treating the connection as dead.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -226,16 +227,20 @@ impl LegNode {
         let recv_route: RecvRoute = match self.faces {
             Facing::Host => {
                 let mut sinks: HashMap<String, Vec<HostwardSink>> = HashMap::new();
+                let mut feeds: HashMap<String, TapFeed> = HashMap::new();
                 for ch in &self.channels {
                     let addr = EndpointAddr::channel(&self.name, ch);
                     if let Some(s) = wiring.host_sinks.remove(&addr) {
                         sinks.insert(ch.clone(), s);
                     }
+                    if let Some(feed) = wiring.tap_feeds.remove(&addr) {
+                        feeds.insert(ch.clone(), feed);
+                    }
                     if let Some(rx) = wiring.host_targetward_rx.remove(&addr) {
                         send_receivers.push((ch.clone(), rx, stat_for(ch)));
                     }
                 }
-                RecvRoute::Host(sinks)
+                RecvRoute::Host { sinks, feeds }
             }
             Facing::Target => {
                 let mut inbound_txs: HashMap<String, mpsc::Sender<Chunk>> = HashMap::new();
@@ -395,8 +400,12 @@ type SendReceiver = (String, mpsc::Receiver<Chunk>, Rc<ChannelStat>);
 
 /// How the pump routes a decoded wire event into the local graph.
 enum RecvRoute {
-    /// faces=host: fan each channel's hostward data out to local consumers.
-    Host(HashMap<String, Vec<HostwardSink>>),
+    /// faces=host: fan each channel's hostward data out to local consumers, and
+    /// mirror it to the channel's tap hub for taps and the replay ring (§17).
+    Host {
+        sinks: HashMap<String, Vec<HostwardSink>>,
+        feeds: HashMap<String, TapFeed>,
+    },
     /// faces=target: hand each channel's targetward data to its per-channel task.
     Target(HashMap<String, mpsc::Sender<Chunk>>),
 }
@@ -695,26 +704,34 @@ async fn route_recv(
                 s.active.set(true);
             }
             match route {
-                RecvRoute::Host(sinks) => match sinks.get(ch) {
-                    Some(chsinks) => {
-                        if let Some(s) = stat {
-                            s.delivered_hostward.set(s.delivered_hostward.get() + n);
-                        }
-                        for (tx, counters) in chsinks {
-                            match tx.try_send(bytes.clone()) {
-                                Ok(()) => {}
-                                Err(TrySendError::Full(_)) => {
-                                    counters.add_full(n);
-                                    if let Some(s) = stat {
-                                        s.discarded_hostward.set(s.discarded_hostward.get() + n);
+                RecvRoute::Host { sinks, feeds } => {
+                    // Mirror to this channel's tap hub for taps and the replay ring
+                    // (§17), independent of whether a local consumer is bound.
+                    if let Some(feed) = feeds.get(ch) {
+                        feed.mirror(&bytes);
+                    }
+                    match sinks.get(ch) {
+                        Some(chsinks) => {
+                            if let Some(s) = stat {
+                                s.delivered_hostward.set(s.delivered_hostward.get() + n);
+                            }
+                            for (tx, counters) in chsinks {
+                                match tx.try_send(bytes.clone()) {
+                                    Ok(()) => {}
+                                    Err(TrySendError::Full(_)) => {
+                                        counters.add_full(n);
+                                        if let Some(s) = stat {
+                                            s.discarded_hostward
+                                                .set(s.discarded_hostward.get() + n);
+                                        }
                                     }
+                                    Err(TrySendError::Closed(_)) => {}
                                 }
-                                Err(TrySendError::Closed(_)) => {}
                             }
                         }
+                        None => note_unbound(ch, stat, n, shared),
                     }
-                    None => note_unbound(ch, stat, n, shared),
-                },
+                }
                 RecvRoute::Target(txs) => match txs.get(ch) {
                     // The per-channel task counts accepted_targetward once the local
                     // device-write handoff accepts; here we just backpressure.

@@ -218,6 +218,13 @@ pub enum NodeConfig {
         /// never-drop targetward path, always counted.
         #[serde(default = "default_true")]
         purge_on_reconnect: bool,
+        /// Replay ring depth in bytes for this serial node's host-facing endpoint
+        /// (§5): a bounded ring of the most recent hostward bytes, retained so a
+        /// late tap (§17) sees what just happened. A feature buffer, not flow
+        /// control — it never backpressures and costs nothing when unset (default
+        /// 0 = off).
+        #[serde(default)]
+        replay_ring: usize,
         /// Initial modem-line assertions applied at open (§7.1). Declared last so
         /// it serializes after the scalar fields (a nested table must follow them
         /// in TOML's array-of-tables syntax); omitted when unset.
@@ -596,6 +603,7 @@ mod tests {
                     arbitration: Arbitration::Exclusive,
                     hostward_buffer: 256,
                     purge_on_reconnect: true,
+                    replay_ring: 0,
                     modem: ModemLines::default(),
                 },
                 NodeConfig::Pty {
@@ -657,6 +665,7 @@ mod tests {
                     arbitration: Arbitration::Exclusive,
                     hostward_buffer: 256,
                     purge_on_reconnect: true,
+                    replay_ring: 0,
                     modem: ModemLines::default(),
                 },
                 NodeConfig::Codec {
@@ -800,6 +809,7 @@ mod tests {
                     arbitration: Arbitration::Exclusive,
                     hostward_buffer: 512,
                     purge_on_reconnect: true,
+                    replay_ring: 0,
                     modem: ModemLines {
                         dtr: Some(true),
                         rts: Some(false),
@@ -1028,6 +1038,7 @@ mod tests {
                 arbitration: Arbitration::Exclusive,
                 hostward_buffer: 0,
                 purge_on_reconnect: true,
+                replay_ring: 0,
                 modem: ModemLines::default(),
             }],
             edges: vec![],
@@ -1157,7 +1168,9 @@ mod tests {
                 any_flow(),
                 any_facing(),
                 any_arbitration(),
-                1usize..2048,
+                // (hostward_buffer, replay_ring) packed into one tuple slot to stay
+                // within proptest's 12-element tuple limit.
+                (1usize..2048, 0usize..4096),
                 any_modem(),
                 any::<bool>(),
             )
@@ -1172,7 +1185,7 @@ mod tests {
                         flow_control,
                         faces,
                         arbitration,
-                        hostward_buffer,
+                        (hostward_buffer, replay_ring),
                         modem,
                         purge_on_reconnect,
                     )| {
@@ -1188,6 +1201,7 @@ mod tests {
                             arbitration,
                             hostward_buffer,
                             purge_on_reconnect,
+                            replay_ring,
                             modem,
                         }
                     }

@@ -80,6 +80,14 @@ struct GraphState {
     origin_locks: HashMap<String, (SharedLock, OriginId)>,
     /// Monotonic allocator for transient `send` origin ids (§6).
     next_send_origin: Cell<u64>,
+    /// Host-facing endpoint **display** → its tap hub (§5 ring, §17 taps). The
+    /// daemon registers taps here on `tap.open`, and reports open taps in `state`.
+    /// The hub's ingest task self-terminates when the producer's feed sender drops
+    /// (teardown/removal), so no handle join is tracked.
+    tap_hubs: HashMap<String, crate::tap::SharedTapHub>,
+    /// Monotonic, daemon-unique allocator for tap ids (§17), so `state` and
+    /// `tap.close` can name a tap unambiguously across endpoints and connections.
+    next_tap_id: Cell<u64>,
 }
 
 impl GraphState {
@@ -385,7 +393,9 @@ impl Daemon {
             st.endpoint_locks.clear();
             st.endpoint_targetward.clear();
             st.origin_locks.clear();
+            st.tap_hubs.clear();
             st.absorb_wiring(&wiring);
+            spawn_tap_hubs(st, &mut wiring);
             st.nodes = nodes;
             st.config = config;
             for node in &mut st.nodes {
@@ -484,6 +494,7 @@ impl Daemon {
             };
             let mut wiring = crate::runtime::Wiring::build(&mini, &self.notifier);
             st.absorb_wiring(&wiring);
+            spawn_tap_hubs(st, &mut wiring);
             node.start(&mut wiring);
             st.nodes.push(node);
             st.config.nodes.push(node_cfg);
@@ -561,6 +572,11 @@ impl Daemon {
                     removed_locks.push(lock);
                 }
                 st.endpoint_targetward.remove(disp);
+                // Drop this endpoint's tap hub handle (§17); its ingest task
+                // self-terminates when the node's teardown above dropped the
+                // producer's feed sender, and any open tap's connection observes the
+                // closed delivery channel.
+                st.tap_hubs.remove(disp);
                 // If this endpoint is a *writer* (a PTY/codec side that fed a
                 // surviving host endpoint's lock), unregister it from that lock so it
                 // does not linger as a phantom origin — or, if it held the lock,
@@ -647,7 +663,67 @@ impl Daemon {
                     Value::Object(obj)
                 })
                 .collect();
-            json!({ "nodes": nodes })
+            // Open taps, connection-scoped and read-only (§17): each reports its id,
+            // the endpoint it observes, and its own drop counter (§5). Zero taps →
+            // an empty array. Taps are state, never configuration, so `dump` is
+            // unaffected (§8/§11).
+            let mut taps = Vec::new();
+            for (endpoint, hub) in &st.tap_hubs {
+                let snap = hub.with(|h| h.snapshot());
+                // `feed_dropped` is endpoint-level loss at the producer→hub hop (§5);
+                // report it on each of the endpoint's taps so a slow-hub gap is
+                // visible to whoever is watching.
+                for (id, dropped) in snap.taps {
+                    taps.push(json!({
+                        "tap": id,
+                        "endpoint": endpoint,
+                        "dropped": dropped,
+                        "feed_dropped": snap.feed_dropped,
+                    }));
+                }
+            }
+            json!({ "nodes": nodes, "taps": taps })
+        })
+    }
+
+    /// `tap.open` (§17): register a connection-scoped, read-only tap on a
+    /// host-facing endpoint. `out` is the serving connection's outbound tap channel;
+    /// the hub delivers this endpoint's hostward bytes into it as [`TapMsg`]s, which
+    /// the connection base64-frames into `tap.data` notifications. With `--replay`
+    /// and a configured ring (§5), the ring snapshot is spliced in ahead of the live
+    /// stream. Returns the RPC result plus an [`OpenTap`] handle the connection keeps
+    /// so it can `tap.close` the tap or close it when the connection drops. Errors if
+    /// the endpoint is unknown or not host-facing (only host-facing endpoints have a
+    /// hub) — a tap observes a hostward stream, so a target-facing endpoint has none.
+    pub(crate) fn tap_open(
+        &self,
+        params: Option<Value>,
+        out: mpsc::Sender<crate::tap::TapMsg>,
+    ) -> Result<(Value, crate::tap::OpenTap), RpcError> {
+        let endpoint = params
+            .as_ref()
+            .and_then(|p| p.get("endpoint"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("missing 'endpoint' in params"))?;
+        let replay = params
+            .as_ref()
+            .and_then(|p| p.get("replay"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.state.with_mut(|st| {
+            let hub = st.tap_hubs.get(endpoint).cloned().ok_or_else(|| {
+                RpcError::invalid_params(format!("no host-facing endpoint {endpoint:?} to tap"))
+            })?;
+            let tap_id = st.next_tap_id.get();
+            st.next_tap_id.set(tap_id + 1);
+            let dropped = Rc::new(Cell::new(0));
+            let replay_bytes = hub.with_mut(|h| h.register(tap_id, out, dropped, replay));
+            let result = json!({
+                "tap": tap_id,
+                "endpoint": endpoint,
+                "replay_bytes": replay_bytes,
+            });
+            Ok((result, crate::tap::OpenTap { tap_id, hub }))
         })
     }
 
@@ -1116,6 +1192,9 @@ impl Daemon {
             st.endpoint_locks.clear();
             st.endpoint_targetward.clear();
             st.origin_locks.clear();
+            // Drop the tap hub handles (§17): each ingest task self-terminates as the
+            // node teardowns above drop the producers' feed senders.
+            st.tap_hubs.clear();
             json!({ "torn_down": count })
         })
     }
@@ -1258,6 +1337,26 @@ fn merge_into(target: &mut serde_json::Map<String, Value>, source: Value) {
         for (k, v) in m {
             target.insert(k, v);
         }
+    }
+}
+
+/// Spawn one tap-hub ingest task per host-facing endpoint in `wiring`, recording
+/// each hub handle in the daemon state (§17). The task drains its feed channel — the
+/// producer mirrors hostward bytes into it (only while a tap or ring wants them) —
+/// and appends to the ring plus fans out to the registered taps. It self-terminates
+/// when the producer's feed sender drops (node teardown/removal), so no join handle
+/// is tracked; runs on the current-thread `LocalSet`, like every node task. Drains
+/// `tap_hub_setup` so a later `node.start` (which claims `tap_feeds`) is unaffected.
+fn spawn_tap_hubs(st: &mut GraphState, wiring: &mut crate::runtime::Wiring) {
+    for (addr, setup) in std::mem::take(&mut wiring.tap_hub_setup) {
+        let hub = setup.hub;
+        let mut feed_rx = setup.feed_rx;
+        st.tap_hubs.insert(addr.to_string(), hub.clone());
+        tokio::task::spawn_local(async move {
+            while let Some(chunk) = feed_rx.recv().await {
+                hub.with_mut(|h| h.ingest(&chunk));
+            }
+        });
     }
 }
 
