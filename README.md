@@ -158,7 +158,8 @@ hardening guidance.
 
 ## Documentation
 
-- [`docs/17-design-claude-fable-v8.md`](docs/17-design-claude-fable-v8.md) — the normative design document (concepts, node types, RPC contract, and the reasoning behind each decision).
+- [`docs/20-design-claude-fable-v9.md`](docs/20-design-claude-fable-v9.md) — the normative design document (concepts, node types, RPC contract, and the reasoning behind each decision).
+- [`docs/21-implementation-plan-claude-fable-v9.md`](docs/21-implementation-plan-claude-fable-v9.md) — the normative implementation plan (phases and post-1.0 tracks).
 - [`docs/rpc/`](docs/rpc/) — the JSON-RPC method reference (the stable contract of §10).
 - [`docs/codec-authors.md`](docs/codec-authors.md) — writing a codec: the trait, the event vocabulary, and the envelope protocol for external (any-language) codecs.
 - [`docs/security.md`](docs/security.md) — threat model and hardening.

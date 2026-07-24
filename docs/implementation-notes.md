@@ -1,8 +1,10 @@
 # serial_nexus — implementation notes & handoff
 
 **As of:** 2026-07-23 (**phases 0-8 + post-1.0 simplification + extension track done**;
-now the **v9 design revision + web console track (plan §11 / design §17) IN PROGRESS** —
-items §11.1 (the tap) and §11.2 (the replay ring) built + validated).
+the **v9 design revision + web console track (plan §11 / design §17) is DONE** —
+§11.1 (the tap) + §11.2 (the replay ring) and §11.3-6 (the `serialnexusweb` client with
+the TLS tier) all built, validated, and committed on `implementation` (`4594d02`,
+`18f5216`)).
 **Branch:** `implementation` (off `main`).
 **Normative docs are now v9:** `docs/20-design-claude-fable-v9.md` (design) and
 `docs/21-implementation-plan-claude-fable-v9.md` (plan). v1–v8 docs are in
