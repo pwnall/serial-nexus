@@ -7,15 +7,38 @@ POSIX carries the design, and degrades — never crashes, never silently misbeha
 
 ## Update — 2026-07-24 hands-on pass (macOS 15.7.8 / Darwin 24.6.0, x86_64, real FTDI crossover rig)
 
-The first hands-on pass on real hardware ran, and settled the open questions. Two
-things below that this page previously marked *"expected"* / *"needs a Mac"* turned
-out to be **real defects, now fixed**; the rest is confirmed. See
-`docs/implementation-notes.md` (2026-07-24 session) for the mechanism.
+The first hands-on pass on real hardware ran, and settled the open questions; a
+follow-up pass on the same rig extended the coverage (250000-baud data, the serial
+signal verbs through the daemon, and a physical unplug→replug heal) and closed the
+license-gate skip. Two things below that this page previously marked *"expected"* /
+*"needs a Mac"* turned out to be **real defects, now fixed**; the rest is confirmed.
+See `docs/implementation-notes.md` (2026-07-24 session) for the mechanism.
 
-- **Build / test / lint:** all clean; **156 tests pass, same count as Linux.**
-- **Serial data plane over the real crossover cable:** **32 KiB byte-exact both
-  directions**, `send` verb reaches hardware, **TIOCEXCL enforced**, driver counters
-  gracefully absent. **verified.**
+- **Build / test / lint:** all clean; **248 tests pass, 0 fail** (`cargo test --workspace`).
+- **Serial data plane over the real crossover cable:** byte-exact both directions at
+  **115200 and 250000** (32 KiB each way, SHA-256), the `send` verb reaches hardware,
+  **a second open of a held port is refused**, driver counters gracefully absent.
+  *TIOCEXCL nuance:* the daemon sets `TIOCEXCL` unconditionally and the second open is
+  genuinely refused, but macOS `cu.*` call-out devices are single-open at the driver
+  layer regardless — so on macOS the refusal is real yet **not attributable to the ioctl
+  alone** (`nexus-doctor` P3 confirms the ioctl is *accepted*, not that it is what refuses
+  the open). The clean isolation — a second open that succeeds without `TIOCEXCL` and
+  fails with it — is a Linux-rig property. **verified.**
+- **Serial signal verbs over real hardware:** `send-break` / `set-modem` / `pulse-dtr`
+  driven end-to-end through the daemon against a real UART all succeed — the Tier-3
+  property (§13) this null modem exists to test, unreachable on a pts (which `ENOTTY`s
+  set-modem/pulse-dtr, so `p7_signals` cannot cover it). A break is observed at the far
+  end as a NUL (best-effort; deterministic frame-error detection needs Linux-only
+  `TIOCGICOUNT`). **verified.**
+- **Unplug → replug heal on real hardware:** pulling a USB adapter parks its serial node
+  in **`waiting` (device lost)** — the graph is unchanged, only the *state* moves
+  (config-vs-state split) — and replugging re-resolves the same stable `cu.usbserial-*`
+  path, reopens (termios + modem lines reapplied), returns to `active`, and carries data
+  again (a `send` nonce crossed the healed wire). The §7/§12 "survive replug" property on
+  real macOS hardware (the Linux `p7_replug`/`p7_unplug` self-skip there). **verified.**
+- **License gate proven, not just configured:** with `cargo-deny` installed,
+  `cargo deny check` is clean and the folded `p0_license_gate` test (plants a banned crate,
+  asserts cargo-deny rejects it) passes. **verified.**
 - **PTY nodes — FIXED.** They previously *faulted* on macOS (`tcgetattr: ENOTTY`): the
   §7.2 baseline termios was applied through the pty **master**, which BSD rejects. Now
   cfg-gated to apply through the **slave** on non-Linux (`nodes/pty.rs::with_termios_fd`),
@@ -54,11 +77,12 @@ verified by a clean cross-compile —
 cargo check --target x86_64-apple-darwin --workspace   # Finished, no errors
 ```
 
-— and by reading the platform gates in the source (below). It is **not yet
-runtime-verified on a real Mac.** Confirming actual kernel and device behavior is
-the job of the macOS CI lane and a future hands-on pass; until then, everything
-that depends on live macOS behavior is marked *unverified* here and stays that
-way honestly.
+— and by reading the platform gates in the source (below). Beyond that compile-time
+proof, the mechanisms that depend on live macOS behavior **have now been
+runtime-verified on a real Mac** — see the hands-on update block at the top of this
+page, which is the authoritative record. The feature matrix below is kept as the
+original Phase-8 *prediction*; where it still reads *expected* / *needs a Mac* for an
+item the update block reports **verified**, the update block wins.
 
 ## How to read the verdicts
 
@@ -73,14 +97,14 @@ way honestly.
 | Feature | Linux | macOS | Notes |
 |---|---|---|---|
 | Workspace build | ✅ | ✅ | Compiles for `*-apple-darwin`. **cross-checked.** |
-| Data plane (PTY pair, `read`/`write`/`poll(2)`) | ✅ | ✅ (expected) | Plain POSIX; no Linux-only syscalls on the hot path. **expected.** |
+| Data plane (PTY pair, `read`/`write`/`poll(2)`) | ✅ | ✅ | Plain POSIX; no Linux-only syscalls on the hot path. **verified** (byte-exact over the real rig at 115200 & 250000). |
 | PTY client-termios observation (EXTPROC + `TIOCPKT`) | ✅ | ❓ | Packet-mode signaling is **unverified** on macOS (§7.2). **needs a Mac.** |
 | Reconciliation poll (termios backstop) | ✅ | ✅ | Unconditional; becomes the *sole* observation path if EXTPROC misbehaves. **cross-checked** (code) / macOS timing **expected.** |
 | Driver error counters (`TIOCGICOUNT`: overrun/framing/parity) | ✅ | ➖ omitted | `TIOCGICOUNT` is Linux-only; the binding is gated, the reader stubs to `ENOTSUP`, counters are simply absent — exactly as a pts behaves on Linux. **cross-checked.** |
-| Modem-line read/set, break (`TIOCMGET`, DTR/RTS) | ✅ | ✅ (expected) | Not gated; serial2 + the shared `sys` ioctls are cross-platform. **expected.** |
+| Modem-line read/set, break (`TIOCMGET`, DTR/RTS) | ✅ | ✅ | Not gated; serial2 + the shared `sys` ioctls are cross-platform. **verified** (`send-break`/`set-modem`/`pulse-dtr` driven through the daemon on the real rig; break seen far-end as a NUL). |
 | Advertised PTY baud ≥ 460800 (`B460800`/`B921600`) | ✅ | ➖ capped | macOS termios tops out at `B230400`; the high arms are gated out. Advertised baud is cosmetic on a PTY, so it falls through to "unset." **cross-checked.** |
 | Identity: `usb:` / `by-path:` resolve to a live path | ✅ | ✖ inert | No `/dev/serial/by-id`, no `by-path` tree, no `/sys`. A node configured this way resolves to nothing and stays **`waiting`** forever. **expected.** |
-| Identity: add by present raw path | ✅ | ✅ (expected) | Captures a `raw:<path>` identity with the standard instability warning. **expected** (runtime path **needs a Mac**). |
+| Identity: add by present raw path | ✅ | ✅ | Captures a `raw:<path>` identity with the standard instability warning. **verified** (a physical unplug→replug faults to `waiting` then heals to `active` at the same `cu.*` path). |
 | Identity: add by bare serial number | ✅ | ✖ unsupported | Needs the deferred IOKit resolver backend (§14). **cross-checked** (falls through to an empty adapter scan). |
 | Device-node convention | `/dev/ttyUSB*`, `/dev/ttyACM*` | `/dev/cu.*` | Use the **call-out** (`cu.*`) nodes, **not** `tty.*` (those block on carrier detect). **expected** (macOS convention). |
 | Root control socket | `/run/serialnexusd.sock` | `/run/serialnexusd.sock` | `/run` exists on macOS (symlink to `/var/run`). **expected.** |
@@ -88,9 +112,9 @@ way honestly.
 | Stale PTY symlink auto-recovery after a crash | ✅ | ✖ faults | Recovery is keyed on `/dev/pts` (Linux devpts); macOS pts nodes are `/dev/ttys###`, so a stale symlink is **not** reclaimed — the node faults instead. Minor degradation. **cross-checked.** |
 | Doctor P1 (EXTPROC/`TIOCPKT`) | ✅ | ❓ | Reports the real delta on a given Mac; a `degraded` verdict means §7.2 runs poll-only. **needs a Mac.** |
 | Doctor P2 (PTY presence / `POLLHUP`) | ✅ | ❓ | Presence detection is POSIX but the exact `POLLHUP` timing is **unverified.** **needs a Mac.** |
-| Doctor P3 (serial-port fit / UART cert) | ✅ | ➖ degrades | The `TIOCGICOUNT` clause reports unsupported; other clauses need a `--port`. **expected.** |
+| Doctor P3 (serial-port fit / UART cert) | ✅ | ✅ | Custom baud, `TIOCEXCL`, modem lines, break all pass on a named `--port`; only the `TIOCGICOUNT` sub-clause is absent. **verified** (P3 `supported` on both rig ports). |
 | Doctor P4 (by-id resolution) | ✅ | ➖ skipped | No by-id tree → `skipped ("no adapter")`. **cross-checked.** |
-| Doctor P5 (rig certification) | ✅ | ➖ skipped | Depends on `TIOCGICOUNT` for the error-counter clause; opt-in and rig-bound anyway. **expected.** |
+| Doctor P5 (rig certification) | ✅ | ➖ partial | Discovery **pairs both ports** (crossover proven bidirectionally); the counter-based characterization stays `skipped` — `p5_is_uart` gates on `TIOCGICOUNT`, Linux-only. **verified** (discovery) / cert Linux-only. |
 | Doctor env: `dialout`/`plugdev` membership | ✅ | ➖ skipped | `getgroups` is unavailable in nix on Apple, so supplementary membership is reported **unknown/skipped**. macOS serial access is governed by device-node ownership, not these groups. **cross-checked.** |
 | Doctor env: device-node access check | ✅ | ✅ (expected) | `access(2)` on the node path is cross-platform. **expected.** |
 

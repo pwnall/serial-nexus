@@ -136,8 +136,10 @@ cross-wired as a null modem (`/dev/cu.usbserial-BH00L4KU` ↔ `…-BH00LL8O`).
 **Now runtime-verified (was only "cross-checked"/"expected"):** `cargo build/test/fmt/clippy`
 (incl. `--no-default-features` and `--target x86_64-apple-darwin`) all clean; **156 tests pass,
 identical count to Linux**. Serial data plane on the real crossover cable: **32 KiB byte-exact
-both directions**, `send` verb reaches hardware, **TIOCEXCL enforced**, driver counters
-gracefully absent (TIOCGICOUNT is Linux-only). `serial2` opening `/dev/cu.*` works.
+both directions**, `send` verb reaches hardware, **a second open of a held port is refused**
+(TIOCEXCL is set unconditionally; on macOS `cu.*` is single-open at the driver layer regardless,
+so the refusal is real but not attributable to the ioctl alone — see the follow-up note below),
+driver counters gracefully absent (TIOCGICOUNT is Linux-only). `serial2` opening `/dev/cu.*` works.
 
 **Two real macOS defects — both contradicted docs/macos.md's *predicted* verdicts — FOUND and FIXED:**
 
@@ -195,6 +197,48 @@ rig `/dev/cu.usbserial-BH00L4KU ↔ …BH00LL8O` (~6.9 s of real serial transfer
 gracefully `null` (TIOCGICOUNT is Linux-only). This is the macOS serial gate — a pty cannot be a
 serial device there, so every other serial test self-skips and this exercises the real path via the
 daemon's own fast, lossless reader.
+
+**Follow-up: extended rig coverage + license gate + TIOCEXCL precision (same 2026-07-24 rig).** A
+post-validation multi-agent adversarial audit confirmed the core green is non-vacuous and surfaced
+runnable-but-unexercised coverage; commit `2c01170` closes the two agent-runnable gaps by adding two
+real-rig tests to `serial_hardware.rs`:
+
+- `crossover_rig_custom_baud_byte_exact` — byte-exact both directions at **250000** (32 KiB each way,
+  SHA-256), proving the FTDI actually *clocks* a high custom rate on the wire (P3 only proves the
+  driver stores/reads the divisor back). 9600 is deliberately omitted: the one-shot `Sim::client`
+  closes the injector pty on exit and races the slow drain (saw 3072/4096 B) — a **test-harness
+  artifact, not a targetward drop** (invariant #3 is guarded by
+  `targetward_oversize_chunk_is_fragmented_never_dropped`; a held-open direct-write probe was itself
+  flawed — cooked-mode pty `OPOST`/`ONLCR` corrupts binary data, so the injector must set raw mode).
+- `crossover_rig_signal_verbs` — `send-break`/`set-modem`/`pulse-dtr` driven end-to-end through the
+  daemon against a real UART (the Tier-3 property §13 defines the null modem to test; `p7_signals`
+  reaches only a pts, which `ENOTTY`s set-modem/pulse-dtr). Break is observed far-end as a **NUL**
+  (best-effort; deterministic frame-error detection needs Linux-only TIOCGICOUNT, so not asserted).
+
+All three rig tests share a process-wide `RIG` mutex (poison-tolerant `into_inner`) so they never
+contend the two physical ports under the default parallel harness. Shared `null_modem_cfg` /
+`inject_verify` / `boot_rig` helpers. Full suite now **248 pass / 0 fail / 4 ignored**; fmt+clippy clean.
+
+**Unplug→replug heal validated manually on the rig** (an agent can't pull a cable): a `serialnexusd`
+holding both ports via `serialnexusctl` — pull one adapter → its node → `waiting (device … lost)`
+while the other stays `active` and the graph is unchanged (config-vs-state split, invariant #7);
+replug → `active` in ~1 s at the **same stable `cu.usbserial-*` path** (termios + modem lines
+reapplied); a `send` nonce then crossed the healed wire. This is the §7/§12 "survive replug" property
+on real macOS hardware — the Linux `p7_replug`/`p7_unplug` self-skip there. `purged_on_reconnect`
+stayed 0 (no in-flight bytes to purge), which is correct.
+
+**License gate now PROVEN, not just configured** (it had been silently self-skipping): with
+`cargo-deny` installed, `cargo deny check licenses bans sources` is clean and `p0_license_gate`
+(plants a banned crate, asserts cargo-deny rejects it) passes — the permissive-only policy is
+demonstrated, not assumed.
+
+**TIOCEXCL precision (audit finding, docs corrected).** The daemon sets `TIOCEXCL` unconditionally
+(`nodes/serial.rs`) and a second open of a held port is genuinely refused, but macOS `cu.*` call-out
+devices are single-open at the driver layer regardless — so on macOS the refusal is real yet **not
+attributable to the ioctl alone** (doctor P3 confirms the ioctl is *accepted*, not that it is what
+refuses the open). The clean isolation — a second open that succeeds without TIOCEXCL and fails with
+it — is a Linux-rig property. `docs/macos.md` and the macOS-session summary above were reworded from
+the earlier "TIOCEXCL enforced" to the accurate "a second opener is refused" + this nuance.
 
 **Migration COMPLETE.** All of phases 0–8 (58 bash scripts) are ported to 43 `nexus-itest/tests/*.rs`
 files (**83 tests**, 1 `#[ignore]`d endurance soak), across three batches (0–4, 5–6, 7–8), each
