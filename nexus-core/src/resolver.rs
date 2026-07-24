@@ -167,11 +167,13 @@ impl Resolver {
                 reason: "expected usb:<vid>:<pid>:<serial>:<iface>".into(),
             });
         }
-        // A structurally meaningless identity — any empty field (`usb::::`,
-        // `usb:0403:6001::00`) — is rejected at add time rather than stored and
-        // dumped as a canonical `device` (§11). An absent serial/interface is
-        // spelled with the `-` marker, never empty.
-        if fields.iter().any(|f| f.is_empty()) {
+        // A structurally meaningless identity — any empty *or whitespace-only*
+        // field (`usb::::`, `usb:0403:6001::00`, `usb:0403:6001: :00`) — is rejected
+        // at add time rather than stored and dumped as a canonical `device` (§11).
+        // An absent serial/interface is spelled with the `-` marker, never empty and
+        // never blank; a blank field would never match a real sysfs identity, so it
+        // is malformed here for the same reason the empty form is (§12, §15.27).
+        if fields.iter().any(|f| f.trim().is_empty()) {
             return Err(ResolveError::Malformed {
                 input: input.to_owned(),
                 reason:
@@ -894,11 +896,13 @@ mod tests {
         let t = TmpTree::new();
         let r = Resolver::new(t.path());
         for input in [
-            "usb::::",           // all empty
-            "usb::6001:S:00",    // empty vid
-            "usb:0403::S:00",    // empty pid
-            "usb:0403:6001::00", // empty serial
-            "usb:0403:6001:S:",  // empty iface
+            "usb::::",            // all empty
+            "usb::6001:S:00",     // empty vid
+            "usb:0403::S:00",     // empty pid
+            "usb:0403:6001::00",  // empty serial
+            "usb:0403:6001:S:",   // empty iface
+            "usb:0403:6001: :00", // whitespace-only serial (§12, §15.27)
+            "usb: :6001:S:00",    // whitespace-only vid
         ] {
             assert!(
                 matches!(r.resolve_input(input), Err(ResolveError::Malformed { .. })),
