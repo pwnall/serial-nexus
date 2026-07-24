@@ -1,12 +1,93 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-24 (**phases 0-8 + simplification + extension + web-console tracks done**;
-the **v10 track is DONE** — plan §11.7–§11.9 + §16.11: default-on replay rings, tap byte
-offsets + instance nonce, browser-side OPFS history, and the bash retirement).
+**As of:** 2026-07-24 (**phases 0-8 + simplification + extension + web-console + v10 tracks done**;
+the **v11 console-map track is DONE** — plan §12 / design §7.8/§15.33: the per-console character
+`map` node).
 **Branch:** `implementation` (off `main`).
-**Normative docs are now v10:** `docs/22-design-claude-fable-v10.md` (design) and
-`docs/23-implementation-plan-claude-fable-v10.md` (plan). v1–v9 docs are in
-`docs/historical/`. Section references (§) point at the v10 design.
+**Normative docs are now v11:** `docs/24-design-claude-fable-v11.md` (design) and
+`docs/25-implementation-plan-claude-fable-v11.md` (plan). v1–v10 docs are in
+`docs/historical/`. Section references (§) point at the v11 design.
+
+---
+
+## v11 CONSOLE-MAP TRACK (plan §12 / design §7.8, §15.33) — DONE (2026-07-24 session, uncommitted)
+
+v11 = v10 + one new normative surface, the **map node**, plus three doc-catch-up tweaks that
+describe already-committed behavior (the §5 bulk-copy replay-ring tripwire wording, the §15.30
+doctor-P2 `termios_settable` discriminator sharpening, and the §2/§3 map mentions). **The two
+doc-catch-up code items were verified already-aligned, no change:** `tap::ReplayRing` is already a
+bulk `copy_from_slice` circular `Vec<u8>` (fix #2 from the v10 session), and doctor P2 already gates
+on `termios_settable` not `never_opened` (`probes.rs`). The only executable work was **plan §12**.
+
+**§12.1 — THE MAP NODE.** picocom's `--imap`/`--omap` byte mappings as a first-class **interior
+transform** (the first *non-codec* one), slotting into the endpoint-keyed wiring (§15.23) with
+**zero `Wiring::build` structural change** — purely via `shape()`, exactly as the design promised.
+- **Pure engine** `nexus-core/src/map.rs` (`#[forbid(unsafe)]`, property-tested): `Mapping` (the 14
+  picocom names), `MapDirection` (a compiled 256-entry first-match table + `k×` expansion bound),
+  `MapDirection::apply(input, out, on_rule)` — a stateless byte→byte-sequence substitution, first
+  match per byte wins, `on_rule` decouples the pure module from the daemon's `Cell` counters.
+  Faithful to picocom's `do_map`/`map2hex` (verified against source): hex form is `[xx]` lowercase;
+  `nrmhex` range is `0x20..=0x7e` (space included); `8bithex` is `0x80..=0xff`. Unit + proptests:
+  256-byte oracle per mapping, first-match ordering, k× output bound, chunk-boundary irrelevance.
+- **Config** `nexus-core/src/config.rs`: `NodeConfig::Map { name, hostward, targetward, arbitration,
+  replay_ring }`; `shape()` = a **host-facing default endpoint** (the mapped side, standard
+  lock/fan-out/tap/ring machinery) + a **target-facing `raw` endpoint** (`MAP_RAW_ENDPOINT = "raw"`,
+  addressed `node/raw`); `name()`/`replay_ring()`/`arbitration()` arms; `GraphConfig::validate()`
+  rejects an unknown mapping name → new `ValidationError::UnknownMapping` (graph.rs), **structural,
+  caught before any `--replace` teardown** so a bad map never destroys a good graph. Round-trip +
+  proptest cover the new variant.
+- **Node runtime** `nexus-daemon/src/nodes/map.rs` (`MapNode`, mirrors `codec.rs` but simpler — no
+  framing, no fragmentation): a hostward pump (raw upstream → map → mapped fan-out + tap/ring mirror,
+  lossy-at-boundary §5) and a targetward pump (consumer writes → map → upstream via `reacquire_held`,
+  the §6 held origin). Per-direction `bytes_in`/`bytes_out` + per-rule substitution counters in
+  `state_extra` (`Cell` on the runtime thread, `Rc`-shared — no borrow crosses `.await`, no `RefCell`).
+  Wired into the `Node` enum (mod.rs).
+
+**§12.2 — REFERENCE CONFIG + DOCS.** `packaging/serialnexusd.example.toml` gains an active mapped
+console (`quirky`/`qcon`: `hostward=["lfcrlf"]` normalizes bare LF, `targetward=["lfcr"]` satisfies
+CR). `docs/rpc/configuration.md` documents the map node, addressing, the full picocom vocabulary
+table, first-match ordering, and steal-to-bypass; `docs/rpc/observation.md` documents the per-rule /
+per-direction state counters; `README.md` architecture table gains a **map** row. Cross-links added.
+
+**⚠️ Adversarial audit (5-lens find→verify workflow, 11 agents) → the 3 core lenses (design-fidelity,
+data-plane-invariants, concurrency-lifecycle) found ZERO deviations; 5 findings CONFIRMED, all fixed
+or covered; do NOT regress:**
+1. **[correctness, the one real fix] a map raw edge that OMITS `write_mode` defaulted to on-demand,
+   which the held-origin targetward pump can't drive → parked forever.** Design §7.8 says the raw edge
+   "defaults to held". **Fixed** (`runtime.rs Wiring::build`): an omitted/`on-demand` edge whose target
+   is a map's `raw` endpoint is **promoted to `held`** (mirroring the log→never override); explicit
+   `held` passes through, explicit `never` is preserved for a read-only/display map. Docs updated
+   (config.rs `EdgeConfig`/`Map` docs, configuration.md). Regression:
+   `map_raw_edge_defaults_to_held_and_maps_targetward_at_volume` (omits `write_mode`, asserts
+   holder=`console/raw`, then targetward byte-exact at volume vs oracle + counters — would hang without
+   the fix).
+2. **[test] fully-deleted-chunk path (the `is_empty()` guards) untested** → `map_deletion_emits_nothing_for_a_fully_deleted_chunk` (`ignlf` deletes a lone `\n`; the device receives only a following survivor, proving the empty chunk emitted nothing while `bytes_in`/`ignlf` advance and `bytes_out` stays 0).
+3. **[test] targetward per-rule/per-direction counters never cross-checked** → the steal test now asserts targetward `bytes_in`/`bytes_out`/`rules.lfcrlf`.
+4. **[test] targetward byte-exactness only at ~5 bytes** → the new volume test drives 40 varied/LF-dense sends byte-exact vs an independent oracle.
+5. **[test] `raw.dropped_slow_consumer` never asserted** → surfaced-and-zero asserted in the volume test; a deterministic >0 firehose is infeasible (the map's hostward output is all-lossy so the pump never stalls on its own), and the counter uses the *identical* shared `DropCounters` machinery proven by `p3_counters`/`p3_exact_loss`, claimed at `map.rs` by one inspection-verified line. The "holdover-bound-under-Busy" finding was **REFUTED** (the map has no holdover slot — it is stateless; the k× proptest bounds interior memory and the design structurally precludes unbounded parking).
+
+**Gates (all green on the Linux 7.0 dev box):** `cargo fmt --all --check`; `cargo clippy --workspace
+--all-targets` (+ minimal `--no-default-features`); `cargo deny check licenses bans sources`;
+`cargo check --target x86_64-apple-darwin --workspace --exclude serialnexusweb`; and `cargo test
+--workspace --locked` — **265 passed / 0 failed / 4 ignored**. New tests: `nexus-itest/tests/p8_map.rs`
+(6 tests — 1 cross-platform config-validation + 1 unknown-mapping + 4 serial-device-gated data-plane,
+self-skipping on macOS) plus the `nexus-core` map unit/proptests.
+
+**REAL TIER-3 HARDWARE VALIDATION (2026-07-24, two FTDI FT232R adapters cross-wired on the 7.0 box:
+`/dev/ttyUSB0` `usb:0403:6001:BH00LL8O:00` ↔ `/dev/ttyUSB1` `usb:0403:6001:BH00L4KU:00`).** `nexus-doctor
+--port /dev/ttyUSB0 --port /dev/ttyUSB1` = **15 supported / 0 degraded / 0 unsupported** (P2 supported —
+the §15.30 fix holds; P5 certifies the pair both directions, `rate_ladder=true
+deliberate_mismatch_observed=true`); baseline passes `expectations/linux.jq`. The full suite run with
+`SNX_CROSSOVER_A`/`_B` set = **265 pass / 0 fail** with all four `serial_hardware.rs` rig tests actually
+*running* (not skipping): the three pre-existing (byte-exact bidi @115200 + `send` + TIOCEXCL; custom
+baud @250000; the signal verbs) **plus a NEW `crossover_rig_map_node_both_directions`** — the v11 map
+node driven over the physical wire: its raw edge omits `write_mode` (so it doubles as the **held-default
+fix's real-silicon regression** — `port0` holder becomes `console/raw`), targetward `send console` →
+`lfcrlf` → `port0` TX → wire → `port1` RX byte-exact against the oracle, and hostward CR-laden `send
+port1` → wire → `port0` RX → `crlf` map → the mapped log byte-exact, per-rule counters confirmed. **The
+one thing still owed: the map's real-browser visual check** (the web console rendering the mapped stream,
+plan §12.2) — an agent can't drive a browser, so it rides the manual checklist (§16.7), like the OPFS
+round-trip.
 
 ---
 

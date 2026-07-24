@@ -44,6 +44,7 @@ attached edge, and one exclusive write lock arbitrates who may write back.
 | **codec** | Interior protocol transform: splits one multiplexed stream into N named channels (or re-multiplexes them), framing knowledge staying inside the node (§7.5). |
 | **exec-codec** | The escape hatch: a `codec` node with `codec = "exec"` that runs an external child process speaking a documented envelope protocol on stdin/stdout, so protocol tools under any license can be wrapped without linking (§7.6). |
 | **leg** | Cross-daemon transport: carries every channel multiplexed over one TCP or Unix socket to a peer daemon, loopback-only unless explicitly opted out (§7.4). |
+| **map** | Per-console character map: picocom's `--imap`/`--omap` byte mappings (bare-LF fix, CR-expecting input, hex display) applied once in configuration so every consumer sees the corrected stream; a stateless interior transform, not a codec ([§7.8](docs/rpc/configuration.md#the-map-node--character-mapping-78)). |
 | **existing-terminal** | *(design-specified, §7.7; not yet implemented in 0.2.0)* connects to a pre-existing PTY or tty by path — a QEMU console, a simulator, a mock device. |
 
 ## Five-minute quickstart

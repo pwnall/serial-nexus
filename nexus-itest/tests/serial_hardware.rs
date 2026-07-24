@@ -324,3 +324,141 @@ fn crossover_rig_signal_verbs() {
         &delta[..delta.len().min(16)]
     );
 }
+
+/// The v11 **map node** (§7.8) driven over the physical crossover rig — the map's
+/// data plane is sim-exercisable (`p8_map.rs` on a Linux null modem), but per the
+/// §16.7 doctrine the new node also earns a real-silicon drive. A `map` sits in front
+/// of `port0`: its held raw edge OMITS `write_mode`, so this doubles as the on-real-
+/// hardware regression for the audit's held-default fix (an omitted map raw edge must
+/// acquire the upstream lock, not park). Both directions are checked byte-exact over
+/// the wire against an independent oracle:
+///
+/// * **targetward** — `send console` (mapped side) → `lfcrlf` → `port0` TX → wire →
+///   `port1` RX → `rx1`, which must equal the oracle-mapped line;
+/// * **hostward** — `send port1` (raw, CR-laden) → wire → `port0` RX → `crlf` map →
+///   `maplog`, the mapped view, which must equal the CR→LF oracle.
+#[test]
+fn crossover_rig_map_node_both_directions() {
+    let Some((p0, p1)) = crossover_ports() else {
+        eprintln!("SKIP crossover_rig_map_node_both_directions: no crossover rig");
+        return;
+    };
+    let _rig = rig_guard();
+    eprintln!("crossover rig (map node): {p0} <-> {p1}");
+
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let run_dir = d.run().path().to_path_buf();
+    // port0 is exclusive so the map genuinely HOLDS its write lock; port1 is
+    // free-for-all so `send port1` (the raw hostward injection) needs no ceremony.
+    // The map's raw edge omits write_mode → must default to held (the audit fix).
+    let cfg = format!(
+        r#"
+[[node]]
+type = "serial"
+name = "port0"
+device = "{p0}"
+baud = 115200
+[[node]]
+type = "serial"
+name = "port1"
+device = "{p1}"
+baud = 115200
+arbitration = "free-for-all"
+[[node]]
+type = "map"
+name = "console"
+hostward = ["crlf"]
+targetward = ["lfcrlf"]
+[[node]]
+type = "log"
+name = "maplog"
+directory = "{dir}"
+filename = "maplog.log"
+[[node]]
+type = "log"
+name = "rx1"
+directory = "{dir}"
+filename = "rx1.log"
+[[edge]]
+a = "port0"
+b = "console/raw"
+[[edge]]
+a = "console"
+b = "maplog"
+write_mode = "never"
+[[edge]]
+a = "port1"
+b = "rx1"
+write_mode = "never"
+"#,
+        dir = run_dir.display(),
+    );
+    rpc.load_toml(&cfg, false).expect("load map rig config");
+    for node in ["port0", "port1", "console"] {
+        assert!(
+            rpc.wait_status(node, "active", Duration::from_secs(20)),
+            "{node} not active: {:?}",
+            rpc.node(node)
+        );
+    }
+
+    // The audit fix on real hardware: an omitted map raw-edge write_mode defaults to
+    // `held`, so the map acquires port0's lock on attach (holder = "console/raw").
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            rpc.node("port0")
+                .and_then(|n| n["lock"]["holder"].as_str().map(str::to_owned))
+                == Some("console/raw".to_owned())
+        }),
+        "an omitted map raw-edge write_mode must default to held on real hardware (§7.8): {:?}",
+        rpc.node("port0")
+    );
+
+    // Let both FTDIs settle at line rate before the first byte (the P5 first-byte
+    // garble at 115200+); short exact-match messages are unforgiving of a garbled byte.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // --- Targetward over the wire: send at the map → lfcrlf → port0 TX → port1 RX ---
+    let rx1 = run_dir.join("rx1.log");
+    rpc.send("console", "MAP-TARGET-hello", false, 5000)
+        .expect("send console (targetward through the map)");
+    // "MAP-TARGET-hello" + the send's trailing '\n' → lfcrlf → ...hello\r\n.
+    let want_rx1 = b"MAP-TARGET-hello\r\n".to_vec();
+    assert!(
+        wait_until(Duration::from_secs(10), || std::fs::read(&rx1)
+            .map(|b| b == want_rx1)
+            .unwrap_or(false)),
+        "targetward map output did not cross the wire byte-exact; rx1={:?}",
+        std::fs::read(&rx1).unwrap_or_default()
+    );
+
+    // --- Hostward over the wire: send raw (CR-laden) at port1 → port0 RX → crlf map ---
+    let maplog = run_dir.join("maplog.log");
+    rpc.send("port1", "MAP\rHOST\rEND", false, 5000)
+        .expect("send port1 (raw hostward injection)");
+    // port1 TX = "MAP\rHOST\rEND\n"; crlf maps each CR(0x0d)→LF(0x0a); the trailing \n
+    // is untouched → "MAP\nHOST\nEND\n" in the mapped view.
+    let want_maplog = b"MAP\nHOST\nEND\n".to_vec();
+    assert!(
+        wait_until(Duration::from_secs(10), || std::fs::read(&maplog)
+            .map(|b| b == want_maplog)
+            .unwrap_or(false)),
+        "hostward map output (CR→LF) did not match the oracle; maplog={:?}",
+        std::fs::read(&maplog).unwrap_or_default()
+    );
+
+    // The map's per-direction/per-rule counters reflect the two mapped lines.
+    let node = rpc.node("console").expect("map node in state");
+    assert_eq!(
+        node["targetward"]["rules"]["lfcrlf"].as_u64(),
+        Some(1),
+        "targetward lfcrlf fired once (the one LF in the sent line): {node}"
+    );
+    assert_eq!(
+        node["hostward"]["rules"]["crlf"].as_u64(),
+        Some(2),
+        "hostward crlf fired for both CRs in the injected line: {node}"
+    );
+    eprintln!("map node byte-exact both directions over the physical crossover ✓");
+}

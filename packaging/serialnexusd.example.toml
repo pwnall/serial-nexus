@@ -58,6 +58,53 @@ a = "usb0"
 b = "cap"
 write_mode = "never"
 
+# --- A quirky console, normalized once with a map node (§7.8) --------------------
+#
+# Some consoles emit bare LF (no CR) and expect CR on input. Instead of re-teaching
+# every terminal, log, and remote session that quirk (picocom --imap/--omap on each),
+# a `map` node fixes it in ONE place, and every consumer — PTY, log, leg, web console
+# — sees the corrected stream. The map is an interior transform, not a codec: no
+# channels, no frames, just a stateless byte substitution (§7.8).
+
+[[node]]
+type = "serial"
+name = "quirky"
+device = "usb:0403:6001:BH00LL8O:00"
+
+# hostward = device -> consumers (picocom's --imap): this console emits bare LF, so
+#   `lfcrlf` turns each LF into CR LF and terminals/logs render clean line breaks.
+# targetward = consumers -> device (picocom's --omap): the console's line editor wants
+#   CR, so `lfcr` turns the Enter key's LF into the CR the firmware expects.
+# Within a direction the FIRST matching rule per input byte wins, so list order
+# resolves conflicts deterministically (§7.8). An unknown mapping name fails the load.
+[[node]]
+type = "map"
+name = "qcon"
+hostward = ["lfcrlf"]
+targetward = ["lfcr"]
+
+[[node]]
+type = "pty"
+name = "qterm"
+path = "/run/serialnexusd/quirky"
+
+# The serial feeds the map's RAW upstream side (`qcon/raw`, a `node/raw` address),
+# `held` so the map owns the console's writes — like a demux's edge to its serial, but
+# with softer stakes: bypassing a map is merely unmapped, not corrupt, so a
+# `serialnexusctl send quirky --steal` injects RAW bytes past the map (§7.8). The
+# map's MAPPED side is the bare node name `qcon`; `send qcon` speaks the mapped stream.
+[[edge]]
+a = "quirky"
+b = "qcon/raw"
+write_mode = "held"
+
+# The map's mapped side (its default endpoint, addressed as the bare node name) fans
+# out to consumers — here the operator PTY (§4). A log or a leg channel could attach
+# here too, all seeing the corrected stream.
+[[edge]]
+a = "qcon"
+b = "qterm"
+
 # --- The reference topology (§2), for reference ---------------------------------
 #
 # To split one multiplexed UART into named channels and forward them to a second

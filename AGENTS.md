@@ -3,7 +3,7 @@
 Orientation for an AI agent (or human) picking this repo up cold. It captures what
 the code *is*, how to build/verify it, and the hard-won invariants you must not
 regress. When this file and the design disagree, **the design wins** — see
-`docs/22-design-claude-fable-v10.md`.
+`docs/24-design-claude-fable-v11.md`.
 
 ---
 
@@ -32,7 +32,10 @@ same identity), `pty` (interactive pseudo-terminal + stable symlink), `log`
 (interior demux/re-mux, framing stays inside the node), `exec`-codec (a `codec` running
 an external child speaking the envelope protocol on stdin/stdout — the any-language
 escape hatch), `leg` (cross-daemon transport, every channel multiplexed over one
-TCP/Unix socket, loopback-only unless opted out). `existing-terminal` (§7.7) is
+TCP/Unix socket, loopback-only unless opted out), `map` (§7.8 — a stateless per-console
+character transform: picocom's `--imap`/`--omap` byte mappings applied once in config; the
+first *non-codec* interior transform, host-facing default endpoint + a target-facing `raw`
+endpoint, raw edge defaults to `held` with steal-to-bypass). `existing-terminal` (§7.7) is
 *design-specified but not implemented*.
 
 ## 2. Current status (read this first)
@@ -46,13 +49,19 @@ TCP/Unix socket, loopback-only unless opted out). `existing-terminal` (§7.7) is
   -D warnings` (+ the minimal-daemon clippy); `cargo deny check`. **The whole suite runs on
   macOS too** (serial-*device* tests self-skip there — §7 — and the real crossover-hardware
   test runs when a rig is attached).
-- **All planned phases 0–8 are done**, plus four post-1.0 tracks: the simplification
+- **All planned phases 0–8 are done**, plus five post-1.0 tracks: the simplification
   track (design §16 / plan §9), the out-of-tree-codec extension track (design §15.26 /
-  plan §10), the web console track (design §17 / plan §11.1–§11.6), and the **v10 track**
+  plan §10), the web console track (design §17 / plan §11.1–§11.6), the **v10 track**
   (design §15.32 / plan §11.7–§11.9 + §16.11): **default-on replay rings** (64 KiB on every
   host-facing endpoint, per-channel on codec/exec/leg, opt out with `replay_ring = 0`),
   **tap byte offsets** (`tap.data.offset`, `tap.open`'s `from_offset`, `info.instance`
-  nonce), **browser-side OPFS history** in `serialnexusweb`, and the bash retirement.
+  nonce), **browser-side OPFS history** in `serialnexusweb`, and the bash retirement; and
+  the **v11 console-map track** (design §7.8/§15.33 / plan §12): the **`map` node** — a
+  stateless per-console character transform (picocom's byte mappings), the first non-codec
+  interior transform, slotting into the endpoint-keyed wiring with no `Wiring::build`
+  structural change. Its raw edge defaults to `held` (an omitted/on-demand map raw edge is
+  promoted to `held` in `Wiring::build`, mirroring the log→never override; `never` makes a
+  read-only map).
 - **Deferred / not implemented on purpose:** design §14 items, and RPC verbs `connect` /
   `disconnect` / `set-attribute` (they return `-32601`). `existing-terminal` node (§7.7).
 - **Open review items:** the Opus comprehensive code review is `docs/19-claude-opus-code-review.md`;
@@ -93,7 +102,8 @@ Dependency direction: `nexus-daemon` → {`nexus-core`, `nexus-rpc`, `nexus-sys`
 - `cell.rs` — `CriticalCell`, the `RefCell` wrapper that makes "a borrow never crosses `.await`" a compile-shape fact (§16.2).
 - `registry.rs` — codec `Registry` value (`with_builtins`/`register`); **no dynamic loading** (§8/§15.26).
 - `tap.rs` — connection-scoped taps + per-endpoint replay ring (§5/§6/§17).
-- `nodes/` — `Node` enum + per-node runtimes: `serial`, `pty`, `log`, `codec`, `exec`, `leg`.
+- `nodes/` — `Node` enum + per-node runtimes: `serial`, `pty`, `log`, `codec`, `exec`, `leg`, `map`.
+  (`map.rs` is the §7.8 character-map node; its pure transform engine is `nexus-core/src/map.rs`.)
 
 ## 4. Build / test / lint (exact commands)
 
@@ -285,7 +295,7 @@ running engineering log and the authoritative "why the code looks like this" rec
 ## 9. How work has been done here (the working rhythm)
 
 - **Design/plan pairs are version-suffixed and monotonic.** The newest pair lives in
-  `docs/` (currently v10: `22-design-…-v10.md` + `23-implementation-plan-…-v10.md`);
+  `docs/` (currently v11: `24-design-…-v11.md` + `25-implementation-plan-…-v11.md`);
   superseded generations move to `docs/historical/`. `§N` always means the *current*
   normative design. ADRs are numbered subsections under design **§15.x** (plus §16
   post-completion review, §17 web console). The RPC method-by-method reference is

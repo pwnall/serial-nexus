@@ -32,7 +32,7 @@ Each node object carries:
 | `name` | string | the node name |
 | `status` | string | `active`, `waiting`, or `faulted` |
 | `reason` | string | present only for `waiting`/`faulted`: why |
-| *(node-type extras)* | varies | observed counters/details for the node kind (e.g. serial driver counters, log/leg/exec/codec internals) — observed-only, disjoint from config |
+| *(node-type extras)* | varies | observed counters/details for the node kind (e.g. serial driver counters, log/leg/exec/codec internals, [map substitution counters](#map-node-state)) — observed-only, disjoint from config |
 | `lock` | `LockSnapshot` | present on a single-endpoint node (e.g. serial): its host-facing endpoint's write lock |
 | `channels` | object | present on a multi-endpoint node (e.g. codec): `channels[<channel>].lock` is each channel's `LockSnapshot` |
 
@@ -71,6 +71,37 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"state"}' | nc -U "$SOCK" | jq
       }
     }
   ]
+}
+```
+
+### Map node state
+
+A [`map`](configuration.md#the-map-node--character-mapping-78) node reports its
+observed transform activity as node-type extras — the cheap way to discover which
+quirk a mystery console actually has (§7.8). Each direction (`hostward`,
+`targetward`) carries:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `bytes_in` | integer | input bytes seen in this direction |
+| `bytes_out` | integer | output bytes produced (differs from `bytes_in` when rules expand or delete) |
+| `rules` | object | per-rule substitution counts, keyed by mapping name — how many input bytes each configured rule actually substituted (a shadowed rule stays `0`) |
+
+A `raw.dropped_slow_consumer` count surfaces hostward bytes the upstream dropped
+because the map's raw-side intake was full (§5 — the map falling behind, counted
+where it happens, like a codec's multiplexed-side drop count). The map's mapped
+endpoint's write lock appears in the top-level `lock` field, like any single
+host-facing-endpoint node.
+
+```console
+$ serialnexusctl --json state | jq '.nodes[] | select(.name=="console")'
+{
+  "name": "console",
+  "status": "active",
+  "hostward": { "bytes_in": 4096, "bytes_out": 4103, "rules": { "lfcrlf": 7 } },
+  "targetward": { "bytes_in": 12, "bytes_out": 12, "rules": { "lfcr": 1 } },
+  "raw": { "dropped_slow_consumer": 0 },
+  "lock": { "arbitration": "exclusive", "holder": null, "origins": [], "waiters": [] }
 }
 ```
 

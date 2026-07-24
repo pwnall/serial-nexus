@@ -377,6 +377,14 @@ impl Wiring {
         // alongside single-endpoint boundary nodes.
         let mut facing: HashMap<EndpointAddr, (Facing, Arbitration)> = HashMap::new();
         let mut is_log: HashMap<&str, bool> = HashMap::new();
+        // A map node's raw (target-facing) endpoint addresses (§7.8). The map's edge
+        // into the upstream is `held` by default — the map owns the console's writes,
+        // with steal-to-bypass as the sanctioned raw path — but the generic edge
+        // default is `on-demand`, which a held-origin interior pump cannot drive (it
+        // would park forever), so an omitted/on-demand map raw edge is promoted to
+        // `held` below, mirroring the log→never override.
+        let mut is_map_raw: std::collections::HashSet<EndpointAddr> =
+            std::collections::HashSet::new();
         // A serial node's configured hostward-consumer drop policy (§5, §7.1): the
         // fan-out buffer depth to each of its consumers. Other producers (codec
         // channels) use the built-in default.
@@ -408,6 +416,12 @@ impl Wiring {
             } = n
             {
                 host_hostward_depth.insert(n.name(), *hostward_buffer);
+            }
+            if matches!(n, NodeConfig::Map { .. }) {
+                is_map_raw.insert(EndpointAddr::channel(
+                    n.name(),
+                    nexus_core::config::MAP_RAW_ENDPOINT,
+                ));
             }
         }
 
@@ -464,10 +478,22 @@ impl Wiring {
 
             // Register this attachment as an origin on the host endpoint's lock
             // (§6), labelled by the target's address so `lock`/`unlock` can name
-            // it. A log target is inherently `never`; every other edge carries its
-            // declared mode. The origin's label is its display address.
+            // it. A log target is inherently `never`; a map's raw edge is `held` by
+            // default (§7.8); every other edge carries its declared mode. The
+            // origin's label is its display address.
             let mode = if is_log.get(target.node.as_str()).copied().unwrap_or(false) {
                 WriteMode::Never
+            } else if is_map_raw.contains(target) && edge.write_mode == WriteMode::OnDemand {
+                // A map's edge into the upstream endpoint defaults to `held` (§7.8):
+                // the map owns the console's writes and holds the upstream lock, with
+                // steal-to-bypass as the sanctioned raw path. The generic edge default
+                // is `on-demand`, which the held-origin targetward pump cannot drive
+                // (`reacquire_held` only grants a `held` origin, so on-demand would
+                // park forever). Promote the default here — mirroring the log→never
+                // override — so an omitted `write_mode` yields the working held path.
+                // Explicit `held` passes through unchanged; explicit `never` is
+                // preserved for a read-only/display map (no targetward path).
+                WriteMode::Held
             } else {
                 edge.write_mode
             };

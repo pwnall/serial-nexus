@@ -10,6 +10,7 @@ pub mod codec;
 pub mod exec;
 pub mod leg;
 pub mod log;
+pub mod map;
 pub mod pty;
 pub mod serial;
 
@@ -26,6 +27,7 @@ pub enum Node {
     Codec(codec::CodecNode),
     Exec(exec::ExecCodecNode),
     Leg(leg::LegNode),
+    Map(map::MapNode),
 }
 
 impl Node {
@@ -65,6 +67,10 @@ impl Node {
                 registry.build(codec_name, attributes)?,
             )),
             NodeConfig::Leg { .. } => Node::Leg(leg::LegNode::create(config)),
+            // A map node (§7.8): a stateless interior character transform. Its
+            // mapping names were validated structurally before any teardown; a parse
+            // failure here is a defensive structural `Err`, never a panic.
+            NodeConfig::Map { .. } => Node::Map(map::MapNode::create(config)?),
         })
     }
 
@@ -84,6 +90,7 @@ impl Node {
             Node::Codec(n) => &n.name,
             Node::Exec(n) => &n.name,
             Node::Leg(n) => &n.name,
+            Node::Map(n) => &n.name,
         }
     }
 
@@ -95,6 +102,7 @@ impl Node {
             Node::Codec(n) => n.status(),
             Node::Exec(n) => n.status(),
             Node::Leg(n) => n.status(),
+            Node::Map(n) => n.status(),
         }
     }
 
@@ -108,6 +116,7 @@ impl Node {
             Node::Codec(n) => n.state_extra(),
             Node::Exec(n) => n.state_extra(),
             Node::Leg(n) => n.state_extra(),
+            Node::Map(n) => n.state_extra(),
         }
     }
 
@@ -142,6 +151,7 @@ impl Node {
             Node::Codec(n) => n.start(wiring),
             Node::Exec(n) => n.start(wiring),
             Node::Leg(n) => n.start(wiring),
+            Node::Map(n) => n.start(wiring),
         }
     }
 
@@ -174,6 +184,7 @@ impl Node {
             Node::Codec(n) => n.teardown(),
             Node::Exec(n) => n.teardown(),
             Node::Leg(n) => n.teardown(),
+            Node::Map(n) => n.teardown(),
         }
     }
 }

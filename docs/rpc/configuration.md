@@ -211,3 +211,94 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"dump"}' | nc -U "$SOCK" | jq 
   "edges": []
 }
 ```
+
+---
+
+## The `map` node — character mapping (§7.8)
+
+A `map` node is a per-console **character-mapping transform**: picocom's
+`--imap`/`--omap` byte mappings made a place in the graph instead of a flag on
+every terminal, log, and remote session (design §7.8, §15.33). It is deliberately
+*not* a codec — no channels, no frames — just a stateless byte-to-byte-sequence
+substitution.
+
+**Shape and addressing.** A map has two endpoints. Its **mapped** side is the
+host-facing default endpoint, addressed by the bare node name and carrying the
+standard write-lock, fan-out, tap, and replay-ring machinery — so consumers (PTY,
+log, leg, tap, web console) attach here and see the corrected stream. Its **raw**
+side is the target-facing endpoint, addressed as `node/raw`; the upstream endpoint
+whose bytes it maps attaches there. Because both the upstream endpoint and the map
+carry a default replay ring, a **raw view and a mapped view coexist** by default.
+
+```toml
+[[node]]
+type = "map"
+name = "console"
+hostward = ["lfcrlf"]   # device -> consumers (picocom --imap)
+targetward = ["lfcr"]   # consumers -> device (picocom --omap)
+# arbitration (default "exclusive") and replay_ring (default 65536) apply to the
+# mapped host-facing endpoint, exactly as for any other host endpoint.
+
+[[edge]]                 # the serial feeds the map's RAW side, held (see below)
+a = "usb0"
+b = "console/raw"
+write_mode = "held"
+
+[[edge]]                 # the map's MAPPED side fans out to consumers
+a = "console"
+b = "some-pty"
+```
+
+**Direction names, not flow names.** The two lists are named by the *direction of
+the bytes they transform*, never the flow-relative input/output vocabulary rejected
+everywhere else in the schema (§15.3): `hostward` is picocom's `--imap` (device
+toward consumers), `targetward` is `--omap` (consumers toward device). An empty (or
+omitted) list is the identity.
+
+**First match wins.** Within a direction the rules are an *ordered* list; for each
+input byte, the **first** rule whose match-set contains it fires, and the rest are
+shadowed. Order therefore resolves conflicts deterministically —
+`["igncr", "crlf"]` deletes CR, `["crlf", "igncr"]` translates it. (This differs
+from picocom, which applies a fixed internal priority; here the operator's list
+order *is* the priority.) An **unknown mapping name is a structural error** naming
+the offender — caught before any teardown under `--replace`, so a bad name never
+destroys a good graph.
+
+**The held edge and steal-to-bypass.** The map's edge into the upstream endpoint
+**defaults to `held`** — the demux's pattern with softer stakes: bypassing a map is
+not corruption, merely unmapped. Because the generic edge default is `on-demand`
+(which a held-origin transform pump cannot drive), an **omitted or `on-demand`**
+`write_mode` on the raw edge is treated as `held` at runtime; write `held` explicitly
+if you prefer (the shipped example does). An explicit `never` instead makes a
+**read-only/display map** with no targetward path. `send` at the map's endpoint
+(`send console`) speaks the mapped stream; a `send --steal` at the *upstream*
+endpoint (`send usb0 --steal`) ousts the map transiently and injects raw bytes
+verbatim, the map reclaiming its held edge afterward (§6 held priority).
+
+### The mapping vocabulary (picocom's)
+
+| Name | Matches | → Output | Expansion |
+| --- | --- | --- | --- |
+| `crlf` | CR (`0x0d`) | LF (`0x0a`) | 1 |
+| `crcrlf` | CR | CR LF | 2 |
+| `igncr` | CR | *(deleted)* | 0 |
+| `lfcr` | LF (`0x0a`) | CR | 1 |
+| `lfcrlf` | LF | CR LF | 2 |
+| `ignlf` | LF | *(deleted)* | 0 |
+| `bsdel` | BS (`0x08`) | DEL (`0x7f`) | 1 |
+| `delbs` | DEL (`0x7f`) | BS (`0x08`) | 1 |
+| `spchex` | SPACE (`0x20`) | `[20]` | 4 |
+| `tabhex` | TAB (`0x09`) | `[09]` | 4 |
+| `crhex` | CR | `[0d]` | 4 |
+| `lfhex` | LF | `[0a]` | 4 |
+| `8bithex` | any `0x80..=0xff` | `[xx]` | 4 |
+| `nrmhex` | any printable `0x20..=0x7e` | `[xx]` | 4 |
+
+The hex-display form is `[` + two lowercase hex digits + `]`, matching picocom's
+`map2hex`. `nrmhex` covers every printable ASCII byte **including space** (picocom's
+`0x20..=0x7e`); `spchex`/`tabhex` exist to hex *only* space or tab. Output is bounded
+at `k ×` input, where `k` is the largest expansion among the active rules (the
+right-hand column), which keeps the §5 interior holdover bounded across the map.
+
+Per-rule and per-direction substitution counters are observed state, reported by
+[`state`](observation.md#map-node-state).

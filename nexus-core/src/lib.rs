@@ -15,6 +15,8 @@
 //! * [`lock`] — the per-endpoint write-arbitration state machine (§6): who may
 //!   write targetward, with holder and purge accounting. Pure; the daemon shares
 //!   it between the control plane and the origin read tasks.
+//! * [`map`] — the map node's stateless character-mapping transform (§7.8, §15.33):
+//!   picocom's byte mappings as a first-match table, property-tested here.
 //! * [`config`] / [`state`] — the strict configuration/state split (§15.8),
 //!   enforced by the type system: state fields do not exist in configuration
 //!   types.
@@ -23,6 +25,7 @@ pub mod config;
 pub mod data;
 pub mod graph;
 pub mod lock;
+pub mod map;
 pub mod resolver;
 pub mod state;
 

@@ -293,6 +293,12 @@ pub enum ValidationError {
     /// be at least one chunk deep. Checked at the config level (the depth is a
     /// plain scalar the topology model never sees), naming the offender.
     ZeroHostwardBuffer { node: String },
+    /// A map node lists a mapping name that is not in picocom's vocabulary (§7.8):
+    /// an unknown name is a structural error, so a bad map never grows a graph or,
+    /// under `--replace`, destroys a good one. Checked at the config level (the
+    /// mapping lists are opaque strings the topology model never sees), naming the
+    /// offending node and mapping.
+    UnknownMapping { node: String, mapping: String },
 }
 
 impl fmt::Display for ValidationError {
@@ -378,6 +384,12 @@ impl fmt::Display for ValidationError {
                 write!(
                     f,
                     "node {node:?} declares hostward_buffer = 0, which would drop nearly all hostward output (must be at least 1, §5)"
+                )
+            }
+            ValidationError::UnknownMapping { node, mapping } => {
+                write!(
+                    f,
+                    "map node {node:?} lists unknown mapping {mapping:?} (not in picocom's vocabulary, §7.8)"
                 )
             }
         }

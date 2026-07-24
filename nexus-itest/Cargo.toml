@@ -19,3 +19,7 @@ libc.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# The packaging example config is structurally validated against the real graph
+# validator (plan §12.2 "the example config load-verifies with the map present"),
+# with no daemon and no filesystem side effects.
+nexus-core = { path = "../nexus-core" }

@@ -16,6 +16,15 @@ use crate::graph::{
     Arbitration, DEFAULT_ENDPOINT, EdgeSpec, EndpointAddr, EndpointSpec, Facing, GraphModel,
     NodeShape, ValidationError, WriteMode,
 };
+use crate::map::Mapping;
+
+/// The reserved local name of a map node's target-facing (unmapped, upstream-side)
+/// endpoint (§7.8). A map's host-facing side is its *default* endpoint (addressed by
+/// the bare node name, carrying the standard lock/fan-out/tap/ring machinery); its
+/// target-facing side — the edge into the upstream endpoint whose bytes it maps — is
+/// addressed as `node/raw`. A map has no channel list, so this reserved name cannot
+/// collide with an operator-declared identity.
+pub const MAP_RAW_ENDPOINT: &str = "raw";
 
 /// A complete graph configuration: the exact shape `dump` emits and `load`
 /// accepts (§11).
@@ -121,6 +130,27 @@ impl GraphConfig {
                     errors.push(ValidationError::EmptyLeg { node: name.clone() });
                 }
             }
+            // A map's mapping lists are opaque strings the topology model never sees,
+            // so — like the leg checks above and the codec attribute schema — an
+            // unknown mapping name is validated here at the config level (§7.8). This
+            // runs before any teardown in `load --replace`, so a bad name can never
+            // destroy a good graph, matching the codec precheck's guarantee.
+            if let NodeConfig::Map {
+                name,
+                hostward,
+                targetward,
+                ..
+            } = node
+            {
+                for mapping in hostward.iter().chain(targetward) {
+                    if Mapping::from_name(mapping).is_none() {
+                        errors.push(ValidationError::UnknownMapping {
+                            node: name.clone(),
+                            mapping: mapping.clone(),
+                        });
+                    }
+                }
+            }
         }
         errors.extend(self.to_model().validate());
         errors
@@ -161,13 +191,16 @@ fn is_loopback_addr(address: &str) -> bool {
 pub struct EdgeConfig {
     pub a: EndpointAddr,
     pub b: EndpointAddr,
-    /// Write-arbitration mode for this edge (§6). Note: on an edge whose target is
-    /// an inherently read-only node (a log, §7.3), the runtime forces the effective
-    /// mode to `never` regardless of the value configured here — the log origin
-    /// gets no targetward path and no lock handle (`Wiring::build`). The configured
-    /// value still round-trips verbatim through `dump`/`load`, so a persisted
-    /// `held`/`on-demand` on a log edge is cosmetic and does not reflect runtime
-    /// behavior.
+    /// Write-arbitration mode for this edge (§6). Two runtime overrides exist, both
+    /// applied in the daemon's `Wiring::build`: on an edge whose target is an
+    /// inherently read-only node (a log, §7.3) the effective mode is forced to
+    /// `never` (the log gets no targetward path and no lock handle); and on a map's
+    /// raw edge (target = `node/raw`, §7.8) an omitted or `on-demand` mode is promoted
+    /// to `held`, since a map owns the console's writes and a held-origin pump cannot
+    /// run on-demand — an explicit `never` there instead makes a read-only map. The
+    /// configured value still round-trips verbatim through `dump`/`load`, so a
+    /// persisted value that an override supersedes is cosmetic and does not reflect
+    /// runtime behavior.
     #[serde(default)]
     pub write_mode: WriteMode,
 }
@@ -359,6 +392,45 @@ pub enum NodeConfig {
         /// fields, which TOML's array-of-tables syntax requires.
         channels: Vec<String>,
     },
+    /// Map node (§7.8, §15.33): a stateless per-console character-mapping transform.
+    /// One host-facing default endpoint (the *mapped* side, addressed by the bare
+    /// node name and carrying the standard write-lock / fan-out / tap / replay-ring
+    /// machinery) and one target-facing endpoint (the *raw*, unmapped upstream side,
+    /// addressed as `node/raw` — [`MAP_RAW_ENDPOINT`]). Deliberately **not** a codec:
+    /// no channels, no frames, no resync — just §5's interior contract at its
+    /// simplest, so both a raw view (the upstream endpoint's ring) and a mapped view
+    /// (this node's ring) exist by default.
+    ///
+    /// The map's edge into the upstream endpoint **defaults to `held`** (§7.8) — the
+    /// demux's pattern with softer stakes: bypassing a map is not corruption, merely
+    /// unmapped, so steal-to-bypass is a legitimate, visible act. `send` at this
+    /// node's endpoint speaks mapped; `send` at the upstream endpoint, after a steal,
+    /// speaks raw. Because the generic edge default is `on-demand` — which a
+    /// held-origin interior pump cannot drive — an omitted or `on-demand` raw edge is
+    /// treated as `held` at runtime ([`crate::config`] → the daemon's `Wiring::build`);
+    /// an explicit `never` makes a read-only/display map with no targetward path.
+    Map {
+        name: String,
+        /// Ordered mappings applied to **hostward** bytes (device → consumers) —
+        /// picocom's `--imap`. First match per input byte wins; an unknown name is a
+        /// structural error (§7.8). An empty list is the identity.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hostward: Vec<String>,
+        /// Ordered mappings applied to **targetward** bytes (consumers → device) —
+        /// picocom's `--omap`. Same rules as [`Self::Map::hostward`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        targetward: Vec<String>,
+        /// Arbitration policy for the mapped (host-facing) endpoint (§6). Defaults to
+        /// exclusive, as for every host-facing endpoint.
+        #[serde(default)]
+        arbitration: Arbitration,
+        /// Replay-ring depth in bytes for the mapped (host-facing) endpoint (§5,
+        /// §15.32). Defaults on at 64 KiB; `0` opts out. The raw upstream view has its
+        /// own ring on the upstream endpoint, so a map yields a raw and a mapped
+        /// scrollback by default (§7.8).
+        #[serde(default = "default_replay_ring")]
+        replay_ring: usize,
+    },
 }
 
 /// Leg socket substrate (§7.4). `unix` is inherently local; `tcp` is
@@ -387,7 +459,8 @@ impl NodeConfig {
             | NodeConfig::Pty { name, .. }
             | NodeConfig::Log { name, .. }
             | NodeConfig::Codec { name, .. }
-            | NodeConfig::Leg { name, .. } => name,
+            | NodeConfig::Leg { name, .. }
+            | NodeConfig::Map { name, .. } => name,
         }
     }
 
@@ -400,7 +473,10 @@ impl NodeConfig {
         match self {
             NodeConfig::Serial { replay_ring, .. }
             | NodeConfig::Codec { replay_ring, .. }
-            | NodeConfig::Leg { replay_ring, .. } => Some(*replay_ring),
+            | NodeConfig::Leg { replay_ring, .. }
+            // A map's mapped side is its host-facing default endpoint, which carries
+            // the ring (§7.8); the raw target-facing endpoint gets none, inert.
+            | NodeConfig::Map { replay_ring, .. } => Some(*replay_ring),
             NodeConfig::Pty { .. } | NodeConfig::Log { .. } => None,
         }
     }
@@ -470,6 +546,23 @@ impl NodeConfig {
                     .collect();
                 NodeShape::new(endpoints)
             }
+            // A map exposes its mapped side as the host-facing default endpoint
+            // (carrying the node's arbitration policy) and its raw side as one
+            // target-facing endpoint (§7.8). The target-facing raw endpoint has the
+            // default arbitration — it is an origin into the upstream, not an
+            // arbitrated host endpoint of its own.
+            NodeConfig::Map { arbitration, .. } => NodeShape::new(vec![
+                EndpointSpec {
+                    name: DEFAULT_ENDPOINT.to_owned(),
+                    facing: Facing::Host,
+                    arbitration: *arbitration,
+                },
+                EndpointSpec {
+                    name: MAP_RAW_ENDPOINT.to_owned(),
+                    facing: Facing::Target,
+                    arbitration: Arbitration::default(),
+                },
+            ]),
         }
     }
 
@@ -480,7 +573,8 @@ impl NodeConfig {
         match self {
             NodeConfig::Serial { arbitration, .. }
             | NodeConfig::Codec { arbitration, .. }
-            | NodeConfig::Leg { arbitration, .. } => *arbitration,
+            | NodeConfig::Leg { arbitration, .. }
+            | NodeConfig::Map { arbitration, .. } => *arbitration,
             NodeConfig::Pty { .. } | NodeConfig::Log { .. } => Arbitration::default(),
         }
     }
@@ -1136,6 +1230,151 @@ mod tests {
         );
     }
 
+    #[test]
+    fn map_config_round_trips_and_validates() {
+        // A quirky console (§7.8): a serial feeds a held map, whose mapped side fans
+        // out to a PTY. Exercises the map config (ordered hostward/targetward lists)
+        // through TOML and structural validation, including the `node/raw` target
+        // endpoint addressing.
+        let cfg = GraphConfig {
+            nodes: vec![
+                NodeConfig::Serial {
+                    name: "usb0".into(),
+                    device: "usb:0403:6001:ABSCDJ6O:00".into(),
+                    baud: 115_200,
+                    data_bits: DataBits::Eight,
+                    parity: Parity::None,
+                    stop_bits: StopBits::One,
+                    flow_control: FlowControl::None,
+                    faces: Facing::Host,
+                    arbitration: Arbitration::Exclusive,
+                    hostward_buffer: 256,
+                    purge_on_reconnect: true,
+                    replay_ring: DEFAULT_REPLAY_RING,
+                    modem: ModemLines::default(),
+                },
+                NodeConfig::Map {
+                    name: "console".into(),
+                    hostward: vec!["crlf".into()],
+                    targetward: vec!["lfcr".into()],
+                    arbitration: Arbitration::Exclusive,
+                    replay_ring: DEFAULT_REPLAY_RING,
+                },
+                NodeConfig::Pty {
+                    name: "console-pty".into(),
+                    path: "/run/serial_nexus/console".into(),
+                    owner: None,
+                    group: None,
+                    mode: None,
+                    advertised_baud: 115_200,
+                    hostward_buffer: 32,
+                },
+            ],
+            edges: vec![
+                // serial(host) -> map raw side (target, `node/raw`); the map's edge
+                // into the upstream is held, the demux's pattern (§7.8).
+                EdgeConfig {
+                    a: EndpointAddr::node("usb0"),
+                    b: EndpointAddr::channel("console", MAP_RAW_ENDPOINT),
+                    write_mode: WriteMode::Held,
+                },
+                // map's mapped side (host, the default endpoint) -> the PTY.
+                EdgeConfig {
+                    a: EndpointAddr::node("console"),
+                    b: EndpointAddr::node("console-pty"),
+                    write_mode: WriteMode::OnDemand,
+                },
+            ],
+        };
+        let toml = toml::to_string(&cfg).expect("serialize");
+        let back: GraphConfig = toml::from_str(&toml).expect("deserialize");
+        assert_eq!(cfg, back, "map config must round-trip through TOML\n{toml}");
+        assert!(
+            cfg.validate().is_empty(),
+            "map topology must be structurally valid: {:?}",
+            cfg.validate()
+        );
+
+        // The map's shape: mapped host default endpoint + raw target endpoint (§7.8).
+        let shape = cfg.nodes[1].shape();
+        assert_eq!(shape.endpoints.len(), 2, "a map has exactly two endpoints");
+        let mapped = shape.endpoints.iter().find(|e| e.name.is_empty()).unwrap();
+        assert_eq!(mapped.facing, Facing::Host, "mapped side faces host");
+        let raw = shape
+            .endpoints
+            .iter()
+            .find(|e| e.name == MAP_RAW_ENDPOINT)
+            .unwrap();
+        assert_eq!(raw.facing, Facing::Target, "raw side faces target");
+
+        // Omitted mapping lists default to the identity (empty) and round-trip clean.
+        let minimal: GraphConfig = toml::from_str(
+            r#"
+            [[node]]
+            type = "map"
+            name = "m"
+        "#,
+        )
+        .expect("parse minimal map");
+        match &minimal.nodes[0] {
+            NodeConfig::Map {
+                hostward,
+                targetward,
+                replay_ring,
+                ..
+            } => {
+                assert!(hostward.is_empty() && targetward.is_empty(), "identity map");
+                assert_eq!(*replay_ring, DEFAULT_REPLAY_RING, "map ring defaults on");
+            }
+            other => panic!("expected map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_mapping_is_rejected() {
+        // §7.8: an unknown mapping name is a structural error naming the offender, in
+        // either direction — caught by validate() before any teardown (so a bad
+        // `--replace` config never destroys a good graph).
+        let cfg = |hostward: Vec<String>, targetward: Vec<String>| GraphConfig {
+            nodes: vec![NodeConfig::Map {
+                name: "m".into(),
+                hostward,
+                targetward,
+                arbitration: Arbitration::Exclusive,
+                replay_ring: DEFAULT_REPLAY_RING,
+            }],
+            edges: vec![],
+        };
+        // Bad name hostward.
+        assert!(
+            cfg(vec!["crlf".into(), "bogus".into()], vec![])
+                .validate()
+                .iter()
+                .any(
+                    |e| matches!(e, ValidationError::UnknownMapping { node, mapping }
+                    if node == "m" && mapping == "bogus")
+                ),
+            "expected UnknownMapping for a bad hostward name"
+        );
+        // Bad name targetward.
+        assert!(
+            cfg(vec![], vec!["nope".into()]).validate().iter().any(
+                |e| matches!(e, ValidationError::UnknownMapping { mapping, .. }
+                    if mapping == "nope")
+            ),
+            "expected UnknownMapping for a bad targetward name"
+        );
+        // Every valid picocom name is accepted.
+        let all: Vec<String> = crate::map::Mapping::all_names().map(String::from).collect();
+        assert!(
+            !cfg(all.clone(), all)
+                .validate()
+                .iter()
+                .any(|e| matches!(e, ValidationError::UnknownMapping { .. })),
+            "the full picocom vocabulary must validate"
+        );
+    }
+
     // Proptest strategies producing well-typed (not necessarily graph-valid)
     // configurations, to prove serde round-trips. Every enum variant, every
     // Some/None option, non-default numerics, and edges are all reachable, so a
@@ -1168,6 +1407,25 @@ mod tests {
     }
     fn any_facing() -> impl Strategy<Value = Facing> {
         prop_oneof![Just(Facing::Host), Just(Facing::Target)]
+    }
+    fn any_mapping_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("crlf"),
+            Just("crcrlf"),
+            Just("igncr"),
+            Just("lfcr"),
+            Just("lfcrlf"),
+            Just("ignlf"),
+            Just("bsdel"),
+            Just("delbs"),
+            Just("spchex"),
+            Just("tabhex"),
+            Just("crhex"),
+            Just("lfhex"),
+            Just("8bithex"),
+            Just("nrmhex"),
+        ]
+        .prop_map(String::from)
     }
     fn any_arbitration() -> impl Strategy<Value = Arbitration> {
         prop_oneof![Just(Arbitration::Exclusive), Just(Arbitration::FreeForAll)]
@@ -1352,6 +1610,22 @@ mod tests {
                         }
                     },
                 ),
+            (
+                ident(),
+                prop::collection::vec(any_mapping_name(), 0..4),
+                prop::collection::vec(any_mapping_name(), 0..4),
+                any_arbitration(),
+                0usize..131_072,
+            )
+                .prop_map(|(name, hostward, targetward, arbitration, replay_ring)| {
+                    NodeConfig::Map {
+                        name,
+                        hostward,
+                        targetward,
+                        arbitration,
+                        replay_ring,
+                    }
+                }),
         ]
     }
 
