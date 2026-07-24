@@ -1,0 +1,83 @@
+/* serial_nexus web console — minimal, dependency-free styling (design §17). */
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  font: 14px/1.4 system-ui, sans-serif;
+  color: #ddd;
+  background: #1a1c20;
+}
+#app { display: flex; height: 100vh; }
+
+#rail {
+  width: 240px;
+  flex: 0 0 240px;
+  background: #23262c;
+  border-right: 1px solid #34383f;
+  display: flex;
+  flex-direction: column;
+  padding: 8px;
+  overflow-y: auto;
+}
+#rail h1 { font-size: 15px; margin: 4px 4px 10px; color: #9ecbff; }
+#consoles { list-style: none; margin: 0; padding: 0; flex: 1; }
+.console {
+  padding: 7px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.console:hover { background: #2c3038; }
+.console.selected { background: #2f4a70; }
+.cname { flex: 1; font-weight: 600; }
+.lockbadge { font-size: 11px; color: #ffb454; white-space: nowrap; }
+.waiters { font-size: 11px; color: #888; }
+#conn { padding: 6px 4px; font-size: 12px; }
+#conn.connected { color: #7ec699; }
+#conn.disconnected { color: #e06c75; }
+
+#pane { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#pane-head {
+  padding: 10px 14px;
+  border-bottom: 1px solid #34383f;
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+}
+#pane-title { font-weight: 700; }
+#pane-lock { color: #ffb454; font-size: 12px; }
+#pane-drops { color: #e06c75; font-size: 12px; margin-left: auto; }
+
+#term {
+  flex: 1;
+  margin: 0;
+  padding: 12px 14px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: 13px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  background: #14161a;
+}
+.marker { color: #6b7280; font-style: italic; }
+
+#sendform { display: flex; padding: 8px; gap: 8px; border-top: 1px solid #34383f; }
+#sendline {
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid #3a3f47;
+  border-radius: 5px;
+  background: #14161a;
+  color: #eee;
+  font: inherit;
+}
+#sendline:disabled { opacity: 0.5; }
+#sendbtn {
+  padding: 8px 16px;
+  border: 0;
+  border-radius: 5px;
+  background: #3f6db0;
+  color: #fff;
+  cursor: pointer;
+}
+#sendbtn:disabled { opacity: 0.5; cursor: default; }

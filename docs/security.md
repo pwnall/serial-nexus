@@ -113,6 +113,59 @@ is not to make remote exposure impossible — it is to make it a recorded, audit
 choice that shows up in `dump` output and in a `grep insecure_bind` across your
 configs, rather than a silent default someone quietly forked the code to obtain.
 
+## The web console: a bearer token, Host validation, and three bind tiers
+
+`serialnexusweb` (§17) is a **separate process** — a pure client of the daemon's
+control socket on one side, and an HTTP + WebSocket server for a browser on the
+other. The daemon does not link it, serve it, or know it exists; the web server is
+"simply a client that holds the socket, and whoever holds the token holds exactly
+what the web server holds."
+
+The delta that shapes its security is one sentence: **the control socket is mode
+0600, but a loopback TCP port is reachable by every local user.** So the web
+server cannot lean on file permissions the way the daemon does. Two mechanisms
+replace them, and they solve *different layers* (§15.29):
+
+- **The token answers *who may act*.** Every request and every WebSocket upgrade
+  requires a per-session bearer token — 256 bits from the OS CSPRNG, generated at
+  startup and printed as a ready-to-open URL (`http://127.0.0.1:PORT/?token=…`,
+  Jupyter-style). Opening that URL sets the token as a `SameSite=Strict` session
+  cookie and drops it from the address bar; every later request (assets and the WS
+  upgrade alike) carries the cookie, which doubles as CSRF protection. No cookie,
+  no access — a request without it gets `401`.
+- **The channel answers *who can read and replay*.** A bearer token over plaintext
+  HTTP is a secret broadcast to every on-path observer, who reads it once and holds
+  console access — root shells, per above — indefinitely. That is exactly what TLS
+  fixes, and why the token alone is not enough off loopback.
+
+The Host header is validated on every request against the localhost family (plus any
+`--host` names), so a page that rebinds DNS to `127.0.0.1` still fails — its Host is
+its own, and it gets `403`.
+
+**The bind policy is three-tiered, and the tiers are not interchangeable:**
+
+1. **Loopback + token (the default).** On loopback the kernel is the channel; there
+   is nothing on the wire to sniff, so the token needs no crypto. Remote access is
+   SSH port forwarding of the loopback port — the same posture as the legs, above.
+2. **`--tls` + token (the sanctioned non-loopback mode).** rustls plus the token is
+   the configuration in which "the bearer token is like an API key" is *actually
+   true*, because every widely deployed API rides an encrypted channel. This is the
+   only non-loopback mode that is not a footgun.
+3. **`--insecure-bind` (the named footgun).** A non-loopback bind without TLS is
+   refused outright unless this flag is set — the same "a named footgun beats a
+   patched binary" reasoning as the legs' `insecure_bind`. The token stays mandatory,
+   and the flag's own help text states what is forfeited: **every console byte, and
+   the token itself, is readable and replayable by anyone on the network path.** Use
+   it only on a network you genuinely trust; prefer `--tls` or SSH forwarding.
+
+What the web console **cannot** do is as load-bearing as what it can. It never
+mutates the graph: the server refuses `load`, `add-node`, `remove-node`, `teardown`,
+`shutdown`, and the live-surgery verbs at the bridge, so even a compromised page
+cannot reconfigure the daemon — it can only watch consoles (`tap`/`subscribe`/
+`state`), send lines (`send`), and arbitrate the write lock (`lock`/`unlock`,
+explicit steal only, never automatic). And it never writes to disk: watching a
+console is a tap, not a log node, so viewing never becomes an unasked-for recording.
+
 ## The exec codec child runs as the daemon's user
 
 The exec codec (§7.6) is the escape hatch for proprietary framing: it spawns a

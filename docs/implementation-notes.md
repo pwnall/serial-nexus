@@ -1,12 +1,123 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-22 (**phases 0-8 + post-1.0 simplification track done**, then the
-**v8 design revision + the extension track (plan §10 / design §15.26) executed in
-full**).
+**As of:** 2026-07-23 (**phases 0-8 + post-1.0 simplification + extension track done**;
+now the **v9 design revision + web console track (plan §11 / design §17) IN PROGRESS** —
+items §11.1 (the tap) and §11.2 (the replay ring) built + validated).
 **Branch:** `implementation` (off `main`).
-**Normative docs are now v8:** `docs/17-design-claude-fable-v8.md` (design) and
-`docs/18-implementation-plan-claude-fable-v8.md` (plan). v1–v7 docs (03–16) are in
-`docs/historical/`. Section references (§) point at the v8 design.
+**Normative docs are now v9:** `docs/20-design-claude-fable-v9.md` (design) and
+`docs/21-implementation-plan-claude-fable-v9.md` (plan). v1–v8 docs are in
+`docs/historical/`. Section references (§) point at the v9 design.
+
+---
+
+**v9 REVISION + WEB CONSOLE TRACK (plan §11) — DONE (2026-07-23 session).**
+v9 = v8 + a new normative surface: §5 gains **the replay ring** (`replay_ring = <bytes>`
+on a host-facing endpoint, graduated from §14), §6/§10 gain **taps** (`tap.open`/
+`tap.close`, the `never` write mode in dynamic form), and new §15.28/§15.29/§17 spec the
+**web console client** (`serialnexusweb`). Everything else in v9 (§5 fragmentation
+invariant, §6 purge-to-quiescence + acquisition-time held-priority, §7.3 log write_mode,
+§10 EOF-cancel, §12 identity spelling, §15.27) is **doc-catch-up describing the
+already-committed Opus review remediation** (`b9d8a50`).
+
+**Design-alignment check (v8→v9 diff, workflow-audited): 2 real deviations in committed
+code, BOTH FIXED by aligning code to the design:**
+1. **§5 "one shared helper" for targetward fragmentation** — the in-process codec
+   (`codec.rs channel_targetward`) reimplemented the fragmentation-bounds loop inline
+   (it frames via the pluggable `c.mux`, not the envelope `encode` that the old
+   `data_frames` hardcoded), so "via the one shared helper" was literally false for the
+   3rd framer. **Fixed:** extracted `runtime::frame_ranges`/`frame_payload_cap` (the
+   error-prone cap+range math §15.27 cared about); `data_frames` (leg+exec) and the codec
+   now BOTH fragment on that one shared helper. No-drop invariant already held; this makes
+   the design true. Guard: `targetward_oversize_chunk_is_fragmented_never_dropped` +
+   exec-crash 256KiB round-trip stay green.
+2. **§12 whitespace identity field** — `resolve_usb_identity` rejected empty fields but
+   not whitespace-only (`usb:0403:6001: :00` was accepted, would never match sysfs →
+   permanent `waiting`). v9 §12 says "empty or whitespace-only fields are malformed at add
+   time". **Fixed:** `f.trim().is_empty()`; test extended with two whitespace cases.
+
+**§11.1 THE TAP + §11.2 THE REPLAY RING — BUILT + VALIDATED.** New `nexus-daemon/src/
+tap.rs`: `TapHub` (per host-facing endpoint, `Rc<CriticalCell<>>`), `Tap`, `ReplayRing`,
+`TapFeed`, `TapMsg`, `OpenTap`. **Architecture (the crux was the blocking-thread serial
+reader owning its `Vec<HostwardSink>` — no shared mutable fan-out):** each host-facing
+producer mirrors hostward chunks into a per-endpoint **tap-feed** channel (a runtime-thread
+hub task drains it → `TapHub::ingest`), gated by an `Arc<AtomicBool> active` flag so an
+untapped, ring-less endpoint pays only one relaxed atomic load per chunk ("costs nothing
+when unset", §5). The tap-feed is **excluded from the serial reader's `any_live`/
+`discarded_unattached` accounting** (a spy tap never masks a real consumer's absence).
+Taps are connection-scoped: `serve_connection` owns one bounded per-connection channel
+(`TAP_QUEUE_CAP=128`, the §5 boundary — a stalled tab fills it → hub drops-with-counter,
+per-tap), intercepts `tap.open`/`tap.close`, streams `tap.data` (base64) notifications, and
+`OpenTap::drop` detaches the tap from its hub on `tap.close` or connection drop (prompt even
+on an idle endpoint). **Exact-splice** (`--replay`): `register` snapshots the ring and
+queues it into the connection channel *before* adding the tap to the fan-out, and because
+`ingest`+`register` are both synchronous `hub.with_mut` critical sections on the one thread,
+no live chunk can interleave — ring-then-live is a contiguous suffix, no gap/dup (§15.20
+doing double duty). `replay_ring` config landed on the **serial** node; codec/leg host
+channels get a hub (tap works) but per-channel ring config is a scoped deferral. Hub tasks
+self-terminate when the producer's feed sender drops (teardown/remove/replace); `state`
+reports open taps `{tap,endpoint,dropped}`; `dump` is untouched (taps are state, §8).
+`nexus-rpc` gained tested `base64_encode`/`base64_decode`; `serialnexusctl tap <endpoint>
+[--replay] [--bytes N] [--stall-ms N]` (holds the write half open, §15.20); `nexus-sim pty
+--source` gained `--wait-file` gating (presence!=readiness). Producers touched: serial,
+codec, exec, leg (all mirror; pty/log are target-facing → no tap).
+
+**Gates:** `cargo test --workspace` = **154** (was 149), fmt/clippy(all-targets) clean.
+New e2e (all pass, in `phase8/`): `tap.sh` (tap==co-attached-log==source byte-exact;
+dump-unaffected; connection-drop detach), `tap-drops.sh` (unread tap dropped 6.5MB while
+the log stayed byte-exact — a slow tab costs only itself), `replay-ring.sh` (exact splice:
+replay+live == a contiguous suffix of the stream; empty-replay marker replay_bytes=0 on a
+ring-off/empty endpoint; `replay_ring` round-trips dump/load). Regression-checked green:
+phase3 counters/exact-loss/log, phase5 demux/exec-crash, phase6 reference/head-of-line.
+
+**⚠️ Adversarial audit of the tap/ring code (6-dimension workflow) → 3 confirmed, ALL
+FIXED; do NOT regress:**
+- **[MED] a configured `replay_ring` silenced `discarded_unattached`** (serial reader).
+  The tap-feed's `active` flag is set whenever a ring is configured *or* a tap is open,
+  and the reader gated the discard counter on `!tap_wanted` — so a ring alone (no tap,
+  no consumer) hid the loss of everything beyond the ring depth (§5 "loss always
+  visible"; the ring "never substitutes for a log node"). **Fixed:** the tap/ring mirror
+  is a spy *out of the graph* with its own accounting; `discarded_unattached` now counts
+  graph-consumer-absence independent of the mirror, matching codec/exec/leg. Regression:
+  `active_tap_feed_does_not_hide_unattached_loss` (SERIAL-4).
+- **[LOW] `TapFeed::mirror` dropped on a full feed uncounted** — §5 wants all loss
+  counted. **Fixed:** a per-endpoint `feed_dropped` atomic (shared TapFeed↔hub),
+  incremented on the `try_send` Full, surfaced in `state.taps[].feed_dropped`. Still
+  never backpressures (the ring must not stall the device).
+- **[LOW] `serialnexusctl tap --bytes 0` swallowed the ack** — the `while written<limit`
+  loop never ran, so a failed open (unknown endpoint) exited 0. **Fixed:** read the
+  tap.open ack *before* the byte loop; `--bytes 0` is a confirmed no-op, a failed open
+  exits non-zero.
+
+**§11.3–§11.6 THE WEB CLIENT — BUILT + VALIDATED.** New crate **`serialnexusweb`** (a
+pure RPC client of the daemon; the daemon gains no HTTP, §17). **Deps (all §13-permissive,
+`cargo deny check licenses bans sources` green):** `tokio-tungstenite` (WS framing),
+`sha1` (WS accept), `getrandom` (token), and for the TLS tier `rustls`+`rcgen` pinned to
+the single **`ring`** backend (no aws-lc, no rustls-pemfile). HTTP is hand-rolled on tokio
+(§15.13 ethos); tungstenite does only post-handshake framing (`from_raw_socket`); the
+server is generic over the stream so TLS and plaintext share one path. **§15.29 security:**
+a 256-bit bearer token gates every request as a `SameSite=Strict` session cookie (set by
+the `?token=` bootstrap URL, then dropped from the address bar); the Host header is
+validated on every request (DNS-rebinding defense, even on loopback); **three bind tiers**
+— loopback+token (default), `--tls`+token (rustls, self-signed on first run for lab use,
+key mode 0600), `--insecure-bind` (named footgun, warns). **The bridge is a filtering
+JSON-RPC proxy** (`bridge.rs`): one daemon UDS connection per browser WS, auto-subscribes,
+relays both ways, and **denies graph/lifecycle verbs** (`load`/`add-node`/`remove-node`/
+`teardown`/`shutdown`/`connect`/`disconnect`/`set-attribute`) so the web console can never
+mutate the graph (§17 non-goal). Frontend = embedded static `index.html`/`app.js`/`app.css`
+(functional console: left rail from state+subscribe, tap terminal with replay marker + drop
+counter, send box with holder-named LOCKED + explicit-steal). `serialnexusweb wsclient`
+(headless: `--endpoint`+`--bytes` taps and checksums; `--rpc`+`--params` one-shots) is the
+validation client. `nexus-rpc` gained shared `base64_encode`/`base64_decode`. `docs/
+security.md` gained the web section (token/Host/three tiers, token-is-not-TLS).
+
+**Gates (final):** `cargo test --workspace` = **156**, fmt/clippy(all-targets)/cargo-deny
+(licenses+bans+sources)/macOS-cross-check clean. New e2e in `phase8/` (all pass; run in
+`all.sh --through 8` / nightly): `tap.sh`, `tap-drops.sh`, `replay-ring.sh`, `web.sh`
+(401/403/302/200 gates + non-loopback-refused + WS byte stream browser→device byte-exact +
+console-list-matches-state + denylist-through-WS + TLS curl `--cacert` round-trip +
+untrusted-cert-rejected + non-loopback-permitted-with-`--tls`). ⚠️ web.sh is slow (~90s:
+4 server instances + cert gen + a 256KiB WS byte stream). ALL SIX plan §11 items done.
+NOT committed; no `main` merge.
 
 ---
 

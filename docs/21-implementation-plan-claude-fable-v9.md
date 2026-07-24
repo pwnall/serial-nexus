@@ -1,6 +1,6 @@
 # serial_nexus — Implementation Plan
 
-**Status:** Executed — phases 0–8, the post-1.0 simplification track (§9), and the extension track (§10) are complete, audited, and green, with the Opus review's 56 findings remediated; the web console track (§11, from design §17) is the open work.
+**Status:** Executed — phases 0–8, the post-1.0 simplification track (§9), the extension track (§10), and the web console track (§11, from design §17) are complete, audited, and green, with the Opus review's 56 findings remediated.
 **Companion:** `serial_nexus-design.md` — section references (§) below point there. The design is normative; where implementation reality disagrees with it, the design gets a new §15 entry before the code diverges.
 **Shape:** Nine phases (0–8), each with a goal, scope traced to design sections, key tasks, testable exit criteria, and an agent-validation block of concrete commands with expected outcomes. Sizes are relative (S/M/L) because calendar mapping depends on availability, not on the work.
 
@@ -272,7 +272,7 @@ The recommendation order is deliberate: items 1–3 make the Rust path the easy 
 
 ## 11. Web console track
 
-Design §17 and §15.28 are the rationale; the daemon work is deliberately two small features, and everything else is a client. Priority-ordered, agent-validated.
+Design §17 and §15.28 are the rationale; the daemon work is deliberately two small features, and everything else is a client. Priority-ordered, agent-validated. *Executed in full — the tap and the replay ring (daemon), then `serialnexusweb` (server, WS bridge, three-tier bind policy, embedded console UI, TLS tier via rustls/ring); a 3-finding adversarial audit of the tap/ring code was remediated (the notable one: a configured ring silenced `discarded_unattached`). Validation lives in `scripts/validate/phase8/{tap,tap-drops,replay-ring,web}.sh`.*
 
 1. **The tap.** `tap.open <endpoint> [--replay]` / `tap.close` on the control plane: a connection-scoped, read-only dynamic attachment at a host-facing endpoint, streaming `tap.data` notifications (base64 chunks) with a bounded per-tap queue and drop counters; detaches on connection drop. *Validation:* a sim source through a tapped endpoint — the tap-side checksum equals a co-attached sim client's; a deliberately unread tap accumulates counted drops while the sim client stays byte-exact; dropping the tap's connection detaches it (`state` shows zero taps); `dump` is byte-identical before and after tapping, because taps never touch configuration.
 2. **The replay ring.** Per-host-facing-endpoint `replay_ring = <bytes>` (default off); `tap.open --replay` delivers ring-then-live under the exact-splice guarantee. *Validation:* stream a seeded source, open a replay tap mid-stream, assert the concatenated replay-plus-live checksum equals the source from ring-depth onward — no gap, no duplication — under load; a ring-off endpoint answers `--replay` with an explicit empty-replay marker; the attribute round-trips through dump/load.

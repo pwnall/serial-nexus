@@ -1,0 +1,56 @@
+[package]
+name = "serialnexusweb"
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "serial_nexus web console — a pure RPC client of serialnexusd serving a loopback browser UI (design §17)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Async runtime + I/O. The web server and the RPC client to the daemon's UDS both
+# ride tokio's native socket types (no tty quirks here, §15.18).
+tokio = { workspace = true, features = [
+    "rt",
+    "net",
+    "io-util",
+    "macros",
+    "time",
+    "sync",
+    "signal",
+] }
+# The stable RPC surface (§15.16) + base64 for tap.data, shared with the CLI.
+nexus-rpc.workspace = true
+# Configuration types, to render the console list from `dump`/`state`.
+nexus-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# WebSocket framing (RFC 6455). MIT-licensed (§13 permissive gate). We hand-roll the
+# HTTP request handling (static assets, the token/Host gate, the upgrade 101) on
+# tokio — matching the daemon's hand-rolled JSON-RPC (§15.13) — and use tungstenite
+# only for the post-handshake frame codec via `from_raw_socket`.
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+# The Sec-WebSocket-Accept digest (RFC 6455 §4.2.2). Already in the tungstenite tree,
+# so a direct dependency adds nothing; MIT/Apache (§13).
+sha1 = "0.10"
+# Per-session bearer token entropy (§15.29). A separate process from the daemon, so
+# the workflow-resumability ban on randomness (which applies to the daemon) does not
+# apply here.
+getrandom = "0.2"
+# TLS for the §15.29 non-loopback tier (plan §11.6). rustls + rcgen are permissive
+# (§13, verified by `cargo deny check licenses`); pinned to the single `ring` crypto
+# backend so only one is built, and `rustls-pki-types`' own PEM reader replaces the
+# deprecated rustls-pemfile.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1", features = ["std", "alloc"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "crypto"] }

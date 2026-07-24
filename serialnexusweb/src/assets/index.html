@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>serial_nexus console</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="rail">
+      <h1>serial_nexus</h1>
+      <ul id="consoles"></ul>
+      <div id="conn" class="disconnected">connecting…</div>
+    </aside>
+    <main id="pane">
+      <header id="pane-head">
+        <span id="pane-title">select a console</span>
+        <span id="pane-lock"></span>
+        <span id="pane-drops"></span>
+      </header>
+      <pre id="term" tabindex="0"></pre>
+      <form id="sendform">
+        <input id="sendline" type="text" placeholder="send a line…" autocomplete="off" disabled>
+        <button id="sendbtn" type="submit" disabled>send</button>
+      </form>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
