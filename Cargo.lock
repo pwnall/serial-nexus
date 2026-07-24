@@ -561,6 +561,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-itest"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "sha2",
+ "toml",
+]
+
+[[package]]
 name = "nexus-rpc"
 version = "0.2.0"
 dependencies = [

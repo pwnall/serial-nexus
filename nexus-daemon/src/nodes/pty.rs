@@ -156,7 +156,7 @@ impl PtyNode {
         unlockpt(&master).map_err(|e| format!("unlockpt: {e}"))?;
         let pts = sys::ptsname(&master).map_err(|e| format!("ptsname: {e}"))?;
 
-        apply_baseline(master.as_fd(), self.advertised_baud)?;
+        apply_baseline(&master, &pts, self.advertised_baud)?;
         sys::set_packet_mode(master.as_raw_fd(), true).map_err(|e| format!("TIOCPKT: {e}"))?;
 
         self.install_symlink(&pts)?;
@@ -258,8 +258,12 @@ impl PtyNode {
         // Reader + presence poll: client → serial (targetward), plus the presence
         // check that also gates the writer below and the client-termios
         // reconciliation that feeds state (§7.2).
+        // The slave path drives the BSD/macOS termios fallback (see
+        // `with_termios_fd`); `master` is `Some`, so setup ran and `pts_path` is set.
+        let pts: Rc<str> = Rc::from(self.pts_path.clone().unwrap_or_default());
         self.tasks.push(tokio::task::spawn_local(read_and_poll(
             master.clone(),
+            pts,
             self.present.clone(),
             self.client_termios.clone(),
             targetward,
@@ -380,10 +384,51 @@ impl Drop for PtyNode {
     }
 }
 
-/// Baseline termios (§7.2): raw + echo off + EXTPROC on, applied through the
-/// master, plus the cosmetic advertised baud. Free so both creation and the
-/// last-close reset can call it against a borrowed master fd.
-fn apply_baseline(fd: BorrowedFd, advertised_baud: u32) -> Result<(), String> {
+/// Run `op` against the fd that controls this pair's termios.
+///
+/// On Linux the pty **master** is itself a terminal, so `tc*attr` operate on it
+/// directly — the original, unchanged behavior. On BSD/macOS the master is *not*
+/// a terminal (`tcgetattr`/`tcsetattr` return `ENOTTY`), so we momentarily open
+/// the **slave** and operate on it instead — the §13 platform arm of the §7.2
+/// termios path. The brief slave open does not corrupt presence: reconciliation
+/// only runs while a client already holds the slave (so it is already "present"),
+/// and the last-close reset wants exactly the re-primed "absent" HUP state a
+/// fresh open→close leaves behind (see [`prime_slave`]).
+#[cfg(target_os = "linux")]
+fn with_termios_fd<T>(
+    master: &PtyMaster,
+    _pts: &str,
+    op: impl FnOnce(BorrowedFd) -> T,
+) -> Result<T, String> {
+    Ok(op(master.as_fd()))
+}
+#[cfg(not(target_os = "linux"))]
+fn with_termios_fd<T>(
+    _master: &PtyMaster,
+    pts: &str,
+    op: impl FnOnce(BorrowedFd) -> T,
+) -> Result<T, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(pts)
+        .map_err(|e| format!("open slave {pts}: {e}"))?;
+    Ok(op(slave.as_fd()))
+}
+
+/// Baseline termios (§7.2): raw + echo off + EXTPROC on, plus the cosmetic
+/// advertised baud. Applied through the master on Linux and a momentarily-opened
+/// slave on BSD/macOS (see [`with_termios_fd`]). Free so both creation and the
+/// last-close reset can call it.
+fn apply_baseline(master: &PtyMaster, pts: &str, advertised_baud: u32) -> Result<(), String> {
+    // Outer `?` propagates a slave-open failure (BSD path); the inner Result is the
+    // tcget/tcsetattr outcome.
+    with_termios_fd(master, pts, |fd| apply_baseline_fd(fd, advertised_baud))?
+}
+
+fn apply_baseline_fd(fd: BorrowedFd, advertised_baud: u32) -> Result<(), String> {
     let mut t = tcgetattr(fd).map_err(|e| format!("tcgetattr: {e}"))?;
     cfmakeraw(&mut t);
     t.local_flags.remove(LocalFlags::ECHO);
@@ -405,11 +450,12 @@ fn handle_last_close(
     fd: RawFd,
     buf: &mut [u8],
     master: &Rc<PtyMaster>,
+    pts: &str,
     advertised_baud: u32,
     client_termios: &CriticalCell<Option<Value>>,
     lock: &Option<(SharedLock, OriginId)>,
 ) {
-    let _ = apply_baseline(master.as_fd(), advertised_baud);
+    let _ = apply_baseline(master, pts, advertised_baud);
     client_termios.with_mut(|c| *c = None);
     if let Some((l, id)) = lock {
         let (held, exclusive, held_mode) = l.with(|g| {
@@ -478,6 +524,7 @@ fn drain_and_discard(fd: RawFd, buf: &mut [u8]) -> u64 {
 /// deterministic (§7.2). Sleeps only when idle, so an active transfer streams.
 async fn read_and_poll(
     master: Rc<PtyMaster>,
+    pts: Rc<str>,
     present: Arc<AtomicBool>,
     client_termios: Rc<CriticalCell<Option<Value>>>,
     tx: Option<mpsc::Sender<Chunk>>,
@@ -538,7 +585,7 @@ async fn read_and_poll(
                             // client that already hung up must not re-populate the
                             // state handle_last_close clears — we still drain (and
                             // forward) data below regardless of POLLHUP.
-                            reconcile_termios(&master, &client_termios);
+                            reconcile_termios(&master, &pts, &client_termios);
                             last_reconcile = Instant::now();
                         }
                         // Other control packets (flush, flow-control) carry no
@@ -570,10 +617,21 @@ async fn read_and_poll(
                 fd,
                 &mut buf,
                 &master,
+                &pts,
                 advertised_baud,
                 &client_termios,
                 &lock,
             );
+        }
+        // BSD/macOS only: the slave's termios resets to cooked when the last slave
+        // fd closes (verified: a momentary daemon-side set does not survive to the
+        // client's open), so the setup-time baseline is gone by the time a client
+        // attaches. Re-assert it on the rising edge — the client now holds the slave,
+        // so *its* fd keeps the raw/echo-off/EXTPROC baseline alive for the session.
+        // The §13 platform arm of the §7.2 baseline; on Linux the master carries it.
+        #[cfg(not(target_os = "linux"))]
+        if !was && present_now {
+            let _ = apply_baseline(&master, &pts, advertised_baud);
         }
 
         // Slow reconciliation backstop (§7.2): while a client is present, re-read
@@ -581,7 +639,7 @@ async fn read_and_poll(
         // Gate on live presence, not the top-of-loop `now`, so a close detected
         // mid-drain above cannot re-populate the client_termios it just cleared.
         if present.load(Ordering::Relaxed) && last_reconcile.elapsed() >= RECONCILE_INTERVAL {
-            reconcile_termios(&master, &client_termios);
+            reconcile_termios(&master, &pts, &client_termios);
             last_reconcile = Instant::now();
         }
 
@@ -597,15 +655,20 @@ async fn read_and_poll(
     }
 }
 
-/// Read the client's current termios through the master and store it in state;
-/// re-assert EXTPROC if the client cleared it, so the daemon keeps observing
-/// subsequent changes (§7.2). Observe-only — never propagated to hardware (§14).
-fn reconcile_termios(master: &PtyMaster, store: &CriticalCell<Option<Value>>) {
-    let Ok(t) = tcgetattr(master) else { return };
+/// Read the client's current termios (through the master on Linux, a slave open
+/// on BSD/macOS — see [`with_termios_fd`]) and store it in state; re-assert
+/// EXTPROC if the client cleared it, so the daemon keeps observing subsequent
+/// changes (§7.2). Observe-only — never propagated to hardware (§14).
+fn reconcile_termios(master: &PtyMaster, pts: &str, store: &CriticalCell<Option<Value>>) {
+    let _ = with_termios_fd(master, pts, |fd| reconcile_termios_fd(fd, store));
+}
+
+fn reconcile_termios_fd(fd: BorrowedFd, store: &CriticalCell<Option<Value>>) {
+    let Ok(t) = tcgetattr(fd) else { return };
     if !t.local_flags.contains(LocalFlags::EXTPROC) {
         let mut re = t.clone();
         re.local_flags.insert(LocalFlags::EXTPROC);
-        let _ = tcsetattr(master, SetArg::TCSANOW, &re);
+        let _ = tcsetattr(fd, SetArg::TCSANOW, &re);
     }
     let char_bits = match t.control_flags & ControlFlags::CSIZE {
         cs if cs == ControlFlags::CS8 => 8,

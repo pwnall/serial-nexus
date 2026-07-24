@@ -5,6 +5,47 @@ the one every mechanism is specified against; macOS is supported where plain
 POSIX carries the design, and degrades — never crashes, never silently misbehaves
 — everywhere the design leans on a Linux-only facility.
 
+## Update — 2026-07-24 hands-on pass (macOS 15.7.8 / Darwin 24.6.0, x86_64, real FTDI crossover rig)
+
+The first hands-on pass on real hardware ran, and settled the open questions. Two
+things below that this page previously marked *"expected"* / *"needs a Mac"* turned
+out to be **real defects, now fixed**; the rest is confirmed. See
+`docs/implementation-notes.md` (2026-07-24 session) for the mechanism.
+
+- **Build / test / lint:** all clean; **156 tests pass, same count as Linux.**
+- **Serial data plane over the real crossover cable:** **32 KiB byte-exact both
+  directions**, `send` verb reaches hardware, **TIOCEXCL enforced**, driver counters
+  gracefully absent. **verified.**
+- **PTY nodes — FIXED.** They previously *faulted* on macOS (`tcgetattr: ENOTTY`): the
+  §7.2 baseline termios was applied through the pty **master**, which BSD rejects. Now
+  cfg-gated to apply through the **slave** on non-Linux (`nodes/pty.rs::with_termios_fd`),
+  re-asserted on the client's presence rising edge (the macOS slave termios resets on
+  last-close). Presence tracking works; the full client→pty→serial→crossover path is
+  **verified byte-exact.** Linux path unchanged.
+- **Doctor P1 → `degraded`** (EXTPROC/packet-mode notifications don't surface; §7.2 runs
+  poll-only — benign, as designed). **Doctor P2 → `degraded`** (was `unsupported`): POLLHUP
+  presence works via priming + slave-termios, so the probe now says `degraded`, not
+  `unsupported`. **`expectations/macos.jq` now PASSES** (0 unsupported).
+- **`nexus-sim` PTY doubles — FIXED** for the same master-termios reason (BSD leaves termios
+  to the consumer).
+
+### macOS test-infrastructure limitation: a pty is not a usable serial device
+
+`serial2::SerialPort::open` on a macOS **pts** returns `ENOTTY` (it sets baud via a
+macOS-specific ioctl a pty rejects). So the Linux "no-target doctrine" — a pty standing in
+for a serial device — **does not work on macOS**. Serial-*device* tests on macOS use a
+**real crossover rig** or **skip**; the product's real-UART path is unaffected (proven
+byte-exact above). The Rust harness (`nexus-itest`) encodes exactly this: `serial_rig()`
+yields the real rig on macOS, a sim pty on Linux, or `None` → skip.
+
+The validation harness is being migrated from the bash `scripts/validate/**` (which used
+`stat -c`, `nc -q`, `sha256sum`, `timeout`, `/dev/serial/by-id` — none macOS-portable) to
+the cross-platform **`nexus-itest`** crate. macOS-verified so far: control-plane + the
+hardware crossover byte-exact test.
+
+The feature matrix below is the original Phase-8 *predicted* table, kept for reference; where
+this update block and the table disagree, **this block is the observed truth.**
+
 **What Phase 8 actually delivered:** the whole workspace now *compiles* for
 `*-apple-darwin` and *degrades gracefully* at every Linux-specific edge. That is
 verified by a clean cross-compile —

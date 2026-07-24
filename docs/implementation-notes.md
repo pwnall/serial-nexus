@@ -12,6 +12,72 @@ the TLS tier) all built, validated, and committed on `implementation` (`4594d02`
 
 ---
 
+## macOS runtime validation + PTY fix + Rust test-harness migration — 2026-07-24 session
+
+**First hands-on macOS pass on real hardware** (the §13 roadmap "verified" milestone). Ran the
+whole workspace on **macOS 15.7.8 / Darwin 24.6.0 (x86_64)** with two FTDI FT232R adapters
+cross-wired as a null modem (`/dev/cu.usbserial-BH00L4KU` ↔ `…-BH00LL8O`).
+
+**Now runtime-verified (was only "cross-checked"/"expected"):** `cargo build/test/fmt/clippy`
+(incl. `--no-default-features` and `--target x86_64-apple-darwin`) all clean; **156 tests pass,
+identical count to Linux**. Serial data plane on the real crossover cable: **32 KiB byte-exact
+both directions**, `send` verb reaches hardware, **TIOCEXCL enforced**, driver counters
+gracefully absent (TIOCGICOUNT is Linux-only). `serial2` opening `/dev/cu.*` works.
+
+**Two real macOS defects — both contradicted docs/macos.md's *predicted* verdicts — FOUND and FIXED:**
+
+1. **PTY nodes faulted at creation: `tcgetattr: ENOTTY`.** The §7.2 baseline termios was applied
+   through the pty **master**, which BSD rejects (the master is not a terminal there); the entire
+   `pty` node type was non-functional on macOS. **Fix — cfg-gated, Linux path byte-for-byte
+   unchanged** (`nodes/pty.rs::with_termios_fd`): on non-Linux the baseline/reconcile run through a
+   momentarily-opened **slave**. Two further macOS pty facts, both handled:
+   - **The slave's termios resets to cooked on last-close** (verified with a Python `openpty`
+     probe: a daemon-side set does not survive to the client's open). So the baseline is
+     re-asserted on the presence **rising edge** — the client then holds the slave, keeping the
+     raw/echo-off/EXTPROC setting alive for the session. There is a poll-latency window before the
+     re-assert, consistent with the "poll-only observation" macOS story (§7.2); a client that sets
+     its own raw termios (all interactive clients, and the sim `client`) is unaffected.
+   - **A never-opened master does not POLLHUP** — already handled by the existing `prime_slave`;
+     the node simply never reached it before (it faulted on the master `tcgetattr` first). Post-fix,
+     `client_present` true/false transitions are correct.
+   Verified end-to-end over real hardware: sim client → pty → serial → crossover → serial → log,
+   **byte-exact both directions**.
+
+2. **Doctor P2 (POLLHUP presence) reported `unsupported`, failing `expectations/macos.jq`.** The
+   probe treated macOS's `hup_when_never_opened=false` + `termios_settable_without_slave=false` as
+   unsupported. But presence *works* via priming + slave-termios (proven). **Fix** (`probes.rs`):
+   P2 now reports **`degraded`** when the core presence signals (`hup_after_close && !hup_while_open
+   && !hup_after_reopen`) hold but the kernel needs the §7.2 platform arm. `macos.jq` now passes
+   (summary: 0 unsupported); Linux stays `supported`.
+
+**nexus-sim — same master-termios ENOTTY.** `apply_raw_pair` is a **no-op on BSD/macOS**: the
+consumer configures the slave (the daemon's serial node via serial2, or the sim `client`), and
+opening the slave to set termios would prime POLLHUP → the echo/source/sink loops read that as
+"client hung up" and exit early. `set_raw`/`termios_of_pair` cfg-gated to match.
+
+**Discovered macOS test-infra limitation (NOT a product bug): a pty cannot stand in for a serial
+device.** `serial2::SerialPort::open` on a macOS **pts** returns `ENOTTY` (it sets baud via a
+macOS-specific ioctl a pty rejects). The Linux "no-target doctrine" (a pty as a fake serial device)
+therefore does not run on macOS — serial-*device* tests there need **real hardware or must skip**.
+Real UARTs are unaffected (proven byte-exact). See `docs/macos.md`.
+
+**Rust test-harness migration (replacing the bash `scripts/validate/**`, per operator request).**
+New **`nexus-itest`** crate (`publish = false`, workspace member): a cross-platform harness that
+boots `serialnexusd`, drives it with a small in-Rust JSON-RPC client (replacing `serialnexusctl
+--json | jq`), orchestrates `nexus-sim` doubles as subprocesses, and asserts on structured results
++ byte-exact SHA-256 — none of the `stat -c` / `nc -q` / `sha256sum` / `timeout` /
+`/dev/serial/by-id` bash portability hazards (all of which break the old scripts on macOS).
+`serial_rig()`/`crossover_ports()` yield a serial device (macOS: the real crossover rig; Linux: a
+sim pty double; otherwise `None` → the test self-skips, the §5 skip discipline). **Verified on
+macOS: 6/6** — `tests/control_plane.rs` (×5: socket perms, structural atomicity, truthful state,
+JSON-RPC hygiene, dump→load→dump round-trip) and `tests/serial_hardware.rs` (the real-hardware
+crossover byte-exact test, exercising the macOS-fixed PTY injector). **Status:** foundation +
+phase-2 control-plane + the hardware rig ported and green; the remaining phase-0/1/3–8 ports are
+the next tranche (the bash scripts stay in place until each is superseded). `Cargo.lock` updated
+for the new member.
+
+---
+
 **v9 REVISION + WEB CONSOLE TRACK (plan §11) — DONE (2026-07-23 session).**
 v9 = v8 + a new normative surface: §5 gains **the replay ring** (`replay_ring = <bytes>`
 on a host-facing endpoint, graduated from §14), §6/§10 gain **taps** (`tap.open`/

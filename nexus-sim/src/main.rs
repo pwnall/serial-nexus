@@ -427,9 +427,53 @@ fn err_verdict(mode: &str, e: &anyhow::Error) -> Value {
     json!({"tool": "nexus-sim", "mode": mode, "error": e.to_string(), "pass": false})
 }
 
-/// Set a fd to raw termios (no echo, no translation) — binary-transparent.
+/// Set a fd to raw termios (no echo, no translation) — binary-transparent. Only the
+/// Linux `apply_raw_pair` uses it (BSD/macOS leaves termios to the consumer).
+#[cfg(target_os = "linux")]
 fn set_raw<F: AsFd>(fd: &F) -> anyhow::Result<()> {
     set_raw_baud(fd, None)
+}
+
+/// Apply raw termios to a freshly-created pty pair per platform: Linux through the
+/// **master** (a terminal there); BSD/macOS through a momentarily-opened **slave**
+/// (the master is not a terminal — `tc*attr` → `ENOTTY`). Mirrors the daemon's PTY
+/// node (`nodes::pty::with_termios_fd`). On BSD the slave's termios resets on
+/// last-close, but the consumer (the daemon's serial node, or a client) reconfigures
+/// on open; the double only needs a clean, non-faulting setup.
+#[cfg(target_os = "linux")]
+fn apply_raw_pair(master: &PtyMaster, _pts: &str) -> anyhow::Result<()> {
+    set_raw(master)
+}
+#[cfg(not(target_os = "linux"))]
+fn apply_raw_pair(_master: &PtyMaster, _pts: &str) -> anyhow::Result<()> {
+    // BSD/macOS: the master is not a terminal (ENOTTY), and opening the slave to set
+    // termios would prime POLLHUP on the master — which the echo/source/sink loops
+    // read as "client hung up" and exit early. Leave the pair at its default termios
+    // and let the CONSUMER configure it: the daemon's serial node opens the slave
+    // through serial2 (raw 8N1), and the sim `client` sets raw on its own slave fd.
+    // A never-opened master does not HUP here, so the loops wait correctly meanwhile.
+    Ok(())
+}
+
+/// Read a pty pair's termios per platform (master on Linux, a slave open on BSD).
+#[cfg(target_os = "linux")]
+fn termios_of_pair(master: &PtyMaster, _pts: &str) -> anyhow::Result<nix::sys::termios::Termios> {
+    Ok(tcgetattr(master)?)
+}
+#[cfg(not(target_os = "linux"))]
+fn termios_of_pair(_master: &PtyMaster, pts: &str) -> anyhow::Result<nix::sys::termios::Termios> {
+    Ok(tcgetattr(&open_slave(pts)?)?)
+}
+
+/// Open the pty slave read-write (`O_NOCTTY`) for BSD/macOS termios operations.
+#[cfg(not(target_os = "linux"))]
+fn open_slave(pts: &str) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    Ok(std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(nix::libc::O_NOCTTY)
+        .open(pts)?)
 }
 
 /// Raw termios with an optional standard baud, applied in one `tcsetattr` so the
@@ -499,9 +543,11 @@ fn run_pty_inner(a: &PtyArgs) -> anyhow::Result<Value> {
     unlockpt(&master)?;
     let pts = ptsname(&master)?;
 
-    // Raw baseline on the pair, applied through the master so we never open the
-    // slave ourselves (per S2: opening+closing the slave would prime POLLHUP).
-    set_raw(&master)?;
+    // Raw baseline on the pair. On Linux this goes through the master (so we never
+    // open the slave ourselves — per S2, opening+closing it would prime POLLHUP); on
+    // BSD/macOS the master is not a terminal, so it goes through a momentary slave
+    // open (see `apply_raw_pair`).
+    apply_raw_pair(&master, &pts)?;
 
     if let Some(link) = &a.link {
         let _ = std::fs::remove_file(link);
@@ -524,7 +570,7 @@ fn run_pty_inner(a: &PtyArgs) -> anyhow::Result<Value> {
         let n = parse_size(a.bytes.as_deref().unwrap_or("0"))?;
         pty_sink(&mut master, n, a.timeout_ms)
     } else if a.report_termios {
-        pty_report_termios(&master)
+        pty_report_termios(&master, &pts)
     } else if a.stall {
         pty_stall(&master, a.timeout_ms)
     } else {
@@ -562,7 +608,7 @@ fn nullmodem_master(link: &std::path::Path) -> anyhow::Result<PtyMaster> {
     grantpt(&master)?;
     unlockpt(&master)?;
     let pts = ptsname(&master)?;
-    set_raw(&master)?;
+    apply_raw_pair(&master, &pts)?;
     let _ = std::fs::remove_file(link);
     std::os::unix::fs::symlink(&pts, link)?;
     Ok(master)
@@ -728,8 +774,8 @@ fn pty_stall(_master: &PtyMaster, timeout_ms: u64) -> anyhow::Result<Value> {
     Ok(json!({"tool": "nexus-sim", "mode": "pty", "behavior": "stall", "pass": true}))
 }
 
-fn pty_report_termios(master: &PtyMaster) -> anyhow::Result<Value> {
-    let t = tcgetattr(master)?;
+fn pty_report_termios(master: &PtyMaster, pts: &str) -> anyhow::Result<Value> {
+    let t = termios_of_pair(master, pts)?;
     // On Linux nix reports the output speed as a `BaudRate` enum of standard
     // rates (e.g. `B115200`); its debug form is stable and comparable, and baud
     // is cosmetic on a PTY anyway (§7.2).
@@ -1139,7 +1185,7 @@ fn run_mux_inner(a: &MuxArgs) -> anyhow::Result<Value> {
     grantpt(&master)?;
     unlockpt(&master)?;
     let pts = ptsname(&master)?;
-    set_raw(&master)?;
+    apply_raw_pair(&master, &pts)?;
     let _ = std::fs::remove_file(link);
     std::os::unix::fs::symlink(&pts, link)?;
 
