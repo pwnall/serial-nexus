@@ -1,14 +1,129 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-23 (**phases 0-8 + post-1.0 simplification + extension track done**;
-the **v9 design revision + web console track (plan §11 / design §17) is DONE** —
-§11.1 (the tap) + §11.2 (the replay ring) and §11.3-6 (the `serialnexusweb` client with
-the TLS tier) all built, validated, and committed on `implementation` (`4594d02`,
-`18f5216`)).
+**As of:** 2026-07-24 (**phases 0-8 + simplification + extension + web-console tracks done**;
+the **v10 track is DONE** — plan §11.7–§11.9 + §16.11: default-on replay rings, tap byte
+offsets + instance nonce, browser-side OPFS history, and the bash retirement).
 **Branch:** `implementation` (off `main`).
-**Normative docs are now v9:** `docs/20-design-claude-fable-v9.md` (design) and
-`docs/21-implementation-plan-claude-fable-v9.md` (plan). v1–v8 docs are in
-`docs/historical/`. Section references (§) point at the v9 design.
+**Normative docs are now v10:** `docs/22-design-claude-fable-v10.md` (design) and
+`docs/23-implementation-plan-claude-fable-v10.md` (plan). v1–v9 docs are in
+`docs/historical/`. Section references (§) point at the v10 design.
+
+---
+
+## v10 TRACK (plan §11.7–§11.9 + §16.11) — DONE (2026-07-24 session, uncommitted)
+
+v10 = v9 + a normative revision (design §15.32 / §11.7–§11.9 / §16.11) plus doc-catch-up
+ADRs §15.30 (macOS contact) and §15.31 (the validation suite became a crate) that describe
+already-committed work. The four executable items were built + validated this session, and
+validating them on the **real Linux 7.0 dev box with the FTDI crossover rig attached**
+surfaced three additional real issues that were fixed at the root (see "Three fixes…" below):
+a genuine doctor-P2 regression on `main`, a throughput regression the new default-on rings
+introduced, and two over-specified/racy tests. The full suite is green after.
+
+**§11.7 — DEFAULT-ON, PER-CHANNEL REPLAY RINGS.** `replay_ring` now defaults to **64 KiB**
+(`nexus_core::config::DEFAULT_REPLAY_RING`) on *every* host-facing endpoint, opt out with
+`0`, superseding the serial-only opt-in default and the codec/leg scoped deferral. New
+`replay_ring` field on `Codec` and `Leg` node configs (serial's default flipped); a
+`NodeConfig::replay_ring()` accessor. `runtime::Wiring::build` sizes `host_ring_cap` for
+**every host-facing endpoint** from its owning node's value (target-facing endpoints get
+none — inert on a serial output leg, a sending leg's channels, a demux's multiplexed side).
+The §5 accounting doctrine still holds: the tap/ring mirror is a spy *outside* the graph, so
+`discarded_unattached` is independent of it (regression `active_tap_feed_does_not_hide_unattached_loss`
+stays green). The ring is a **bulk-memcpy circular `Vec<u8>`** (`tap::ReplayRing`) — see fix
+#2 below for why a byte-by-byte `VecDeque` is forbidden here now that the ring is on the hot
+path of every endpoint. New guard:
+`p8_replay_ring::default_ring_on_a_codec_channel_splices_exactly` (race-free: replay tap opened
+after the stream drains, ring == last 64 KiB of the channel log, `feed_dropped == 0`).
+
+**§11.8 — TAP OFFSETS + INSTANCE NONCE.** `TapHub` tracks a monotonic `ingested: u64`;
+`TapMsg` and the `tap.data` notification carry the hostward byte `offset` of the chunk's
+first byte; `tap.open` returns `from_offset` (the ring's oldest byte under `--replay`, else
+the live edge); replay pieces walk `piece_off` (advancing even past a dropped piece, so a
+gap is visible not silent). `register()` returns `Registered { replay_bytes, from_offset }`.
+`from_offset = self.ingested − snap.len()` never underflows — every `ingest` pushes the same
+chunk to the ring *and* advances `ingested`, so `snap.len() ≤ ingested` invariantly. `info`
+gains a per-boot `instance` nonce (`daemon.rs::new_instance_nonce()`, a `RandomState`-seeded
+u64 mixed with pid + nanos — no new dependency); it changes across restarts so a client
+detects the offset reset. New tests `p8_tap_offsets.rs`
+(`reconnecting_tap_reconstructs_stream_exactly_once_by_offset` — a raw-socket client folds two
+replays by offset into a byte-exact stream, proving overlap-trim; and the instance-nonce
+stable/changes test). `p5_info` asserts `instance`; `docs/rpc/observation.md` documents the
+new fields + a Taps section (taps were previously undocumented in `docs/rpc/`).
+
+**§11.9 — BROWSER-SIDE OPFS HISTORY.** New pure ES module
+`serialnexusweb/src/assets/history.mjs` (offset-splice frontier + 16 MiB trim-oldest
+retention, DOM/storage-free), unit-tested by `history.test.mjs` (`node --test`, 9 tests) and
+gated by `nexus-itest/tests/p8_web_history.rs` (self-skips without `node`). Thin OPFS adapter
+`opfs.mjs` (per-`(origin, endpoint, instance)` key, 8-byte end-offset header + capped bytes,
+`navigator.storage.persist()` status surfaced, memory-only fallback). `app.js` became an ES
+module wiring history + OPFS: restores stored scrollback before the ring replay, splices live
+by offset (no reload duplication), debounced persist, export/clear controls, a storage badge.
+`index.html` (module script + toolbar), `app.css`, `assets.rs` (serve the two `.mjs`).
+`p8_web::web_http_security_gates` now also asserts the modules serve 200. **The OPFS adapter
+itself is browser-only and rides the manual/hardware checklist (§16.7) — the *logic* that
+must be correct is the node-tested pure module; a real-browser drive is still owed at the
+checklist.**
+
+**§16.11 — BASH RETIRED.** The last three shell scripts are folded into `nexus-itest` and
+`scripts/` is **deleted**: `p0_license_gate.rs` (plants `serialport`, asserts cargo-deny
+rejects it; self-skips without cargo-deny), `p8_external_codec.rs` (now *builds* the excluded
+template from the consumer position + runs its conformance kit, then drives `acme-daemon` over
+RPC — lifting the batch-2b "may not invoke cargo" constraint), and `wait-for.sh` → `wait_until`.
+CI (`ci.yml`): `license-gate`/`external-codec` jobs repointed to the folded tests. Sim doubles
+stay *subprocesses* deliberately (recorded evaluated-and-kept).
+
+**Three fixes surfaced by running the full suite on the real 7.0 dev box (`pwnblet`) with
+the FTDI crossover rig attached — NOT environment artifacts, real issues:**
+
+1. **Doctor P2 was a genuine regression from the macOS commit `d1d8520`, fixed here.** That
+   commit added `&& o.never_opened` to P2's `Supported` gate, on the false premise (stated
+   in its own comment) that "Linux HUPs a never-opened master." It does not — §3.2 and this
+   box both show `hup_when_never_opened = false`, which is exactly why the PTY node primes
+   the slave. So the change silently demoted **native Linux** from `Supported` to `Degraded`,
+   failing `meta_gates::doctor_reports_no_unsupported_capability` and `expectations/linux.jq`
+   (which *requires* P2 supported) on every real Linux — it was masked only because that
+   session ran on macOS and *assumed* Linux (the §15.30 "predicted ≠ verified" trap, ironically
+   reintroduced by the §15.30 fix). **Fix** (`probes.rs`): `never_opened` no longer gates the
+   verdict (priming handles it on every platform); the real Linux-vs-BSD split is
+   `termios_settable` — Linux master is a terminal → `Supported`; macOS master is not
+   (ENOTTY) → `Degraded`. Both `linux.jq` (P2 supported) and `macos.jq` (P2 supported-or-degraded)
+   now pass. This was a real pre-existing bug on committed HEAD, unrelated to v10 features but
+   found while validating them.
+2. **Default-on rings had a throughput regression; fixed at the root, not hidden.** The
+   original `ReplayRing` used a `VecDeque<u8>` with byte-at-a-time `drain`+`extend` — ~128 KiB
+   of per-byte churn per 64 KiB chunk, on the runtime thread, on *every* endpoint now that
+   rings default on. It starved the runtime thread and collapsed the 256 MiB firehose from
+   passing to ~1.9 MB/s (blew the 60 s bound). **Fix** (`tap.rs`): a fixed circular `Vec<u8>`
+   ring — `push` is two bulk `copy_from_slice`s. Firehose now completes in **2.5 s**, honoring
+   §15.32's "re-verified against the §15.19 throughput bar" instead of opting the benchmark out.
+3. **Two over-specified/racy tests hardened** (the added ring load raised their flake rate under
+   full-suite parallelism; each fix is design-faithful, not a mask): `Rpc::shutdown` is now
+   RST-tolerant (a `shutdown` verb inherently may not flush a response before the process exits
+   — a pre-existing race that flaked both ways); and `p3_counters::pty_no_client`'s
+   `dropped_slow_consumer == 0` became "presence-gated discard dominates" (§5 requires loss be
+   *counted*, not that a firehose never overflows a bounded buffer). The earlier `replay_ring = 0`
+   opt-out on that test was reverted — it runs on the real default-on config now.
+
+**Gates (all on the real Linux 7.0 box + FTDI FT232R crossover rig, `/dev/ttyUSB0 ↔ ttyUSB1`):**
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets`(+minimal), `cargo deny check`,
+`cargo check --target x86_64-apple-darwin --workspace --exclude serialnexusweb` (the `ring`/rustls
+dep can't cross-build from Linux — pre-existing; the real macOS gate is `cargo test` on a Mac),
+and `cargo test --workspace --locked` — **all green, confirmed across repeated runs.** On the
+physical rig: `nexus-doctor --port /dev/ttyUSB0 --port /dev/ttyUSB1` reports **15 supported / 0
+degraded / 0 unsupported** (P2 now `supported`; P5 certifies the pair both directions — custom
+baud, break, TIOCGICOUNT, bidirectional rate ladder, deliberate-mismatch observed), and the
+`serial_hardware::crossover_rig_data_plane_send_and_exclusivity` test drives the daemon through
+the physical crossover byte-exact both directions with the `send` verb reaching hardware and
+TIOCEXCL enforced. Committed on `implementation`; **no `main` merge without an explicit ask.**
+
+**For the next validating session (esp. on macOS, without these notes' git context):** the four
+v10 features plus the three fixes above are all in this change set. On macOS specifically —
+doctor **P2 is expected to be `degraded`** (BSD master isn't a terminal; `macos.jq` accepts it),
+serial-*device* itest tests self-skip (pts ≠ serial device; the real path is `serial_hardware.rs`
+via `/dev/cu.usbserial-*` or `SNX_CROSSOVER_A`/`_B`), the `--target x86_64-apple-darwin`
+cross-check is unnecessary (build natively), and `p8_web_history.rs` needs `node` (self-skips
+without it). The browser OPFS round-trip (`app.js` + `opfs.mjs`) is the one thing not covered by
+an automated test — drive it in a real browser as the manual-checklist step (§16.7).
 
 ---
 

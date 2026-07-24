@@ -42,8 +42,10 @@ jobs:
       - name: Test (unit + property + nexus-itest integration harness)
         run: cargo test --workspace --locked
 
-  # The licensing gate proven, not assumed (§13). cargo-deny plus the one surviving
-  # tooling script that proves the gate rejects a banned crate.
+  # The licensing gate proven, not assumed (§13). cargo-deny plus the nexus-itest test
+  # that proves the gate rejects a banned crate (§16.11 folded the bash script into it;
+  # it self-skips where cargo-deny is absent, so this job — which installs it — is where
+  # it runs for real).
   license-gate:
     runs-on: ubuntu-latest
     steps:
@@ -53,7 +55,7 @@ jobs:
       - name: License and ban check
         run: cargo deny check licenses bans sources
       - name: Prove the gate rejects a banned crate
-        run: bash scripts/validate/phase0/license-gate.sh
+        run: cargo test -p nexus-itest --test p0_license_gate --locked
 
   # Capability report (design §15.17): run every probe on the runner, assert the
   # platform expectation, and archive the Markdown so every capability claim has a
@@ -80,10 +82,11 @@ jobs:
 
   # Out-of-tree codec template (§15.26 / plan §10.3): build the closed-repo stand-in
   # from the CONSUMER's own position (its own workspace manifest, path deps standing
-  # in for version pins) and prove the custom daemon serves its `acme` codec. This is
-  # the embedding pattern proven to compile per push. (The runtime assertion is also
-  # ported to nexus-itest tests/p8_external_codec.rs, which runs against the binary
-  # this job builds when it is present.)
+  # in for version pins), run its conformance-kit test, and prove the custom daemon
+  # serves its `acme` codec alongside the built-ins. §16.11 folded the bash script into
+  # nexus-itest tests/p8_external_codec.rs, which now builds the excluded template itself
+  # (the `check` job's `cargo test --workspace` also exercises it; this job keeps an
+  # isolated stable-toolchain signal for the embedding pattern).
   external-codec:
     runs-on: ubuntu-latest
     steps:
@@ -91,10 +94,8 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
       - name: Build and exercise the out-of-tree template
-        run: bash scripts/validate/phase8/external-codec.sh
+        run: cargo test -p nexus-itest --test p8_external_codec --locked
 
   # macOS is best-effort (design §13). Now that the PTY node works on macOS (§7.2
   # slave-termios) and the harness is portable Rust, the macOS lane runs the SAME

@@ -154,6 +154,29 @@ impl TapConn {
         }
     }
 
+    /// Collect exactly `n` decoded `tap.data` bytes (the whole replay of a completed,
+    /// quiescent stream) or fewer if the tap goes quiet — used when the tap opens
+    /// *after* the source has finished, so no live tail can follow the ring snapshot.
+    fn collect_exact(&mut self, n: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let hard = Instant::now() + Duration::from_secs(20);
+        while (out.len() as u64) < n && Instant::now() < hard {
+            let Some(line) = self.read_line(Duration::from_millis(500)) else {
+                continue;
+            };
+            if let Ok(v) = serde_json::from_str::<Value>(&line)
+                && v.get("method").and_then(Value::as_str) == Some("tap.data")
+                && let Some(data) = v
+                    .get("params")
+                    .and_then(|p| p.get("data"))
+                    .and_then(Value::as_str)
+            {
+                out.extend_from_slice(&base64_decode(data));
+            }
+        }
+        out
+    }
+
     /// Collect the decoded `tap.data` payload until the hostward stream is complete
     /// (`log` at full size) and the tap has been quiet long enough to be drained.
     /// Bounded by a hard cap — no unbounded wait. The 1200 ms quiet window
@@ -199,9 +222,10 @@ fn replay_ring_attribute_round_trips_and_empty_marker() {
     let d = Daemon::start();
     let rpc = d.rpc();
 
-    // usb0 carries a 64 KiB ring, usb1 none; both devices are absent, so both load
-    // `waiting` (load never fails on a missing device, §15.8) — but their tap hubs
-    // exist from the first instant.
+    // usb0 carries an explicit 64 KiB ring, usb1 opts out with `replay_ring = 0`
+    // (default-on since §15.32, so opting out is the annotated case now); both
+    // devices are absent, so both load `waiting` (load never fails on a missing
+    // device, §15.8) — but their tap hubs exist from the first instant.
     let absent0 = d.run().join("absent-usb0");
     let absent1 = d.run().join("absent-usb1");
     let cfg = format!(
@@ -217,6 +241,7 @@ type = "serial"
 name = "usb1"
 device = "{dev1}"
 arbitration = "free-for-all"
+replay_ring = 0
 "#,
         dev0 = absent0.display(),
         dev1 = absent1.display(),
@@ -402,5 +427,162 @@ b = "logx"
         sha256_hex(&captured),
         sha256_hex(tail),
         "replay+live != a contiguous suffix of the stream (gap or duplication at the splice)"
+    );
+}
+
+// ---- Property 4: the ring is default-on and per-channel on a codec (§11.7/§15.32) --
+
+/// Every host-facing endpoint carries a 64 KiB ring by default now (§15.32), including
+/// a demultiplexer's *channels* — the per-channel ring that superseded the serial-only
+/// deferral. This drives a reference-framed stream through a `serial → held demux → log`
+/// graph whose codec node is **unannotated** (so its channel `mux/c0` gets the default
+/// ring), then, after the stream has fully drained, opens a replay tap on that channel
+/// and asserts its snapshot is byte-exact the last 64 KiB of the channel's log — the
+/// exact-splice guarantee holding on a codec channel, with `feed_dropped == 0` proving
+/// the ring lost nothing at the mirror hop. Opening the tap *after* completion removes
+/// any live-tail timing: the ring alone is under test. Linux-only (pty-as-serial).
+#[test]
+fn default_ring_on_a_codec_channel_splices_exactly() {
+    let Some(probe) = serial_echo() else {
+        eprintln!("SKIP default_ring_on_a_codec_channel_splices_exactly: no serial device");
+        return;
+    };
+    drop(probe);
+    // 128 KiB > the 64 KiB ring, so the ring evicts to its last R bytes; 32 frames at
+    // the 4096-byte default is well under the tap-feed cap, so a single unpaced burst
+    // never overruns the hub (asserted below via feed_dropped == 0).
+    const NBYTES: u64 = 131072;
+
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let run = d.run();
+    let dev = run.join("dev");
+    let go = run.join("go");
+    let logdir = run.join("logs");
+    std::fs::create_dir_all(&logdir).expect("mkdir log directory");
+    let log = logdir.join("c0.log");
+
+    // A one-shot reference-framed source for channel c0, gated until GO (created once the
+    // graph is active, so the burst cannot overflow the not-yet-open serial pts).
+    let dev_str = dev.to_string_lossy().into_owned();
+    let go_str = go.to_string_lossy().into_owned();
+    let _mux = Sim::spawn(
+        &[
+            "mux",
+            "--channel",
+            "c0",
+            "--bytes",
+            "128KiB",
+            "--seed",
+            "31",
+            "--link",
+            &dev_str,
+            "--wait-file",
+            &go_str,
+            "--timeout-ms",
+            "60000",
+        ],
+        Some(&dev),
+    );
+
+    // The codec node is unannotated: mux/c0 inherits the default 64 KiB ring (§15.32).
+    let cfg = format!(
+        r#"
+[[node]]
+type = "serial"
+name = "usb0"
+device = "{dev}"
+[[node]]
+type = "codec"
+name = "mux"
+codec = "reference"
+faces = "target"
+channels = ["c0"]
+[[node]]
+type = "log"
+name = "logx"
+directory = "{logdir}"
+filename = "c0.log"
+[[edge]]
+a = "usb0"
+b = "mux"
+write_mode = "held"
+[[edge]]
+a = "mux/c0"
+b = "logx"
+write_mode = "never"
+"#,
+        dev = dev.display(),
+        logdir = logdir.display(),
+    );
+    rpc.load_toml(&cfg, false).expect("load demux+log graph");
+    assert!(
+        rpc.wait_status("usb0", "active", Duration::from_secs(20)),
+        "usb0 not active: {:?}",
+        rpc.node("usb0")
+    );
+    assert!(
+        rpc.wait_status("mux", "active", Duration::from_secs(10)),
+        "codec not active: {:?}",
+        rpc.node("mux")
+    );
+
+    // Default-on round-trips through dump: the unannotated codec reports the 64 KiB ring.
+    assert_eq!(
+        dump_replay_ring(&rpc.dump(), "mux"),
+        Some(R),
+        "unannotated codec did not default to a {R}-byte ring: {}",
+        rpc.dump()
+    );
+
+    // Release the burst and wait for the channel's log to complete (all delivered).
+    std::fs::File::create(&go).expect("touch GO gate");
+    assert!(
+        wait_until(Duration::from_secs(40), || file_len(&log) >= NBYTES),
+        "channel log never reached {NBYTES} bytes (got {})",
+        file_len(&log)
+    );
+
+    // Give the async ring hub a beat to drain the mirror feed, then confirm the ring is
+    // full (its replay is exactly R). A one-shot `tap.open` closes on return.
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            rpc.ok("tap.open", json!({ "endpoint": "mux/c0", "replay": true }))["replay_bytes"]
+                .as_u64()
+                == Some(R)
+        }),
+        "codec channel ring never filled to {R}"
+    );
+
+    // Open the real replay tap and capture its full ring snapshot.
+    let (replay_bytes, mut tap) = TapConn::open_replay(&d.socket(), "mux/c0");
+    assert_eq!(
+        replay_bytes, R,
+        "codec channel replay_bytes = {replay_bytes}"
+    );
+
+    // The mirror lost nothing at the producer→hub hop (§5): the ring is a clean suffix.
+    let feed_dropped = rpc.state()["taps"]
+        .as_array()
+        .and_then(|taps| {
+            taps.iter()
+                .find(|t| t["endpoint"].as_str() == Some("mux/c0"))
+        })
+        .and_then(|t| t["feed_dropped"].as_u64());
+    assert_eq!(
+        feed_dropped,
+        Some(0),
+        "codec channel ring dropped bytes at the mirror hop: {}",
+        rpc.state()["taps"]
+    );
+
+    let captured = tap.collect_exact(R);
+    assert_eq!(captured.len() as u64, R, "captured != full ring");
+    let logged = std::fs::read(&log).expect("read c0.log");
+    let tail = &logged[logged.len() - R as usize..];
+    assert_eq!(
+        sha256_hex(&captured),
+        sha256_hex(tail),
+        "codec-channel replay != the last {R} bytes of the channel stream (ring gap/dup)"
     );
 }

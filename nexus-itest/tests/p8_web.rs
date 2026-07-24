@@ -312,6 +312,15 @@ fn web_http_security_gates() {
         200,
         "GET / with the cookie should be 200"
     );
+    // (5) the ES modules app.js imports must serve too (§11.9) — a 404 here breaks the
+    // module import chain in the browser and the console never boots.
+    for m in ["/history.mjs", "/opfs.mjs"] {
+        assert_eq!(
+            http_status(port, "GET", m, "127.0.0.1", Some(cookie.as_str())),
+            200,
+            "GET {m} with the cookie should be 200"
+        );
+    }
 }
 
 // ---- (6a) the WS bridge relays state and enforces the §17 denylist ---------------

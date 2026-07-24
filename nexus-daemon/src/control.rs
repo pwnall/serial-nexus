@@ -282,7 +282,13 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
             tap = tap_rx.recv() => if let Some(msg) = tap {
                 let note = Notification::new(
                     "tap.data",
-                    Some(json!({ "tap": msg.tap_id, "data": base64_encode(&msg.bytes) })),
+                    Some(json!({
+                        "tap": msg.tap_id,
+                        // The endpoint hostward offset of this chunk's first byte
+                        // (§11.8), so a client splices replay and live exactly.
+                        "offset": msg.offset,
+                        "data": base64_encode(&msg.bytes),
+                    })),
                 );
                 if write_half
                     .write_all(nexus_rpc::to_line(&note).as_bytes())

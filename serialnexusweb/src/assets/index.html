@@ -18,6 +18,11 @@
         <span id="pane-title">select a console</span>
         <span id="pane-lock"></span>
         <span id="pane-drops"></span>
+        <span id="pane-storage" class="storage"></span>
+        <span id="pane-tools">
+          <button id="exportbtn" type="button" disabled>export</button>
+          <button id="clearbtn" type="button" disabled>clear</button>
+        </span>
       </header>
       <pre id="term" tabindex="0"></pre>
       <form id="sendform">
@@ -26,6 +31,6 @@
       </form>
     </main>
   </div>
-  <script src="/app.js"></script>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

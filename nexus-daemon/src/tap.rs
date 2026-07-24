@@ -26,7 +26,6 @@
 //! two-lane model doing double duty for §5's ring splice).
 
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -62,6 +61,20 @@ const REPLAY_PIECE: usize = 64 * 1024;
 pub struct TapMsg {
     pub tap_id: u64,
     pub bytes: Chunk,
+    /// The endpoint's monotonic hostward byte offset of `bytes[0]` (§10/§15.32): the
+    /// count of hostward bytes ingested at this endpoint before these. Lets a
+    /// reconnecting client (the browser history of §17) splice replay and live
+    /// exactly, trimming any overlap instead of duplicating ring bytes on reload.
+    pub offset: u64,
+}
+
+/// The outcome of registering a tap (§11.8): how many replay bytes were queued and the
+/// endpoint offset the tap's stream begins at. With `--replay` and a non-empty ring,
+/// `from_offset` is the offset of the ring's first byte; otherwise it is the current
+/// live edge, so the next `tap.data` this tap sees carries exactly that offset.
+pub struct Registered {
+    pub replay_bytes: u64,
+    pub from_offset: u64,
 }
 
 /// The producer side of a tap feed: where a host-facing producer mirrors its
@@ -114,9 +127,22 @@ struct Tap {
 /// A bounded ring of the most recent hostward bytes on a host-facing endpoint
 /// (design §5 replay ring). `cap == 0` means no ring (the default), and no bytes
 /// are ever stored.
+///
+/// Backed by a fixed circular `Vec<u8>` (lazily allocated to `cap` on first use), so
+/// `push` is at most two `copy_from_slice`s — O(bytes) with **bulk** memcpy, never the
+/// byte-at-a-time churn a `VecDeque<u8>` drain+extend would impose. Since default-on
+/// rings (§15.32) put this on the hostward hot path of *every* endpoint, and the hub
+/// task drains it on the single runtime thread, a per-byte cost here starves the rest of
+/// that thread and collapses firehose throughput (measured); bulk memcpy keeps it within
+/// the §15.19 bound.
 struct ReplayRing {
     cap: usize,
-    buf: VecDeque<u8>,
+    /// Circular storage; empty until the first push, then exactly `cap` bytes long.
+    buf: Vec<u8>,
+    /// Index where the next byte will be written (`% cap`).
+    pos: usize,
+    /// Valid bytes currently retained, `<= cap`.
+    len: usize,
 }
 
 impl ReplayRing {
@@ -130,13 +156,36 @@ impl ReplayRing {
         } else {
             bytes
         };
-        let overflow = (self.buf.len() + bytes.len()).saturating_sub(self.cap);
-        self.buf.drain(..overflow.min(self.buf.len()));
-        self.buf.extend(bytes.iter().copied());
+        if bytes.is_empty() {
+            return;
+        }
+        if self.buf.is_empty() {
+            self.buf = vec![0u8; self.cap];
+        }
+        // Write into the circular buffer at `pos`, wrapping once at the end.
+        let n = bytes.len();
+        let first = (self.cap - self.pos).min(n);
+        self.buf[self.pos..self.pos + first].copy_from_slice(&bytes[..first]);
+        if n > first {
+            self.buf[..n - first].copy_from_slice(&bytes[first..]);
+        }
+        self.pos = (self.pos + n) % self.cap;
+        self.len = (self.len + n).min(self.cap);
     }
 
     fn snapshot(&self) -> Vec<u8> {
-        self.buf.iter().copied().collect()
+        if self.len == 0 {
+            return Vec::new();
+        }
+        // Oldest retained byte sits `len` behind the write cursor.
+        let start = (self.pos + self.cap - self.len) % self.cap;
+        let mut out = Vec::with_capacity(self.len);
+        let first = (self.cap - start).min(self.len);
+        out.extend_from_slice(&self.buf[start..start + first]);
+        if self.len > first {
+            out.extend_from_slice(&self.buf[..self.len - first]);
+        }
+        out
     }
 }
 
@@ -144,6 +193,11 @@ impl ReplayRing {
 pub struct TapHub {
     taps: Vec<Tap>,
     ring: Option<ReplayRing>,
+    /// Total hostward bytes ever ingested at this endpoint (§11.8): the monotonic
+    /// offset stamped on each delivered chunk. Wraps only at u64 (petabytes), never in
+    /// a session; a daemon restart resets it and the `info` instance nonce changes so a
+    /// client detects the reset rather than splicing across it.
+    ingested: u64,
     /// Producer mirrors hostward bytes only while this is set — a ring is
     /// configured (always active), or at least one tap is open. Shared with every
     /// [`TapFeed`] for this endpoint.
@@ -173,8 +227,11 @@ impl TapHub {
             taps: Vec::new(),
             ring: (ring_cap > 0).then(|| ReplayRing {
                 cap: ring_cap,
-                buf: VecDeque::new(),
+                buf: Vec::new(),
+                pos: 0,
+                len: 0,
             }),
+            ingested: 0,
             active: active.clone(),
             feed_dropped: feed_dropped.clone(),
             _endpoint: endpoint.into(),
@@ -192,10 +249,14 @@ impl TapHub {
             ring.push(chunk);
         }
         let n = chunk.len() as u64;
+        // Offset of this chunk's first byte in the endpoint's hostward stream (§11.8),
+        // stamped before advancing the running total.
+        let offset = self.ingested;
         self.taps.retain(|tap| {
             match tap.out.try_send(TapMsg {
                 tap_id: tap.id,
                 bytes: chunk.clone(),
+                offset,
             }) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -205,6 +266,7 @@ impl TapHub {
                 Err(mpsc::error::TrySendError::Closed(_)) => false, // connection gone
             }
         });
+        self.ingested = self.ingested.wrapping_add(n);
         self.refresh_active();
     }
 
@@ -220,25 +282,42 @@ impl TapHub {
         out: mpsc::Sender<TapMsg>,
         dropped: Rc<Cell<u64>>,
         replay: bool,
-    ) -> u64 {
+    ) -> Registered {
         let mut replay_bytes = 0u64;
+        // Where this tap's stream begins (§11.8). With a non-empty ring under `--replay`
+        // it is the offset of the ring's oldest retained byte; otherwise it is the live
+        // edge, so the tap's first live `tap.data` carries exactly this offset.
+        let mut from_offset = self.ingested;
         if replay && let Some(ring) = &self.ring {
             let snap = ring.snapshot();
+            from_offset = self.ingested - snap.len() as u64;
+            // Offset walks the stream position of each replay piece — advancing even
+            // past a dropped piece, so a client that loses one still splices the rest
+            // at the right offset (a gap it can see, never a silent shift).
+            let mut piece_off = from_offset;
             for piece in snap.chunks(REPLAY_PIECE) {
                 let bytes = Chunk::copy_from_slice(piece);
                 let len = bytes.len() as u64;
-                match out.try_send(TapMsg { tap_id: id, bytes }) {
+                match out.try_send(TapMsg {
+                    tap_id: id,
+                    bytes,
+                    offset: piece_off,
+                }) {
                     Ok(()) => replay_bytes += len,
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         dropped.set(dropped.get() + len);
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
+                piece_off += len;
             }
         }
         self.taps.push(Tap { id, out, dropped });
         self.refresh_active();
-        replay_bytes
+        Registered {
+            replay_bytes,
+            from_offset,
+        }
     }
 
     /// Remove a tap by id (explicit `tap.close` or connection drop). Idempotent: a
@@ -334,8 +413,10 @@ mod tests {
         hub.with_mut(|h| h.ingest(&Chunk::from_static(b"0123456789")));
         let (tx, mut rx) = mpsc::channel(64);
         let dropped = Rc::new(Cell::new(0));
-        let replay = hub.with_mut(|h| h.register(1, tx, dropped, true));
-        assert_eq!(replay, 8);
+        let reg = hub.with_mut(|h| h.register(1, tx, dropped, true));
+        assert_eq!(reg.replay_bytes, 8);
+        // 10 bytes ingested, ring keeps the last 8 → replay begins at offset 2 (§11.8).
+        assert_eq!(reg.from_offset, 2);
         // Live bytes after registration continue the stream.
         hub.with_mut(|h| h.ingest(&Chunk::from_static(b"abc")));
         // Ring tail (23456789) then live (abc): exact splice, no gap, no dup.
@@ -348,8 +429,10 @@ mod tests {
         hub.with_mut(|h| h.ingest(&Chunk::from_static(b"data")));
         let (tx, _rx) = mpsc::channel(64);
         let dropped = Rc::new(Cell::new(0));
-        let replay = hub.with_mut(|h| h.register(1, tx, dropped, true));
-        assert_eq!(replay, 0); // explicit empty-replay marker (§17)
+        let reg = hub.with_mut(|h| h.register(1, tx, dropped, true));
+        assert_eq!(reg.replay_bytes, 0); // explicit empty-replay marker (§17)
+        // No ring, but 4 bytes already flowed: the tap resumes at the live edge (§11.8).
+        assert_eq!(reg.from_offset, 4);
     }
 
     #[test]

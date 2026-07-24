@@ -148,6 +148,11 @@ pub struct Daemon {
     /// prefers it, so incremental surgery survives a daemon restart. `None` disables
     /// persistence (unit tests via [`Daemon::default`]).
     state_file: Option<std::path::PathBuf>,
+    /// A per-boot nonce reported by `info` (§10/§11.8). Tap byte offsets are only
+    /// meaningful within one daemon process; on restart the offsets reset to 0 and
+    /// this nonce changes, so a client (the browser history of §17) keyed on it
+    /// detects the reset and starts a fresh history instead of splicing across it.
+    instance: u64,
 }
 
 /// The outcome of a (possibly waiting) acquisition attempt (§15.20). Distinguishes
@@ -167,6 +172,23 @@ enum WaitOutcome {
     Closed,
 }
 
+/// A per-boot instance nonce (§11.8). A fresh `RandomState` is seeded from the OS RNG
+/// once per process, so hashing a per-process input yields a value that differs across
+/// daemon restarts without pulling in a randomness dependency; process id and a
+/// nanosecond timestamp are folded in as belt-and-suspenders so even an unlucky seed
+/// collision resolves. Uniqueness across restarts — not cryptographic strength — is all
+/// that is required: it exists only so a client detects an offset reset.
+fn new_instance_nonce() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u32(std::process::id());
+    if let Ok(d) = SystemTime::now().duration_since(UNIX_EPOCH) {
+        h.write_u128(d.as_nanos());
+    }
+    h.finish()
+}
+
 impl Daemon {
     pub fn new(
         resolver: nexus_core::Resolver,
@@ -184,6 +206,7 @@ impl Daemon {
             resolver,
             registry,
             state_file,
+            instance: new_instance_nonce(),
         }
     }
 
@@ -717,11 +740,15 @@ impl Daemon {
             let tap_id = st.next_tap_id.get();
             st.next_tap_id.set(tap_id + 1);
             let dropped = Rc::new(Cell::new(0));
-            let replay_bytes = hub.with_mut(|h| h.register(tap_id, out, dropped, replay));
+            let reg = hub.with_mut(|h| h.register(tap_id, out, dropped, replay));
             let result = json!({
                 "tap": tap_id,
                 "endpoint": endpoint,
-                "replay_bytes": replay_bytes,
+                "replay_bytes": reg.replay_bytes,
+                // The endpoint offset this tap's stream begins at (§11.8): a
+                // reconnecting client trims replay overlap against the last offset it
+                // stored, so a reload never duplicates ring bytes into its history.
+                "from_offset": reg.from_offset,
             });
             Ok((result, crate::tap::OpenTap { tap_id, hub }))
         })
@@ -739,6 +766,10 @@ impl Daemon {
             "wire_version": crate::WIRE_VERSION,
             "envelope_version": crate::ENVELOPE_VERSION,
             "codecs": self.registry.codec_names(),
+            // Per-boot nonce (§11.8): tap byte offsets are only comparable within one
+            // instance, so a client keys its stored history on this and starts fresh
+            // when it changes across a restart.
+            "instance": self.instance,
         })
     }
 

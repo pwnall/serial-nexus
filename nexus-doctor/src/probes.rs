@@ -137,24 +137,32 @@ pub fn p2_presence() -> Probe {
                 .observe("zero_timeout_poll_ns_median", o.poll_ns);
             // Core presence: POLLHUP must be absent while a slave is open, present
             // after it closes, and clear again on reopen. These are the signals the
-            // data plane gates on. Two further facts separate a fully-native kernel
-            // (Linux) from a BSD/macOS one the PTY node works around:
-            //  * `never_opened` — Linux HUPs a never-opened master; BSD does not, so
-            //    the node primes the slave (open+close at creation) to seed "absent".
-            //  * `termios_settable` — the Linux master is a terminal; the BSD master
-            //    is not (ENOTTY), so the node applies the baseline via the slave and
-            //    re-asserts it on the client's rising edge (the slave's termios there
-            //    resets on last-close). See nexus-daemon `nodes::pty::with_termios_fd`.
+            // data plane gates on.
+            //
+            // `never_opened` is recorded but does NOT gate the verdict: NO mainstream
+            // kernel — Linux included (§3.2, and verified on 7.0: a never-opened master
+            // does not HUP) — reliably HUPs a never-opened master, so the node primes
+            // the slave (open+close at creation) to seed "absent" on every platform.
+            // Priming is a universal refinement, not a platform arm. (An earlier fix
+            // wrongly gated Supported on `never_opened` being true, which no Linux
+            // satisfies, so it demoted native Linux to Degraded — the §15.30 "predicted
+            // ≠ verified" trap, caught by running on real Linux hardware.)
+            //
+            // The one genuine platform split is `termios_settable`: the Linux master is
+            // a terminal, so the baseline is applied through it (Supported); a BSD/macOS
+            // master is not (ENOTTY), so the node applies the baseline via the slave and
+            // re-asserts it on the client's rising edge (Degraded, still fully
+            // functional). See nexus-daemon `nodes::pty::with_termios_fd`.
             let core_presence = o.after_close && !o.while_open && !o.after_reopen;
-            if core_presence && o.never_opened && o.termios_settable {
+            if core_presence && o.termios_settable {
                 p.verdict(
                     Status::Supported,
-                    "POLLHUP presence detection works natively; the node also primes the slave (open+close at creation) for the never-opened case.",
+                    "POLLHUP presence detection works; the master is a terminal (baseline applied natively), and the node primes the slave (open+close at creation) for the never-opened case.",
                 )
             } else if core_presence {
                 p.verdict(
                     Status::Degraded,
-                    "POLLHUP presence works once the slave is primed, but this kernel needs the §7.2 platform arm: a never-opened master does not HUP and/or the master is not a terminal (termios applied via the slave). The PTY node handles both (§13); presence-gated output is available.",
+                    "POLLHUP presence works once the slave is primed, but this kernel's master is not a terminal (ENOTTY): the baseline is applied via the slave and re-asserted on the client's rising edge (§7.2). The PTY node handles it (§13); presence-gated output is available.",
                 )
             } else {
                 p.verdict(

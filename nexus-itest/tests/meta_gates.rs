@@ -3,8 +3,8 @@
 //! `unsafe` confined to `nexus-sys`) and `phase0/doctor.sh` (§15.17 — no probe reports
 //! `unsupported`). Portable Rust: no `jq`, no shell `grep`.
 //!
-//! (The `license-gate.sh` cargo-deny check stays a tooling step — it needs cargo-deny
-//! installed — and `jq-lint.sh`/`harness-selftest.sh` become obsolete as the bash goes.)
+//! (The license gate is now `tests/p0_license_gate.rs`, which self-skips without
+//! cargo-deny; §16.11 folded the last three shell scripts into Rust, so no bash remains.)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

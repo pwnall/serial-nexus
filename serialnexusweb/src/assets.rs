@@ -12,6 +12,10 @@ pub struct Asset {
 const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_JS: &str = include_str!("assets/app.js");
 const APP_CSS: &str = include_str!("assets/app.css");
+// The ES modules app.js imports: the pure offset-splice/retention core (§11.9,
+// unit-tested under `node --test`) and the thin OPFS persistence adapter.
+const HISTORY_MJS: &str = include_str!("assets/history.mjs");
+const OPFS_MJS: &str = include_str!("assets/opfs.mjs");
 
 /// Resolve a request path to a static asset, or `None` for a 404. The token/Host
 /// gate has already run in the server (§15.29); this only maps paths to bytes.
@@ -28,6 +32,14 @@ pub fn lookup(path: &str) -> Option<Asset> {
         "/app.css" => Some(Asset {
             content_type: "text/css; charset=utf-8",
             body: APP_CSS.as_bytes(),
+        }),
+        "/history.mjs" => Some(Asset {
+            content_type: "text/javascript; charset=utf-8",
+            body: HISTORY_MJS.as_bytes(),
+        }),
+        "/opfs.mjs" => Some(Asset {
+            content_type: "text/javascript; charset=utf-8",
+            body: OPFS_MJS.as_bytes(),
         }),
         _ => None,
     }

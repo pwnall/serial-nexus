@@ -48,6 +48,18 @@ body {
 #pane-title { font-weight: 700; }
 #pane-lock { color: #ffb454; font-size: 12px; }
 #pane-drops { color: #e06c75; font-size: 12px; margin-left: auto; }
+#pane-storage { color: #6b7280; font-size: 12px; }
+#pane-tools { display: flex; gap: 6px; }
+#pane-tools button {
+  font-size: 12px;
+  padding: 2px 8px;
+  background: #22252b;
+  color: #cbd0d8;
+  border: 1px solid #34383f;
+  border-radius: 4px;
+  cursor: pointer;
+}
+#pane-tools button:disabled { opacity: 0.4; cursor: default; }
 
 #term {
   flex: 1;

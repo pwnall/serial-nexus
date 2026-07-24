@@ -370,8 +370,24 @@ impl Rpc {
         let _ = self.call("teardown", Value::Null);
     }
 
+    /// Ask the daemon to shut down. Best-effort by nature: `shutdown` makes the daemon
+    /// exit, and it may close (RST) the connection before flushing a response — a
+    /// legitimate outcome, since the process is going away. Whether the response flush
+    /// wins the race against teardown is environment-timing-dependent, so unlike
+    /// [`Self::call`] (which panics on a read error) this treats a reset/EOF as success,
+    /// keeping the shutdown deterministic across environments. The response, if it does
+    /// arrive first, is simply drained.
     pub fn shutdown(&self) {
-        let _ = self.call("shutdown", Value::Null);
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        let line = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"shutdown\"}}\n");
+        if let Ok(mut stream) = UnixStream::connect(&self.socket) {
+            let _ = stream.write_all(line.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut sink = [0u8; 64];
+            let _ = stream.read(&mut sink); // drain a response if any; ignore reset/EOF
+        }
     }
 }
 

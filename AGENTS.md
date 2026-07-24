@@ -3,7 +3,7 @@
 Orientation for an AI agent (or human) picking this repo up cold. It captures what
 the code *is*, how to build/verify it, and the hard-won invariants you must not
 regress. When this file and the design disagree, **the design wins** — see
-`docs/20-design-claude-fable-v9.md`.
+`docs/22-design-claude-fable-v10.md`.
 
 ---
 
@@ -39,22 +39,22 @@ TCP/Unix socket, loopback-only unless opted out). `existing-terminal` (§7.7) is
 
 - **Branch:** `implementation` (off `main`). Version **0.2.0** (annotated tag `0.2.0`
   at the phase-8 release mark). Pre-1.0, lab-usable on Linux.
-- **Baseline that must stay green:** `cargo test --workspace --locked` — **156 unit/property
-  tests + the `nexus-itest` integration harness (§5)** (the former bash `scripts/validate/**`,
-  now portable Rust); `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
-  --locked -- -D warnings` (+ the minimal-daemon clippy); `cargo deny check`. **The whole
-  suite runs on macOS too** (serial-*device* tests self-skip there — §7 — and the real
-  crossover-hardware test runs when a rig is attached).
-- **All planned phases 0–8 are done**, plus three post-1.0 tracks: the simplification
+- **Baseline that must stay green:** `cargo test --workspace --locked` — **unit/property
+  tests + the `nexus-itest` integration harness (§5)**, now the *only* validation suite
+  (the last three bash scripts were folded into `nexus-itest` in v10 §16.11, so `scripts/`
+  is gone); `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked --
+  -D warnings` (+ the minimal-daemon clippy); `cargo deny check`. **The whole suite runs on
+  macOS too** (serial-*device* tests self-skip there — §7 — and the real crossover-hardware
+  test runs when a rig is attached).
+- **All planned phases 0–8 are done**, plus four post-1.0 tracks: the simplification
   track (design §16 / plan §9), the out-of-tree-codec extension track (design §15.26 /
-  plan §10), and the **v9 web console track** (design §17 / plan §11) — taps, the replay
-  ring, and the `serialnexusweb` client, committed through §11.6 (commits `4594d02`,
-  `18f5216`). Note: `docs/implementation-notes.md`'s header may still read "web console
-  IN PROGRESS" — that is stale; the commits landed.
+  plan §10), the web console track (design §17 / plan §11.1–§11.6), and the **v10 track**
+  (design §15.32 / plan §11.7–§11.9 + §16.11): **default-on replay rings** (64 KiB on every
+  host-facing endpoint, per-channel on codec/exec/leg, opt out with `replay_ring = 0`),
+  **tap byte offsets** (`tap.data.offset`, `tap.open`'s `from_offset`, `info.instance`
+  nonce), **browser-side OPFS history** in `serialnexusweb`, and the bash retirement.
 - **Deferred / not implemented on purpose:** design §14 items, and RPC verbs `connect` /
   `disconnect` / `set-attribute` (they return `-32601`). `existing-terminal` node (§7.7).
-  Per-channel `replay_ring` on codec/leg (only `serial` carries it today; taps still work
-  on codec/leg channels).
 - **Open review items:** the Opus comprehensive code review is `docs/19-claude-opus-code-review.md`;
   its remediation was committed (`b9d8a50`) and folded into v9. If you touch that area,
   check the review's action table for anything still marked open before assuming it's clean.
@@ -99,20 +99,25 @@ Dependency direction: `nexus-daemon` → {`nexus-core`, `nexus-rpc`, `nexus-sys`
 
 ```sh
 cargo build --workspace --locked
-# The one suite: 156 unit/property tests + the nexus-itest integration harness. It
-# builds every binary first (serialnexusd/nexus-sim/serialnexusweb/nexus-doctor) so
-# the harness's bin() lookups resolve; the exec/envelope codec tests need python3.
+# The one suite: unit/property tests + the nexus-itest integration harness. It builds
+# every binary first (serialnexusd/nexus-sim/serialnexusweb/nexus-doctor) so the harness's
+# bin() lookups resolve; the exec/envelope codec tests need python3, and the folded
+# license-gate/external-codec/web-history tests shell out to cargo-deny/cargo/node and
+# self-skip when the tool is absent.
 cargo test  --workspace --locked
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 # The minimal daemon (no built-in codecs) must ALSO be warning-clean:
 cargo clippy -p serialnexusd -p nexus-daemon --no-default-features --locked -- -D warnings
-# macOS portability gate (no Mac needed — it type-checks the cfg resolution):
-cargo check --target x86_64-apple-darwin --workspace
-# Licensing gate (permissive-only), proven not assumed:
+# macOS portability gate (no Mac needed — it type-checks the cfg resolution). NOTE: the
+# `ring` crate (serialnexusweb's TLS dep) cannot cross-build from Linux, so exclude it —
+# the real macOS gate is `cargo test --workspace` on a Mac runner:
+cargo check --target x86_64-apple-darwin --workspace --exclude serialnexusweb
+# Licensing gate (permissive-only), proven not assumed. The second command is the folded
+# gate that plants a banned crate and asserts cargo-deny rejects it (self-skips without it):
 cargo deny check licenses bans sources
-bash scripts/validate/phase0/license-gate.sh   # proves cargo-deny rejects a banned crate
-# Run one ported script's tests, or the #[ignore]d endurance soak:
+cargo test -p nexus-itest --test p0_license_gate --locked
+# Run one test file, or the #[ignore]d endurance soak:
 cargo test -p nexus-itest --test p4_steal_lease
 cargo test -p nexus-itest --test p8_soak -- --ignored
 ```
@@ -149,9 +154,11 @@ which was not macOS-portable: `stat -c`, `nc -q`, `sha256sum`, `timeout`, and
   high-volume read, so *that* is where hardware byte-exactness is asserted).
 - **Meta-gates are proven, not assumed.** `tests/meta_gates.rs` scans the tree and
   asserts `unsafe` is confined to `nexus-sys/` (with a planted-`unsafe` self-proof), and
-  asserts `nexus-doctor` reports no `unsupported` capability. The one surviving bash gate
-  is `scripts/validate/phase0/license-gate.sh` — it plants a banned crate and asserts
-  cargo-deny rejects it (kept because it needs the cargo-deny tool).
+  asserts `nexus-doctor` reports no `unsupported` capability. The licensing gate is
+  `tests/p0_license_gate.rs` (folded from bash in v10 §16.11): it plants a banned crate and
+  asserts cargo-deny rejects it, self-skipping where cargo-deny is absent. `p8_external_codec.rs`
+  builds the out-of-tree template from a consumer's position, and `p8_web_history.rs` runs
+  the browser history module's `node --test` (self-skip without node). **No bash remains.**
 - **No bare sleeps.** Use `wait_until(Duration, || cond)` / `rpc.wait_status(…)` /
   `Subscription::wait_for(…)`. `Daemon`/`Sim`/`TempRun` clean up on `Drop` (kill children,
   remove the temp dir), so a panicking test never leaks a daemon or a socket.
@@ -161,9 +168,11 @@ which was not macOS-portable: `stat -c`, `nc -q`, `sha256sum`, `timeout`, and
 **Hardware rig:** `serial_hardware.rs` — two USB-serial adapters cross-wired as a null
 modem (each is the other's target), auto-detected via `crossover_ports()`
 (`/dev/cu.usbserial-*` on macOS, or `SNX_CROSSOVER_A`/`_B`). **Self-skips when absent.**
-The two genuine tooling scripts that remain are `phase0/license-gate.sh` and
-`phase8/external-codec.sh` (builds the out-of-tree codec template from a consumer's
-position); `scripts/lib/wait-for.sh` survives for the latter.
+There are **no shell scripts left** (v10 §16.11): the former tooling wrappers — the
+license gate, the external-consumer build, and their `wait-for` helper — are now
+`nexus-itest` tests that spawn the same tools directly (`cargo-deny`, `cargo`, `node`),
+each self-skipping when its tool is unavailable. Sim doubles stay *subprocesses*
+deliberately (cross-process scheduling realism exposed §15.19's timer floor).
 
 ## 6. Load-bearing invariants — DO NOT REGRESS
 
@@ -203,6 +212,19 @@ These are settled by real bugs and benchmarks. Each cites where it lives.
    targetward (non-holders are simply not read = backpressure, no drop). A lone PTY needs
    an explicit `lock` to write, or the node set to `arbitration = "free-for-all"`. The
    `send` verb self-acquires the lock. Do not weaken the gate to "fix" a test.
+9. **The replay ring is bulk-memcpy, and default-on (64 KiB).** Since v10 §15.32 every
+   host-facing endpoint carries a `replay_ring` (default 65536, opt out with `0`), so its
+   hostward mirror + hub run on the hot path of *every* endpoint. `tap::ReplayRing` MUST stay
+   a fixed circular `Vec<u8>` written with `copy_from_slice` — a byte-at-a-time `VecDeque`
+   `drain`+`extend` starved the runtime thread and collapsed the 256 MiB firehose from 2.5 s
+   to ~1.9 MB/s (measured, then fixed). Guard: `p3_firehose` completes well under its 60 s
+   bound. `discarded_unattached`/`discarded_no_client` accounting stays independent of the
+   mirror (the ring is a spy *outside* the graph, §5) — guard `active_tap_feed_does_not_hide_unattached_loss`.
+10. **`tap.data` offsets are monotonic per boot; `from_offset = ingested − ring.len()` never
+   underflows.** Every `ingest` both pushes to the ring and advances `ingested`, so the ring
+   holds `≤ ingested` bytes by construction (`nexus-daemon/src/tap.rs`, §11.8). `info.instance`
+   is a per-boot nonce so a client detects the offset reset across a restart. Do not stamp an
+   offset *after* advancing `ingested`, or splice-exactness breaks.
 
 For the deeper code-level invariants (purge-on-acquire runs synchronously at grant time;
 the exec pump polls stdin/stdout/stderr concurrently to avoid deadlock; serial
@@ -223,6 +245,23 @@ running engineering log and the authoritative "why the code looks like this" rec
 - **macOS is best-effort** (`docs/macos.md`): the tree compiles and degrades gracefully;
   `#[cfg]`-gated blockers are `TIOCGICOUNT` and `ptsname_r` (Linux-only). The gating CI
   deliverable is only that it *builds* + portable tests pass. **Windows is out of scope.**
+  - **Doctor P2 on macOS is `degraded`, and that is correct** (`macos.jq` accepts
+    supported-or-degraded): the BSD master is not a terminal, so the baseline termios is
+    applied via a momentarily-opened slave (§7.2 platform arm). Linux is `supported`. The
+    verdict split is `termios_settable`, **not** `never_opened` — a v10 fix (`probes.rs`)
+    corrected a regression that had wrongly gated Linux `Supported` on `never_opened` (which
+    no Linux satisfies — a never-opened master doesn't HUP, §3.2), demoting native Linux to
+    `Degraded`. If a fresh session sees P2 `degraded` on **Linux**, that is a real problem;
+    on macOS it is expected.
+  - **The macOS local cross-check must exclude `serialnexusweb`:** `cargo check --target
+    x86_64-apple-darwin --workspace --exclude serialnexusweb` — the `ring` crate (its TLS dep)
+    cannot cross-build from Linux. The real macOS gate is `cargo test --workspace` *on the Mac*,
+    where `ring` builds natively and this exclusion is unnecessary.
+  - **Serial-*device* itest tests self-skip on macOS** (a pts can't be a serial device there —
+    `serial2` → `ENOTTY`); the real macOS serial path is `serial_hardware.rs` via
+    `crossover_ports()` (`/dev/cu.usbserial-*`, or `SNX_CROSSOVER_A`/`_B`), self-skipping with
+    no rig. `p8_web_history.rs` runs the browser history module under `node --test` and
+    self-skips without `node`.
 - **serial2, not serialport.** The MPL `serialport`/`mio-serial`/`tokio-serial` stack and
   LGPL `libudev` bindings are **banned in `deny.toml`**. `serial2` is opened blocking and
   driven by the daemon's own poll-based readiness; even `serial2-tokio` was dropped because
@@ -246,7 +285,7 @@ running engineering log and the authoritative "why the code looks like this" rec
 ## 9. How work has been done here (the working rhythm)
 
 - **Design/plan pairs are version-suffixed and monotonic.** The newest pair lives in
-  `docs/` (currently v9: `20-design-…-v9.md` + `21-implementation-plan-…-v9.md`);
+  `docs/` (currently v10: `22-design-…-v10.md` + `23-implementation-plan-…-v10.md`);
   superseded generations move to `docs/historical/`. `§N` always means the *current*
   normative design. ADRs are numbered subsections under design **§15.x** (plus §16
   post-completion review, §17 web console). The RPC method-by-method reference is

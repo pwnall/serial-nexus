@@ -38,10 +38,10 @@ for a serial device — **does not work on macOS**. Serial-*device* tests on mac
 byte-exact above). The Rust harness (`nexus-itest`) encodes exactly this: `serial_rig()`
 yields the real rig on macOS, a sim pty on Linux, or `None` → skip.
 
-The validation harness is being migrated from the bash `scripts/validate/**` (which used
+The validation harness was fully migrated from the bash `scripts/validate/**` (which used
 `stat -c`, `nc -q`, `sha256sum`, `timeout`, `/dev/serial/by-id` — none macOS-portable) to
-the cross-platform **`nexus-itest`** crate. macOS-verified so far: control-plane + the
-hardware crossover byte-exact test.
+the cross-platform **`nexus-itest`** crate; `scripts/` is gone entirely (v10 §16.11).
+macOS-verified: control-plane + the hardware crossover byte-exact test.
 
 The feature matrix below is the original Phase-8 *predicted* table, kept for reference; where
 this update block and the table disagree, **this block is the observed truth.**

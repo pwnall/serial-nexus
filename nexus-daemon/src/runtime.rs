@@ -381,28 +381,33 @@ impl Wiring {
         // fan-out buffer depth to each of its consumers. Other producers (codec
         // channels) use the built-in default.
         let mut host_hostward_depth: HashMap<&str, usize> = HashMap::new();
-        // A host-facing endpoint's configured replay-ring depth in bytes (§5, §17).
-        // Only a serial node's single host endpoint carries the attribute today;
-        // codec/leg host-facing channels default to 0 (their per-channel ring config
-        // is deferred work, §14). Every host endpoint still gets a hub — a tap can
-        // attach to any of them — but only a configured one keeps a ring.
+        // A host-facing endpoint's configured replay-ring depth in bytes (§5, §15.32).
+        // Every host-facing endpoint carries the attribute now — a serial node's
+        // single endpoint and every host-facing channel of a codec or leg — each
+        // defaulting to 64 KiB (config layer) and opt-out with `0`. Every host
+        // endpoint gets a hub regardless (a tap can attach to any of them); this map
+        // sizes each one's ring.
         let mut host_ring_cap: HashMap<EndpointAddr, usize> = HashMap::new();
         for n in &config.nodes {
+            let node_ring = n.replay_ring();
             for ep in &n.shape().endpoints {
-                facing.insert(
-                    EndpointAddr::new(n.name(), ep.name.clone()),
-                    (ep.facing, ep.arbitration),
-                );
+                let addr = EndpointAddr::new(n.name(), ep.name.clone());
+                facing.insert(addr.clone(), (ep.facing, ep.arbitration));
+                // Ring only a host-facing endpoint; the node's value is inert on any
+                // target-facing endpoint (a serial output leg, a sending leg's
+                // channels, a demux's multiplexed side).
+                if ep.facing == Facing::Host
+                    && let Some(cap) = node_ring
+                {
+                    host_ring_cap.insert(addr, cap);
+                }
             }
             is_log.insert(n.name(), matches!(n, NodeConfig::Log { .. }));
             if let NodeConfig::Serial {
-                hostward_buffer,
-                replay_ring,
-                ..
+                hostward_buffer, ..
             } = n
             {
                 host_hostward_depth.insert(n.name(), *hostward_buffer);
-                host_ring_cap.insert(EndpointAddr::node(n.name()), *replay_ring);
             }
         }
 

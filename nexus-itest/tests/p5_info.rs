@@ -59,6 +59,11 @@ fn info_reports_full_capability_surface() {
         info["daemon_version"].is_string(),
         "info.daemon_version is not a string: {info}"
     );
+    // .instance | number — the per-boot nonce for tap offset-reset detection (§11.8).
+    assert!(
+        info["instance"].is_number(),
+        "info.instance is not a number: {info}"
+    );
 }
 
 // ---- (2) an unknown codec is structural, atomic, and names the available list ---

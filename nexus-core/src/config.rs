@@ -221,9 +221,9 @@ pub enum NodeConfig {
         /// Replay ring depth in bytes for this serial node's host-facing endpoint
         /// (§5): a bounded ring of the most recent hostward bytes, retained so a
         /// late tap (§17) sees what just happened. A feature buffer, not flow
-        /// control — it never backpressures and costs nothing when unset (default
-        /// 0 = off).
-        #[serde(default)]
+        /// control — it never backpressures. Defaults on at 64 KiB (§15.32); set
+        /// `0` to opt out.
+        #[serde(default = "default_replay_ring")]
         replay_ring: usize,
         /// Initial modem-line assertions applied at open (§7.1). Declared last so
         /// it serializes after the scalar fields (a nested table must follow them
@@ -287,6 +287,13 @@ pub enum NodeConfig {
         /// channels in a demultiplexer, the multiplexed side in a re-multiplexer.
         #[serde(default)]
         arbitration: Arbitration,
+        /// Replay-ring depth in bytes applied to every host-facing channel endpoint
+        /// of this codec (§5, §15.32): a demultiplexer's channels each keep an
+        /// independent ring of their most recent hostward bytes. Defaults on at
+        /// 64 KiB; set `0` to opt every channel out. A re-multiplexer's host-facing
+        /// side (its multiplexed endpoint) rings the same way.
+        #[serde(default = "default_replay_ring")]
+        replay_ring: usize,
         /// The opaque, codec-validated attribute table (§8). The codec
         /// deserializes it into its own types; a schema failure is structural
         /// and fails the load (§11). Empty for the reference framing codec, which
@@ -339,6 +346,13 @@ pub enum NodeConfig {
         /// as for a codec's host-facing endpoints (§6).
         #[serde(default)]
         arbitration: Arbitration,
+        /// Replay-ring depth in bytes applied to every host-facing channel of this
+        /// leg (§5, §15.32) — the arriving channels on the receiving side
+        /// (`faces = "host"`). Each channel keeps its own ring. Defaults on at
+        /// 64 KiB; `0` opts out. Ignored on a sending leg (`faces = "target"`),
+        /// whose channels face target and have no hostward stream to ring.
+        #[serde(default = "default_replay_ring")]
+        replay_ring: usize,
         /// The channel identities carried over this leg; each is a channel
         /// endpoint. A `/` in any identity — or an empty identity — is a
         /// structural error (§3). Declared last so it serializes after the scalar
@@ -374,6 +388,20 @@ impl NodeConfig {
             | NodeConfig::Log { name, .. }
             | NodeConfig::Codec { name, .. }
             | NodeConfig::Leg { name, .. } => name,
+        }
+    }
+
+    /// The configured replay-ring depth (in bytes) applied to each of this node's
+    /// host-facing endpoints (§5, §15.32). `None` for node types that own no
+    /// host-facing endpoint of their own (PTY, log — both face target). The wiring
+    /// applies the value only to endpoints that actually face host, so a value on a
+    /// serial/codec/leg oriented entirely toward target is inert.
+    pub fn replay_ring(&self) -> Option<usize> {
+        match self {
+            NodeConfig::Serial { replay_ring, .. }
+            | NodeConfig::Codec { replay_ring, .. }
+            | NodeConfig::Leg { replay_ring, .. } => Some(*replay_ring),
+            NodeConfig::Pty { .. } | NodeConfig::Log { .. } => None,
         }
     }
 
@@ -574,6 +602,16 @@ fn default_idle_release_ms() -> u64 {
     1_000
 }
 
+/// Default replay-ring depth in bytes for every host-facing endpoint (§5, §15.32):
+/// 64 KiB of scrollback, on by default so a console never punishes a late attacher.
+/// `0` opts out. Applies to serial nodes and to every host-facing channel of a
+/// codec or leg node.
+pub const DEFAULT_REPLAY_RING: usize = 65536;
+
+fn default_replay_ring() -> usize {
+    DEFAULT_REPLAY_RING
+}
+
 fn default_true() -> bool {
     true
 }
@@ -674,6 +712,7 @@ mod tests {
                     faces: Facing::Target,
                     channels: vec!["console".into(), "trace".into()],
                     arbitration: Arbitration::Exclusive,
+                    replay_ring: DEFAULT_REPLAY_RING,
                     attributes: {
                         let mut t = toml::Table::new();
                         t.insert("resync".into(), toml::Value::Boolean(true));
@@ -887,6 +926,7 @@ mod tests {
                     idle_release_ms: 1_000,
                     purge_on_reconnect: true,
                     arbitration: Arbitration::Exclusive,
+                    replay_ring: DEFAULT_REPLAY_RING,
                     channels: vec!["console".into(), "trace".into()],
                 },
                 NodeConfig::Pty {
@@ -929,6 +969,7 @@ mod tests {
             idle_release_ms: 1_000,
             purge_on_reconnect: true,
             arbitration: Arbitration::Exclusive,
+            replay_ring: DEFAULT_REPLAY_RING,
             channels: vec!["a".into()],
         };
         let rejected = |node: NodeConfig| {
@@ -978,6 +1019,7 @@ mod tests {
                 idle_release_ms: 1_000,
                 purge_on_reconnect: true,
                 arbitration: Arbitration::Exclusive,
+                replay_ring: DEFAULT_REPLAY_RING,
                 channels: vec![],
             }],
             edges: vec![],
@@ -1006,6 +1048,7 @@ mod tests {
                 idle_release_ms: 1_000,
                 purge_on_reconnect: true,
                 arbitration: Arbitration::Exclusive,
+                replay_ring: DEFAULT_REPLAY_RING,
                 channels: vec!["".into()],
             }],
             edges: vec![],
@@ -1243,20 +1286,24 @@ mod tests {
                 any_facing(),
                 prop::collection::vec(ident(), 0..4),
                 any_arbitration(),
+                0usize..131_072,
             )
-                .prop_map(|(name, codec, faces, channels, arbitration)| {
-                    NodeConfig::Codec {
-                        name,
-                        codec,
-                        faces,
-                        channels,
-                        arbitration,
-                        // The attribute table's TOML round-trip is covered by the
-                        // explicit demux test; keep the proptest table empty so the
-                        // arbitrary structural shapes stay TOML-clean.
-                        attributes: toml::Table::new(),
+                .prop_map(
+                    |(name, codec, faces, channels, arbitration, replay_ring)| {
+                        NodeConfig::Codec {
+                            name,
+                            codec,
+                            faces,
+                            channels,
+                            arbitration,
+                            replay_ring,
+                            // The attribute table's TOML round-trip is covered by the
+                            // explicit demux test; keep the proptest table empty so the
+                            // arbitrary structural shapes stay TOML-clean.
+                            attributes: toml::Table::new(),
+                        }
                     }
-                }),
+                ),
             (
                 ident(),
                 any_facing(),
@@ -1267,7 +1314,9 @@ mod tests {
                 0u64..30_000,
                 0u64..30_000,
                 0u64..30_000,
-                any::<bool>(),
+                // (purge_on_reconnect, replay_ring) packed into one tuple slot to
+                // stay within proptest's 12-tuple Strategy arity.
+                (any::<bool>(), 0usize..131_072),
                 any_arbitration(),
                 prop::collection::vec(ident(), 0..4),
             )
@@ -1282,7 +1331,7 @@ mod tests {
                         reconnect_initial_ms,
                         reconnect_max_ms,
                         idle_release_ms,
-                        purge_on_reconnect,
+                        (purge_on_reconnect, replay_ring),
                         arbitration,
                         channels,
                     )| {
@@ -1297,6 +1346,7 @@ mod tests {
                             reconnect_max_ms,
                             idle_release_ms,
                             purge_on_reconnect,
+                            replay_ring,
                             arbitration,
                             channels,
                         }

@@ -149,6 +149,7 @@ None.
 | `wire_version` | integer | the daemon-to-daemon wire protocol version (§9) |
 | `envelope_version` | integer | the exec-codec envelope version (§8/§15.15) — a codec author pins against this |
 | `codecs` | array of string | the registered in-process codec names, sorted (the `exec` child-process codec is always available and is not listed here) |
+| `instance` | integer | a per-boot nonce (§11.8). Tap byte offsets are only comparable within one daemon process; on restart the offsets reset to 0 and this value changes, so a client keyed on it (the web console's browser history, §17) detects the reset and starts fresh instead of splicing across it |
 
 ### CLI
 
@@ -169,7 +170,8 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"info"}' | nc -U "$SOCK" | jq 
   "daemon_version": "0.2.0",
   "wire_version": 1,
   "envelope_version": 1,
-  "codecs": ["reference"]
+  "codecs": ["reference"],
+  "instance": 12719384756019283746
 }
 ```
 
@@ -207,6 +209,55 @@ detach-release (§10, §15.20), rather than waiting for the next periodic tick.
 ```json
 {"jsonrpc":"2.0","method":"lock","params":{"endpoint":"usb0","lock":{ "arbitration":"exclusive","holder":"demux","origins":[ ... ],"waiters":[] }}}
 ```
+
+### `tap.data` notification
+
+The live hostward byte stream of one open [tap](#taps), base64-chunked. Emitted
+on the connection that opened the tap, one per hostward chunk (and, right after
+`tap.open --replay`, one per replay-ring piece).
+
+| Param | Type | Description |
+| --- | --- | --- |
+| `tap` | integer | the tap id from the `tap.open` result |
+| `offset` | integer | the endpoint's monotonic hostward byte offset of this chunk's first byte (§11.8) — replay pieces carry their true stream offset, so a reconnecting client trims overlap and splices exactly. Offsets are comparable only within one daemon `instance` (see [`info`](#info)) |
+| `data` | string | base64 of the chunk's bytes |
+
+```json
+{"jsonrpc":"2.0","method":"tap.data","params":{"tap":3,"offset":131072,"data":"aGVsbG8="}}
+```
+
+---
+
+## Taps
+
+A **tap** is a connection-scoped, read-only observer on a host-facing endpoint
+(§17): it streams that endpoint's hostward bytes as `tap.data` notifications and
+is torn down when its `tap.close` runs or the connection drops. Taps are *state*
+— they never appear in configuration or `dump`.
+
+### `tap.open`
+
+| Param | Type | Description |
+| --- | --- | --- |
+| `endpoint` | string | the host-facing endpoint to observe (`usb0`, `mux/console`) |
+| `replay` | bool | *optional* — prefix the endpoint's replay ring (§5) ahead of the live stream, with an exact splice |
+
+Result:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `tap` | integer | the new tap id (used by `tap.close` and in `tap.data`) |
+| `endpoint` | string | echoed |
+| `replay_bytes` | integer | bytes of ring replayed ahead of the live stream — `0` is the explicit empty-replay marker (ring off, or as-yet unfilled) |
+| `from_offset` | integer | the endpoint offset this tap's stream begins at (§11.8): with a non-empty replay, the ring's oldest byte; otherwise the live edge, i.e. the offset the next `tap.data` will carry. A reconnecting client trims replay against the last offset it stored |
+
+### `tap.close`
+
+| Param | Type | Description |
+| --- | --- | --- |
+| `tap` | integer | the tap id to close (must be open on this connection) |
+
+Result: `{ "closed": <tap id> }`.
 
 ---
 
