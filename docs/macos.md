@@ -214,12 +214,13 @@ The doctor's P1/P2 verdicts and its environment section are the ground truth for
 what actually works on that machine — they turn "macOS is different" into a named
 delta instead of a mystery (§13, §15.17).
 
-Exercise the control plane and data path with the phase-2 validation scripts,
-which are plain bash and build only `serialnexusd`/`serialnexusctl`:
+Exercise the control plane, data path, codecs, legs, taps, and the web console with
+the portable **`nexus-itest`** harness (the former bash `scripts/validate/**`, now Rust):
 
 ```
-scripts/validate/phase2/control-plane.sh   # boot, load-on-empty, dump→load round-trip, socket perms
-scripts/validate/phase2/data-path.sh       # PTY presence + targetward/hostward bytes
+cargo test --workspace                        # the whole suite; serial-device tests self-skip on macOS
+cargo test -p nexus-itest --test control_plane
+cargo test -p nexus-itest --test serial_hardware -- --nocapture   # runs when a crossover rig is attached
 ```
 
 **CI gate.** The Linux lane runs `nexus-doctor --json | jq -e -f

@@ -39,10 +39,12 @@ TCP/Unix socket, loopback-only unless opted out). `existing-terminal` (§7.7) is
 
 - **Branch:** `implementation` (off `main`). Version **0.2.0** (annotated tag `0.2.0`
   at the phase-8 release mark). Pre-1.0, lab-usable on Linux.
-- **Baseline that must stay green:** `cargo test --workspace --locked` = **156 tests**;
-  `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`;
-  `scripts/validate/all.sh --through 8`; shellcheck clean; macOS cross-check
-  (`cargo check --target x86_64-apple-darwin --workspace`).
+- **Baseline that must stay green:** `cargo test --workspace --locked` — **156 unit/property
+  tests + the `nexus-itest` integration harness (§5)** (the former bash `scripts/validate/**`,
+  now portable Rust); `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
+  --locked -- -D warnings` (+ the minimal-daemon clippy); `cargo deny check`. **The whole
+  suite runs on macOS too** (serial-*device* tests self-skip there — §7 — and the real
+  crossover-hardware test runs when a rig is attached).
 - **All planned phases 0–8 are done**, plus three post-1.0 tracks: the simplification
   track (design §16 / plan §9), the out-of-tree-codec extension track (design §15.26 /
   plan §10), and the **v9 web console track** (design §17 / plan §11) — taps, the replay
@@ -76,6 +78,7 @@ Cargo workspace; `fuzz/` and `examples/external-codec/` are deliberately **exclu
 | `serialnexusweb` | bin | Standalone loopback HTTP+WebSocket console that is a **pure RPC client** of the daemon (the daemon gains no HTTP). Filtering JSON-RPC proxy; enforces per-session token + Host validation; **refuses graph/lifecycle verbs** (§17). Hand-rolled HTTP on tokio; `tokio-tungstenite` WS; TLS via `rustls`+`rcgen` pinned to the **ring** backend. |
 | `nexus-sim` | bin | Deterministic **test double** (plan §3): PTY doubles, client drivers, in-process null-modem, TCP link-outage proxy, wire/envelope/exec conformance batteries. Emits one machine-readable JSON verdict line per run. Uses the daemon's own permissive PTY/socket calls. `publish = false`. |
 | `nexus-doctor` | bin | Shipping **capability checker** (§15.17). Passive kernel probes P1 (EXTPROC/TIOCPKT), P2 (PTY POLLHUP presence), P4 (by-id resolver) + opt-in real-port P3 (serial fit) and P5 (rig cert). Markdown or `--json`. **Attach its output to any bug report.** |
+| `nexus-itest` | lib+tests | The **cross-platform integration harness** (§5), which replaced the bash `scripts/validate/**`. `src/lib.rs`: boots `serialnexusd` on a temp socket, an in-Rust JSON-RPC client (`Rpc`), a streaming `Subscription` (`subscribe`/`tap`), `nexus-sim` subprocess doubles, `serial_pair`/`serial_echo` (Linux sim) / `crossover_ports` (real HW) providers with self-skip, and `sha256_hex`. `tests/*.rs`: one file per former phase script. `publish = false`. |
 
 Dependency direction: `nexus-daemon` → {`nexus-core`, `nexus-rpc`, `nexus-sys`,
 `codec-api`, `codec-reference`}; both client bins → {`nexus-rpc`, `nexus-core`};
@@ -96,59 +99,71 @@ Dependency direction: `nexus-daemon` → {`nexus-core`, `nexus-rpc`, `nexus-sys`
 
 ```sh
 cargo build --workspace --locked
-cargo test  --workspace --locked                                   # 156 tests
+# The one suite: 156 unit/property tests + the nexus-itest integration harness. It
+# builds every binary first (serialnexusd/nexus-sim/serialnexusweb/nexus-doctor) so
+# the harness's bin() lookups resolve; the exec/envelope codec tests need python3.
+cargo test  --workspace --locked
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 # The minimal daemon (no built-in codecs) must ALSO be warning-clean:
 cargo clippy -p serialnexusd -p nexus-daemon --no-default-features --locked -- -D warnings
 # macOS portability gate (no Mac needed — it type-checks the cfg resolution):
 cargo check --target x86_64-apple-darwin --workspace
-# Shellcheck the harness (CI pins 0.11.0; 0.9.0 false-fires SC2015/SC2317 here):
-find scripts -name '*.sh' -print0 | xargs -0 shellcheck
-bash scripts/validate/phase0/jq-lint.sh
-bash scripts/validate/phase0/harness-selftest.sh
 # Licensing gate (permissive-only), proven not assumed:
 cargo deny check licenses bans sources
+bash scripts/validate/phase0/license-gate.sh   # proves cargo-deny rejects a banned crate
+# Run one ported script's tests, or the #[ignore]d endurance soak:
+cargo test -p nexus-itest --test p4_steal_lease
+cargo test -p nexus-itest --test p8_soak -- --ignored
 ```
 
 `--locked` everywhere: **`Cargo.lock` is committed** (plan §2). CI (`.github/workflows/ci.yml`)
-runs per-push jobs `check`, `license-gate`, `harness-lint`, `doctor`, `integration`
-(`all.sh --through 3` + phase-8 deterministic gates + extension gates), `external-codec`,
-and `macos`; `soak-nightly` / `sweep-nightly` (`--through 8`) / `fuzz-nightly` are
-`schedule`-only. CI toolchain is pinned to **1.97** for the `check` job.
+runs per-push jobs `check` (fmt + clippy ×2 + `cargo test --workspace`, which now carries
+the whole integration suite), `license-gate`, `doctor`, `external-codec`, and **`macos`**
+(the same `cargo test --workspace` — serial-device tests self-skip — plus the now-gating
+`macos.jq` doctor check); `soak-nightly` / `sweep-nightly` (`--include-ignored`) /
+`fuzz-nightly` are `schedule`-only. CI toolchain is pinned to **1.97** for the `check` job.
 
 ## 5. The validation harness (how "done" is proven)
 
-Every check is a **self-judging bash script** under `scripts/validate/phaseN/`. Each
-prints **one JSON verdict line** to stdout and encodes pass/fail in its **exit code**
-(0 = pass; a `skipped` verdict is a legitimate third outcome that still exits 0).
-`scripts/validate/all.sh [--through N] [--json-summary FILE]` runs them all and, with
-`--json-summary`, aggregates `{total, passed, failed, scripts:[…]}`.
+The harness is the **`nexus-itest` crate** — portable Rust integration tests, run by
+`cargo test` like any other. It **replaced the bash `scripts/validate/**` maze** (2026-07-24),
+which was not macOS-portable: `stat -c`, `nc -q`, `sha256sum`, `timeout`, and
+`/dev/serial/by-id` all diverge across Linux/macOS. Each former phase script became a
+`nexus-itest/tests/<name>.rs` (e.g. `p4_steal_lease.rs`, `p6_outage.rs`, `p8_web.rs`);
+`src/lib.rs` is the shared foundation. A test that cannot run on a platform **self-skips**
+(`eprintln!("SKIP …"); return`) — the same skip-is-valid discipline the bash rig had.
 
 **Iron conventions — follow them when adding tests:**
-- **Tests pin to RPC/types, never CLI output.** Drive the daemon with
-  `serialnexusctl --json … | jq -e '…'` and assert on structured JSON. The only free-text
-  grep allowed is confirming an *error kind* in an `.err` file, always paired with an
-  RPC-level assertion. Ground-truth for data-plane claims is a **byte-exact checksum**
-  from `nexus-sim`, never a judgement.
-- **Gates are proven, not assumed.** `phase0/license-gate.sh` injects `serialport = "*"`
-  and asserts cargo-deny rejects it. `phase0/unsafe-gate.sh` plants an `unsafe {}` and
-  asserts the detector catches it, then asserts `unsafe` is confined to `nexus-sys/`.
-  `phase0/harness-selftest.sh` feeds a nonzero counter to the assertion helpers and
-  asserts they *fail* (the anti-tautology regression).
-- **No bare sleeps.** Use `scripts/lib/wait-for.sh <cmd> <timeout> [interval]` (bounded
-  polling). Shared libs: `scripts/lib/assert.sh` (the fragile jq assertions — note
-  `assert_loss_counters_zero` uses `(add // 0) == 0`, *not* `add // 0 == 0`, which jq
-  parses as `add // true` and silently passes), `fixture-tree.sh` (fake by-id/by-path +
-  sysfs so the resolver runs unprivileged), `semantic-diff.sh` (canonical config-dump
-  round-trip).
-- **`set -uo pipefail`, no `-e`** (the `fail()`/verdict path owns the exit), with an
-  EXIT trap that kills the daemon/sim and `rm -rf "$TMPD"`.
+- **Assert on structured RPC results / byte-exact SHA-256, never CLI text.** Drive the
+  daemon via the in-Rust `Rpc` client (`d.rpc().call(method, json!({…}))` and helpers
+  like `send`/`lock`/`load_toml`/`state`/`wait_status`); ground-truth for data-plane
+  claims is `sha256_hex(bytes)` or a `nexus-sim`-reported checksum, never a judgement.
+- **Serial *device* tests skip off Linux.** A pty **cannot be a serial device on macOS**
+  (`serial2` → `ENOTTY`), so `serial_echo()` (single echo device) and `serial_pair()`
+  (lossless cross-wired null modem) are **Linux-only** (sim-backed) and return `None`
+  elsewhere → the test skips. Nodes that need no serial device (pty, log, codec, exec,
+  leg, tap, control-plane) run on **every** platform. The real macOS serial path is the
+  dedicated `serial_hardware.rs` test via `crossover_ports()` — it reads through the
+  daemon's own fast, lossless reader (a flow-control-less UART drops bytes under a raw
+  high-volume read, so *that* is where hardware byte-exactness is asserted).
+- **Meta-gates are proven, not assumed.** `tests/meta_gates.rs` scans the tree and
+  asserts `unsafe` is confined to `nexus-sys/` (with a planted-`unsafe` self-proof), and
+  asserts `nexus-doctor` reports no `unsupported` capability. The one surviving bash gate
+  is `scripts/validate/phase0/license-gate.sh` — it plants a banned crate and asserts
+  cargo-deny rejects it (kept because it needs the cargo-deny tool).
+- **No bare sleeps.** Use `wait_until(Duration, || cond)` / `rpc.wait_status(…)` /
+  `Subscription::wait_for(…)`. `Daemon`/`Sim`/`TempRun` clean up on `Drop` (kill children,
+  remove the temp dir), so a panicking test never leaks a daemon or a socket.
+- **Heavy/endurance tests are `#[ignore]`d** (e.g. `p8_soak::soak_endurance`, SOAK_*-env
+  parameterized) and run in the nightly `--include-ignored` sweep, not per push.
 
-**Hardware rig:** `scripts/validate/hardware/crossover-rig.sh` — two USB-serial adapters
-cross-wired as a null modem (each is the other's target). **Self-skips when absent**
-(skip = valid verdict); *not* in the per-push sweep. `nexus-doctor` P5 certifies the rig
-*first* (§15.21) so a later failure is attributable to the daemon, not a loose wire.
+**Hardware rig:** `serial_hardware.rs` — two USB-serial adapters cross-wired as a null
+modem (each is the other's target), auto-detected via `crossover_ports()`
+(`/dev/cu.usbserial-*` on macOS, or `SNX_CROSSOVER_A`/`_B`). **Self-skips when absent.**
+The two genuine tooling scripts that remain are `phase0/license-gate.sh` and
+`phase8/external-codec.sh` (builds the out-of-tree codec template from a consumer's
+position); `scripts/lib/wait-for.sh` survives for the latter.
 
 ## 6. Load-bearing invariants — DO NOT REGRESS
 
@@ -169,7 +184,7 @@ These are settled by real bugs and benchmarks. Each cites where it lives.
    caught it (§5/§15.27). The in-process codec, `leg`, and `exec` all fragment through that
    one helper. Guard test: `targetward_oversize_chunk_is_fragmented_never_dropped`.
 4. **All `unsafe` lives in `nexus-sys`.** Every other crate is `#![forbid(unsafe_code)]`;
-   `scripts/validate/phase0/unsafe-gate.sh` proves the confinement.
+   `nexus-itest/tests/meta_gates.rs` (`unsafe_is_confined_to_nexus_sys`) proves the confinement.
 5. **No `std::cell::RefCell` in the daemon.** `serialnexusd/clippy.toml` bans it via
    `disallowed-types`; daemon state lives in `nexus_daemon::cell::CriticalCell`, whose contents
    are reachable only inside a synchronous `with`/`with_mut` closure, so a borrow **cannot

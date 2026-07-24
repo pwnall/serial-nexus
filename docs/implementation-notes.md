@@ -69,12 +69,22 @@ boots `serialnexusd`, drives it with a small in-Rust JSON-RPC client (replacing 
 `/dev/serial/by-id` bash portability hazards (all of which break the old scripts on macOS).
 `serial_rig()`/`crossover_ports()` yield a serial device (macOS: the real crossover rig; Linux: a
 sim pty double; otherwise `None` → the test self-skips, the §5 skip discipline). **Verified on
-macOS: 6/6** — `tests/control_plane.rs` (×5: socket perms, structural atomicity, truthful state,
-JSON-RPC hygiene, dump→load→dump round-trip) and `tests/serial_hardware.rs` (the real-hardware
-crossover byte-exact test, exercising the macOS-fixed PTY injector). **Status:** foundation +
-phase-2 control-plane + the hardware rig ported and green; the remaining phase-0/1/3–8 ports are
-the next tranche (the bash scripts stay in place until each is superseded). `Cargo.lock` updated
-for the new member.
+macOS: 6/6** — `tests/control_plane.rs` and `tests/serial_hardware.rs` (the real-hardware crossover byte-exact
+test, exercising the macOS-fixed PTY injector).
+
+**Migration COMPLETE.** All of phases 0–8 (58 bash scripts) are ported to 43 `nexus-itest/tests/*.rs`
+files (**83 tests**, 1 `#[ignore]`d endurance soak), across three batches (0–4, 5–6, 7–8), each
+compiling + clippy/fmt-clean and **green on macOS** (serial-*device* tests self-skip; codec/exec/leg/
+tap/**web** tests run there). The 55 retired scripts are deleted; only three genuine tooling files
+survive — `phase0/license-gate.sh` (cargo-deny gate), `phase8/external-codec.sh` (out-of-tree template
+build), and `scripts/lib/wait-for.sh` (used by the latter). **CI switched:** `check`/`macos` now run
+`cargo test --workspace` (the integration suite included); the `macos` lane runs the full suite and
+gates on `expectations/macos.jq`; `harness-lint` (shellcheck/jq-lint) and the script-driven
+`integration` job are gone; the nightly lanes run `cargo test … --ignored`/`--include-ignored`.
+Key foundation decisions: serial providers are Linux-sim + lossless (a raw high-volume read over a
+flow-control-less UART drops bytes — that byte-exactness lives in `serial_hardware.rs` via the
+daemon's reader); the RPC verb→params shapes come from `serialnexusctl::build_request` (`load` is
+`{config, replace}`, not a path). `Cargo.lock` updated for the new member. AGENTS.md §5 rewritten.
 
 ---
 

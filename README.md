@@ -125,10 +125,15 @@ which is why step 7 works under both policies.)
 ## Building and testing
 
 ```sh
-cargo build              # all workspace crates
-cargo test               # unit and property tests
-scripts/validate/all.sh  # end-to-end phase validation (add --through N to stop early)
+cargo build --workspace          # all workspace crates
+cargo test  --workspace          # unit/property tests + the nexus-itest integration harness
 ```
+
+`cargo test --workspace` is the whole suite: the pure-logic unit/property tests **and**
+the `nexus-itest` end-to-end harness (it boots `serialnexusd`/`nexus-sim`/`serialnexusweb`
+and drives them over the control socket). It runs on Linux and macOS; serial-*device*
+tests self-skip where a pty cannot stand in for a serial port (macOS), and a real
+crossover-rig test runs when two USB-serial adapters are attached.
 
 `nexus-doctor` is the shipping capability report: it probes every kernel
 behavior the design depends on (PTY packet mode, serial ioctls, `by-id`

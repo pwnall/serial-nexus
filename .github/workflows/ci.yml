@@ -4,8 +4,8 @@ on:
   push:
   pull_request:
   schedule:
-    # Nightly lane (§Phase 8): the longer soak and the fuzz battery, which are too
-    # slow for every push. 06:00 UTC daily.
+    # Nightly lane (§Phase 8): the longer soak, the full include-ignored sweep, and
+    # the fuzz battery — too slow for every push. 06:00 UTC daily.
     - cron: '0 6 * * *'
 
 env:
@@ -13,11 +13,14 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Unprivileged lane: builds, lints, unit/property tests, license gate.
-  # Runs on every push (§3). MSRV is pinned to the development toolchain: the code
-  # uses let-chains and other post-1.85 idioms freely, so the floor is the compiler
-  # it is built with, not edition 2024's minimum. Bump this in lockstep with the
-  # workspace Cargo.toml's `rust-version`.
+  # Unprivileged lane: builds, lints, and the WHOLE test suite — unit + property
+  # tests AND the nexus-itest integration harness (design §5), which boots
+  # serialnexusd/nexus-sim/serialnexusweb as subprocesses and drives them over the
+  # control socket. `cargo test --workspace` builds every binary before running, so
+  # the harness's bin() lookups resolve. The exec/envelope codec tests shell out to
+  # python3, which the runner image provides. Runs on every push (§3). MSRV is pinned
+  # to the development toolchain (the code uses let-chains freely); bump in lockstep
+  # with the workspace Cargo.toml `rust-version`.
   check:
     runs-on: ubuntu-latest
     steps:
@@ -36,10 +39,11 @@ jobs:
       # unused binding when no codec is registered.
       - name: Clippy (minimal daemon, no built-in codecs)
         run: cargo clippy -p serialnexusd -p nexus-daemon --no-default-features --locked -- -D warnings
-      - name: Test
+      - name: Test (unit + property + nexus-itest integration harness)
         run: cargo test --workspace --locked
 
-  # The licensing gate proven, not assumed (§13, phase 0 validation).
+  # The licensing gate proven, not assumed (§13). cargo-deny plus the one surviving
+  # tooling script that proves the gate rejects a banned crate.
   license-gate:
     runs-on: ubuntu-latest
     steps:
@@ -51,37 +55,11 @@ jobs:
       - name: Prove the gate rejects a banned crate
         run: bash scripts/validate/phase0/license-gate.sh
 
-  # Harness hygiene (post-1.0 §9.4, design §16.5): shellcheck every validation
-  # script, run the jq-lint, and run the assertion-helper self-test (which pins the
-  # soak's jq-precedence tautology dead). Fast — no workspace build.
-  harness-lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-      # Pin shellcheck to the version the scripts are developed against. Ubuntu's
-      # apt ships an older build (0.9.0 on noble) whose SC2015/SC2317 info-level
-      # heuristics fire on this codebase's assert-or-fail and trap-cleanup idioms;
-      # 0.11.0 dropped those false positives. Pinning keeps CI's linter identical
-      # to the dev toolchain instead of drifting with the runner image.
-      - name: Install shellcheck 0.11.0
-        run: |
-          ver=0.11.0
-          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/v${ver}/shellcheck-v${ver}.linux.x86_64.tar.xz" | tar -xJ
-          sudo install "shellcheck-v${ver}/shellcheck" /usr/local/bin/shellcheck
-          rm -rf "shellcheck-v${ver}"
-          shellcheck --version
-      - name: shellcheck the validation scripts
-        run: find scripts -name '*.sh' -print0 | xargs -0 shellcheck
-      - name: jq-lint
-        run: bash scripts/validate/phase0/jq-lint.sh
-      - name: Assertion-helper self-test
-        run: bash scripts/validate/phase0/harness-selftest.sh
-
   # Capability report (design §15.17): run every probe on the runner, assert the
-  # platform expectation, and archive the Markdown so every capability claim has
-  # a dated report behind it. `skipped(no adapter)` is a valid CI verdict.
+  # platform expectation, and archive the Markdown so every capability claim has a
+  # dated report behind it. `skipped(no adapter)` is a valid CI verdict. (The
+  # no-unsupported assertion is ALSO covered by nexus-itest tests/meta_gates.rs; this
+  # job additionally archives the human report.)
   doctor:
     runs-on: ubuntu-latest
     steps:
@@ -100,42 +78,12 @@ jobs:
           name: nexus-doctor-report
           path: nexus-doctor-report.md
 
-  # Kernel-facing integration lane: the phase validation scripts that need real
-  # PTYs and Unix sockets. Unprivileged; the privileged/nightly lanes are added
-  # as their phases land.
-  integration:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-      - name: Build workspace
-        run: cargo build --workspace --locked
-      - name: Run validation scripts (through phase 3)
-        run: bash scripts/validate/all.sh --through 3
-      # The phase-8 release gates are deterministic, so they run per-push here. The
-      # full --through 8 sweep stays out of per-push CI to keep it lean (the heavy
-      # phase-3 firehose/benchmark and multi-daemon topologies run in the local suite).
-      - name: Phase 8 release gates (quickstart, agent-task, soak smoke)
-        run: |
-          bash scripts/validate/phase8/quickstart.sh
-          bash scripts/validate/phase8/agent-task.sh
-          SOAK_SECONDS=6 bash scripts/validate/phase8/soak.sh
-      # Extension-track gates (§15.26 / plan §10): the `info` verb + unknown-codec
-      # structural error, and the exec-conformance harness (golden/liveness/frag/
-      # restart). Deterministic and fast, so they run per push.
-      - name: Extension gates (info verb, exec conformance)
-        run: |
-          bash scripts/validate/phase5/info.sh
-          bash scripts/validate/phase5/exec-conformance.sh
-
   # Out-of-tree codec template (§15.26 / plan §10.3): build the closed-repo stand-in
   # from the CONSUMER's own position (its own workspace manifest, path deps standing
   # in for version pins) and prove the custom daemon serves its `acme` codec. This is
-  # the embedding pattern proven to compile per push rather than promised.
+  # the embedding pattern proven to compile per push. (The runtime assertion is also
+  # ported to nexus-itest tests/p8_external_codec.rs, which runs against the binary
+  # this job builds when it is present.)
   external-codec:
     runs-on: ubuntu-latest
     steps:
@@ -148,10 +96,12 @@ jobs:
       - name: Build and exercise the out-of-tree template
         run: bash scripts/validate/phase8/external-codec.sh
 
-  # macOS is best-effort (design §13): the GATING deliverable is that the workspace
-  # BUILDS and the portable property/unit tests pass; the doctor report and the
-  # phase-2 e2e run informationally (poll-only observation path), since EXTPROC and
-  # the by-id/counter mechanisms are Linux-only. Deltas are documented in docs/macos.md.
+  # macOS is best-effort (design §13). Now that the PTY node works on macOS (§7.2
+  # slave-termios) and the harness is portable Rust, the macOS lane runs the SAME
+  # `cargo test --workspace` as Linux: the serial-*device* tests self-skip (a pty is
+  # not a serial device on macOS — serial2 → ENOTTY), while control-plane, pty,
+  # codec, exec, leg, tap, and web tests all run. The doctor macos.jq gate is now a
+  # REAL gate (P2 is `degraded`, not `unsupported`). Deltas documented in docs/macos.md.
   macos:
     runs-on: macos-latest
     steps:
@@ -161,18 +111,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install jq
         run: brew install jq
-      - name: Build (the macOS portability gate)
-        run: cargo build --workspace --locked
-      - name: Test the portable core (pure logic, property tests)
-        run: cargo test --locked -p nexus-core -p codec-api -p codec-reference -p nexus-rpc
-      - name: Capability report (informational — macOS is best-effort)
-        continue-on-error: true
+      - name: Build + test (portable core + integration harness; serial tests self-skip)
+        run: cargo test --workspace --locked
+      - name: Capability report + macos.jq gate
         run: |
           cargo run -q --locked -p nexus-doctor -- --markdown | tee nexus-doctor-macos.md
           cargo run -q --locked -p nexus-doctor -- --json | jq -e -f expectations/macos.jq
-      - name: Phase 2 e2e on the poll-only path (informational)
-        continue-on-error: true
-        run: bash scripts/validate/phase2/data-path.sh
       - uses: actions/upload-artifact@v4
         with:
           name: nexus-doctor-macos-report
@@ -180,8 +124,9 @@ jobs:
 
   # Nightly soak (§Phase 8 item 2): the reference-topology data plane under sustained
   # synthetic load, asserting bounded RSS, allowlisted counters, zero faults, and a
-  # final checksum reconciliation. A true 24-hour soak runs on dedicated hardware
-  # before a release; CI runs a substantial bounded slice within the runner's limits.
+  # final checksum reconciliation. The `#[ignore]`d endurance test, parameterized by
+  # the same SOAK_* env knobs the bash used. A true 24-hour soak runs on dedicated
+  # hardware before a release; CI runs a bounded slice.
   soak-nightly:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
@@ -190,15 +135,16 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
       - name: Soak (30 minutes)
-        run: SOAK_SECONDS=1800 SOAK_INTERVAL=30 bash scripts/validate/phase8/soak.sh
+        env:
+          SOAK_SECONDS: '1800'
+          SOAK_INTERVAL: '30'
+        run: cargo test -p nexus-itest --locked --test p8_soak -- --ignored --nocapture
 
-  # Nightly full sweep (post-1.0 §9.5, design §16.5): the complete deterministic
-  # `--through 8` validation suite, promoted from local-only to CI — "a validation
-  # suite that only runs on the author's machine is a reliability claim on the honor
-  # system." Its aggregated verdict JSON is archived as the run's evidence.
+  # Nightly full sweep (post-1.0 §9.5, design §16.5): the complete suite INCLUDING the
+  # #[ignore]d endurance/heavy tests — "a validation suite that only runs on the
+  # author's machine is a reliability claim on the honor system." Now just the Rust
+  # suite with ignored tests included; the exit code is the verdict.
   sweep-nightly:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
@@ -207,23 +153,11 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install jq, shellcheck, cargo-deny
-        run: |
-          sudo apt-get update && sudo apt-get install -y jq shellcheck
-          cargo install cargo-deny --locked
-      - name: Build workspace
-        run: cargo build --workspace --locked
-      - name: Full deterministic sweep (--through 8)
-        run: bash scripts/validate/all.sh --through 8 --json-summary sweep-verdicts.json
-      - name: Assert the sweep passed
-        run: jq -e '.failed == 0 and .total >= 42' sweep-verdicts.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sweep-verdicts
-          path: sweep-verdicts.json
+      - name: Full suite including ignored (endurance/heavy)
+        run: cargo test --workspace --locked -- --include-ignored
 
-  # Nightly fuzzing (§Phase 8): the frame and envelope parsers, on top of the
-  # existing proptest coverage. Needs a nightly toolchain and libFuzzer.
+  # Nightly fuzzing (§Phase 8): the frame and envelope parsers, on top of the existing
+  # proptest coverage. Needs a nightly toolchain and libFuzzer.
   fuzz-nightly:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
