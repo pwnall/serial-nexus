@@ -12,10 +12,13 @@
 //!
 //! The software-loopback doctrine — a pty standing in for a serial device — does not
 //! work on macOS: `serial2` configures a serial port with an ioctl a pty rejects
-//! (`ENOTTY`). So tests that need a serial *device* obtain one from [`serial_rig`],
-//! which yields a **real crossover rig** when present (this is how macOS exercises the
-//! serial path) and otherwise returns `None` so the test **skips** — the same
-//! self-skip discipline the bash hardware rig used. The daemon itself is proven on
+//! (`ENOTTY`). So tests that need a serial *device* obtain a **lossless** one from
+//! [`serial_pair`] (a cross-wired null modem) or [`serial_echo`] (a single echo device)
+//! — both Linux-only (a sim pty), returning `None` so the test **skips** elsewhere. The
+//! macOS real-hardware serial path is covered by the dedicated `serial_hardware` test
+//! (via [`crossover_ports`]), which reads through the daemon's own fast, lossless reader
+//! rather than a raw client (a flow-control-less UART drops bytes under a raw high-volume
+//! read). The daemon itself is proven on
 //! real macOS serial hardware; everything that does not need a serial device (control
 //! plane, config, pty, codecs, legs) runs on every platform.
 //!
@@ -266,6 +269,103 @@ impl Rpc {
         self.ok("dump", Value::Null)
     }
 
+    /// The `info` result (registry / codec info, §10).
+    pub fn info(&self) -> Value {
+        self.ok("info", Value::Null)
+    }
+
+    /// `add-node` a single node authored as a `[[node]]` TOML block.
+    pub fn add_node_toml(&self, node_toml: &str) -> Result<Value, RpcError> {
+        let v: toml::Value = toml::from_str(node_toml).expect("parse add-node TOML");
+        let node = v
+            .get("node")
+            .and_then(|n| n.as_array())
+            .and_then(|a| a.first())
+            .cloned()
+            .expect("add_node_toml needs a [[node]] block");
+        self.call(
+            "add-node",
+            json!({ "node": serde_json::to_value(&node).unwrap() }),
+        )
+    }
+
+    pub fn remove_node(&self, node: &str, cascade: bool) -> Result<Value, RpcError> {
+        self.call("remove-node", json!({ "node": node, "cascade": cascade }))
+    }
+
+    /// `send` one line targetward through an endpoint (§6). `steal` takes the lock.
+    pub fn send(
+        &self,
+        endpoint: &str,
+        line: &str,
+        steal: bool,
+        timeout_ms: u64,
+    ) -> Result<Value, RpcError> {
+        self.call(
+            "send",
+            json!({ "endpoint": endpoint, "line": line, "timeout_ms": timeout_ms, "steal": steal }),
+        )
+    }
+
+    pub fn lock(
+        &self,
+        origin: &str,
+        steal: bool,
+        wait: bool,
+        lease_ms: Option<u64>,
+    ) -> Result<Value, RpcError> {
+        self.call(
+            "lock",
+            json!({ "origin": origin, "steal": steal, "wait": wait, "lease_ms": lease_ms }),
+        )
+    }
+
+    pub fn unlock(&self, origin: &str) -> Result<Value, RpcError> {
+        self.call("unlock", json!({ "origin": origin }))
+    }
+
+    pub fn send_break(&self, node: &str, ms: u64) -> Result<Value, RpcError> {
+        self.call("send-break", json!({ "node": node, "ms": ms }))
+    }
+
+    pub fn rotate(&self, node: &str) -> Result<Value, RpcError> {
+        self.call("rotate", json!({ "node": node }))
+    }
+
+    /// Open a streaming connection (`subscribe` for state notifications, or
+    /// `tap.open`/other) and return a [`Subscription`] that yields the id-less
+    /// notification lines. The request ack is consumed here (§10).
+    pub fn stream(&self, method: &str, params: Value) -> Subscription {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        let mut req = serde_json::Map::new();
+        req.insert("jsonrpc".into(), json!("2.0"));
+        req.insert("id".into(), json!(id));
+        req.insert("method".into(), json!(method));
+        if !params.is_null() {
+            req.insert("params".into(), params);
+        }
+        let line = format!("{}\n", Value::Object(req));
+        let stream = UnixStream::connect(&self.socket)
+            .unwrap_or_else(|e| panic!("connect {}: {e}", self.socket.display()));
+        let mut sub = Subscription {
+            stream,
+            buf: Vec::new(),
+        };
+        sub.stream
+            .write_all(line.as_bytes())
+            .expect("write stream request");
+        sub.stream.flush().expect("flush");
+        // Consume the ack (a response carrying our id) before notifications flow.
+        let _ = sub.read_line_until(Instant::now() + Duration::from_secs(10));
+        sub
+    }
+
+    /// `subscribe` to the daemon's state-notification stream (§10).
+    pub fn subscribe(&self) -> Subscription {
+        self.stream("subscribe", Value::Null)
+    }
+
     pub fn teardown(&self) {
         let _ = self.call("teardown", Value::Null);
     }
@@ -376,30 +476,27 @@ impl Drop for Sim {
     }
 }
 
-/// A serial-device provider for tests that need a real (or software) serial port.
-pub enum SerialRig {
-    /// A cross-wired pair of real serial ports (the macOS path, and Linux with a rig):
-    /// each is the other's target (the no-target doctrine).
-    Crossover { port_a: String, port_b: String },
-    /// A single software echo/loopback pty device (Linux software-loopback doctrine).
-    /// The `Sim` is kept alive for the rig's lifetime.
-    SoftLoopback {
-        device: PathBuf,
-        _sim: Sim,
-        _run: TempRun,
-    },
+/// A single software serial device that echoes what is written to it — the Linux
+/// software-loopback "device" for echo round-trip tests. **Not available on macOS** (a
+/// pty cannot be a serial device there — `serial2` → `ENOTTY`); those tests skip. Keeps
+/// its backing sim + dir alive for its lifetime.
+pub struct SerialEcho {
+    device: PathBuf,
+    _sim: Sim,
+    _run: TempRun,
 }
 
-/// Obtain a serial rig for a data-plane test, or `None` to **skip** (no rig on this
-/// platform/box). On macOS this is real crossover hardware; on Linux, a sim pty
-/// echo double. Set `SNX_CROSSOVER_A`/`SNX_CROSSOVER_B` to force specific ports.
-pub fn serial_rig() -> Option<SerialRig> {
-    if let Some((a, b)) = crossover_ports() {
-        return Some(SerialRig::Crossover {
-            port_a: a,
-            port_b: b,
-        });
+impl SerialEcho {
+    /// The `/dev`-like path a `serial` node should open as its `device`.
+    pub fn device(&self) -> &Path {
+        &self.device
     }
+}
+
+/// A single echoing serial device, or `None` to **skip**. Linux: a `nexus-sim pty
+/// --echo` double. macOS: `None` (no single-port echo hardware; use [`serial_pair`] +
+/// real hardware for the crossover path instead).
+pub fn serial_echo() -> Option<SerialEcho> {
     #[cfg(target_os = "linux")]
     {
         let run = TempRun::new();
@@ -415,7 +512,7 @@ pub fn serial_rig() -> Option<SerialRig> {
             ],
             Some(&device),
         );
-        return Some(SerialRig::SoftLoopback {
+        return Some(SerialEcho {
             device,
             _sim: sim,
             _run: run,
@@ -453,5 +550,119 @@ pub fn crossover_ports() -> Option<(String, String)> {
             return Some((ports[0].clone(), ports[1].clone()));
         }
     }
+    None
+}
+
+/// A streaming connection to the daemon (`subscribe`/`tap.open`), yielding id-less
+/// notification lines. Buffers across reads so a timeout never splits a line.
+pub struct Subscription {
+    stream: UnixStream,
+    buf: Vec<u8>,
+}
+
+impl Subscription {
+    /// Read one complete `\n`-terminated line by `deadline`, or `None`.
+    fn read_line_until(&mut self, deadline: Instant) -> Option<String> {
+        loop {
+            if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=pos).collect();
+                return Some(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            self.stream.set_read_timeout(Some(deadline - now)).ok();
+            let mut tmp = [0u8; 8192];
+            match self.stream.read(&mut tmp) {
+                Ok(0) => return None,
+                Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                Err(_) => return None, // WouldBlock/TimedOut/closed
+            }
+        }
+    }
+
+    /// The next notification JSON within `timeout`, or `None` on timeout/close.
+    pub fn next(&mut self, timeout: Duration) -> Option<Value> {
+        let line = self.read_line_until(Instant::now() + timeout)?;
+        serde_json::from_str(&line).ok()
+    }
+
+    /// Wait for a notification matching `pred` within `timeout`.
+    pub fn wait_for(
+        &mut self,
+        timeout: Duration,
+        mut pred: impl FnMut(&Value) -> bool,
+    ) -> Option<Value> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            match self.next(deadline - now) {
+                Some(n) if pred(&n) => return Some(n),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+}
+
+/// A cross-wired serial pair — the two ends are each other's target (the no-target
+/// doctrine). Backed by a `nexus-sim nullmodem` (two crossed pts), which is **lossless**
+/// — byte-exact behavior tests require that. It is deliberately Linux-only:
+///
+/// * A pty cannot be a serial device on macOS (`serial2` → `ENOTTY`), so there is no
+///   software null modem there.
+/// * Real macOS crossover *hardware* works, but a flow-control-less UART drops bytes
+///   under a *raw* high-volume reader, which would flake a byte-exact assertion. The
+///   macOS real-hardware serial path is instead proven by the dedicated
+///   `serial_hardware` test, whose reader is the daemon's own (fast, lossless) reader
+///   into a `log` node ([`crossover_ports`]).
+///
+/// Keeps its backing sim + dir alive for its lifetime.
+pub struct SerialPair {
+    a: String,
+    b: String,
+    _sim: Sim,
+    _run: TempRun,
+}
+
+impl SerialPair {
+    pub fn ports(&self) -> (&str, &str) {
+        (&self.a, &self.b)
+    }
+}
+
+/// A lossless cross-wired serial pair, or `None` to **skip**. Linux: a `nexus-sim
+/// nullmodem`. Non-Linux: `None` (see the [`SerialPair`] note; the macOS hardware path
+/// lives in the `serial_hardware` test via [`crossover_ports`]).
+pub fn serial_pair() -> Option<SerialPair> {
+    #[cfg(target_os = "linux")]
+    {
+        let run = TempRun::new();
+        let a = run.join("nm-a");
+        let b = run.join("nm-b");
+        let sim = Sim::spawn(
+            &[
+                "nullmodem",
+                "--link-a",
+                &a.to_string_lossy(),
+                "--link-b",
+                &b.to_string_lossy(),
+                "--timeout-ms",
+                "600000",
+            ],
+            Some(&a),
+        );
+        return Some(SerialPair {
+            a: a.to_string_lossy().into_owned(),
+            b: b.to_string_lossy().into_owned(),
+            _sim: sim,
+            _run: run,
+        });
+    }
+    #[allow(unreachable_code)]
     None
 }
