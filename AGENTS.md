@@ -108,10 +108,15 @@ Dependency direction: `nexus-daemon` → {`nexus-core`, `nexus-rpc`, `nexus-sys`
 ## 4. Build / test / lint (exact commands)
 
 ```sh
+# `cargo build --workspace` is NOT optional before the suite: the nexus-itest harness
+# boots the plain `target/debug/{serialnexusd,nexus-sim,serialnexusweb,nexus-doctor}`
+# artifacts, and only `cargo build` emits those — `cargo test` builds the
+# test-instrumented bins under `deps/`, not the plain artifact — so `cargo test` alone
+# on a clean tree fails every itest with "binary not found" (CI runs the build step
+# first for exactly this reason; see .github/workflows/ci.yml).
 cargo build --workspace --locked
-# The one suite: unit/property tests + the nexus-itest integration harness. It builds
-# every binary first (serialnexusd/nexus-sim/serialnexusweb/nexus-doctor) so the harness's
-# bin() lookups resolve; the exec/envelope codec tests need python3, and the folded
+# The one suite: unit/property tests + the nexus-itest integration harness (needs the
+# binaries built above). The exec/envelope codec tests need python3, and the folded
 # license-gate/external-codec/web-history tests shell out to cargo-deny/cargo/node and
 # self-skip when the tool is absent.
 cargo test  --workspace --locked

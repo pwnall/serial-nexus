@@ -53,14 +53,16 @@ fn target_dir() -> PathBuf {
 }
 
 /// Locate a workspace binary (`serialnexusd`, `serialnexusctl`, `nexus-sim`,
-/// `nexus-doctor`). Requires a prior `cargo build --workspace` (which `cargo test
-/// --workspace` does as part of its compile phase); panics with guidance otherwise.
+/// `nexus-doctor`). Requires a prior `cargo build --workspace`: `cargo test` only
+/// builds the test-instrumented bins under `target/debug/deps/`, never the plain
+/// `target/debug/<name>` artifact this boots, so the workspace must be built first
+/// (CI does exactly that — see `.github/workflows/ci.yml`). Panics with guidance otherwise.
 pub fn bin(name: &str) -> PathBuf {
     let exe = target_dir().join(name);
     assert!(
         exe.exists(),
         "binary `{name}` not found at {} — run `cargo build --workspace` first \
-         (or invoke the suite as `cargo test --workspace`)",
+         (`cargo test` builds only the deps/ test bins, not this plain artifact)",
         exe.display()
     );
     exe

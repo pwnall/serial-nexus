@@ -16,11 +16,13 @@ jobs:
   # Unprivileged lane: builds, lints, and the WHOLE test suite — unit + property
   # tests AND the nexus-itest integration harness (design §5), which boots
   # serialnexusd/nexus-sim/serialnexusweb as subprocesses and drives them over the
-  # control socket. `cargo test --workspace` builds every binary before running, so
-  # the harness's bin() lookups resolve. The exec/envelope codec tests shell out to
-  # python3, which the runner image provides. Runs on every push (§3). MSRV is pinned
-  # to the development toolchain (the code uses let-chains freely); bump in lockstep
-  # with the workspace Cargo.toml `rust-version`.
+  # control socket. The harness's bin() lookups resolve `target/debug/<name>`, which
+  # ONLY `cargo build` produces — `cargo test` builds the test-instrumented bins under
+  # `deps/`, not the plain artifact — so an explicit `cargo build --workspace` MUST
+  # precede the test step (matching AGENTS.md §4's documented local flow). The
+  # exec/envelope codec tests shell out to python3, which the runner image provides.
+  # Runs on every push (§3). MSRV is pinned to the development toolchain (the code uses
+  # let-chains freely); bump in lockstep with the workspace Cargo.toml `rust-version`.
   check:
     runs-on: ubuntu-latest
     steps:
@@ -39,6 +41,10 @@ jobs:
       # unused binding when no codec is registered.
       - name: Clippy (minimal daemon, no built-in codecs)
         run: cargo clippy -p serialnexusd -p nexus-daemon --no-default-features --locked -- -D warnings
+      # `cargo test` does NOT emit `target/debug/serialnexusd` (only the deps/ test
+      # bins); the nexus-itest harness boots that plain artifact, so build it first.
+      - name: Build workspace binaries (nexus-itest boots them as subprocesses)
+        run: cargo build --workspace --locked
       - name: Test (unit + property + nexus-itest integration harness)
         run: cargo test --workspace --locked
 
@@ -112,6 +118,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install jq
         run: brew install jq
+      # As on Linux: `cargo test` never emits the plain `target/debug/serialnexusd`
+      # the nexus-itest harness boots — build the workspace bins first.
+      - name: Build workspace binaries (nexus-itest boots them as subprocesses)
+        run: cargo build --workspace --locked
       - name: Build + test (portable core + integration harness; serial tests self-skip)
         run: cargo test --workspace --locked
       - name: Capability report + macos.jq gate
@@ -136,6 +146,10 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: Swatinem/rust-cache@v2
+      # p8_soak boots serialnexusd + nexus-sim; `cargo test -p nexus-itest` would not
+      # produce those plain artifacts, so build the workspace bins first.
+      - name: Build workspace binaries (soak boots them as subprocesses)
+        run: cargo build --workspace --locked
       - name: Soak (30 minutes)
         env:
           SOAK_SECONDS: '1800'
@@ -154,6 +168,9 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: Swatinem/rust-cache@v2
+      # `cargo test` never emits the plain workspace bins the nexus-itest harness boots.
+      - name: Build workspace binaries (nexus-itest boots them as subprocesses)
+        run: cargo build --workspace --locked
       - name: Full suite including ignored (endurance/heavy)
         run: cargo test --workspace --locked -- --include-ignored
 
