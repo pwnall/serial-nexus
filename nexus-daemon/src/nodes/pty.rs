@@ -535,6 +535,13 @@ async fn read_and_poll(
     let mut buf = vec![0u8; READ_BUF];
     let mut last_reconcile = Instant::now();
     let mut wait = ACTIVE_POLL;
+    // Set when this session's client has sent an actual data payload (a
+    // `TIOCPKT_DATA` packet), cleared by `handle_last_close`. It lets a collapsed
+    // session — one whose whole attach→stream→detach a starved task first observes
+    // only at the closing EOF, so `present` never latched true — still run the
+    // last-close handler, while a bare hangup (no client data) does not. See the
+    // close block below.
+    let mut saw_data = false;
     loop {
         let re = sys::poll_ready(fd, PollFlags::POLLIN | PollFlags::POLLHUP);
         let now = !re.contains(PollFlags::POLLHUP);
@@ -567,7 +574,11 @@ async fn read_and_poll(
                     Ok(n) if n >= 1 => {
                         did = true;
                         if buf[0] == sys::TIOCPKT_DATA {
-                            // Data packet: forward the payload targetward.
+                            // Data packet: a real client wrote content this session
+                            // (never a self-issued control packet), so the close
+                            // below must run even if the rising edge was never seen.
+                            saw_data = true;
+                            // Forward the payload targetward.
                             if n > 1
                                 && let Some(tx) = &tx
                             {
@@ -610,9 +621,20 @@ async fn read_and_poll(
         // holder releases (detach-release); an exclusive non-holder's buffered
         // backlog is purged-and-counted (purge-on-detach); a free-for-all writer,
         // already drained above, keeps its bytes.
+        //
+        // The `saw_data && closed` arm covers a *collapsed* session: under load a
+        // starved task's first poll of a client can observe the attach, the whole
+        // stream, AND the closing EOF at once, so `present` never latches true and
+        // the `was` edge misses it — leaving an on-demand holder that streamed and
+        // detached in one poll holding its lock forever (§6). Gating on `saw_data`
+        // (a real `TIOCPKT_DATA` payload) keeps this an edge: a bare hangup with no
+        // client data does not fire, and — crucially — the control packet that
+        // `handle_last_close`'s own `tcsetattr` leaves on the now-hung-up master is
+        // read back as data-less EOF, so it can't re-trigger the handler and spin
+        // the runtime. `saw_data` is cleared once the close is handled.
         let present_now = now && !closed;
         let was = present.swap(present_now, Ordering::Relaxed);
-        if was && !present_now {
+        if (was && !present_now) || (closed && saw_data) {
             handle_last_close(
                 fd,
                 &mut buf,
@@ -622,6 +644,7 @@ async fn read_and_poll(
                 &client_termios,
                 &lock,
             );
+            saw_data = false;
         }
         // BSD/macOS only: the slave's termios resets to cooked when the last slave
         // fd closes (verified: a momentary daemon-side set does not survive to the
