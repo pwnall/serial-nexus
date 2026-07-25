@@ -1,12 +1,106 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-24 (**phases 0-8 + simplification + extension + web-console + v10 tracks done**;
-the **v11 console-map track is DONE** — plan §12 / design §7.8/§15.33: the per-console character
-`map` node).
+**As of:** 2026-07-25 (**phases 0-8 + simplification + extension + web-console + v10 + v11
+console-map tracks done**; the **`serialnexusweb` web console is now REAL-BROWSER validated** over the
+FTDI crossover rig — see the top track — with **one UI follow-up open**: `load --replace` freezes a
+live console's OPFS-restored view; a browser-only fix is proposed but not yet implemented).
 **Branch:** `implementation` (off `main`).
 **Normative docs are now v11:** `docs/24-design-claude-fable-v11.md` (design) and
 `docs/25-implementation-plan-claude-fable-v11.md` (plan). v1–v10 docs are in
 `docs/historical/`. Section references (§) point at the v11 design.
+
+---
+
+## WEB CONSOLE REAL-BROWSER VALIDATION (design §17 / plan §11) — DONE (2026-07-25 session, uncommitted)
+
+First **actual browser** validation of `serialnexusweb`. Previously the web/OPFS round-trip rode the
+manual checklist (§16.7) "because an agent can't drive a browser" (see the v11 track note below); this
+session drove a real Chrome via the browser-automation harness. Run on the **real FTDI crossover rig**
+(`/dev/ttyUSB0` `…BH00LL8O` ↔ `/dev/ttyUSB1` `…BH00L4KU`): the daemon owns `ttyUSB0` as serial node
+`usb0` (exclusive, default 64 KiB ring); an **external raw echo+banner responder** on `ttyUSB1` returns
+typed input and emits a periodic `[responder] tick N` line, so both the send round-trip **and**
+unsolicited hostward rendering are exercised; `serialnexusweb --bind 127.0.0.1:8088 --token … --socket …`.
+Every claim below is asserted on structured RPC / OPFS state / byte content, never on a screenshot.
+
+**All green:**
+- **Bootstrap/token:** `?token=` → **302** → clean `/` (token stripped from the address bar);
+  `Set-Cookie: nexus_session=…; Path=/; HttpOnly; SameSite=Strict` (HttpOnly ⇒ `document.cookie` empty,
+  as intended). App assets + WS connect; console list from `state`; `info.instance` fetched on connect.
+- **Terminal I/O over the physical UART:** select → `tap.open` (inputs enabled), `— replay (N bytes) —`
+  marker, live incoming ticks render; a typed line → `send` → ttyUSB0 → crossover → responder echo →
+  hostward tap → **rendered byte-exact, exactly once** (no dup).
+- **OPFS scrollback:** file `hist_<host>__<endpoint>__<instanceNonce>.bin`; reload restores
+  `— stored history —` then `— replay —` **spliced with no dup/gap** (the sent line appears once across
+  the seam — the subtle §11.8 offset-splice claim). Export (`usb0.log`, correct bytes, no RPC); Clear
+  (`— history cleared —` + OPFS file deleted, client-local).
+- **Arbitration UI:** 🔒 holder badge + `locked by <holder>` (live via `lock`/subscribe); a send while
+  locked → **explicit** steal confirm naming the holder (never automatic, §17); the steal took the lock
+  at the daemon (holder → null).
+- **Security:** the WS bridge refuses `load`/`teardown`/`add-node`/`remove-node`/`shutdown`/`connect`/
+  `disconnect`/`set-attribute` at the bridge with **-32601** and the daemon **survives a `shutdown`
+  attempt**; HTTP gates: no-cookie→**401**, bad-Host→**403**, wrong-token→**401**; the ES-module chain
+  (`/history.mjs`, `/opfs.mjs`) serves 200.
+- **Drop accounting (§5 / invariant #9):** a gated 256 MiB `nexus-sim pty --source` firehose added via
+  `add-node` (`usb0` untouched) into a slow browser tab → that tab's tap `dropped` climbed to
+  **260,632,266** while `feed_dropped=0` (shared producer→hub hop) and `usb0` stayed unaffected — "a slow
+  spy costs only itself".
+- **Nonce reset:** a daemon restart rotated `info.instance` (`14446068600432912000` →
+  `6963886532795428825`); the app keyed a **fresh** OPFS segment under the new nonce and left the old
+  file **unread** (the reset-detection working as designed).
+
+This **discharges the web/OPFS round-trip item on the manual checklist (§16.7)**. The **map** node's
+browser visual (plan §12.2) still rides the checklist — this session validated a plain serial console,
+not a map render.
+
+**⚠️ UI ISSUE FOUND — NOT YET FIXED (proposed patch below): `load --replace` freezes a live web
+console's OPFS-restored view.** After an operator runs `serialnexusctl load --replace` (or
+`remove-node`+`add-node`, or `teardown`+`load` — all reach the same teardown/rebuild) **beneath a live
+browser session** tapping the endpoint, the console stops rendering new bytes. Root cause, verified
+line-by-line:
+- `TapHub::new` hard-codes `ingested: 0` (`tap.rs:234`); `load(replace=true)` does `teardown()` →
+  `st.tap_hubs.clear()` → `spawn_tap_hubs(...)` (`daemon.rs:419-421`), so every hub's hostward **offset
+  space restarts at 0**. But `instance` is an immutable per-boot `u64` (`daemon.rs:155/209`, reached only
+  through `&self`), so `info.instance` **does not change** — violating the assumption the offset counter's
+  own doc states at `tap.rs:196-200` ("a daemon restart resets it *and the info nonce changes* so a client
+  detects the reset rather than splicing across it").
+- Browser: `keyFor` (`app.js:159`) keys OPFS on the unchanged nonce → reopens the pre-reset file;
+  `fromStored` sets `frontier = stored.endOffset` (high, `app.js:175`); the re-anchor
+  `history.frontier = res.from_offset` is guarded by `if (!stored)` (`app.js:187`) so it **never fires**
+  for a restored history; every live frame (offset ≈ 0) hits `splice()`'s `end <= frontier` overlap
+  branch (`history.mjs:51-52`) → returns an **empty** array → nothing appended. **Permanent freeze**
+  (the reset stream would have to emit ~`frontier` bytes before it caught up).
+- **Severity: web-UI availability only.** §17 denies the web console all graph/lifecycle verbs, so a web
+  user **cannot** trigger it — only an operator reconfiguring via CLI beneath a live session. **No data
+  loss / corruption / persisted-state change:** the daemon stays healthy (rx climbs, a fresh raw
+  `tap.open`/WS on the same endpoint streams live fine), and the stored OPFS bytes are intact (merely
+  stranded in a dead offset space). Recovers today via the **Clear button or a hard reload** (both
+  re-anchor). Empirically confirmed by deleting the OPFS file → live rendering resumes immediately.
+- **Recommended fix — Option A (browser-only, ~6 lines, daemon untouched, OPFS keys stay stable so
+  benign reloads keep their scrollback):** add a pure helper to `history.mjs` —
+  `offsetSpaceReset(frontier, fromOffset, replayBytes) = frontier!==null && (fromOffset+(replayBytes||0)) < frontier`
+  (the live edge rewound below the restored frontier, impossible within one monotonic offset space) — and
+  in `app.js selectConsole`, when it fires on a restored history, re-anchor `history.frontier =
+  res.from_offset` and emit a `— stream reset (endpoint reconfigured) —` marker (old bytes stay as
+  scrollback, new bytes splice forward). Regression: a case in the `history.mjs` `node --test` suite run
+  by `nexus-itest/tests/p8_web_history.rs`. **Alternatives considered and rejected as heavier:** (B) a
+  per-endpoint offset epoch surfaced in `tap.open`/`state` folded into the OPFS key — honors invariant
+  #10 for *all* offset clients but orphans scrollback on every benign reconfigure; (C) rebump the whole
+  `instance` nonce — coarse, orphans every endpoint, needs interior mutability on an immutable field;
+  (D) carry `ingested` forward per endpoint identity — semantically dishonest (concatenates two unrelated
+  streams with no gap). A doc-only note at `tap.rs:196-200` recording that `load --replace`/hub rebuild
+  also resets the offset space without a nonce change is worthwhile regardless.
+
+**Secondary UI observation (not a data bug):** under a sustained firehose the tab's main thread gets
+pegged rendering the backlog (the extension connection briefly dropped), and `#pane-drops` lags reality
+badly — it showed `6,925,512` while the daemon's real figure was `260,632,266`. Cause: `#pane-drops` only
+refreshes on the daemon's 200 ms `emit_state_snapshot` notifications (`lib.rs:64` `SNAPSHOT_INTERVAL`),
+which queue **behind** the tap-data backlog on the single shared WS (head-of-line blocking of the control
+lane by the data lane). A future nicety: a separate control lane, or a bounded/coalesced data lane, so
+control-plane freshness survives data-plane overload.
+
+**Gates:** validation-only session; no source changed, so the workspace gates are unchanged from the v11
+track below (265 pass / 0 fail / 4 ignored). The proposed Option-A fix + its regression test are **not
+yet applied** — tracked as a follow-up.
 
 ---
 
