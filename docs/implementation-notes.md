@@ -11,6 +11,51 @@ live console's OPFS-restored view; a browser-only fix is proposed but not yet im
 
 ---
 
+## OPUS COMPREHENSIVE CODE REVIEW #2 — `docs/26-claude-opus-code-review.md` (2026-07-25)
+
+A second full-workspace review (multi-agent + adversarial verification + live reproductions) landed at
+`docs/26-claude-opus-code-review.md`. **Nothing from it is fixed yet** — read its §1 action table
+before touching the web bridge, the config validation path, `Wiring::build`'s write-mode promotion,
+`nexus-core/src/map.rs`, or the leg's Unix listener. Its four **justified** deviations are recorded
+below as §3.15–§3.18 (flow-control spelling, per-node `arbitration`, the runtime-side map `held`
+promotion, and `nexus_core::data` as specification-not-path — the last also corrects §3.3).
+
+Highest-impact confirmed items, all reproduced on a live daemon: the web bridge's verb denylist is
+bypassed by a newline inside one WebSocket frame (`teardown`/`shutdown` executed); `replay_ring` and
+`hostward_buffer` are unbounded, the first aborting the process on the next hostward byte (and
+crash-looping via the persisted config), the second panicking *after* a `--replace` teardown; a
+codec/exec multiplexed edge with an omitted `write_mode` silently parks every targetward byte while
+`send` reports success; `spchex` implements SPACE→hex where picocom's `M_SPCHEX` is the
+control-character class (checked against upstream source), leaving no rule able to hex a control byte;
+and a pipelined request during a waiting verb tears down the whole control connection, which now kills
+web-console sessions. Also: the clippy `RefCell` ban (invariant #5) stopped covering `nexus-daemon` at
+the v8 library split — proven with a planted `RefCell` plus a lint canary — so AGENTS.md §6 and
+`cell.rs` currently overstate it.
+
+The review's §7 is a reproduction log (22 live reproductions). **Verification is complete and was
+independently re-verified**: all 113 candidate findings faced an adversarial verifier, and 21 of them
+were then re-checked **blind against a pristine `git worktree`** after an audit showed the first pass
+was contaminated. Final: **93 survived** (2 critical [the same bridge defect found twice], 8 high,
+29 medium, 45 low, 9 nit) and **20 were refuted**, with §6 tabulating every refutation.
+
+**Why the re-verification happened, and why it mattered.** This review document and the new §3.1x
+entries sat in the working tree throughout two quota-forced workflow resumes, and **64 of 113
+verifiers actually fetched the review** while checking "is this already documented?" — so their
+verdicts were not independent of the conclusions they were checking. The 21 whose disposition
+genuinely rode on a contaminated verdict were re-judged from a checkout containing neither document.
+**17 of 21 agreed; 4 did not**, in both directions:
+
+- **CFG-1** REFUTED → **CONFIRMED**: the circularity caught. §3.15 below is withdrawn as a result.
+- **LOG-2** CONFIRMED → **REFUTED**: reproduced live, but the behavior is what §5 specifies for the
+  default overflow policy. A live reproduction is evidence about *behavior*, never about whether the
+  behavior is a *defect* — that judgement is a design question, and the blind reader was right.
+- **LOCK-3** and **SYS-1** REFUTED → CONFIRMED/PLAUSIBLE (both low).
+
+`DM-6` and the map-config half of `MAP-1` were re-judged blind and came back REFUTED-as-actionable
+again, so §3.16 and §3.17 stand on independent evidence.
+
+---
+
 ## WEB CONSOLE REAL-BROWSER VALIDATION (design §17 / plan §11) — DONE (2026-07-25 session, uncommitted)
 
 First **actual browser** validation of `serialnexusweb`. Previously the web/OPFS round-trip rode the
@@ -1200,6 +1245,66 @@ per-`state`-call reparse) is **deliberately deferred** — it is a cross-cutting
 `load`/`add_node`/`remove_node`/`state`/`send`/`resolve_origin` at once, and the review
 itself recommends landing it as an isolated follow-up commit rather than bundling it with
 the correctness fixes; the mechanical dedup it enables (OPSIMP-4/5) is already in place.
+
+### 3.15 WITHDRAWN — `flow_control` spelling is a defect, not a justified deviation
+This slot briefly held "the design text should follow the code" for `flow_control`'s kebab-case
+values. **That disposition was wrong and is withdrawn.** A blind re-verification (a verifier working
+from a pristine checkout that contained neither this entry nor the review that proposed it) *ran the
+parser*: `xonxoff` and `rtscts` — the exact spellings normative design §7.1 lists — fail to
+deserialize with `unknown variant`, and because that is a TOML parse error the **entire configuration
+file is rejected**. `docs/rpc/configuration.md` documents no serial termios attributes at all, so
+§7.1 is the only operator-facing reference for this value and following it does not work.
+
+Per AGENTS.md ("when this file and the design disagree, the design wins") the code is the deviating
+side. Tracked as a low-severity should-fix in `docs/26` (CFG-1); the suggested fix is
+`#[serde(alias = "xonxoff")]` / `#[serde(alias = "rtscts")]`, keeping kebab-case canonical so `dump`
+round-trips unchanged, plus documenting the accepted values.
+
+The entry is left in place rather than deleted because *how* it was wrong is worth keeping: the
+original verdict that made it look settled came from a verifier that had read this very entry.
+The slot number is retired; do not reuse §3.15.
+
+### 3.16 `arbitration` is configured per node, applied to every host-facing endpoint
+**Design:** §6 calls `arbitration = exclusive | free-for-all` "a per-endpoint attribute", and
+§15.7 "a per-endpoint opt-out".
+**Reality:** it is a scalar on the node (`Serial`, `Codec`, `Leg`, `Map` configs), and
+`Wiring::build` applies the node's value to each of that node's host-facing endpoints; `state`
+reports it per endpoint, inside each `LockSnapshot`.
+**Decision:** keep the code. No shipped node type has a case for divergent per-endpoint policy
+— a codec's channels and a leg's channels are one operator decision in practice — and a
+per-endpoint override is additive later (a channel-level attribute overriding the node's) with
+no change to the lock machinery, which is already keyed per endpoint. The observable surface
+already matches the design's wording. (Opus review `docs/26`, DM-6.)
+
+### 3.17 The map's `held` raw-edge default lives in the runtime, not the config default
+**Design:** §7.8 — "The map's targetward edge into the upstream endpoint defaults to `held`".
+**Reality:** `EdgeConfig::write_mode`'s serde default is `on-demand` like every other edge;
+`runtime::Wiring::build` promotes an omitted/`on-demand` edge whose target is a map's `raw`
+endpoint to `held` (explicit `held` passes through, explicit `never` is preserved for a
+read-only map).
+**Decision:** keep the code. Promotion at wiring time — mirroring the log→`never` override —
+keeps `dump` faithful to what the operator actually wrote, which is the §11 round-trip
+property; folding the default into the config layer would make `dump` emit a mode the operator
+never typed, and would need the edge default to depend on the *other* endpoint's node type.
+The cost is that the runtime mode and the dumped mode differ for an omitted value, which is
+why `EdgeConfig`'s doc comment and `docs/rpc/configuration.md` both state the promotion
+explicitly. (Opus review `docs/26`; the "dump round-trips wrongly" reading was refuted.)
+
+### 3.18 `nexus_core::data` is the executable specification of §5, not the shipped data path
+**Design:** §5 — the deliver contracts, the one-chunk holdover, boundary-only policy.
+**Reality:** nothing outside `nexus-core/src/data.rs` references `HostwardConsumer`,
+`HostFanout`, `MockConsumer`, `TargetwardSink`, `Holdover`, `BusyBoundary` or `Delivery`; only
+the `Chunk` type alias escapes the module. The daemon implements the same semantics directly
+on bounded `tokio::sync::mpsc` channels in `runtime.rs` and each `nodes/*.rs`.
+**Decision:** recorded rather than changed here, with two consequences a reader must know.
+(a) **§3.3 above is stale on one point:** the runtime does *not* call
+`TargetwardSink::flush()`; the anti-stranding property it describes is real but is carried by
+the channel-plus-`send().await` shape, and `flush()` exists only in the model. (b) The `data`
+property tests are evidence about the *contract*, not about the shipped boundaries — the
+per-node fan-out loops are hand-rolled (five copies) and have diverged at least once in
+accounting (the map's missing unattached-loss counter). Treat a change to §5 semantics as
+requiring edits in both places until the loops are rebased onto one helper, which is design
+§16.1 applied to the data plane and is the recommended fix. (Opus review `docs/26`, F3.)
 
 ---
 
