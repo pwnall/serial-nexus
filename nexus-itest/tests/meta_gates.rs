@@ -555,3 +555,160 @@ fn every_unstable_fuzz_api_export_has_a_fuzz_target() {
         "expected to check at least the two parsers SEC-7 named; checked {checked}"
     );
 }
+
+/// The crates a `nexus-core` dependency on would give it the ability to open a
+/// device node. `serial2` opens serial ports; `nexus-sys` is the workspace's only
+/// `unsafe` crate and owns every ioctl; `nix` and `libc` are the raw syscall
+/// surfaces underneath both.
+const DEVICE_OPENING_CRATES: &[&str] = &["serial2", "nexus-sys", "nix", "libc"];
+
+/// Does `manifest` declare a dependency on `krate`?
+///
+/// Every spelling cargo accepts, because a detector that misses one is worse than
+/// no detector: `krate = "1.0"`, `krate = { … }`, the **dotted** `krate.workspace =
+/// true` (which is the only form this workspace actually uses, so an earlier
+/// version of this function that omitted it could not have caught a single real
+/// violation), a `[dependencies.krate]` table — including under a
+/// `[target.'cfg(…)'.dependencies]` prefix — and a *renamed* dependency
+/// `alias = { package = "krate" }`. Matched at the start of a trimmed line, so a
+/// crate merely named in a comment does not trip it.
+fn declares_dependency(manifest: &str, krate: &str) -> bool {
+    manifest.lines().any(|line| {
+        let line = line.trim();
+        // A table header ending in `.<krate>` under any dependency table.
+        if let Some(inner) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            let is_dep_table = inner.contains("dependencies.");
+            if is_dep_table && inner.ends_with(&format!(".{krate}")) {
+                return true;
+            }
+        }
+        // A renamed dependency pulling the same crate in under another name.
+        if line.contains(&format!("package = \"{krate}\""))
+            || line.contains(&format!("package=\"{krate}\""))
+        {
+            return true;
+        }
+        // `krate = …` or `krate.<key> = …` (the workspace-inheritance spelling).
+        let Some(rest) = line.strip_prefix(krate) else {
+            return false;
+        };
+        let rest = rest.trim_start();
+        rest.starts_with('=') || (rest.starts_with('.') && rest.contains('='))
+    })
+}
+
+/// `ports` cannot reach for the tools that open a device (design §12, §15.35).
+///
+/// Passivity matters because opening a USB-serial adapter asserts DTR and resets
+/// the board behind it, so an operator running `ports` *to look* must not disturb
+/// anything. **The behavioural proof is `p10_ports`**, whose fixture device nodes
+/// are writer-less FIFOs: any read of one would block forever and the RPC would
+/// time out. This gate is the narrower structural half, and its claim is bounded
+/// deliberately — it does *not* prove nothing is opened, because `std::fs` can open
+/// a path with no dependency and no `unsafe`. What it proves is that `nexus-core`
+/// carries neither the crates that *drive* a serial port (`serial2`, `nexus-sys`,
+/// `nix`, `libc`) nor an explicit file-opening API, so the enumeration path stays
+/// what §15.35 specifies: readlinks, directory listings, and sysfs attribute reads.
+///
+/// Written as a gate rather than a comment because the failure mode is a future
+/// convenience — "just add `nix` to nexus-core for one `stat`" — that no reviewer
+/// would connect to a board resetting on the bench three months later.
+#[test]
+fn port_enumeration_cannot_open_a_device() {
+    let root = repo_root();
+    let manifest_path = root.join("nexus-core/Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
+
+    // Prove the detector fires before trusting its clean verdict — a gate whose
+    // scanner silently stopped scanning is this file's whole reason to exist. Every
+    // spelling is planted, and **the dotted one especially**: this workspace writes
+    // every dependency as `krate.workspace = true`, so a detector blind to that form
+    // would pass forever while catching nothing.
+    for krate in DEVICE_OPENING_CRATES {
+        for planted in [
+            format!("{krate} = \"0.1\""),
+            format!("{krate} = {{ version = \"0.1\" }}"),
+            format!("{krate}.workspace = true"),
+            format!("{krate}.version = \"0.1\""),
+            format!("[dependencies.{krate}]\nversion = \"0.1\""),
+            format!("[dev-dependencies.{krate}]\nversion = \"0.1\""),
+            format!("[target.'cfg(unix)'.dependencies.{krate}]\nversion = \"0.1\""),
+            format!("renamed = {{ package = \"{krate}\", version = \"0.1\" }}"),
+        ] {
+            let doc = format!("{manifest}\n{planted}\n");
+            assert!(
+                declares_dependency(&doc, krate),
+                "the dependency detector missed a planted `{planted}`"
+            );
+        }
+    }
+    // …and that it does not trip on the crate merely being discussed, or on an
+    // unrelated crate whose name merely starts the same way. `nexus-core` explains in
+    // prose why it resolves devices without libudev (§15.10).
+    for benign in [
+        "# serial2 is deliberately not a dependency here",
+        "nix-compat.workspace = true",
+        "libcst = \"1.0\"",
+    ] {
+        assert!(
+            !DEVICE_OPENING_CRATES
+                .iter()
+                .any(|k| declares_dependency(&format!("{benign}\n"), k)),
+            "the detector must not read {benign:?} as a dependency"
+        );
+    }
+
+    for krate in DEVICE_OPENING_CRATES {
+        assert!(
+            !declares_dependency(&manifest, krate),
+            "nexus-core declares a dependency on `{krate}`, which can open a device \
+             node. The resolver's enumeration face (`ports`, §15.35) is passive by \
+             construction: readlinks and sysfs reads only, because probing a port \
+             toggles DTR and resets the board behind it. If this dependency is \
+             genuinely needed, move the code that needs it out of nexus-core."
+        );
+    }
+
+    let lib = std::fs::read_to_string(root.join("nexus-core/src/lib.rs")).expect("read lib.rs");
+    assert!(
+        lib.contains("#![forbid(unsafe_code)]"),
+        "nexus-core must forbid unsafe: without it, a hand-rolled `open` syscall \
+         could reach a device with no dependency to notice"
+    );
+
+    // No explicit file-opening API anywhere in nexus-core. The resolver needs only
+    // `read_dir`, `read_link`, `exists`, `canonicalize` and `read_to_string` on
+    // sysfs attributes; reaching for `File::open` or `OpenOptions` is the shape a
+    // device probe would take, and it needs no dependency to write.
+    const OPENERS: &[&str] = &["OpenOptions", "File"];
+    let sources = sources_under(&root.join("nexus-core/src"));
+    assert!(
+        !sources.is_empty(),
+        "found no nexus-core sources — this gate would pass vacuously"
+    );
+    // Self-proof first, on the same scanner.
+    for opener in OPENERS {
+        assert!(
+            has_code_token(&format!("let f = std::fs::{opener}::open(p);"), opener),
+            "the opener detector missed a planted `{opener}`"
+        );
+    }
+    assert!(
+        !has_code_token("// File::open would be wrong here\n", "File"),
+        "the opener detector must not trip on a comment"
+    );
+    for (path, src) in &sources {
+        for opener in OPENERS {
+            assert!(
+                !has_code_token(src, opener),
+                "{} reaches for `{opener}`. nexus-core resolves device identity by \
+                 readlink and sysfs read only (§12, §15.35): opening a device node \
+                 asserts DTR and resets the board behind it, and `ports` is the verb \
+                 an operator runs to *look*. If a file genuinely must be opened here, \
+                 that is a design change, not a refactor.",
+                path.display()
+            );
+        }
+    }
+}

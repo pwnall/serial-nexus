@@ -410,8 +410,21 @@ async fn write_asset<S: AsyncWrite + Unpin>(
     stream: &mut S,
     asset: crate::assets::Asset,
 ) -> anyhow::Result<()> {
+    // A restrictive CSP and `nosniff` on every asset (§17, §15.35). The console
+    // renders daemon-supplied strings — node names, refusal messages, port
+    // descriptions — and since the token holder can now edit the graph, a future
+    // DOM-injection slip would be code execution *as the operator's session* rather
+    // than a defaced page. Everything the page needs is same-origin and inline-free:
+    // scripts and styles are served from here, the WebSocket is same-origin, and the
+    // history export is a `blob:` URL. `frame-ancestors 'none'` keeps the console out
+    // of a frame, which `SameSite=Strict` alone does not guarantee.
+    const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+                       connect-src 'self' ws: wss:; img-src 'self' data:; \
+                       base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+         Content-Security-Policy: {CSP}\r\nX-Content-Type-Options: nosniff\r\n\
+         Referrer-Policy: no-referrer\r\n\
          Cache-Control: no-store\r\nConnection: close\r\n\r\n",
         asset.content_type,
         asset.body.len()

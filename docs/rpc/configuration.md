@@ -6,11 +6,13 @@ is snapshotted to the daemon's state file so incremental surgery survives a
 restart (§11/§15.9). Read-only `dump` and the observation verbs never touch it.
 
 Methods on this page: [`load`](#load), [`add-node`](#add-node),
-[`remove-node`](#remove-node), [`dump`](#dump).
+[`remove-node`](#remove-node), [`connect`](#connect), [`disconnect`](#disconnect),
+[`dump`](#dump).
 
 `GraphConfig` and `NodeConfig` are the configuration types shared with `dump`;
-they are exactly the load format. `dump` round-trips them, and `serialnexusctl`
-renders them as TOML.
+they are exactly the load format. `connect`/`disconnect` take an `EdgeConfig` —
+the same `[[edge]]` table `load` accepts — for the same reason. `dump` round-trips
+them, and `serialnexusctl` renders them as TOML.
 
 ---
 
@@ -199,13 +201,15 @@ A file carrying more is an **error** — nothing is sent — naming what it foun
 $ serialnexusctl add-node two-nodes.toml
 Error: two-nodes.toml: add-node takes a single [[node]] and no [[edge]], but this
 file has 2 node(s) and 1 edge(s) — nothing was added. Use `serialnexusctl load`
-(or `load --replace` over a running graph) for a multi-node configuration: edges
-cannot be added afterwards, because `connect` is deferred (§14).
+(or `load --replace` over a running graph) for a multi-node configuration, or add
+the nodes one at a time and wire them with `connect`.
 ```
 
-Taking the first node and discarding the rest would be bad enough for a dropped
-`[[node]]`; a dropped `[[edge]]` is *unrecoverable*, because `connect` is
-deferred (§14) and no verb could add it afterwards.
+Taking the first node and discarding the rest would silently drop configuration
+the operator wrote, which is bad enough for a `[[node]]`; refusing names what it
+found instead. (A dropped `[[edge]]` used to be *unrecoverable* — `connect` was
+deferred. Since §15.35 it is recoverable, but a silent drop is still a silent
+drop.)
 
 ### Errors
 
@@ -268,6 +272,146 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"remove-node","params":{"node"
 Any tap open on a removed node's endpoints is told its endpoint is gone with a
 [`tap.closed`](observation.md#tapclosed-notification) notification carrying
 `reason: "endpoint removed"`, rather than going silently dead.
+
+---
+
+## `connect`
+
+Attach **one edge** to a running graph (§15.35). Reshaping a graph no longer means
+either remove-and-re-add or a `load --replace` outage.
+
+The operation is deliberately not a special case. The *candidate* graph —
+everything currently configured plus this one edge — runs the same
+`GraphConfig::validate` a `load` runs, so §4's three graph rules, §6's mux-edge
+write mode and held-origin uniqueness, name legality and the numeric ranges all
+apply here, and a violation creates nothing. On success the producer's live
+fan-out gains a sink and the consumer's edge slot is filled *under running tasks*,
+so nothing restarts: a mid-stream connect joins the stream at the join point, and
+a serial node keeps its `TIOCEXCL` and its DTR line untouched.
+
+Orientation comes from the endpoints' facings (§15.3), not from the argument
+order: `connect a b` and `connect b a` are the same edge. The result reports the
+resolved orientation, host end first.
+
+### Params
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `a` | `EndpointAddr` | yes | one endpoint's display address (`usb0`, `mux/console`, `cons/raw`) |
+| `b` | `EndpointAddr` | yes | the other endpoint |
+| `write_mode` | string | no (default `on-demand`) | `never`, `on-demand` or `held` (§6) |
+
+The params are the same `[[edge]]` table `load` accepts, so an operator writes one
+thing; a nested `{"edge": {...}}` is accepted too. `write_mode: null` means
+"unspecified" (the default), for clients that always send the field.
+
+### Result
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `connected.a` | string | the **host-facing** end, as resolved |
+| `connected.b` | string | the **target-facing** end |
+| `write_mode` | string | the *effective* mode (§6) — a log target is forced to `never`, a map's `raw` endpoint is promoted to `held` (§7.3/§7.8) |
+| `consumer_live` | bool | whether the target endpoint has a running pump to receive on. `false` is reachable and is **not** an error: a pty whose setup faulted, or a `faces = "host"` codec/exec whose driver is deferred (§14), takes the edge and carries nothing — the same dead edge `load` would have produced for the same graph (§15.8). Reported so "connected" and "no bytes will ever flow" do not look alike |
+
+Note the result reports the **effective** mode while `dump` round-trips the
+**declared** one. That is the §16 rule: one implementation computes the
+promotions, and both the validator and the data plane consult it.
+
+### CLI
+
+```console
+$ serialnexusctl connect usb0 console
+$ serialnexusctl connect usb0 mux --write-mode held
+```
+
+### Errors
+
+* `-32002` — structural validation of the candidate graph failed; `data.errors`
+  lists every message, and the first is in the error's own `message`. This covers
+  every rule `load` enforces, **including reference integrity**: an unknown node,
+  an unknown endpoint on a known node, a same-facing pair, a target endpoint that
+  would have two edges (which is also how re-adding an existing edge is refused),
+  a cycle, a codec's multiplexed edge that is neither `held` nor `never`, and a
+  second `held` origin on one endpoint.
+* `-32602` — the *params* are malformed, before any graph is considered: a missing
+  `a`/`b`, an unknown `write_mode` value, or an unknown key (the edge schema is
+  `deny_unknown_fields`, §11).
+
+### Example
+
+```console
+$ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"connect","params":{"a":"usb0","b":"console"}}' \
+    | nc -N -U "$SOCK" | jq .result
+{
+  "connected": { "a": "usb0", "b": "console" },
+  "write_mode": "on-demand"
+}
+```
+
+---
+
+## `disconnect`
+
+Remove **one edge** from a running graph (§15.35). The reverse of `connect`, with
+one clause that is not symmetric and is the reason the verb needs care: **a
+lock-holding origin releases and purges on its way out.**
+
+That is §15.27's phantom-holder lesson applied before the bug could recur here. A
+writer removed while holding an endpoint's write lock would otherwise leave it
+wedged as locked by an origin that no longer exists, with no recovery. So
+`disconnect` unregisters the origin (whether it was the holder or a queued
+waiter), wakes the FIFO head so a parked `lock --wait` is granted, and purges the
+departing origin's un-flushed targetward backlog so bytes typed under the old lock
+cannot surface later under whoever takes the endpoint next (§6).
+
+Nothing buffered hostward is lost to the detach itself: removing the producer's
+sink closes that edge's channel, and the consumer drains what it already holds
+before parking.
+
+### Params
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `a` | `EndpointAddr` | yes | one endpoint of the edge (either order) |
+| `b` | `EndpointAddr` | yes | the other endpoint |
+
+### Result
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `disconnected.a` | string | the host-facing end |
+| `disconnected.b` | string | the target-facing end |
+| `released_lock` | bool | whether the removed origin was holding the write lock — reported, because it changed who may write |
+| `purged_bytes` | integer | un-flushed targetward bytes discarded with the departing origin (§5: loss is always visible). Nonzero only for a **pty** target: that is the buffer §6's purge rule is about (a human typing ahead of a grant). An interior origin's un-sent bytes stay in its own bounded channel and are delivered if it is wired again, so nothing is purged and `0` is the honest answer |
+
+### CLI
+
+```console
+$ serialnexusctl disconnect usb0 console
+```
+
+### Errors
+
+* `-32602` — no edge joins those two endpoints, or the params are malformed. The
+  message names the pair.
+
+### Example
+
+```console
+$ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"disconnect","params":{"a":"usb0","b":"console"}}' \
+    | nc -N -U "$SOCK" | jq .result
+{
+  "disconnected": { "a": "usb0", "b": "console" },
+  "released_lock": true,
+  "purged_bytes": 41
+}
+```
+
+An interior node left with no upstream reports `waiting` — the same honest state
+it would have loaded in — and its writers *backpressure* rather than losing bytes:
+targetward is the direction §5 forbids dropping on, so an unattached node stalls
+its writers exactly as a steal does.
 
 ---
 

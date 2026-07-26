@@ -3,7 +3,7 @@
 Orientation for an AI agent (or human) picking this repo up cold. It captures what
 the code *is*, how to build/verify it, and the hard-won invariants you must not
 regress. When this file and the design disagree, **the design wins** — see
-`docs/24-design-claude-fable-v11.md`.
+`docs/28-design-claude-fable-v12.md`.
 
 ---
 
@@ -62,16 +62,25 @@ endpoint, raw edge defaults to `held` with steal-to-bypass). `existing-terminal`
   structural change. Its raw edge defaults to `held` (an omitted/on-demand map raw edge is
   promoted to `held` by `GraphConfig::effective_write_mode`, mirroring the log→never override;
   `never` makes a read-only map, which is now inert rather than destructive — the mapped
-  endpoint's targetward receiver is drained-and-counted instead of dropped).
-- **Deferred / not implemented on purpose:** design §14 items, and RPC verbs `connect` /
-  `disconnect` / `set-attribute` (they return `-32601`). `existing-terminal` node (§7.7). A
+  endpoint's targetward receiver is drained-and-counted instead of dropped); and the
+  **v12 graph-editing track** (design §15.35 / plan §14): the passive **`ports`** verb
+  (the resolver's enumeration face — identity, current path, bound-status, built from
+  by-id/by-path readlinks, sysfs and a BSD `cu.*` scan, and **never `open(2)`**, because
+  probing a port toggles DTR), the **`connect`/`disconnect`** edge-surgery verbs (live
+  edge add/remove under the same critical-section validation as `load`), and the web
+  console's **graph and editor pages** with the bridge allowlist widened to the
+  graph-editing verbs.
+- **Deferred / not implemented on purpose:** design §14 items, and the RPC verb
+  `set-attribute` alone (it returns `-32601`; remove-and-re-add covers it). `connect` and
+  `disconnect` **left that list in v12** (§15.35) and are implemented.
+  `existing-terminal` node (§7.7). A
   serial node's `faces = "target"` output-leg role (§7.1) is *described* by the design and has
   no wiring, so it is now **refused structurally** rather than loading a port it seizes with
   `TIOCEXCL` and attaches to nothing; a standalone re-multiplexing codec (`faces = "host"`)
   now comes up `waiting` with a §14 reason, which is what §7.5 promised, instead of `faulted`.
 - **Review remediation:** two full-workspace Opus reviews exist.
   `docs/historical/19-claude-opus-code-review.md` was remediated in `b9d8a50` and folded into v9.
-  `docs/26-claude-opus-code-review.md` (2026-07-25, 93 surviving findings, 20 refuted) was
+  `docs/historical/26-claude-opus-code-review.md` (2026-07-25, 93 surviving findings, 20 refuted) was
   **remediated this session** — the review file itself is a frozen historical record and still
   reads "nothing is fixed yet", so **read `docs/implementation-notes.md`, not the review, for
   what is true now**. Its §6 lists the 20 refutations, which need no action and should not be
@@ -90,6 +99,9 @@ endpoint, raw edge defaults to `held` with steal-to-bypass). `existing-terminal`
   `faces = "target"`; a whitespace-only or over-256-byte name; and an operator `load` whose
   non-empty source text parses to an empty graph (a mis-typed `[[nodez]]` used to make
   `--replace` an unannounced `teardown` reporting success). Each names the offender.
+  **Since v12 these are not load-only:** `connect` validates the candidate graph with the
+  same `GraphConfig::validate` call, so an illegal edge added to a *running* graph is
+  refused by the same rule with the same message and nothing changed.
 - **One behaviour change to existing working configs:** `spchex` now maps picocom's
   control-byte class (DEL plus `0x00..=0x1f` except TAB/LF/CR) instead of SPACE, so a graph
   that enabled it emits different bytes — see the v11 track entry in
@@ -183,10 +195,15 @@ which was not macOS-portable: `stat -c`, `nc -q`, `sha256sum`, `timeout`, and
 `nexus-itest/tests/<name>.rs` (e.g. `p4_steal_lease.rs`, `p6_outage.rs`, `p8_web.rs`);
 `src/lib.rs` is the shared foundation. A test that cannot run on a platform **self-skips**
 (`eprintln!("SKIP …"); return`) — the same skip-is-valid discipline the bash rig had. The
-`p9_*` files are the newest family — "phase 9" by convention only, since the numbered phases
-ended at 8: they are the regression guards for `docs/26-claude-opus-code-review.md`, one file
-per defect area, each module doc naming the finding IDs it pins and the reviewer's live
-reproduction it replays. Put a new review-driven guard there rather than in a `p0`–`p8` file.
+`p9_*` files are the regression guards for `docs/historical/26-claude-opus-code-review.md` — "phase 9"
+by convention only, since the numbered phases ended at 8 — one file per defect area, each
+module doc naming the finding IDs it pins and the reviewer's live reproduction it replays.
+**Put a new review-driven guard there** rather than in a `p0`–`p8` file. A *feature* track
+gets its own family instead, so the two never blur: the v12 graph-editing track is `p10_*`
+(`p10_ports.rs`, `p10_edge_surgery.rs`). The web console is the one deliberate exception —
+its §15.35 graph/editor tests went into `p8_web.rs`, because that file already carries
+several hundred lines of web-server harness (`WebServer`, a raw RFC 6455 client,
+`wsclient_rpc`) and a fourth copy of it would cost more than a slightly over-full file.
 
 **Iron conventions — follow them when adding tests:**
 - **Assert on structured RPC results / byte-exact SHA-256, never CLI text.** Drive the
@@ -353,14 +370,23 @@ These are settled by real bugs and benchmarks. Each cites where it lives.
    the browser. Re-serializing one parsed object emits exactly one line, so what was screened
    is exactly what is sent. And `bridge::ALLOWED` enumerates the verbs the console may invoke
    rather than the ones it may not: a denylist fails **open** on every verb §10 grows
-   afterwards, which made §17's hard non-goal depend on someone remembering to extend it. Do
-   not invert either half, and do not forward raw frame text.
+   afterwards, which made the boundary depend on someone remembering to extend it. Do
+   not invert either half, and do not forward raw frame text. **v12 widened the list**
+   (§15.35): `add-node`, `remove-node`, `connect`, `disconnect` and `ports` are now
+   forwarded — a token holder already commands every configured console, so withholding
+   graph edits protected little. Read that as the allowlist working, not eroding: widening
+   it is a deliberate act with a design section behind it, which is exactly what an
+   inverted list would have given away. **`load`, `teardown` and `shutdown` stay off the
+   browser wire**, pinned by `bridge::the_allowlist_admits_graph_editing_and_no_lifecycle_verb`
+   and end to end by `p8_web::the_editor_verbs_pass_the_bridge_and_lifecycle_verbs_still_do_not`.
 12. **Write-mode promotion has exactly one implementation.** `GraphConfig::effective_write_mode`
    (`nexus-core/src/config.rs`) is the single source of truth for the two
    configuration-to-runtime promotions — a log target forced to `never`, and a map's `raw`
    endpoint promoted from `on-demand` to `held` (§7.8) — and **both** the validator
    (`GraphConfig::validate`, for the one-`held`-origin-per-endpoint rule) and the data plane
-   (`runtime::Wiring::build`) call it. Re-deriving a promotion in either place is how the
+   (`runtime::Wiring::build`) call it — and, since v12, `Daemon::connect`, which registers a
+   live edge's origin with the same effective mode a loaded one would get. Re-deriving a
+   promotion in any of the three is how the
    validator and the runtime come to disagree about what a graph actually does: the reachable
    shape is two maps on one upstream endpoint with `write_mode` written nowhere, both silently
    promoted to `held`, one of them starved forever and invisible in `state` (§16, review 26
@@ -378,6 +404,25 @@ These are settled by real bugs and benchmarks. Each cites where it lives.
    `MAX_ROTATION_PADDING` 20 digits), every check goes through the one `range_error` helper,
    and a proptest sweeps extreme values. A new numeric knob gets a range here on the day it is
    added.
+
+14. **Edge surgery mutates *shared* wiring; it never restarts a node.** `connect` and
+   `disconnect` change a running graph through three long-lived structures, and the reason
+   each exists is a bug it prevents (§15.35, `nexus-daemon/src/runtime.rs`). A host-facing
+   endpoint's fan-out is a `FanOutList` (an `Arc<Mutex<Vec<AttachedSink>>>`, shared with the
+   serial reader's blocking thread — invariant 2 — at a cost of one uncontended lock per
+   64 KiB chunk). A target-facing endpoint owns an `EdgeInbox`, a stream of hostward
+   receivers its pump loops over, so the pump outlives every individual edge. And its
+   `EdgeSlot` carries the targetward sender + lock, re-read per chunk. **Do not "simplify"
+   any of this into restarting the node's tasks:** aborting a task drops the *targetward*
+   receiver out from under senders that stay live in `GraphState::endpoint_targetward` and in
+   every writer origin, which is MAP-1's chain — a pty origin's next write fails, its reader
+   ends, and presence latching, last-close handling and detach-release go with it. Three
+   states, three behaviours, and the middle one is the subtle one: attached-and-writable
+   forwards; **attached but read-only** (`write_mode = "never"`) drains-and-counts, because
+   parking would wedge a writer forever on a configuration that will never become writable;
+   **not attached** parks (`runtime::await_origin`), because targetward is the direction §5
+   forbids dropping on — a detached edge must stall its writers exactly as a steal does.
+   Guards: `p10_edge_surgery.rs`, and `p9_unwired_interior.rs` still pins the read-only arm.
 
 For the deeper code-level invariants (purge-on-acquire runs synchronously at grant time;
 the exec pump polls stdin/stdout/stderr concurrently to avoid deadlock; serial
@@ -438,7 +483,7 @@ running engineering log and the authoritative "why the code looks like this" rec
 ## 9. How work has been done here (the working rhythm)
 
 - **Design/plan pairs are version-suffixed and monotonic.** The newest pair lives in
-  `docs/` (currently v11: `24-design-…-v11.md` + `25-implementation-plan-…-v11.md`);
+  `docs/` (currently v12: `28-design-…-v12.md` + `29-implementation-plan-…-v12.md`);
   superseded generations move to `docs/historical/`. `§N` always means the *current*
   normative design. ADRs are numbered subsections under design **§15.x** (plus §16
   post-completion review, §17 web console). The RPC method-by-method reference is
@@ -446,7 +491,12 @@ running engineering log and the authoritative "why the code looks like this" rec
 - **Every phase/track has ended with a multi-agent adversarial audit** (per-area finders +
   independent verifiers; each finding verified before it's accepted, then fixed by aligning
   code to design). This is the expected bar for substantial changes — find, verify, fix,
-  add a regression guard. `docs/implementation-notes.md` records the confirmed/refuted
+  add a regression guard. **Two rules the audits themselves cost us:** a verifier gets the
+  finding and the tree, *never* the report (review 26, §15.34) — and the tree must not move
+  under the verifier (the v12 audit, which fixed findings while the skeptics read and got 35
+  of 43 back as "not real" for defects that were real when filed). Freeze the worktree for
+  the verification pass, or pin the verifiers to the commit the finders read. When in doubt,
+  the thing that actually settles a finding is a test that fails without the fix. `docs/implementation-notes.md` records the confirmed/refuted
   counts per phase.
 - **Commit discipline:** work happens on `implementation`; the user reviews before commit
   and before any `main` merge. Do not push or merge to `main` without being asked. Commit

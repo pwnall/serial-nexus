@@ -141,29 +141,59 @@ impl Node {
                 // unconditionally is therefore exact, not an assumption; if the role
                 // is ever implemented it wires a *different* set of entries here.
                 let addr = EndpointAddr::node(&n.name);
-                let hostward = wiring.host_sinks.remove(&addr).unwrap_or_default();
+                let hostward = wiring
+                    .host_fanout
+                    .remove(&addr)
+                    .unwrap_or_else(crate::runtime::FanOutList::new);
                 let targetward = wiring.host_targetward_rx.remove(&addr);
                 let tap_feed = wiring.tap_feeds.remove(&addr);
                 n.start(hostward, targetward, tap_feed);
             }
             Node::Pty(n) => {
                 let addr = EndpointAddr::node(&n.name);
-                let hostward = wiring.target_hostward_rx.remove(&addr);
-                let targetward = wiring.target_targetward_tx.remove(&addr);
+                let inbox = wiring.target_inbox.remove(&addr);
+                let edge = wiring.target_edges.remove(&addr);
                 let counters = wiring.target_counters.remove(&addr);
-                let lock = wiring.origin_locks.remove(&addr);
-                n.start(hostward, targetward, counters, lock);
+                n.start(inbox, edge, counters);
             }
             Node::Log(n) => {
                 let addr = EndpointAddr::node(&n.name);
-                let hostward = wiring.target_hostward_rx.remove(&addr);
+                let inbox = wiring.target_inbox.remove(&addr);
                 let counters = wiring.target_counters.remove(&addr);
-                n.start(hostward, counters);
+                n.start(inbox, counters);
             }
             Node::Codec(n) => n.start(wiring),
             Node::Exec(n) => n.start(wiring),
             Node::Leg(n) => n.start(wiring),
             Node::Map(n) => n.start(wiring),
+        }
+    }
+
+    /// An edge was just attached to this node's target-facing `endpoint` (§15.35).
+    ///
+    /// The channels themselves are already live — the daemon filled the endpoint's
+    /// inbox and origin slot, which the node's running tasks re-read — so this is
+    /// only about the node's *reported* status: an interior node that came up
+    /// `waiting` for want of an upstream is now doing its job, and `state` has to
+    /// say so. Boundary nodes whose status does not depend on an edge ignore it.
+    pub fn edge_attached(&mut self, endpoint: &EndpointAddr) {
+        match self {
+            Node::Codec(n) => n.set_upstream_attached(endpoint, true),
+            Node::Exec(n) => n.set_upstream_attached(endpoint, true),
+            Node::Map(n) => n.set_upstream_attached(endpoint, true),
+            _ => {}
+        }
+    }
+
+    /// The edge on this node's target-facing `endpoint` was removed (§15.35). The
+    /// mirror of [`Self::edge_attached`]: an interior node with no upstream is
+    /// `waiting`, which is the same honest state it would have loaded in.
+    pub fn edge_detached(&mut self, endpoint: &EndpointAddr) {
+        match self {
+            Node::Codec(n) => n.set_upstream_attached(endpoint, false),
+            Node::Exec(n) => n.set_upstream_attached(endpoint, false),
+            Node::Map(n) => n.set_upstream_attached(endpoint, false),
+            _ => {}
         }
     }
 

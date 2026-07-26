@@ -15,6 +15,8 @@
 import { newHistory, fromStored, splice, bytesOf, offsetSpaceReset } from "/history.mjs";
 import { makeSaver } from "/saver.mjs";
 import { opfsAvailable, requestPersistence, load, save, clear } from "/opfs.mjs";
+import { model as graphModel, render as renderGraph } from "/graph.mjs";
+import { render as renderEditor } from "/editor.mjs";
 
 const consolesEl = document.getElementById("consoles");
 const connEl = document.getElementById("conn");
@@ -28,10 +30,14 @@ const clearBtn = document.getElementById("clearbtn");
 const sendForm = document.getElementById("sendform");
 const sendLine = document.getElementById("sendline");
 const sendBtn = document.getElementById("sendbtn");
+const graphViewEl = document.getElementById("graphview");
+const editorViewEl = document.getElementById("editorview");
+const viewBtns = Array.from(document.querySelectorAll(".viewbtn"));
 
 let ws = null;
 let nextId = 1;
 const pending = new Map();          // id -> resolve
+const pendingFull = new Set();      // ids whose caller wants the whole envelope
 let selected = null;                // selected endpoint display
 let currentTap = null;              // active tap id
 let lastState = { nodes: [], taps: [] };
@@ -45,16 +51,46 @@ let history = null;                 // current console's ConsoleHistory (history
 let historyKey = null;              // OPFS key for the current console — set with `history`
 let saveTimer = null;               // debounced persist handle
 let selectGen = 0;                  // selectConsole re-entrancy generation (see below)
+let view = "console";               // console | graph | editor (§17, §15.35)
+let lastDump = { node: [], edge: [] };
+let lastPorts = [];
 
 // At most one OPFS write in flight per key, newest snapshot wins: `createWritable()`
 // truncates, so two overlapping full-buffer rewrites of one console's scrollback let the
 // second truncate into the middle of the first. Failures are surfaced, not swallowed.
 const saver = makeSaver(save, (err) => storageFailed(err));
 
+// `WebSocket.send` on a closed socket does not throw — it discards — so an
+// unguarded call leaves its promise pending forever and leaks the id. The view and
+// editor controls are live from the first paint, before `onopen` and after a drop,
+// so both senders check first and settle with a refusal the caller can render.
+function socketReady() {
+  return ws !== null && ws.readyState === WebSocket.OPEN;
+}
+
 function rpc(method, params) {
+  if (!socketReady()) return Promise.resolve(null);
   return new Promise((resolve) => {
     const id = nextId++;
     pending.set(id, resolve);
+    ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params: params || null }));
+  });
+}
+
+// The editor needs the daemon's *words*, not just "it failed": a structural refusal
+// names the rule that was broken (§4/§11), and that is the only precise thing the
+// operator gets. `rpc` keeps its null-on-error shape for the console paths that only
+// branch on success; this one hands back the whole envelope.
+function rpcFull(method, params) {
+  if (!socketReady()) {
+    return Promise.resolve({
+      error: { code: 0, message: "not connected to the daemon — reload to reconnect" },
+    });
+  }
+  return new Promise((resolve) => {
+    const id = nextId++;
+    pending.set(id, resolve);
+    pendingFull.add(id);
     ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params: params || null }));
   });
 }
@@ -77,6 +113,12 @@ function connect() {
     connEl.className = "disconnected";
     sendLine.disabled = sendBtn.disabled = true;
     flushSave();
+    // Settle everything still in flight: an unsettled promise is a caller parked
+    // forever, and `pending` would grow for the rest of the page's life.
+    for (const [id, cb] of pending) {
+      cb(pendingFull.delete(id) ? { error: { code: 0, message: "connection closed" } } : null);
+    }
+    pending.clear();
   };
   ws.onmessage = (ev) => onMessage(ev.data);
 }
@@ -84,20 +126,108 @@ function connect() {
 async function refreshState() {
   const st = await rpc("state", null);
   if (st) { lastState = st; renderConsoles(); }
+  if (view !== "console") await refreshGraph();
 }
+
+// Topology comes from `dump` (configuration) and status from `state` (observed) —
+// the §15.8 split, kept in the client too. `ports` is only needed by the editor's
+// serial palette entry, so it is fetched with the rest rather than on every tick.
+async function refreshGraph() {
+  const dump = await rpc("dump", null);
+  if (dump) lastDump = dump;
+  if (view === "editor") {
+    const p = await rpc("ports", null);
+    if (p && p.ports) lastPorts = p.ports;
+  }
+  renderView();
+}
+
+function renderView() {
+  graphViewEl.hidden = view !== "graph";
+  editorViewEl.hidden = view !== "editor";
+  // The console view is the pane's original chrome; hide it as one unit.
+  for (const el of [termEl, sendForm, document.getElementById("pane-head")]) {
+    el.hidden = view !== "console";
+  }
+  for (const b of viewBtns) b.classList.toggle("active", b.dataset.view === view);
+  if (view === "graph") renderGraph(graphViewEl, graphModel(lastDump, lastState));
+  if (view === "editor") {
+    renderEditor(editorViewEl, {
+      dump: lastDump,
+      ports: lastPorts,
+      rpc: rpcFull,
+      confirm: (t) => window.confirm(t),
+      refresh: () => refreshGraph(),
+    });
+  }
+}
+
+// Refetch `dump` at most once a second while the graph view is live, so a 5 Hz
+// state stream costs one extra RPC per second rather than five.
+let topologyAt = 0;
+function refreshTopology() {
+  const now = Date.now();
+  if (now - topologyAt < 1000) {
+    renderView();
+    return;
+  }
+  topologyAt = now;
+  refreshGraph();
+}
+
+function selectView(next) {
+  // Assigning `location.hash` fires `hashchange`, whose listener calls back in
+  // here; without this guard one click issues its RPCs twice and rebuilds the
+  // editor's DOM under itself.
+  if (view === next) return;
+  view = next;
+  location.hash = next === "console" ? "" : `#${next}`;
+  if (next === "console") {
+    renderView();
+    // `#term` was `display:none` while another view showed, which zeroes its
+    // scroll offset and makes every follow-the-tail check fail. Re-anchor it, or
+    // the terminal never auto-scrolls again for the rest of the session.
+    termEl.scrollTop = termEl.scrollHeight;
+  } else {
+    refreshGraph();
+  }
+}
+
+for (const b of viewBtns) b.onclick = () => selectView(b.dataset.view);
+window.addEventListener("hashchange", () => {
+  const h = location.hash.replace("#", "");
+  selectView(h === "graph" || h === "editor" ? h : "console");
+});
 
 function onMessage(text) {
   let msg;
   try { msg = JSON.parse(text); } catch { return; }
   if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
     const cb = pending.get(msg.id);
-    if (cb) { pending.delete(msg.id); cb(msg.error ? null : msg.result); }
+    if (cb) {
+      pending.delete(msg.id);
+      const full = pendingFull.delete(msg.id);
+      cb(full ? msg : (msg.error ? null : msg.result));
+    }
     return;
   }
   // id-less notification
   switch (msg.method) {
-    case "state": lastState = msg.params; renderConsoles(); break;
-    case "lock": renderConsoles(); break;
+    // Status indicators are live off `subscribe` (§17): a node flipping to
+    // `waiting` repaints the graph page without a poll.
+    case "state":
+      lastState = msg.params;
+      renderConsoles();
+      // Repaint the graph live — but from a *fresh* `dump`, throttled. The status
+      // indicators come from `state`, the topology does not, so repainting on a
+      // state tick alone would animate a stale graph: a node another client added
+      // would stay invisible while the page visibly refreshed around it.
+      if (view === "graph") refreshTopology();
+      break;
+    case "lock":
+      renderConsoles();
+      if (view === "graph") renderView();
+      break;
     case "tap.data": onTapData(msg.params); break;
     case "tap.closed": onTapClosed(msg.params); break;
   }
@@ -352,4 +482,7 @@ sendForm.onsubmit = async (e) => {
   }
 };
 
+const initialHash = location.hash.replace("#", "");
+if (initialHash === "graph" || initialHash === "editor") view = initialHash;
+renderView();
 connect();

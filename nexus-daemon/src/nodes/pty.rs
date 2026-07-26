@@ -22,6 +22,7 @@
 //!   gated** — written only while a client holds the slave, discarded-with-count
 //!   otherwise (§7.2).
 
+use std::cell::Cell;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
@@ -62,7 +63,9 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
 use nexus_core::lock::{Arbitration, OriginId, WriteMode};
 
 use crate::cell::CriticalCell;
-use crate::runtime::{ACTIVE_POLL, DropCounters, READ_BUF, SharedLock, back_off};
+use crate::runtime::{
+    ACTIVE_POLL, DropCounters, EdgeInbox, READ_BUF, SharedLock, SharedTargetEdge, back_off,
+};
 use nexus_sys as sys;
 
 pub struct PtyNode {
@@ -91,6 +94,10 @@ pub struct PtyNode {
     /// sync teardown can't rely on the aborted async pump dropping its sender,
     /// since the runtime isn't running while teardown blocks on the join.
     writer_stop: Arc<AtomicBool>,
+    /// Bytes read from the client and then lost because the host endpoint's
+    /// targetward channel was gone — an edge disconnected, or its node removed,
+    /// between the read and the send (§5: loss is counted where it happens).
+    discarded_targetward: Rc<Cell<u64>>,
     /// Hostward drop counters for this boundary (§5), shared with the serial
     /// reader. Reports presence-gated discards and slow-consumer full-buffer
     /// drops in state. Defaulted at creation, replaced from the wiring at start.
@@ -137,6 +144,7 @@ impl PtyNode {
             present: Arc::new(AtomicBool::new(false)),
             writer: None,
             writer_stop: Arc::new(AtomicBool::new(false)),
+            discarded_targetward: Rc::new(Cell::new(0)),
             counters: Arc::new(DropCounters::default()),
             client_termios: Rc::new(CriticalCell::new(None)),
             tasks: Vec::new(),
@@ -236,10 +244,9 @@ impl PtyNode {
     /// never writes.
     pub fn start(
         &mut self,
-        hostward: Option<mpsc::Receiver<Chunk>>,
-        targetward: Option<mpsc::Sender<Chunk>>,
+        inbox: Option<EdgeInbox>,
+        edge: Option<SharedTargetEdge>,
         counters: Option<Arc<DropCounters>>,
-        lock: Option<(SharedLock, OriginId)>,
     ) {
         // Adopt the wiring's shared counters (the same Rc the serial reader
         // increments) so presence-gated discards and full-buffer drops land on
@@ -263,22 +270,30 @@ impl PtyNode {
         // The slave path drives the BSD/macOS termios fallback (see
         // `with_termios_fd`); `master` is `Some`, so setup ran and `pts_path` is set.
         let pts: Rc<str> = Rc::from(self.pts_path.clone().unwrap_or_default());
+        let edge = edge.unwrap_or_else(crate::runtime::TargetEdge::new);
         self.tasks.push(tokio::task::spawn_local(read_and_poll(
             master.clone(),
             pts,
             self.present.clone(),
             self.client_termios.clone(),
-            targetward,
+            edge,
             self.advertised_baud,
-            lock,
+            self.discarded_targetward.clone(),
         )));
 
         // Writer: serial → client (hostward), presence-gated, on a dedicated
         // blocking thread so a fast consumer receives at line rate (§15.19). An
-        // async pump bridges the hostward channel to a std channel the thread
-        // blocks on; aborting the pump on teardown drops its sender, which unblocks
-        // and ends the thread (std recv returns Err once every sender is gone).
-        if let Some(mut rx) = hostward {
+        // async pump bridges each attached edge's hostward channel to a std channel
+        // the thread blocks on; aborting the pump on teardown drops its sender,
+        // which unblocks and ends the thread (std recv returns Err once every
+        // sender is gone).
+        //
+        // Both halves are created unconditionally, even with no edge attached
+        // (§15.35): the pump parks on the endpoint's inbox and the thread parks on
+        // an empty bridge, so a later `connect` needs no thread spawn on the
+        // runtime thread and no second failure path. An idle parked thread costs
+        // nothing but its stack.
+        if let Some(mut inbox) = inbox {
             // Bounded bridge: the pump moves chunks into it and drops-with-count
             // when it is full (a slow consumer shedding at its own boundary, §5),
             // so the writer thread's blocking recv can also observe the stop flag.
@@ -286,12 +301,16 @@ impl PtyNode {
             let (btx, brx) = std_mpsc::sync_channel::<Chunk>(self.hostward_buffer.max(1));
             let pump_counters = self.counters.clone();
             self.tasks.push(tokio::task::spawn_local(async move {
-                while let Some(chunk) = rx.recv().await {
-                    let len = chunk.len() as u64;
-                    match btx.try_send(chunk) {
-                        Ok(()) => {}
-                        Err(std_mpsc::TrySendError::Full(_)) => pump_counters.add_full(len),
-                        Err(std_mpsc::TrySendError::Disconnected(_)) => break,
+                while let Some(mut rx) = inbox.recv().await {
+                    while let Some(chunk) = rx.recv().await {
+                        let len = chunk.len() as u64;
+                        match btx.try_send(chunk) {
+                            Ok(()) => {}
+                            Err(std_mpsc::TrySendError::Full(_)) => pump_counters.add_full(len),
+                            // The writer thread is gone: no later edge can be
+                            // served either, so stop rather than spin.
+                            Err(std_mpsc::TrySendError::Disconnected(_)) => return,
+                        }
                     }
                 }
             }));
@@ -331,6 +350,9 @@ impl PtyNode {
             // client held the slave, and bytes dropped because the client was
             // too slow to drain its bounded buffer.
             "discarded_no_client": self.counters.discarded_absent(),
+            // Client bytes lost because this pty's host endpoint went away between
+            // the read and the send (§5, §15.35).
+            "discarded_targetward": self.discarded_targetward.get(),
             "dropped_slow_consumer": self.counters.dropped_full(),
             // Observed client termios (§7.2), null until a client touches it.
             "client_termios": self.client_termios.with(|c| c.clone()),
@@ -465,11 +487,11 @@ fn handle_last_close(
     pts: &str,
     advertised_baud: u32,
     client_termios: &CriticalCell<Option<Value>>,
-    lock: &Option<(SharedLock, OriginId)>,
+    origin: &Option<(mpsc::Sender<Chunk>, SharedLock, OriginId)>,
 ) {
     let _ = apply_baseline(master, pts, advertised_baud);
     client_termios.with_mut(|c| *c = None);
-    if let Some((l, id)) = lock {
+    if let Some((_, l, id)) = origin {
         let (held, exclusive, held_mode) = l.with(|g| {
             (
                 g.holder() == Some(*id),
@@ -539,9 +561,9 @@ async fn read_and_poll(
     pts: Rc<str>,
     present: Arc<AtomicBool>,
     client_termios: Rc<CriticalCell<Option<Value>>>,
-    tx: Option<mpsc::Sender<Chunk>>,
+    edge: SharedTargetEdge,
     advertised_baud: u32,
-    lock: Option<(SharedLock, OriginId)>,
+    discarded_targetward: Rc<Cell<u64>>,
 ) {
     let fd = master.as_raw_fd();
     let mut buf = vec![0u8; READ_BUF];
@@ -558,15 +580,28 @@ async fn read_and_poll(
         let re = sys::poll_ready(fd, PollFlags::POLLIN | PollFlags::POLLHUP);
         let now = !re.contains(PollFlags::POLLHUP);
 
+        // Re-read the live edge binding every pass (§15.35): `connect` and
+        // `disconnect` fill and clear this slot on a running node, so a pty gains
+        // and loses its write path without its reader ever restarting — which is
+        // what keeps presence latching, termios reconciliation and detach-release
+        // continuous across edge surgery. Cloning the binding out of the critical
+        // section is what lets the send below `.await` with no borrow held (§15.20).
+        let origin = edge.origin();
+
         // Write arbitration (§6): a writing origin drains targetward only while it
         // holds the lock; a non-holder is *not read from*, so its bytes stay in
         // the kernel buffer (backpressure to the client), never dropped. A spy
         // with no lock handle still reads — its termios and presence surface — but
         // has no `tx`, so its stray writes go nowhere. Each borrow below is dropped
         // before any await.
-        let may_write = match &lock {
-            Some((l, id)) => l.with(|g| g.may_write(*id)),
-            None => true,
+        // An endpoint with no edge at all is *not read from* (§6, §15.35): the
+        // client's bytes stay in the kernel buffer as backpressure rather than being
+        // read and thrown away. An attached but read-only edge (`write_mode =
+        // "never"`) still reads — that is the spy shape, whose termios and presence
+        // an operator does want surfaced — and its stray writes go nowhere.
+        let may_write = match &origin {
+            Some((_, l, id)) => l.with(|g| g.may_write(*id)),
+            None => edge.with(|e| e.attached),
         };
 
         let mut did = false;
@@ -590,14 +625,36 @@ async fn read_and_poll(
                             // (never a self-issued control packet), so the close
                             // below must run even if the rising edge was never seen.
                             saw_data = true;
-                            // Forward the payload targetward.
+                            // Forward the payload targetward — or, with no writable
+                            // edge (a read-only spy edge, or one `disconnect`
+                            // removed), count it. Either way the bytes are
+                            // accounted: §5 forbids the silent version, and this
+                            // path used to take it.
+                            if n > 1 && origin.is_none() {
+                                discarded_targetward
+                                    .set(discarded_targetward.get() + (n - 1) as u64);
+                            }
                             if n > 1
-                                && let Some(tx) = &tx
+                                && let Some((tx, _, _)) = &origin
                             {
                                 let payload = Chunk::copy_from_slice(&buf[1..n]);
                                 // Targetward: backpressure to the origin (await).
+                                let n = payload.len() as u64;
                                 if tx.send(payload).await.is_err() {
-                                    return; // serial gone
+                                    // The host endpoint is gone. Do *not* return:
+                                    // that would end presence latching, termios
+                                    // reconciliation and detach-release with it
+                                    // (MAP-1's chain). Break out of the drain and
+                                    // let the next pass re-read the edge slot,
+                                    // which a `disconnect` will have cleared.
+                                    //
+                                    // The payload is already out of the master, so
+                                    // it is lost — and §5 says loss is counted where
+                                    // it happens, so it is charged here rather than
+                                    // vanishing the way every sibling producer's
+                                    // does not.
+                                    discarded_targetward.set(discarded_targetward.get() + n);
+                                    break;
                                 }
                             }
                         } else if buf[0] & sys::TIOCPKT_IOCTL != 0 && now {
@@ -658,7 +715,7 @@ async fn read_and_poll(
                 &pts,
                 advertised_baud,
                 &client_termios,
-                &lock,
+                &origin,
             );
             saw_data = false;
         }

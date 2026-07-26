@@ -140,6 +140,19 @@ impl GraphConfig {
         }
     }
 
+    /// An edge's `(host-facing end, target-facing end)`, public for the daemon's
+    /// edge-surgery verbs (§15.35): `connect` and `disconnect` need to know which
+    /// end produces and which consumes, and re-deriving that from facings at the
+    /// call site is exactly the kind of second implementation §16 exists to
+    /// prevent. `None` for a same-facing or dangling edge, which validation
+    /// already reports.
+    pub fn edge_ends_of<'e>(
+        &self,
+        edge: &'e EdgeConfig,
+    ) -> Option<(&'e EndpointAddr, &'e EndpointAddr)> {
+        self.edge_ends(edge)
+    }
+
     /// Whether `addr` is a codec (or exec) node's *multiplexed* endpoint — its
     /// default, empty-named endpoint (§7.5/§7.6, §15.22). The exec codec is an
     /// ordinary codec node selected by `codec = "exec"`, so one test covers both.
@@ -907,11 +920,12 @@ pub enum StopBits {
 /// Serial flow control. `none` is the 3-wire default (§5); the others remain
 /// ordinary port attributes (§7.1).
 ///
-/// Kebab-case is canonical, so `dump` round-trips unchanged — but §7.1 spells the
-/// values `xonxoff` and `rtscts`, and those are the only operator-facing reference
-/// for this attribute. Without the aliases the design's own spellings fail to
-/// deserialize, and because that is a parse error it rejects the *entire*
-/// configuration file. The design wins: both spellings are accepted.
+/// Kebab-case is canonical, so `dump` round-trips unchanged, and §7.1 now says so.
+/// The unhyphenated `xonxoff` / `rtscts` stay accepted as aliases because that is
+/// what §7.1 used to spell and what operators wrote against it: without them the
+/// design's own spellings failed to deserialize, and because that is a parse error
+/// it rejected the *entire* configuration file (CFG-1). Both spellings are
+/// accepted; only one is emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FlowControl {
@@ -2301,9 +2315,10 @@ mod tests {
 
     #[test]
     fn flow_control_accepts_the_designs_spellings_and_dumps_kebab_case() {
-        // §7.1 spells these `xonxoff` and `rtscts`; the canonical serde form is
-        // kebab-case. Both parse (the design wins), and `dump` still emits the
-        // canonical spelling so round-trips are unchanged.
+        // §7.1's original spellings were `xonxoff` and `rtscts`; the canonical serde
+        // form — and what §7.1 says today — is kebab-case. Both parse, so a config
+        // written against either reads, and `dump` still emits the canonical
+        // spelling so round-trips are unchanged.
         let parse = |spelling: &str| -> FlowControl {
             let cfg: GraphConfig = toml::from_str(&format!(
                 r#"
@@ -2321,7 +2336,11 @@ mod tests {
             }
         };
         assert_eq!(parse("xon-xoff"), FlowControl::XonXoff);
-        assert_eq!(parse("xonxoff"), FlowControl::XonXoff, "§7.1's spelling");
+        assert_eq!(
+            parse("xonxoff"),
+            FlowControl::XonXoff,
+            "the retired spelling"
+        );
         assert_eq!(parse("rts-cts"), FlowControl::RtsCts);
         assert_eq!(parse("rtscts"), FlowControl::RtsCts, "§7.1's spelling");
         assert_eq!(parse("none"), FlowControl::None);

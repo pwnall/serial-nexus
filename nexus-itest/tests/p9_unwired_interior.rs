@@ -1,7 +1,7 @@
 //! MAP-1's shape, generalised: **a `waiting` interior node must be inert, not
 //! destructive** (design §15.8, §5).
 //!
-//! The review (`docs/26-claude-opus-code-review.md`, MAP-1 runtime) reported the map
+//! The review (`docs/historical/26-claude-opus-code-review.md`, MAP-1 runtime) reported the map
 //! node dropping its mapped endpoint's targetward receiver when it had no writable
 //! raw edge. The receiver's *senders* stay live — in `GraphState::endpoint_targetward`
 //! and in every attached writer origin — so dropping it closes the channel underneath

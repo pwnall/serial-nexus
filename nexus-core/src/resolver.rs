@@ -92,6 +92,34 @@ pub struct Adapter {
     pub identity: Option<String>,
 }
 
+/// One serial device the resolver can *see*, for the `ports` verb (§12, §15.35):
+/// the identity an operator would put in a `device` field, where it currently
+/// lives, and what it is.
+///
+/// Enumeration is strictly **passive** — every field comes from a readlink, a
+/// directory listing, or a sysfs read. Nothing here calls `open(2)`, because
+/// opening a USB-serial adapter to look at it asserts DTR and resets the board on
+/// exactly the hardware people care about (§15.35). That is the whole reason this
+/// is a separate face on the resolver rather than a probe in `nexus-doctor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortCandidate {
+    /// The canonical identity to store in configuration, in §12 preference
+    /// order: `usb:…` when the sysfs walk yields one, else `by-path:…`, else the
+    /// `raw:…` escape hatch.
+    pub identity: String,
+    pub kind: DeviceKind,
+    /// The `/dev` path the device currently occupies. Always present — a
+    /// candidate is by definition something the resolver just saw.
+    pub path: PathBuf,
+    /// Human echo (§12), so an operator recognizes the adapter before binding it.
+    pub description: String,
+    /// The `/dev/serial/by-id` entry name, when the device has one.
+    pub by_id: Option<String>,
+    /// The documented instability warning carried by the degraded identity forms
+    /// (§12) — `None` for a `usb:` identity.
+    pub warning: Option<String>,
+}
+
 struct UsbInfo {
     identity: String,
     description: String,
@@ -384,6 +412,90 @@ impl Resolver {
                 identity,
             });
         }
+        out
+    }
+
+    /// Every serial device the resolver can see right now, as the identity an
+    /// operator would bind it by (§12 preference order) — the `ports` verb's
+    /// enumeration face (§15.35).
+    ///
+    /// Three passive sources, unioned and deduplicated by device node:
+    /// `/dev/serial/by-id` (the canonical USB face), `/dev/serial/by-path` (which
+    /// still covers an adapter whose serial number is absent, so it has no by-id
+    /// entry the resolver can use), and a scan of `<dev_root>/dev` for `cu.*`
+    /// callout devices — the BSD/macOS face, where no by-id tree exists and a raw
+    /// `cu.*` path is the interim identity (§12). The `cu.*` scan is not
+    /// `cfg`-gated: the prefix simply matches nothing on Linux, and one code path
+    /// keeps the macOS arm reachable from a Linux fixture instead of shipping
+    /// untested.
+    ///
+    /// Each candidate's identity comes from the *same* [`Self::capture_for_dev`]
+    /// fallback chain `add-node` uses, so what `ports` shows is exactly what
+    /// binding that path would store — not a second opinion about it.
+    ///
+    /// **Passive by construction.** Readlinks, directory listings and sysfs reads
+    /// only: no `open(2)`, because opening a USB adapter asserts DTR and resets
+    /// the attached board (§15.35). Sorted by path, so two calls read the same.
+    pub fn enumerate_ports(&self) -> Vec<PortCandidate> {
+        // dev node name → its by-id entry name, when it has one.
+        let mut seen: std::collections::BTreeMap<String, Option<String>> =
+            std::collections::BTreeMap::new();
+
+        for adapter in self.discover_adapters() {
+            if let Some(name) = adapter.dev_path.file_name() {
+                seen.insert(
+                    name.to_string_lossy().into_owned(),
+                    Some(adapter.by_id_name),
+                );
+            }
+        }
+        // by-path covers the adapters by-id cannot name.
+        if let Ok(entries) = std::fs::read_dir(self.dev_root.join("dev/serial/by-path")) {
+            for entry in entries.flatten() {
+                let Ok(target) = std::fs::read_link(entry.path()) else {
+                    continue;
+                };
+                let Some(dev_name) = target.file_name().map(|s| s.to_string_lossy().into_owned())
+                else {
+                    continue;
+                };
+                seen.entry(dev_name).or_insert(None);
+            }
+        }
+        // The BSD/macOS callout devices. `cu.*`, never `tty.*`: the callout node is
+        // the one that does not block waiting for carrier detect, and so the one a
+        // serial tool opens.
+        if let Ok(entries) = std::fs::read_dir(self.dev_root.join("dev")) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("cu.") {
+                    seen.entry(name).or_insert(None);
+                }
+            }
+        }
+
+        let mut out: Vec<PortCandidate> = seen
+            .into_iter()
+            .filter_map(|(dev_name, by_id)| {
+                let raw = format!("/dev/{dev_name}");
+                let rooted = self.rooted(&raw);
+                // A by-id link can outlive its device node; do not offer a path
+                // that is no longer there.
+                if !rooted.exists() {
+                    return None;
+                }
+                let resolved = self.capture_for_dev(&dev_name, rooted.clone(), &raw);
+                Some(PortCandidate {
+                    identity: resolved.identity,
+                    kind: resolved.kind,
+                    path: rooted,
+                    description: resolved.description,
+                    by_id,
+                    warning: resolved.warning,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.path.cmp(&b.path));
         out
     }
 
@@ -995,5 +1107,120 @@ mod tests {
         // The canonical absent-serial/iface form (with `-`) is still accepted
         // (device absent → path None, no by-id tree in the fixture).
         assert!(r.resolve_input("usb:0403:6001:-:-").is_ok());
+    }
+
+    // -- enumerate_ports: the `ports` verb's passive face (§12, §15.35) ---------
+
+    #[test]
+    fn enumerate_ports_lists_each_source_with_its_identity_form() {
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        // 1. A well-behaved USB adapter: by-id entry + a serial number → `usb:`.
+        add_usb_device(
+            t.path(),
+            "1-1",
+            "ttyUSB0",
+            "usb-FTDI_FT232R_USB_UART_A6008isP-if00-port0",
+            "0403",
+            "6001",
+            Some("A6008isP"),
+            "00",
+            Some(("FTDI", "FT232R USB UART")),
+        );
+        // 2. An adapter with no serial number: by-id cannot name it usefully, so
+        //    it reaches the enumeration through by-path and degrades (§12).
+        write(&t.path().join("dev/ttyUSB1"), "");
+        let by_path = t.path().join("dev/serial/by-path");
+        std::fs::create_dir_all(&by_path).unwrap();
+        std::os::unix::fs::symlink("../../ttyUSB1", by_path.join("pci-0:1:1.1-port0")).unwrap();
+        // 3. The BSD/macOS callout face: a bare `cu.*` node, no by-id, no sysfs.
+        write(&t.path().join("dev/cu.usbserial-FT1234"), "");
+        // 4. A `tty.*` twin, which must NOT be listed (it is not the callout node).
+        write(&t.path().join("dev/tty.usbserial-FT1234"), "");
+
+        let ports = r.enumerate_ports();
+        let by_ident: Vec<&str> = ports.iter().map(|p| p.identity.as_str()).collect();
+        assert_eq!(
+            by_ident,
+            vec![
+                "raw:/dev/cu.usbserial-FT1234",
+                "usb:0403:6001:A6008isP:00",
+                "by-path:pci-0:1:1.1-port0",
+            ],
+            "sorted by path, one entry per device node: {ports:#?}"
+        );
+
+        let usb = ports.iter().find(|p| p.kind == DeviceKind::Usb).unwrap();
+        assert_eq!(usb.path, t.path().join("dev/ttyUSB0"));
+        assert!(usb.description.contains("FTDI FT232R"));
+        assert_eq!(
+            usb.by_id.as_deref(),
+            Some("usb-FTDI_FT232R_USB_UART_A6008isP-if00-port0")
+        );
+        assert!(usb.warning.is_none(), "a usb identity is not a fallback");
+
+        let bypath = ports.iter().find(|p| p.kind == DeviceKind::ByPath).unwrap();
+        assert_eq!(bypath.path, t.path().join("dev/ttyUSB1"));
+        assert!(bypath.by_id.is_none());
+        assert!(bypath.warning.is_some(), "the fallback forms warn (§12)");
+
+        let cu = ports.iter().find(|p| p.kind == DeviceKind::Raw).unwrap();
+        assert_eq!(cu.path, t.path().join("dev/cu.usbserial-FT1234"));
+        assert!(cu.warning.is_some());
+    }
+
+    #[test]
+    fn enumerate_ports_agrees_with_what_binding_the_path_would_store() {
+        // The identity `ports` advertises must be byte-identical to the one
+        // `add-node` captures from the same path — otherwise the verb invites an
+        // operator to bind something other than what it showed them (§15.35).
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        add_usb_device(
+            t.path(),
+            "1-1",
+            "ttyUSB0",
+            "usb-FTDI_FT232R_USB_UART_A6008isP-if00-port0",
+            "0403",
+            "6001",
+            Some("A6008isP"),
+            "00",
+            Some(("FTDI", "FT232R USB UART")),
+        );
+        for candidate in r.enumerate_ports() {
+            let raw = format!("/dev/{}", candidate.path.file_name().unwrap().display());
+            let captured = r.resolve_input(&raw).expect("present device captures");
+            assert_eq!(captured.identity, candidate.identity);
+            assert_eq!(captured.kind, candidate.kind);
+            assert_eq!(captured.description, candidate.description);
+        }
+    }
+
+    #[test]
+    fn enumerate_ports_skips_a_by_id_link_whose_device_node_is_gone() {
+        // A stale by-id symlink (unplugged mid-scan) must not be offered as a
+        // bindable candidate: it has no path, and `ports` reports present devices.
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        let dev = add_usb_device(
+            t.path(),
+            "1-1",
+            "ttyUSB0",
+            "usb-FTDI_FT232R_USB_UART_A6008isP-if00-port0",
+            "0403",
+            "6001",
+            Some("A6008isP"),
+            "00",
+            None,
+        );
+        assert_eq!(r.enumerate_ports().len(), 1);
+        std::fs::remove_file(&dev).unwrap();
+        assert!(r.enumerate_ports().is_empty(), "stale link is not a port");
+    }
+
+    #[test]
+    fn enumerate_ports_on_an_empty_tree_is_empty_not_an_error() {
+        let t = TmpTree::new();
+        assert!(Resolver::new(t.path()).enumerate_ports().is_empty());
     }
 }

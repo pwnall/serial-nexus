@@ -80,8 +80,8 @@ use tokio::task::JoinHandle;
 use crate::boundary;
 use crate::cell::CriticalCell;
 use crate::runtime::{
-    CHANNEL_CAP, DataFrame, HostwardSink, LossCounter, READ_BUF, SharedLock, Wiring, data_frames,
-    fan_out,
+    CHANNEL_CAP, DataFrame, LossCounter, READ_BUF, SharedFanOut, SharedLock, SharedTargetEdge,
+    Wiring, data_frames,
 };
 use crate::tap::TapFeed;
 
@@ -353,11 +353,11 @@ impl LegNode {
         // How the pump routes decoded wire events back into the local graph.
         let recv_route: RecvRoute = match self.faces {
             Facing::Host => {
-                let mut sinks: HashMap<String, Vec<HostwardSink>> = HashMap::new();
+                let mut sinks: HashMap<String, SharedFanOut> = HashMap::new();
                 let mut feeds: HashMap<String, TapFeed> = HashMap::new();
                 for ch in &self.channels {
                     let addr = EndpointAddr::channel(&self.name, ch);
-                    if let Some(s) = wiring.host_sinks.remove(&addr) {
+                    if let Some(s) = wiring.host_fanout.remove(&addr) {
                         sinks.insert(ch.clone(), s);
                     }
                     if let Some(feed) = wiring.tap_feeds.remove(&addr) {
@@ -373,32 +373,47 @@ impl LegNode {
                 let mut inbound_txs: HashMap<String, mpsc::Sender<Chunk>> = HashMap::new();
                 for ch in &self.channels {
                     let addr = EndpointAddr::channel(&self.name, ch);
-                    if let Some(rx) = wiring.target_hostward_rx.remove(&addr) {
-                        send_receivers.push((ch.clone(), rx, stat_for(ch)));
+                    // The local hostward stream reaches the wire pump through a
+                    // permanent per-channel relay, so the pump's `select!` over
+                    // receivers is untouched by edge surgery: the relay parks on the
+                    // endpoint's inbox, drains an edge until `disconnect` closes it,
+                    // and parks again (§15.35).
+                    if let Some(mut inbox) = wiring.target_inbox.remove(&addr) {
+                        let (relay_tx, relay_rx) = mpsc::channel::<Chunk>(CHANNEL_CAP);
+                        send_receivers.push((ch.clone(), relay_rx, stat_for(ch)));
+                        self.tasks.push(tokio::task::spawn_local(async move {
+                            while let Some(mut rx) = inbox.recv().await {
+                                while let Some(chunk) = rx.recv().await {
+                                    if relay_tx.send(chunk).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }));
                     }
                     let _ = wiring.target_counters.remove(&addr);
                     // Targetward into the local graph, gated on this leg's on-demand
                     // origin lock. One task per channel does the acquire, the
                     // idle-release, and the (backpressured) write; the pump feeds it
                     // through a bounded per-channel queue so a stalled channel
-                    // backpressures the whole connection (§9 head-of-line).
-                    let target_tx = wiring.target_targetward_tx.remove(&addr);
-                    let origin = wiring.origin_locks.remove(&addr);
-                    if let (Some(target_tx), Some((lock, id))) = (target_tx, origin) {
-                        let (inbound_tx, inbound_rx) = mpsc::channel::<Chunk>(CHANNEL_CAP);
-                        inbound_txs.insert(ch.clone(), inbound_tx);
-                        let stat = self.stats.get(ch).cloned().unwrap_or_default();
-                        let idle = Duration::from_millis(self.idle_release_ms);
-                        self.tasks.push(tokio::task::spawn_local(channel_targetward(
-                            inbound_rx,
-                            target_tx,
-                            lock,
-                            id,
-                            idle,
-                            stat,
-                            self.shared.clone(),
-                        )));
-                    }
+                    // backpressures the whole connection (§9 head-of-line). The task
+                    // exists whether or not an edge is attached and re-reads the live
+                    // binding per chunk (§15.35).
+                    let edge = wiring
+                        .target_edges
+                        .remove(&addr)
+                        .unwrap_or_else(crate::runtime::TargetEdge::new);
+                    let (inbound_tx, inbound_rx) = mpsc::channel::<Chunk>(CHANNEL_CAP);
+                    inbound_txs.insert(ch.clone(), inbound_tx);
+                    let stat = self.stats.get(ch).cloned().unwrap_or_default();
+                    let idle = Duration::from_millis(self.idle_release_ms);
+                    self.tasks.push(tokio::task::spawn_local(channel_targetward(
+                        inbound_rx,
+                        edge,
+                        idle,
+                        stat,
+                        self.shared.clone(),
+                    )));
                 }
                 RecvRoute::Target(inbound_txs)
             }
@@ -550,7 +565,7 @@ enum RecvRoute {
     /// faces=host: fan each channel's hostward data out to local consumers, and
     /// mirror it to the channel's tap hub for taps and the replay ring (§17).
     Host {
-        sinks: HashMap<String, Vec<HostwardSink>>,
+        sinks: HashMap<String, SharedFanOut>,
         feeds: HashMap<String, TapFeed>,
     },
     /// faces=target: hand each channel's targetward data to its per-channel task.
@@ -913,7 +928,7 @@ async fn route_recv(
                                 Some(s) => &s.discarded_hostward,
                                 None => &scratch,
                             };
-                            let out = fan_out(&bytes, chsinks, unattached);
+                            let out = chsinks.broadcast(&bytes, unattached);
                             if let Some(s) = stat {
                                 if out.live {
                                     s.delivered_hostward.set(s.delivered_hostward.get() + n);
@@ -1013,22 +1028,58 @@ fn note_undeliverable(
 /// reports.
 async fn channel_targetward(
     mut rx: mpsc::Receiver<Chunk>,
-    tx: mpsc::Sender<Chunk>,
-    lock: SharedLock,
-    id: OriginId,
+    edge: SharedTargetEdge,
     idle: Duration,
     stat: Rc<ChannelStat>,
     shared: Rc<LegShared>,
 ) {
     let purging = shared.purge_on_reconnect;
-    let mut holding = false;
+    // What this task believes it currently holds. Tracked as the binding itself, not
+    // a bare flag, because `connect`/`disconnect` can replace the local edge under a
+    // running task (§15.35): a binding that changed identity is one this task never
+    // acquired, so the old floor must be yielded rather than re-released blindly.
+    let mut holding: Option<(SharedLock, OriginId)> = None;
     loop {
-        let msg = if holding {
+        // Re-read the live edge. `disconnect` clears it (and releases the lock on
+        // this origin's behalf), so an unbound channel counts and drops what the
+        // wire delivers rather than wedging the whole connection behind a local
+        // endpoint the operator detached.
+        let binding = edge.origin();
+        match (&binding, &holding) {
+            (Some((_, _, new_id)), Some((old_lock, old_id))) if new_id != old_id => {
+                release(old_lock, *old_id);
+                holding = None;
+            }
+            (None, Some((old_lock, old_id))) => {
+                release(old_lock, *old_id);
+                holding = None;
+            }
+            _ => {}
+        }
+        let Some((tx, lock, id)) = binding else {
+            // Unattached: **drain and count**, deliberately *not* park.
+            //
+            // The interior nodes park here, because their targetward pump serves one
+            // endpoint and stalling it backpressures exactly that endpoint's writers
+            // (§5). A leg is different: these bytes come from a *remote peer* over
+            // one shared connection, and a parked channel fills its bounded queue and
+            // then head-of-line blocks every other channel on the link (§9). Blocking
+            // a whole cross-machine link because one local endpoint was detached is
+            // worse than counting, and §7.4 already treats data for a channel with no
+            // local endpoint as counted loss ("announced but unbound").
+            let Some(bytes) = rx.recv().await else {
+                break; // source closed (torn down)
+            };
+            stat.discarded_targetward
+                .set(stat.discarded_targetward.get() + bytes.len() as u64);
+            continue;
+        };
+        let msg = if holding.is_some() {
             tokio::select! {
                 v = rx.recv() => v,
                 _ = tokio::time::sleep(idle) => {
                     release(&lock, id);
-                    holding = false;
+                    holding = None;
                     continue;
                 }
                 // The peer dropped: yield the local endpoint's floor now, so a local
@@ -1039,7 +1090,7 @@ async fn channel_targetward(
                 _ = shared.disconnect.notified() => {
                     purge_inbound(purging, &mut rx, 0, &stat).await;
                     release(&lock, id);
-                    holding = false;
+                    holding = None;
                     continue;
                 }
             }
@@ -1058,16 +1109,22 @@ async fn channel_targetward(
         // timer (LEG-4).
         let epoch = shared.disconnect_epoch.get();
         if !ensure_acquired(&lock, id).await {
-            return; // endpoint torn down or we cannot write
+            // Endpoint torn down (or this origin cannot write). Same reasoning as the
+            // send-error arm below: count and keep the task, because a later `connect`
+            // can hand this channel a live local endpoint (§15.35).
+            stat.discarded_targetward
+                .set(stat.discarded_targetward.get() + n);
+            holding = None;
+            continue;
         }
-        holding = true;
+        holding = Some((lock.clone(), id));
         // The peer vanished while this chunk queued for a contended local lock: it is
         // outage-era stale before it was ever written, so purge it here rather than
         // acquiring the floor and firing it (§6, LEG-3).
         if purging && shared.disconnect_epoch.get() != epoch {
             purge_inbound(purging, &mut rx, n, &stat).await;
             release(&lock, id);
-            holding = false;
+            holding = None;
             continue;
         }
         // Race the (backpressured) local write against the peer's disconnect: a chunk
@@ -1089,13 +1146,21 @@ async fn channel_targetward(
                 .accepted_targetward
                 .set(stat.accepted_targetward.get() + n),
             Some(Err(_)) => {
+                // The local endpoint's targetward channel closed under us — its node
+                // was removed, or the graph was replaced. Count the loss and keep the
+                // task: with edge surgery (§15.35) a `connect` may give this channel a
+                // new local endpoint, and returning here would leave a leg channel
+                // permanently dead with no way back short of a reload.
+                stat.discarded_targetward
+                    .set(stat.discarded_targetward.get() + n);
                 release(&lock, id);
-                return; // the local endpoint is gone
+                holding = None;
+                continue;
             }
             None => {
                 purge_inbound(purging, &mut rx, n, &stat).await;
                 release(&lock, id);
-                holding = false;
+                holding = None;
                 continue;
             }
         }
@@ -1106,10 +1171,10 @@ async fn channel_targetward(
         if shared.disconnect_epoch.get() != epoch {
             purge_inbound(purging, &mut rx, 0, &stat).await;
             release(&lock, id);
-            holding = false;
+            holding = None;
         }
     }
-    if holding {
+    if let Some((lock, id)) = holding {
         release(&lock, id);
     }
 }

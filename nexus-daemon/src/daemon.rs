@@ -84,6 +84,25 @@ struct GraphState {
     /// its node name) → (its endpoint's lock, its origin id), for resolving a
     /// `lock`/`unlock` by origin name to the right lock (§6).
     origin_locks: HashMap<String, (SharedLock, OriginId)>,
+    /// Host-facing endpoint **display** → its live fan-out list (§15.35), so
+    /// `connect`/`disconnect` can join and leave a *running* producer's broadcast
+    /// without restarting it.
+    host_fanout: HashMap<String, crate::runtime::SharedFanOut>,
+    /// Target-facing endpoint **display** → the sending half of its edge inbox
+    /// (§15.35): how `connect` hands a running consumer its new hostward receiver.
+    target_inbox: HashMap<String, crate::runtime::EdgeInboxTx>,
+    /// Target-facing endpoint **display** → its [`DropCounters`](crate::runtime::DropCounters).
+    /// Owned by the endpoint, not the edge, so a reconnect does not reset an
+    /// operator's loss history.
+    target_counters: HashMap<String, std::sync::Arc<crate::runtime::DropCounters>>,
+    /// Target-facing endpoint **display** → its live edge binding (§15.35), the slot
+    /// `connect` fills and `disconnect` clears under the endpoint's running task.
+    target_edges: HashMap<String, crate::runtime::SharedTargetEdge>,
+    /// Monotonic allocator for edge-assigned origin ids, so an origin registered by
+    /// a live `connect` never collides with one the initial wiring assigned (which
+    /// counts up from 0) or with a transient `send` origin (which starts at
+    /// [`SEND_ORIGIN_BASE`]).
+    next_edge_origin: Cell<u64>,
     /// Monotonic allocator for transient `send` origin ids (§6).
     next_send_origin: Cell<u64>,
     /// Host-facing endpoint **display** → its tap hub (§5 ring, §17 taps). The
@@ -123,6 +142,106 @@ impl GraphState {
         });
     }
 
+    /// Undo one edge's *runtime* wiring: stop the bytes, clear the write path,
+    /// leave the lock cleanly, and purge what the departing origin still held
+    /// (§15.35). Configuration is the caller's to update.
+    ///
+    /// Shared by `disconnect` and by `remove-node --cascade`, deliberately: both
+    /// remove edges from a running graph, and two implementations of "leave the
+    /// lock cleanly" is how the phantom holder came back the first time (§15.27,
+    /// §16 one-rule-one-place).
+    fn detach_edge_runtime(&mut self, host: &str, target: &str) -> DetachedEdge {
+        // 1. Stop the bytes. Dropping the producer's sink closes this edge's hostward
+        //    channel, so the consumer drains what it already holds and then parks on
+        //    its inbox — no chunk is lost to the detach itself.
+        if let Some(fanout) = self.host_fanout.get(host) {
+            fanout.detach(&target.parse().expect("address parses"));
+        }
+
+        // 2. Clear the consumer's write path before releasing the lock, so the origin
+        //    takes no *new* chunk from its queue under a lock it no longer owns.
+        //    (A chunk already parked inside `tx.send(...).await` may still land: the
+        //    writer holds a clone of the host endpoint's sender, taken before the
+        //    await. That is bounded — one in-flight chunk per origin — and is the
+        //    same window `remove-node` has always had; closing it would mean an
+        //    epoch on the targetward channel, which §14 defers as the PTY per-open
+        //    epoch's sibling.)
+        if let Some(slot) = self.target_edges.get(target) {
+            slot.with_mut(|e| {
+                e.writer = None;
+                e.attached = false;
+            });
+        }
+
+        // 3. Leave the lock cleanly (§6/§15.20). `unregister` drops this origin
+        //    whether it was the holder or a queued waiter, and the wake lets the FIFO
+        //    head take a lock the departing origin was holding — the phantom-holder
+        //    fix, applied on the edge path before the bug could recur.
+        //
+        //    The registration comes from the edge slot, **not** from `origin_locks`.
+        //    The lock registers every origin so `state` can list it; `origin_locks`
+        //    holds only the ones `lock`/`unlock` can address (mode ≠ `never`).
+        //    Unregistering through the narrower map leaves a read-only origin — a log
+        //    edge, say — in `state` for an edge that no longer exists, and one more of
+        //    them after every connect/disconnect cycle.
+        let mut released_lock = false;
+        self.origin_locks.remove(target);
+        let registered = self
+            .target_edges
+            .get(target)
+            .and_then(|slot| slot.with(|e| e.registered.clone()));
+        if let Some((lock, origin_id)) = registered {
+            released_lock = lock.with(|g| g.holder() == Some(origin_id));
+            lock.with_mut(|g| g.unregister(origin_id));
+            lock.wake_waiters();
+            lock.emit_change();
+        }
+        if let Some(slot) = self.target_edges.get(target) {
+            slot.with_mut(|e| e.registered = None);
+        }
+
+        // 4. Purge the departing origin's un-flushed targetward backlog (§6
+        //    purge-on-acquire's sibling): bytes it typed while it still held the lock
+        //    must not surface later under whoever takes the endpoint next.
+        //
+        //    Scope, stated rather than implied: `purge_origin` reaches a **pty**'s
+        //    kernel buffer and nothing else — that is the case §6 wrote the rule for,
+        //    a human typing ahead of a grant. An interior origin (codec, exec, map,
+        //    leg) has no such buffer; what it holds sits in its own bounded channel,
+        //    which the node keeps and will deliver if it is wired again. Draining
+        //    that on a *disconnect* would be a design decision about whose bytes they
+        //    are, and §6's purge rule does not make it — so this reports 0 for those
+        //    kinds rather than pretending to have purged something.
+        // `EndpointAddr`'s parse is infallible — every display form round-trips — so
+        // the node component is always available here.
+        let mut purged_bytes = 0;
+        let target_addr: EndpointAddr = target.parse().expect("address parses");
+        if let Some(node) = self.nodes.iter().find(|n| n.name() == target_addr.node) {
+            purged_bytes = node.purge_origin();
+        }
+        // 5. Let the consuming node re-report its status: an interior node with no
+        //    upstream is `waiting`, honestly (§7.5/§15.8).
+        if let Some(node) = self.nodes.iter_mut().find(|n| n.name() == target_addr.node) {
+            node.edge_detached(&target_addr);
+        }
+        DetachedEdge {
+            released_lock,
+            purged_bytes,
+        }
+    }
+
+    /// Drop every per-endpoint handle belonging to `node` (§15.35). Called on
+    /// removal, so the maps do not accumulate handles to endpoints the graph no
+    /// longer has across add/remove cycles.
+    fn forget_endpoints(&mut self, endpoints: &[String]) {
+        for ep in endpoints {
+            self.host_fanout.remove(ep);
+            self.target_inbox.remove(ep);
+            self.target_counters.remove(ep);
+            self.target_edges.remove(ep);
+        }
+    }
+
     /// Find a node by name, or the shared `unknown node` error (§10) — the lookup
     /// idiom used by every node-targeted verb.
     fn node(&self, name: &str) -> Result<&Node, RpcError> {
@@ -158,7 +277,40 @@ impl GraphState {
         for (a, (l, id)) in &wiring.origin_locks {
             self.origin_locks.insert(a.to_string(), (l.clone(), *id));
         }
+        // The edge-surgery handles (§15.35). Absorbed the same way and at the same
+        // time as the lock handles above, so `connect` on a node added a moment ago
+        // reaches exactly the machinery `load` would have wired.
+        for (a, f) in &wiring.host_fanout {
+            self.host_fanout.insert(a.to_string(), f.clone());
+        }
+        for (a, t) in &wiring.target_inbox_tx {
+            self.target_inbox.insert(a.to_string(), t.clone());
+        }
+        for (a, c) in &wiring.target_counters {
+            self.target_counters.insert(a.to_string(), c.clone());
+        }
+        for (a, e) in &wiring.target_edges {
+            self.target_edges.insert(a.to_string(), e.clone());
+        }
+        // Keep the edge-origin allocator clear of every id this wiring assigned.
+        // Taken from the plan's own counter rather than from `origin_locks`, which
+        // omits `never` origins: a graph whose only edge is `never` would otherwise
+        // leave the floor at 0 and hand the next live `connect` an id already
+        // registered on that very lock, where the two would alias — unregistering
+        // one would drop the other.
+        if wiring.next_origin > self.next_edge_origin.get() {
+            self.next_edge_origin.set(wiring.next_origin);
+        }
     }
+}
+
+/// What [`GraphState::detach_edge_runtime`] had to undo, reported rather than done
+/// silently: an operator who disconnects a writer that held the write lock has
+/// changed who may write, and one whose client had bytes queued has lost them by
+/// design (§5 all-loss-is-visible, §6).
+struct DetachedEdge {
+    released_lock: bool,
+    purged_bytes: u64,
 }
 
 /// The running daemon: graph state, a shutdown signal, and the `subscribe`
@@ -331,9 +483,12 @@ impl Daemon {
             }
             "add-node" => self.add_node(params),
             "remove-node" => self.remove_node(params),
+            "connect" => self.connect(params),
+            "disconnect" => self.disconnect(params),
             "dump" => Ok(self.dump()),
             "state" => Ok(self.state()),
             "info" => Ok(self.info()),
+            "ports" => Ok(self.ports()),
             // The stream itself is served by the connection task (control.rs);
             // dispatch just acknowledges the subscription (§10).
             "subscribe" => Ok(json!({ "subscribed": true })),
@@ -486,6 +641,15 @@ impl Daemon {
             st.endpoint_locks.clear();
             st.endpoint_targetward.clear();
             st.origin_locks.clear();
+            // …and the edge-surgery handles with them, symmetrically with `teardown`
+            // (§15.35). Leaving these to be overwritten key-by-key by `absorb_wiring`
+            // would let a new graph reusing an endpoint *name* inherit the old
+            // endpoint's fan-out and edge slot, whose live sender still feeds a
+            // consumer that no longer exists.
+            st.host_fanout.clear();
+            st.target_inbox.clear();
+            st.target_counters.clear();
+            st.target_edges.clear();
             // Any hub still here belongs to the outgoing graph; its taps must learn
             // their endpoint is gone rather than go quiet (§17, TAP-1). Under
             // `--replace` the teardown above already did this, so this is the
@@ -660,6 +824,27 @@ impl Daemon {
             // stop before joining costs the runtime thread one node's stop latency
             // rather than a sum here, and keeps all three teardown paths one shape
             // (BND-1).
+            // Undo each attached edge's runtime wiring first, through the *same*
+            // helper `disconnect` uses (§15.35): the producer's sink goes, the
+            // consumer's slot is cleared, and a lock-holding origin leaves cleanly.
+            // Doing it here rather than relying on channel closure is what keeps a
+            // surviving producer's fan-out from accumulating dead sinks across
+            // add/remove cycles, and keeps the two removal paths from drifting.
+            let cascaded: Vec<(String, String)> = st
+                .config
+                .edges
+                .iter()
+                .filter(|e| e.a.node == name || e.b.node == name)
+                .filter_map(|e| {
+                    st.config
+                        .edge_ends_of(e)
+                        .map(|(h, t)| (h.to_string(), t.to_string()))
+                })
+                .collect();
+            for (host, target) in &cascaded {
+                st.detach_edge_runtime(host, target);
+            }
+
             let mut node = st.nodes.remove(idx);
             node.signal_stop();
             node.teardown();
@@ -709,6 +894,10 @@ impl Daemon {
                 !removed_locks.iter().any(|rl| std::rc::Rc::ptr_eq(rl, lock))
             });
 
+            // Drop this node's per-endpoint edge-surgery handles (§15.35), which are
+            // handles to endpoints the graph no longer has.
+            st.forget_endpoints(&endpoints);
+
             // Drop the node's edges and the node itself from configuration.
             st.config
                 .edges
@@ -716,6 +905,202 @@ impl Daemon {
             st.config.nodes.retain(|n| n.name() != name);
 
             Ok(json!({ "removed": name, "cascaded_edges": attached }))
+        })
+    }
+
+    /// `connect` (§10/§15.35): attach one edge to a running graph.
+    ///
+    /// The whole point is that this is *not* a special case. The candidate graph —
+    /// current configuration plus the one new edge — runs the same
+    /// `GraphConfig::validate` a `load` runs, so orientation pairing, the
+    /// one-edge-per-target rule, the acyclicity rule, the codec-mux write-mode
+    /// corollary and held-origin uniqueness are all enforced here with nothing
+    /// created on a violation (§4, §6, §11). The runtime side is then a plain
+    /// mutation: the producer's live fan-out gains a sink and the consumer's edge
+    /// slot is filled, both under running tasks, so a mid-stream connect joins the
+    /// stream at the join point rather than restarting anything.
+    fn connect(&self, params: Option<Value>) -> Result<Value, RpcError> {
+        let edge = parse_edge_param(params.as_ref())?;
+        self.state.with_mut(|st| {
+            // Validate the candidate graph before touching anything (§11 atomicity).
+            let mut candidate = st.config.clone();
+            candidate.edges.push(edge.clone());
+            let errors = candidate.validate();
+            if !errors.is_empty() {
+                let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+                return Err(RpcError::new(
+                    app_errors::STRUCTURAL,
+                    format!("structural error: {}", messages[0]),
+                )
+                .with_data(json!({ "errors": messages })));
+            }
+            // A duplicate needs no check of its own: re-adding an existing edge gives
+            // its target endpoint two, which §4 rule 2 refuses above by name. One
+            // rule, one place (§16) — a second implementation here would be dead
+            // code that only ever disagreed with the validator.
+
+            // Post-validation the edge is host↔target; `effective_write_mode` is the
+            // one implementation of the two configuration-to-runtime promotions
+            // (§16, invariant 12) and is consulted here exactly as `Wiring::build`
+            // consults it, so a live edge and a loaded one register the same mode.
+            let (host, target) = match candidate.edge_ends_of(&edge) {
+                Some(pair) => pair,
+                None => {
+                    return Err(RpcError::invalid_params(
+                        "edge must join one host-facing endpoint to one target-facing endpoint",
+                    ));
+                }
+            };
+            let mode = candidate.effective_write_mode(&edge);
+            // Keep the parsed addresses; the display forms key the daemon's maps.
+            let (host_addr, target_addr) = (host.clone(), target.clone());
+            let (host, target) = (host_addr.to_string(), target_addr.to_string());
+
+            let fanout = st.host_fanout.get(&host).cloned().ok_or_else(|| {
+                RpcError::invalid_params(format!("host-facing endpoint {host:?} is not wired"))
+            })?;
+            let inbox = st.target_inbox.get(&target).cloned().ok_or_else(|| {
+                RpcError::invalid_params(format!("target-facing endpoint {target:?} is not wired"))
+            })?;
+            let slot = st.target_edges.get(&target).cloned().ok_or_else(|| {
+                RpcError::invalid_params(format!(
+                    "target-facing endpoint {target:?} has no edge slot"
+                ))
+            })?;
+            let counters = st.target_counters.get(&target).cloned().unwrap_or_default();
+
+            // Register the origin on the host endpoint's lock before any byte can
+            // flow, so arbitration is decided from the first chunk (§6).
+            let origin_id = OriginId(st.next_edge_origin.get());
+            st.next_edge_origin.set(origin_id.0 + 1);
+            if let Some(lock) = st.endpoint_locks.get(&host) {
+                lock.with_mut(|l| l.register(origin_id, target.clone(), mode));
+                // Record the registration for *every* mode, so `disconnect` can undo
+                // it; only a writable one also gets a targetward path and a
+                // `lock`/`unlock` address (§6).
+                let writer = (mode != WriteMode::Never)
+                    .then(|| st.endpoint_targetward.get(&host).cloned())
+                    .flatten();
+                if writer.is_some() {
+                    st.origin_locks
+                        .insert(target.clone(), (lock.clone(), origin_id));
+                }
+                slot.with_mut(|e| {
+                    e.attached = true;
+                    e.registered = Some((lock.clone(), origin_id));
+                    e.writer = writer;
+                });
+                // A `held` origin is granted the lock inside `register` when the
+                // endpoint is free — a *fresh exclusive grant*, which §6 says runs
+                // purge-on-acquire before the origin's bytes flow. At load that was
+                // vacuous (nothing had written yet); on a running graph the new
+                // origin may have a backlog from an earlier attachment, and firing it
+                // is the stale-command hazard §6 exists to prevent. Synchronously,
+                // at grant time, exactly as the `lock`/`send` verbs do.
+                let granted = lock.with(|g| g.holder() == Some(origin_id));
+                if granted {
+                    let purged = st
+                        .nodes
+                        .iter()
+                        .find(|n| n.name() == target_addr.node)
+                        .map_or(0, |n| n.purge_origin());
+                    if purged > 0 {
+                        lock.with_mut(|g| g.record_purge(origin_id, purged));
+                    }
+                }
+                // Wake the endpoint's waiters. A `held` origin registered while
+                // someone else holds the lock is *not* granted by `register`, and its
+                // pump may already be parked in `reacquire_held`; without a wake it
+                // sits there until an unrelated transition happens to nudge the lock.
+                lock.wake_waiters();
+                lock.emit_change();
+            } else {
+                slot.with_mut(|e| e.attached = true);
+            }
+
+            // Hostward: the same channel `Wiring::build` would have made, at the same
+            // depth (the producing node's consumer drop policy, §5/§7.1).
+            let (htx, hrx) =
+                mpsc::channel(crate::runtime::hostward_depth(&candidate, &host_addr.node));
+            fanout.attach(crate::runtime::AttachedSink {
+                target: target_addr.clone(),
+                tx: htx,
+                counters,
+            });
+            // Hand the consumer its receiver. A *full* inbox would mean the endpoint
+            // already has an unconsumed edge, which validation just ruled out. A
+            // *closed* one means the consuming endpoint has no pump at all — a pty
+            // whose setup faulted, or a `faces = "host"` codec/exec channel, whose
+            // driver is deferred (§14). That is the same dead edge `load` would have
+            // produced for the same graph, so it is not a refusal (§15.8:
+            // environmental failure never fails a configuration operation) — but it
+            // is not silent either, because "connected" and "no bytes will ever flow"
+            // must not look alike.
+            let live = inbox.try_send(hrx).is_ok();
+            if !live {
+                tracing::warn!(
+                    host = %host,
+                    target = %target,
+                    "connected an edge whose consumer has no running pump; no bytes \
+                     will flow until that node comes up"
+                );
+            }
+
+            // Let the consuming node update its own status (an interior node that was
+            // `waiting` for an upstream is now `active`).
+            if let Some(node) = st.nodes.iter_mut().find(|n| n.name() == target_addr.node) {
+                node.edge_attached(&target_addr);
+            }
+
+            st.config.edges.push(edge);
+            Ok(json!({
+                "connected": { "a": host, "b": target },
+                "write_mode": mode.to_string(),
+                // Whether the consuming endpoint actually has a pump to receive on.
+                // `false` is a real, reachable state (a faulted pty, a deferred
+                // re-multiplexer orientation) and the caller is told rather than left
+                // to infer it from silence.
+                "consumer_live": live,
+            }))
+        })
+    }
+
+    /// `disconnect` (§10/§15.35): remove one edge from a running graph.
+    ///
+    /// The reverse of `connect`, with one clause that is not symmetric and is the
+    /// whole reason this verb needs care: **a lock-holding origin must release and
+    /// purge on its way out.** That is §15.27's phantom-holder lesson — a writer
+    /// removed while holding an endpoint's lock leaves it wedged as locked by
+    /// someone who no longer exists, with no recovery — applied to the edge
+    /// operation before the bug could recur here (§6, §15.35).
+    fn disconnect(&self, params: Option<Value>) -> Result<Value, RpcError> {
+        let edge = parse_edge_param(params.as_ref())?;
+        self.state.with_mut(|st| {
+            let Some(index) = st.config.edges.iter().position(|e| same_edge(e, &edge)) else {
+                return Err(RpcError::invalid_params(format!(
+                    "no edge between {} and {}",
+                    edge.a, edge.b
+                )));
+            };
+            let existing = st.config.edges[index].clone();
+            let Some((host, target)) = st.config.edge_ends_of(&existing) else {
+                // A same-facing or dangling edge cannot be in a validated config.
+                st.config.edges.remove(index);
+                return Ok(json!({ "disconnected": { "a": edge.a, "b": edge.b } }));
+            };
+            let (host, target) = (host.to_string(), target.to_string());
+
+            let detached = st.detach_edge_runtime(&host, &target);
+            let (released_lock, purged) = (detached.released_lock, detached.purged_bytes);
+            st.config.edges.remove(index);
+            Ok(json!({
+                "disconnected": { "a": host, "b": target },
+                // Reported rather than silent: an operator who disconnects a writer
+                // that held the lock has changed who may write, and one whose client
+                // had bytes queued has lost them by design (§5 all-loss-is-visible).
+                "released_lock": released_lock,
+                "purged_bytes": purged,
+            }))
         })
     }
 
@@ -878,6 +1263,74 @@ impl Daemon {
             // instance, so a client keys its stored history on this and starts fresh
             // when it changes across a restart.
             "instance": self.instance,
+        })
+    }
+
+    /// `ports` (§12/§15.35): the resolver's enumeration face — every serial device
+    /// on this machine, the identity that would bind it, and whether a node in the
+    /// running graph already has it.
+    ///
+    /// **Passive.** The whole answer is readlinks, directory listings and sysfs
+    /// reads ([`Resolver::enumerate_ports`](nexus_core::Resolver::enumerate_ports));
+    /// no candidate device is opened, because opening a USB-serial adapter asserts
+    /// DTR and resets the board behind it. That is a behavioural contract, not an
+    /// implementation detail — `ports` is the verb an operator runs to *look*.
+    ///
+    /// `bound_to` answers "is this one already spoken for" by resolving each serial
+    /// node's stored identity to its current path and matching on the path, so an
+    /// adapter bound by `usb:` identity, by `by-path:`, or by a raw path all report
+    /// bound — where comparing identity strings would only have caught the first.
+    /// Both sides are canonicalized before the comparison, because the raw-path
+    /// forms resolve *literally*: a node configured as
+    /// `raw:/dev/serial/by-id/usb-FTDI_…` names the same device as the enumerated
+    /// `/dev/ttyUSB0` through a symlink, and a textual comparison would report it
+    /// free and invite an operator to bind it twice.
+    fn ports(&self) -> Value {
+        let candidates = self.resolver.enumerate_ports();
+        self.state.with(|st| {
+            // Each serial node's currently-resolved path, so the match below is a
+            // path comparison rather than an identity-spelling comparison.
+            let bound: Vec<(String, Option<std::path::PathBuf>, &str)> = st
+                .config
+                .nodes
+                .iter()
+                .filter_map(|n| match n {
+                    nexus_core::config::NodeConfig::Serial { name, device, .. } => Some((
+                        name.clone(),
+                        self.resolver.resolve_current_path(device),
+                        device.as_str(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            // Compare through `canonicalize`, falling back to the literal path when it
+            // fails (an absent device), so a symlinked raw path still matches.
+            let real = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.into());
+            let bound: Vec<(String, Option<std::path::PathBuf>, &str)> = bound
+                .into_iter()
+                .map(|(name, path, device)| (name, path.map(|p| real(&p)), device))
+                .collect();
+            let ports: Vec<Value> = candidates
+                .iter()
+                .map(|c| {
+                    let canonical = real(&c.path);
+                    let holder = bound.iter().find(|(_, path, device)| {
+                        path.as_deref() == Some(canonical.as_path()) || *device == c.identity
+                    });
+                    json!({
+                        "identity": c.identity,
+                        "kind": c.kind.label(),
+                        "path": c.path.display().to_string(),
+                        "description": c.description,
+                        "by_id": c.by_id,
+                        "warning": c.warning,
+                        // The node that already binds this device, or null when it
+                        // is a free candidate an `add-node` could take.
+                        "bound_to": holder.map(|(name, _, _)| name.clone()),
+                    })
+                })
+                .collect();
+            json!({ "ports": ports })
         })
     }
 
@@ -1378,6 +1831,13 @@ impl Daemon {
             st.endpoint_locks.clear();
             st.endpoint_targetward.clear();
             st.origin_locks.clear();
+            // The edge-surgery handles go with them (§15.35): a stale fan-out or edge
+            // slot for an endpoint the graph no longer has is a handle to nothing, and
+            // leaving them would grow these maps across every `load --replace`.
+            st.host_fanout.clear();
+            st.target_inbox.clear();
+            st.target_counters.clear();
+            st.target_edges.clear();
             // Drop the tap hub handles (§17) — telling each open tap its endpoint is
             // gone, since the connection-side handles outlive this map (TAP-1). Each
             // ingest task self-terminates as the node teardowns above drop the
@@ -1590,7 +2050,44 @@ fn structural_error(message: &str, available: Option<Value>) -> RpcError {
 /// (§11). Read-only verbs (`state`, `dump`, `subscribe`), arbitration (`lock`/
 /// `unlock`/`send`), `rotate`, and `shutdown` never touch config.
 fn is_config_mutation(method: &str) -> bool {
-    matches!(method, "load" | "teardown" | "add-node" | "remove-node")
+    matches!(
+        method,
+        // Edge surgery is configuration too (§15.35): without these two here, a
+        // rewiring an operator just performed would evaporate on the next restart
+        // and the persisted config would silently diverge from `dump` — a
+        // fail-*silent* shape, which is why it is spelled out rather than assumed.
+        "load" | "teardown" | "add-node" | "remove-node" | "connect" | "disconnect"
+    )
+}
+
+/// Whether two edges join the same endpoint pair, in either order. An edge is
+/// undirected in configuration — orientation comes from the endpoints' facings
+/// (§15.3) — so `disconnect` must find the edge however the operator spells it.
+fn same_edge(x: &nexus_core::config::EdgeConfig, y: &nexus_core::config::EdgeConfig) -> bool {
+    (x.a == y.a && x.b == y.b) || (x.a == y.b && x.b == y.a)
+}
+
+/// Parse `connect`/`disconnect` params into an [`EdgeConfig`](nexus_core::config::EdgeConfig)
+/// — the same `[[edge]]` shape `load` accepts, so an operator writes one thing.
+/// `write_mode` is optional and defaults exactly as configuration does.
+fn parse_edge_param(params: Option<&Value>) -> Result<nexus_core::config::EdgeConfig, RpcError> {
+    let params = params.ok_or_else(|| RpcError::invalid_params("missing params"))?;
+    // Accept both the flat `{a, b, write_mode}` spelling and a nested `{edge: {…}}`,
+    // since the latter is what a caller holding a `[[edge]]` table already has.
+    let value = params.get("edge").unwrap_or(params);
+    let mut obj = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| RpcError::invalid_params("edge params must be an object"))?;
+    // An explicit `null` write_mode means "unspecified", not "invalid": the CLI and
+    // the web editor both send the field unconditionally.
+    if obj.get("write_mode").is_some_and(Value::is_null) {
+        obj.remove("write_mode");
+    }
+    // `EdgeConfig` is `deny_unknown_fields`, so a typo is named rather than ignored
+    // — the §11 rule applied to an edge operation (§15.35).
+    serde_json::from_value(Value::Object(obj))
+        .map_err(|e| RpcError::invalid_params(format!("invalid edge: {e}")))
 }
 
 /// Write `bytes` to `path` atomically: create the parent directory, write a

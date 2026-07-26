@@ -47,6 +47,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use nexus_itest::daemon_answers;
 use nexus_itest::{Daemon, Rpc, TempRun, wait_until};
 use serde_json::Value;
 
@@ -244,9 +246,14 @@ fn a_bare_hangup_leaves_the_daemon_cpu_bounded() {
         .expect("spawn serialnexusd");
     let pid = child.id();
     let d = KillOnDrop(child);
+    // Wait until the daemon *answers*, not merely until its socket inode appears
+    // (AGENTS.md §5, T7): under a full-suite run the inode can be visible before the
+    // daemon is serving, and the next RPC then fails with ENOENT out of nowhere.
     assert!(
-        wait_until(Duration::from_secs(10), || run.socket().exists()),
-        "daemon control socket never appeared"
+        wait_until(Duration::from_secs(10), || {
+            run.socket().exists() && daemon_answers(&run.socket())
+        }),
+        "daemon never answered on its control socket"
     );
     let rpc = Rpc::new(run.socket());
     rpc.load_toml(&cfg(&run), false).expect("load graph");

@@ -1,24 +1,237 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-25 (**phases 0-8 + simplification + extension + web-console + v10 + v11
-console-map tracks done**, plus the **review-26 remediation track** — all 93 findings of
-`docs/26-claude-opus-code-review.md` dispositioned, ledger in
-`docs/27-review-26-remediation-ledger.md`, design §15.34, plan §13. The
-**`serialnexusweb` web console is REAL-BROWSER validated** over the FTDI crossover rig;
-the `load --replace` OPFS freeze that was open there is now fixed on both sides — the
-daemon says `tap.closed`, and the client re-anchors its offset space — but the browser
-half is checklist-verified, not CI-verified, per §16.7.)
+**As of:** 2026-07-26 (**phases 0-8 + simplification + extension + web-console + v10 + v11
+console-map + review-26 remediation tracks done**, plus the **v12 graph-editing track** —
+`ports`, `connect`/`disconnect`, and the web console's graph and editor pages, design
+§15.35, plan §14. The **`serialnexusweb` web console is REAL-BROWSER validated** over the
+FTDI crossover rig for the *console* view; the graph and editor views are API-validated in
+`p8_web.rs` and go on the §16.7 manual checklist for their rendering half.)
 **Branch:** `implementation` (off `main`).
-**Normative docs are now v11:** `docs/24-design-claude-fable-v11.md` (design) and
-`docs/25-implementation-plan-claude-fable-v11.md` (plan). v1–v10 docs are in
-`docs/historical/`. Section references (§) point at the v11 design.
+**Normative docs are now v12:** `docs/28-design-claude-fable-v12.md` (design) and
+`docs/29-implementation-plan-claude-fable-v12.md` (plan). v1–v11 docs, the review and its
+remediation ledger are in `docs/historical/`. Section references (§) point at the v12
+design.
+
+---
+
+## v12 GRAPH-EDITING TRACK (plan §14 / design §15.35) — DONE (2026-07-26 session)
+
+v12 is the first track since v10 that adds *capability* rather than closing findings. Its
+three surfaces all answer the same complaint: the daemon could be operated, but only by
+someone who already knew what was plugged in and was willing to take an outage to rewire
+it. Design §15.35 is the rationale.
+
+**First, an alignment pass on the design itself.** The v12 document was rebased from the
+*pre-remediation* v11 text, so it silently dropped seven rules the review-26 remediation
+had added and the code still enforces. None of these was a code deviation — the audit found
+zero — so the fix was to restore the text, not to remove working code. Restored: §3's
+name-legality clause (`BlankName`/`NameTooLong`/`MAX_NAME_LEN`, whose absence left AGENTS.md
+invariant 7 with no design source); §8's and §15.26's `unstable_fuzz_api` amendment (both
+modules ship and a meta-gate enforces its one-target-per-export rule, citing a section that
+no longer said it); §16.2's `RefCell`-ban *scope* (v12 still said "in `serialnexusd`" — the
+exact wording INV5-CLIPPY-SCOPE proved broken); §11's empty-parse refusal; §15.21's P5
+verdict folding; and, in §15.34, the two clauses that make the shared-helper rules binding
+(the hostward fan-out is *one* helper for all five producers, and `effective_write_mode` is
+consulted by **both** the validator and the wiring). §7.1's `flow_control` spellings were
+corrected to the canonical kebab-case with the unhyphenated forms named as aliases, and
+§11/§16.10's "connect/disconnect are deferred" text was reconciled with §10/§14/§15.35.
+
+**§14.1 — THE `ports` VERB.**
+- **Enumeration** `nexus-core/src/resolver.rs::enumerate_ports` → `Vec<PortCandidate>`
+  (identity, kind, path, description, `by_id`, warning). Three passive sources unioned and
+  deduplicated by device node: `/dev/serial/by-id`, `/dev/serial/by-path` (which still
+  covers an adapter whose serial number is absent), and a `<dev-root>/dev` scan for `cu.*`
+  callout nodes — the BSD/macOS face. The `cu.*` scan is deliberately **not** `cfg`-gated:
+  the prefix matches nothing on Linux, and one code path keeps the macOS arm reachable from
+  a Linux fixture instead of shipping untested.
+- Each candidate's identity comes from the *same* private `capture_for_dev` chain
+  `add-node` uses, so what `ports` advertises is byte-identical to what binding that path
+  would store. `enumerate_ports_agrees_with_what_binding_the_path_would_store` pins it.
+- **The verb** `Daemon::ports` adds `bound_to`, resolved by comparing *paths* (each serial
+  node's stored identity through `resolve_current_path`) rather than identity spellings —
+  so a device held by a `by-path:` identity reports bound even though `ports` advertises it
+  as `usb:`.
+- **Passivity has two proofs.** Structural: `meta_gates::port_enumeration_cannot_open_a_device`
+  asserts `nexus-core` declares no dependency that *could* open a device
+  (`serial2`/`nexus-sys`/`nix`/`libc`) and still forbids `unsafe`, with a planted-violation
+  self-proof on the manifest scanner. Runtime: `p10_ports.rs`'s fixture device nodes are
+  writer-less FIFOs, so a blocking `open(2)` would never return and the RPC would hit its
+  timeout.
+- `Daemon::start_with_args` was added to `nexus-itest` so a test can pass `--dev-root`
+  without a fourth hand-rolled `KillOnDrop` copy.
+
+**§14.2 — `connect` / `disconnect`.** The verbs are easy; making them *the same operation
+`load` performs, minus the outage* is the work, and it needed a wiring change.
+
+- **The problem.** Edges were only ever created by `Wiring::build` and consumed by
+  `Node::start`; a node's tasks owned their channels outright. Adding an edge to a running
+  graph therefore meant restarting tasks — and aborting a task drops its *targetward*
+  receiver out from under senders that stay live in `GraphState::endpoint_targetward` and in
+  every writer origin. That is MAP-1's chain exactly.
+- **The shape that fixed it** (`nexus-daemon/src/runtime.rs`), resting on one observation:
+  §4 rule 2 gives a target-facing endpoint **at most one edge**, so everything an edge
+  contributes is derivable from the two endpoints' *permanent* resources.
+  - `FanOutList` / `SharedFanOut` — a host-facing endpoint's live sink list, `Arc<Mutex<…>>`
+    because the serial reader owns it from a blocking thread (invariant 2). One uncontended
+    lock per 64 KiB chunk; `p3_firehose` is the standing proof it costs nothing.
+  - `EdgeInbox` — a target-facing endpoint's stream of hostward receivers. Its pump loops
+    `while let Some(rx) = inbox.recv().await { while let Some(c) = rx.recv().await {…} }`,
+    so it outlives every individual edge with **no extra per-chunk hop**. `disconnect`
+    closes the edge channel by dropping the producer's sink, and the pump drains what was
+    buffered before parking again — the detach costs no bytes.
+  - `EdgeSlot`/`TargetEdge` — the targetward sender + lock + origin id, re-read per chunk,
+    with a `Notify` so an unattached pump can park.
+- **Three states, three behaviours** — and the middle one is the subtle one. Attached and
+  writable: forward. **Attached but read-only** (`write_mode = "never"`): drain and count,
+  because parking would wedge a writer forever on a configuration that will never become
+  writable (MAP-1). **Not attached**: park in `runtime::await_origin`, because targetward is
+  the direction §5 forbids dropping on — a detached edge must stall its writers exactly as a
+  steal does. The `attached` flag exists precisely to tell the last two apart.
+- **`disconnect` releases and purges.** §15.27's phantom-holder lesson applied before the
+  bug could recur on the new path: unregister the origin (holder or queued waiter), wake the
+  FIFO head, purge the departing origin's un-flushed backlog, and report both
+  (`released_lock`, `purged_bytes`) rather than doing it silently.
+- **Two smaller things that had to move with it.** `is_config_mutation` gained
+  `connect`/`disconnect` — without that, a rewiring would have evaporated on restart while
+  `dump` still showed it, a fail-*silent* shape. And the exec supervisor now consults the
+  live edge slot when it reports `active`, instead of latching a status at child spawn and
+  racing `connect` to describe the same node.
+- **Deliberately not added:** a duplicate-edge check in the verb. Re-adding an edge gives
+  its target endpoint two, which §4 rule 2 already refuses by name; a second implementation
+  would be dead code that could only ever disagree with the validator.
+
+**§14.3/§14.4 — THE GRAPH AND EDITOR PAGES, AND THE POSTURE.**
+- `serialnexusweb/src/assets/graph.mjs` and `editor.mjs`: pure renderers, handed snapshots
+  by `app.js`. One shell, three views, hash-routed (`#graph`, `#editor`) so each is
+  bookmarkable without the server growing a router.
+- The graph page reads `dump` for topology and `state` for status — the §15.8 split kept in
+  the client too. It deliberately does **not** re-derive the write-mode promotions: that
+  computation has exactly one implementation, in the daemon (invariant 12).
+- The editor **enforces nothing**. Every §4 rule is the daemon's, and the page surfaces the
+  refusal verbatim; `rpcFull` exists so the operator sees `data.errors[0]` rather than "it
+  failed". What the page does own is the destructive confirmation, and it *names what
+  cascades* rather than asking "are you sure?".
+- `bridge::ALLOWED` grew `add-node`, `remove-node`, `connect`, `disconnect`, `ports`.
+  `load`, `teardown`, `shutdown` and the nonexistent `set-attribute` stay refused, pinned
+  both as a unit test and end to end. `docs/security.md` gained the capability statement:
+  graph editing is daemon-user capability (a log node writes files, an exec codec runs
+  commands), so the token is operator trust — stated in a block quote rather than implied.
+
+**⚠️ Adversarial audit (6-lens find→verify workflow, ~50 agents) — 47 candidates; do NOT
+regress these.** The lenses were the wiring refactor, the two verbs, `ports`, the web
+surfaces, an invariant-by-invariant sweep, and the documentation. The wiring refactor is
+where the damage was, which is the expected shape: it is the part that changed a
+load-bearing structure rather than adding one.
+
+1. `[correctness, CRITICAL]` **A targetward pump parked in `reacquire_held` when its edge
+   was disconnected never woke.** `unregister` makes both `may_write` and `reclaim_held`
+   false forever while the lock stays *open* (the endpoint is fine — this origin left), so
+   the loop had no exit: the pump parked holding a chunk it had already taken, and a later
+   `connect` could not revive it, because the new edge gets a new id and nothing wakes the
+   old wait. `reacquire_held` now also exits on `write_mode(id).is_none()`.
+2. `[correctness, HIGH]` **A `faces = "target"` leg channel with no local edge head-of-line
+   blocked the whole wire connection.** The refactor gave every channel a task, and an
+   unattached one parked — filling its bounded queue and stalling every other channel on
+   the link (§9). The interior nodes park correctly, because their pump serves one endpoint;
+   a **shared** pump must count instead. The leg and the exec codec (whose route runs inside
+   the child's single stdout decode loop) now drain-and-count. The rule to keep: *park only
+   where the stall is confined to the endpoint whose edge was removed.*
+3. `[correctness, HIGH]` **`connect` of a `held` edge never woke the lock's waiters**, so a
+   held pump already parked in `reacquire_held` sat there until an unrelated transition
+   nudged it; and a `held` origin granted the lock inside `register` **skipped
+   purge-on-acquire**, which §6 requires on every fresh exclusive grant. At load that was
+   vacuous; on a running graph the new origin can have a backlog, and firing it is exactly
+   the stale-command hazard §6 exists to prevent.
+4. `[correctness, MEDIUM ×2]` **Two `never`-origin bugs, one root cause.** The lock
+   registers *every* origin so `state` can list it, while `origin_locks` holds only those
+   `lock`/`unlock` can address. Detach unregistered through the narrower map — so a log edge
+   left a phantom origin per cycle — and `absorb_wiring` derived the live-`connect` id floor
+   from it — so a graph whose only edge was `never` handed the next `connect` an id already
+   registered on that very lock, where the two aliased. Fixed by recording the registration
+   in the edge slot (`TargetEdge::registered`, every mode) and taking the floor from
+   `Wiring`'s own counter. Guards:
+   `disconnecting_a_read_only_edge_leaves_no_phantom_origin` and
+   `a_live_connect_never_reuses_an_origin_id_the_load_already_registered`.
+5. `[correctness, HIGH]` **The `ports` passivity meta-gate could not detect the violation it
+   names.** `declares_dependency` matched `krate = …` and `[dependencies.krate]`, but **not**
+   `krate.workspace = true` — the only spelling this workspace uses. It would have passed
+   forever while catching nothing, which is INV5-CLIPPY-SCOPE's exact shape. It now matches
+   every form (dotted, table, target-specific, renamed via `package`), plants each one in its
+   self-proof, and its *claim* is narrowed: it proves nexus-core carries neither the crates
+   that drive a port nor an explicit file-opening API — not that nothing is opened, since
+   `std::fs` needs no dependency and no `unsafe`. The behavioural proof is `p10_ports`'s
+   writer-less FIFOs.
+6. `[correctness, MEDIUM]` **`bound_to` compared paths textually**, so a node holding a
+   device through a symlinked raw path (`raw:/dev/serial/by-id/…`) read as *free* and invited
+   a second binding that just faults on TIOCEXCL. Both sides are canonicalized now;
+   `bound_status_follows_a_symlinked_raw_path_to_the_device_it_names` was verified to fail
+   without the fix.
+7. `[correctness, HIGH]` **`hidden` did not hide.** The graph/editor views set `hidden` on
+   `#pane-head` and `#sendform`, but the UA rule `[hidden] { display: none }` is
+   origin-weaker than *any* author declaration, and both carry `display: flex`. The console
+   chrome stayed on screen under the new views. One author-origin `[hidden]` rule fixes it.
+8. `[correctness, MEDIUM ×3]` Web client: the graph page repainted on every `state` tick from
+   a **stale `dump`**, so a topology change from another client never appeared while the page
+   visibly refreshed around it (now a throttled refetch); `#term` lost its scroll position to
+   `display:none` and never followed the tail again after a view round trip; and `ws.send`
+   was called unguarded from controls that are live before `onopen`, silently discarding and
+   leaking the promise (now guarded, and `onclose` settles what is in flight).
+9. `[docs, HIGH]` **`docs/security.md` contradicted itself**: it said a compromised page
+   "cannot stop the daemon or replace its configuration wholesale" two paragraphs after
+   stating that a token holder can run an arbitrary command as the daemon's user. `add-node`
+   accepts an exec codec, which subsumes both. The lifecycle verbs stay off the wire because
+   they are not what the operator asked for — **not** because withholding them constrains an
+   attacker who holds the token. The page says so now, and its "never writes to disk on the
+   daemon's behalf" line is qualified: watching does not, *editing does*.
+10. `[docs, MEDIUM ×2]` Design §10 described `ports` as enumerating devices "not bound into
+   the graph" (it returns all, tagged); §17 said the graph page renders from `state` (`state`
+   carries no edges and must not — they are configuration). Both corrected, plus the smaller
+   stale-comment sweep (`connect` deferred, the flow-control spellings, the moved review-doc
+   paths, the v11 doc pair in AGENTS.md §9, the test count below).
+
+**A methodology note, because the verification half went wrong in a new way.** §15.34's rule
+— a verifier gets the finding and the tree, never the report — was followed: no skeptic could
+read the finder's output. But the *tree changed under them*. Fixes were landing while the
+verifiers read, so 35 of 43 verdicts came back "not real", including for defects that were
+unambiguously real when filed and are now fixed (the `reacquire_held` wedge, the leg's
+head-of-line block, both `never`-origin bugs). A refutation of an already-fixed defect is not
+evidence the finding was wrong; it is evidence the verifier read a different tree. Every
+finding acted on above was therefore confirmed by reading the code directly, and the three
+sharpest were confirmed the only way that settles it — a test that **fails without the fix**
+(`bound_status_follows_a_symlinked_raw_path_to_the_device_it_names` was run against a reverted
+`connect` and did fail; the two origin guards were written before their fixes and failed).
+The rule to add for the next audit: **freeze the worktree for the verification pass**, or run
+the verifiers against a `git worktree` pinned to the commit the finders read. Fixing while
+verifying invalidates the verification just as surely as letting a verifier read the report.
+
+Accepted rather than fixed, each now stated in the code and the RPC docs rather than left to
+be discovered: `ports` is O(adapters²) because `capture_for_dev` re-scans to detect a
+duplicated serial number — bounded by adapter count on a human-scale verb; `bound_to` names
+the *first* node when two are configured on one device (a shape validation permits and
+TIOCEXCL then punishes); and `disconnect`'s purge reaches a pty's kernel buffer only, which
+is the case §6's rule is about — an interior origin's un-sent bytes stay in its own channel
+and are delivered if it is wired again.
+
+**Gates (all green on the Linux 7.0 dev box):** `cargo build --workspace --locked`;
+`cargo test --workspace --locked` (**459 passing / 0 failing / 4 ignored**, up from 436);
+`cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`
+plus the minimal-daemon pass; `cargo deny check licenses bans sources`;
+`cargo check --target x86_64-apple-darwin --workspace --exclude serialnexusweb`;
+`nexus-doctor --json | jq -e -f expectations/linux.jq`. New test files: `p10_ports.rs` (4),
+`p10_edge_surgery.rs` (6), `serialnexusweb/src/assets/graph.test.mjs` (10 under
+`node --test`), plus four new `p8_web.rs` tests and one new meta-gate.
+
+**Still owed (§16.7):** the graph and editor pages are API-validated, not browser-validated.
+Their *rendering* — the view switch, the palette form, the cascade confirmation dialog —
+is exercisable only by a real browser and goes on the manual checklist beside `app.js`'s
+console-switching logic.
 
 ---
 
 ## REVIEW-26 REMEDIATION — all 93 findings dispositioned (2026-07-25 session, uncommitted)
 
-The findings in `docs/26-claude-opus-code-review.md` are addressed. The finding-by-finding
-ledger is **`docs/27-review-26-remediation-ledger.md`** — read that before re-filing
+The findings in `docs/historical/26-claude-opus-code-review.md` are addressed. The finding-by-finding
+ledger is **`docs/historical/27-review-26-remediation-ledger.md`** — read that before re-filing
 anything from the review; several items are *deliberately declined* with reasons, and
 re-fixing a cleared candidate is its own defect. Design §15.34 records the pattern-level
 lessons; plan §13 is the track.
@@ -79,10 +292,10 @@ modules under it (`history.mjs`, `saver.mjs`) are `node --test`-covered per push
 
 ---
 
-## OPUS COMPREHENSIVE CODE REVIEW #2 — `docs/26-claude-opus-code-review.md` (2026-07-25)
+## OPUS COMPREHENSIVE CODE REVIEW #2 — `docs/historical/26-claude-opus-code-review.md` (2026-07-25)
 
 A second full-workspace review (multi-agent + adversarial verification + live reproductions) landed at
-`docs/26-claude-opus-code-review.md`. **The review file is a frozen record of the review as
+`docs/historical/26-claude-opus-code-review.md`. **The review file is a frozen record of the review as
 delivered** — it still reads "nothing is fixed yet", because it was written before the remediation
 that followed it. Read the remediation entry above it for what is true now, and read the review for
 *why*: its §1 action table, its §6 list of the 20 refuted candidates (which need no action and should
@@ -1272,7 +1485,7 @@ vary `hostward_buffer` and `modem`).
 
 ### 3.14 Opus comprehensive review remediation — DONE (2026-07-23)
 A full multi-agent, adversarially-verified code review landed at
-`docs/19-claude-opus-code-review.md` (63 verified findings, 56 distinct). **All of them
+`docs/historical/19-claude-opus-code-review.md` (63 verified findings, 56 distinct). **All of them
 have now been addressed** — every should-fix item fixed with a deterministic regression
 test, every justified deviation either hardened or documented, and the testing/doc gaps
 closed. Gates after the work: `cargo test --workspace` green (all 16 binaries),
@@ -1362,10 +1575,11 @@ the correctness fixes; the mechanical dedup it enables (OPSIMP-4/5) is already i
 
 ### 3.15 WITHDRAWN — `flow_control` spelling was a defect, not a justified deviation
 This slot briefly held "the design text should follow the code" for `flow_control`'s kebab-case
-values. It was wrong: `xonxoff`/`rtscts` — the exact spellings normative §7.1 lists — failed to
+values. It was wrong: `xonxoff`/`rtscts` — the exact spellings §7.1 listed at the time — failed to
 deserialize, and since that is a TOML parse error the *entire* configuration file was rejected. It
 is now fixed as CFG-1 (`#[serde(alias = …)]` on both, kebab-case still canonical so `dump`
-round-trips unchanged), so there is no deviation left to record.
+round-trips unchanged), and v12 corrected §7.1 to name the canonical kebab-case form with the
+unhyphenated ones as aliases — so there is no deviation left to record, in either direction.
 
 The heading is kept as a marker rather than deleted, because *how* it was wrong is the useful part:
 the verdict that made this look settled came from a verifier that had read this very entry. Blind

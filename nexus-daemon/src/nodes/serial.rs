@@ -48,7 +48,7 @@ use tokio::task::JoinHandle;
 
 use crate::boundary::{self, BlockingReader};
 use crate::cell::CriticalCell;
-use crate::runtime::{self, HostwardSink, READ_BUF, fan_out};
+use crate::runtime::{self, READ_BUF, SharedFanOut};
 use crate::tap::TapFeed;
 use nexus_sys as sys;
 
@@ -187,7 +187,7 @@ impl SerialNode {
     /// dropping their commands; only the sanctioned purge-on-reconnect drains it.
     pub fn start(
         &mut self,
-        hostward: Vec<HostwardSink>,
+        hostward: SharedFanOut,
         targetward: Option<mpsc::Receiver<Chunk>>,
         tap_feed: Option<TapFeed>,
     ) {
@@ -290,7 +290,7 @@ struct SuperviseCtx {
     device: String,
     resolver: Resolver,
     params: OpenParams,
-    hostward: Vec<HostwardSink>,
+    hostward: SharedFanOut,
     targetward: Option<mpsc::Receiver<Chunk>>,
     /// The tap-feed mirror for this endpoint (§17): the reader mirrors each
     /// hostward chunk here while a tap or ring wants it. `None` only in unit tests.
@@ -497,7 +497,7 @@ fn fault(ctx: &SuperviseCtx, reason: String) {
 /// consumer's [`DropCounters`] (a slow spy costs only itself).
 fn reader_thread(
     fd: std::os::fd::RawFd,
-    hostward: Vec<HostwardSink>,
+    hostward: SharedFanOut,
     tap_feed: Option<TapFeed>,
     discarded_unattached: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
@@ -545,7 +545,7 @@ fn reader_thread(
                         // `discarded_unattached` — the case a consumer cascade-removed
                         // while this node survives produces, which would otherwise
                         // vanish uncounted.
-                        fan_out(&chunk, &hostward, &*discarded_unattached);
+                        hostward.broadcast(&chunk, &*discarded_unattached);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => {
@@ -742,7 +742,7 @@ mod tests {
                 },
                 purge_on_reconnect: true,
             },
-            hostward: Vec::new(),
+            hostward: crate::runtime::FanOutList::new(),
             targetward,
             tap_feed: None,
             shared: Rc::new(CriticalCell::new(SerialShared {
@@ -819,7 +819,12 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Chunk>(4);
         drop(rx); // consumer gone: the sink is now permanently Closed.
         let counters = Arc::new(crate::runtime::DropCounters::default());
-        let hostward: Vec<HostwardSink> = vec![(tx, counters.clone())];
+        let hostward = crate::runtime::FanOutList::new();
+        hostward.attach(crate::runtime::AttachedSink {
+            target: "consumer".parse().expect("address parses"),
+            tx,
+            counters: counters.clone(),
+        });
         let discarded = Arc::new(AtomicU64::new(0));
 
         // Feed 5 bytes, then close the write end: the reader drains them, hits EOF,
@@ -876,8 +881,8 @@ mod tests {
         std::thread::spawn(move || {
             reader_thread(
                 rfd,
-                Vec::new(), // no graph consumer
-                Some(feed), // but a ring/tap is watching
+                crate::runtime::FanOutList::new(), // no graph consumer
+                Some(feed),                        // but a ring/tap is watching
                 discarded_thread,
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(Notify::new()),

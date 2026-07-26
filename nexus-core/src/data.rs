@@ -11,7 +11,7 @@
 //! property test here proves the rule is coherent and that the model obeys it;
 //! it does not prove the daemon obeys it. The two are kept honest against each
 //! other by review and by the integration suite, which is a documented
-//! shortcoming (F3/LOCK-3 in `docs/26-claude-opus-code-review.md`) and not a
+//! shortcoming (F3/LOCK-3 in `docs/historical/26-claude-opus-code-review.md`) and not a
 //! claim of coverage.
 //!
 //! The rules, and where each is *really* implemented:

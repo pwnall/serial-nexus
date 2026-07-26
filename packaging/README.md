@@ -43,15 +43,24 @@ manual `useradd` needed.
 ## Capture your device's identity
 
 The example config names the device by a resolver identity so it survives replug and
-reboot (§12). Capture yours with `add-node`, which echoes the resolved identity:
+reboot (§12). Start with `ports`, which lists what is actually plugged in and the
+identity that would bind each one — it opens nothing, so listing a port never toggles
+DTR and never resets the board behind it:
 
 ```sh
-# With the adapter plugged in, add a serial node by raw path and read back its
-# canonical identity, then paste that identity into config.toml.
-printf '[[node]]\ntype="serial"\nname="usb0"\ndevice="/dev/ttyUSB0"\n' > /tmp/n.toml
+serialnexusctl ports
+# /dev/ttyUSB0   free   usb:0403:6001:A6008isP:00
+#                       FTDI FT232R USB UART, serial A6008isP, interface 00
+```
+
+Paste that identity into `config.toml`, or bind it straight away with `add-node`,
+which echoes back what it resolved so a wrong device answering is noticed:
+
+```sh
+printf '[[node]]\ntype="serial"\nname="usb0"\ndevice="usb:0403:6001:A6008isP:00"\n' > /tmp/n.toml
 serialnexusctl add-node /tmp/n.toml
 # -> added usb0 — bound: FTDI FT232R, serial A6008isP, interface 0
-serialnexusctl dump | grep device      # the captured usb:… identity
+serialnexusctl ports                   # the port now reads: bound usb0
 ```
 
 ## Operating it
@@ -59,8 +68,11 @@ serialnexusctl dump | grep device      # the captured usb:… identity
 ```sh
 serialnexusctl state                 # observed status of every node
 serialnexusctl --json state | jq .   # machine-readable (or speak JSON-RPC directly)
+serialnexusctl ports                 # what is plugged in, and what already binds it
 serialnexusctl send usb0 --line "…"  # atomic acquire-write-release to the device
 serialnexusctl rotate cap            # rotate a log node on demand
+serialnexusctl connect usb0 console  # wire an edge onto the running graph
+serialnexusctl disconnect usb0 cap   # …and take one out, with no outage
 sudo systemctl reload-or-restart serialnexusd   # note: no live reload; restart re-reads state
 ```
 
@@ -106,9 +118,29 @@ greppable footgun — prefer SSH forwarding.
 
 ## Upgrading to this build — what changed for operators
 
-The `docs/26-claude-opus-code-review.md` remediation tightened configuration
-validation and changed a few operator-visible behaviours. There is no separate
-changelog, so the list lives here, where someone installing the unit will read it.
+There is no separate changelog, so the list lives here, where someone installing the
+unit will read it.
+
+**New in this build (design §15.35).** Three additions, none of which breaks an
+existing configuration:
+
+- **`serialnexusctl ports`** lists the serial devices on the machine, the identity
+  that would bind each one, and which node already holds it. It is strictly passive —
+  by-id/by-path readlinks and sysfs, never `open(2)` — so listing a port cannot reset
+  the board behind it.
+- **`serialnexusctl connect` / `disconnect`** reshape a running graph one edge at a
+  time, under the same structural validation `load` performs. Rewiring no longer needs
+  a `load --replace` outage; disconnecting a writer that holds the write lock releases
+  it and purges its un-flushed bytes rather than leaving the endpoint wedged.
+- **The web console can now edit the graph** — a graph page and an editor page join
+  the console view. *This is a security-posture change and it is deliberate:* whoever
+  holds the web token can now create a log node (which writes files) and an exec codec
+  (which runs a command), both as the daemon's user. Treat the token as equivalent to
+  shell access for that account. Daemon lifecycle stays off the browser wire: `load`,
+  `teardown` and `shutdown` are still refused there. See `docs/security.md`.
+
+**From the `docs/historical/26-claude-opus-code-review.md` remediation**, which tightened
+configuration validation and changed a few operator-visible behaviours.
 
 **Configurations that used to load and now do not.** Each is refused *structurally*,
 before anything is created — so under `load --replace` a bad file can no longer

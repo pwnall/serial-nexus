@@ -295,6 +295,25 @@ impl Rpc {
         self.call("remove-node", json!({ "node": node, "cascade": cascade }))
     }
 
+    /// The `ports` result — the resolver's passive device enumeration (§12/§15.35).
+    pub fn ports(&self) -> Value {
+        self.ok("ports", Value::Null)
+    }
+
+    /// `connect` one edge onto the running graph (§15.35). `write_mode` is the
+    /// declared mode; `None` leaves it to the config default (`on-demand`).
+    pub fn connect(&self, a: &str, b: &str, write_mode: Option<&str>) -> Result<Value, RpcError> {
+        self.call(
+            "connect",
+            json!({ "a": a, "b": b, "write_mode": write_mode }),
+        )
+    }
+
+    /// `disconnect` the edge between two endpoints (§15.35).
+    pub fn disconnect(&self, a: &str, b: &str) -> Result<Value, RpcError> {
+        self.call("disconnect", json!({ "a": a, "b": b }))
+    }
+
     /// `send` one line targetward through an endpoint (§6). `steal` takes the lock.
     pub fn send(
         &self,
@@ -465,6 +484,15 @@ impl Daemon {
     /// Boot a fresh daemon on an empty graph and wait until it **answers RPC** —
     /// not merely until its socket inode appears ([`daemon_answers`], T7).
     pub fn start() -> Self {
+        Self::start_with_args(&[])
+    }
+
+    /// [`Self::start`] plus extra `serialnexusd` flags — the seam a test needs to
+    /// point the resolver at a fixture tree (`--dev-root`, §12). Kept here rather
+    /// than hand-rolled per test so the readiness wait, the temp `XDG_RUNTIME_DIR`
+    /// and the kill-on-drop stay in one place; a test that must *restart* the
+    /// daemon mid-run still manages its own `Child` (the `p7_*` pattern).
+    pub fn start_with_args(extra: &[&str]) -> Self {
         let run = TempRun::new();
         let socket = run.socket();
         let child = Command::new(bin("serialnexusd"))
@@ -472,6 +500,7 @@ impl Daemon {
             .arg(&socket)
             .arg("--state-file")
             .arg(run.state_file())
+            .args(extra)
             .env("XDG_RUNTIME_DIR", run.path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

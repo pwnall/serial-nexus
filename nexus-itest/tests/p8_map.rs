@@ -22,7 +22,7 @@
 //! one (macOS: `serial2` → `ENOTTY`), per the harness doctrine (§5). Property 1 runs
 //! everywhere — a map is an interior transform with no device of its own.
 //!
-//! The audit (`docs/26-claude-opus-code-review.md`) added three more, all
+//! The audit (`docs/historical/26-claude-opus-code-review.md`) added three more, all
 //! device-free and therefore running on **every** platform. They source their
 //! hostward bytes from a `leg` channel driven by a `nexus-sim wire` peer rather than
 //! from a UART — the map neither knows nor cares which host-facing endpoint feeds

@@ -35,7 +35,6 @@ use codec_api::{Event, EventKind, FrameDecoder};
 use nexus_core::Chunk;
 use nexus_core::config::NodeConfig;
 use nexus_core::graph::{EndpointAddr, Facing};
-use nexus_core::lock::OriginId;
 use nexus_core::state::{NodeState, NodeStatus};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -46,8 +45,8 @@ use tokio::task::JoinHandle;
 use crate::boundary;
 use crate::cell::CriticalCell;
 use crate::runtime::{
-    CHANNEL_CAP, DataFrame, DropCounters, HostwardSink, READ_BUF, SharedLock, Wiring, data_frames,
-    fan_out, reacquire_held,
+    CHANNEL_CAP, DataFrame, DropCounters, READ_BUF, SharedFanOut, SharedTargetEdge, Wiring,
+    data_frames, reacquire_held,
 };
 use crate::tap::TapFeed;
 
@@ -99,6 +98,10 @@ pub struct ExecCodecNode {
     /// The multiplexed side's own hostward drops (the codec falling behind the
     /// serial), surfaced so the §5 loss stays located. Claimed at start.
     mux_counters: Option<Arc<DropCounters>>,
+    /// The multiplexed side's live edge binding (§15.35): whether an upstream is
+    /// attached and, when it is writable, the targetward sender and lock the child's
+    /// remux output rides. `connect`/`disconnect` mutate it under the running pumps.
+    mux_edge: Option<SharedTargetEdge>,
     /// Restart attempts since the first start — both a failed spawn and a post-crash
     /// respawn bump it, so a child that can never spawn (bad argv / ENOENT) is visibly
     /// retrying rather than reporting a frozen zero (observable state, §7.6).
@@ -148,6 +151,7 @@ impl ExecCodecNode {
             attrs,
             stats: Rc::new(stats),
             mux_counters: None,
+            mux_edge: None,
             restart_count: Rc::new(Cell::new(0)),
             mux_discarded_targetward: Rc::new(Cell::new(0)),
             unframable_discarded: Rc::new(Cell::new(0)),
@@ -205,26 +209,32 @@ impl ExecCodecNode {
             self.drain_unwired_channels(wiring);
             return;
         }
+        // The multiplexed side's machinery exists whether or not an upstream is
+        // attached today (§15.35): every task starts, parked on the endpoint's inbox
+        // and its origin slot, so a later `connect` needs no restart and no channel
+        // receiver is ever dropped under its still-live senders (MAP-1, §15.8).
         let mux = EndpointAddr::node(&self.name);
-        let Some(mux_hostward_rx) = wiring.target_hostward_rx.remove(&mux) else {
+        let mux_inbox = wiring.target_inbox.remove(&mux);
+        let mux_edge = wiring
+            .target_edges
+            .remove(&mux)
+            .unwrap_or_else(crate::runtime::TargetEdge::new);
+        self.mux_edge = Some(mux_edge.clone());
+        self.mux_counters = wiring.target_counters.remove(&mux);
+        if !mux_edge.with(|e| e.attached) {
             self.status.with_mut(|s| {
                 s.set(NodeStatus::Waiting {
                     reason: "multiplexed side has no attached upstream".to_owned(),
                 });
             });
-            self.drain_unwired_channels(wiring);
-            return;
-        };
-        let mux_targetward_tx = wiring.target_targetward_tx.remove(&mux);
-        let serial_lock = wiring.origin_locks.remove(&mux);
-        self.mux_counters = wiring.target_counters.remove(&mux);
+        }
 
-        let mut channel_sinks: HashMap<String, Vec<HostwardSink>> = HashMap::new();
+        let mut channel_sinks: HashMap<String, SharedFanOut> = HashMap::new();
         let mut channel_feeds: HashMap<String, TapFeed> = HashMap::new();
         let mut channel_rxs: Vec<(String, mpsc::Receiver<Chunk>)> = Vec::new();
         for ch in &self.channels {
             let addr = EndpointAddr::channel(&self.name, ch);
-            if let Some(sinks) = wiring.host_sinks.remove(&addr) {
+            if let Some(sinks) = wiring.host_fanout.remove(&addr) {
                 channel_sinks.insert(ch.clone(), sinks);
             }
             if let Some(feed) = wiring.tap_feeds.remove(&addr) {
@@ -240,13 +250,17 @@ impl ExecCodecNode {
         // each channel's targetward writes (tagged with the channel identity). The
         // forwarders outlive child restarts, so the merged source survives them.
         let (src_tx, src_rx) = mpsc::channel::<(String, Chunk)>(CHANNEL_CAP);
-        {
+        if let Some(mut inbox) = mux_inbox {
             let src_tx = src_tx.clone();
             self.tasks.push(tokio::task::spawn_local(async move {
-                let mut rx = mux_hostward_rx;
-                while let Some(chunk) = rx.recv().await {
-                    if src_tx.send((MUX_CHANNEL.to_owned(), chunk)).await.is_err() {
-                        break;
+                // One forwarder across every upstream edge this node is given
+                // (§15.35): park on the inbox, drain the edge until `disconnect`
+                // closes it, park again.
+                while let Some(mut rx) = inbox.recv().await {
+                    while let Some(chunk) = rx.recv().await {
+                        if src_tx.send((MUX_CHANNEL.to_owned(), chunk)).await.is_err() {
+                            return;
+                        }
                     }
                 }
             }));
@@ -271,8 +285,7 @@ impl ExecCodecNode {
                 env: self.attrs.env.clone().into_iter().collect(),
                 backoff_ms: self.attrs.restart_backoff_ms,
                 src_rx,
-                mux_targetward_tx,
-                serial_lock,
+                mux_edge,
                 channel_sinks,
                 channel_feeds,
                 stats: self.stats.clone(),
@@ -281,6 +294,23 @@ impl ExecCodecNode {
                 unframable_discarded: self.unframable_discarded.clone(),
                 status: self.status.clone(),
             })));
+    }
+
+    /// Re-report status after edge surgery on `endpoint` (§15.35). Only the
+    /// multiplexed side decides `active`/`waiting`; a channel endpoint faces host.
+    pub fn set_upstream_attached(&mut self, endpoint: &EndpointAddr, attached: bool) {
+        if !endpoint.is_default() || endpoint.node != self.name {
+            return;
+        }
+        self.status.with_mut(|s| {
+            s.set(if attached {
+                NodeStatus::Active
+            } else {
+                NodeStatus::Waiting {
+                    reason: "multiplexed side has no attached upstream".to_owned(),
+                }
+            })
+        });
     }
 
     pub fn status(&self) -> NodeState {
@@ -344,9 +374,8 @@ struct SuperviseArgs {
     env: Vec<(String, String)>,
     backoff_ms: u64,
     src_rx: mpsc::Receiver<(String, Chunk)>,
-    mux_targetward_tx: Option<mpsc::Sender<Chunk>>,
-    serial_lock: Option<(SharedLock, OriginId)>,
-    channel_sinks: HashMap<String, Vec<HostwardSink>>,
+    mux_edge: SharedTargetEdge,
+    channel_sinks: HashMap<String, SharedFanOut>,
     channel_feeds: HashMap<String, TapFeed>,
     stats: Rc<HashMap<String, Rc<ChannelStat>>>,
     restart_count: Rc<Cell<u64>>,
@@ -388,7 +417,19 @@ async fn supervise(mut a: SuperviseArgs) {
                 continue;
             }
         };
-        a.status.with_mut(|s| s.set(NodeStatus::Active));
+        // The child is up, but a node with no upstream has nothing to carry: report
+        // `waiting` until an edge attaches (§7.5/§15.8, §15.35). Consulting the live
+        // slot here rather than latching a status at start keeps the supervisor and
+        // `connect` from racing to describe the same node.
+        a.status.with_mut(|s| {
+            s.set(if a.mux_edge.with(|e| e.attached) {
+                NodeStatus::Active
+            } else {
+                NodeStatus::Waiting {
+                    reason: "multiplexed side has no attached upstream".to_owned(),
+                }
+            })
+        });
 
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -397,8 +438,7 @@ async fn supervise(mut a: SuperviseArgs) {
         // Pump both directions concurrently until the child dies or the source
         // closes. The outcome distinguishes the two so teardown does not respawn.
         let routing = Routing {
-            mux_targetward_tx: &a.mux_targetward_tx,
-            serial_lock: &a.serial_lock,
+            mux_edge: &a.mux_edge,
             channel_sinks: &a.channel_sinks,
             channel_feeds: &a.channel_feeds,
             stats: &a.stats,
@@ -439,9 +479,8 @@ enum PumpEnd {
 /// targetward path to the device and its lock, and each channel's hostward
 /// fan-out. Borrowed for a child's lifetime.
 struct Routing<'a> {
-    mux_targetward_tx: &'a Option<mpsc::Sender<Chunk>>,
-    serial_lock: &'a Option<(SharedLock, OriginId)>,
-    channel_sinks: &'a HashMap<String, Vec<HostwardSink>>,
+    mux_edge: &'a SharedTargetEdge,
+    channel_sinks: &'a HashMap<String, SharedFanOut>,
     channel_feeds: &'a HashMap<String, TapFeed>,
     stats: &'a Rc<HashMap<String, Rc<ChannelStat>>>,
     mux_discarded_targetward: &'a Rc<Cell<u64>>,
@@ -550,8 +589,7 @@ async fn pump_child(
 /// a real channel is fanned out hostward to that channel's consumers.
 async fn route_event(ev: Event, routing: &Routing<'_>) {
     let Routing {
-        mux_targetward_tx,
-        serial_lock,
+        mux_edge,
         channel_sinks,
         channel_feeds,
         stats,
@@ -568,11 +606,18 @@ async fn route_event(ev: Event, routing: &Routing<'_>) {
                 let n = bytes.len() as u64;
                 // Targetward remux output → the device, backpressured (§5). Gated on
                 // the exec codec holding the serial lock (§6).
-                if let (Some(tx), Some((lock, id))) = (mux_targetward_tx, serial_lock) {
+                // Re-read the live edge per event (§15.35), and — unlike the codec
+                // and the map — **never park** on an unattached one. This route runs
+                // inside the child's single stdout decode loop, so a parked mux event
+                // stalls every *hostward* channel event queued behind it: one
+                // detached device edge would stop delivery to local consumers that
+                // have nothing to do with it. A shared pump counts; only a
+                // per-endpoint pump can afford to backpressure.
+                if let Some((tx, lock, id)) = mux_edge.origin() {
                     // The serial endpoint went away under us (its node was removed at
                     // runtime, or the graph was replaced): these device-bound bytes
                     // have nowhere left to go, exactly like the no-path case below.
-                    if !reacquire_held(lock, *id).await {
+                    if !reacquire_held(&lock, id).await {
                         mux_discarded_targetward.set(mux_discarded_targetward.get() + n);
                         return;
                     }
@@ -610,7 +655,7 @@ async fn route_event(ev: Event, routing: &Routing<'_>) {
                     // are still delivered.
                     let scratch = Cell::new(0u64);
                     let unattached = stat.map_or(&scratch, |s| &s.discarded_unattached);
-                    if fan_out(&bytes, sinks, unattached).live
+                    if sinks.broadcast(&bytes, unattached).live
                         && let Some(s) = stat
                     {
                         s.delivered_hostward.set(s.delivered_hostward.get() + n);
@@ -643,9 +688,8 @@ mod tests {
     /// The routing fixture the tests below share, plus the two counters they assert
     /// on. Held together so a new `Routing` field breaks one place, not five.
     struct Fixture {
-        mux_tx: Option<mpsc::Sender<Chunk>>,
-        lock: Option<(SharedLock, OriginId)>,
-        sinks: HashMap<String, Vec<HostwardSink>>,
+        mux_edge: SharedTargetEdge,
+        sinks: HashMap<String, SharedFanOut>,
         feeds: HashMap<String, TapFeed>,
         stats: Rc<HashMap<String, Rc<ChannelStat>>>,
         mux_discarded: Rc<Cell<u64>>,
@@ -655,8 +699,9 @@ mod tests {
     impl Fixture {
         fn new() -> Fixture {
             Fixture {
-                mux_tx: None,
-                lock: None,
+                // Attached, read-only: the mux side exists but cannot write, which
+                // is the case these tests are about (an unattached one parks).
+                mux_edge: crate::runtime::TargetEdge::read_only(),
                 sinks: HashMap::new(),
                 feeds: HashMap::new(),
                 stats: Rc::new(HashMap::new()),
@@ -667,8 +712,7 @@ mod tests {
 
         fn routing(&self) -> Routing<'_> {
             Routing {
-                mux_targetward_tx: &self.mux_tx,
-                serial_lock: &self.lock,
+                mux_edge: &self.mux_edge,
                 channel_sinks: &self.sinks,
                 channel_feeds: &self.feeds,
                 stats: &self.stats,
@@ -697,10 +741,10 @@ mod tests {
         // serial node removed at runtime), `reacquire_held` fails and the
         // device-bound bytes are lost — the branch that used to return early without
         // touching the counter its sibling maintained (§5 all-loss-counted).
-        use nexus_core::lock::{Arbitration, EndpointLock, WriteMode};
+        use nexus_core::lock::{Arbitration, EndpointLock, OriginId, WriteMode};
         use tokio::sync::broadcast;
 
-        let mut f = Fixture::new();
+        let f = Fixture::new();
         let (tx, _rx) = mpsc::channel::<Chunk>(4);
         let id = OriginId(1);
         let mut lock = EndpointLock::new(Arbitration::Exclusive);
@@ -708,10 +752,13 @@ mod tests {
         // then the endpoint is closed, which is what makes the reclaim give up.
         lock.register(id, "mux", WriteMode::OnDemand);
         let (notifier, _nrx) = broadcast::channel(16);
-        let cell: SharedLock = Rc::new(crate::runtime::LockCell::new("serial", lock, notifier));
+        let cell: crate::runtime::SharedLock =
+            Rc::new(crate::runtime::LockCell::new("serial", lock, notifier));
         cell.close();
-        f.mux_tx = Some(tx);
-        f.lock = Some((cell, id));
+        f.mux_edge.with_mut(|e| {
+            e.registered = Some((cell, id));
+            e.writer = Some(tx);
+        });
 
         let payload = Chunk::from_static(b"device-bound bytes");
         let n = payload.len() as u64;
@@ -734,8 +781,15 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Chunk>(4);
         drop(rx); // consumer gone: the sink is permanently Closed
         let counters = Arc::new(DropCounters::default());
-        f.sinks
-            .insert("console".to_owned(), vec![(tx, counters.clone())]);
+        {
+            let fanout = crate::runtime::FanOutList::new();
+            fanout.attach(crate::runtime::AttachedSink {
+                target: "consumer".parse().expect("address parses"),
+                tx,
+                counters: counters.clone(),
+            });
+            f.sinks.insert("console".to_owned(), fanout);
+        }
 
         let payload = Chunk::from_static(b"hostward bytes");
         let n = payload.len() as u64;
@@ -751,10 +805,13 @@ mod tests {
         let stat = Rc::new(ChannelStat::default());
         f.stats = Rc::new(HashMap::from([("console".to_owned(), stat.clone())]));
         let (tx, mut rx) = mpsc::channel::<Chunk>(4);
-        f.sinks.insert(
-            "console".to_owned(),
-            vec![(tx, Arc::new(DropCounters::default()))],
-        );
+        let fanout = crate::runtime::FanOutList::new();
+        fanout.attach(crate::runtime::AttachedSink {
+            target: "consumer".parse().expect("address parses"),
+            tx,
+            counters: Arc::new(DropCounters::default()),
+        });
+        f.sinks.insert("console".to_owned(), fanout);
 
         let payload = Chunk::from_static(b"hostward bytes");
         let n = payload.len() as u64;

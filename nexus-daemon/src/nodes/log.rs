@@ -39,10 +39,9 @@ use nexus_core::Chunk;
 use nexus_core::config::{NodeConfig, OverflowPolicy};
 use nexus_core::{NodeState, NodeStatus};
 use serde_json::json;
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::runtime::DropCounters;
+use crate::runtime::{DropCounters, EdgeInbox};
 
 /// Upper bound on in-memory queued log bytes before the overflow policy fires
 /// (§5 bounded interior). Generous enough that a briefly slow disk buffers
@@ -220,19 +219,21 @@ impl LogNode {
         node
     }
 
-    /// Start the ingest pump: drain the hostward channel into the shared queue,
-    /// applying the overflow policy (§7.3). The counters ride from the wiring so
-    /// full-channel ingest drops are folded into reported loss.
-    pub fn start(
-        &mut self,
-        hostward: Option<mpsc::Receiver<Chunk>>,
-        counters: Option<Arc<DropCounters>>,
-    ) {
+    /// Start the ingest pump: drain each attached edge's hostward channel into the
+    /// shared queue, applying the overflow policy (§7.3). The counters ride from
+    /// the wiring so full-channel ingest drops are folded into reported loss.
+    ///
+    /// The pump outlives every individual edge (§15.35): it parks on the endpoint's
+    /// [`EdgeInbox`](crate::runtime::EdgeInbox) when nothing is connected, drains
+    /// the edge it is given until `disconnect` closes that channel, and parks
+    /// again. So a log connected mid-stream starts capturing at the join point,
+    /// and one disconnected keeps every byte already queued.
+    pub fn start(&mut self, inbox: Option<EdgeInbox>, counters: Option<Arc<DropCounters>>) {
         if let Some(counters) = counters {
             self.ingest_counters = counters;
         }
-        if let Some(rx) = hostward {
-            self.pump = Some(tokio::task::spawn_local(pump(self.shared.clone(), rx)));
+        if let Some(inbox) = inbox {
+            self.pump = Some(tokio::task::spawn_local(pump(self.shared.clone(), inbox)));
         }
     }
 
@@ -349,12 +350,17 @@ impl Drop for LogNode {
 
 /// The ingest pump (async, LocalSet): move hostward bytes into the bounded queue,
 /// applying the overflow policy on a full queue (§7.3).
-async fn pump(shared: Arc<Shared>, mut rx: mpsc::Receiver<Chunk>) {
-    while let Some(chunk) = rx.recv().await {
-        let mut q = shared.q.lock().unwrap();
-        if enqueue(&mut q, chunk) {
-            shared.cv.notify_all();
+async fn pump(shared: Arc<Shared>, mut inbox: EdgeInbox) {
+    while let Some(mut rx) = inbox.recv().await {
+        while let Some(chunk) = rx.recv().await {
+            let mut q = shared.q.lock().unwrap();
+            if enqueue(&mut q, chunk) {
+                shared.cv.notify_all();
+            }
         }
+        // The edge went away (`disconnect`, or the producing node's teardown).
+        // Everything it had already buffered was drained above, so nothing is lost;
+        // park until the endpoint is connected again.
     }
 }
 

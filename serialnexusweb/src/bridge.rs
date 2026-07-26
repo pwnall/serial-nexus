@@ -1,9 +1,25 @@
 //! The WebSocket ↔ daemon bridge (design §17). Each browser WebSocket gets one
 //! daemon control-socket connection; the server relays JSON-RPC both ways — a
-//! filtering proxy, not an interpreter. Filtering enforces §17's hard non-goal: the
-//! web client never mutates the graph, so graph and lifecycle verbs are refused at
-//! the server (defence in depth — even a compromised page cannot `load` or
-//! `teardown`). Everything else — `state`/`subscribe`/`info`/`dump`, `tap.open`/
+//! *screening* proxy, not an interpreter.
+//!
+//! What the screen draws a line around changed with §15.35, and the reasoning is
+//! worth keeping rather than just the outcome. The original non-goal was "the web
+//! client never mutates the graph", enforced here so that even a compromised page
+//! could not reconfigure the daemon. That was the right default until the operator
+//! decided otherwise, and the argument that retired it is a fair one: a token holder
+//! already commands every configured console on the machine — every device, every
+//! `send` — so withholding graph edits protected little while costing real workflow.
+//! So the allowlist now includes the **graph-editing** verbs (`add-node`,
+//! `remove-node`, `connect`, `disconnect`, and the passive `ports`), and graph
+//! editing is stated plainly in `docs/security.md` as daemon-user capability: a log
+//! node writes files and an exec codec runs commands as the daemon's user, and
+//! whoever holds the token is trusted with exactly that.
+//!
+//! **Lifecycle verbs stay off the browser wire.** `load` (which replaces the whole
+//! graph), `teardown` and `shutdown` are refused here, because the ask was graph
+//! editing and a browser page turning the daemon off serves no one.
+//!
+//! Everything else — `state`/`subscribe`/`info`/`dump`/`ports`, `tap.open`/
 //! `tap.close`, `send`, `lock`/`unlock`, `rotate`, the serial signals — passes
 //! through, and the daemon's notifications (`state`, `lock`, `tap.data`) stream
 //! back. Taps and `subscribe` are connection-scoped, so one daemon connection per
@@ -19,8 +35,10 @@
 //!    screened. Re-serialising one parsed object emits exactly one line (JSON escapes
 //!    every interior newline), so what was screened is exactly what is sent.
 //! 2. **The verb set is an allowlist**, so a verb added to §10 tomorrow is refused
-//!    here until someone deliberately admits it. A denylist made the §17 non-goal
-//!    depend on remembering to extend it.
+//!    here until someone deliberately admits it. A denylist made the boundary depend
+//!    on remembering to extend it. Widening the list (as §15.35 did) is a deliberate
+//!    act with a line of evidence behind it; that is exactly the property an
+//!    allowlist buys and an inverted list would give away.
 
 use std::path::PathBuf;
 
@@ -32,23 +50,31 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
-/// The complete set of verbs the browser may invoke: §10's observation, tap,
-/// arbitration, rotation and serial-signal surface — everything that is *not* graph
-/// mutation (`load`, `add-node`, `remove-node`, and the §14-deferred `connect` /
-/// `disconnect` / `set-attribute`) or daemon lifecycle (`teardown`, `shutdown`).
-/// That boundary is §17's; the allowlist shape is what makes it fail safe, since an
-/// unrecognized verb — a future one, or a smuggled one — is refused by default.
-/// (`dump` is here because it is read-only: it reports configuration, never writes
-/// it. The serial signals are here because §17 draws its line at graph and lifecycle,
-/// and a page that may `send` arbitrary bytes to a device is not meaningfully
-/// restrained by withholding `send-break`; the UI does not drive them today.)
+/// The complete set of verbs the browser may invoke (§17, §15.35): §10's
+/// observation, tap, arbitration, rotation, serial-signal **and graph-editing**
+/// surface. Everything not named here is refused, which is what makes the boundary
+/// fail safe — an unrecognized verb, a future one or a smuggled one, is refused by
+/// default rather than admitted by oversight.
+///
+/// What is deliberately absent, and why:
+///
+/// * `load` — it replaces the entire graph in one call, which is a different act
+///   from editing it. The editor page composes the incremental verbs instead.
+/// * `teardown`, `shutdown` — daemon lifecycle. The ask was graph editing.
+///
+/// `set-attribute` is absent because it does not exist (§14). If it lands, admitting
+/// it here is a deliberate act, exactly as admitting these was.
 const ALLOWED: &[&str] = &[
+    // Observation.
     "state",
     "subscribe",
     "info",
+    "ports",
     "dump",
     "tap.open",
     "tap.close",
+    // Arbitration, logging, serial signals. (A page that may `send` arbitrary bytes
+    // to a device is not meaningfully restrained by withholding `send-break`.)
     "send",
     "lock",
     "unlock",
@@ -56,6 +82,11 @@ const ALLOWED: &[&str] = &[
     "send-break",
     "set-modem",
     "pulse-dtr",
+    // Graph editing (§15.35). Daemon-user capability, stated in docs/security.md.
+    "add-node",
+    "remove-node",
+    "connect",
+    "disconnect",
 ];
 
 pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
@@ -180,12 +211,13 @@ fn screen(text: &str) -> Result<Value, String> {
     match v.get("method").and_then(Value::as_str) {
         None => Err(rpc_error(id, -32600, "invalid request: no method")),
         // Fail safe: anything not named in ALLOWED is refused, including verbs §10
-        // grows later (§17: the web client never mutates the graph).
+        // grows later (§17/§15.35: the console edits the graph, but daemon lifecycle
+        // stays off the browser wire).
         Some(m) if !ALLOWED.contains(&m) => Err(rpc_error(
             id,
             -32601,
             &format!(
-                "method {m:?} is not available from the web console (§17: it never mutates the graph)"
+                "method {m:?} is not available from the web console (§17: lifecycle verbs stay off the browser wire)"
             ),
         )),
         Some(_) => Ok(v),
@@ -226,19 +258,13 @@ mod tests {
     }
 
     #[test]
-    fn graph_mutating_verbs_are_refused_others_pass() {
-        // Graph and lifecycle verbs are rejected locally (§17 non-goal), including the
-        // §14-deferred surgery verbs the daemon does not implement yet.
-        for m in [
-            "load",
-            "add-node",
-            "remove-node",
-            "teardown",
-            "shutdown",
-            "connect",
-            "disconnect",
-            "set-attribute",
-        ] {
+    fn lifecycle_verbs_are_refused_others_pass() {
+        // §15.35 settled the posture: the console *edits* the graph, so the
+        // graph-editing verbs are forwarded (asserted below, via ALLOWED). What stays
+        // refused is daemon lifecycle plus whole-graph replacement — and
+        // `set-attribute`, which does not exist and must not be admitted by
+        // anticipation (§14). These are the ones a compromised page must not reach.
+        for m in ["load", "teardown", "shutdown", "set-attribute"] {
             let req = format!("{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"{m}\"}}");
             let v = rejection(&req);
             assert_eq!(v["id"], 3, "the rejection keeps the id for correlation");
@@ -277,6 +303,33 @@ mod tests {
             "send",
         ] {
             assert!(ALLOWED.contains(&m), "app.js needs {m}");
+        }
+        // The graph and editor pages (§15.35) drive these; the same fail-safe
+        // direction, pinned so a future tightening of the list breaks a test rather
+        // than the page.
+        for m in [
+            "dump",
+            "ports",
+            "add-node",
+            "remove-node",
+            "connect",
+            "disconnect",
+        ] {
+            assert!(ALLOWED.contains(&m), "the editor page needs {m}");
+        }
+    }
+
+    /// The posture change is bounded: widening the allowlist to graph editing must
+    /// not have admitted lifecycle by accident. Stated as its own test because
+    /// "these four are absent" is the property, and a list that grows silently is
+    /// exactly what §17's allowlist shape exists to prevent.
+    #[test]
+    fn the_allowlist_admits_graph_editing_and_no_lifecycle_verb() {
+        for m in ["load", "teardown", "shutdown", "set-attribute"] {
+            assert!(
+                !ALLOWED.contains(&m),
+                "{m} must stay off the browser wire (§17/§15.35)"
+            );
         }
     }
 

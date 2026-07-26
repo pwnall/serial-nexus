@@ -55,6 +55,23 @@ enum Cmd {
         #[arg(long)]
         cascade: bool,
     },
+    /// Attach one edge to a running graph (§15.35): `connect <a> <b>`, where the
+    /// endpoints are display addresses (`usb0`, `mux/console`, `cons/raw`). The
+    /// same structural rules as `load` apply — an illegal edge is refused naming
+    /// the rule, with nothing changed.
+    Connect {
+        /// One endpoint (order does not matter; orientation comes from facings).
+        a: String,
+        /// The other endpoint.
+        b: String,
+        /// Write mode for this edge: `never`, `on-demand` (default) or `held` (§6).
+        #[arg(long)]
+        write_mode: Option<String>,
+    },
+    /// Remove one edge from a running graph (§15.35). A lock-holding origin
+    /// releases the lock and its un-flushed backlog is purged, so the endpoint is
+    /// left writable rather than wedged on a writer that is gone (§6).
+    Disconnect { a: String, b: String },
     /// Dump the current configuration (TOML by default).
     Dump,
     /// Report observed node state.
@@ -63,6 +80,11 @@ enum Cmd {
     /// and envelope protocol versions, and the registered codec names — so you can
     /// discover what a possibly-custom daemon supports rather than assume it.
     Info,
+    /// List the serial devices this machine has, the identity that would bind each
+    /// one, and which graph node already holds it (§12/§15.35). Strictly passive:
+    /// nothing is opened, so listing a port never toggles DTR on the board behind
+    /// it.
+    Ports,
     /// Stream node status and counter snapshots as they change. Prints one JSON
     /// notification per line; exits after `--count` of them (default: run until
     /// the connection closes).
@@ -263,9 +285,10 @@ fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
         Cmd::AddNode { file } => {
             // A single-node TOML configuration; take its one node — and refuse
             // anything larger rather than adding the first node and dropping the
-            // rest (review 26, CLI-2). Silently discarding a `[[node]]` is bad; a
-            // discarded `[[edge]]` is unrecoverable, because `connect` is deferred
-            // (§14) — there is no verb that could add it afterwards.
+            // rest (review 26, CLI-2). Silently discarding configuration the
+            // operator wrote is the defect, whether it is a `[[node]]` or an
+            // `[[edge]]`; `connect` can add the edge back (§15.35), but only if the
+            // operator is told it went missing.
             let config = read_config(file)?;
             let node = single_node(&config, file)?;
             (
@@ -277,9 +300,15 @@ fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
             "remove-node",
             Some(json!({ "node": node, "cascade": cascade })),
         ),
+        Cmd::Connect { a, b, write_mode } => (
+            "connect",
+            Some(json!({ "a": a, "b": b, "write_mode": write_mode })),
+        ),
+        Cmd::Disconnect { a, b } => ("disconnect", Some(json!({ "a": a, "b": b }))),
         Cmd::Dump => ("dump", None),
         Cmd::State => ("state", None),
         Cmd::Info => ("info", None),
+        Cmd::Ports => ("ports", None),
         Cmd::Subscribe { .. } => unreachable!("subscribe is handled before dispatch"),
         Cmd::Tap { .. } => unreachable!("tap is handled before dispatch"),
         Cmd::Rotate { node } => ("rotate", Some(json!({ "node": node }))),
@@ -356,9 +385,9 @@ fn read_config(file: &Path) -> anyhow::Result<GraphConfig> {
 ///
 /// `add-node` adds exactly one node and no edges (§11), so a file carrying more
 /// than that is an operator mistake, not an instruction to take the first node:
-/// the surplus nodes would be dropped, and a dropped `[[edge]]` cannot be added
-/// afterwards at all (`connect` is deferred, §14). `load` / `load --replace` is
-/// the multi-node verb, so the message points there.
+/// the surplus would be dropped silently. `load` / `load --replace` is the
+/// multi-node verb, so the message points there — and, since §15.35, at
+/// `connect` for wiring nodes added one at a time.
 fn single_node<'c>(
     config: &'c GraphConfig,
     file: &Path,
@@ -372,8 +401,8 @@ fn single_node<'c>(
             "{}: add-node takes a single [[node]] and no [[edge]], but this file has \
              {nodes} node(s) and {edges} edge(s) — nothing was added. Use \
              `serialnexusctl load` (or `load --replace` over a running graph) for a \
-             multi-node configuration: edges cannot be added afterwards, because \
-             `connect` is deferred (§14).",
+             multi-node configuration, or add the nodes one at a time and wire them \
+             with `connect`.",
             file.display(),
         );
     }
@@ -427,6 +456,77 @@ fn render(cmd: &Cmd, result: &Value) -> anyhow::Result<()> {
                 println!("wire v{w}, envelope v{e}");
             }
             println!("codecs: {}", codecs.join(", "));
+        }
+        Cmd::Connect { .. } => {
+            let mode = result
+                .get("write_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let pair = result.get("connected");
+            let a = pair
+                .and_then(|p| p.get("a"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let b = pair
+                .and_then(|p| p.get("b"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            // Host first, then target: the rendering states the orientation the
+            // daemon resolved, so an operator sees which end produces (§15.3).
+            println!("connected {a} -> {b} ({mode})");
+        }
+        Cmd::Disconnect { .. } => {
+            let pair = result.get("disconnected");
+            let a = pair
+                .and_then(|p| p.get("a"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let b = pair
+                .and_then(|p| p.get("b"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            println!("disconnected {a} -> {b}");
+            if result.get("released_lock").and_then(Value::as_bool) == Some(true) {
+                println!("  the removed origin held the write lock; it is released");
+            }
+            let purged = result
+                .get("purged_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if purged > 0 {
+                println!("  purged {purged} un-flushed byte(s) from the removed origin");
+            }
+        }
+        Cmd::Ports => {
+            let empty = vec![];
+            let ports = result
+                .get("ports")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty);
+            if ports.is_empty() {
+                println!("(no serial devices found)");
+            }
+            for p in ports {
+                let path = p.get("path").and_then(Value::as_str).unwrap_or("?");
+                let identity = p.get("identity").and_then(Value::as_str).unwrap_or("?");
+                let desc = p.get("description").and_then(Value::as_str).unwrap_or("");
+                // The bound flag comes first on the line: the operator's question is
+                // "what can I take", and a free port should be scannable at a glance.
+                let bound = match p.get("bound_to").and_then(Value::as_str) {
+                    Some(node) => format!("bound {node}"),
+                    None => "free".to_owned(),
+                };
+                println!("{path:<24} {bound:<16} {identity}");
+                if !desc.is_empty() {
+                    println!("{:<24} {desc}", "");
+                }
+                // The degraded identity forms carry a documented instability
+                // warning (§12); an operator about to bind one should see it here
+                // rather than discover it after a replug.
+                if let Some(w) = p.get("warning").and_then(Value::as_str) {
+                    println!("{:<24} ⚠ {w}", "");
+                }
+            }
         }
         Cmd::Load { .. } => {
             let n = result.get("loaded").and_then(Value::as_u64).unwrap_or(0);
@@ -693,7 +793,7 @@ mod tests {
 
     /// `add-node` adds one node and no edges (§11). A file with more must be
     /// refused, naming the counts — never "add the first node and drop the rest",
-    /// because a dropped edge is unrecoverable with `connect` deferred (§14).
+    /// because silently dropping configuration the operator wrote is the defect (§15.35 makes a dropped edge recoverable via `connect`, but only if you are told).
     /// Review 26, CLI-2.
     #[test]
     fn add_node_refuses_files_carrying_more_than_one_node_or_any_edge() {
@@ -713,7 +813,7 @@ mod tests {
         assert!(err.contains("nothing was added"), "no reassurance: {err}");
         assert!(err.contains("load"), "does not point at load: {err}");
 
-        // One node plus an edge: the edge is the unrecoverable part.
+        // One node plus an edge: the edge is the part that would vanish unannounced.
         let edged = cfg(
             "[[node]]\ntype = \"log\"\nname = \"a\"\ndirectory = \"/tmp\"\nfilename = \"a.log\"\n\
              [[edge]]\na = \"usb0\"\nb = \"a\"\n",

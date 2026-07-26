@@ -1,5 +1,5 @@
 //! Phase 9 — the **filesystem half of the §10 authorization model**, from review 26
-//! (`docs/26-claude-opus-code-review.md` findings CP-3, SEC-4/RV-6, SEC-2, SEC-8).
+//! (`docs/historical/26-claude-opus-code-review.md` findings CP-3, SEC-4/RV-6, SEC-2, SEC-8).
 //!
 //! `docs/security.md` calls socket permissions "the whole authorization model": there
 //! is no per-verb authentication, so whoever can `connect(2)` owns every console the

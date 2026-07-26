@@ -15,8 +15,8 @@ directory documents that surface method by method.
 
 | Page | Methods |
 | --- | --- |
-| [configuration.md](configuration.md) | `load`, `add-node`, `remove-node`, `dump` |
-| [observation.md](observation.md) | `state`, `subscribe`, `info`, `tap.open`, `tap.close` (+ the `state` / `lock` / `tap.data` / `tap.closed` notifications and `LockSnapshot`) |
+| [configuration.md](configuration.md) | `load`, `add-node`, `remove-node`, `connect`, `disconnect`, `dump` |
+| [observation.md](observation.md) | `state`, `subscribe`, `info`, `ports`, `tap.open`, `tap.close` (+ the `state` / `lock` / `tap.data` / `tap.closed` notifications and `LockSnapshot`) |
 | [arbitration.md](arbitration.md) | `lock`, `unlock`, `send` |
 | [logging.md](logging.md) | `rotate` |
 | [serial-signals.md](serial-signals.md) | `send-break`, `set-modem`, `pulse-dtr` |
@@ -167,10 +167,10 @@ flags and precede the subcommand.
 Version skew between a client and the daemon degrades gracefully by
 construction: a method this daemon does not implement returns the standard
 `-32601` (method not found), telling a mismatched CLI exactly which operations
-are missing (§15.16). The design's §10 verb list additionally names `connect`,
-`disconnect`, and `set-attribute` (edge and attribute surgery); those are **not
-implemented in this daemon build** and currently return `-32601`. Only the
-methods documented on the pages above are live.
+are missing (§15.16). The design's §10 verb list additionally names
+`set-attribute` (attribute surgery on a live node); it is **not implemented in
+this daemon build** and returns `-32601` — remove-and-re-add covers it (§14).
+Only the methods documented on the pages above are live.
 
 ## Error codes
 

@@ -3,7 +3,7 @@
 //! config never destroys a good running graph").
 //!
 //! Every case here is a **regression guard for a defect the Opus review reproduced
-//! on a live daemon** (`docs/26-claude-opus-code-review.md` §1/§7); the fixes moved
+//! on a live daemon** (`docs/historical/26-claude-opus-code-review.md` §1/§7); the fixes moved
 //! each one into `GraphConfig::validate` (or into serde's `deny_unknown_fields`),
 //! so the guard's shape is always the same: hand the daemon the offending config,
 //! assert the *structural* refusal names the offender, and assert the daemon and its

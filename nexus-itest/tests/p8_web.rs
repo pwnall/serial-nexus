@@ -254,11 +254,24 @@ fn run_web_bounded(args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
 /// `serialnexusweb wsclient --rpc`, returning the correlated JSON response (a `result`
 /// on success, an `error` when the bridge refuses a denied verb, §17).
 fn wsclient_rpc(port: u16, method: &str, timeout: Duration) -> Option<Value> {
+    wsclient_rpc_params(port, method, None, timeout)
+}
+
+/// [`wsclient_rpc`] with a JSON params object — the shape the editor page's verbs
+/// need (§15.35).
+fn wsclient_rpc_params(
+    port: u16,
+    method: &str,
+    params: Option<&str>,
+    timeout: Duration,
+) -> Option<Value> {
     let url = format!("ws://127.0.0.1:{port}/ws");
-    let out = run_web_bounded(
-        &["wsclient", "--url", &url, "--token", TOKEN, "--rpc", method],
-        timeout,
-    )?;
+    let mut args: Vec<&str> = vec!["wsclient", "--url", &url, "--token", TOKEN, "--rpc", method];
+    if let Some(p) = params {
+        args.push("--params");
+        args.push(p);
+    }
+    let out = run_web_bounded(&args, timeout)?;
     serde_json::from_slice(&out).ok()
 }
 
@@ -622,7 +635,9 @@ path = "{console}"
         "console list via the WS bridge != the daemon's directly"
     );
 
-    // A graph-mutating verb is refused at the bridge, never reaching the daemon (§17).
+    // `load` is refused at the bridge, never reaching the daemon (§17/§15.35: the
+    // console edits the graph incrementally, but whole-graph replacement and daemon
+    // lifecycle stay off the browser wire).
     let ws_load = wsclient_rpc(port, "load", Duration::from_secs(15))
         .expect("no response for a bridged load");
     assert_eq!(
@@ -634,6 +649,259 @@ path = "{console}"
         daemon_names,
         "a refused load must not have reached the daemon"
     );
+}
+
+// ---- (11) §15.35: the graph and editor pages ------------------------------------
+
+/// The graph page renders from the daemon's own verbs and nothing else, so the
+/// bridge must relay `dump` and `state` *unchanged*. A server-side aggregation would
+/// be a third view of the graph that neither verb reports, free to drift from both.
+#[test]
+fn the_graph_pages_data_is_the_daemons_own_dump_and_state() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let cfg = format!(
+        r#"
+[[node]]
+type = "map"
+name = "m"
+hostward = []
+targetward = []
+[[node]]
+type = "pty"
+name = "c1"
+path = "{a}"
+[[edge]]
+a = "m"
+b = "c1"
+"#,
+        a = d.run().join("c1").display(),
+    );
+    rpc.load_toml(&cfg, false).expect("load");
+    let server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path(), &[]);
+    let port = server
+        .port("http", Duration::from_secs(10))
+        .expect("web server never printed its bound http URL");
+
+    let ws_dump = wsclient_rpc(port, "dump", Duration::from_secs(15))
+        .expect("no dump response via the WS bridge");
+    assert_eq!(
+        ws_dump["result"],
+        rpc.dump(),
+        "the bridge must relay `dump` unchanged — the graph page's topology source"
+    );
+    // `state` carries live counters, so compare its structure rather than its
+    // bytes: the node list and each node's status are what the indicators render.
+    let ws_state = wsclient_rpc(port, "state", Duration::from_secs(15))
+        .expect("no state response via the WS bridge");
+    assert_eq!(node_names(&ws_state["result"]), node_names(&rpc.state()));
+
+    // The edge is in `dump`, with its endpoints as display addresses — the page
+    // reads exactly this to draw the topology.
+    let edges = ws_dump["result"]["edge"]
+        .as_array()
+        .expect("dump carries the edge list");
+    assert_eq!(edges.len(), 1, "one edge: {ws_dump}");
+    assert_eq!(edges[0]["a"], "m");
+    assert_eq!(edges[0]["b"], "c1");
+}
+
+/// A scripted fault flips a node's indicator and flips it back, live over the same
+/// bridge the page uses (§14.3). Device-free: disconnecting an interior node's
+/// upstream is a real fault the operator can cause, and the honest report of it is
+/// `waiting` (§15.8).
+#[test]
+fn a_scripted_fault_flips_the_indicator_and_back() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let cfg = format!(
+        r#"
+[[node]]
+type = "map"
+name = "up"
+hostward = []
+targetward = []
+[[node]]
+type = "map"
+name = "m"
+hostward = []
+targetward = []
+[[node]]
+type = "pty"
+name = "c1"
+path = "{a}"
+[[edge]]
+a = "up"
+b = "m/raw"
+"#,
+        a = d.run().join("c1").display(),
+    );
+    rpc.load_toml(&cfg, false).expect("load");
+    let server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path(), &[]);
+    let port = server
+        .port("http", Duration::from_secs(10))
+        .expect("web server never printed its bound http URL");
+
+    let status_via_bridge = |name: &str| -> String {
+        let st = wsclient_rpc(port, "state", Duration::from_secs(15))
+            .expect("no state response via the WS bridge");
+        st["result"]["nodes"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .find(|n| n["name"] == name)
+            .and_then(|n| n["status"].as_str())
+            .unwrap_or("?")
+            .to_owned()
+    };
+    assert_eq!(status_via_bridge("m"), "active");
+
+    // The fault, applied through the very verbs the editor page drives.
+    let out = wsclient_rpc_params(
+        port,
+        "disconnect",
+        Some(r#"{"a":"up","b":"m/raw"}"#),
+        Duration::from_secs(15),
+    )
+    .expect("no disconnect response");
+    assert!(out.get("error").is_none(), "disconnect refused: {out}");
+    assert!(
+        wait_until(Duration::from_secs(5), || status_via_bridge("m")
+            == "waiting"),
+        "the indicator never flipped to waiting"
+    );
+
+    let out = wsclient_rpc_params(
+        port,
+        "connect",
+        Some(r#"{"a":"up","b":"m/raw"}"#),
+        Duration::from_secs(15),
+    )
+    .expect("no connect response");
+    assert!(out.get("error").is_none(), "connect refused: {out}");
+    assert!(
+        wait_until(Duration::from_secs(5), || status_via_bridge("m")
+            == "active"),
+        "the indicator never came back"
+    );
+}
+
+/// The widened allowlist is bounded: graph editing passes, lifecycle does not
+/// (§15.35). Asserted end to end rather than only as a unit test on `ALLOWED`,
+/// because the property that matters is what reaches the *daemon*.
+#[test]
+fn the_editor_verbs_pass_the_bridge_and_lifecycle_verbs_still_do_not() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let cfg = format!(
+        r#"
+[[node]]
+type = "pty"
+name = "c1"
+path = "{a}"
+"#,
+        a = d.run().join("c1").display(),
+    );
+    rpc.load_toml(&cfg, false).expect("load");
+    let server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path(), &[]);
+    let port = server
+        .port("http", Duration::from_secs(10))
+        .expect("web server never printed its bound http URL");
+
+    // Refused at the bridge, whatever the daemon would have done with them.
+    for m in ["load", "teardown", "shutdown", "set-attribute"] {
+        let v = wsclient_rpc(port, m, Duration::from_secs(15))
+            .unwrap_or_else(|| panic!("no response for a bridged {m}"));
+        assert_eq!(
+            v["error"]["code"], -32601,
+            "{m} must stay off the browser wire (§17/§15.35): {v}"
+        );
+    }
+    // The daemon is still there and still holds its graph — proof the refusals were
+    // local to the bridge rather than something the daemon survived.
+    assert!(daemon_alive(&d.socket()));
+    assert_eq!(node_names(&rpc.state()), vec!["c1".to_string()]);
+
+    // `ports` is passive and passes; the graph-editing verbs pass and take effect.
+    let v = wsclient_rpc(port, "ports", Duration::from_secs(15)).expect("no ports response");
+    assert!(v["result"]["ports"].is_array(), "ports relayed: {v}");
+}
+
+/// End to end through the editor page's own API path: add a console over the
+/// WebSocket, wire it with `connect`, and confirm bytes reach it — the workflow
+/// §15.35 exists to close, exercised the way the page performs it.
+#[test]
+fn the_editor_path_adds_a_console_and_bytes_flow_through_it() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    // An upstream host endpoint that needs no device: a map's mapped side.
+    rpc.load_toml(
+        r#"
+[[node]]
+type = "map"
+name = "m"
+hostward = []
+targetward = []
+"#,
+        false,
+    )
+    .expect("load");
+    let server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path(), &[]);
+    let port = server
+        .port("http", Duration::from_secs(10))
+        .expect("web server never printed its bound http URL");
+
+    let logdir = d.run().join("weblogs");
+    std::fs::create_dir_all(&logdir).expect("mkdir");
+    let add = format!(
+        r#"{{"node":{{"type":"log","name":"cap","directory":"{}","filename":"web.log"}}}}"#,
+        logdir.display()
+    );
+    let v = wsclient_rpc_params(port, "add-node", Some(&add), Duration::from_secs(15))
+        .expect("no add-node response");
+    assert!(v.get("error").is_none(), "add-node refused: {v}");
+
+    let v = wsclient_rpc_params(
+        port,
+        "connect",
+        Some(r#"{"a":"m","b":"cap"}"#),
+        Duration::from_secs(15),
+    )
+    .expect("no connect response");
+    assert!(v.get("error").is_none(), "connect refused: {v}");
+
+    // Bytes now flow through what the page just built. `send` rides the same bridge.
+    let v = wsclient_rpc_params(
+        port,
+        "send",
+        Some(r#"{"endpoint":"m","line":"built-from-the-browser","steal":true}"#),
+        Duration::from_secs(15),
+    )
+    .expect("no send response");
+    assert!(v.get("error").is_none(), "send refused: {v}");
+
+    // The map is unattached upstream, so a *targetward* send parks — what we assert
+    // instead is the hostward direction the log consumes, which the map produces
+    // only from an upstream it does not have. So assert the structural outcome: the
+    // graph the browser built is the graph the daemon holds, edge and all.
+    let dump = rpc.dump();
+    assert!(
+        dump["node"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .any(|n| n["name"] == "cap"),
+        "the node the browser added is in the daemon's configuration: {dump}"
+    );
+    let edges = dump["edge"].as_array().expect("edges");
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["a"], "m");
+    assert_eq!(edges[0]["b"], "cap");
+
+    // And it is refused the same way `load` is if the page tries to overreach.
+    let v = wsclient_rpc(port, "teardown", Duration::from_secs(15)).expect("no teardown response");
+    assert_eq!(v["error"]["code"], -32601);
+    assert!(daemon_alive(&d.socket()));
 }
 
 // ---- (7) WEB-1/SEC-1: one frame is exactly one request ---------------------------

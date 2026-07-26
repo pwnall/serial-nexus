@@ -278,18 +278,52 @@ costs nothing and bounds what one frame can make the server buffer. The hostward
    the token itself, is readable and replayable by anyone on the network path.** Use
    it only on a network you genuinely trust; prefer `--tls` or SSH forwarding.
 
-What the web console **cannot** do is as load-bearing as what it can. It never
-mutates the graph, and the bridge enforces that with an **allowlist**, not a
-denylist: the browser may invoke exactly `state`, `subscribe`, `info`, `dump`,
-`tap.open`, `tap.close`, `send`, `lock`, `unlock`, `rotate`, `send-break`,
-`set-modem`, `pulse-dtr` — and **everything else is refused with `-32601`**,
-including a verb §10 grows tomorrow. That direction is the load-bearing half: a
-denylist admits every future verb and keeps the non-goal true only for as long as
-someone remembers to extend it, which is exactly how a stated boundary erodes. So
-`load`, `add-node`, `remove-node`, `teardown`, `shutdown` and the §14-deferred
-live-surgery verbs never reach the daemon, and a compromised page cannot
-reconfigure it — it can only watch consoles, send lines, and arbitrate the write
-lock (explicit steal only, never automatic).
+### What the token holder can do, stated plainly
+
+**Graph editing from the browser is daemon-user capability, and the token is
+operator trust.** Since §15.35 the web console edits the graph: the bridge's
+allowlist admits `add-node`, `remove-node`, `connect`, `disconnect` and the passive
+`ports` alongside the observation, tap, arbitration, rotation and serial-signal
+verbs. That is a real widening and it deserves a plain statement rather than an
+implication:
+
+> A log node writes files, and an exec codec runs a command — both as the user
+> `serialnexusd` runs as. Whoever holds the web token can therefore create a node
+> that writes a file anywhere that user can write, and a node that executes an
+> arbitrary command line as that user. Treat the token as equivalent to shell
+> access for that account, and run the daemon under a dedicated, unprivileged user
+> (see the checklist below) so "the daemon's user" is as small a blast radius as
+> possible.
+
+The earlier posture — the console never mutates the graph — was the right default
+until the operator decided otherwise, and the argument that retired it is recorded
+rather than erased: a token holder already commands every configured console on the
+machine, so withholding graph edits protected little while costing real workflow.
+
+What the console still **cannot** do is as load-bearing as what it can, and the
+bridge enforces it with an **allowlist**, not a denylist: the browser may invoke
+exactly `state`, `subscribe`, `info`, `ports`, `dump`, `tap.open`, `tap.close`,
+`send`, `lock`, `unlock`, `rotate`, `send-break`, `set-modem`, `pulse-dtr`,
+`add-node`, `remove-node`, `connect`, `disconnect` — and **everything else is
+refused with `-32601`**, including a verb §10 grows tomorrow. That direction is the
+load-bearing half: a denylist admits every future verb and keeps the boundary true
+only for as long as someone remembers to extend it, which is exactly how a stated
+boundary erodes. Widening the list, as §15.35 did, is a deliberate act with a
+reason attached; an inverted list would have widened itself.
+
+So **`load`, `teardown` and `shutdown` never reach the daemon** from a browser:
+whole-graph replacement and daemon lifecycle are not graph editing, and a page that
+can turn the daemon off serves no one.
+
+Do not read that as a containment boundary. It is not one, and saying so would be
+worse than saying nothing: `add-node` accepts a full node configuration, and an exec
+codec's node configuration *is* a command line. A token holder who can add a node can
+therefore run a command as the daemon's user, which subsumes stopping the daemon and
+rewriting its configuration on disk. The lifecycle verbs stay off the wire because
+they are not what the operator asked for, not because withholding them constrains an
+attacker who already holds the token. **The token is the boundary.** Treat it as
+shell access for the account `serialnexusd` runs as; the checklist below is how you
+make that account small.
 
 Two properties make that screen binding rather than decorative, both settled by a
 reproduced bypass (review 26, WEB-1/SEC-1). **One frame is exactly one request:**
@@ -301,10 +335,15 @@ one the screen approved, and no second request can ride behind an embedded newli
 A screen that decides on a different object than the one it transmits is not a
 screen.
 
-And it never writes to disk on the daemon's behalf: watching a console is a tap,
-not a log node, so viewing never becomes an unasked-for recording. The browser's
-own OPFS scrollback is the exception, and it is the viewer's disk, not the
-daemon's — see the replay-ring section above.
+**Watching** still never writes to disk on the daemon's behalf: a tap is not a log
+node, so viewing never becomes an unasked-for recording, and the browser's own OPFS
+scrollback is the viewer's disk rather than the daemon's (see the replay-ring
+section above). **Editing does**, and since §15.35 the console can edit: the editor
+page's palette offers a `log` node with a directory and a filename, so a token
+holder can start a recording — anywhere the daemon's user can write. That is the
+same capability the block quote above states; it is repeated here because "the web
+console does not record" is the kind of half-true an operator remembers and the
+qualifier is not.
 
 ## The exec codec child runs as the daemon's user
 

@@ -171,6 +171,16 @@ pub(crate) async fn reacquire_held(lock: &SharedLock, id: OriginId) -> bool {
         if lock.is_closed() {
             return false;
         }
+        // The origin was **unregistered** — `disconnect` removed its edge (§15.35).
+        // Without this exit the loop is unreachable-forever: `may_write` and
+        // `reclaim_held` both consult `origins`, and an id that is not in it can
+        // never satisfy either, while the lock itself stays open (the endpoint is
+        // fine — it is *this* origin that left). The pump would park holding the
+        // chunk it had already taken, and a later `connect` could not revive it,
+        // because the new edge gets a *new* id and nothing wakes the old wait.
+        if lock.with(|g| g.write_mode(id).is_none()) {
+            return false;
+        }
         // Enable the wake future before the reclaim attempt (lost-wakeup-free).
         let notified = lock.notified();
         tokio::pin!(notified);
@@ -313,6 +323,233 @@ impl LossCounter for Cell<u64> {
     }
 }
 
+/// One attached hostward consumer, tagged by the **target endpoint** the edge
+/// reaches (§15.35).
+///
+/// The tag is what makes an edge removable: §4 rule 2 gives a target-facing
+/// endpoint at most one edge, so a target address names exactly one sink in a
+/// producer's fan-out and `disconnect` needs no separate edge identity.
+pub(crate) struct AttachedSink {
+    pub target: EndpointAddr,
+    pub tx: mpsc::Sender<Chunk>,
+    pub counters: Arc<DropCounters>,
+}
+
+/// One host-facing endpoint's **live** fan-out list (§15.35).
+///
+/// A producer holds this for its whole life and re-reads it per chunk, so
+/// `connect` and `disconnect` join and leave a running fan-out without restarting
+/// the producer — which matters because restarting a serial node would drop
+/// `TIOCEXCL` and toggle DTR on the board behind it.
+///
+/// `Mutex` rather than a single-threaded cell because the serial reader runs on a
+/// dedicated blocking thread (§15.19, invariant 2) while the control plane runs on
+/// the runtime thread. The cost is one uncontended lock per *chunk* — a 64 KiB
+/// device read, not a byte — which is noise beside the read it accompanies; the
+/// firehose guard (`p3_firehose`) is the standing proof.
+pub struct FanOutList {
+    sinks: std::sync::Mutex<Vec<AttachedSink>>,
+}
+
+/// A shared handle to one host-facing endpoint's [`FanOutList`].
+pub type SharedFanOut = Arc<FanOutList>;
+
+impl FanOutList {
+    pub(crate) fn new() -> SharedFanOut {
+        Arc::new(FanOutList {
+            sinks: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Add one consumer. Called from `Wiring::build` at load and from `connect` on
+    /// a running graph — the same call, so a mid-stream connect joins the fan-out
+    /// exactly where a loaded one would have.
+    pub(crate) fn attach(&self, sink: AttachedSink) {
+        self.lock().push(sink);
+    }
+
+    /// Remove the consumer reached through `target`, returning whether one went.
+    ///
+    /// Dropping the sink drops the only sender on that edge's hostward channel, so
+    /// the consumer's pump drains what is buffered and then sees the channel close
+    /// — the detach costs no bytes and needs no second signal.
+    pub(crate) fn detach(&self, target: &EndpointAddr) -> bool {
+        let mut sinks = self.lock();
+        let before = sinks.len();
+        sinks.retain(|s| &s.target != target);
+        sinks.len() != before
+    }
+
+    /// Whether any consumer is attached — the cheap check a producer makes before
+    /// deciding a read is worth doing at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// Broadcast one hostward chunk to every attached consumer, accounting for all
+    /// loss (§5). The single hostward fan-out: see [`fan_out`].
+    pub(crate) fn broadcast(&self, chunk: &Chunk, unattached: &dyn LossCounter) -> FanOut {
+        fan_out(chunk, &self.lock(), unattached)
+    }
+
+    /// The sink list. A poisoned mutex cannot lose data here — every operation is a
+    /// `Vec` push/retain with no invariant spanning them — so the guard is taken
+    /// through the poison rather than panicking a data-plane thread with it.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<AttachedSink>> {
+        self.sinks.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// One target-facing endpoint's **live** edge binding (§15.35).
+///
+/// Every target-facing endpoint owns one for its whole life; `connect` fills it
+/// and `disconnect` clears it, and the endpoint's already-running task re-reads it
+/// each iteration. Nothing is spawned or aborted, which is the point: the
+/// alternative — restarting the task — would drop the targetward *receiver* out
+/// from under senders that are still live in `GraphState::endpoint_targetward` and
+/// in every writer origin, which is MAP-1's chain exactly (§15.8, notes §3.x).
+#[derive(Default)]
+pub struct TargetEdge {
+    /// The host endpoint's lock and the id this origin is registered under (§6).
+    /// Present for **every** attached edge, `never` included — the lock registers
+    /// every origin so `state` can list it, so every one of them must be
+    /// unregisterable. Tracking this only for writable edges is how a `never`
+    /// origin outlives the edge that created it and lingers in `state` as a
+    /// phantom.
+    pub registered: Option<(SharedLock, OriginId)>,
+    /// The targetward path into the host endpoint. Present only when the effective
+    /// write mode is not `never`, so a read-only edge is registered but has no
+    /// writer.
+    pub writer: Option<mpsc::Sender<Chunk>>,
+    /// Whether an edge is attached at all. Distinct from `writer.is_some()`
+    /// because a `never` edge is a real attachment that simply cannot write, and
+    /// it is *this* flag — not the writer — that decides whether an interior node
+    /// reports `active` or `waiting` for want of an upstream (§7.5, §15.8).
+    pub attached: bool,
+}
+
+/// One target-facing endpoint's edge binding plus the signal that it changed
+/// (§15.35).
+///
+/// The signal is what lets an *unattached* endpoint apply §5's targetward
+/// contract properly. Three states, three behaviours, and the difference between
+/// the last two is why `attached` exists separately from `origin`:
+///
+/// * **Attached and writable** — forward, gated on the lock (§6).
+/// * **Attached, not writable** (`write_mode = "never"`, the declared read-only
+///   edge) — drain and count. Parking would wedge a writer forever on a
+///   configuration that says, permanently, that its bytes go nowhere; the node
+///   must be *inert*, not destructive (MAP-1, §15.8).
+/// * **Not attached** (`disconnect`, or never connected) — **park**, consuming
+///   nothing, so the endpoint's bounded targetward channel fills and its writers
+///   backpressure. Targetward is the direction §5 forbids dropping on, so an
+///   operator detaching an edge must stall the writers, not shed their bytes —
+///   the same thing a steal does to a held origin. [`Self::changed`] wakes the
+///   pump when `connect` fills the slot again.
+pub struct EdgeSlot {
+    state: CriticalCell<TargetEdge>,
+    changed: Notify,
+}
+
+/// A shared handle to one target-facing endpoint's [`EdgeSlot`].
+pub type SharedTargetEdge = Rc<EdgeSlot>;
+
+impl EdgeSlot {
+    pub fn with<R>(&self, f: impl FnOnce(&TargetEdge) -> R) -> R {
+        self.state.with(f)
+    }
+
+    /// The writable binding — sender, lock, origin id — or `None` when this edge
+    /// cannot write (read-only, or nothing attached). The one place the three parts
+    /// are assembled, so a caller cannot pair a writer with the wrong id.
+    pub fn origin(&self) -> Option<(mpsc::Sender<Chunk>, SharedLock, OriginId)> {
+        self.state.with(|e| match (&e.writer, &e.registered) {
+            (Some(tx), Some((lock, id))) => Some((tx.clone(), lock.clone(), *id)),
+            _ => None,
+        })
+    }
+
+    /// Mutate the binding and wake whoever is parked on it. Every writer goes
+    /// through here, so a fill can never be missed by a parked pump.
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut TargetEdge) -> R) -> R {
+        let out = self.state.with_mut(f);
+        self.changed.notify_waiters();
+        out
+    }
+
+    /// A future that completes on the next binding change. Enable it *before*
+    /// re-reading the slot, or a `connect` landing in between is lost and the pump
+    /// parks forever on an endpoint that is now wired.
+    pub fn changed(&self) -> Notified<'_> {
+        self.changed.notified()
+    }
+}
+
+impl TargetEdge {
+    /// An edge slot that is **attached but not writable** — the declared read-only
+    /// edge (`write_mode = "never"`, §7.3/§7.8). Distinct from [`Self::new`], which
+    /// is *unattached* and makes its pump park: the two states behave differently
+    /// on purpose, so a test that means one must not reach for the other.
+    #[cfg(test)]
+    pub(crate) fn read_only() -> SharedTargetEdge {
+        let slot = TargetEdge::new();
+        slot.with_mut(|e| e.attached = true);
+        slot
+    }
+
+    // `TargetEdge` is only ever handed out behind an `Rc<EdgeSlot>` — the whole point
+    // is that producer and control plane share one — so a bare `Self` would have no
+    // caller.
+    #[allow(clippy::new_ret_no_self)]
+    pub(crate) fn new() -> SharedTargetEdge {
+        Rc::new(EdgeSlot {
+            state: CriticalCell::new(TargetEdge::default()),
+            changed: Notify::new(),
+        })
+    }
+}
+
+/// Wait for `edge` to carry a writable origin, returning it (§15.35).
+///
+/// The shared park used by every interior targetward pump. `None` means the edge
+/// is attached but read-only — the caller drains and counts rather than waiting,
+/// because that configuration will never become writable on its own.
+pub(crate) async fn await_origin(
+    edge: &SharedTargetEdge,
+) -> Option<(mpsc::Sender<Chunk>, SharedLock, OriginId)> {
+    loop {
+        // Enable the wake before reading, so a `connect` between the read and the
+        // await is not lost.
+        let changed = edge.changed();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let origin = edge.origin();
+        if origin.is_some() || edge.with(|e| e.attached) {
+            return origin;
+        }
+        changed.await;
+    }
+}
+
+/// The stream of hostward receivers a target-facing endpoint is given over its
+/// life — one per edge it is connected with (§15.35).
+///
+/// A consuming task owns the receiving half forever and loops
+/// `while let Some(rx) = inbox.recv().await { while let Some(chunk) = rx.recv().await { … } }`:
+/// the inner loop ends when `disconnect` drops the producer's sink and the edge
+/// channel closes (after draining whatever it still held), and the outer loop
+/// parks until the next `connect`. One task, no aborts, no extra per-chunk hop.
+pub type EdgeInbox = mpsc::Receiver<mpsc::Receiver<Chunk>>;
+
+/// The sending half of an [`EdgeInbox`], kept by the daemon so `connect` can hand
+/// a running node its new edge.
+pub type EdgeInboxTx = mpsc::Sender<mpsc::Receiver<Chunk>>;
+
+/// Depth of an [`EdgeInbox`]. An endpoint has at most one edge at a time (§4 rule
+/// 2), so this only ever buffers a connect that lands while the consumer is
+/// draining the previous edge's tail.
+pub(crate) const EDGE_INBOX_CAP: usize = 4;
+
 /// What one hostward [`fan_out`] did with its chunk, for the producer's own
 /// per-node/per-channel bookkeeping.
 pub(crate) struct FanOut {
@@ -353,7 +590,7 @@ pub(crate) struct FanOut {
 /// unattached count. Mirror before calling this, and pass the graph sinks only.
 pub(crate) fn fan_out(
     chunk: &Chunk,
-    sinks: &[HostwardSink],
+    sinks: &[AttachedSink],
     unattached: &dyn LossCounter,
 ) -> FanOut {
     let n = chunk.len() as u64;
@@ -361,7 +598,7 @@ pub(crate) fn fan_out(
         live: false,
         dropped_full: 0,
     };
-    for (tx, counters) in sinks {
+    for AttachedSink { tx, counters, .. } in sinks {
         match tx.try_send(chunk.clone()) {
             // Delivered to a live consumer.
             Ok(()) => out.live = true,
@@ -441,10 +678,27 @@ pub const CHANNEL_CAP: usize = 256;
 /// under the §7.2 sub-second presence requirement.
 pub const IDLE_POLL: Duration = Duration::from_millis(5);
 
-/// A hostward fan-out target: a bounded sender into one consuming boundary,
-/// paired with that boundary's [`DropCounters`] so a full-buffer drop is counted
-/// where it happens (§5).
-pub type HostwardSink = (mpsc::Sender<Chunk>, Arc<DropCounters>);
+/// The hostward channel depth for a consumer fed by the node named `host_node`.
+///
+/// A serial node's `hostward_buffer` is its *consumers'* drop policy (§5, §7.1) —
+/// how much each of them may buffer before drops begin — so the depth belongs to
+/// the producing node, not the consuming one. Shared by `Wiring::build` and by
+/// `connect`, which creates the same channel on a running graph: an edge added
+/// mid-stream must buffer exactly as one loaded from configuration would.
+pub(crate) fn hostward_depth(config: &GraphConfig, host_node: &str) -> usize {
+    config
+        .nodes
+        .iter()
+        .find_map(|n| match n {
+            NodeConfig::Serial {
+                name,
+                hostward_buffer,
+                ..
+            } if name == host_node => Some(*hostward_buffer),
+            _ => None,
+        })
+        .unwrap_or(CHANNEL_CAP)
+}
 
 /// The channels the data plane hands to each node's `start`, keyed by **endpoint
 /// address** (`node` or `node/channel`, §3). Built once from the loaded
@@ -463,9 +717,11 @@ pub struct Wiring {
     /// Host-facing endpoint → its write lock (§6). The daemon keeps a clone for
     /// `lock`/`unlock`/`send` and for reporting lock state.
     pub endpoint_locks: HashMap<EndpointAddr, SharedLock>,
-    /// Host-facing endpoint → one hostward sink per attached consumer (fan-out,
-    /// §4 rule 2).
-    pub host_sinks: HashMap<EndpointAddr, Vec<HostwardSink>>,
+    /// Host-facing endpoint → its live fan-out list (§4 rule 2, §15.35). One per
+    /// host-facing endpoint whether or not it has consumers today: the producer
+    /// keeps the handle for its whole life and `connect`/`disconnect` mutate it in
+    /// place.
+    pub host_fanout: HashMap<EndpointAddr, SharedFanOut>,
     /// Host-facing endpoint → the single targetward receiver it drains (all its
     /// writing origins feed this one channel, arbitrated by the lock).
     pub host_targetward_rx: HashMap<EndpointAddr, mpsc::Receiver<Chunk>>,
@@ -473,17 +729,34 @@ pub struct Wiring {
     /// inject a line as a transient origin even with no writer attached (§6).
     pub host_targetward_tx: HashMap<EndpointAddr, mpsc::Sender<Chunk>>,
     // --- target-facing endpoints (PTY, log, codec multiplexed side) ---
-    /// Target-facing endpoint → its hostward receiver (from its one host endpoint).
-    pub target_hostward_rx: HashMap<EndpointAddr, mpsc::Receiver<Chunk>>,
-    /// Target-facing endpoint → its [`DropCounters`] (shared with the host sink),
-    /// for drop/discard counts and state reporting (§5, §7.2, §7.3).
+    /// Target-facing endpoint → the stream of hostward receivers it will be given,
+    /// one per edge over its life (§15.35). The consuming task takes this at
+    /// `start` and keeps it forever; the daemon keeps the sending half.
+    pub target_inbox: HashMap<EndpointAddr, EdgeInbox>,
+    /// Target-facing endpoint → the sending half of its [`EdgeInbox`], which
+    /// `connect` uses to hand a running node its new edge.
+    pub target_inbox_tx: HashMap<EndpointAddr, EdgeInboxTx>,
+    /// Target-facing endpoint → its [`DropCounters`] (shared with whatever host
+    /// sink currently feeds it), for drop/discard counts and state reporting (§5,
+    /// §7.2, §7.3). One per *endpoint*, not per edge: the counters describe the
+    /// consuming boundary, so a reconnect does not reset an operator's loss history.
     pub target_counters: HashMap<EndpointAddr, Arc<DropCounters>>,
-    /// Writing target-facing endpoint → its targetward sender into its host
-    /// endpoint. Only origins that can write (mode ≠ never) appear here.
-    pub target_targetward_tx: HashMap<EndpointAddr, mpsc::Sender<Chunk>>,
-    /// Writing target-facing endpoint → (its host endpoint's lock, its origin id).
-    /// The origin gates its targetward drain on this (§6); only writers appear.
+    /// Target-facing endpoint → its live edge binding (§15.35): the targetward
+    /// sender and lock handle while an edge with a writable mode is attached.
+    pub target_edges: HashMap<EndpointAddr, SharedTargetEdge>,
+    /// Writing target-facing endpoint → (its host endpoint's lock, its origin id),
+    /// so the control plane can resolve a `lock`/`unlock` by origin name (§6). Only
+    /// origins that can write (mode ≠ never) appear — a `never` origin is still
+    /// *registered* on the lock, but it is not addressable by `lock`/`unlock`, and
+    /// its id lives in the target endpoint's [`TargetEdge::registered`].
     pub origin_locks: HashMap<EndpointAddr, (SharedLock, OriginId)>,
+    /// One past the highest origin id this plan assigned (§15.35). The daemon keeps
+    /// its live-`connect` allocator above this, so an edge added later can never
+    /// collide with one the plan registered. Derived from the counter rather than
+    /// from `origin_locks`, which omits `never` origins — a graph whose only edge is
+    /// `never` would otherwise leave the floor at 0 and hand `connect` an id already
+    /// registered on that very lock.
+    pub next_origin: u64,
     // --- taps and the replay ring (§5 ring, §17 taps) ---
     /// Host-facing endpoint → the producer-side tap feed it mirrors hostward bytes
     /// into (only while a tap or ring wants them). Each producer claims its own
@@ -517,10 +790,6 @@ impl Wiring {
         // from each node's shape, so codec channels and multiplexed sides appear
         // alongside single-endpoint boundary nodes.
         let mut facing: HashMap<EndpointAddr, (Facing, Arbitration)> = HashMap::new();
-        // A serial node's configured hostward-consumer drop policy (§5, §7.1): the
-        // fan-out buffer depth to each of its consumers. Other producers (codec
-        // channels) use the built-in default.
-        let mut host_hostward_depth: HashMap<&str, usize> = HashMap::new();
         // A host-facing endpoint's configured replay-ring depth in bytes (§5, §15.32).
         // Every host-facing endpoint carries the attribute now — a serial node's
         // single endpoint and every host-facing channel of a codec or leg — each
@@ -542,12 +811,6 @@ impl Wiring {
                     host_ring_cap.insert(addr, cap);
                 }
             }
-            if let NodeConfig::Serial {
-                hostward_buffer, ..
-            } = n
-            {
-                host_hostward_depth.insert(n.name(), *hostward_buffer);
-            }
         }
 
         let mut wiring = Wiring::default();
@@ -567,6 +830,7 @@ impl Wiring {
                 let (tx, rx) = mpsc::channel(CHANNEL_CAP);
                 wiring.host_targetward_rx.insert(addr.clone(), rx);
                 wiring.host_targetward_tx.insert(addr.clone(), tx);
+                wiring.host_fanout.insert(addr.clone(), FanOutList::new());
 
                 // One tap hub per host-facing endpoint (§17): a tap can attach to
                 // any of them. The hub owns the endpoint's replay ring (§5) — sized
@@ -586,6 +850,19 @@ impl Wiring {
                 wiring
                     .tap_hub_setup
                     .insert(addr.clone(), TapHubSetup { hub, feed_rx });
+            } else {
+                // Every *target*-facing endpoint gets its edge machinery whether or
+                // not configuration wires it today (§15.35). Building these per
+                // endpoint rather than per edge is what makes `connect` a plain
+                // mutation of a running graph: the consuming task, its counters and
+                // its origin slot already exist, so an edge only has to arrive.
+                let (inbox_tx, inbox_rx) = mpsc::channel(EDGE_INBOX_CAP);
+                wiring.target_inbox.insert(addr.clone(), inbox_rx);
+                wiring.target_inbox_tx.insert(addr.clone(), inbox_tx);
+                wiring
+                    .target_counters
+                    .insert(addr.clone(), Arc::new(DropCounters::default()));
+                wiring.target_edges.insert(addr.clone(), TargetEdge::new());
             }
         }
 
@@ -617,14 +894,22 @@ impl Wiring {
             }
 
             // Targetward: only origins that can write (mode ≠ never) get a path to
-            // the host endpoint and a lock handle to gate their drain (§6).
-            if mode != WriteMode::Never {
-                if let Some(ttx) = wiring.host_targetward_tx.get(host) {
-                    wiring
-                        .target_targetward_tx
-                        .insert(target.clone(), ttx.clone());
-                }
-                if let Some(lock) = wiring.endpoint_locks.get(host) {
+            // the host endpoint and a lock handle to gate their drain (§6). The
+            // binding goes into the target endpoint's live slot, which is the same
+            // slot `connect` fills on a running graph.
+            if let (Some(slot), Some(lock)) = (
+                wiring.target_edges.get(target),
+                wiring.endpoint_locks.get(host),
+            ) {
+                let writer = (mode != WriteMode::Never)
+                    .then(|| wiring.host_targetward_tx.get(host).cloned())
+                    .flatten();
+                slot.with_mut(|e| {
+                    e.attached = true;
+                    e.registered = Some((lock.clone(), origin_id));
+                    e.writer = writer;
+                });
+                if mode != WriteMode::Never {
                     wiring
                         .origin_locks
                         .insert(target.clone(), (lock.clone(), origin_id));
@@ -632,25 +917,33 @@ impl Wiring {
             }
 
             // Hostward: one dedicated channel per (host, target) edge, so a slow
-            // consumer's drops are isolated to its own channel (§5). One shared
-            // DropCounters rides with both ends — the producer counts full-buffer
+            // consumer's drops are isolated to its own channel (§5). The endpoint's
+            // DropCounters ride with both ends — the producer counts full-buffer
             // drops, the consumer counts its own boundary discards. Depth is the
             // producing serial's configured hostward buffer (§7.1), else default.
-            let depth = host_hostward_depth
-                .get(host.node.as_str())
-                .copied()
-                .unwrap_or(CHANNEL_CAP);
-            let (htx, hrx) = mpsc::channel(depth);
-            let counters = Arc::new(DropCounters::default());
-            wiring
-                .host_sinks
-                .entry(host.clone())
-                .or_default()
-                .push((htx, counters.clone()));
-            wiring.target_hostward_rx.insert(target.clone(), hrx);
-            wiring.target_counters.insert(target.clone(), counters);
+            let (htx, hrx) = mpsc::channel(hostward_depth(config, &host.node));
+            let counters = wiring
+                .target_counters
+                .get(target)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(fanout) = wiring.host_fanout.get(host) {
+                fanout.attach(AttachedSink {
+                    target: target.clone(),
+                    tx: htx,
+                    counters,
+                });
+            }
+            // Hand the consuming endpoint its receiver through the same inbox
+            // `connect` uses. `try_send` cannot fail here: the inbox was created
+            // empty two loops ago and holds at most one edge per target endpoint
+            // (§4 rule 2, which validation has already enforced).
+            if let Some(inbox) = wiring.target_inbox_tx.get(target) {
+                let _ = inbox.try_send(hrx);
+            }
         }
 
+        wiring.next_origin = next_origin;
         wiring
     }
 }
@@ -828,10 +1121,20 @@ mod tests {
 
     // --- the shared hostward fan-out (F1) --------------------------------------
 
-    fn sink(cap: usize) -> (HostwardSink, mpsc::Receiver<Chunk>, Arc<DropCounters>) {
+    fn sink(cap: usize) -> (AttachedSink, mpsc::Receiver<Chunk>, Arc<DropCounters>) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel::<Chunk>(cap);
         let counters = Arc::new(DropCounters::default());
-        ((tx, counters.clone()), rx, counters)
+        (
+            AttachedSink {
+                target: format!("consumer{n}").parse().expect("address parses"),
+                tx,
+                counters: counters.clone(),
+            },
+            rx,
+            counters,
+        )
     }
 
     #[test]
@@ -869,7 +1172,7 @@ mod tests {
         // unattached — a slow spy costs only itself (§5).
         let (full_sink, _full_rx, full_counters) = sink(1);
         full_sink
-            .0
+            .tx
             .try_send(Chunk::copy_from_slice(b"x"))
             .expect("fill the slow consumer's buffer");
         let (live_sink, mut live_rx, live_counters) = sink(4);

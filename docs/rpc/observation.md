@@ -5,7 +5,8 @@ split (§15.8). Observed state is never persisted and, by construction, absent
 from every configuration type: the fields here simply do not exist in `dump`.
 
 Methods on this page: [`state`](#state), [`subscribe`](#subscribe),
-[`info`](#info), [`tap.open`](#tapopen), [`tap.close`](#tapclose). This page also
+[`info`](#info), [`ports`](#ports), [`tap.open`](#tapopen),
+[`tap.close`](#tapclose). This page also
 documents the [notification stream](#notifications) — the `state`/`lock` pair
 `subscribe` opens plus the per-tap `tap.data`/`tap.closed` — and the
 [`LockSnapshot`](#locksnapshot) shape shared by `state`, the `lock`
@@ -305,6 +306,108 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"info"}' | nc -N -U "$SOCK" | 
   "envelope_version": 1,
   "codecs": ["reference"],
   "instance": 12719384756019283746
+}
+```
+
+---
+
+## `ports`
+
+List the serial devices the resolver can see on this machine, the identity that
+would bind each one, and whether a node in the running graph already holds it
+(§12, §15.35). This is the resolver's enumeration face: the answer to "what is
+plugged in, and what is still free", so an operator no longer has to learn device
+paths out-of-band before `add-node`.
+
+**Scope, stated precisely.** The sources are exactly the ones §15.35 names:
+`/dev/serial/by-id`, `/dev/serial/by-path`, and — on BSD/macOS — `cu.*` nodes under
+`/dev`. On Linux those trees are udev's USB-serial face, so a device with no entry
+in them is **not listed**: an on-board UART (`/dev/ttyS0`, `/dev/ttyAMA0`) or an
+adapter whose driver udev has no rule for. Those are still perfectly bindable — by
+a `raw:` path, which is what §12's escape hatch is for — they simply do not appear
+here. `ports` is a discovery aid, not an inventory.
+
+**Strictly passive, and that is a contract rather than an implementation detail.**
+The whole result is built from `/dev/serial/by-id` and `/dev/serial/by-path`
+readlinks, a `<dev-root>/dev` listing for BSD/macOS `cu.*` callout nodes, and
+sysfs reads. No candidate device is opened, because opening a USB-serial adapter
+asserts DTR and resets the board behind it — on exactly the hardware people care
+about. `ports` is the verb you run to *look*.
+
+The `identity` field comes from the same §12 fallback chain `add-node` captures
+with (`usb:` → `by-path:` → `raw:`), so what `ports` shows is precisely what
+binding that path would store — not a second opinion about it. An adapter whose
+serial number is absent or duplicated therefore appears as `by-path:`, carrying
+the documented instability `warning`, exactly as it would after an add.
+
+Pure observation; touches no graph state and opens no device.
+
+### Params
+
+None.
+
+### Result
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `ports` | array of object | one entry per device node found, sorted by `path` |
+
+Each entry:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `identity` | string | the canonical identity to put in a serial node's `device` field (§12) |
+| `kind` | string | `"usb"`, `"by-path"` or `"raw"` — which form `identity` uses |
+| `path` | string | the `/dev` path the device currently occupies |
+| `description` | string | human echo, e.g. `FTDI FT232R USB UART, serial A6008isP, interface 00` |
+| `by_id` | string \| null | the `/dev/serial/by-id` entry name, when the device has one |
+| `warning` | string \| null | the documented instability warning carried by the `by-path`/`raw` fallbacks (§12); `null` for a `usb:` identity |
+| `bound_to` | string \| null | the serial node that already binds this device, or `null` when it is free |
+
+`bound_to` is decided by resolving each serial node's stored identity to its
+*current path* and comparing canonicalized paths, so a device bound by `usb:`
+identity, by `by-path:`, or by a raw path — including a raw path that is a symlink
+into `/dev/serial/by-id` — all report bound. Comparing identity spellings would
+only have caught the first. When two nodes are configured on one device (which
+loads, and leaves the second faulted on `TIOCEXCL`), `bound_to` names the first.
+
+### CLI
+
+```console
+$ serialnexusctl ports          # rendered: path, free/bound, identity, description
+$ serialnexusctl --json ports   # the raw object
+```
+
+### Errors
+
+None beyond the transport-level codes. A machine with no serial devices returns
+an empty array, not an error.
+
+### Example
+
+```console
+$ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"ports"}' | nc -N -U "$SOCK" | jq .result
+{
+  "ports": [
+    {
+      "identity": "usb:0403:6001:BH00LL8O:00",
+      "kind": "usb",
+      "path": "/dev/ttyUSB0",
+      "description": "FTDI FT232R USB UART, serial BH00LL8O, interface 00",
+      "by_id": "usb-FTDI_FT232R_USB_UART_BH00LL8O-if00-port0",
+      "warning": null,
+      "bound_to": "usb0"
+    },
+    {
+      "identity": "usb:0403:6001:BH00L4KU:00",
+      "kind": "usb",
+      "path": "/dev/ttyUSB1",
+      "description": "FTDI FT232R USB UART, serial BH00L4KU, interface 00",
+      "by_id": "usb-FTDI_FT232R_USB_UART_BH00L4KU-if00-port0",
+      "warning": null,
+      "bound_to": null
+    }
+  ]
 }
 ```
 

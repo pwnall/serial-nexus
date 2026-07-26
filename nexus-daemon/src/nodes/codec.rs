@@ -34,7 +34,6 @@ use codec_api::{Codec, Event, EventKind};
 use nexus_core::Chunk;
 use nexus_core::config::NodeConfig;
 use nexus_core::graph::{EndpointAddr, Facing};
-use nexus_core::lock::OriginId;
 use nexus_core::state::{NodeState, NodeStatus};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -42,7 +41,8 @@ use tokio::task::JoinHandle;
 
 use crate::cell::CriticalCell;
 use crate::runtime::{
-    DropCounters, HostwardSink, SharedLock, Wiring, fan_out, frame_ranges, reacquire_held,
+    DropCounters, EdgeInbox, SharedFanOut, SharedTargetEdge, Wiring, await_origin, frame_ranges,
+    reacquire_held,
 };
 use crate::tap::TapFeed;
 
@@ -85,6 +85,11 @@ pub struct CodecNode {
     /// side fell behind (its bounded intake was full) — a §5 loss, surfaced so it
     /// stays located and attributable. Claimed from the wiring at start.
     mux_counters: Option<Arc<DropCounters>>,
+    /// The multiplexed side's live edge binding (§15.35): whether an upstream is
+    /// attached and, when it is writable, the targetward sender and lock every
+    /// channel frames through. `connect`/`disconnect` mutate it under the running
+    /// tasks.
+    mux_edge: Option<SharedTargetEdge>,
     /// Targetward bytes arriving at the *multiplexed* endpoint that this node has no
     /// path for — the re-multiplexer orientation, whose driver is deferred (§14).
     /// They are drained rather than dropped (see `drain_unwired_channels`) so a
@@ -121,6 +126,7 @@ impl CodecNode {
             codec: Rc::new(CriticalCell::new(codec)),
             stats: Rc::new(stats),
             mux_counters: None,
+            mux_edge: None,
             mux_discarded_targetward: Rc::new(Cell::new(0)),
             tasks: Vec::new(),
             status: NodeState::new(NodeStatus::Active),
@@ -191,35 +197,33 @@ impl CodecNode {
         }
 
         // Multiplexed side (the default endpoint, target-facing): raw hostward in,
-        // raw targetward out. Without an attached serial there is no data path.
+        // raw targetward out. Without an attached serial there is no data path yet —
+        // the node waits (§15.8) but every task still starts, parked on the endpoint's
+        // inbox and its origin slot, so a later `connect` needs no restart (§15.35).
+        // A waiting node must be *inert*, not destructive: the channels' targetward
+        // receivers are kept and drained rather than dropped, since their senders stay
+        // live in `GraphState::endpoint_targetward` and in every attached writer
+        // origin. That is MAP-1's chain — a pty origin's next write fails,
+        // `read_and_poll` returns, and presence latching, `handle_last_close`, termios
+        // reconciliation and detach-release go with it, wedging the channel's lock on
+        // a holder that has gone away while its bytes vanish uncounted (§15.8).
         let mux = EndpointAddr::node(&self.name);
-        let Some(mux_hostward_rx) = wiring.target_hostward_rx.remove(&mux) else {
+        let mux_inbox = wiring.target_inbox.remove(&mux);
+        self.mux_edge = wiring.target_edges.remove(&mux);
+        self.mux_counters = wiring.target_counters.remove(&mux);
+        if !self.mux_attached() {
             self.status.set(NodeStatus::Waiting {
                 reason: "multiplexed side has no attached upstream".to_owned(),
             });
-            // Returning here must NOT leave the channels' targetward receivers in the
-            // wiring plan: it is dropped at the end of `load`, which closes each
-            // channel under senders that are still live in `GraphState::endpoint_targetward`
-            // and in every attached writer origin. That is MAP-1's chain — a pty
-            // origin's next write fails, `read_and_poll` returns, and presence
-            // latching, `handle_last_close`, termios reconciliation and detach-release
-            // go with it, wedging the channel's lock on a holder that has gone away
-            // while its bytes vanish uncounted. A waiting node must be *inert*, not
-            // destructive (§15.8), so drain the channels instead.
-            self.drain_unwired_channels(wiring);
-            return;
-        };
-        let mux_targetward_tx = wiring.target_targetward_tx.remove(&mux);
-        let serial_lock = wiring.origin_locks.remove(&mux);
-        self.mux_counters = wiring.target_counters.remove(&mux);
+        }
 
-        // Per-channel hostward fan-out sinks, targetward receivers, and tap feeds.
-        let mut channel_sinks: HashMap<String, Vec<HostwardSink>> = HashMap::new();
+        // Per-channel hostward fan-outs, targetward receivers, and tap feeds.
+        let mut channel_sinks: HashMap<String, SharedFanOut> = HashMap::new();
         let mut channel_feeds: HashMap<String, TapFeed> = HashMap::new();
         let mut channel_rxs: Vec<(String, mpsc::Receiver<Chunk>)> = Vec::new();
         for ch in &self.channels {
             let addr = EndpointAddr::channel(&self.name, ch);
-            if let Some(sinks) = wiring.host_sinks.remove(&addr) {
+            if let Some(sinks) = wiring.host_fanout.remove(&addr) {
                 channel_sinks.insert(ch.clone(), sinks);
             }
             if let Some(feed) = wiring.tap_feeds.remove(&addr) {
@@ -232,13 +236,15 @@ impl CodecNode {
 
         // Hostward: demux the multiplexed stream and fan each channel out (§5),
         // mirroring to each channel's tap hub for taps and the replay ring (§17).
-        self.tasks.push(tokio::task::spawn_local(hostward_demux(
-            self.codec.clone(),
-            mux_hostward_rx,
-            channel_sinks,
-            channel_feeds,
-            self.stats.clone(),
-        )));
+        if let Some(inbox) = mux_inbox {
+            self.tasks.push(tokio::task::spawn_local(hostward_demux(
+                self.codec.clone(),
+                inbox,
+                channel_sinks,
+                channel_feeds,
+                self.stats.clone(),
+            )));
+        }
 
         // Targetward: one task per channel, framing its writes back into the
         // multiplexed stream — only if the multiplexed side can write to the device
@@ -255,33 +261,45 @@ impl CodecNode {
         // and detach-release — a healthy-looking graph whose console silently stops
         // reporting its client. Draining makes a read-only demux inert instead, with
         // the loss counted where it happens (§5).
-        match (mux_targetward_tx, serial_lock) {
-            (Some(mux_tx), Some((serial_lock, mux_id))) => {
-                for (ch, rx) in channel_rxs {
-                    let Some(stat) = self.stats.get(&ch).cloned() else {
-                        continue;
-                    };
-                    self.tasks.push(tokio::task::spawn_local(channel_targetward(
-                        ch,
-                        rx,
-                        mux_tx.clone(),
-                        self.codec.clone(),
-                        serial_lock.clone(),
-                        mux_id,
-                        stat,
-                    )));
-                }
-            }
-            _ => {
-                for (ch, rx) in channel_rxs {
-                    let Some(stat) = self.stats.get(&ch).cloned() else {
-                        continue;
-                    };
-                    self.tasks
-                        .push(tokio::task::spawn_local(channel_targetward_drain(rx, stat)));
-                }
-            }
+        let mux_edge = self
+            .mux_edge
+            .clone()
+            .unwrap_or_else(crate::runtime::TargetEdge::new);
+        for (ch, rx) in channel_rxs {
+            let Some(stat) = self.stats.get(&ch).cloned() else {
+                continue;
+            };
+            self.tasks.push(tokio::task::spawn_local(channel_targetward(
+                ch,
+                rx,
+                mux_edge.clone(),
+                self.codec.clone(),
+                stat,
+            )));
         }
+    }
+
+    /// Whether the multiplexed side currently has an upstream edge (§15.35).
+    fn mux_attached(&self) -> bool {
+        self.mux_edge
+            .as_ref()
+            .is_some_and(|e| e.with(|s| s.attached))
+    }
+
+    /// Re-report status after edge surgery on `endpoint` (§15.35). Only the
+    /// multiplexed side decides `active`/`waiting`: a channel endpoint faces host,
+    /// and its own liveness is already reported per channel from the demux stats.
+    pub fn set_upstream_attached(&mut self, endpoint: &EndpointAddr, attached: bool) {
+        if !endpoint.is_default() || endpoint.node != self.name {
+            return;
+        }
+        self.status.set(if attached {
+            NodeStatus::Active
+        } else {
+            NodeStatus::Waiting {
+                reason: "multiplexed side has no attached upstream".to_owned(),
+            }
+        });
     }
 
     pub fn status(&self) -> NodeState {
@@ -362,66 +380,72 @@ impl Drop for CodecNode {
 /// fan-out and before the next `recv().await`.
 async fn hostward_demux(
     codec: Rc<CriticalCell<Box<dyn Codec>>>,
-    mut mux_rx: mpsc::Receiver<Chunk>,
-    channel_sinks: HashMap<String, Vec<HostwardSink>>,
+    mut inbox: EdgeInbox,
+    channel_sinks: HashMap<String, SharedFanOut>,
     channel_feeds: HashMap<String, TapFeed>,
     stats: Rc<HashMap<String, Rc<ChannelStat>>>,
 ) {
-    while let Some(chunk) = mux_rx.recv().await {
-        let mut events = Vec::new();
-        codec.with_mut(|c| {
-            if let Err(e) = c.demux(&chunk, &mut |ev| events.push(ev)) {
-                tracing::warn!("codec demux error: {e}");
-            }
-        });
-        for ev in events {
-            let stat = stats.get(ev.channel.as_str());
-            match ev.kind {
-                EventKind::Data(bytes) => {
-                    let n = bytes.len() as u64;
-                    if let Some(s) = stat {
-                        s.active.set(true);
-                    }
-                    // Mirror to this channel's tap hub for taps and the replay ring
-                    // (§17), independent of whether a graph consumer is bound — a
-                    // tapped-but-unconsumed channel still reaches its observer.
-                    if let Some(feed) = channel_feeds.get(ev.channel.as_str()) {
-                        feed.mirror(&bytes);
-                    }
-                    // Fan out to this channel's consumers through the one shared
-                    // helper (§5, F1). A channel that reached no live consumer —
-                    // none bound, or every sink permanently `Closed` after a cascade
-                    // removal — discards-with-count; data on an unconfigured channel
-                    // (no stat) is noise from the mux and simply dropped —
-                    // announced-but-unbound is a leg concern (§7.4).
-                    if let Some(sinks) = channel_sinks.get(ev.channel.as_str()) {
-                        // `channel_sinks` and `stats` are both keyed by the
-                        // configured channel list, so a bound sink always has a
-                        // stat; `scratch` is the defensive arm — its count is
-                        // thrown away, but the bytes are still delivered.
-                        let scratch = Cell::new(0u64);
-                        let unattached = stat.map_or(&scratch, |s| &s.discarded_unattached);
-                        if fan_out(&bytes, sinks, unattached).live
-                            && let Some(s) = stat
-                        {
-                            s.delivered_hostward.set(s.delivered_hostward.get() + n);
+    // One task across every upstream edge this node is given over its life (§15.35):
+    // it parks on the inbox while unattached, drains an edge until `disconnect`
+    // closes it, then parks again — so the codec's framing state and its channels'
+    // tasks survive edge surgery untouched.
+    while let Some(mut mux_rx) = inbox.recv().await {
+        while let Some(chunk) = mux_rx.recv().await {
+            let mut events = Vec::new();
+            codec.with_mut(|c| {
+                if let Err(e) = c.demux(&chunk, &mut |ev| events.push(ev)) {
+                    tracing::warn!("codec demux error: {e}");
+                }
+            });
+            for ev in events {
+                let stat = stats.get(ev.channel.as_str());
+                match ev.kind {
+                    EventKind::Data(bytes) => {
+                        let n = bytes.len() as u64;
+                        if let Some(s) = stat {
+                            s.active.set(true);
                         }
-                    } else if let Some(s) = stat {
-                        s.discarded_unattached.set(s.discarded_unattached.get() + n);
+                        // Mirror to this channel's tap hub for taps and the replay ring
+                        // (§17), independent of whether a graph consumer is bound — a
+                        // tapped-but-unconsumed channel still reaches its observer.
+                        if let Some(feed) = channel_feeds.get(ev.channel.as_str()) {
+                            feed.mirror(&bytes);
+                        }
+                        // Fan out to this channel's consumers through the one shared
+                        // helper (§5, F1). A channel that reached no live consumer —
+                        // none bound, or every sink permanently `Closed` after a cascade
+                        // removal — discards-with-count; data on an unconfigured channel
+                        // (no stat) is noise from the mux and simply dropped —
+                        // announced-but-unbound is a leg concern (§7.4).
+                        if let Some(sinks) = channel_sinks.get(ev.channel.as_str()) {
+                            // `channel_sinks` and `stats` are both keyed by the
+                            // configured channel list, so a bound sink always has a
+                            // stat; `scratch` is the defensive arm — its count is
+                            // thrown away, but the bytes are still delivered.
+                            let scratch = Cell::new(0u64);
+                            let unattached = stat.map_or(&scratch, |s| &s.discarded_unattached);
+                            if sinks.broadcast(&bytes, unattached).live
+                                && let Some(s) = stat
+                            {
+                                s.delivered_hostward.set(s.delivered_hostward.get() + n);
+                            }
+                        } else if let Some(s) = stat {
+                            s.discarded_unattached.set(s.discarded_unattached.get() + n);
+                        }
                     }
-                }
-                EventKind::Open => {
-                    if let Some(s) = stat {
-                        s.active.set(true);
+                    EventKind::Open => {
+                        if let Some(s) = stat {
+                            s.active.set(true);
+                        }
                     }
-                }
-                EventKind::Close => {
-                    if let Some(s) = stat {
-                        s.active.set(false);
+                    EventKind::Close => {
+                        if let Some(s) = stat {
+                            s.active.set(false);
+                        }
                     }
-                }
-                EventKind::Error(msg) => {
-                    tracing::debug!(channel = %ev.channel, "codec channel error: {msg}");
+                    EventKind::Error(msg) => {
+                        tracing::debug!(channel = %ev.channel, "codec channel error: {msg}");
+                    }
                 }
             }
         }
@@ -468,14 +492,27 @@ async fn mux_targetward_drain(mut rx: mpsc::Receiver<Chunk>, discarded: Rc<Cell<
 async fn channel_targetward(
     channel: String,
     mut rx: mpsc::Receiver<Chunk>,
-    mux_tx: mpsc::Sender<Chunk>,
+    mux_edge: SharedTargetEdge,
     codec: Rc<CriticalCell<Box<dyn Codec>>>,
-    serial_lock: SharedLock,
-    mux_id: OriginId,
     stat: Rc<ChannelStat>,
 ) {
     while let Some(bytes) = rx.recv().await {
         let total = bytes.len();
+        // Re-read the multiplexed side's live edge per chunk (§15.35). An
+        // *unattached* mux side — never connected, or one a `disconnect` just
+        // removed — parks inside `await_origin`: this channel's targetward buffer
+        // fills and its writers backpressure, which is §5's targetward contract and
+        // the same stall a steal produces. A `write_mode = "never"` mux edge
+        // (validation's documented read-only demux) is attached and will never
+        // become writable, so it drains-and-counts instead — inert rather than
+        // destructive, and never wedging a writer forever (MAP-1: closing the
+        // receiver under a pty origin ends that origin's reader task and takes
+        // presence latching and detach-release with it).
+        let Some((mux_tx, serial_lock, mux_id)) = await_origin(&mux_edge).await else {
+            stat.discarded_targetward
+                .set(stat.discarded_targetward.get() + total as u64);
+            continue;
+        };
         // Fragment on the shared boundary helper (§5/§15.27): identical piece
         // ranges to the envelope framers, but each range is framed through this
         // codec's pluggable `mux` and lock-gated per piece rather than encoded
@@ -503,10 +540,18 @@ async fn channel_targetward(
             // `send --steal` transiently ousts it; re-acquire FIFO once the stealer
             // releases. The framed piece is parked in `framed` meanwhile.
             if !reacquire_held(&serial_lock, mux_id).await {
-                return; // the serial endpoint was torn down
+                // The upstream endpoint was torn down. Count the undelivered tail
+                // and stop framing *this* chunk, but keep the task: a `connect` may
+                // give this codec a new upstream, and the receiver's senders are
+                // still live either way (§5, §15.35).
+                stat.discarded_targetward
+                    .set(stat.discarded_targetward.get() + (total - off) as u64);
+                break;
             }
             if mux_tx.send(Chunk::from(framed)).await.is_err() {
-                return; // serial gone
+                stat.discarded_targetward
+                    .set(stat.discarded_targetward.get() + (total - off) as u64);
+                break;
             }
             stat.accepted_targetward
                 .set(stat.accepted_targetward.get() + piece_len);
@@ -517,7 +562,8 @@ async fn channel_targetward(
 #[cfg(all(test, feature = "codec-reference"))]
 mod tests {
     use super::*;
-    use nexus_core::lock::{Arbitration, EndpointLock, WriteMode};
+    use crate::runtime::{SharedLock, TargetEdge};
+    use nexus_core::lock::{Arbitration, EndpointLock, OriginId, WriteMode};
     use tokio::sync::broadcast;
 
     /// A serial lock whose held demux origin already owns the write lock, so the
@@ -531,6 +577,19 @@ mod tests {
             Rc::new(crate::runtime::LockCell::new("mux", lock, notifier)),
             id,
         )
+    }
+
+    /// A multiplexed-side edge slot bound to `held_lock`'s origin, writing into
+    /// `mux_tx` — the shape `connect` leaves behind (§15.35).
+    fn bound_edge(mux_tx: mpsc::Sender<Chunk>) -> SharedTargetEdge {
+        let (lock, id) = held_lock();
+        let slot = TargetEdge::new();
+        slot.with_mut(|e| {
+            e.attached = true;
+            e.registered = Some((lock, id));
+            e.writer = Some(mux_tx);
+        });
+        slot
     }
 
     /// A read-only demux (`write_mode = "never"` on the multiplexed edge, which
@@ -547,7 +606,19 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let task = tokio::task::spawn_local(channel_targetward_drain(rx, stat.clone()));
+                // A `write_mode = "never"` mux edge: *attached*, so the channel
+                // drains-and-counts rather than parking. (An unattached side — no
+                // edge, or one a `disconnect` removed — backpressures instead, which
+                // is the other half of the rule and a different test.)
+                let task = tokio::task::spawn_local(channel_targetward(
+                    "console".to_owned(),
+                    rx,
+                    TargetEdge::read_only(),
+                    Rc::new(CriticalCell::new(
+                        Box::new(codec_reference::ReferenceCodec::new()) as Box<dyn Codec>,
+                    )),
+                    stat.clone(),
+                ));
                 for _ in 0..3 {
                     // A sender whose receiver had been dropped would fail here — the
                     // exact failure that killed the writer's task in the defect.
@@ -582,22 +653,13 @@ mod tests {
         let codec: Rc<CriticalCell<Box<dyn Codec>>> = Rc::new(CriticalCell::new(Box::new(
             codec_reference::ReferenceCodec::new(),
         )));
-        let (lock, id) = held_lock();
         let stat = Rc::new(ChannelStat::default());
+        let edge = bound_edge(mux_tx);
 
         in_tx.send(Chunk::from(payload.clone())).await.unwrap();
         drop(in_tx); // close the source so the task drains its one chunk and returns
 
-        channel_targetward(
-            channel,
-            in_rx,
-            mux_tx,
-            codec.clone(),
-            lock,
-            id,
-            stat.clone(),
-        )
-        .await;
+        channel_targetward(channel, in_rx, edge, codec.clone(), stat.clone()).await;
 
         // Every framed piece round-trips through `demux` byte-exact, with no loss.
         let mut reassembled: Vec<u8> = Vec::new();
