@@ -9,6 +9,42 @@
 #
 # The parsers under test are pure, total functions over &[u8] — the ideal fuzz
 # surface — and each target asserts a decode/re-encode invariant beyond "no panic".
+#
+# -----------------------------------------------------------------------------
+# Coverage map (review 26, SEC-7: "fuzzing covers only leg-reachable decoders")
+# -----------------------------------------------------------------------------
+# The first four targets all sit on the codec-api layer, i.e. they are reachable
+# only through a configured `leg` or `exec` codec. Everything an ordinary client
+# can reach over the 0600 control socket — with no leg, no peer, no child process
+# — was unfuzzed. SEC-7 named four such parsers; here is where each stands.
+#
+#   1. `nexus-rpc`'s request parser  -> rpc_request_line   ADDED
+#      Every byte written to the control socket. The daemon's front door.
+#   2. `nexus-rpc`'s base64          -> rpc_base64         ADDED
+#      Hand-rolled (§13 permissive-only), and `tap.data`'s byte-exactness rests
+#      on it in both directions.
+#   3. the control-socket LINE READER (`RequestLines`)     NOT FUZZABLE TODAY
+#      `nexus-daemon`'s `control` module is private (`mod control;`) and
+#      `RequestLines` is a private struct inside it. Fuzzing it would mean making
+#      daemon internals public purely for the fuzzer, which trades a real API
+#      boundary (§15.26: the embeddable surface is `run`/`RunOptions`/`Registry`,
+#      nothing else) for a test convenience. Its own unit tests in `control.rs`
+#      cover the framing contract — multi-line, EOF, over-cap refusal, and
+#      cancel-safety across a dropped read future. If this is ever wanted under
+#      libFuzzer, the honest move is to lift the reader into a small crate of its
+#      own, not to widen `nexus-daemon`.
+#   4. the web server's HTTP head parser                   NOT FUZZABLE TODAY
+#      `serialnexusweb` is a **binary-only** crate: `read_request` lives in
+#      `src/server.rs` with no lib target, so nothing outside the binary can call
+#      it. Same disposition as (3) — a lib target exists to be depended on, and
+#      §17 makes the console a standalone process on purpose.
+#
+# And one target beyond SEC-7's list, for the review's testing item 10:
+#
+#   5. `GraphConfig` deserialize + validate -> config_load ADDED
+#      The `load` verb's payload, reachable with no leg. Two of the review's
+#      three worst findings (#2 `replay_ring`, #3 `hostward_buffer`) were plain
+#      configuration numbers that walked straight through this parser.
 [package]
 name = "serial-nexus-fuzz"
 version = "0.0.0"
@@ -22,6 +58,14 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 codec-api = { path = "../codec-api" }
 codec-reference = { path = "../codecs/reference" }
+# The leg-free surfaces (SEC-7). `nexus-rpc` is the control socket's stable framing
+# and its dependency-free base64; `nexus-core` owns `GraphConfig` and its structural
+# validation. Both are already workspace members, so this adds no third-party
+# dependency and nothing new for `cargo deny` to weigh (§13).
+nexus-rpc = { path = "../nexus-rpc" }
+nexus-core = { path = "../nexus-core" }
+# `load` carries JSON, so the config target parses what the RPC actually delivers.
+serde_json = "1"
 
 # Fuzz targets are their own binaries; keep them out of docs/tests/benches.
 [[bin]]
@@ -48,6 +92,28 @@ bench = false
 [[bin]]
 name = "reference_demux"
 path = "fuzz_targets/reference_demux.rs"
+test = false
+doc = false
+bench = false
+
+# --- leg-free surfaces (SEC-7) -----------------------------------------------
+[[bin]]
+name = "rpc_request_line"
+path = "fuzz_targets/rpc_request_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_base64"
+path = "fuzz_targets/rpc_base64.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_load"
+path = "fuzz_targets/config_load.rs"
 test = false
 doc = false
 bench = false

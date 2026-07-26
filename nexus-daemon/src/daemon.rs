@@ -50,6 +50,12 @@ const DEFAULT_SEND_TIMEOUT_MS: u64 = 2000;
 /// real one on the same endpoint (§6).
 const SEND_ORIGIN_BASE: u64 = 1 << 40;
 
+/// File mode for the persisted configuration snapshot (§11/§15.9), owner-only
+/// (SEC-4). It records exec-codec argv and environment and names every console, so
+/// it gets the control socket's own 0600 posture rather than whatever the umask
+/// happens to be — `--socket-group` widens the *socket*, deliberately not this.
+const STATE_FILE_MODE: u32 = 0o600;
+
 /// Daemon-specific error codes, in the reserved application range (§10). Defined
 /// once in [`nexus_rpc::AppError`] (§16.8); these are const projections of that
 /// single registry, so the call sites keep naming `app_errors::X` while the codes,
@@ -91,6 +97,32 @@ struct GraphState {
 }
 
 impl GraphState {
+    /// Detach every tap on the hubs this graph state still owns and tell their
+    /// clients why (§17, TAP-1). `teardown`, `load --replace` and `remove-node` all
+    /// drop hub handles out from under connection-side `OpenTap`s, which survive —
+    /// so without this the tap vanishes from `state.taps` while its client sits on a
+    /// live connection receiving nothing, with no notification and no error.
+    ///
+    /// `retain` decides which endpoints go: `remove-node` names the removed node's
+    /// endpoints, `teardown`/`load --replace` take everything.
+    fn detach_taps(&mut self, reason: crate::tap::TapCloseReason, retain: impl Fn(&str) -> bool) {
+        self.tap_hubs.retain(|endpoint, hub| {
+            if retain(endpoint) {
+                return true;
+            }
+            let closed = hub.with_mut(|h| h.detach_all(reason));
+            if !closed.is_empty() {
+                tracing::info!(
+                    endpoint = %endpoint,
+                    taps = closed.len(),
+                    reason = reason.as_str(),
+                    "detached open taps: their endpoint is gone"
+                );
+            }
+            false
+        });
+    }
+
     /// Find a node by name, or the shared `unknown node` error (§10) — the lookup
     /// idiom used by every node-targeted verb.
     fn node(&self, name: &str) -> Result<&Node, RpcError> {
@@ -153,6 +185,12 @@ pub struct Daemon {
     /// this nonce changes, so a client (the browser history of §17) keyed on it
     /// detects the reset and starts a fresh history instead of splicing across it.
     instance: u64,
+    /// How many control connections have actually issued `subscribe` (OBS-1). The
+    /// broadcast channel's own `receiver_count()` cannot answer this: every
+    /// connection takes a receiver at accept, before any verb, so it counts
+    /// *connections*. `Cell` because the daemon is single-threaded by construction
+    /// (§5) — the control plane and the data plane share one runtime thread.
+    subscribers: Cell<usize>,
 }
 
 /// The outcome of a (possibly waiting) acquisition attempt (§15.20). Distinguishes
@@ -207,6 +245,7 @@ impl Daemon {
             registry,
             state_file,
             instance: new_instance_nonce(),
+            subscribers: Cell::new(0),
         }
     }
 
@@ -238,13 +277,36 @@ impl Daemon {
         self.notifier.subscribe()
     }
 
+    /// Count one connection as a subscriber (OBS-1). Called when a connection's
+    /// `subscribe` verb succeeds, not when it merely connects — the distinction
+    /// [`Self::emit_state_snapshot`] gates on.
+    pub(crate) fn add_subscriber(&self) {
+        self.subscribers.set(self.subscribers.get() + 1);
+    }
+
+    /// Drop one subscriber (the connection closed, or its task unwound).
+    pub(crate) fn remove_subscriber(&self) {
+        self.subscribers
+            .set(self.subscribers.get().saturating_sub(1));
+    }
+
+    /// Connections currently subscribed to the notification stream (§10).
+    pub(crate) fn subscriber_count(&self) -> usize {
+        self.subscribers.get()
+    }
+
     /// Publish a full state snapshot to subscribers (§10: status transitions and
     /// counter snapshots). A no-op when nobody is listening, so the periodic
     /// tick costs nothing on an unsubscribed daemon. This is the observability
     /// *floor*; lock transitions are additionally delivered as immediate `lock`
     /// notifications by the [`crate::runtime::LockCell`] (§10, §15.20).
+    ///
+    /// Gated on the *subscriber* tally, not `receiver_count()` (OBS-1): every
+    /// connection takes a broadcast receiver at accept, so the receiver count is a
+    /// connection count and a `serialnexusctl state` or a `tap`-only client would
+    /// have had the whole graph serialized at 5 Hz on its behalf.
     pub fn emit_state_snapshot(&self) {
-        if self.notifier.receiver_count() == 0 {
+        if self.subscriber_count() == 0 {
             return;
         }
         let snapshot = self.state();
@@ -371,9 +433,10 @@ impl Daemon {
 
         // `--replace` clears the running graph first (teardown-then-load, §11). The
         // config is already validated, so this only fires for a config that will
-        // load. `teardown` takes its own borrow, so run it before ours.
+        // load. `teardown` takes its own borrow, so run it before ours. Open taps
+        // are told the graph was replaced, not that the daemon was torn down (§17).
         if replace {
-            self.teardown();
+            self.teardown_with(crate::tap::TapCloseReason::GraphReplaced);
         }
 
         self.state.with_mut(|st| {
@@ -392,6 +455,13 @@ impl Daemon {
                 match Node::instantiate(nc, &self.resolver, &self.registry) {
                     Ok(node) => nodes.push(node),
                     Err(reason) => {
+                        // Roll back the partially-built graph with the same
+                        // signal-all-then-join shape as `teardown` (BND-1), so an
+                        // aborted load does not stall the runtime thread for the sum
+                        // of the already-started nodes' stop latencies.
+                        for n in &mut nodes {
+                            n.signal_stop();
+                        }
                         for mut n in nodes {
                             n.teardown();
                         }
@@ -416,7 +486,12 @@ impl Daemon {
             st.endpoint_locks.clear();
             st.endpoint_targetward.clear();
             st.origin_locks.clear();
-            st.tap_hubs.clear();
+            // Any hub still here belongs to the outgoing graph; its taps must learn
+            // their endpoint is gone rather than go quiet (§17, TAP-1). Under
+            // `--replace` the teardown above already did this, so this is the
+            // idempotent backstop for a `load` onto a graph that was emptied some
+            // other way.
+            st.detach_taps(crate::tap::TapCloseReason::GraphReplaced, |_| false);
             st.absorb_wiring(&wiring);
             spawn_tap_hubs(st, &mut wiring);
             st.nodes = nodes;
@@ -581,9 +656,20 @@ impl Daemon {
                 })
                 .unwrap_or_default();
 
-            // Tear the node down (release env, flush log) and drop it.
+            // Tear the node down (release env, flush log) and drop it. Signalling
+            // stop before joining costs the runtime thread one node's stop latency
+            // rather than a sum here, and keeps all three teardown paths one shape
+            // (BND-1).
             let mut node = st.nodes.remove(idx);
+            node.signal_stop();
             node.teardown();
+
+            // Tell any tap on this node's endpoints that its endpoint is gone (§17,
+            // TAP-1): the connection-side `OpenTap` handles outlive the hub, so a
+            // bare `tap_hubs.remove` leaves the client silently receiving nothing.
+            st.detach_taps(crate::tap::TapCloseReason::EndpointRemoved, |ep| {
+                !endpoints.iter().any(|e| e == ep)
+            });
 
             // Close and prune the node's host-endpoint locks (wake parked waiters), and
             // prune its targetward/origin entries. Keep the removed locks to also evict
@@ -595,11 +681,9 @@ impl Daemon {
                     removed_locks.push(lock);
                 }
                 st.endpoint_targetward.remove(disp);
-                // Drop this endpoint's tap hub handle (§17); its ingest task
-                // self-terminates when the node's teardown above dropped the
-                // producer's feed sender, and any open tap's connection observes the
-                // closed delivery channel.
-                st.tap_hubs.remove(disp);
+                // (The endpoint's tap hub was dropped by `detach_taps` above, which
+                // also told its taps why; its ingest task self-terminates when the
+                // node's teardown dropped the producer's feed sender.)
                 // If this endpoint is a *writer* (a PTY/codec side that fed a
                 // surviving host endpoint's lock), unregister it from that lock so it
                 // does not linger as a phantom origin — or, if it held the lock,
@@ -652,6 +736,11 @@ impl Daemon {
                 .map(|n| {
                     let mut obj = serde_json::Map::new();
                     obj.insert("name".into(), json!(n.name()));
+                    // §7's "a status of active | waiting | faulted with reason and
+                    // timestamp": `NodeState` serializes flat as
+                    // `{status, reason?, since_unix_ms}`, and carries no `name` of its
+                    // own, so the merge lands all three beside the name with nothing
+                    // shadowed (STATE-1).
                     merge_into(&mut obj, serde_json::to_value(n.status()).unwrap());
                     merge_into(&mut obj, n.state_extra());
                     // Each of the node's host-facing endpoints reports its write-lock
@@ -691,11 +780,25 @@ impl Daemon {
             // an empty array. Taps are state, never configuration, so `dump` is
             // unaffected (§8/§11).
             let mut taps = Vec::new();
-            for (endpoint, hub) in &st.tap_hubs {
+            // Per-endpoint observation of the tap/ring machinery (§5, DM-5). The
+            // endpoint-level `feed_dropped` used to be rendered *only* inside a per-tap
+            // object, so on an endpoint with a ring and no open tap — the default for
+            // every endpoint since §15.32 — the counter existed and nobody could read
+            // it. §5's accounting doctrine is that loss is always visible; a counter
+            // nobody can reach is not. Reported here where it is always reachable, and
+            // still mirrored onto each tap for compatibility.
+            let mut endpoints = Vec::new();
+            // Sorted, so `state` reads the same twice running rather than in
+            // `HashMap` order.
+            let mut hubs: Vec<_> = st.tap_hubs.iter().collect();
+            hubs.sort_by(|a, b| a.0.cmp(b.0));
+            for (endpoint, hub) in hubs {
                 let snap = hub.with(|h| h.snapshot());
-                // `feed_dropped` is endpoint-level loss at the producer→hub hop (§5);
-                // report it on each of the endpoint's taps so a slow-hub gap is
-                // visible to whoever is watching.
+                endpoints.push(json!({
+                    "endpoint": endpoint,
+                    "feed_dropped": snap.feed_dropped,
+                    "taps": snap.taps.len(),
+                }));
                 for (id, dropped) in snap.taps {
                     taps.push(json!({
                         "tap": id,
@@ -705,7 +808,7 @@ impl Daemon {
                     }));
                 }
             }
-            json!({ "nodes": nodes, "taps": taps })
+            json!({ "nodes": nodes, "taps": taps, "endpoints": endpoints })
         })
     }
 
@@ -749,6 +852,11 @@ impl Daemon {
                 // reconnecting client trims replay overlap against the last offset it
                 // stored, so a reload never duplicates ring bytes into its history.
                 "from_offset": reg.from_offset,
+                // Bytes this endpoint has already lost at its producer→hub feed hop
+                // (§5, TAP-1b). The offset space counts delivered bytes only — which
+                // is what keeps replay's splice exact — so this is the baseline for
+                // the `gap_before` deltas `tap.data` carries from here on.
+                "feed_dropped": reg.feed_dropped,
             });
             Ok((result, crate::tap::OpenTap { tap_id, hub }))
         })
@@ -938,12 +1046,17 @@ impl Daemon {
                 .get(&p.endpoint)
                 .cloned()
                 .ok_or_else(|| RpcError::internal("endpoint has no targetward path"))?;
-            // The endpoint advertises a targetward path, but an interior codec/exec
-            // channel whose multiplexed side is read-only or unattached drops its
-            // receiver at start (§7.5). A closed sender means that dead path: fail
-            // with a defined, meaningful error here rather than registering the
-            // transient origin, running the lock dance, and then failing opaquely at
-            // delivery with a -32603 (RUNTIME-1).
+            // The endpoint advertises a targetward path, but that path can still be
+            // dead — a node torn down while this endpoint survives, or any future node
+            // kind that stops draining a host-facing endpoint. (Interior nodes are no
+            // longer allowed to *cause* this: a codec, exec or map with no writable
+            // path drains its receivers rather than dropping them, precisely because
+            // dropping one closes the channel under live writer origins and kills a
+            // pty's reader task — MAP-1's chain. The check stays as the honest
+            // backstop.) A closed sender means a dead path: fail with a defined,
+            // meaningful error here rather than registering the transient origin,
+            // running the lock dance, and then failing opaquely at delivery with a
+            // -32603 (RUNTIME-1).
             if sender.is_closed() {
                 return Err(RpcError::invalid_params(format!(
                     "endpoint {:?} cannot accept targetward writes (its interior node has no writable path to the device)",
@@ -1059,6 +1172,27 @@ impl Daemon {
             Steal::ReadOnly => Err(RpcError::invalid_params(format!(
                 "origin {origin:?} is write=never and cannot hold the lock"
             ))),
+            // Stealing from yourself is a no-op in the state machine (LOCK-4): the
+            // grant, the queue and the generation all survive, so the holder's own
+            // in-flight bytes are *not* purged and its lease is not voided. Mirror
+            // the `WaitOutcome::AlreadyHeld` arm above: re-arm a lease if asked
+            // (renewing first so the prior, shorter timer cannot fire), no purge, and
+            // report `acquired: false` because nothing changed hands.
+            Steal::AlreadyHeld => {
+                if let Some(ms) = lease_ms {
+                    let generation = cell.with_mut(|g| g.renew(id));
+                    if let Some(generation) = generation {
+                        cell.emit_change();
+                        self.spawn_lease(cell.clone(), id, generation, ms);
+                    }
+                }
+                Ok(json!({
+                    "origin": origin,
+                    "held": true,
+                    "acquired": false,
+                    "stole_from": Value::Null,
+                }))
+            }
             Steal::Stolen { previous } => {
                 let stole_from =
                     previous.and_then(|p| cell.with(|g| g.label(p).map(str::to_owned)));
@@ -1206,6 +1340,22 @@ impl Daemon {
     }
 
     fn teardown(&self) -> Value {
+        self.teardown_with(crate::tap::TapCloseReason::Teardown)
+    }
+
+    /// `teardown` (§11), naming the reason its open taps are told (§17): a plain
+    /// `teardown`/shutdown, or the teardown half of `load --replace`.
+    ///
+    /// **Stop is signalled to every node before any node is joined** (BND-1). A
+    /// node's stop-join blocks the single runtime thread (`boundary::stop_join`
+    /// parks until its reader thread observes the flag at its next poll wake), so
+    /// joining them one at a time inside this one critical section cost the whole
+    /// daemon — every console, every connection — the *sum* of the nodes' stop
+    /// latencies. Signalling first lets the latencies overlap: the second pass
+    /// joins threads that have already been told to leave. The alternative the
+    /// review rejected — a shorter poll interval — buys the same latency with
+    /// permanently more idle wakeups (§15.19).
+    fn teardown_with(&self, reason: crate::tap::TapCloseReason) -> Value {
         self.state.with_mut(|st| {
             let count = st.nodes.len();
             // Close every endpoint lock first: a parked `lock --wait`/`send` waiter may
@@ -1216,6 +1366,11 @@ impl Daemon {
             for cell in st.endpoint_locks.values() {
                 cell.close();
             }
+            // Pass 1: tell every node to stop. Cheap and non-blocking.
+            for n in &mut st.nodes {
+                n.signal_stop();
+            }
+            // Pass 2: join them, now that they are all already unwinding.
             for mut n in st.nodes.drain(..) {
                 n.teardown();
             }
@@ -1223,9 +1378,11 @@ impl Daemon {
             st.endpoint_locks.clear();
             st.endpoint_targetward.clear();
             st.origin_locks.clear();
-            // Drop the tap hub handles (§17): each ingest task self-terminates as the
-            // node teardowns above drop the producers' feed senders.
-            st.tap_hubs.clear();
+            // Drop the tap hub handles (§17) — telling each open tap its endpoint is
+            // gone, since the connection-side handles outlive this map (TAP-1). Each
+            // ingest task self-terminates as the node teardowns above drop the
+            // producers' feed senders.
+            st.detach_taps(reason, |_| false);
             json!({ "torn_down": count })
         })
     }
@@ -1233,6 +1390,33 @@ impl Daemon {
     /// Tear down all nodes on clean shutdown (unlink PTY symlinks, drop ports).
     pub fn teardown_all(&self) {
         let _ = self.teardown();
+    }
+}
+
+#[cfg(test)]
+impl Daemon {
+    /// Test seam: advertise one host-facing endpoint — its write lock and its
+    /// targetward sender — without building a graph, so the control-plane tests can
+    /// drive the *waiting* lane (`send`, `lock --wait`) directly. `GraphState` is
+    /// private to this module, which is why the seam lives here rather than in
+    /// `control.rs`'s test module.
+    pub(crate) fn advertise_endpoint_for_test(
+        &self,
+        display: &str,
+        lock: SharedLock,
+        targetward: mpsc::Sender<Chunk>,
+    ) {
+        self.state.with_mut(|st| {
+            st.endpoint_locks.insert(display.to_owned(), lock);
+            st.endpoint_targetward
+                .insert(display.to_owned(), targetward);
+        });
+    }
+
+    /// Test seam: register one endpoint's tap hub, as `spawn_tap_hubs` would.
+    pub(crate) fn advertise_tap_hub_for_test(&self, display: &str, hub: crate::tap::SharedTapHub) {
+        self.state
+            .with_mut(|st| st.tap_hubs.insert(display.to_owned(), hub));
     }
 }
 
@@ -1418,8 +1602,17 @@ fn is_config_mutation(method: &str) -> bool {
 /// truncated snapshot after an outage — and the parent directory is fsynced *after*
 /// the rename, so the rename itself is durable. Config mutations are rare, so the
 /// two fsyncs cost nothing measurable; what they remove is a corrupt state file.
+///
+/// **Mode 0600, explicitly** (SEC-4). The snapshot carries exec-codec argv and
+/// environment, and it named the consoles a reader could then go and tap; inheriting
+/// the umask published it at 0664 on a default box. The mode is set on the *temp*
+/// file, which is the inode the rename installs, so the permissive window is closed
+/// too — and re-applied to the open handle in case a stale temp sibling survived a
+/// crash with a wider mode. The packaged unit's `StateDirectoryMode=0700` stays as
+/// the outer layer; this is the file's own.
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let dir = match path.parent() {
         Some(d) if !d.as_os_str().is_empty() => {
             std::fs::create_dir_all(d)?;
@@ -1435,7 +1628,15 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     };
     // Write and fsync the temp file's contents to disk before the rename.
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(STATE_FILE_MODE)
+            .open(&tmp)?;
+        // `mode` applies only at creation; a leftover temp sibling from a crash
+        // would keep its old (possibly umask-wide) mode, so narrow it explicitly.
+        f.set_permissions(std::fs::Permissions::from_mode(STATE_FILE_MODE))?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
@@ -1550,6 +1751,119 @@ mod tests {
             error_codes::INVALID_PARAMS,
             "expected a defined invalid_params error, not an opaque internal (-32603)"
         );
+    }
+
+    /// TAP-1: `teardown` (and, by the same path, `load --replace` and
+    /// `remove-node`) drops the endpoint's tap hub while the connection-side
+    /// `OpenTap` handles survive. Every open tap must be told — a terminal
+    /// `tap.closed` on its own channel naming the endpoint and the reason — and the
+    /// hub must remember it was orphaned, so the client's next `tap.close` fails
+    /// instead of reporting a success that closed nothing. It must also disappear
+    /// from `state.taps`, which it already did; the silence was the defect.
+    #[test]
+    fn teardown_tells_open_taps_their_endpoint_is_gone() {
+        let daemon = Daemon::default();
+        let (hub, _active, _fd) = crate::tap::TapHub::new("usb0", 64);
+        daemon.advertise_tap_hub_for_test("usb0", hub.clone());
+
+        let (tx, mut rx) = mpsc::channel::<crate::tap::TapMsg>(8);
+        let (result, handle) = daemon
+            .tap_open(Some(json!({ "endpoint": "usb0" })), tx)
+            .expect("the endpoint has a hub");
+        let tap_id = result["tap"].as_u64().unwrap();
+        assert_eq!(result["feed_dropped"], json!(0));
+
+        let torn = daemon.teardown();
+        assert_eq!(torn, json!({ "torn_down": 0 }));
+
+        match rx.try_recv() {
+            Ok(crate::tap::TapMsg::Closed {
+                tap_id: id,
+                endpoint,
+                reason,
+            }) => {
+                assert_eq!(id, tap_id);
+                assert_eq!(endpoint, "usb0");
+                assert_eq!(reason, "teardown");
+            }
+            _ => panic!("an orphaned tap must be told its endpoint is gone"),
+        }
+        // The surviving handle knows it is dead, which is what turns the next
+        // `tap.close` into an error instead of a hollow success (control.rs).
+        assert!(handle.is_orphaned());
+        assert_eq!(handle.endpoint(), "usb0");
+        assert_eq!(daemon.state()["taps"], json!([]));
+    }
+
+    /// DM-5: endpoint-level `feed_dropped` used to be rendered only inside a per-tap
+    /// object, so on a ring-only endpoint — the default for *every* endpoint since
+    /// §15.32 — the counter could not be read at all. §5's doctrine is that loss is
+    /// always visible.
+    #[test]
+    fn feed_dropped_is_readable_on_an_endpoint_with_no_open_tap() {
+        let daemon = Daemon::default();
+        let (hub, _active, feed_dropped) = crate::tap::TapHub::new("usb0", 64);
+        daemon.advertise_tap_hub_for_test("usb0", hub);
+        feed_dropped.fetch_add(4096, std::sync::atomic::Ordering::Relaxed);
+
+        let state = daemon.state();
+        assert_eq!(state["taps"], json!([]), "no tap is open");
+        assert_eq!(
+            state["endpoints"],
+            json!([{ "endpoint": "usb0", "feed_dropped": 4096, "taps": 0 }]),
+            "the endpoint's own loss must be reachable without a tap"
+        );
+    }
+
+    /// OBS-1: the 5 Hz full-graph snapshot must be gated on connections that
+    /// actually issued `subscribe`, not on broadcast receivers — every connection
+    /// takes a receiver at accept, before any verb.
+    #[test]
+    fn state_snapshots_are_gated_on_subscribers_not_connections() {
+        let daemon = Daemon::default();
+        // A merely-connected client: it holds a receiver but never subscribed.
+        let mut rx = daemon.subscribe();
+        daemon.emit_state_snapshot();
+        assert!(
+            rx.try_recv().is_err(),
+            "an unsubscribed connection must not cost a snapshot"
+        );
+
+        daemon.add_subscriber();
+        daemon.emit_state_snapshot();
+        assert!(rx.try_recv().is_ok(), "a subscriber gets the snapshot");
+
+        daemon.remove_subscriber();
+        assert_eq!(daemon.subscriber_count(), 0);
+        daemon.emit_state_snapshot();
+        assert!(rx.try_recv().is_err(), "and the tally comes back down");
+    }
+
+    /// SEC-4: the configuration snapshot carries exec-codec argv and environment and
+    /// names every console, so it is created owner-only rather than at the umask's
+    /// discretion (0664 was observed). The temp sibling gets the same mode, so the
+    /// permissive window is closed too.
+    #[test]
+    fn state_file_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir();
+        let target = dir.join("state.toml");
+        let tmp = dir.join("state.toml.tmp");
+
+        // Plant a world-readable stale temp sibling: a crash could leave one, and
+        // the rename would otherwise install its mode.
+        std::fs::write(&tmp, b"stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        atomic_write(&target, b"secret = true").unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, STATE_FILE_MODE,
+            "state file must be 0600, got {mode:o}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `atomic_write` durably replaces the target: the bytes round-trip, the temp

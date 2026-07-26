@@ -46,7 +46,7 @@ $ serialnexusctl send-break usb0 --ms 500
 
 ```console
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"send-break","params":{"node":"usb0","ms":500}}' \
-    | nc -U "$SOCK" | jq .result
+    | nc -N -U "$SOCK" | jq .result
 {
   "node": "usb0",
   "break_ms": 500
@@ -96,7 +96,7 @@ untouched.
 
 ```console
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"set-modem","params":{"node":"usb0","dtr":true,"rts":null}}' \
-    | nc -U "$SOCK" | jq .result
+    | nc -N -U "$SOCK" | jq .result
 {
   "node": "usb0",
   "dtr": true,
@@ -132,7 +132,15 @@ duration, then to the opposite level.
 ```console
 $ serialnexusctl pulse-dtr usb0                         # 100 ms, assert=true
 $ serialnexusctl pulse-dtr usb0 --ms 200 --assert false
+$ serialnexusctl pulse-dtr usb0 --ms 200 --assert=false  # equivalent
 ```
+
+`--assert` **takes a value** (`true` or `false`); it is not a bare flag, and both
+the space and `=` spellings work. That is deliberate: the RPC's low-then-high
+pulse is `assert = false`, and a bare boolean flag defaulting to `true` could
+only ever send `true`, leaving half the verb unreachable from the CLI. Omitting
+`--assert` entirely still gives the documented default of `true`; writing
+`--assert` with no value is an error naming the two accepted values.
 
 ### Errors
 
@@ -143,7 +151,7 @@ $ serialnexusctl pulse-dtr usb0 --ms 200 --assert false
 
 ```console
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"pulse-dtr","params":{"node":"usb0","ms":200,"assert":true}}' \
-    | nc -U "$SOCK" | jq .result
+    | nc -N -U "$SOCK" | jq .result
 {
   "node": "usb0",
   "pulse_ms": 200,

@@ -41,9 +41,24 @@
 //! §15.24 stale-status fix, now structural). Every task is aborted on teardown and
 //! Drop; a lock borrow never crosses an `.await` — now a compile-shape fact via
 //! [`CriticalCell`] rather than a review rule (§15.20, §16.2).
+//!
+//! **The listen role's filesystem artifact.** A `listen`+`unix` leg narrows its
+//! socket to **0600** ([`bind_listener`]): §9's posture is that SSH supplies
+//! confidentiality and authentication *between machines*, which says nothing about
+//! the local users who can reach the path — and the v1 wire has no authentication
+//! of its own, so a bearer of that path writes into every console bound to the leg.
+//! That is precisely the trust set the control socket's 0600 mode governs (§10), and
+//! §15.29 already settled the principle for the web console: a bearer of a local
+//! channel is not the same trust set as a 0600 socket. The address is also treated
+//! as an operator file until proven otherwise — a non-socket is never unlinked, a
+//! socket with a live peer is never stolen, and teardown removes only the inode this
+//! node actually created.
 
+use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::FileTypeExt;
+use std::path::Path;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -54,22 +69,48 @@ use codec_api::{
 use nexus_core::config::{LegRole, NodeConfig, Transport};
 use nexus_core::graph::{EndpointAddr, Facing};
 use nexus_core::lock::{Acquire, OriginId};
-use nexus_core::{Chunk, NodeStatus};
+use nexus_core::{Chunk, NodeState, NodeStatus};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
 use crate::boundary;
 use crate::cell::CriticalCell;
-use crate::runtime::{CHANNEL_CAP, HostwardSink, READ_BUF, SharedLock, Wiring, data_frames};
+use crate::runtime::{
+    CHANNEL_CAP, DataFrame, HostwardSink, LossCounter, READ_BUF, SharedLock, Wiring, data_frames,
+    fan_out,
+};
 use crate::tap::TapFeed;
 
 /// How long to wait for the peer's hello before treating the connection as dead.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a pre-bind dial at a `listen`+`unix` leg's address may take before the
+/// existing socket is treated as live. A socket nobody listens on refuses
+/// *immediately* (ECONNREFUSED), so anything slower is somebody answering — and the
+/// safe reading of an ambiguous answer is "not mine to unlink" (SEC-8).
+const PEER_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How many peer-announced-but-unconfigured identities one leg remembers (§8).
+/// The list exists to prompt an operator ("the peer offers `console-c`, you have not
+/// configured it"), and a few hundred is far past the point where a human reads it —
+/// but a peer streaming data frames with fresh channel ids would otherwise grow it
+/// without limit, on the single runtime thread (LEG-2). Hostile peers are in scope
+/// (`p6_hostility`), and a `listen`+`unix` leg is dialable by anyone who can reach
+/// its path.
+const MAX_UNBOUND: usize = 256;
+
+/// How much of a peer-supplied identity is remembered. Channel identities an
+/// operator writes are short; the wire admits far longer ones, and `state` needs
+/// only enough to recognize what the peer offered (LEG-2).
+const MAX_UNBOUND_ID_LEN: usize = 64;
+
+/// Appended to an identity [`MAX_UNBOUND_ID_LEN`] truncated, so `state` never
+/// implies the peer sent the shorter name.
+const TRUNCATION_MARKER: &str = "…(truncated)";
 
 /// A boxed duplex byte stream, abstracting over tcp and unix sockets so the pump
 /// is transport-agnostic. Tasks run on the single-threaded `LocalSet`, so no
@@ -78,6 +119,7 @@ trait DuplexStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> DuplexStream for T {}
 
 /// A bound listener for the `listen` role.
+#[derive(Debug)]
 enum Listener {
     Tcp(TcpListener),
     Unix(UnixListener),
@@ -110,10 +152,25 @@ struct ChannelStat {
     /// faces=target: into the local graph, once the device-write handoff accepts).
     accepted_targetward: Cell<u64>,
     /// Hostward bytes dropped at this leg because a local consumer's buffer was
-    /// full (faces=host) — a §5 loss counted where it happens.
+    /// full, or because a configured channel has no consumer bound at all
+    /// (faces=host) — a §5 loss counted where it happens.
     discarded_hostward: Cell<u64>,
+    /// Targetward bytes dropped at this leg because wire data arrived for a
+    /// configured channel with no writable local edge behind it, or whose local
+    /// writer task is gone (faces=target). Charging these to `discarded_hostward`
+    /// was LEG-4: the loss is real, the direction was wrong.
+    discarded_targetward: Cell<u64>,
+    /// Bytes of a chunk the wire framer refused to encode. Defensively unreachable
+    /// for the fixed envelope — every fragment provably fits [`data_frames`]' bound
+    /// — but §5/invariant 3's shape is "fragment, never skip-on-error, **count any
+    /// residual**", and `data_frames` stops fragmenting on an encode error, so an
+    /// uncounted short framing would be a silent truncation (RV-9). The in-process
+    /// codec counts the same case as `discarded_targetward`; the leg's send half
+    /// serves whichever direction the facing implies, so it gets its own name.
+    discarded_unframable: Cell<u64>,
     /// Targetward bytes discarded on reconnect because they were outage-era stale
-    /// (§7.4 purge-on-reconnect).
+    /// (§7.4 purge-on-reconnect). Counted on both sides of the wire: the sending
+    /// side's local backlog, and — since LEG-3 — the receiving side's too.
     purged_on_reconnect: Cell<u64>,
     /// Whether the peer announced this configured channel (`bound`), else `waiting`.
     bound: Cell<bool>,
@@ -121,17 +178,81 @@ struct ChannelStat {
     active: Cell<bool>,
 }
 
+/// Peer-announced identities this configuration does not declare — visible state
+/// awaiting an operator, never an endpoint (§8). Bounded in both count and
+/// per-identity length: a peer streaming data frames with fresh channel ids would
+/// otherwise grow an uncapped `Vec` without limit and turn its linear dedup scan
+/// into O(n²) work on the single runtime thread (LEG-2). Insertion order is what
+/// `state` reports, so two snapshots diff meaningfully; the parallel set makes the
+/// per-frame membership test O(1) rather than a scan of the cap.
+#[derive(Default)]
+struct UnboundSet {
+    order: Vec<String>,
+    seen: HashSet<String>,
+    /// Occurrences the cap refused to record — *not* distinct identities, which
+    /// cannot be known without remembering them, which is the thing being bounded.
+    /// A repeat of an already-recorded identity is not an overflow.
+    overflow: u64,
+}
+
+impl UnboundSet {
+    /// Record a peer-supplied identity, truncated and capped.
+    fn insert(&mut self, id: &str) {
+        let id = truncate_identity(id);
+        if self.seen.contains(id.as_ref()) {
+            return;
+        }
+        if self.order.len() >= MAX_UNBOUND {
+            self.overflow += 1;
+            return;
+        }
+        let id = id.into_owned();
+        self.seen.insert(id.clone());
+        self.order.push(id);
+    }
+
+    /// Forget everything: binding state is per-connection (§8), so it is cleared at
+    /// hello reconciliation and when a connection drops — the overflow count with
+    /// it, since it describes that connection's peer.
+    fn clear(&mut self) {
+        self.order.clear();
+        self.seen.clear();
+        self.overflow = 0;
+    }
+}
+
+/// Bound the stored length of a peer-supplied identity, marking a truncation
+/// explicitly (LEG-2). Truncation lands on a `char` boundary: the identity is
+/// peer-supplied UTF-8 and a split code point would not survive JSON.
+fn truncate_identity(id: &str) -> Cow<'_, str> {
+    if id.len() <= MAX_UNBOUND_ID_LEN {
+        return Cow::Borrowed(id);
+    }
+    let mut end = MAX_UNBOUND_ID_LEN;
+    while end > 0 && !id.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!("{}{TRUNCATION_MARKER}", &id[..end]))
+}
+
 /// Node-level observed state shared with the supervisor task (which flips it as
 /// the connection comes and goes).
 struct LegShared {
-    status: CriticalCell<NodeStatus>,
+    status: CriticalCell<NodeState>,
     peer_address: CriticalCell<Option<String>>,
     peer_version: Cell<Option<u16>>,
     peer_capabilities: Cell<u32>,
     reconnect_count: Cell<u64>,
-    /// Peer-announced identities this configuration does not declare — visible
-    /// state awaiting an operator, never an endpoint (§8).
-    unbound: CriticalCell<Vec<String>>,
+    /// Peer-announced-but-unconfigured identities (§8), bounded per LEG-2.
+    unbound: CriticalCell<UnboundSet>,
+    /// The unix socket path the `listen` role actually bound, so teardown unlinks
+    /// its own artifact and never an operator file this node merely found (SEC-8).
+    /// `None` for tcp, for the connect role, and before a successful bind.
+    bound_unix_path: CriticalCell<Option<String>>,
+    /// §7.4 purge-on-reconnect. Read by the supervisor (the sending side's local
+    /// backlog) *and* by every faces=target channel task (the receiving side's,
+    /// LEG-3), which is what makes it shared rather than a supervisor argument.
+    purge_on_reconnect: bool,
     /// Pulsed by the supervisor when a connection drops, so each faces=target
     /// channel task promptly releases its on-demand write lock (§7.1: release on
     /// idle *or* peer disconnect), rather than holding the local floor until idle.
@@ -141,6 +262,25 @@ struct LegShared {
     /// misses the pulse; it snapshots this counter before the write and re-reads it
     /// after, releasing the lock promptly when it changed (§7.1, LEG-4).
     disconnect_epoch: Cell<u64>,
+}
+
+impl LegShared {
+    fn new(purge_on_reconnect: bool) -> LegShared {
+        LegShared {
+            status: CriticalCell::new(NodeState::new(NodeStatus::Waiting {
+                reason: "no peer connected yet".to_owned(),
+            })),
+            peer_address: CriticalCell::new(None),
+            peer_version: Cell::new(None),
+            peer_capabilities: Cell::new(0),
+            reconnect_count: Cell::new(0),
+            unbound: CriticalCell::new(UnboundSet::default()),
+            bound_unix_path: CriticalCell::new(None),
+            purge_on_reconnect,
+            disconnect: Notify::new(),
+            disconnect_epoch: Cell::new(0),
+        }
+    }
 }
 
 pub struct LegNode {
@@ -153,7 +293,6 @@ pub struct LegNode {
     reconnect_initial_ms: u64,
     reconnect_max_ms: u64,
     idle_release_ms: u64,
-    purge_on_reconnect: bool,
     channels: Vec<String>,
     stats: Rc<HashMap<String, Rc<ChannelStat>>>,
     shared: Rc<LegShared>,
@@ -193,21 +332,9 @@ impl LegNode {
             reconnect_initial_ms: *reconnect_initial_ms,
             reconnect_max_ms: *reconnect_max_ms,
             idle_release_ms: *idle_release_ms,
-            purge_on_reconnect: *purge_on_reconnect,
             channels: channels.clone(),
             stats: Rc::new(stats),
-            shared: Rc::new(LegShared {
-                status: CriticalCell::new(NodeStatus::Waiting {
-                    reason: "no peer connected yet".to_owned(),
-                }),
-                peer_address: CriticalCell::new(None),
-                peer_version: Cell::new(None),
-                peer_capabilities: Cell::new(0),
-                reconnect_count: Cell::new(0),
-                unbound: CriticalCell::new(Vec::new()),
-                disconnect: Notify::new(),
-                disconnect_epoch: Cell::new(0),
-            }),
+            shared: Rc::new(LegShared::new(*purge_on_reconnect)),
             tasks: Vec::new(),
         }
     }
@@ -285,7 +412,6 @@ impl LegNode {
                 address: self.address.clone(),
                 reconnect_initial_ms: self.reconnect_initial_ms,
                 reconnect_max_ms: self.reconnect_max_ms,
-                purge_on_reconnect: self.purge_on_reconnect,
                 channels: self.channels.clone(),
                 send_receivers,
                 recv_route,
@@ -294,7 +420,10 @@ impl LegNode {
             })));
     }
 
-    pub fn status(&self) -> NodeStatus {
+    /// The node's status *and* the moment it was entered (§7 "with reason and
+    /// timestamp"), so an operator watching a flapping peer reads the age of the
+    /// condition rather than the age of the last poll (STATE-1).
+    pub fn status(&self) -> NodeState {
         self.shared.status.with(|s| s.clone())
     }
 
@@ -310,17 +439,21 @@ impl LegNode {
                     "delivered_hostward": stat.delivered_hostward.get(),
                     "accepted_targetward": stat.accepted_targetward.get(),
                     "discarded_hostward": stat.discarded_hostward.get(),
+                    "discarded_targetward": stat.discarded_targetward.get(),
+                    "discarded_unframable": stat.discarded_unframable.get(),
                     "purged_on_reconnect": stat.purged_on_reconnect.get(),
                 });
                 (ch.clone(), obj)
             })
             .collect();
-        // Announced-but-unconfigured identities: visible state, no endpoint (§8).
+        // Announced-but-unconfigured identities: visible state, no endpoint (§8),
+        // in the bounded insertion order LEG-2 established.
         let mut channels = channels;
-        self.shared.unbound.with(|u| {
-            for id in u {
+        let unbound_overflow = self.shared.unbound.with(|u| {
+            for id in &u.order {
                 channels.insert(id.clone(), json!({ "binding": "unbound" }));
             }
+            u.overflow
         });
         let mut obj = json!({
             "role": role_str(self.role),
@@ -331,6 +464,9 @@ impl LegNode {
             "protocol_version": self.shared.peer_version.get(),
             "capabilities": self.shared.peer_capabilities.get(),
             "reconnect_count": self.shared.reconnect_count.get(),
+            // Wire frames whose unconfigured identity the LEG-2 cap refused to
+            // record: a peer inventing identities is visible rather than silent.
+            "unbound_overflow": unbound_overflow,
             "channels": channels,
         });
         // The §9 named footgun: surface it as a visible, greppable confession in
@@ -341,32 +477,43 @@ impl LegNode {
         obj
     }
 
-    /// Remove the bound `listen`+`unix` socket inode — our filesystem artifact —
-    /// so a torn-down or removed leg leaves no orphan, mirroring the PTY symlink
-    /// cleanup (§7.2) and the control-socket removal (§10). Only a `listen` leg over
-    /// `unix` owns a path; the connect role and the tcp transport have none. A
-    /// best-effort unlink: a missing file (never bound, or already removed by a
-    /// prior teardown) is fine, exactly like `bind_listener`'s stale-socket dance.
+    /// Remove the `listen`+`unix` socket inode — our filesystem artifact — so a
+    /// torn-down or removed leg leaves no orphan, mirroring the PTY symlink cleanup
+    /// (§7.2) and the control-socket removal (§10).
+    ///
+    /// Only the path this node *actually bound* is unlinked, and the record is taken
+    /// so the unlink happens exactly once (teardown then Drop). The former code
+    /// unlinked the configured address for every `listen`+`unix` leg, bound or not,
+    /// so a leg configured with `address = "/home/me/notes.txt"` deleted that file on
+    /// teardown even though `bind_listener` had refused it (SEC-8).
     fn unlink_listen_socket(&self) {
-        if self.role == LegRole::Listen && self.transport == Transport::Unix {
-            let _ = std::fs::remove_file(&self.address);
+        if let Some(path) = self.shared.bound_unix_path.with_mut(Option::take) {
+            let _ = std::fs::remove_file(path);
         }
     }
 
-    pub fn teardown(&mut self) {
+    /// The cheap, non-blocking half of teardown: abort every data-plane task (which
+    /// drops the listener and the socket with them) and release the filesystem
+    /// artifact, returning immediately. `daemon.rs` signals every node before paying
+    /// any join cost, so a slow node cannot stall the runtime thread on behalf of
+    /// its neighbours during `remove-node` / `load --replace` / shutdown (BND-1).
+    /// The leg has nothing to join, so [`Self::teardown`] is exactly this; the split
+    /// exists so the two-phase shape is uniform across node kinds. Idempotent.
+    pub fn signal_stop(&mut self) {
         for t in self.tasks.drain(..) {
             t.abort();
         }
         self.unlink_listen_socket();
+    }
+
+    pub fn teardown(&mut self) {
+        self.signal_stop();
     }
 }
 
 impl Drop for LegNode {
     fn drop(&mut self) {
-        for t in self.tasks.drain(..) {
-            t.abort();
-        }
-        self.unlink_listen_socket();
+        self.signal_stop();
     }
 }
 
@@ -384,8 +531,8 @@ fn transport_str(t: Transport) -> &'static str {
     }
 }
 
-fn connection_str(status: &NodeStatus) -> &'static str {
-    match status {
+fn connection_str(state: &NodeState) -> &'static str {
+    match state.status() {
         NodeStatus::Active => "connected",
         NodeStatus::Waiting { .. } => "waiting",
         NodeStatus::Faulted { .. } => "faulted",
@@ -417,7 +564,6 @@ struct SuperviseArgs {
     address: String,
     reconnect_initial_ms: u64,
     reconnect_max_ms: u64,
-    purge_on_reconnect: bool,
     channels: Vec<String>,
     send_receivers: Vec<SendReceiver>,
     recv_route: RecvRoute,
@@ -442,7 +588,15 @@ async fn supervise(mut a: SuperviseArgs) {
     // dials with backoff.
     let listener = match a.role {
         LegRole::Listen => match bind_listener(a.transport, &a.address).await {
-            Ok(l) => Some(l),
+            Ok(l) => {
+                // Record the inode this node actually created, so teardown unlinks
+                // its own artifact and nothing else (SEC-8).
+                if a.transport == Transport::Unix {
+                    let path = a.address.clone();
+                    a.shared.bound_unix_path.with_mut(|p| *p = Some(path));
+                }
+                Some(l)
+            }
             Err(e) => {
                 set_status(
                     &a.shared,
@@ -524,16 +678,24 @@ async fn supervise(mut a: SuperviseArgs) {
             }
         };
 
-        // Purge-on-reconnect: on a reconnect (not the first connection), the
-        // targetward source's backlog is outage-era stale (§7.4). Only the
-        // faces=host side carries a local targetward backlog to purge; the
-        // faces=target targetward arrives from the wire, so there is none.
-        if connected_before && a.purge_on_reconnect && a.faces == Facing::Host {
+        // Purge-on-reconnect, sending side: on a reconnect (not the first
+        // connection) this leg's local targetward backlog is outage-era stale
+        // (§6/§7.4), so it must not fire into a device that rebooted. Only the
+        // faces=host side has one *here* — a faces=host leg's send source is the
+        // arbitrated targetward stream of local writers, while a faces=target leg's
+        // send source is hostward device data, which §5 governs with drop-and-count
+        // at boundaries, not with purge. The faces=target side's targetward backlog
+        // arrives from the wire and is purged in `channel_targetward`, which owns it
+        // (LEG-3).
+        //
+        // The drain runs to *quiescence* via the shared helper — drain, yield,
+        // redrain, bounded rounds — because §6 names the case a single `try_recv`
+        // pass misses: "including a chunk held by a producer suspended mid-send"
+        // (DM-2/LEG-1). It is the same helper the serial node's purge uses, so the
+        // two instances of the one purge rule cannot drift again.
+        if connected_before && a.shared.purge_on_reconnect && a.faces == Facing::Host {
             for (_ch, rx, stat) in &mut a.send_receivers {
-                let mut purged = 0u64;
-                while let Ok(bytes) = rx.try_recv() {
-                    purged += bytes.len() as u64;
-                }
+                let purged = boundary::drain_to_quiescence(rx).await;
                 if purged > 0 {
                     stat.purged_on_reconnect
                         .set(stat.purged_on_reconnect.get() + purged);
@@ -558,23 +720,7 @@ async fn supervise(mut a: SuperviseArgs) {
         )
         .await;
 
-        // The connection dropped. Clear per-connection binding state (the node parks
-        // its channels until the next peer, faulted-and-wait) and pulse the
-        // disconnect signal so every faces=target channel task releases its
-        // on-demand write lock now rather than after the idle interval (§7.1).
-        for stat in a.stats.values() {
-            stat.bound.set(false);
-            stat.active.set(false);
-        }
-        a.shared.unbound.with_mut(|u| u.clear());
-        a.shared.peer_address.with_mut(|p| *p = None);
-        // Bump the epoch before pulsing so a channel task that missed the transient
-        // pulse (blocked in a backpressured local write) detects the drop after its
-        // write completes and releases the floor promptly (§7.1, LEG-4).
-        a.shared
-            .disconnect_epoch
-            .set(a.shared.disconnect_epoch.get() + 1);
-        a.shared.disconnect.notify_waiters();
+        clear_connection_state(&a.stats, &a.shared);
 
         a.shared
             .reconnect_count
@@ -592,6 +738,33 @@ async fn supervise(mut a: SuperviseArgs) {
             backoff.sleep().await;
         }
     }
+}
+
+/// The connection dropped: forget everything that describes *that peer*, and pulse
+/// the disconnect signal.
+///
+/// Binding is per-connection (§8), so the node parks its channels until the next
+/// peer arrives (faulted-and-wait). The handshake-derived fields go with it: a
+/// peerless leg reporting the departed peer's `protocol_version` and `capabilities`
+/// reads as a live handshake, which is exactly the stale state LEG-5 named — every
+/// field here is re-established by the next `handshake`/`bind_channels` pair.
+///
+/// The epoch is bumped *before* the pulse: `notify_waiters` stores no permit, so a
+/// channel task blocked in a backpressured local write misses the pulse and detects
+/// the drop by re-reading the epoch after its write instead (§7.1, LEG-4).
+fn clear_connection_state(stats: &Rc<HashMap<String, Rc<ChannelStat>>>, shared: &Rc<LegShared>) {
+    for stat in stats.values() {
+        stat.bound.set(false);
+        stat.active.set(false);
+    }
+    shared.unbound.with_mut(UnboundSet::clear);
+    shared.peer_address.with_mut(|p| *p = None);
+    shared.peer_version.set(None);
+    shared.peer_capabilities.set(0);
+    shared
+        .disconnect_epoch
+        .set(shared.disconnect_epoch.get() + 1);
+    shared.disconnect.notify_waiters();
 }
 
 /// Pump one connection: the socket write half drains the send source and the read
@@ -625,18 +798,33 @@ async fn pump(
                     }
                     // Fragment an over-large chunk into consecutive Data frames
                     // rather than drop it (§15.24); the peer reassembles per channel.
-                    for (piece_len, frame) in data_frames(ch.as_str(), &bytes) {
-                        if write_half.write_all(&frame).await.is_err() {
-                            return PumpEnd::PeerGone;
-                        }
-                        if let Some(stat) = stats.get(&ch) {
-                            let n = piece_len as u64;
-                            if send_is_hostward {
-                                stat.delivered_hostward
-                                    .set(stat.delivered_hostward.get() + n);
-                            } else {
-                                stat.accepted_targetward
-                                    .set(stat.accepted_targetward.get() + n);
+                    for item in data_frames(ch.as_str(), &bytes) {
+                        match item {
+                            DataFrame::Piece(piece_len, frame) => {
+                                if write_half.write_all(&frame).await.is_err() {
+                                    return PumpEnd::PeerGone;
+                                }
+                                if let Some(stat) = stats.get(&ch) {
+                                    let n = piece_len as u64;
+                                    if send_is_hostward {
+                                        stat.delivered_hostward
+                                            .set(stat.delivered_hostward.get() + n);
+                                    } else {
+                                        stat.accepted_targetward
+                                            .set(stat.accepted_targetward.get() + n);
+                                    }
+                                }
+                            }
+                            // The framer refused a piece and handed back the exact
+                            // source-byte tail that never reached the wire. Counting
+                            // it is the half of invariant 3 that says "count any
+                            // residual" — the old `map_while` shape truncated the
+                            // chunk in silence (RV-9).
+                            DataFrame::Residual(residual) => {
+                                if let Some(stat) = stats.get(&ch) {
+                                    stat.discarded_unframable
+                                        .set(stat.discarded_unframable.get() + residual as u64);
+                                }
                             }
                         }
                     }
@@ -712,33 +900,47 @@ async fn route_recv(
                     }
                     match sinks.get(ch) {
                         Some(chsinks) => {
+                            // The one shared hostward fan-out (§5, F1): it charges the
+                            // all-sinks-closed case to `unattached` itself, which is
+                            // exactly the case this loop used to swallow — an announced
+                            // channel whose local consumer was cascade-removed while the
+                            // leg lived on. An unconfigured identity has no `ChannelStat`
+                            // to charge, so its bytes go to a scratch counter and are
+                            // reported as `unbound` state instead (§8: announcements
+                            // never grow the graph).
+                            let scratch = Cell::new(0u64);
+                            let unattached: &dyn LossCounter = match stat {
+                                Some(s) => &s.discarded_hostward,
+                                None => &scratch,
+                            };
+                            let out = fan_out(&bytes, chsinks, unattached);
                             if let Some(s) = stat {
-                                s.delivered_hostward.set(s.delivered_hostward.get() + n);
-                            }
-                            for (tx, counters) in chsinks {
-                                match tx.try_send(bytes.clone()) {
-                                    Ok(()) => {}
-                                    Err(TrySendError::Full(_)) => {
-                                        counters.add_full(n);
-                                        if let Some(s) = stat {
-                                            s.discarded_hostward
-                                                .set(s.discarded_hostward.get() + n);
-                                        }
-                                    }
-                                    Err(TrySendError::Closed(_)) => {}
+                                if out.live {
+                                    s.delivered_hostward.set(s.delivered_hostward.get() + n);
                                 }
+                                // Per-channel mirror of the full-buffer loss the sinks'
+                                // own `DropCounters` already carry (§5).
+                                s.discarded_hostward
+                                    .set(s.discarded_hostward.get() + out.dropped_full);
                             }
                         }
-                        None => note_unbound(ch, stat, n, shared),
+                        None => note_undeliverable(ch, stat, n, shared, Undeliverable::Hostward),
                     }
                 }
                 RecvRoute::Target(txs) => match txs.get(ch) {
                     // The per-channel task counts accepted_targetward once the local
                     // device-write handoff accepts; here we just backpressure.
                     Some(tx) => {
-                        let _ = tx.send(bytes).await;
+                        // A closed queue means this channel's writer task is gone
+                        // (torn down). The bytes are lost either way; §5 wants the
+                        // loss counted where it happens rather than swallowed.
+                        if tx.send(bytes).await.is_err()
+                            && let Some(s) = stat
+                        {
+                            s.discarded_targetward.set(s.discarded_targetward.get() + n);
+                        }
                     }
-                    None => note_unbound(ch, stat, n, shared),
+                    None => note_undeliverable(ch, stat, n, shared, Undeliverable::Targetward),
                 },
             }
         }
@@ -758,27 +960,57 @@ async fn route_recv(
     }
 }
 
-/// Handle wire data for a channel with no local sink. A *configured* channel with
-/// no consumer bound is a §5 boundary drop — counted (like the serial node's
-/// discard-when-unattached). An *unconfigured* identity is `unbound` state — its
-/// bytes are dropped (§8: announcements never grow the graph) and the identity is
-/// surfaced for an operator.
-fn note_unbound(ch: &str, stat: Option<&Rc<ChannelStat>>, n: u64, shared: &Rc<LegShared>) {
+/// Which way the undeliverable wire data was travelling, and therefore which
+/// counter it is charged to. A `faces = host` leg's arriving data is hostward
+/// (device → local consumers); a `faces = target` leg's is targetward (remote
+/// operator → local graph). Charging both to `discarded_hostward` was LEG-4: the
+/// loss was counted, the direction was a lie.
+#[derive(Clone, Copy, Debug)]
+enum Undeliverable {
+    Hostward,
+    Targetward,
+}
+
+/// Handle wire data for a channel with no local edge behind it. A *configured*
+/// channel with no consumer bound is a §5 boundary drop — counted in its direction
+/// (like the serial node's discard-when-unattached). An *unconfigured* identity is
+/// `unbound` state — its bytes are dropped (§8: announcements never grow the graph)
+/// and the identity is surfaced, bounded, for an operator (LEG-2).
+fn note_undeliverable(
+    ch: &str,
+    stat: Option<&Rc<ChannelStat>>,
+    n: u64,
+    shared: &Rc<LegShared>,
+    direction: Undeliverable,
+) {
     if let Some(s) = stat {
-        s.discarded_hostward.set(s.discarded_hostward.get() + n);
-        return; // configured but unattached: dropped and counted, not "unbound"
+        // Configured but unattached: dropped and counted, not "unbound".
+        let counter = match direction {
+            Undeliverable::Hostward => &s.discarded_hostward,
+            Undeliverable::Targetward => &s.discarded_targetward,
+        };
+        counter.set(counter.get() + n);
+        return;
     }
-    shared.unbound.with_mut(|unbound| {
-        if !unbound.iter().any(|u| u == ch) {
-            unbound.push(ch.to_owned());
-        }
-    });
+    shared.unbound.with_mut(|unbound| unbound.insert(ch));
 }
 
 /// A faces=target channel's targetward task: hand each wire-arriving chunk into the
 /// local graph, gated on this leg's on-demand origin lock (§6). Acquires implicitly
 /// on data arrival and releases after `idle` *or* on peer disconnect (§7.1); the
-/// framed chunk is backpressured (`send().await`), never dropped.
+/// framed chunk is backpressured (`send().await`), never dropped — except by
+/// purge-on-reconnect, §6's one sanctioned targetward drain.
+///
+/// **The receiving side's purge (LEG-3).** The sending side of a leg is not the only
+/// place outage-era commands accumulate: this task owns a bounded queue of up to
+/// [`CHANNEL_CAP`] wire-arriving chunks plus the one it is currently writing, and
+/// nothing used to purge them — so §6/§7.4's guarantee ("twenty minutes of buffered
+/// commands must not fire into its boot prompt") held on computer A and quietly did
+/// not on computer B. The purge runs when the peer drops rather than when it
+/// returns: the pump is dead by then, so no fresh byte can be swallowed with the
+/// stale ones, and the memory is freed for the duration of the outage. Every drop
+/// here is counted into `purged_on_reconnect`, the same counter the sending side
+/// reports.
 async fn channel_targetward(
     mut rx: mpsc::Receiver<Chunk>,
     tx: mpsc::Sender<Chunk>,
@@ -788,6 +1020,7 @@ async fn channel_targetward(
     stat: Rc<ChannelStat>,
     shared: Rc<LegShared>,
 ) {
+    let purging = shared.purge_on_reconnect;
     let mut holding = false;
     loop {
         let msg = if holding {
@@ -799,8 +1032,12 @@ async fn channel_targetward(
                     continue;
                 }
                 // The peer dropped: yield the local endpoint's floor now, so a local
-                // operator is not blocked behind a vanished remote (§7.1).
+                // operator is not blocked behind a vanished remote (§7.1), and drop
+                // whatever the dead connection left queued (§6, LEG-3). `select!`
+                // may take this arm even with a chunk already queued, so the drain
+                // belongs here and not only on the blocked paths below.
                 _ = shared.disconnect.notified() => {
+                    purge_inbound(purging, &mut rx, 0, &stat).await;
                     release(&lock, id);
                     holding = false;
                     continue;
@@ -824,22 +1061,80 @@ async fn channel_targetward(
             return; // endpoint torn down or we cannot write
         }
         holding = true;
-        if tx.send(bytes).await.is_err() {
+        // The peer vanished while this chunk queued for a contended local lock: it is
+        // outage-era stale before it was ever written, so purge it here rather than
+        // acquiring the floor and firing it (§6, LEG-3).
+        if purging && shared.disconnect_epoch.get() != epoch {
+            purge_inbound(purging, &mut rx, n, &stat).await;
             release(&lock, id);
-            return; // the local endpoint is gone
+            holding = false;
+            continue;
         }
-        stat.accepted_targetward
-            .set(stat.accepted_targetward.get() + n);
+        // Race the (backpressured) local write against the peer's disconnect: a chunk
+        // still waiting on a full local queue when the peer vanishes is exactly the
+        // stale command §6 forbids delivering. `Sender::send` is cancel-safe — on the
+        // disconnect arm the chunk was *not* handed to the graph — so the purge count
+        // is exact. With purge-on-reconnect off, the operator asked for the backlog to
+        // survive the outage, so the write is not raced at all.
+        let sent = if purging {
+            tokio::select! {
+                r = tx.send(bytes) => Some(r),
+                _ = shared.disconnect.notified() => None,
+            }
+        } else {
+            Some(tx.send(bytes).await)
+        };
+        match sent {
+            Some(Ok(())) => stat
+                .accepted_targetward
+                .set(stat.accepted_targetward.get() + n),
+            Some(Err(_)) => {
+                release(&lock, id);
+                return; // the local endpoint is gone
+            }
+            None => {
+                purge_inbound(purging, &mut rx, n, &stat).await;
+                release(&lock, id);
+                holding = false;
+                continue;
+            }
+        }
         // The chunk is delivered (no targetward drop, §5); if the peer vanished
         // while we acquired or wrote, yield the local floor now rather than holding
-        // it behind a vanished remote until the idle interval (§7.1, LEG-4).
+        // it behind a vanished remote until the idle interval (§7.1, LEG-4), and
+        // drop the outage-era backlog behind it (§6, LEG-3).
         if shared.disconnect_epoch.get() != epoch {
+            purge_inbound(purging, &mut rx, 0, &stat).await;
             release(&lock, id);
             holding = false;
         }
     }
     if holding {
         release(&lock, id);
+    }
+}
+
+/// Drop this channel's outage-era targetward backlog, counting `in_flight` (the
+/// bytes of a chunk already taken from the queue and abandoned) along with it.
+///
+/// Draining runs to *quiescence* through the same shared helper the serial node and
+/// the leg's sending side use, so §6's "including a chunk held by a producer
+/// suspended mid-send" is honoured identically in all three places (DM-2/LEG-1). A
+/// no-op when purge-on-reconnect is off — then the backlog is the operator's
+/// declared intent.
+async fn purge_inbound(
+    purging: bool,
+    rx: &mut mpsc::Receiver<Chunk>,
+    in_flight: u64,
+    stat: &Rc<ChannelStat>,
+) {
+    if !purging {
+        return;
+    }
+    let purged = in_flight + boundary::drain_to_quiescence(rx).await;
+    if purged > 0 {
+        stat.purged_on_reconnect
+            .set(stat.purged_on_reconnect.get() + purged);
     }
 }
 
@@ -992,25 +1287,110 @@ fn bind_channels(
         unbound.clear();
         for id in &hello.channels {
             if !configured.contains(id.as_str()) {
-                unbound.push(id.0.clone());
+                // Through the same bounded insert as the data path: a hello is
+                // peer-supplied too, and announces as many identities as it likes
+                // (LEG-2).
+                unbound.insert(id.as_str());
             }
         }
     });
 }
 
+/// Record a status transition. [`NodeState::set`] re-stamps only on a real change,
+/// so a reconnect loop repeating the same fault reason keeps reporting the age of
+/// the fault rather than the age of the last retry (§7, STATE-1).
 fn set_status(shared: &Rc<LegShared>, status: NodeStatus) {
-    shared.status.with_mut(|s| *s = status);
+    shared.status.with_mut(|s| {
+        s.set(status);
+    });
 }
 
+/// Bind the `listen` role's socket.
+///
+/// The unix arm carries the leg's two filesystem obligations.
+///
+/// **Reclaiming** the address is conditional (SEC-8): the configured path is treated
+/// as an operator file until it is proven to be a stale socket of the kind a previous
+/// run left behind — see [`clear_stale_socket`].
+///
+/// **Narrowing** it is `apply_socket_perms`, the same one policy point the control
+/// socket uses (§10) — SEC-2: `bind(2)` creates the inode `0o777 & !umask`, which was
+/// observed as `srwxrwxr-x`, and the v1 wire has no authentication of its own, so
+/// every local user could dial the leg and write into its consoles. There is no group
+/// widen because `--socket-group` has no plumbing to a leg node: a leg is 0600, full
+/// stop.
+///
+/// The chmod lands *after* the bind, which leaves a window — a racer who knows the
+/// path and connects in the microseconds before it applies lands in the backlog and
+/// is accepted later. The alternative, a umask-guarded bind, closes that window and
+/// opens a worse one: `umask` is **process-global**, so a file or directory another
+/// thread creates inside the guard comes out narrowed too — and a directory created
+/// without its execute bits is not "tighter", it is broken. That was measured here,
+/// not theorized: under the guard a concurrently-created directory came out 0600 and
+/// the next bind inside it failed `EACCES`. The daemon has file-creating blocking
+/// threads (§15.19), so this is the same trade the control socket already made, with
+/// the same mitigation: the window is bounded by two adjacent synchronous syscalls,
+/// with no `.await` between them and the accept loop not yet running. Closing it
+/// properly wants `SO_PEERCRED` at accept, which is a policy addition rather than a
+/// permission fix.
 async fn bind_listener(transport: Transport, address: &str) -> std::io::Result<Listener> {
     match transport {
         Transport::Tcp => Ok(Listener::Tcp(TcpListener::bind(address).await?)),
         Transport::Unix => {
-            // A stale socket from a previous run would block the bind; unlink it
-            // first (the standard dance). A missing file is fine.
-            let _ = std::fs::remove_file(address);
-            Ok(Listener::Unix(UnixListener::bind(address)?))
+            clear_stale_socket(address).await?;
+            let listener = UnixListener::bind(address)?;
+            crate::apply_socket_perms(Path::new(address), None).map_err(std::io::Error::other)?;
+            Ok(Listener::Unix(listener))
         }
+    }
+}
+
+/// Make `address` bindable, or refuse — the `listen`+`unix` reclaim rule (SEC-8).
+///
+/// The former code unconditionally unlinked the configured address before binding,
+/// so a leg configured with `address = "/home/me/notes.txt"` deleted that file. Two
+/// conditions now gate the unlink, and both must hold:
+///
+/// 1. **It is a socket.** Checked with `symlink_metadata`, so a symlink is refused
+///    as itself rather than followed to whatever it names.
+/// 2. **Nobody is listening on it.** A stale socket refuses a dial immediately
+///    (`ECONNREFUSED`); a successful dial means another daemon owns this address, and
+///    unlinking it would silently steal the name while leaving that daemon accepting
+///    on an unreachable inode. An answer that is neither prompt nor a refusal is read
+///    as live, because that is the reading that fails safe.
+///
+/// Refusal is an error, which the supervisor turns into a faulted node with the
+/// reason in state — the §15.8 shape: an environmental problem changes state, never
+/// the graph.
+async fn clear_stale_socket(address: &str) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(address) {
+        Ok(md) => md,
+        // Nothing there: the ordinary first-bind path.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "exists and is not a unix socket; refusing to unlink it",
+        ));
+    }
+    match tokio::time::timeout(PEER_PROBE_TIMEOUT, UnixStream::connect(address)).await {
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(address)
+        }
+        Ok(Ok(_live_peer)) => Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "a peer is already listening there; refusing to take its address",
+        )),
+        Ok(Err(e)) => Err(std::io::Error::new(
+            e.kind(),
+            format!("probing the existing socket: {e}; refusing to unlink it"),
+        )),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "the existing socket did not refuse a dial promptly; refusing to unlink it",
+        )),
     }
 }
 
@@ -1025,5 +1405,386 @@ async fn connect_stream(
             Ok(Box::new(s))
         }
         Transport::Unix => Ok(Box::new(UnixStream::connect(address).await?)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A fresh, unique temp directory per call (tests may run in parallel). Kept
+    /// short: a Unix socket path is bounded at ~108 bytes (`SUN_LEN`).
+    fn unique_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("snx-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn shared() -> Rc<LegShared> {
+        Rc::new(LegShared::new(true))
+    }
+
+    fn stats_for(channels: &[&str]) -> Rc<HashMap<String, Rc<ChannelStat>>> {
+        Rc::new(
+            channels
+                .iter()
+                .map(|c| ((*c).to_owned(), Rc::new(ChannelStat::default())))
+                .collect(),
+        )
+    }
+
+    fn leg_config(name: &str, address: &str) -> NodeConfig {
+        toml::from_str(&format!(
+            r#"
+            type = "leg"
+            name = "{name}"
+            faces = "host"
+            transport = "unix"
+            role = "listen"
+            address = "{address}"
+            channels = ["console"]
+            "#
+        ))
+        .unwrap()
+    }
+
+    // LEG-2: an uncapped `Vec` let a peer streaming frames with fresh channel ids
+    // grow the leg's memory without limit. The cap holds, the earliest identities
+    // (the ones an operator is most likely acting on) are the ones kept, and the
+    // refusals are counted rather than silent.
+    #[test]
+    fn unbound_identities_are_capped_and_the_overflow_counted() {
+        let mut set = UnboundSet::default();
+        for i in 0..MAX_UNBOUND + 50 {
+            set.insert(&format!("ch-{i}"));
+        }
+        assert_eq!(set.order.len(), MAX_UNBOUND);
+        assert_eq!(set.seen.len(), MAX_UNBOUND);
+        assert_eq!(set.overflow, 50);
+        // Insertion order is stable, so two `state` snapshots diff meaningfully.
+        assert_eq!(set.order[0], "ch-0");
+        assert_eq!(
+            set.order[MAX_UNBOUND - 1],
+            format!("ch-{}", MAX_UNBOUND - 1)
+        );
+    }
+
+    // A repeat of an identity already recorded is not an overflow — the counter
+    // reports refusals to *record*, so a peer hammering one unconfigured channel
+    // does not look like a peer inventing identities.
+    #[test]
+    fn a_repeated_unbound_identity_is_neither_duplicated_nor_counted() {
+        let mut set = UnboundSet::default();
+        for _ in 0..1000 {
+            set.insert("ch-a");
+        }
+        assert_eq!(set.order, vec!["ch-a".to_owned()]);
+        assert_eq!(set.overflow, 0);
+
+        // …including once the cap is reached.
+        for i in 0..MAX_UNBOUND * 2 {
+            set.insert(&format!("ch-{i}"));
+        }
+        let after = set.overflow;
+        set.insert("ch-a");
+        assert_eq!(
+            set.overflow, after,
+            "a recorded identity is never an overflow"
+        );
+    }
+
+    // LEG-2: the wire admits identities far longer than any operator writes, and
+    // `state` must not imply the peer sent the shortened name.
+    #[test]
+    fn a_long_unbound_identity_is_truncated_with_a_marker() {
+        let long = "z".repeat(MAX_UNBOUND_ID_LEN * 4);
+        let mut set = UnboundSet::default();
+        set.insert(&long);
+        assert_eq!(set.order.len(), 1);
+        let stored = &set.order[0];
+        assert!(stored.ends_with(TRUNCATION_MARKER), "{stored}");
+        assert_eq!(
+            stored.len(),
+            MAX_UNBOUND_ID_LEN + TRUNCATION_MARKER.len(),
+            "the stored identity is bounded, not merely marked"
+        );
+        // Two distinct over-long identities sharing a prefix collapse to one entry —
+        // acceptable: the list prompts an operator, it is not a channel registry.
+        set.insert(&format!("{long}-and-more"));
+        assert_eq!(set.order.len(), 1);
+    }
+
+    // Truncation must land on a `char` boundary: the identity is peer-supplied UTF-8
+    // and a split code point would not survive JSON.
+    #[test]
+    fn truncation_lands_on_a_char_boundary() {
+        // 3 bytes each, so the cap falls mid-character for some prefix lengths.
+        for pad in 0..4 {
+            let id = format!("{}{}", "a".repeat(pad), "€".repeat(MAX_UNBOUND_ID_LEN));
+            let stored = truncate_identity(&id).into_owned();
+            assert!(stored.ends_with(TRUNCATION_MARKER));
+            // The mere fact that it is a `String` proves boundary-correctness; assert
+            // the body round-trips as the prefix it claims to be.
+            let body = stored.strip_suffix(TRUNCATION_MARKER).unwrap();
+            assert!(id.starts_with(body), "{body} is not a prefix of the input");
+            assert!(body.len() <= MAX_UNBOUND_ID_LEN);
+        }
+    }
+
+    // A short identity is borrowed untouched — the common case allocates nothing.
+    #[test]
+    fn a_short_identity_is_not_rewritten() {
+        assert!(matches!(truncate_identity("console"), Cow::Borrowed(_)));
+    }
+
+    // LEG-4: wire data for a configured channel with no writable local edge was
+    // charged to `discarded_hostward` regardless of which way it was travelling. The
+    // loss was real; the direction was a lie.
+    #[test]
+    fn undeliverable_data_is_charged_to_its_own_direction() {
+        let shared = shared();
+        let stats = stats_for(&["console"]);
+        let stat = stats.get("console").cloned();
+
+        note_undeliverable(
+            "console",
+            stat.as_ref(),
+            7,
+            &shared,
+            Undeliverable::Hostward,
+        );
+        note_undeliverable(
+            "console",
+            stat.as_ref(),
+            11,
+            &shared,
+            Undeliverable::Targetward,
+        );
+
+        let stat = stat.unwrap();
+        assert_eq!(stat.discarded_hostward.get(), 7);
+        assert_eq!(stat.discarded_targetward.get(), 11);
+        // A configured channel is never "unbound", whichever way its bytes went.
+        assert_eq!(shared.unbound.with(|u| u.order.len()), 0);
+    }
+
+    // The unconfigured-identity arm records state instead of a counter (§8:
+    // announcements never grow the graph) — through the bounded insert.
+    #[test]
+    fn an_unconfigured_identity_becomes_bounded_unbound_state() {
+        let shared = shared();
+        for i in 0..MAX_UNBOUND + 3 {
+            note_undeliverable(
+                &format!("ch-{i}"),
+                None,
+                4,
+                &shared,
+                Undeliverable::Hostward,
+            );
+        }
+        shared.unbound.with(|u| {
+            assert_eq!(u.order.len(), MAX_UNBOUND);
+            assert_eq!(u.overflow, 3);
+        });
+    }
+
+    // LEG-5: `protocol_version` and `capabilities` outlived the connection that
+    // established them, so a peerless leg reported a live handshake. Everything that
+    // describes *that peer* goes when the peer does.
+    #[test]
+    fn a_dropped_connection_clears_the_handshake_state() {
+        let shared = shared();
+        let stats = stats_for(&["console"]);
+        // Simulate a connected, reconciled session.
+        shared.peer_version.set(Some(WIRE_VERSION));
+        shared.peer_capabilities.set(0b1011);
+        shared
+            .peer_address
+            .with_mut(|p| *p = Some("unix".to_owned()));
+        shared.unbound.with_mut(|u| {
+            u.insert("ch-they-offered");
+            u.overflow = 9;
+        });
+        stats["console"].bound.set(true);
+        stats["console"].active.set(true);
+        let epoch = shared.disconnect_epoch.get();
+
+        clear_connection_state(&stats, &shared);
+
+        assert_eq!(shared.peer_version.get(), None);
+        assert_eq!(shared.peer_capabilities.get(), 0);
+        assert_eq!(shared.peer_address.with(|p| p.clone()), None);
+        shared.unbound.with(|u| {
+            assert!(u.order.is_empty());
+            assert!(u.seen.is_empty());
+            assert_eq!(u.overflow, 0);
+        });
+        assert!(!stats["console"].bound.get());
+        assert!(!stats["console"].active.get());
+        // The epoch bump is what a channel task blocked in a local write reads
+        // (§7.1, LEG-4) — and now also its cue to purge (LEG-3).
+        assert_eq!(shared.disconnect_epoch.get(), epoch + 1);
+    }
+
+    // STATE-1: §7 wants "a status of active | waiting | faulted with reason and
+    // timestamp", and the stamp must age with the *condition*, not with the retry
+    // loop that keeps re-reporting it.
+    #[test]
+    fn a_repeated_fault_reason_does_not_restamp_the_status() {
+        let shared = shared();
+        set_status(
+            &shared,
+            NodeStatus::Faulted {
+                reason: "connect: refused".to_owned(),
+            },
+        );
+        let first = shared.status.with(NodeState::since_unix_ms);
+        set_status(
+            &shared,
+            NodeStatus::Faulted {
+                reason: "connect: refused".to_owned(),
+            },
+        );
+        assert_eq!(shared.status.with(NodeState::since_unix_ms), first);
+        assert_eq!(shared.status.with(connection_str), "faulted");
+        set_status(&shared, NodeStatus::Active);
+        assert_eq!(shared.status.with(connection_str), "connected");
+    }
+
+    // The new counters and the overflow are reachable in `state`, which is where an
+    // operator (and every itest) reads them — a counter nobody can see is not one.
+    #[test]
+    fn state_extra_surfaces_the_new_counters() {
+        let node = LegNode::create(&leg_config("up", "/tmp/never-bound.sock"));
+        node.stats["console"].discarded_targetward.set(3);
+        node.stats["console"].discarded_unframable.set(5);
+        node.shared.unbound.with_mut(|u| u.overflow = 12);
+
+        let state = node.state_extra();
+        assert_eq!(state["unbound_overflow"], json!(12));
+        let ch = &state["channels"]["console"];
+        assert_eq!(ch["discarded_targetward"], json!(3));
+        assert_eq!(ch["discarded_unframable"], json!(5));
+        // A leg with no peer reports no handshake (LEG-5's steady state).
+        assert_eq!(state["protocol_version"], Value::Null);
+    }
+
+    // SEC-2: the v1 wire has no authentication (§9), so the path is the whole gate —
+    // it must be no wider than the control socket's 0600 (§10).
+    #[tokio::test]
+    async fn a_listen_unix_leg_binds_its_socket_0600() {
+        let dir = unique_dir("legsec2");
+        let path = dir.join("leg.sock");
+        let address = path.to_str().unwrap();
+
+        let listener = bind_listener(Transport::Unix, address).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "observed {mode:o}");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // SEC-8: the configured address is an operator file until proven to be a stale
+    // socket. A leg pointed at `notes.txt` used to delete it.
+    #[tokio::test]
+    async fn a_non_socket_address_is_refused_and_left_alone() {
+        let dir = unique_dir("legsec8a");
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, b"important").unwrap();
+        let address = path.to_str().unwrap();
+
+        let err = bind_listener(Transport::Unix, address).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"important");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A symlink is refused *as itself* — `symlink_metadata`, not `metadata`, so the
+    // check cannot be talked into following a link to something valuable.
+    #[tokio::test]
+    async fn a_symlink_address_is_refused_without_being_followed() {
+        let dir = unique_dir("legsec8b");
+        let target = dir.join("target.sock");
+        let link = dir.join("link.sock");
+        // Even when the link points at a real, dead socket: the address itself is
+        // not a socket, so it is not ours to unlink.
+        let listener = tokio::net::UnixListener::bind(&target).unwrap();
+        drop(listener);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = bind_listener(Transport::Unix, link.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(std::fs::symlink_metadata(&link).is_ok(), "link survives");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // SEC-8: a socket somebody is listening on belongs to that somebody. Unlinking
+    // it would take the name and leave them accepting on an unreachable inode.
+    #[tokio::test]
+    async fn a_live_socket_is_not_stolen() {
+        let dir = unique_dir("legsec8c");
+        let path = dir.join("leg.sock");
+        let address = path.to_str().unwrap();
+        let incumbent = tokio::net::UnixListener::bind(&path).unwrap();
+
+        let err = bind_listener(Transport::Unix, address).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        // The incumbent is still reachable at its address.
+        assert!(tokio::net::UnixStream::connect(&path).await.is_ok());
+        drop(incumbent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // …and the stale-socket case the original unconditional unlink existed to
+    // handle still works: a socket nobody listens on refuses a dial, and is cleared.
+    #[tokio::test]
+    async fn a_stale_socket_is_still_reclaimed() {
+        let dir = unique_dir("legsec8d");
+        let path = dir.join("leg.sock");
+        let address = path.to_str().unwrap();
+        drop(tokio::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists(), "neither std nor tokio unlinks on drop");
+
+        let listener = bind_listener(Transport::Unix, address).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // SEC-8, teardown half: the unlink is keyed on what this node actually bound,
+    // not on what it was configured with — so a leg that never bound (or that was
+    // refused) removes nothing.
+    #[test]
+    fn teardown_unlinks_only_a_socket_this_node_bound() {
+        let dir = unique_dir("legsec8e");
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, b"important").unwrap();
+
+        let mut node = LegNode::create(&leg_config("up", path.to_str().unwrap()));
+        node.teardown();
+        assert_eq!(std::fs::read(&path).unwrap(), b"important");
+
+        // Once a bind is recorded, teardown does remove it — exactly once.
+        std::fs::write(&path, b"pretend-socket").unwrap();
+        let recorded = path.to_str().unwrap().to_owned();
+        node.shared
+            .bound_unix_path
+            .with_mut(|p| *p = Some(recorded.clone()));
+        node.teardown();
+        assert!(!path.exists());
+        std::fs::write(&path, b"recreated by someone else").unwrap();
+        node.teardown();
+        assert!(path.exists(), "the record is taken, so the unlink is once");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

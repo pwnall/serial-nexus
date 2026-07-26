@@ -60,6 +60,18 @@ pub enum WriteMode {
     Held,
 }
 
+impl fmt::Display for WriteMode {
+    /// The configuration spelling (the serde `kebab-case` form), so a validation
+    /// message quotes back exactly what the operator wrote.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteMode::Never => f.write_str("never"),
+            WriteMode::OnDemand => f.write_str("on-demand"),
+            WriteMode::Held => f.write_str("held"),
+        }
+    }
+}
+
 /// Per-host-facing-endpoint arbitration policy (§6). Defaults to exclusive;
 /// free-for-all is the escape hatch for machine-to-machine links coordinated
 /// elsewhere.
@@ -75,6 +87,18 @@ pub enum Arbitration {
 /// channels use their channel identity instead; the display form of the sole
 /// endpoint is just the node name (§3).
 pub const DEFAULT_ENDPOINT: &str = "";
+
+/// The byte ceiling on a node name and on a channel identity (§3).
+///
+/// Generous for a human-chosen label and deliberately far below the wire's frame
+/// bound: a channel identity is carried in every envelope frame's header, so the
+/// per-frame payload is the frame size minus the header *minus the identity*. An
+/// unbounded identity therefore shrinks the payload to zero and makes the shared
+/// fragmentation helper unable to place a single byte — the only route by which its
+/// residual can be non-zero, and one §5 would then have to account for rather than
+/// prevent. 256 bytes leaves the payload within a byte or two of its maximum while
+/// making that failure mode unreachable by construction (§9 clause 4, §15.24).
+pub const MAX_NAME_LEN: usize = 256;
 
 /// Address of an endpoint: a node name plus a local endpoint name. Single
 /// endpoint nodes use [`DEFAULT_ENDPOINT`]; codec/leg channels use their
@@ -254,6 +278,94 @@ pub enum ValidationError {
     /// names must be non-empty; channel identities are barred from emptiness by
     /// the default-endpoint collision ([`Self::DuplicateEndpoint`]).
     EmptyName { node: String },
+    /// A node name or channel identity is non-empty but consists only of
+    /// whitespace. §12 states the rule for identity *fields* ("empty or
+    /// whitespace-only fields are malformed"); it holds just as hard for names,
+    /// because a node called `" "` renders indistinguishably from every other
+    /// blank name in `state`, `dump`, and every message that quotes it — the same
+    /// §11 legality clause ("no empties") the empty-name rejection serves. The
+    /// *reserved* empty default-endpoint name is untouched: only a declared,
+    /// non-empty, all-whitespace name is caught. `endpoint` is `None` when the
+    /// offender is the node's own name, `Some` when it is a channel identity.
+    BlankName {
+        node: String,
+        endpoint: Option<String>,
+    },
+    /// A node name or channel identity longer than [`MAX_NAME_LEN`]. Names are
+    /// operator-chosen labels (§3), so the cap is generous by any human standard —
+    /// but it is load-bearing rather than cosmetic: a channel identity travels
+    /// *inside every envelope frame's header*, so a pathologically long one shrinks
+    /// the per-frame payload to nothing and the targetward framer can no longer fit
+    /// a single byte. That is the one way the fragmentation helper's residual can be
+    /// non-zero, which §5's no-drop obligation then has to count rather than
+    /// prevent. Capping the name here makes the residual unreachable by
+    /// construction instead of merely pathological (§5, §9 clause 4, §15.24).
+    NameTooLong {
+        node: String,
+        endpoint: Option<String>,
+        len: usize,
+        max: usize,
+    },
+    /// A numeric configuration field is outside the range that is structurally
+    /// meaningful for it. Numeric knobs are range-checked at *validation* time —
+    /// before anything is created and, under `load --replace`, before the running
+    /// graph is torn down (§11 load atomicity, §15.26) — because the alternative is
+    /// a value that loads cleanly and then kills the daemon: an unbounded
+    /// `replay_ring` aborts the process on the first hostward byte (the ring
+    /// allocates lazily) and, since `load` persists configuration, crash-loops on
+    /// every restart; an unbounded `hostward_buffer` panics inside tokio's bounded
+    /// channel *after* `--replace` has already torn the good graph down. `field` is
+    /// the configuration key; `min`/`max` bound it inclusively.
+    NumericOutOfRange {
+        node: String,
+        field: &'static str,
+        value: u64,
+        min: u64,
+        max: u64,
+    },
+    /// A serial node declares `faces = "target"`. §7.1 describes the role (the port
+    /// used as an output leg toward another machine's tools) but no wiring for it
+    /// exists: such a node opens the device, takes `TIOCEXCL`, and is attached to
+    /// nothing — a held-hostage port with no data path and no diagnostic. Refused
+    /// structurally until the role is implemented; it is deferred work (§14).
+    SerialFacesTarget { node: String },
+    /// An edge feeds a codec (or exec) node's *multiplexed* endpoint — its default,
+    /// empty-named endpoint (§7.5/§7.6) — with a write mode that is neither `held`
+    /// nor `never`. The multiplexed side's targetward pump is a held-origin pump:
+    /// it is gated by the lock's held reclaim, which by construction only ever
+    /// grants a `Held` origin, so an `on-demand` origin parks on its first chunk
+    /// forever while `send` reports success. That silently swallows targetward
+    /// bytes, which §5 forbids outright, so the constraint is structural and the
+    /// operator is told rather than left to hunt a stall.
+    MultiplexedEdgeNotHeld {
+        edge: usize,
+        origin: EndpointAddr,
+        mux: EndpointAddr,
+        write_mode: WriteMode,
+    },
+    /// Two effectively-`held` edges attach to one host-facing endpoint. `held`
+    /// means "acquire-on-attach, held indefinitely" (§6), which two origins cannot
+    /// both have: one wins arbitrarily, the loser can never write, is not even
+    /// queued as a waiter, and nothing in `state` says so. "Effectively" counts the
+    /// runtime promotions ([`crate::config::GraphConfig::effective_write_mode`]),
+    /// so the reachable case — two maps on one upstream endpoint with `write_mode`
+    /// written nowhere — is caught too. Endpoints whose node is `free-for-all` are
+    /// exempt: there is no lock there, so two held writers are a deliberate choice.
+    ConflictingHeldEdges {
+        endpoint: EndpointAddr,
+        first: EndpointAddr,
+        second: EndpointAddr,
+    },
+    /// A configuration parsed to an entirely empty graph. Harmless on its own, but
+    /// `load --replace` composes teardown-then-load (§11), so an empty parse of a
+    /// non-empty source file — a comment-only file, or a mis-typed table name —
+    /// turns `--replace` into an unannounced `teardown` that reports success. The
+    /// operators-own-the-graph invariant (§15.8) is what makes `--replace` safe;
+    /// this is the one input that quietly breaks it. Raised by the `load` path
+    /// (which alone knows whether the source text was non-empty), never by
+    /// [`GraphModel::validate`] — an empty graph is a legal graph, and `teardown`
+    /// persists one deliberately.
+    EmptyConfig,
     /// Two of a node's endpoints share a local name — a multi-endpoint node (a
     /// codec) with a duplicate channel identity, or a channel identity colliding
     /// with the reserved multiplexed-side default endpoint (an empty identity,
@@ -326,6 +438,98 @@ impl fmt::Display for ValidationError {
                 write!(
                     f,
                     "a node has an empty name, which is reserved for default endpoints and forbidden as a node name (§3, §11)"
+                )
+            }
+            ValidationError::BlankName {
+                node,
+                endpoint: None,
+            } => {
+                write!(
+                    f,
+                    "node name {node:?} is whitespace-only, which is as unusable as an empty name (§3, §11, §12)"
+                )
+            }
+            ValidationError::BlankName {
+                node,
+                endpoint: Some(channel),
+            } => {
+                write!(
+                    f,
+                    "channel identity {channel:?} on node {node:?} is whitespace-only, which is as unusable as an empty identity (§3, §11, §12)"
+                )
+            }
+            ValidationError::NameTooLong {
+                node,
+                endpoint: None,
+                len,
+                max,
+            } => {
+                write!(
+                    f,
+                    "node name {node:?} is {len} bytes, above the {max}-byte limit for names and identities (§3)"
+                )
+            }
+            ValidationError::NameTooLong {
+                node,
+                endpoint: Some(channel),
+                len,
+                max,
+            } => {
+                write!(
+                    f,
+                    "channel identity {channel:?} on node {node:?} is {len} bytes, above the {max}-byte limit — an identity rides in every frame header, so an oversize one leaves no room for payload (§3, §9)"
+                )
+            }
+            ValidationError::NumericOutOfRange {
+                node,
+                field,
+                value,
+                min,
+                max,
+            } => {
+                if value < min {
+                    write!(
+                        f,
+                        "node {node:?} declares {field} = {value}, below the minimum {min} (a numeric field is range-checked before anything is created, §11)"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "node {node:?} declares {field} = {value}, above the maximum {max} (a numeric field is range-checked before anything is created, §11)"
+                    )
+                }
+            }
+            ValidationError::SerialFacesTarget { node } => {
+                write!(
+                    f,
+                    "serial node {node:?} declares faces = \"target\", which is not implemented — the node would seize the port with TIOCEXCL and be wired to nothing (deferred work, §7.1/§14)"
+                )
+            }
+            ValidationError::MultiplexedEdgeNotHeld {
+                edge,
+                origin,
+                mux,
+                write_mode,
+            } => {
+                write!(
+                    f,
+                    "edge {edge} ({origin} -> {mux}) feeds a codec's multiplexed endpoint with write_mode = \"{write_mode}\"; only \"held\" or \"never\" work there, because the multiplexed side's targetward pump is only ever granted the lock as a held origin — any other mode parks forever while `send` reports success (§5, §7.5/§7.6)"
+                )
+            }
+            ValidationError::ConflictingHeldEdges {
+                endpoint,
+                first,
+                second,
+            } => {
+                write!(
+                    f,
+                    "host-facing endpoint {endpoint} has two held origins ({first} and {second}); \"held\" means acquire-on-attach and held indefinitely, which only one origin can have — the loser could never write and would not even appear as a waiter (§6)"
+                )
+            }
+            ValidationError::EmptyConfig => {
+                write!(
+                    f,
+                    "the configuration declares no nodes and no edges, but its source was not empty — with --replace that would silently tear the running graph down (§11, §15.8)"
                 )
             }
             ValidationError::DuplicateNodeName { node } => {
@@ -443,10 +647,30 @@ impl GraphModel {
                 // incremental add-node path, which both validate a model.
                 errors.push(ValidationError::EmptyName { node: node.clone() });
             }
+            // §11 legality, second half: a name that is non-empty but *all
+            // whitespace* is the empty name wearing a costume — it renders blank in
+            // `state`, in `dump`, and in every error that quotes it, and two of them
+            // are indistinguishable to an operator. §12 already states the rule for
+            // identity fields; it is a naming rule, so it is enforced here for node
+            // names and channel identities alike.
+            if !node.is_empty() && node.trim().is_empty() {
+                errors.push(ValidationError::BlankName {
+                    node: node.clone(),
+                    endpoint: None,
+                });
+            }
             if node.contains('/') {
                 errors.push(ValidationError::InvalidName {
                     node: node.clone(),
                     endpoint: None,
+                });
+            }
+            if node.len() > MAX_NAME_LEN {
+                errors.push(ValidationError::NameTooLong {
+                    node: node.clone(),
+                    endpoint: None,
+                    len: node.len(),
+                    max: MAX_NAME_LEN,
                 });
             }
             // Endpoint names must be locally unique: a codec is the first node kind
@@ -460,6 +684,25 @@ impl GraphModel {
                     errors.push(ValidationError::InvalidName {
                         node: node.clone(),
                         endpoint: Some(ep.name.clone()),
+                    });
+                }
+                // Whitespace-only channel identity, same rule as the node name
+                // above. The `!is_empty()` guard is load-bearing: the *empty* local
+                // name is the reserved default endpoint every single-endpoint node
+                // and every codec/map carries, and it must stay legal — only an
+                // operator-declared identity can be blank.
+                if !ep.name.is_empty() && ep.name.trim().is_empty() {
+                    errors.push(ValidationError::BlankName {
+                        node: node.clone(),
+                        endpoint: Some(ep.name.clone()),
+                    });
+                }
+                if ep.name.len() > MAX_NAME_LEN {
+                    errors.push(ValidationError::NameTooLong {
+                        node: node.clone(),
+                        endpoint: Some(ep.name.clone()),
+                        len: ep.name.len(),
+                        max: MAX_NAME_LEN,
                     });
                 }
                 if !seen.insert(ep.name.as_str()) {
@@ -881,6 +1124,116 @@ mod tests {
                 .any(|e| matches!(e, ValidationError::InvalidName { .. })),
             "legal names must not trip the slash check, got {errs:?}"
         );
+    }
+
+    #[test]
+    fn whitespace_only_names_are_rejected() {
+        // §11 legality / §12's spelling rule: a name that is non-empty but all
+        // whitespace is the empty name in disguise — blank in `state`, blank in
+        // `dump`, blank in every error that quotes it. Both a node name and a
+        // channel identity are covered, and the offender is named.
+        let mut g = GraphModel::new();
+        g.add_node("   ", NodeShape::single(Facing::Host));
+        g.add_node("mux", NodeShape::new(vec![EndpointSpec::host("\t")]));
+        let errs = g.validate();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::BlankName { node, endpoint: None } if node == "   "
+            )),
+            "expected BlankName for a whitespace node name, got {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::BlankName { node, endpoint: Some(c) }
+                    if node == "mux" && c == "\t"
+            )),
+            "expected BlankName for a whitespace channel identity, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn the_reserved_empty_default_endpoint_stays_legal() {
+        // The blank-name rule must not touch the *reserved* empty local name every
+        // single-endpoint node (and every codec's multiplexed side) carries — only
+        // an operator-declared, non-empty, all-whitespace identity is an offender.
+        let errs = fanout_graph().validate();
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::BlankName { .. })),
+            "default endpoints must not trip the blank-name check, got {errs:?}"
+        );
+        // And an empty *node* name still reports as EmptyName, not BlankName, so the
+        // two messages stay distinguishable.
+        let mut g = GraphModel::new();
+        g.add_node("", NodeShape::single(Facing::Host));
+        let errs = g.validate();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::EmptyName { .. }))
+                && !errs
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::BlankName { .. })),
+            "an empty node name is EmptyName, never BlankName: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn an_oversize_name_or_identity_is_rejected() {
+        // A channel identity rides in every envelope frame's header, so an
+        // unbounded one leaves no room for payload and the shared fragmentation
+        // helper cannot place a byte — the only way its residual goes non-zero
+        // (§5, §9 clause 4). The cap makes that unreachable rather than merely
+        // pathological, and it applies to node names for the same §3 reason.
+        let long = "c".repeat(MAX_NAME_LEN + 1);
+        let mut m = GraphModel::new();
+        m.add_node(
+            long.clone(),
+            NodeShape::new(vec![EndpointSpec::host(DEFAULT_ENDPOINT)]),
+        );
+        m.add_node("mux", NodeShape::new(vec![EndpointSpec::host(&long)]));
+        let errs = m.validate();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::NameTooLong { node, endpoint: None, len, max }
+                    if node == &long && *len == MAX_NAME_LEN + 1 && *max == MAX_NAME_LEN
+            )),
+            "expected NameTooLong for the node name, got {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::NameTooLong { node, endpoint: Some(c), .. }
+                    if node == "mux" && c == &long
+            )),
+            "expected NameTooLong for the channel identity, got {errs:?}"
+        );
+
+        // Exactly at the cap is legal — the bound is a ceiling, not a fence.
+        let at_cap = "c".repeat(MAX_NAME_LEN);
+        let mut ok = GraphModel::new();
+        ok.add_node(
+            at_cap.clone(),
+            NodeShape::new(vec![EndpointSpec::host(DEFAULT_ENDPOINT)]),
+        );
+        assert!(
+            !ok.validate()
+                .iter()
+                .any(|e| matches!(e, ValidationError::NameTooLong { .. })),
+            "a name exactly at the cap must be accepted"
+        );
+    }
+
+    #[test]
+    fn write_mode_displays_its_configuration_spelling() {
+        // Validation messages quote the mode back to the operator, so the Display
+        // form must be the kebab-case configuration spelling, not the Rust variant.
+        assert_eq!(WriteMode::Never.to_string(), "never");
+        assert_eq!(WriteMode::OnDemand.to_string(), "on-demand");
+        assert_eq!(WriteMode::Held.to_string(), "held");
     }
 
     #[test]

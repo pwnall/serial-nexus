@@ -12,6 +12,24 @@ Methods on this page: [`lock`](#lock), [`unlock`](#unlock), [`send`](#send). The
 [`LockSnapshot`](observation.md#locksnapshot) that `state` and notifications
 report is documented on the observation page.
 
+> **The two waiting verbs, and the rules that come with them.** `lock` with
+> `wait` and `send` are the only verbs that can suspend, and a connection runs
+> **one of them at a time**. A request pipelined onto a connection whose waiting
+> verb is still parked is answered `-32006` (`a waiting verb is already in flight
+> on this connection; only one is supported at a time — open a second connection,
+> or retry once it resolves`), carrying that request's own `id`; the parked verb
+> is untouched and still answers when it resolves. Concurrent work wants a second
+> connection.
+>
+> Reading **end-of-file** on the connection is the other case, and it is not the
+> same: it *cancels* the parked verb and closes the connection, because a killed
+> `lock --wait` client must leave the FIFO queue promptly and a half-close is
+> indistinguishable from a killed client at read time (§15.20). A raw client must
+> therefore keep its write half open across a waiting verb — `nc -N -U` gets no
+> reply at all — which is why the one-shot `nc -N -U` idiom used elsewhere on
+> these pages does not apply to a contended `lock --wait` or `send`.
+> `serialnexusctl` keeps both halves open.
+
 > **`lock`/`unlock` name the ORIGIN; `send` names the ENDPOINT.** A lock belongs
 > to an endpoint, but an origin (a target-facing writer) feeds exactly one
 > endpoint, so `lock`/`unlock` address it by the origin that wants to write.
@@ -53,7 +71,11 @@ re-arms (renews) the lease.
 
 The `held`/`acquired` combinations: a fresh grant is `held: true, acquired:
 true`; an idempotent re-lock by the current holder is `held: true, acquired:
-false`; a steal is `held: true, acquired: true` plus `stole_from`.
+false`; a steal is `held: true, acquired: true` plus `stole_from`. A `steal` by
+the origin that *already* holds the lock is the same no-op as the re-lock —
+`held: true, acquired: false, stole_from: null` — and deliberately so: it must
+not purge the holder's own in-flight bytes or void its lease by bumping the grant
+generation. A `lease_ms` given on either no-op path re-arms the lease.
 
 ### CLI
 
@@ -73,12 +95,15 @@ Note the CLI spelling `--lease-ms` maps to the `lease_ms` param.
   endpoint is torn down while a `--wait` acquire is parked.
 * `-32602` — missing `origin`, an origin that is not a writable origin on any
   endpoint, or an origin whose write mode is `never` (it cannot hold the lock).
+* `-32006` (waiting verb in flight) — answered to a request *pipelined behind* a
+  parked `--wait` acquire on the same connection, not to the acquire itself; the
+  acquire keeps waiting. See the note at the top of this page.
 
 ### Example
 
 ```console
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"lock","params":{"origin":"demux","steal":true}}' \
-    | nc -U "$SOCK" | jq .result
+    | nc -N -U "$SOCK" | jq .result
 {
   "origin": "demux",
   "held": true,
@@ -129,7 +154,7 @@ $ serialnexusctl unlock demux
 
 ```console
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"unlock","params":{"origin":"demux"}}' \
-    | nc -U "$SOCK" | jq .result
+    | nc -N -U "$SOCK" | jq .result
 {
   "origin": "demux",
   "released": true
@@ -162,7 +187,7 @@ even if the call times out or the connection drops.
 | --- | --- | --- |
 | `endpoint` | string | the endpoint named |
 | `sent` | integer | bytes written targetward, including the appended newline |
-| `delivered` | bool | whether the bytes reached the targetward channel |
+| `delivered` | bool | always `true` on success — the bytes reached the endpoint's targetward channel. Failing to reach it is an error, not a `false` result (see below) |
 
 ### CLI
 
@@ -177,18 +202,24 @@ The CLI spelling `--timeout-ms` maps to `timeout_ms`.
 ### Errors
 
 * `-32003` (locked) — the endpoint stayed locked until `timeout_ms` elapsed
-  (`endpoint … is locked; send timed out`), or was torn down while sending. This
-  path carries no `data.held_by`.
-* `-32602` — missing `endpoint`/`line`, or an `endpoint` that is not a
-  host-facing endpoint with a write lock.
-* `-32603` — the endpoint's targetward channel was closed (nothing to deliver
-  to).
+  (`endpoint "usb0" is locked; send timed out`), or was torn down while sending
+  (`endpoint "usb0" was torn down while sending` — also the answer if the
+  targetward channel closes between the pre-flight check and delivery). This path
+  carries no `data.held_by`.
+* `-32602` — missing `endpoint`/`line`; an `endpoint` that is not a host-facing
+  endpoint with a write lock; or an endpoint that advertises a targetward path it
+  cannot use (`endpoint "mux/c0" cannot accept targetward writes (its interior
+  node has no writable path to the device)`) — a read-only or unattached interior
+  side, refused up front rather than after the lock dance.
+* `-32006` (waiting verb in flight) — answered to a request *pipelined behind* a
+  `send` that is still waiting for the lock, not to the `send` itself. See the
+  note at the top of this page.
 
 ### Example
 
 ```console
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"send","params":{"endpoint":"usb0","line":"reboot"}}' \
-    | nc -U "$SOCK" | jq .result
+    | nc -N -U "$SOCK" | jq .result
 {
   "endpoint": "usb0",
   "sent": 7,

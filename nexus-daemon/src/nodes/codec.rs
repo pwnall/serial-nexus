@@ -7,9 +7,10 @@
 //! a serial; N channel endpoints face host consumers. Hostward, raw multiplexed
 //! bytes are `demux`ed into per-channel events and fanned out; targetward,
 //! per-channel writes are `mux`ed back into the multiplexed stream and forwarded
-//! to the device. The **re-multiplexer** (`faces = host`) is the mirror, driven
-//! by a leg (phase 6); a codec configured that way comes up faulted with a clear
-//! reason, so the config stays loadable and the gap is visible in state (§15.8).
+//! to the device. The **re-multiplexer** (`faces = host`) is the mirror, and a
+//! standalone instance of it has no driver yet: §7.5 says such a node "is accepted
+//! by validation but waits for a driver", so it comes up **waiting** with a §14
+//! reason — the config stays loadable and the gap is visible in state (§15.8).
 //!
 //! **Interior contract (§5).** The codec holds only parser state (a partial
 //! frame, bounded by the frame size) — no queues. It runs on the async runtime;
@@ -31,18 +32,17 @@ use std::sync::Arc;
 
 use codec_api::{Codec, Event, EventKind};
 use nexus_core::Chunk;
-use nexus_core::NodeStatus;
 use nexus_core::config::NodeConfig;
 use nexus_core::graph::{EndpointAddr, Facing};
 use nexus_core::lock::OriginId;
+use nexus_core::state::{NodeState, NodeStatus};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
 use crate::cell::CriticalCell;
 use crate::runtime::{
-    DropCounters, HostwardSink, SharedLock, Wiring, frame_ranges, reacquire_held,
+    DropCounters, HostwardSink, SharedLock, Wiring, fan_out, frame_ranges, reacquire_held,
 };
 use crate::tap::TapFeed;
 
@@ -50,11 +50,14 @@ use crate::tap::TapFeed;
 /// so `Cell` suffices.
 #[derive(Default)]
 struct ChannelStat {
-    /// Bytes handed hostward to this channel's consumers (device → consumers). A
-    /// per-consumer slow-buffer drop is counted separately at that boundary (§5).
+    /// Bytes handed hostward to at least one *live* consumer of this channel
+    /// (device → consumers). A per-consumer slow-buffer drop is counted separately
+    /// at that boundary (§5).
     delivered_hostward: Cell<u64>,
-    /// Bytes discarded because this channel is configured but has no consumer bound
-    /// — a §5 loss counted where it happens, not silently dropped.
+    /// Bytes discarded because this channel reached no live consumer — either it is
+    /// configured with none bound, or every attached one has been cascade-removed
+    /// and its sink is permanently `Closed`. A §5 loss counted where it happens,
+    /// not silently dropped.
     discarded_unattached: Cell<u64>,
     /// Channel bytes forwarded targetward to the device. Freezes while the codec
     /// does not hold the serial's write lock — the observable §6 stall on a stolen
@@ -82,8 +85,14 @@ pub struct CodecNode {
     /// side fell behind (its bounded intake was full) — a §5 loss, surfaced so it
     /// stays located and attributable. Claimed from the wiring at start.
     mux_counters: Option<Arc<DropCounters>>,
+    /// Targetward bytes arriving at the *multiplexed* endpoint that this node has no
+    /// path for — the re-multiplexer orientation, whose driver is deferred (§14).
+    /// They are drained rather than dropped (see `drain_unwired_channels`) so a
+    /// writer's task survives, and counted here so the loss stays attributable (§5).
+    mux_discarded_targetward: Rc<Cell<u64>>,
     tasks: Vec<JoinHandle<()>>,
-    status: NodeStatus,
+    /// The node's observed status *and the moment it entered it* (§7).
+    status: NodeState,
 }
 
 impl CodecNode {
@@ -112,8 +121,48 @@ impl CodecNode {
             codec: Rc::new(CriticalCell::new(codec)),
             stats: Rc::new(stats),
             mux_counters: None,
+            mux_discarded_targetward: Rc::new(Cell::new(0)),
             tasks: Vec::new(),
-            status: NodeStatus::Active,
+            status: NodeState::new(NodeStatus::Active),
+        }
+    }
+
+    /// Claim every channel's targetward receiver and park it in a draining task,
+    /// for the `start` paths that return before the data plane is built (§15.8).
+    ///
+    /// A node that comes up `waiting` still owns its endpoints, and those endpoints
+    /// still have live senders. Leaving the receivers in the wiring plan drops them
+    /// when `load` finishes, which is indistinguishable to a writer from the graph
+    /// being torn down — see the MAP-1 chain in `start`. Draining keeps every writer
+    /// healthy and every lost byte counted.
+    fn drain_unwired_channels(&mut self, wiring: &mut Wiring) {
+        // Whichever side faces host owns the arbitrated targetward channel: the
+        // channels for a demultiplexer, the multiplexed endpoint for a re-multiplexer.
+        // Sweep both rather than assuming an orientation, so neither `start` exit can
+        // leak a receiver.
+        let addrs = std::iter::once((None, EndpointAddr::node(&self.name))).chain(
+            self.channels
+                .iter()
+                .map(|ch| (Some(ch.clone()), EndpointAddr::channel(&self.name, ch))),
+        );
+        for (channel, addr) in addrs.collect::<Vec<_>>() {
+            let Some(rx) = wiring.host_targetward_rx.remove(&addr) else {
+                continue;
+            };
+            // A per-channel stat exists for a channel endpoint; the multiplexed
+            // endpoint has none, so its discards are counted against the node's
+            // mux-side counter instead of being lost.
+            match channel.and_then(|ch| self.stats.get(&ch).cloned()) {
+                Some(stat) => self
+                    .tasks
+                    .push(tokio::task::spawn_local(channel_targetward_drain(rx, stat))),
+                None => self
+                    .tasks
+                    .push(tokio::task::spawn_local(mux_targetward_drain(
+                        rx,
+                        self.mux_discarded_targetward.clone(),
+                    ))),
+            }
         }
     }
 
@@ -121,13 +170,23 @@ impl CodecNode {
     /// endpoints out of the (endpoint-keyed) wiring plan.
     pub fn start(&mut self, wiring: &mut Wiring) {
         if self.faces != Facing::Target {
-            // Re-multiplexer (faces=host): the mirror data path is driven by a leg
-            // (phase 6). Come up faulted so the config loads and the gap shows.
-            self.status = NodeStatus::Faulted {
-                reason:
-                    "re-multiplexer orientation (faces=host) lands in phase 6 with the leg node"
-                        .to_owned(),
-            };
+            // Re-multiplexer (faces=host): §7.5 orients it as the demultiplexer's
+            // mirror, and §14 defers the driver for a *standalone* instance — a leg
+            // node re-multiplexes through its own link codec, so nothing in-tree
+            // drives this one. §7.5/§14 promise it "loads and waits", which is the
+            // waiting/faulted state family's `waiting` arm (§15.8): the environment
+            // it needs is simply not there yet, and no environmental failure has
+            // occurred. Faulting here misreported deferred work as a malfunction.
+            self.status.set(NodeStatus::Waiting {
+                reason: "standalone re-multiplexer orientation (faces=host) has no driver; \
+                         deferred work (§14) — a leg node re-multiplexes through its own \
+                         link codec"
+                    .to_owned(),
+            });
+            // Same rule as the no-upstream exit below: a waiting node must be inert,
+            // not destructive. A re-multiplexer's *multiplexed* side faces host, so it
+            // is the one carrying a live targetward receiver here.
+            self.drain_unwired_channels(wiring);
             return;
         }
 
@@ -135,9 +194,19 @@ impl CodecNode {
         // raw targetward out. Without an attached serial there is no data path.
         let mux = EndpointAddr::node(&self.name);
         let Some(mux_hostward_rx) = wiring.target_hostward_rx.remove(&mux) else {
-            self.status = NodeStatus::Waiting {
+            self.status.set(NodeStatus::Waiting {
                 reason: "multiplexed side has no attached upstream".to_owned(),
-            };
+            });
+            // Returning here must NOT leave the channels' targetward receivers in the
+            // wiring plan: it is dropped at the end of `load`, which closes each
+            // channel under senders that are still live in `GraphState::endpoint_targetward`
+            // and in every attached writer origin. That is MAP-1's chain — a pty
+            // origin's next write fails, `read_and_poll` returns, and presence
+            // latching, `handle_last_close`, termios reconciliation and detach-release
+            // go with it, wedging the channel's lock on a holder that has gone away
+            // while its bytes vanish uncounted. A waiting node must be *inert*, not
+            // destructive (§15.8), so drain the channels instead.
+            self.drain_unwired_channels(wiring);
             return;
         };
         let mux_targetward_tx = wiring.target_targetward_tx.remove(&mux);
@@ -174,25 +243,48 @@ impl CodecNode {
         // Targetward: one task per channel, framing its writes back into the
         // multiplexed stream — only if the multiplexed side can write to the device
         // (its edge is held/on-demand, giving a targetward sender and a lock).
-        if let (Some(mux_tx), Some((serial_lock, mux_id))) = (mux_targetward_tx, serial_lock) {
-            for (ch, rx) in channel_rxs {
-                let Some(stat) = self.stats.get(&ch).cloned() else {
-                    continue;
-                };
-                self.tasks.push(tokio::task::spawn_local(channel_targetward(
-                    ch,
-                    rx,
-                    mux_tx.clone(),
-                    self.codec.clone(),
-                    serial_lock.clone(),
-                    mux_id,
-                    stat,
-                )));
+        //
+        // Otherwise — a `write_mode = "never"` multiplexed edge, which validation
+        // explicitly permits as the read-only demux, or an unattached mux side — the
+        // channel receivers must still be *kept alive and drained*, never dropped
+        // (MAP-1's shape, which the map node hit first). Their senders stay live in
+        // `GraphState::endpoint_targetward` and in every writer origin attached to a
+        // channel, so dropping them would close the channel under a live writer: the
+        // next targetward write fails, and for a pty origin that ends `read_and_poll`
+        // and with it presence latching, last-close handling, termios reconciliation
+        // and detach-release — a healthy-looking graph whose console silently stops
+        // reporting its client. Draining makes a read-only demux inert instead, with
+        // the loss counted where it happens (§5).
+        match (mux_targetward_tx, serial_lock) {
+            (Some(mux_tx), Some((serial_lock, mux_id))) => {
+                for (ch, rx) in channel_rxs {
+                    let Some(stat) = self.stats.get(&ch).cloned() else {
+                        continue;
+                    };
+                    self.tasks.push(tokio::task::spawn_local(channel_targetward(
+                        ch,
+                        rx,
+                        mux_tx.clone(),
+                        self.codec.clone(),
+                        serial_lock.clone(),
+                        mux_id,
+                        stat,
+                    )));
+                }
+            }
+            _ => {
+                for (ch, rx) in channel_rxs {
+                    let Some(stat) = self.stats.get(&ch).cloned() else {
+                        continue;
+                    };
+                    self.tasks
+                        .push(tokio::task::spawn_local(channel_targetward_drain(rx, stat)));
+                }
             }
         }
     }
 
-    pub fn status(&self) -> NodeStatus {
+    pub fn status(&self) -> NodeState {
         self.status.clone()
     }
 
@@ -206,6 +298,7 @@ impl CodecNode {
         // freezes while the demux does not hold the serial lock (§6). `status` is
         // `active` once any data has crossed the channel, else `waiting`.
         let framing_errors = self.codec.with(|c| c.resync_count());
+        let mux_discarded_targetward = self.mux_discarded_targetward.get();
         let channels: serde_json::Map<String, Value> = self
             .channels
             .iter()
@@ -231,15 +324,27 @@ impl CodecNode {
             // the serial), so the loss stays located and attributable (§5).
             "multiplexed": {
                 "dropped_slow_consumer": self.mux_counters.as_ref().map_or(0, |c| c.dropped_full()),
+                // Targetward bytes drained at an unwired multiplexed endpoint (the
+                // re-multiplexer orientation, §14) — inert rather than destructive,
+                // and counted rather than silent (§5).
+                "discarded_targetward": mux_discarded_targetward,
             },
             "channels": channels,
         })
     }
 
-    pub fn teardown(&mut self) {
+    /// Ask this node's tasks to stop, without waiting (§16.1, BND-1). An interior
+    /// codec owns no blocking thread and no environment to release, so signalling
+    /// *is* its whole teardown; the method exists so the daemon can signal every
+    /// node uniformly before it pays any node's join cost.
+    pub fn signal_stop(&mut self) {
         for t in self.tasks.drain(..) {
             t.abort();
         }
+    }
+
+    pub fn teardown(&mut self) {
+        self.signal_stop();
     }
 }
 
@@ -283,28 +388,26 @@ async fn hostward_demux(
                     if let Some(feed) = channel_feeds.get(ev.channel.as_str()) {
                         feed.mirror(&bytes);
                     }
-                    // Fan out to this channel's consumers. A configured channel with
-                    // no consumer bound discards-with-count (§5); data on an
-                    // unconfigured channel (no stat) is noise from the mux and simply
-                    // dropped — announced-but-unbound is a phase-6 leg concern.
-                    match channel_sinks.get(ev.channel.as_str()) {
-                        Some(sinks) => {
-                            if let Some(s) = stat {
-                                s.delivered_hostward.set(s.delivered_hostward.get() + n);
-                            }
-                            for (tx, counters) in sinks {
-                                match tx.try_send(bytes.clone()) {
-                                    Ok(()) => {}
-                                    Err(TrySendError::Full(_)) => counters.add_full(n),
-                                    Err(TrySendError::Closed(_)) => {}
-                                }
-                            }
+                    // Fan out to this channel's consumers through the one shared
+                    // helper (§5, F1). A channel that reached no live consumer —
+                    // none bound, or every sink permanently `Closed` after a cascade
+                    // removal — discards-with-count; data on an unconfigured channel
+                    // (no stat) is noise from the mux and simply dropped —
+                    // announced-but-unbound is a leg concern (§7.4).
+                    if let Some(sinks) = channel_sinks.get(ev.channel.as_str()) {
+                        // `channel_sinks` and `stats` are both keyed by the
+                        // configured channel list, so a bound sink always has a
+                        // stat; `scratch` is the defensive arm — its count is
+                        // thrown away, but the bytes are still delivered.
+                        let scratch = Cell::new(0u64);
+                        let unattached = stat.map_or(&scratch, |s| &s.discarded_unattached);
+                        if fan_out(&bytes, sinks, unattached).live
+                            && let Some(s) = stat
+                        {
+                            s.delivered_hostward.set(s.delivered_hostward.get() + n);
                         }
-                        None => {
-                            if let Some(s) = stat {
-                                s.discarded_unattached.set(s.discarded_unattached.get() + n);
-                            }
-                        }
+                    } else if let Some(s) = stat {
+                        s.discarded_unattached.set(s.discarded_unattached.get() + n);
                     }
                 }
                 EventKind::Open => {
@@ -322,6 +425,34 @@ async fn hostward_demux(
                 }
             }
         }
+    }
+}
+
+/// Keep a read-only demux's channel receiver alive, discarding and counting what
+/// arrives (§5) — the codec's instance of the MAP-1 shape.
+///
+/// A codec whose multiplexed edge is `write_mode = "never"` (validation's documented
+/// read-only demux) or unattached has no path to the device, but its channel
+/// endpoints still carry live senders: the `send` verb's clone and every writer
+/// origin attached to a channel. Dropping the receiver would close the channel under
+/// those senders, and for a pty origin the failed write ends its reader task along
+/// with presence latching, last-close handling and detach-release. Draining keeps the
+/// writers healthy and makes the loss visible in `state` instead of silent.
+async fn channel_targetward_drain(mut rx: mpsc::Receiver<Chunk>, stat: Rc<ChannelStat>) {
+    while let Some(bytes) = rx.recv().await {
+        // The arriving bytes are what is lost; nothing is framed, so this is charged
+        // as a targetward discard rather than a framing refusal.
+        stat.discarded_targetward
+            .set(stat.discarded_targetward.get() + bytes.len() as u64);
+    }
+}
+
+/// Keep an unwired *multiplexed* endpoint's targetward receiver alive, discarding
+/// and counting what arrives (§5) — the re-multiplexer's half of the same rule
+/// `channel_targetward_drain` serves for channels.
+async fn mux_targetward_drain(mut rx: mpsc::Receiver<Chunk>, discarded: Rc<Cell<u64>>) {
+    while let Some(bytes) = rx.recv().await {
+        discarded.set(discarded.get() + bytes.len() as u64);
     }
 }
 
@@ -400,6 +531,39 @@ mod tests {
             Rc::new(crate::runtime::LockCell::new("mux", lock, notifier)),
             id,
         )
+    }
+
+    /// A read-only demux (`write_mode = "never"` on the multiplexed edge, which
+    /// validation permits) keeps its channel receivers alive and counts what it
+    /// discards, instead of dropping them under live senders. Dropping was the
+    /// defect the map node hit first (review 26, MAP-1): the next targetward write
+    /// then fails, and a pty origin's reader task ends with presence latching and
+    /// detach-release still owed. Here: the channel sender stays usable across many
+    /// writes, and every discarded byte is attributable in `state`.
+    #[tokio::test]
+    async fn a_read_only_demux_drains_its_channels_instead_of_closing_them() {
+        let stat = Rc::new(ChannelStat::default());
+        let (tx, rx) = mpsc::channel::<Chunk>(4);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let task = tokio::task::spawn_local(channel_targetward_drain(rx, stat.clone()));
+                for _ in 0..3 {
+                    // A sender whose receiver had been dropped would fail here — the
+                    // exact failure that killed the writer's task in the defect.
+                    tx.send(Chunk::copy_from_slice(b"reboot\n"))
+                        .await
+                        .expect("a read-only demux must still accept writes");
+                }
+                drop(tx);
+                let _ = task.await;
+            })
+            .await;
+        assert_eq!(
+            stat.discarded_targetward.get(),
+            21,
+            "every discarded byte is counted where it is lost (§5)"
+        );
     }
 
     /// XC-NODROP-1: a targetward chunk larger than one frame (once the channel-id

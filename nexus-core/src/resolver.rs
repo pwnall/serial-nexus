@@ -438,7 +438,10 @@ impl Resolver {
     /// The canonical usb identity + description for a tty device name, via the
     /// dependency-free sysfs ancestor walk (§12): the nearest `bInterfaceNumber`
     /// is the interface; the first ancestor with `idVendor` is the USB device —
-    /// stop there or the walk binds the root hub.
+    /// stop there or the walk binds the root hub. The §12 spelling rule is
+    /// enforced *at the source*: a blank `serial` or `bInterfaceNumber` becomes
+    /// the `-` absent marker, and a blank `idVendor`/`idProduct` yields no
+    /// identity at all, so the caller degrades down the fallback chain.
     fn sysfs_lookup(&self, dev_name: &str) -> Option<UsbInfo> {
         let device_link = self
             .sys_root
@@ -453,11 +456,20 @@ impl Resolver {
         let mut cur: &Path = &start;
         for _ in 0..12 {
             if interface.is_none() {
-                interface = read_trimmed(&cur.join("bInterfaceNumber"));
+                // §12 spelling rule, at the source: a present-but-blank
+                // `bInterfaceNumber` normalizes to *absent* exactly as a blank
+                // `serial` does (CP-6). Left empty it would mint the retired
+                // `usb:vid:pid:serial:` form — malformed at add time, and a
+                // stored one only ever comes up waiting (§15.27).
+                interface = read_trimmed(&cur.join("bInterfaceNumber")).filter(|s| !s.is_empty());
             }
             if cur.join("idVendor").exists() {
-                let vid = read_trimmed(&cur.join("idVendor"))?;
-                let pid = read_trimmed(&cur.join("idProduct"))?;
+                // vid/pid have no absent spelling — they *are* the identity — so a
+                // blank one is not normalized but abandoned: yield no usb identity
+                // and let the §12 fallback chain degrade to by-path, rather than
+                // mint an unmatchable `usb::pid:…` (CP-6).
+                let vid = read_trimmed(&cur.join("idVendor")).filter(|s| !s.is_empty())?;
+                let pid = read_trimmed(&cur.join("idProduct")).filter(|s| !s.is_empty())?;
                 let serial = read_trimmed(&cur.join("serial"))
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "-".into());
@@ -885,6 +897,77 @@ mod tests {
         assert_eq!(got.kind, DeviceKind::ByPath);
         assert_eq!(got.identity, "by-path:pci-0000:00:14.0-usb-0:1:1.0-port0");
         assert!(got.warning.is_some());
+    }
+
+    #[test]
+    fn blank_interface_number_normalizes_to_the_absent_marker() {
+        // A sysfs node exposing a present-but-BLANK `bInterfaceNumber` (CP-6).
+        // §12's spelling rule has one shape for every identity field: absent is
+        // written `-`, never left empty. Left empty the walk would mint the
+        // retired `usb:vid:pid:serial:` form — which `resolve_input` itself
+        // rejects as malformed, so the captured identity could never be re-added
+        // and a persisted node would come up waiting forever (§15.27).
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        add_usb_device(
+            t.path(),
+            "1-1",
+            "ttyUSB0",
+            "usb-FTDI_FT232R_USB_UART_A6008isP-if00-port0",
+            "0403",
+            "6001",
+            Some("A6008isP"),
+            "  ", // present-but-whitespace-only interface number
+            None,
+        );
+
+        let got = r.resolve_input("/dev/ttyUSB0").unwrap();
+        assert_eq!(got.identity, "usb:0403:6001:A6008isP:-");
+        assert_eq!(got.kind, DeviceKind::Usb);
+        // The captured identity is well-formed input in its own right (it
+        // round-trips through dump/load and add), and resolves back to the device.
+        assert!(r.resolve_input(&got.identity).is_ok());
+        assert_eq!(
+            r.resolve_current_path(&got.identity),
+            Some(t.path().join("dev/ttyUSB0"))
+        );
+        // An absent interface is omitted from the operator echo, as an absent
+        // serial is.
+        assert!(!got.description.contains("interface"));
+    }
+
+    #[test]
+    fn blank_vendor_id_yields_no_usb_identity_and_degrades_to_by_path() {
+        // vid/pid have no absent spelling — they are the identity — so a blank one
+        // cannot be normalized, only abandoned: the walk yields nothing and §12's
+        // fallback chain takes over (CP-6). Minting `usb::6001:S:00` would store a
+        // device string that `resolve_input` rejects as malformed.
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        add_usb_device(
+            t.path(),
+            "1-1",
+            "ttyUSB0",
+            "usb-Broken_Adapter-if00",
+            "", // blank idVendor
+            "6001",
+            Some("A6008isP"),
+            "00",
+            None,
+        );
+        let by_path = t.path().join("dev/serial/by-path");
+        std::fs::create_dir_all(&by_path).unwrap();
+        std::os::unix::fs::symlink("../../ttyUSB0", by_path.join("pci-0:1:1.0-port0")).unwrap();
+
+        let got = r.resolve_input("/dev/ttyUSB0").unwrap();
+        assert_eq!(got.kind, DeviceKind::ByPath);
+        assert_eq!(got.identity, "by-path:pci-0:1:1.0-port0");
+        assert!(got.warning.is_some());
+        // The discovery listing reports the same absence rather than a half-formed
+        // identity (the doctor's P4 probe reads it, §12).
+        let adapters = r.discover_adapters();
+        assert_eq!(adapters.len(), 1);
+        assert_eq!(adapters[0].identity, None);
     }
 
     #[test]

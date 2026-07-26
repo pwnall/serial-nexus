@@ -404,11 +404,93 @@ fn p5_is_uart(sp: &SerialPort) -> bool {
     sys::read_icounts(sp.as_raw_fd()).is_ok()
 }
 
-/// A single-port certificate line for a real UART: break capability, the
-/// modem-line map (input levels), custom-baud acceptance, and counter support.
-fn p5_certify_port(port: &Path) -> String {
+/// One failed certificate item, named so the verdict can cite it (§15.21).
+///
+/// `integrity` separates the two consequences the certificate can carry: a *data*
+/// failure — the rig did not deliver the bytes it was handed — makes the
+/// certificate unusable as the precondition every tiered run starts from, so it
+/// is a stop condition (`Unsupported`); an uncharacterized item (break, custom
+/// baud, observable error counters) leaves a rig that works but is not fully
+/// characterized (`Degraded`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CertFailure {
+    item: String,
+    integrity: bool,
+}
+
+impl CertFailure {
+    /// Prefix the item with the port (or pair) it was measured on, so the verdict
+    /// line names *which* rig element failed — the whole point of naming the
+    /// asymmetry in the discovery half (§15.21).
+    fn qualified(self, subject: &str) -> CertFailure {
+        CertFailure {
+            item: format!("{subject}: {}", self.item),
+            integrity: self.integrity,
+        }
+    }
+}
+
+/// The outcome of certifying one port or one pair: the report line (the
+/// observation value, unchanged in shape) plus the structured failures the
+/// verdict folds over.
+///
+/// Before this split the certification functions returned only the line, so every
+/// certificate failure was report *text* the verdict never saw: a rate-ladder
+/// mismatch, an unobserved deliberate mismatch, or a dead break all left P5
+/// `supported` and the process exit code 0 (review 26, DOC-1b). §15.21 makes the
+/// certificate the precondition every tiered checklist run starts from — and a
+/// precondition that cannot fail is not one.
+#[derive(Debug, Clone)]
+struct Certificate {
+    line: String,
+    failures: Vec<CertFailure>,
+}
+
+impl Certificate {
+    /// A certificate line with no failures yet.
+    fn new(line: impl Into<String>) -> Self {
+        Certificate {
+            line: line.into(),
+            failures: Vec::new(),
+        }
+    }
+
+    /// A certificate that could not be produced at all (the port would not
+    /// reopen). The rig may be fine; it is simply uncharacterized → degrade.
+    fn unavailable(line: impl Into<String>, item: &str) -> Self {
+        Certificate {
+            line: line.into(),
+            failures: vec![CertFailure {
+                item: item.to_owned(),
+                integrity: false,
+            }],
+        }
+    }
+
+    /// A characterization deliberately not attempted — the non-UART (CI sim) arm.
+    /// Records **no** failure: §15.21 specifies characterization reporting skipped
+    /// on non-UARTs precisely so P5's logic never waits for a bench.
+    fn skipped(reason: &str) -> Self {
+        Certificate::new(format!("skipped ({reason})"))
+    }
+
+    /// Record `item` as failed when `failed`, with its consequence class.
+    fn fail_if(&mut self, failed: bool, item: &str, integrity: bool) {
+        if failed {
+            self.failures.push(CertFailure {
+                item: item.to_owned(),
+                integrity,
+            });
+        }
+    }
+}
+
+/// A single-port certificate for a real UART: break capability, the modem-line
+/// map (input levels), custom-baud acceptance, and counter support. The modem map
+/// is reported, never judged — "not wired" is a valid answer (§15.21).
+fn p5_certify_port(port: &Path) -> Certificate {
     let Ok(sp) = p5_open(port, CUSTOM_BAUD, Parity::None) else {
-        return "unavailable for characterization".into();
+        return Certificate::unavailable("unavailable for characterization", "reopen");
     };
     let baud = sp.get_configuration().and_then(|c| c.get_baud_rate()).ok();
     let custom_baud_ok = baud
@@ -425,7 +507,16 @@ fn p5_certify_port(port: &Path) -> String {
         sp.read_ri().map(|b| b.to_string()).unwrap_or("?".into()),
     );
     let icounter = sys::read_icounts(sp.as_raw_fd()).is_ok();
-    format!("custom_baud={custom_baud_ok} break={break_ok} modem[{modem}] icounter={icounter}")
+    let mut cert = Certificate::new(format!(
+        "custom_baud={custom_baud_ok} break={break_ok} modem[{modem}] icounter={icounter}"
+    ));
+    // None of these is a data-integrity failure: the port carries bytes, but a
+    // checklist tier that leans on a nonstandard rate, on break reception, or on
+    // the driver counters would be running uncertified (§15.21) → degrade, named.
+    cert.fail_if(!custom_baud_ok, "custom_baud", false);
+    cert.fail_if(!break_ok, "break", false);
+    cert.fail_if(!icounter, "icounter", false);
+    cert
 }
 
 /// After (re)opening a port at a new baud, wait for the adapter to apply the new
@@ -442,8 +533,9 @@ const P5_OPEN_SETTLE: Duration = Duration::from_millis(150);
 /// The paired-rig certificate (§15.21), only meaningful on independently clocked
 /// UARTs: a rate ladder including a nonstandard rate (all must round-trip), and a
 /// deliberate baud mismatch that must corrupt the nonce and raise the frame-error
-/// counter — proving the error counters are observable. Returns a summary line.
-fn p5_certify_pair(port_a: &Path, port_b: &Path) -> String {
+/// counter — proving the error counters are observable. Returns the summary line
+/// plus the failures the verdict folds over (DOC-1b).
+fn p5_certify_pair(port_a: &Path, port_b: &Path) -> Certificate {
     // Rate ladder: reconfigure both ports to each rate and exchange a nonce.
     let rates = [9600u32, 115_200, CUSTOM_BAUD];
     let mut ladder_ok = true;
@@ -452,7 +544,7 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> String {
             p5_open(port_a, baud, Parity::None),
             p5_open(port_b, baud, Parity::None),
         ) else {
-            return "pair reopen failed".into();
+            return Certificate::unavailable("pair reopen failed", "pair_reopen");
         };
         std::thread::sleep(P5_OPEN_SETTLE); // let both adapters apply the new baud
         // §15.21 "all must round-trip": certify BOTH directions at each rate, not
@@ -475,7 +567,12 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> String {
             p5_open(port_a, 115_200, Parity::None),
             p5_open(port_b, 9600, Parity::None),
         ) else {
-            return format!("rate_ladder={ladder_ok} mismatch=reopen-failed");
+            let mut cert = Certificate::unavailable(
+                format!("rate_ladder={ladder_ok} mismatch=reopen-failed"),
+                "mismatch_reopen",
+            );
+            cert.fail_if(!ladder_ok, "rate_ladder", true);
+            return cert;
         };
         std::thread::sleep(P5_OPEN_SETTLE); // settle both ends before the mismatch probe
         let before = sys::read_icounts(b.as_raw_fd())
@@ -495,7 +592,17 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> String {
             .unwrap_or(before);
         !contains_sub(&got, unit) && after > before
     };
-    format!("rate_ladder={ladder_ok} deliberate_mismatch_observed={mismatch_observed}")
+    let mut cert = Certificate::new(format!(
+        "rate_ladder={ladder_ok} deliberate_mismatch_observed={mismatch_observed}"
+    ));
+    // The ladder is the integrity item: a rung that did not round-trip means the
+    // rig itself corrupts or loses data, so no tier failure measured through it is
+    // attributable to serial_nexus (§15.21) — a stop condition, not a footnote.
+    cert.fail_if(!ladder_ok, "rate_ladder", true);
+    // An unobserved deliberate mismatch means the error counters are not
+    // observable on this rig: the data path is fine, the characterization is not.
+    cert.fail_if(!mismatch_observed, "deliberate_mismatch", false);
+    cert
 }
 
 pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
@@ -630,18 +737,23 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
     // Release the discovery opens before characterization reopens the ports.
     drop(sps);
 
-    // Characterize each port; a non-UART (the CI sim) skips cleanly.
+    // Characterize each port; a non-UART (the CI sim) skips cleanly. Every
+    // certificate's failures are collected here — they decide the verdict below,
+    // rather than being report text nobody folds in (DOC-1b).
     let mut any_uart = false;
+    let mut failures: Vec<CertFailure> = Vec::new();
     for port in ports {
         if let Ok(sp) = p5_open(port, 115_200, Parity::None) {
             let name = p5_name(port, resolver);
-            if p5_is_uart(&sp) {
+            let cert = if p5_is_uart(&sp) {
                 any_uart = true;
                 drop(sp);
-                p = p.observe(format!("{name} cert").as_str(), p5_certify_port(port));
+                p5_certify_port(port)
             } else {
-                p = p.observe(format!("{name} cert").as_str(), "skipped (not a UART)");
-            }
+                Certificate::skipped("not a UART")
+            };
+            p = p.observe(format!("{name} cert").as_str(), cert.line);
+            failures.extend(cert.failures.into_iter().map(|f| f.qualified(&name)));
         }
     }
     // Paired UARTs get the independent-clock certificate (rate ladder + mismatch).
@@ -653,29 +765,84 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
             continue;
         };
         if a_uart && b_uart {
-            let name = format!(
-                "{} ↔ {} cert",
+            let subject = format!(
+                "{} ↔ {}",
                 p5_name(&ports[i], resolver),
                 p5_name(&ports[j], resolver)
             );
-            p = p.observe(name.as_str(), p5_certify_pair(&ports[i], &ports[j]));
+            let cert = p5_certify_pair(&ports[i], &ports[j]);
+            p = p.observe(format!("{subject} cert").as_str(), cert.line);
+            failures.extend(cert.failures.into_iter().map(|f| f.qualified(&subject)));
         }
     }
 
+    let (status, consequence) = p5_verdict(clean, any_uart, &failures);
+    p.verdict(status, &consequence)
+}
+
+/// Fold discovery and every certificate into P5's one verdict (§15.21, DOC-1b).
+///
+/// Pure, so the fold is unit-testable without a bench — the rest of P5 needs
+/// hardware, which is exactly how the old two-input verdict (`clean` and
+/// `any_uart`, both from *discovery*) went unnoticed while the certification
+/// results were computed and then discarded into report text.
+///
+/// Precedence, worst first: a data-integrity failure is a stop condition
+/// (`Unsupported`); miswiring and uncharacterized items are `Degraded`; anything
+/// else is `Supported`, with the two pre-existing consequence lines preserved
+/// verbatim so the certified and the skipped-on-a-sim paths read as they always
+/// have.
+fn p5_verdict(clean: bool, any_uart: bool, failures: &[CertFailure]) -> (Status, String) {
+    let named = |integrity: bool| -> Vec<&str> {
+        failures
+            .iter()
+            .filter(|f| f.integrity == integrity)
+            .map(|f| f.item.as_str())
+            .collect()
+    };
+    let integrity = named(true);
+    let uncertified = named(false);
+
+    if !integrity.is_empty() {
+        return (
+            Status::Unsupported,
+            format!(
+                "The rig FAILED data integrity ({}) — it did not deliver the bytes it was handed, so a tiered run started from this certificate would misattribute the rig's loss to serial_nexus (§15.21). Re-wire or replace the adapters and re-run P5 before any tier.",
+                integrity.join(", ")
+            ),
+        );
+    }
     if !clean {
-        p.verdict(
+        let also = if uncertified.is_empty() {
+            String::new()
+        } else {
+            format!(" Also uncertified: {}.", uncertified.join(", "))
+        };
+        return (
             Status::Degraded,
-            "A rig is miswired (asymmetric/half-crossed) — named above; fix it before a tiered run so a tier failure is attributable to serial_nexus, not a loose wire (§15.21).",
-        )
-    } else if any_uart {
-        p.verdict(
+            format!(
+                "A rig is miswired (asymmetric/half-crossed) — named above; fix it before a tiered run so a tier failure is attributable to serial_nexus, not a loose wire (§15.21).{also}"
+            ),
+        );
+    }
+    if !uncertified.is_empty() {
+        return (
+            Status::Degraded,
+            format!(
+                "The rig carries data, but is not fully characterized ({}) — a tier leaning on that item would be running uncertified (§15.21). Everything else above is certified.",
+                uncertified.join(", ")
+            ),
+        );
+    }
+    if any_uart {
+        (
             Status::Supported,
-            "Rig discovered and certified; every tiered checklist run starts from this certificate (§15.21).",
+            "Rig discovered and certified; every tiered checklist run starts from this certificate (§15.21).".to_owned(),
         )
     } else {
-        p.verdict(
+        (
             Status::Supported,
-            "Rig discovered and classified (above); characterization skipped on non-UART sims — the certificate populates on real adapters (§13, no-target doctrine).",
+            "Rig discovered and classified (above); characterization skipped on non-UART sims — the certificate populates on real adapters (§13, no-target doctrine).".to_owned(),
         )
     }
 }
@@ -907,5 +1074,114 @@ fn device_access_check(dev: &Path) -> EnvCheck {
             "no access — grant via udev (GROUP=plugdev) or dialout",
             Status::Degraded,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fail(item: &str, integrity: bool) -> CertFailure {
+        CertFailure {
+            item: item.to_owned(),
+            integrity,
+        }
+    }
+
+    /// The sim path (§15.21: "characterization reporting skipped on non-UARTs, so
+    /// P5's logic never waits for a bench") and the fully certified rig both stay
+    /// `supported`, with their consequence lines unchanged.
+    #[test]
+    fn a_clean_rig_is_supported_certified_or_skipped() {
+        let (status, why) = p5_verdict(true, true, &[]);
+        assert_eq!(status.label(), "supported");
+        assert!(why.contains("certified"), "{why}");
+
+        let (status, why) = p5_verdict(true, false, &[]);
+        assert_eq!(status.label(), "supported");
+        assert!(why.contains("skipped on non-UART sims"), "{why}");
+    }
+
+    /// A data-integrity failure is a stop condition: the certificate is the
+    /// precondition every tiered run starts from, so a rig that loses bytes must
+    /// not report `supported` with exit code 0 (review 26, DOC-1b).
+    #[test]
+    fn a_data_integrity_failure_is_unsupported_and_names_the_item() {
+        let (status, why) = p5_verdict(true, true, &[fail("usb-A ↔ usb-B: rate_ladder", true)]);
+        assert!(status.is_unsupported(), "verdict was {}", status.label());
+        assert!(
+            why.contains("usb-A ↔ usb-B: rate_ladder"),
+            "failing item not named: {why}"
+        );
+    }
+
+    /// An uncharacterized item degrades — the rig works, but a tier leaning on
+    /// that item would be running uncertified.
+    #[test]
+    fn an_uncharacterized_item_degrades_and_names_the_item() {
+        let (status, why) = p5_verdict(true, true, &[fail("usb-A: break", false)]);
+        assert_eq!(status.label(), "degraded");
+        assert!(why.contains("usb-A: break"), "item not named: {why}");
+    }
+
+    /// Miswiring keeps its own (discovery-side) message, and still names any
+    /// certificate item that also failed — both facts reach the operator.
+    #[test]
+    fn miswiring_degrades_and_still_reports_uncertified_items() {
+        let (status, why) = p5_verdict(false, true, &[fail("usb-A: custom_baud", false)]);
+        assert_eq!(status.label(), "degraded");
+        assert!(why.contains("miswired"), "{why}");
+        assert!(why.contains("usb-A: custom_baud"), "{why}");
+    }
+
+    /// Integrity outranks miswiring: a half-crossed rig that also corrupts data is
+    /// a stop condition, not a warning.
+    #[test]
+    fn integrity_failure_outranks_miswiring() {
+        let (status, _) = p5_verdict(
+            false,
+            true,
+            &[fail("a: break", false), fail("a ↔ b: rate_ladder", true)],
+        );
+        assert!(status.is_unsupported());
+    }
+
+    /// The two constructors that feed the fold: a skipped characterization records
+    /// no failure (the CI sim must stay green), while an unavailable one degrades.
+    #[test]
+    fn skipped_certificates_carry_no_failure_but_unavailable_ones_do() {
+        let skipped = Certificate::skipped("not a UART");
+        assert_eq!(skipped.line, "skipped (not a UART)");
+        assert!(skipped.failures.is_empty());
+        assert_eq!(
+            p5_verdict(true, false, &skipped.failures).0.label(),
+            "supported"
+        );
+
+        let missing = Certificate::unavailable("pair reopen failed", "pair_reopen");
+        assert_eq!(missing.failures, vec![fail("pair_reopen", false)]);
+        assert_eq!(
+            p5_verdict(true, true, &missing.failures).0.label(),
+            "degraded"
+        );
+    }
+
+    /// A failure is reported against the port (or pair) it was measured on.
+    #[test]
+    fn failures_are_qualified_by_their_subject() {
+        assert_eq!(
+            fail("rate_ladder", true).qualified("usb-A ↔ usb-B"),
+            fail("usb-A ↔ usb-B: rate_ladder", true)
+        );
+    }
+
+    /// `fail_if` only records failures — a passing item leaves the certificate
+    /// clean, which is what keeps a good rig at `supported`.
+    #[test]
+    fn fail_if_records_only_failures() {
+        let mut cert = Certificate::new("line");
+        cert.fail_if(false, "custom_baud", false);
+        cert.fail_if(true, "break", false);
+        assert_eq!(cert.failures, vec![fail("break", false)]);
     }
 }

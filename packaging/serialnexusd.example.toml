@@ -35,9 +35,11 @@ type = "pty"
 name = "console"
 path = "/run/serialnexusd/console"
 
-# The append-only forensic log. Rotate on demand with `serialnexusctl rotate cap`
-# (renames to cap.log.000, cap.log.001, ...; higher is newer). The directory must be
-# in the unit's ReadWritePaths.
+# The append-only forensic log. Rotate on demand with `serialnexusctl rotate cap` —
+# the verb names the NODE, the rotated files are named after the FILE: the current
+# console.log is renamed to console.log.000, then console.log.001, and so on (higher
+# is newer, no shifting cascade). Three digits by default; set `rotation_padding` for
+# more. The directory must be in the unit's ReadWritePaths.
 [[node]]
 type = "log"
 name = "cap"
@@ -129,6 +131,12 @@ b = "qterm"
 # [[edge]]                # serial (default endpoint) -> codec multiplexed side
 # a = "usb0"
 # b = "mux"
+# write_mode = "held"     # REQUIRED on a codec's multiplexed side: the demux owns the
+#                         # UART's writes, and any other writer would corrupt the
+#                         # framing on the wire (§6/§7.5). Only "held" (the working
+#                         # mode) and "never" (a read-only demux) are accepted here;
+#                         # the load is refused otherwise rather than parking every
+#                         # targetward byte forever.
 # [[edge]]                # a channel -> the operator PTY, the log, and the uplink
 # a = "mux/console"
 # b = "console"

@@ -61,6 +61,16 @@ pub enum Steal {
     /// (recorded in state so the ousted holder sees what happened), or `None` if
     /// the lock was free or the endpoint is free-for-all.
     Stolen { previous: Option<OriginId> },
+    /// The caller already held the lock: an idempotent no-op, exactly as
+    /// [`Acquire::AlreadyHeld`] is (LOCK-4). Stealing from yourself is not a
+    /// fresh grant — treating it as one would run purge-on-acquire against the
+    /// holder's *own* in-flight bytes (§6's stale-command purge exists to
+    /// protect a grant from the previous occupant's backlog, not from the
+    /// holder's own writing) and advance the generation, voiding the lease the
+    /// same holder is presumably renewing. Under free-for-all there is no lock
+    /// to already hold, so a self-steal there is `Stolen { previous: None }`
+    /// like any other.
+    AlreadyHeld,
     /// The origin is `write = never` and cannot hold the lock at all.
     ReadOnly,
 }
@@ -175,8 +185,11 @@ impl EndpointLock {
     /// free lock is granted **only to the FIFO head** (or to anyone when the queue
     /// is empty) — so a plain acquire that would barge past an earlier waiter is
     /// denied, naming that waiter; the same holder re-acquiring is a no-op; and a
-    /// lock held by another is denied. A fresh grant removes the caller from the
-    /// queue (if it was waiting) and advances the generation.
+    /// lock held by another is denied. A `held` origin outranks the queue in both
+    /// directions: it takes a free lock whatever the queue holds, and while it is
+    /// registered every other origin is denied even on a free lock (§15.23). A
+    /// fresh grant removes the caller from the queue (if it was waiting) and
+    /// advances the generation.
     pub fn acquire(&mut self, id: OriginId) -> Acquire {
         match self.origins.get(&id) {
             None => return Acquire::ReadOnly,
@@ -190,6 +203,23 @@ impl EndpointLock {
             Some(h) if h == id => Acquire::AlreadyHeld,
             Some(h) => Acquire::Denied { held_by: h },
             None => {
+                // The caller's own mode is settled first (LOCK-1). A registered
+                // `held` origin takes a free lock ahead of the FIFO queue — that is
+                // exactly what [`Self::reclaim_held`] does, and `acquire` must agree
+                // with it: consulting the queue first would deny the held origin
+                // (the head is not it) while the held-priority rule below denies the
+                // head, leaving a free lock nobody can take. §15.23 moved held
+                // priority *into* this state machine so it holds by rule rather than
+                // by which caller happens to run, so the rule has to be complete
+                // here rather than rescued by `reclaim_held` on the shipped path.
+                if self
+                    .origins
+                    .get(&id)
+                    .is_some_and(|o| o.write_mode == WriteMode::Held)
+                {
+                    self.grant_to(id);
+                    return Acquire::Granted;
+                }
                 // Held priority outranks the FIFO queue (§6/§15.23): while the lock
                 // is momentarily free (a steal transiently ousted the demux, or it
                 // has yet to reclaim), a registered `held` origin reclaims ahead of
@@ -238,7 +268,9 @@ impl EndpointLock {
     /// regardless of the current holder, recording the ousted holder so state can
     /// show it. Steal **bypasses the queue without destroying it** — waiters stay
     /// in line for when the stealer releases. A `write = never` origin cannot
-    /// steal; under free-for-all there is no lock, so it trivially succeeds.
+    /// steal; under free-for-all there is no lock, so it trivially succeeds; and
+    /// the current holder stealing from itself is the idempotent
+    /// [`Steal::AlreadyHeld`] no-op rather than a fresh grant (LOCK-4).
     pub fn steal(&mut self, id: OriginId) -> Steal {
         match self.origins.get(&id) {
             None => return Steal::ReadOnly,
@@ -246,9 +278,17 @@ impl EndpointLock {
             Some(_) => {}
         }
         if self.arbitration == Arbitration::FreeForAll {
+            // No lock exists here, so there is nothing to already hold: a
+            // free-for-all steal is the same trivial success it always was.
             return Steal::Stolen { previous: None };
         }
-        let previous = self.holder.filter(|h| *h != id);
+        if self.holder == Some(id) {
+            // Self-steal: leave the holder, the queue and — critically — the
+            // generation untouched, so the caller's own lease and its in-flight
+            // bytes survive (LOCK-4).
+            return Steal::AlreadyHeld;
+        }
+        let previous = self.holder;
         if let Some(prev) = previous {
             self.stolen = Some((prev, id));
         }
@@ -693,6 +733,89 @@ mod tests {
     }
 
     #[test]
+    fn a_free_lock_with_a_queued_waiter_is_still_grantable_to_the_held_origin() {
+        // LOCK-1: held priority (§6/§15.23) and FIFO fairness must not deny each
+        // other into a lock nobody can take. With the lock momentarily free, an
+        // on-demand waiter queued, and the demux's `held` origin registered, the
+        // waiter is (correctly) denied by held priority — so the held origin has
+        // to be grantable through `acquire` itself, not only through the
+        // `reclaim_held` path that happens to run in the daemon.
+        let mut lock = EndpointLock::new(Arbitration::Exclusive);
+        lock.register(OriginId(1), "demux", WriteMode::Held); // acquires on attach
+        lock.register(OriginId(2), "console", WriteMode::OnDemand);
+        lock.enqueue(OriginId(2));
+        assert!(
+            lock.release(OriginId(1)),
+            "the hold is momentarily released"
+        );
+
+        assert_eq!(
+            lock.acquire(OriginId(2)),
+            Acquire::Denied {
+                held_by: OriginId(1)
+            },
+            "an on-demand waiter still defers to the held origin"
+        );
+        assert_eq!(
+            lock.acquire(OriginId(1)),
+            Acquire::Granted,
+            "the held origin takes the free lock ahead of the FIFO head"
+        );
+        assert_eq!(lock.holder(), Some(OriginId(1)));
+        assert_eq!(
+            lock.waiters().collect::<Vec<_>>(),
+            vec![OriginId(2)],
+            "the waiter keeps its place behind the hold"
+        );
+    }
+
+    #[test]
+    fn stealing_from_yourself_is_an_idempotent_no_op() {
+        // LOCK-4: `--steal` by the origin that already holds the lock is not a
+        // fresh grant. A fresh grant runs purge-on-acquire against the holder's
+        // OWN in-flight bytes (§6's purge protects a grant from the previous
+        // occupant's backlog) and advances the generation, voiding the lease the
+        // same holder is presumably renewing.
+        let mut lock = on_demand();
+        assert_eq!(lock.acquire(OriginId(1)), Acquire::Granted);
+        lock.enqueue(OriginId(2));
+        let generation = lock.generation();
+
+        assert_eq!(lock.steal(OriginId(1)), Steal::AlreadyHeld);
+        assert_eq!(
+            lock.generation(),
+            generation,
+            "a self-steal must not void its own lease"
+        );
+        assert_eq!(lock.holder(), Some(OriginId(1)));
+        assert_eq!(
+            lock.waiters().collect::<Vec<_>>(),
+            vec![OriginId(2)],
+            "the queue is untouched"
+        );
+        assert!(
+            lock.snapshot().last_steal.is_none(),
+            "no theft happened, so state reports none"
+        );
+
+        // A genuine steal by the other origin still works and names the victim.
+        assert_eq!(
+            lock.steal(OriginId(2)),
+            Steal::Stolen {
+                previous: Some(OriginId(1))
+            }
+        );
+        assert!(lock.generation() > generation);
+
+        // Free-for-all has no lock to already hold, so a self-steal there is the
+        // same trivial success as any other steal.
+        let mut ffa = EndpointLock::new(Arbitration::FreeForAll);
+        ffa.register(OriginId(1), "a", WriteMode::OnDemand);
+        assert_eq!(ffa.acquire(OriginId(1)), Acquire::Granted);
+        assert_eq!(ffa.steal(OriginId(1)), Steal::Stolen { previous: None });
+    }
+
+    #[test]
     fn generation_advances_on_grant_and_steal_for_lease_guarding() {
         let mut lock = on_demand();
         let g0 = lock.generation();
@@ -909,7 +1032,21 @@ mod tests {
                     }
                     HeldOp::Enqueue(i) => { lock.enqueue(OriginId(i as u64)); }
                     HeldOp::Dequeue(i) => { lock.dequeue(OriginId(i as u64)); }
-                    HeldOp::Steal(i) => { if attached[i as usize] { lock.steal(OriginId(i as u64)); } }
+                    HeldOp::Steal(i) => {
+                        if attached[i as usize] {
+                            let target = OriginId(i as u64);
+                            let was_holder = lock.holder() == Some(target);
+                            let before = lock.generation();
+                            let outcome = lock.steal(target);
+                            if was_holder {
+                                // LOCK-4: a self-steal is an idempotent no-op —
+                                // no fresh grant, so no purge trigger and no
+                                // generation bump to void the holder's lease.
+                                prop_assert_eq!(outcome, Steal::AlreadyHeld);
+                                prop_assert_eq!(lock.generation(), before);
+                            }
+                        }
+                    }
                     HeldOp::ReclaimHeld(i) => { lock.reclaim_held(OriginId(i as u64)); }
                     HeldOp::Renew(i) => { lock.renew(OriginId(i as u64)); }
                 }
@@ -937,6 +1074,18 @@ mod tests {
                 let g = lock.generation();
                 prop_assert!(g >= last_gen, "generation went backwards");
                 last_gen = g;
+                // Invariant 5 (LOCK-1): a free lock is never mutually ungrantable.
+                // With writers registered and no holder, *some* origin's own
+                // `acquire` must succeed — held priority and FIFO fairness may
+                // each deny a contender, but never all of them at once. Probed on
+                // a clone so the property does not perturb the schedule under test.
+                if lock.holder().is_none() && attached.contains(&true) {
+                    let grantable = (0..4u64).any(|i| {
+                        attached[i as usize]
+                            && matches!(lock.clone().acquire(OriginId(i)), Acquire::Granted)
+                    });
+                    prop_assert!(grantable, "free lock that no attached origin can acquire");
+                }
             }
         }
     }

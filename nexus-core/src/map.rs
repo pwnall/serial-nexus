@@ -22,10 +22,33 @@
 //! translations, 2 for the CRLF pair, 4 for the hex-display family. That bound is
 //! what keeps the §5 one-frame holdover slot's memory bounded across the transform.
 //!
-//! The vocabulary and semantics are picocom's, matched byte-for-byte against its
-//! `do_map`/`map2hex`: the hex form is `[` + two lowercase hex digits + `]`, and
-//! `nrmhex` maps every printable ASCII byte `0x20..=0x7e` (space included), leaving
-//! `spchex`/`tabhex` as the way to hex *only* space or tab.
+//! **Fidelity to picocom.** The vocabulary and every rule's match set were read off
+//! upstream `picocom.c` itself — the flag table (`M_CRLF` … `M_NRMHEX`), `do_map`,
+//! and `map2hex` — and not off its manual page, which is where an earlier version of
+//! this module got `spchex` wrong (next paragraph). The correspondence, rule by rule:
+//! `crlf`/`crcrlf`/`igncr`/`crhex` all match CR and emit LF / CR+LF / nothing /
+//! `[0d]`; `lfcr`/`lfcrlf`/`ignlf`/`lfhex` match LF symmetrically; `bsdel` is BS→DEL
+//! and `delbs` DEL→BS; `tabhex` is TAB alone; `8bithex` is every high-bit byte
+//! `0x80..=0xff` (upstream `c & 0x80`); `nrmhex` is printable ASCII `0x20..=0x7e`
+//! (upstream `c >= 0x20 && c < 0x7f`), **space included** — so `nrmhex`, not
+//! `spchex`, is what hexes a space. Every hex rule renders through `map2hex`'s `[` +
+//! two *lowercase* hex digits + `]`, which is where [`MAX_EXPANSION`] = 4 comes from
+//! (upstream's `M_MAXMAP`).
+//!
+//! **`spchex` is picocom's control-byte class, not SPACE.** Upstream's flag comment
+//! reads "map special chars --> hex" and its `do_map` predicate is `c == '\x7f' ||
+//! ((unsigned char)c < 0x20 && c != '\x09' && c != '\x0a' && c != '\x0d')` — DEL plus
+//! every C0 control *except* TAB/LF/CR, which have rules of their own. This module
+//! shipped `spchex` as `b == 0x20` through v11, which both rewrote every space as
+//! `[20]` for anyone who enabled it and left `0x00..=0x1f` and `0x7f` unreachable by
+//! *any* rule in the vocabulary — the "cheap way to discover which quirk a mystery
+//! console actually has" that §7.8 advertises did not exist. **Correcting it changes
+//! the bytes an existing `spchex` configuration produces**, so it is a behavior change
+//! worth a release note, not a silent fix. With the upstream set the hex family now
+//! partitions the whole byte space — `spchex` ∪ `tabhex` ∪ `crhex` ∪ `lfhex` ∪
+//! `nrmhex` ∪ `8bithex` = `0x00..=0xff` — and `spchex` overlaps exactly two non-hex
+//! rules, `bsdel` (BS, `0x08`) and `delbs` (DEL, `0x7f`), where first-match-wins means
+//! the operator's list order decides rather than picocom's internal priority.
 
 /// The maximum bytes any single mapping emits for one input byte: the hex-display
 /// form `[xx]` (4 bytes). The output of a direction is bounded at
@@ -56,7 +79,9 @@ pub enum Mapping {
     Bsdel,
     /// DEL → BS.
     Delbs,
-    /// SPACE → `[20]`.
+    /// Any "special" (C0 control) byte → `[xx]`: DEL (`0x7f`) plus `0x00..=0x1f`
+    /// except TAB/LF/CR, which have their own rules. Picocom's `M_SPCHEX` — *not*
+    /// SPACE, despite the name (see the module doc's fidelity note).
     Spchex,
     /// TAB → `[09]`.
     Tabhex,
@@ -119,8 +144,13 @@ impl Mapping {
             Mapping::Lfcr | Mapping::Lfcrlf | Mapping::Ignlf | Mapping::Lfhex => b == 0x0a,
             Mapping::Bsdel => b == 0x08,
             Mapping::Delbs => b == 0x7f,
-            Mapping::Spchex => b == 0x20,
+            // picocom's `M_SPCHEX` arm of `do_map`, transcribed: `c == '\x7f' ||
+            // ((unsigned char)c < 0x20 && c != '\x09' && c != '\x0a' && c != '\x0d')`.
+            // The name says SPACE, the flag comment says "special chars", and the code
+            // says C0-minus-TAB/LF/CR plus DEL — the code wins (module doc).
+            Mapping::Spchex => b == 0x7f || (b < 0x20 && b != 0x09 && b != 0x0a && b != 0x0d),
             Mapping::Tabhex => b == 0x09,
+            // picocom's `c & 0x80` on a signed char — every byte with the high bit set.
             Mapping::EightBitHex => b >= 0x80,
             // Printable ASCII, space included — picocom's `0x20 <= c < 0x7f`.
             Mapping::NrmHex => (0x20..=0x7e).contains(&b),
@@ -156,8 +186,8 @@ impl Mapping {
                 1
             }
             // Every hex-display mapping renders the matched byte as `[xx]` (picocom's
-            // `map2hex`). For the fixed-byte rules (spchex/tabhex/crhex/lfhex) `b` is
-            // that one byte; for the range families it is whichever byte matched.
+            // `map2hex`). For the single-byte rules (tabhex/crhex/lfhex) `b` is that one
+            // byte; for the class rules (spchex/8bithex/nrmhex) it is whichever matched.
             Mapping::Spchex
             | Mapping::Tabhex
             | Mapping::Crhex
@@ -314,10 +344,32 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// A direct, independent oracle for one mapping applied to one byte — the
-    /// specification the compiled table is checked against (not derived from it).
+    /// A direct oracle for one mapping applied to one byte — the specification the
+    /// compiled table is checked against, transcribed from upstream `picocom.c`'s
+    /// `do_map`/`map2hex` rather than derived from this module. Where the oracle can
+    /// state a rule in a *different* form than [`Mapping::matches`] does, it
+    /// deliberately does (the class rules enumerate their byte sets; `8bithex` uses
+    /// upstream's `c & 0x80`), so a predicate edit fails here instead of agreeing with
+    /// itself. The upstream predicates, for the record:
+    ///
+    /// ```text
+    /// M_CRLF/M_CRCRLF/M_IGNCR/M_CRHEX   case '\x0d'
+    /// M_LFCR/M_LFCRLF/M_IGNLF/M_LFHEX   case '\x0a'
+    /// M_DELBS                           case '\x7f'   -> '\x08'
+    /// M_BSDEL                           case '\x08'   -> '\x7f'
+    /// M_TABHEX                          case '\x09'
+    /// M_SPCHEX   c == '\x7f' || ((unsigned char)c < 0x20
+    ///                            && c != '\x09' && c != '\x0a' && c != '\x0d')
+    /// M_8BITHEX  c & 0x80
+    /// M_NRMHEX   (unsigned char)c >= 0x20 && (unsigned char)c < 0x7f
+    /// ```
     fn oracle_one(m: Mapping, b: u8) -> Option<Vec<u8>> {
+        // picocom's `map2hex`: '[' + hexd[c >> 4] + hexd[c & 0x0f] + ']', lowercase.
         let hex = |c: u8| format!("[{c:02x}]").into_bytes();
+        // M_SPCHEX's class, enumerated: C0 minus TAB/LF/CR, plus DEL.
+        let special = matches!(b, 0x00..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f | 0x7f);
+        // M_NRMHEX's class, stated as "printable ASCII" instead of as a range.
+        let normal = b == b' ' || b.is_ascii_graphic();
         match m {
             Mapping::Crlf if b == 0x0d => Some(vec![0x0a]),
             Mapping::Crcrlf if b == 0x0d => Some(vec![0x0d, 0x0a]),
@@ -327,12 +379,12 @@ mod tests {
             Mapping::Ignlf if b == 0x0a => Some(vec![]),
             Mapping::Bsdel if b == 0x08 => Some(vec![0x7f]),
             Mapping::Delbs if b == 0x7f => Some(vec![0x08]),
-            Mapping::Spchex if b == 0x20 => Some(hex(b)),
+            Mapping::Spchex if special => Some(hex(b)),
             Mapping::Tabhex if b == 0x09 => Some(hex(b)),
             Mapping::Crhex if b == 0x0d => Some(hex(b)),
             Mapping::Lfhex if b == 0x0a => Some(hex(b)),
-            Mapping::EightBitHex if b >= 0x80 => Some(hex(b)),
-            Mapping::NrmHex if (0x20..=0x7e).contains(&b) => Some(hex(b)),
+            Mapping::EightBitHex if b & 0x80 != 0 => Some(hex(b)),
+            Mapping::NrmHex if normal => Some(hex(b)),
             _ => None,
         }
     }
@@ -349,6 +401,10 @@ mod tests {
 
     #[test]
     fn single_mapping_matches_the_oracle_over_all_256_bytes() {
+        // Every mapping against every byte of `0x00..=0xff` — the control range and DEL
+        // included, which is what the MAP-1 defect slipped through: the sweep existed,
+        // but the oracle it checked against restated this module's wrong `spchex`
+        // predicate instead of picocom's. `oracle_one` is now transcribed from upstream.
         for name in Mapping::all_names() {
             let m = Mapping::from_name(name).unwrap();
             let dir = MapDirection::compile(vec![m]);
@@ -399,14 +455,79 @@ mod tests {
 
     #[test]
     fn nrmhex_includes_space_matching_picocom() {
-        // picocom's nrmhex range is 0x20..=0x7e — space included; spchex/tabhex hex
-        // *only* space/tab. Pin the space inclusion so a future refactor can't drift.
+        // picocom's nrmhex range is 0x20..=0x7e — space included, so `nrmhex` is the
+        // rule that hexes a space (`spchex` does not; see the test below). Pin the
+        // space inclusion so a future refactor can't drift.
         let dir = MapDirection::compile(vec![Mapping::NrmHex]);
         let mut out = Vec::new();
         dir.apply(b" A~\t\n", &mut out, |_| {});
         // space->[20], 'A'->[41], '~'->[7e]; tab (0x09) and LF (0x0a) are outside
         // the printable range and pass through.
         assert_eq!(out, b"[20][41][7e]\t\n");
+    }
+
+    #[test]
+    fn spchex_maps_the_control_class_not_space() {
+        // Regression guard for the v11 defect: `spchex` was `b == 0x20`, so the rule an
+        // operator reaches for to reveal stray control bytes instead rewrote every space
+        // as `[20]` while the hunted bytes still passed through invisibly. Upstream
+        // `M_SPCHEX` is DEL plus C0 except TAB/LF/CR (module doc's fidelity note).
+        let dir = MapDirection::compile(vec![Mapping::Spchex]);
+
+        let mut out = Vec::new();
+        let mut fired = 0usize;
+        dir.apply(b"a \x00\x1b\x7f\t\n\rz", &mut out, |_| fired += 1);
+        assert_eq!(out, b"a [00][1b][7f]\t\n\rz");
+        assert_eq!(fired, 3, "only 0x00, 0x1b and 0x7f are substituted");
+
+        // The defect's signature, stated on its own: SPACE is untouched.
+        let mut sp = Vec::new();
+        dir.apply(b" ", &mut sp, |_| panic!("spchex must not fire on SPACE"));
+        assert_eq!(sp, b" ", "hexing a space is nrmhex's job, not spchex's");
+    }
+
+    #[test]
+    fn the_hex_family_can_render_every_byte() {
+        // §7.8 sells the hex family as "the cheap way to discover which quirk a mystery
+        // console actually has", which only holds if the six rules together reach every
+        // byte. Before the spchex fix, 0x00..=0x1f and 0x7f were unreachable by *any*
+        // rule in the vocabulary, so the advertised capability did not exist.
+        let dir = MapDirection::parse(&[
+            "spchex".into(),
+            "tabhex".into(),
+            "crhex".into(),
+            "lfhex".into(),
+            "nrmhex".into(),
+            "8bithex".into(),
+        ])
+        .unwrap();
+        let all: Vec<u8> = (0u8..=255).collect();
+        let mut out = Vec::new();
+        let mut fired = 0usize;
+        dir.apply(&all, &mut out, |_| fired += 1);
+        assert_eq!(fired, 256, "every byte is claimed by some hex rule");
+        let expected: Vec<u8> = all
+            .iter()
+            .flat_map(|b| format!("[{b:02x}]").into_bytes())
+            .collect();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn spchex_overlaps_bsdel_and_delbs_with_list_order_deciding() {
+        // spchex's class contains BS (0x08) and DEL (0x7f), which bsdel/delbs also
+        // match — the only overlaps it has outside the hex family. picocom resolves
+        // that with a fixed internal priority; here the operator's list order does
+        // (§7.8). Pin both directions so the overlap stays deliberate.
+        let hex_first = MapDirection::parse(&["spchex".into(), "delbs".into()]).unwrap();
+        let mut out = Vec::new();
+        hex_first.apply(b"\x7f", &mut out, |_| {});
+        assert_eq!(out, b"[7f]", "spchex before delbs hexes DEL");
+
+        let xlate_first = MapDirection::parse(&["delbs".into(), "spchex".into()]).unwrap();
+        let mut out = Vec::new();
+        xlate_first.apply(b"\x7f", &mut out, |_| {});
+        assert_eq!(out, b"\x08", "delbs before spchex translates DEL");
     }
 
     #[test]
@@ -453,7 +574,7 @@ mod tests {
             names in prop::collection::vec(
                 prop_oneof![
                     Just("crlf"), Just("crcrlf"), Just("igncr"), Just("lfcrlf"),
-                    Just("bsdel"), Just("nrmhex"), Just("8bithex"),
+                    Just("bsdel"), Just("nrmhex"), Just("8bithex"), Just("spchex"),
                 ].prop_map(String::from),
                 0..5,
             ),

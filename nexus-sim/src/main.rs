@@ -192,7 +192,9 @@ struct ClientArgs {
     ready_file: Option<PathBuf>,
     /// Read the hostward stream until it goes quiet (no bytes for `--quiet-ms`),
     /// counting every byte — the fully-draining reader for exact loss accounting.
-    /// Combine with `--read-rate` to be a slow consumer. Does not send.
+    /// Combine with `--read-rate` to be a slow consumer. Does not send. Reading
+    /// zero bytes is a **failed** verdict: a drain has no expected count, so
+    /// "saw nothing" is the only thing it can meaningfully fail on.
     #[arg(long)]
     drain: bool,
     /// Throttle reads to at most this many bytes/second (a slow consumer). Applies
@@ -843,7 +845,16 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
             a.skip,
             a.ready_file.as_deref(),
         )?;
-        let pass = target.is_none_or(|t| received as usize == t);
+        // `--recv N` passes when exactly N bytes arrived. A `--drain` has no target,
+        // and used to pass unconditionally — so a reader that observed *nothing*
+        // still printed `"pass": true`, which is how the README's echo snippet could
+        // report `received: 0, pass: true` and read as a success (review 26, RV-5).
+        // A verdict line is the harness's ground truth (AGENTS.md §5); one that
+        // cannot fail is not a verdict. A drain that read no bytes fails.
+        let pass = match target {
+            Some(t) => received as usize == t,
+            None => received > 0,
+        };
         return Ok(json!({
             "tool": "nexus-sim", "mode": "client",
             "behavior": if a.drain { "drain" } else { "recv" },

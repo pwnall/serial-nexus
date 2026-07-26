@@ -1,0 +1,17 @@
+# Ban raw `std::cell::RefCell` in the daemon (design §16.2, plan §9.2). Daemon
+# state lives in `crate::cell::CriticalCell`, whose state is reachable only inside
+# a synchronous `with`/`with_mut` closure — so a borrow physically cannot cross an
+# `.await`, making §15.20's "a RefCell borrow never crosses an .await" tripwire a
+# compile-shape fact instead of a review item. `CriticalCell`'s own single internal
+# RefCell carries a localized `#[allow(clippy::disallowed_types)]`.
+#
+# This file is a copy of `serialnexusd/clippy.toml`, and must stay one. Clippy
+# resolves `clippy.toml` from `CARGO_MANIFEST_DIR` *upward through ancestors*, and
+# `nexus-daemon` is a sibling of `serialnexusd`, not a descendant — so when the v8
+# library/binary split (§15.26) moved every line of daemon state into this crate,
+# the ban silently stopped covering the code it was written for (review 26,
+# INV5-CLIPPY-SCOPE; proven with a planted `RefCell` plus a lint canary). Keep both
+# files: `serialnexusd` still owns the thin binary, this one owns the state.
+disallowed-types = [
+    { path = "std::cell::RefCell", reason = "use crate::cell::CriticalCell (§16.2): a borrow can't cross .await" },
+]

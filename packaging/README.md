@@ -1,9 +1,9 @@
 # Packaging & deployment
 
 Files for running `serialnexusd` as a system service on Linux. serial_nexus is
-lab-usable on Linux at `0.1.0`; see [`../docs/macos.md`](../docs/macos.md) for the
-best-effort macOS status and [`../docs/security.md`](../docs/security.md) for the
-threat model you accept by exposing the control socket.
+lab-usable on Linux at `0.2.0`, pre-1.0; see [`../docs/macos.md`](../docs/macos.md)
+for the best-effort macOS status and [`../docs/security.md`](../docs/security.md)
+for the threat model you accept by exposing the control socket.
 
 | File | Purpose |
 |------|---------|
@@ -103,3 +103,57 @@ ssh -L 127.0.0.1:7420:127.0.0.1:7420 labmachine
 
 `insecure_bind = true` exists for a non-loopback bind, but it is a deliberately ugly,
 greppable footgun — prefer SSH forwarding.
+
+## Upgrading to this build — what changed for operators
+
+The `docs/26-claude-opus-code-review.md` remediation tightened configuration
+validation and changed a few operator-visible behaviours. There is no separate
+changelog, so the list lives here, where someone installing the unit will read it.
+
+**Configurations that used to load and now do not.** Each is refused *structurally*,
+before anything is created — so under `load --replace` a bad file can no longer
+destroy the running graph, which is the point of the change (§11). Run
+`serialnexusctl load <file>` against a scratch daemon before rolling one out.
+
+- **Unknown keys and unknown tables are rejected.** `advertized_baud = 9600` used to
+  be accepted and silently ignored; a misspelled `[[nodez]]` table used to parse to an
+  empty graph, which `--replace` then applied as an unannounced teardown reported as
+  success. Both now name the offender.
+- **Numeric fields are range-checked**: `replay_ring` ≤ 16 MiB, `hostward_buffer`
+  1..=65536, leg timers ≤ 1 h, log `rotation_padding` ≤ 20, `baud` ≥ 1. A 64 MiB
+  scrollback or a six-hour reconnect backoff is no longer configurable. (Unbounded
+  values were not merely unwise: a large `replay_ring` aborted the daemon on the next
+  byte from the device and then crash-looped from the persisted configuration.)
+- **An edge into a codec's or exec codec's multiplexed endpoint must declare
+  `write_mode = "held"`** (or `"never"` for a read-only demux). Omitting it used to
+  load and then swallow every targetward byte while `send` reported success.
+- **At most one effectively-`held` edge per host-facing endpoint**, unless that
+  endpoint's node sets `arbitration = "free-for-all"`.
+- **A `serial` node with `faces = "target"` is refused** as unimplemented (§14). It
+  used to load, open the device, take `TIOCEXCL`, and be wired to nothing.
+- **Node names and channel identities** may not be whitespace-only and are capped at
+  256 bytes.
+
+**Behaviour changes worth knowing about.**
+
+- **`spchex` maps different bytes.** It now matches picocom's `M_SPCHEX` — DEL plus
+  every control byte below 0x20 except TAB/LF/CR — where it previously matched SPACE.
+  A configuration using `spchex` produces different output; the old behaviour is
+  approximately `nrmhex` restricted to SPACE, and was never what the design specified.
+- **`serialnexusctl add-node` errors** on a file carrying more than one `[[node]]` or
+  any `[[edge]]`, instead of silently adding the first node and discarding the rest.
+- **`--json` prints errors as JSON** (`{"error": {...}}` on stdout, non-zero exit)
+  rather than only as human text on stderr.
+- **`lock --steal` by the origin that already holds the lock** is now a no-op that
+  reports `acquired: false`, instead of a fresh grant that purged the holder's own
+  in-flight bytes and voided its lease.
+- **New file modes**: the state file is created `0600` and log files `0640`. `mode`
+  applies at *creation*, so an existing world-readable log keeps its permissions until
+  it next rotates — if a log shipper runs as another user, fix its group access before
+  the next `rotate` rather than after.
+- **`rotate` is ordered against the write queue**, so everything accepted before the
+  request lands in the old file and everything after in the new one. The cost is
+  latency: rotating a node with a large backlog now waits for that backlog to drain.
+- **A structurally invalid *state file* no longer prevents startup.** The daemon logs
+  an error naming the file, preserves it untouched, and comes up with an empty graph.
+  An invalid `--config` file given explicitly on the command line still fails fast.

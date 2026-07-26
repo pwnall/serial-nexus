@@ -393,6 +393,66 @@ impl Rpc {
     }
 }
 
+/// One `info` round trip on `socket`, returning whether the daemon **answered** —
+/// the readiness probe behind [`Daemon::start`] (T7).
+///
+/// Readiness used to be `socket.exists()`, which is true from the instant
+/// `UnixListener::bind` creates the inode — before the accept loop runs, and before
+/// `startup_load` has finished bringing a persisted graph up. Every test then raced
+/// that window with its first RPC. `Rpc::call` *panics* on a transport failure (by
+/// design: a broken harness must fail loudly), so the race surfaced as a hard,
+/// confusing panic rather than a retry — exactly the flake class `b8d8ed8` had just
+/// fixed in the product.
+///
+/// This is deliberately total: every failure is a `false` (retry), never a panic, so
+/// the caller's bounded [`wait_until`] owns the deadline and the error message.
+/// `info` is the cheapest verb that proves the whole path — accept, read a line,
+/// dispatch, write a response — and it touches no graph state, so probing is free of
+/// side effects (the connection is closed immediately after).
+///
+/// Public so a test that boots its own `serialnexusd` with extra flags (e.g.
+/// `--socket-group`, `p9_permissions.rs`) waits on the same definition of "up" that
+/// [`Daemon::start`] does, instead of inventing a weaker one.
+pub fn daemon_answers(socket: &Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
+        return false;
+    }
+    // id 0 is outside `Rpc`'s own sequence (which starts at 1), so a probe can never
+    // be confused with a test's request.
+    let line = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"info\"}\n";
+    if stream.write_all(line).is_err() || stream.flush().is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => return false, // closed before answering
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                buf.push(byte[0]);
+                if buf.len() > 1 << 20 {
+                    return false;
+                }
+            }
+            Err(_) => return false, // timeout / reset
+        }
+    }
+    // Ready means *answered our request*, not merely "wrote something".
+    serde_json::from_slice::<Value>(&buf)
+        .ok()
+        .and_then(|v| v.get("id").and_then(Value::as_i64))
+        == Some(0)
+}
+
 /// A running `serialnexusd` subprocess with its own temp runtime dir and socket.
 /// Killed and cleaned up on `Drop`.
 pub struct Daemon {
@@ -402,7 +462,8 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Boot a fresh daemon on an empty graph and wait for its control socket.
+    /// Boot a fresh daemon on an empty graph and wait until it **answers RPC** —
+    /// not merely until its socket inode appears ([`daemon_answers`], T7).
     pub fn start() -> Self {
         let run = TempRun::new();
         let socket = run.socket();
@@ -416,11 +477,14 @@ impl Daemon {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn serialnexusd");
-        let ready = wait_until(Duration::from_secs(10), || socket.exists());
+        let ready = wait_until(Duration::from_secs(10), || {
+            socket.exists() && daemon_answers(&socket)
+        });
         assert!(
             ready,
-            "daemon control socket never appeared at {}",
-            socket.display()
+            "daemon never answered `info` on {} within 10s (socket present: {})",
+            socket.display(),
+            socket.exists()
         );
         let rpc = Rpc::new(socket);
         Daemon { child, rpc, run }

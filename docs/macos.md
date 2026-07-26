@@ -41,7 +41,8 @@ See `docs/implementation-notes.md` (2026-07-24 session) for the mechanism.
   asserts cargo-deny rejects it) passes. **verified.**
 - **PTY nodes — FIXED.** They previously *faulted* on macOS (`tcgetattr: ENOTTY`): the
   §7.2 baseline termios was applied through the pty **master**, which BSD rejects. Now
-  cfg-gated to apply through the **slave** on non-Linux (`nodes/pty.rs::with_termios_fd`),
+  cfg-gated to apply through the **slave** on non-Linux
+  (`nexus-daemon/src/nodes/pty.rs::with_termios_fd`),
   re-asserted on the client's presence rising edge (the macOS slave termios resets on
   last-close). Presence tracking works; the full client→pty→serial→crossover path is
   **verified byte-exact.** Linux path unchanged.
@@ -58,8 +59,13 @@ See `docs/implementation-notes.md` (2026-07-24 session) for the mechanism.
 macOS-specific ioctl a pty rejects). So the Linux "no-target doctrine" — a pty standing in
 for a serial device — **does not work on macOS**. Serial-*device* tests on macOS use a
 **real crossover rig** or **skip**; the product's real-UART path is unaffected (proven
-byte-exact above). The Rust harness (`nexus-itest`) encodes exactly this: `serial_rig()`
-yields the real rig on macOS, a sim pty on Linux, or `None` → skip.
+byte-exact above). The Rust harness (`nexus-itest`) encodes exactly this in three
+providers (`nexus-itest/src/lib.rs`): `serial_echo()` (one `nexus-sim pty --echo`
+double) and `serial_pair()` (a `nexus-sim nullmodem`) are **Linux-only** and return
+`None` elsewhere, so every test built on them self-skips on macOS; `crossover_ports()`
+finds the real rig (`SNX_CROSSOVER_A`/`_B`, else two `/dev/cu.usbserial-*` on macOS or
+two `/dev/serial/by-id/*` on Linux) and drives the `serial_hardware` test, itself
+skipping when no rig is attached.
 
 The validation harness was fully migrated from the bash `scripts/validate/**` (which used
 `stat -c`, `nc -q`, `sha256sum`, `timeout`, `/dev/serial/by-id` — none macOS-portable) to
@@ -74,8 +80,14 @@ this update block and the table disagree, **this block is the observed truth.**
 verified by a clean cross-compile —
 
 ```
-cargo check --target x86_64-apple-darwin --workspace   # Finished, no errors
+cargo check --target x86_64-apple-darwin --workspace --exclude serialnexusweb   # Finished, no errors
 ```
+
+`serialnexusweb` is excluded **from the Linux-side cross-check only**: its TLS
+dependency `ring` builds C with `cc` and cannot cross-build to Darwin from Linux
+(`cc: error: unrecognized command-line option '-arch'`). The real macOS gate is
+`cargo test --workspace` *on a Mac*, where `ring` builds natively and no exclusion
+is needed.
 
 — and by reading the platform gates in the source (below). Beyond that compile-time
 proof, the mechanisms that depend on live macOS behavior **have now been
@@ -126,25 +138,30 @@ no fault). `✖` = the feature does not function on macOS today.
 ### 1. Build: what is gated, and why it is safe
 
 The tree compiles for `*-apple-darwin` because four Linux-only touch-points are
-gated behind `cfg`, each onto a fallback the design already had:
+gated behind `cfg`, each onto a fallback the design already had — and each lives
+either in **`nexus-sys/src/lib.rs`**, the workspace's one crate with `unsafe`
+(§16.3), or in the single node that owns the behavior, so no platform arm is
+scattered:
 
 - **`TIOCGICOUNT`** (driver overrun/framing/parity counters). libc exports the
   request code only under `target_os = "linux"/"android"`, so the ioctl binding —
-  and only the binding — is Linux-gated. Off Linux, `read_icounts`/`read_icounter`
-  return `ENOTSUP`, which callers already map to "driver counters unsupported →
+  and only the binding — is Linux-gated. Off Linux, `nexus_sys::read_icounts`
+  returns `ENOTSUP`, which callers already map to "driver counters unsupported →
   omit them." That is the *same* graceful path a pts takes on Linux (a pts has no
   such counters either), so the code path is well-worn, not new. See
-  `serialnexusd/src/sys.rs` and `nexus-doctor/src/sys.rs`.
+  `nexus-sys/src/lib.rs`; the doctor reaches it as `use nexus_sys as sys`.
 - **`ptsname_r(3)`** (the reentrant slave-name resolver, a glibc extension). It
-  does not exist on macOS, so a localized wrapper uses the static-buffer
-  `ptsname(3)` there, copying the `String` out before returning. One wrapper hides
-  the split; every caller stays platform-agnostic. Present in the daemon
-  (`sys.rs`), the doctor (`sys.rs`), and the sim (`nexus-sim/src/main.rs`).
+  does not exist on macOS, so `nexus_sys::ptsname` uses the static-buffer
+  `ptsname(3)` there, copying the `String` out before returning — under a process
+  mutex, since that buffer is process-wide and two concurrent callers would
+  otherwise hand each other another pty's path. One wrapper hides the split, and
+  since §16.3 it is the *only* one: the daemon, the doctor and the sim all call
+  `nexus_sys::ptsname`, so none of them carries `unsafe` of its own.
 - **High-baud `BaudRate` arms** (`B460800`, `B921600`). macOS termios caps
   standard speeds at `B230400`, and nix gates those arms out on Apple. The PTY's
   advertised baud is cosmetic anyway, so an out-of-range value simply falls
   through to "unset" rather than being approximated
-  (`serialnexusd/src/nodes/pty.rs::standard_baud`).
+  (`nexus-daemon/src/nodes/pty.rs::standard_baud`).
 - **`getgroups`** is unavailable in nix on Apple, so the doctor's `dialout`/
   `plugdev` membership check reports *unknown/skipped* rather than a false verdict
   (`nexus-doctor/src/probes.rs::is_group_member`).
@@ -199,11 +216,11 @@ fast path works; `degraded` means poll-only. **needs a Mac.**
   socket `/run/serialnexusd.sock` works unchanged.
 - **Non-root:** `XDG_RUNTIME_DIR` is conventionally unset on macOS, so the daemon's
   socket resolver falls through to **`/tmp/serialnexusd-<uid>.sock`** (see
-  `serialnexusd/src/main.rs::resolve_socket`). This is short enough for the
+  `nexus-daemon/src/lib.rs::resolve_socket`). This is short enough for the
   `sockaddr_un` length limit. Pass `--socket` to override.
 - **Stale PTY symlink after a crash:** the auto-recovery that silently reclaims a
   symlink dangling into devpts is keyed on the target starting with `/dev/pts`
-  (`serialnexusd/src/nodes/pty.rs::install_symlink`). On macOS, pts nodes are
+  (`nexus-daemon/src/nodes/pty.rs::PtyNode::install_symlink`). On macOS, pts nodes are
   `/dev/ttys###`, so that predicate is false: a stale PTY symlink left by a crash
   is **not** reclaimed, and the node **faults** on the pre-existing path instead of
   recovering. A minor degradation — the operator removes the stale symlink by hand

@@ -14,10 +14,10 @@ pub mod map;
 pub mod pty;
 pub mod serial;
 
-use nexus_core::NodeStatus;
 use nexus_core::config::NodeConfig;
 use nexus_core::graph::EndpointAddr;
 use nexus_core::resolver::Resolver;
+use nexus_core::state::NodeState;
 
 /// A live node: its operator-facing name and its environment-owned status.
 pub enum Node {
@@ -94,7 +94,11 @@ impl Node {
         }
     }
 
-    pub fn status(&self) -> NodeStatus {
+    /// This node's observed status together with the moment it entered it (§7: "a
+    /// status of `active | waiting | faulted` with reason and timestamp"). Every
+    /// node kind keeps a [`NodeState`] rather than a bare `NodeStatus`, so a
+    /// recovery poll that re-reports the same condition does not reset the stamp.
+    pub fn status(&self) -> NodeState {
         match self {
             Node::Serial(n) => n.status(),
             Node::Pty(n) => n.status(),
@@ -128,6 +132,14 @@ impl Node {
     pub fn start(&mut self, wiring: &mut crate::runtime::Wiring) {
         match self {
             Node::Serial(n) => {
+                // A serial node's sole endpoint is host-facing, always: §7.1's
+                // `faces = "target"` output-leg role has no driver and is a
+                // *structural validation error* (`ValidationError::SerialFacesTarget`),
+                // so a target-facing serial can no longer reach `start` — it would
+                // seize the port with TIOCEXCL and be wired to nothing (DM-1,
+                // deferred work §7.1/§14). Claiming the host-facing entries
+                // unconditionally is therefore exact, not an assumption; if the role
+                // is ever implemented it wires a *different* set of entries here.
                 let addr = EndpointAddr::node(&n.name);
                 let hostward = wiring.host_sinks.remove(&addr).unwrap_or_default();
                 let targetward = wiring.host_targetward_rx.remove(&addr);
@@ -174,8 +186,35 @@ impl Node {
         }
     }
 
+    /// Ask this node's workers to stop, and return immediately — the cheap half of
+    /// teardown (§16.1, BND-1/LOG-1).
+    ///
+    /// [`Self::teardown`] blocks: it joins a serial reader thread, a pty writer
+    /// thread, a log flush. Paid per node inside one critical section on the single
+    /// runtime thread, `load --replace` and shutdown stall the whole daemon for the
+    /// *sum* of every node's stop latency. Signalling every node first and only then
+    /// tearing them down turns that sum into (roughly) a maximum: by the time the
+    /// first join is entered, every other node's worker is already winding down.
+    ///
+    /// Each kind sets its stop flags, aborts its tasks and returns; nothing is joined
+    /// and no environment is released here, so `teardown` must still run afterwards
+    /// (it is idempotent with respect to this).
+    pub fn signal_stop(&mut self) {
+        match self {
+            Node::Serial(n) => n.signal_stop(),
+            Node::Pty(n) => n.signal_stop(),
+            Node::Log(n) => n.signal_stop(),
+            Node::Codec(n) => n.signal_stop(),
+            Node::Exec(n) => n.signal_stop(),
+            Node::Leg(n) => n.signal_stop(),
+            Node::Map(n) => n.signal_stop(),
+        }
+    }
+
     /// Release environment on teardown/shutdown: stop data-plane tasks, unlink
     /// the PTY symlink, drop the serial port, flush and close the log writer.
+    /// Callers tearing down more than one node should run [`Self::signal_stop`]
+    /// over all of them first (BND-1).
     pub fn teardown(&mut self) {
         match self {
             Node::Serial(n) => n.teardown(),

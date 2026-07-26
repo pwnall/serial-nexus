@@ -69,12 +69,36 @@ pub fn read_icounts(_fd: RawFd) -> nix::Result<SerialIcounts> {
     Err(nix::errno::Errno::ENOTSUP)
 }
 
+/// Serializes the non-reentrant `ptsname(3)` arm below (see [`ptsname`]'s
+/// *Safety* section). Held only across the call and the copy-out — never across
+/// an `.await`, and never by the data plane's hot paths, which do not resolve
+/// slave paths.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+static PTSNAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Resolve a pty master's slave path. Linux/Android have the reentrant
 /// `ptsname_r(3)` (a glibc extension nix exposes safely); elsewhere only the
 /// static-buffer `ptsname(3)` exists, which nix marks `unsafe`. This wrapper hides
 /// the split so the PTY node code is platform-agnostic. On the non-reentrant path
 /// the returned `String` is copied out of the static buffer before this returns,
 /// so no dangling reference escapes.
+///
+/// # Safety (the non-Linux arm's precondition, made explicit)
+///
+/// `ptsname(3)` returns a pointer into a *process-wide static buffer* that the
+/// next call overwrites, so two concurrent callers can hand each other another
+/// pty's path — the wrong slave symlink for a `pty` node (§7.2), which is a
+/// silent misrouting, not a crash. The precondition was previously only
+/// "single-threaded callers", true of every caller today but written in no
+/// document and unenforced (review 26, SYS-1: latent, not live — this arm
+/// compiles only off Linux, and Linux takes the reentrant path).
+///
+/// It is now enforced for callers *inside this process*: the call and the
+/// copy-out run under [`PTSNAME_LOCK`], so concurrent `nexus_sys::ptsname`
+/// callers serialize and each observes its own result. The residual precondition
+/// is the part no library can enforce — **no other code in the process may call
+/// `ptsname(3)` concurrently** (a third-party crate or C library calling it
+/// directly bypasses this lock). serial_nexus itself calls it only here.
 pub fn ptsname(master: &nix::pty::PtyMaster) -> nix::Result<String> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -82,8 +106,15 @@ pub fn ptsname(master: &nix::pty::PtyMaster) -> nix::Result<String> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        // Safety: single-threaded callers; the `String` is cloned out of the
-        // static buffer immediately, so a later `ptsname` call cannot corrupt it.
+        // A poisoned lock carries no state worth refusing over — the guarded
+        // region is one FFI call and a copy — so recover the guard rather than
+        // turning another thread's panic into a pty node that cannot start.
+        let _guard = PTSNAME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Safety: the static buffer is read (and cloned into an owned `String`)
+        // before `_guard` drops, so no other caller of this function can
+        // overwrite it in between, and no reference to it escapes.
         unsafe { nix::pty::ptsname(master) }
     }
 }
@@ -218,4 +249,37 @@ pub fn poll_blocking(
     let mut fds = [PollFd::new(borrowed, interest)];
     let _ = poll(&mut fds, PollTimeout::from(timeout_ms));
     fds[0].revents().unwrap_or_else(nix::poll::PollFlags::empty)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two masters resolved concurrently must each keep their *own* slave path
+    /// (§7.2: the path becomes a `pty` node's stable symlink, so a swap is a
+    /// silent misroute, not a crash). On Linux this rides the reentrant
+    /// `ptsname_r` arm; off Linux it is the regression guard for `PTSNAME_LOCK`,
+    /// the static-buffer precondition documented on [`ptsname`] (review 26,
+    /// SYS-1). Portable either way, which is the point.
+    #[test]
+    fn concurrent_ptsname_keeps_each_master_s_own_path() {
+        use nix::fcntl::OFlag;
+        use nix::pty::posix_openpt;
+
+        let a = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY).expect("open pty master a");
+        let b = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY).expect("open pty master b");
+        let want_a = ptsname(&a).expect("resolve a");
+        let want_b = ptsname(&b).expect("resolve b");
+        assert_ne!(want_a, want_b, "two masters must have distinct slaves");
+
+        std::thread::scope(|s| {
+            for (master, want) in [(&a, &want_a), (&b, &want_b)] {
+                s.spawn(move || {
+                    for _ in 0..200 {
+                        assert_eq!(&ptsname(master).expect("resolve under contention"), want);
+                    }
+                });
+            }
+        });
+    }
 }

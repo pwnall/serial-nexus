@@ -1,3 +1,5 @@
 /target
 /fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
 /examples/external-codec/target

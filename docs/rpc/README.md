@@ -16,7 +16,7 @@ directory documents that surface method by method.
 | Page | Methods |
 | --- | --- |
 | [configuration.md](configuration.md) | `load`, `add-node`, `remove-node`, `dump` |
-| [observation.md](observation.md) | `state`, `subscribe`, `info` (+ the `state` / `lock` notifications and `LockSnapshot`) |
+| [observation.md](observation.md) | `state`, `subscribe`, `info`, `tap.open`, `tap.close` (+ the `state` / `lock` / `tap.data` / `tap.closed` notifications and `LockSnapshot`) |
 | [arbitration.md](arbitration.md) | `lock`, `unlock`, `send` |
 | [logging.md](logging.md) | `rotate` |
 | [serial-signals.md](serial-signals.md) | `send-break`, `set-modem`, `pulse-dtr` |
@@ -34,9 +34,10 @@ mutations are serialized daemon-side, so many clients may connect at once.
 * **Responses** are daemon → client and carry exactly one of `result` or
   `error`, correlated to the request `id`. A response with neither or both is a
   protocol violation and never emitted.
-* **Notifications** are id-less messages the daemon pushes to a connection
-  *after* it has issued `subscribe` — see [observation.md](observation.md).
-  Clients never send notifications.
+* **Notifications** are id-less messages the daemon pushes to a connection — see
+  [observation.md](observation.md). `state` and `lock` go only to a connection
+  that has issued `subscribe`; `tap.data` and `tap.closed` go to the connection
+  that opened the tap, subscribed or not. Clients never send notifications.
 * **`jsonrpc` must be `"2.0"`** on every message; any other version is rejected.
 * **Batch arrays are rejected outright.** A line whose first non-space byte is
   `[` returns `-32600` (`"batch requests are not supported"`) — "deleting the
@@ -44,6 +45,18 @@ mutations are serialized daemon-side, so many clients may connect at once.
 * A line that is not valid JSON returns `-32700`; a well-formed JSON value that
   is not a valid request object returns `-32600`. Both reply with `id: null`
   (JSON-RPC 2.0 §5) so the client's read stream never desyncs.
+* **A request line is capped at 1 MiB.** A longer line — or an unterminated one
+  that grows past the cap — is refused with `-32600` (`"request line exceeds the
+  1048576-byte limit"`, `id: null`) and the connection is closed, so one client
+  cannot grow the shared daemon's read buffer without bound. The cap sits far
+  above any real verb, including a `load`'s inline graph JSON.
+* **One in-flight *waiting* verb per connection.** `lock --wait` and `send` may
+  suspend; while one is parked, a second request pipelined onto the same
+  connection is answered `-32006` — with its own `id` — and the parked verb is
+  left intact and still answers later. Use a second connection for concurrent
+  work. Reaching end-of-file on the read half is different: that *cancels* the
+  waiting verb and closes the connection (§15.20), which is why a half-close is
+  not a way to say "I am done sending" (see below).
 
 ### Request / response shape
 
@@ -52,7 +65,7 @@ mutations are serialized daemon-side, so many clients may connect at once.
 ```
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"nodes":[]}}
+{"jsonrpc":"2.0","id":1,"result":{"endpoints":[],"nodes":[],"taps":[]}}
 ```
 
 ```json
@@ -81,23 +94,34 @@ removed on clean shutdown.
 
 ## Poking it by hand (nc + jq)
 
-Any newline-delimited client works. With `nc -U` (Unix-socket mode) and `jq`:
+Any newline-delimited client works. With `nc -N -U` (Unix-socket mode, half-close
+on stdin EOF) and `jq`:
 
 ```console
 $ SOCK="${XDG_RUNTIME_DIR:-/tmp}/serialnexusd.sock"
-$ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"state"}' | nc -U "$SOCK" | jq
+$ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"state"}' | nc -N -U "$SOCK" | jq
 {
   "jsonrpc": "2.0",
   "id": 1,
-  "result": { "nodes": [] }
+  "result": { "endpoints": [], "nodes": [], "taps": [] }
 }
 ```
 
-`printf` closes `nc`'s send side after the single line; the daemon replies and
-closes the connection, so this is a clean one-shot. `socat - UNIX-CONNECT:$SOCK`
-works identically and is handy for interactive sessions. A `subscribe` request
-instead holds the connection open and streams notification lines (feed them to
-`jq -c` line by line).
+**`-N` is not optional for a one-shot.** The daemon closes a connection when it
+reads end-of-file, never after a reply — nothing in the protocol says a request
+is the last one — so the client must be the side that half-closes. `printf`
+closes `nc`'s *stdin*, and netcat-openbsd does not propagate that to the socket
+without `-N`: the reply prints and then the command hangs forever.
+`socat - UNIX-CONNECT:$SOCK` needs no such flag — it propagates the half-close by
+default — and is handy for interactive sessions.
+
+**Do not use `-N` with a verb that waits or streams.** Because end-of-file
+cancels an in-flight waiting verb (§15.20), a `lock --wait` or a `send` that must
+queue behind a holder gets *no reply at all* under `-N` — the half-close reads as
+a disconnected client. Likewise `subscribe` holds the connection open to stream
+notification lines (feed them to `jq -c` line by line), and `-N` ends it right
+after the acknowledgement. For those, keep the write half open: plain `nc -U`, or
+`socat -,ignoreeof UNIX-CONNECT:$SOCK`.
 
 ## `serialnexusctl --json` is a pass-through
 
@@ -108,8 +132,30 @@ prints the daemon's raw `result` value instead, unmodified:
 ```console
 $ serialnexusctl --json state
 {
-  "nodes": []
+  "endpoints": [],
+  "nodes": [],
+  "taps": []
 }
+```
+
+The **error** path is machine-readable too: `--json` prints the daemon's JSON-RPC
+error object to stdout under an `error` key — `{"error":{"code":…,"message":…,
+"data":…}}` — and exits non-zero, so an agent never has to parse human text to
+learn what failed. The key cannot collide with the success path, which is a raw
+pass-through of the daemon `result` and is never printed alongside it. Without
+`--json` the same failure goes to stderr as `error <code>: <message>` with any
+`data` pretty-printed beneath it.
+
+```console
+$ serialnexusctl --json load bad.toml; echo "exit=$?"
+{
+  "error": {
+    "code": -32002,
+    "data": { "errors": [ "…" ] },
+    "message": "structural error: …"
+  }
+}
+exit=1
 ```
 
 This makes the CLI a drop-in JSON-RPC front end for scripts and agents that
@@ -144,3 +190,4 @@ object with structured detail.
 | `-32003` | locked | a contended `lock`/`send` was refused; `data.held_by` names the holder when known |
 | `-32004` | has edges | `remove-node` refused because edges are still attached and `--cascade` was not given |
 | `-32005` | device absent | `add-node` by raw path or serial number, but the device is not present so its identity cannot be captured (§12) |
+| `-32006` | waiting verb in flight | a request was pipelined behind an in-flight waiting verb on the same connection; §15.20 runs one at a time, and the wait is left intact |

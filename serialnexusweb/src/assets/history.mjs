@@ -63,6 +63,27 @@ export function splice(h, offset, bytes) {
   return fresh;
 }
 
+/// Re-anchor the log when the daemon's offset space restarts beneath it, returning
+/// `true` iff it did.
+///
+/// Hostward offsets are monotonic *per endpoint hub*, and `load --replace`,
+/// `remove-node` and `add-node` all rebuild those hubs — so offsets go back to 0 while
+/// the daemon `instance` nonce, which is per *boot*, does not change. A stored history
+/// whose frontier sits at (say) 900 000 then rejects every fresh chunk as
+/// already-seen, and the console silently freezes: the recorded `load --replace` OPFS
+/// freeze, from the client side.
+///
+/// The retained bytes are real and stay — they happened — but they belong to a space
+/// the daemon no longer counts in, so the frontier moves to where the new stream
+/// actually starts. The caller is expected to mark the seam, because concatenating two
+/// offset spaces without saying so is exactly the silent splice §10's offset contract
+/// exists to prevent.
+export function offsetSpaceReset(h, fromOffset) {
+  if (h.frontier === null || fromOffset >= h.frontier) return false;
+  h.frontier = fromOffset;
+  return true;
+}
+
 /// Enforce the retention cap by dropping oldest whole chunks, then, if a single surviving
 /// chunk still exceeds the cap, keeping only its tail. Never trims below the cap.
 export function trim(h) {

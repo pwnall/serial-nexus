@@ -33,13 +33,48 @@ pub const MAP_RAW_ENDPOINT: &str = "raw";
 /// ([`toml::Table`]) may carry floats, which are only `PartialEq`. Config
 /// equality (round-trip tests) needs only `PartialEq`; nothing keys a map on a
 /// config, so the `Eq` marker was never load-bearing.
+///
+/// `deny_unknown_fields` (§11, "the entire file is validated … before anything is
+/// created"): a mis-typed top-level table — `[[nodez]]` for `[[node]]` — used to
+/// parse to an *empty* graph, and since `load --replace` composes teardown-then-load
+/// the typo became an unannounced `teardown` reporting success. Silence is the one
+/// thing configuration parsing may not do.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphConfig {
     #[serde(default, rename = "node", skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<NodeConfig>,
     #[serde(default, rename = "edge", skip_serializing_if = "Vec::is_empty")]
     pub edges: Vec<EdgeConfig>,
 }
+
+/// The largest accepted `replay_ring` depth, in bytes (§5, §15.32). The ring is a
+/// bounded scrollback buffer sized in tens of kilobytes by design; 16 MiB is already
+/// two orders of magnitude past its rationale, and the cap exists because the ring
+/// allocates lazily on the first hostward byte — an unbounded value loads cleanly and
+/// then *aborts the process* out of the allocator, on a configuration `load` has
+/// already persisted, so the daemon crash-loops on restart (§11, §15.26).
+pub const MAX_REPLAY_RING: usize = 16 * 1024 * 1024;
+
+/// The largest accepted `hostward_buffer` depth, in chunks (§5, §7.1/§7.2). The
+/// buffer absorbs a slow consumer's backlog before dropping-with-counters; 65536
+/// chunks is far beyond any consumer worth waiting for. The cap exists because the
+/// depth is handed straight to a bounded tokio channel, which *panics* above its
+/// permit ceiling — and `load --replace` tears the running graph down before the
+/// wiring is built, so the panic would arrive too late to save it (§11, §15.26).
+pub const MAX_HOSTWARD_BUFFER: usize = 65_536;
+
+/// The largest accepted value for a leg's millisecond timers — reconnect backoff and
+/// idle release (§7.4, §6). One hour: a leg that waits longer than that to retry, or
+/// to release an idle implicit lock, is indistinguishable from a dead one, and the
+/// operator who typed an extra three digits learns it at load rather than by watching
+/// a console that never comes back.
+pub const MAX_TIMER_MS: u64 = 3_600_000;
+
+/// The largest accepted log `rotation_padding`, in digits (§7.3). The rotation
+/// counter is a `u64`, so at most twenty digits can ever be significant; beyond that
+/// the padding is pure filename noise.
+pub const MAX_ROTATION_PADDING: u8 = 20;
 
 impl GraphConfig {
     /// Build the topological [`GraphModel`] this configuration describes, for
@@ -60,11 +95,106 @@ impl GraphConfig {
         model
     }
 
+    /// Whether this configuration declares nothing at all.
+    ///
+    /// An empty graph is perfectly legal — `teardown` persists one deliberately —
+    /// so this is *not* a validation failure. It exists for the `load` path, which
+    /// is the only caller that also knows whether the source text was non-empty: an
+    /// empty parse of a non-empty file (a comment-only file, or a table name serde
+    /// now rejects outright) turns `load --replace` into an unannounced `teardown`
+    /// that reports success, which is the one input that breaks §15.8's
+    /// operators-own-the-graph guarantee. That caller pairs this with
+    /// [`ValidationError::EmptyConfig`].
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.edges.is_empty()
+    }
+
+    /// The node declared under `name`, if any.
+    fn node_named(&self, name: &str) -> Option<&NodeConfig> {
+        self.nodes.iter().find(|n| n.name() == name)
+    }
+
+    /// The orientation of an endpoint address, resolved through the declaring
+    /// node's shape (§4). `None` for a dangling address — the topology model
+    /// reports those as `UnknownNode`/`UnknownEndpoint`.
+    fn endpoint_facing(&self, addr: &EndpointAddr) -> Option<Facing> {
+        self.node_named(&addr.node)?
+            .shape()
+            .endpoints
+            .iter()
+            .find(|e| e.name == addr.endpoint)
+            .map(|e| e.facing)
+    }
+
+    /// An edge's `(host-facing end, target-facing end)`, or `None` when it is
+    /// same-facing or dangling — the cases graph rule 1 and reference integrity
+    /// already report, and the cases the data-plane wiring skips.
+    fn edge_ends<'e>(&self, edge: &'e EdgeConfig) -> Option<(&'e EndpointAddr, &'e EndpointAddr)> {
+        match (
+            self.endpoint_facing(&edge.a)?,
+            self.endpoint_facing(&edge.b)?,
+        ) {
+            (Facing::Host, Facing::Target) => Some((&edge.a, &edge.b)),
+            (Facing::Target, Facing::Host) => Some((&edge.b, &edge.a)),
+            _ => None,
+        }
+    }
+
+    /// Whether `addr` is a codec (or exec) node's *multiplexed* endpoint — its
+    /// default, empty-named endpoint (§7.5/§7.6, §15.22). The exec codec is an
+    /// ordinary codec node selected by `codec = "exec"`, so one test covers both.
+    fn is_multiplexed_endpoint(&self, addr: &EndpointAddr) -> bool {
+        addr.is_default() && matches!(self.node_named(&addr.node), Some(NodeConfig::Codec { .. }))
+    }
+
+    /// The runtime-effective write mode of `edge` (§6) — what the data plane will
+    /// actually register, as opposed to what the operator declared.
+    ///
+    /// **This is the single source of truth for the two configuration-to-runtime
+    /// write-mode promotions** (§16's "one rule, one place"); the daemon's wiring
+    /// consumes it rather than re-deriving them:
+    ///
+    /// 1. **A log target forces `never`.** A log node is inherently read-only
+    ///    (§7.3): it gets no targetward path and no lock handle, whatever the edge
+    ///    says. A configured value round-trips through `dump`/`load` cosmetically.
+    /// 2. **A map's `raw` endpoint promotes `on-demand` to `held`.** A map owns its
+    ///    console's writes (§7.8), and a held-origin interior pump cannot run
+    ///    on-demand — the lock only ever grants a *held* origin that reclaim path,
+    ///    so an on-demand origin would park forever. An omitted `write_mode` is the
+    ///    generic `on-demand` default, so it is promoted here; an explicit `never`
+    ///    is preserved and makes a read-only/display map.
+    ///
+    /// Everything else is the declared mode, including a same-facing or dangling
+    /// edge (which is never wired at all, so the declared value is the honest
+    /// answer).
+    pub fn effective_write_mode(&self, edge: &EdgeConfig) -> WriteMode {
+        let Some((_host, target)) = self.edge_ends(edge) else {
+            return edge.write_mode;
+        };
+        if matches!(self.node_named(&target.node), Some(NodeConfig::Log { .. })) {
+            WriteMode::Never
+        } else if edge.write_mode == WriteMode::OnDemand
+            && target.endpoint == MAP_RAW_ENDPOINT
+            && matches!(self.node_named(&target.node), Some(NodeConfig::Map { .. }))
+        {
+            WriteMode::Held
+        } else {
+            edge.write_mode
+        }
+    }
+
     /// Full structural validation (§4, §11): duplicate node names (checked on the
     /// node *list*, before the model's shape map collapses them) plus the three
     /// graph rules and name checks. An empty vector means the graph is valid. This
     /// is what `load` runs — [`GraphModel::validate`] alone would miss a duplicate
     /// node name, since the model is keyed by name.
+    ///
+    /// Everything the topology model cannot see lives here, because §11 wants the
+    /// *entire* file judged before anything is created — and, under `load --replace`,
+    /// before the running graph is torn down (§15.26). That is three families: the
+    /// per-kind attribute checks (leg transport/address, map mapping names, serial
+    /// facing), the numeric ranges, and the two edge rules that depend on node kinds
+    /// and write modes rather than on endpoint facings.
     pub fn validate(&self) -> Vec<ValidationError> {
         let mut errors = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -74,11 +204,28 @@ impl GraphConfig {
                     node: node.name().to_owned(),
                 });
             }
+            // Every numeric knob is range-checked here, at validation time — before
+            // anything is created and, under `load --replace`, before the running
+            // graph is torn down (§11 load atomicity, §15.26: a structurally-invalid
+            // config must never destroy a good running graph). Two of these were
+            // reachable process-killers rather than merely silly values, which is
+            // why the whole class moved here instead of one field at a time.
+            if let Some(cap) = node.replay_ring() {
+                errors.extend(range_error(
+                    node.name(),
+                    "replay_ring",
+                    cap as u64,
+                    0,
+                    MAX_REPLAY_RING as u64,
+                ));
+            }
             // A zero-depth hostward buffer builds a rendezvous channel that drops
             // nearly all hostward output even for a fast, fully-present consumer
             // (§5, §7.1/§7.2): the fan-out / writer bridge can admit a chunk only in
             // the instant a consumer is blocked in recv. Give the bounded buffer a
-            // floor of one chunk. Only serial and pty carry the tunable.
+            // floor of one chunk, and a ceiling too — the depth is handed straight to
+            // a bounded tokio channel, which panics above its permit ceiling. Only
+            // serial and pty carry the tunable.
             if let NodeConfig::Serial {
                 name,
                 hostward_buffer,
@@ -89,9 +236,52 @@ impl GraphConfig {
                 hostward_buffer,
                 ..
             } = node
-                && *hostward_buffer == 0
             {
-                errors.push(ValidationError::ZeroHostwardBuffer { node: name.clone() });
+                if *hostward_buffer == 0 {
+                    errors.push(ValidationError::ZeroHostwardBuffer { node: name.clone() });
+                } else {
+                    errors.extend(range_error(
+                        name,
+                        "hostward_buffer",
+                        *hostward_buffer as u64,
+                        1,
+                        MAX_HOSTWARD_BUFFER as u64,
+                    ));
+                }
+            }
+            // Serial-specific config-level checks (§7.1).
+            if let NodeConfig::Serial {
+                name, faces, baud, ..
+            } = node
+            {
+                // §7.1 describes the output-leg role (`faces = "target"`), but no
+                // wiring for it exists: the node would open the device, take
+                // TIOCEXCL, and be attached to nothing — a port held hostage with no
+                // data path and no diagnostic. Refuse it honestly rather than let it
+                // load; implementing the role is deferred work (§14).
+                if *faces == Facing::Target {
+                    errors.push(ValidationError::SerialFacesTarget { node: name.clone() });
+                }
+                // Baud has no upper bound on purpose — §7.1/§13 buy custom and
+                // nonstandard rates deliberately — but zero is not a rate: on Linux
+                // B0 means *hang up the line*, which would quietly contradict §7.1's
+                // promise that line states are deterministic.
+                errors.extend(range_error(name, "baud", *baud as u64, 1, u32::MAX as u64));
+            }
+            // A log's rotation-suffix padding (§7.3).
+            if let NodeConfig::Log {
+                name,
+                rotation_padding,
+                ..
+            } = node
+            {
+                errors.extend(range_error(
+                    name,
+                    "rotation_padding",
+                    *rotation_padding as u64,
+                    0,
+                    MAX_ROTATION_PADDING as u64,
+                ));
             }
             // Leg-specific config-level checks the shape/topology model cannot make
             // (it sees only endpoints, not transport/address, and cannot tell a
@@ -102,10 +292,25 @@ impl GraphConfig {
                 transport,
                 address,
                 insecure_bind,
+                reconnect_initial_ms,
+                reconnect_max_ms,
+                idle_release_ms,
                 channels,
                 ..
             } = node
             {
+                // The leg's millisecond timers (§7.4, §6). Nothing overflows at the
+                // top — `Duration::from_millis(u64::MAX)` is a legal, geological
+                // wait — which is exactly the problem: the leg would load, report
+                // itself connecting, and never retry. Cap them where "slow" stops
+                // being distinguishable from "dead".
+                for (field, value) in [
+                    ("reconnect_initial_ms", *reconnect_initial_ms),
+                    ("reconnect_max_ms", *reconnect_max_ms),
+                    ("idle_release_ms", *idle_release_ms),
+                ] {
+                    errors.extend(range_error(name, field, value, 0, MAX_TIMER_MS));
+                }
                 // Loopback-only unless insecure_bind; unix is inherently local (§9).
                 if *transport == Transport::Tcp && !*insecure_bind && !is_loopback_addr(address) {
                     errors.push(ValidationError::NonLoopbackBind {
@@ -152,9 +357,86 @@ impl GraphConfig {
                 }
             }
         }
+
+        // Edge-level rules the topology model cannot make: it knows endpoint facings
+        // and nothing about node kinds or write modes (§4 keeps it that way on
+        // purpose), so both live here, alongside the leg/codec/map config checks.
+        let mut held_origin: std::collections::HashMap<&EndpointAddr, &EndpointAddr> =
+            std::collections::HashMap::new();
+        for (i, edge) in self.edges.iter().enumerate() {
+            let Some((host, target)) = self.edge_ends(edge) else {
+                continue;
+            };
+            // A codec's (or exec's) multiplexed side takes its bytes through a
+            // held-origin pump: the lock's held-reclaim path only ever grants a
+            // `Held` origin, so an `on-demand` origin parks on its first chunk
+            // forever while `send` cheerfully reports success — targetward bytes
+            // accepted, acknowledged, and lost, which §5 forbids outright. `held` is
+            // the working mode and `never` is the deliberate read-only one; anything
+            // else is an operator error worth naming, not a silent stall (§7.5/§7.6).
+            // Only the *target-facing* multiplexed side is constrained: a
+            // re-multiplexer's mux endpoint faces host and is an ordinary arbitrated
+            // endpoint, and a codec's channel endpoints are ordinary origins.
+            if self.is_multiplexed_endpoint(target)
+                && !matches!(edge.write_mode, WriteMode::Held | WriteMode::Never)
+            {
+                errors.push(ValidationError::MultiplexedEdgeNotHeld {
+                    edge: i,
+                    origin: host.clone(),
+                    mux: target.clone(),
+                    write_mode: edge.write_mode,
+                });
+            }
+            // At most one *effectively* held origin per host-facing endpoint (§6).
+            // "Held indefinitely" is a promise only one origin can be given: the lock
+            // picks a winner arbitrarily, and the loser can never write, never joins
+            // the waiter queue, and appears nowhere in `state` as blocked. Going
+            // through `effective_write_mode` (rather than the declared value) is what
+            // catches the reachable shape — two maps attached to one upstream
+            // endpoint with `write_mode` written nowhere, both promoted to held.
+            if self.effective_write_mode(edge) == WriteMode::Held
+                // A `free-for-all` endpoint has no lock at all (§6), so two held
+                // origins there are the operator's explicit, working choice.
+                && self.node_named(&host.node).map(NodeConfig::arbitration)
+                    != Some(Arbitration::FreeForAll)
+            {
+                match held_origin.entry(host) {
+                    std::collections::hash_map::Entry::Occupied(prior) => {
+                        errors.push(ValidationError::ConflictingHeldEdges {
+                            endpoint: host.clone(),
+                            first: (*prior.get()).clone(),
+                            second: target.clone(),
+                        });
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(target);
+                    }
+                }
+            }
+        }
+
         errors.extend(self.to_model().validate());
         errors
     }
+}
+
+/// One inclusive range check, as a [`ValidationError::NumericOutOfRange`] or
+/// nothing. A free function rather than a closure so the per-node checks in
+/// [`GraphConfig::validate`] can keep pushing into the same error vector.
+fn range_error(
+    node: &str,
+    field: &'static str,
+    value: u64,
+    min: u64,
+    max: u64,
+) -> Option<ValidationError> {
+    (value < min || value > max).then(|| ValidationError::NumericOutOfRange {
+        node: node.to_owned(),
+        field,
+        value,
+        min,
+        max,
+    })
 }
 
 /// Whether an address's host is loopback (§7.4/§9 loopback-only rule). Accepts a
@@ -187,7 +469,11 @@ fn is_loopback_addr(address: &str) -> bool {
 }
 
 /// An edge in configuration form: two endpoint addresses and a write mode (§6).
+/// `deny_unknown_fields`, as everywhere in this file: §11 validates the entire file
+/// before anything is created, and a key nobody reads is a validation that silently
+/// did not happen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EdgeConfig {
     pub a: EndpointAddr,
     pub b: EndpointAddr,
@@ -210,8 +496,16 @@ pub struct EdgeConfig {
 ///
 /// `Eq` is deliberately absent (see [`GraphConfig`]): the codec variant's
 /// [`toml::Table`] attribute table is only `PartialEq`.
+///
+/// `deny_unknown_fields` is a *container* attribute and applies to every variant's
+/// field set, so `advertized_baud = 9600` is now a load error naming the key instead
+/// of a typo the daemon ignores while `dump` shows the unchanged default (§11). The
+/// `type` tag itself is stripped before a variant is deserialized, so internal
+/// tagging and the denial coexist — pinned by `unknown_node_field_is_rejected`. The
+/// codec's `attributes` table stays open by construction (§8): it is one opaque
+/// field the codec validates against its own schema, not a field set we know.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum NodeConfig {
     /// Serial port node (§7.1).
     Serial {
@@ -612,12 +906,20 @@ pub enum StopBits {
 
 /// Serial flow control. `none` is the 3-wire default (§5); the others remain
 /// ordinary port attributes (§7.1).
+///
+/// Kebab-case is canonical, so `dump` round-trips unchanged — but §7.1 spells the
+/// values `xonxoff` and `rtscts`, and those are the only operator-facing reference
+/// for this attribute. Without the aliases the design's own spellings fail to
+/// deserialize, and because that is a parse error it rejects the *entire*
+/// configuration file. The design wins: both spellings are accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FlowControl {
     #[default]
     None,
+    #[serde(alias = "xonxoff")]
     XonXoff,
+    #[serde(alias = "rtscts")]
     RtsCts,
 }
 
@@ -628,6 +930,7 @@ pub enum FlowControl {
 /// state). `set-modem`/`pulse-dtr` control verbs (§7.1) act on the live port
 /// later; these are the *initial* states configuration owns and round-trips.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModemLines {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dtr: Option<bool>,
@@ -1375,6 +1678,715 @@ mod tests {
         );
     }
 
+    /// A serial node with everything at its default but the named overrides — the
+    /// building block for the range tests below.
+    fn serial(name: &str) -> NodeConfig {
+        NodeConfig::Serial {
+            name: name.into(),
+            device: "/dev/ttyUSB0".into(),
+            baud: 115_200,
+            data_bits: DataBits::Eight,
+            parity: Parity::None,
+            stop_bits: StopBits::One,
+            flow_control: FlowControl::None,
+            faces: Facing::Host,
+            arbitration: Arbitration::Exclusive,
+            hostward_buffer: 256,
+            purge_on_reconnect: true,
+            replay_ring: DEFAULT_REPLAY_RING,
+            modem: ModemLines::default(),
+        }
+    }
+
+    /// [`serial`] with one field bent out of shape — the range tests all want a
+    /// valid node with exactly one offender in it.
+    fn serial_with(name: &str, bend: impl FnOnce(&mut NodeConfig)) -> NodeConfig {
+        let mut node = serial(name);
+        bend(&mut node);
+        node
+    }
+
+    fn errors_of(nodes: Vec<NodeConfig>, edges: Vec<EdgeConfig>) -> Vec<ValidationError> {
+        GraphConfig { nodes, edges }.validate()
+    }
+
+    #[test]
+    fn replay_ring_is_range_checked() {
+        // §11/§15.26: an absurd ring depth must fail *validation*, not the allocator.
+        // Left unchecked it loads cleanly, aborts the process on the first hostward
+        // byte (the ring allocates lazily), and — since `load` persists config —
+        // crash-loops on every restart. Every node kind that carries the attribute
+        // is covered, via NodeConfig::replay_ring().
+        let over = MAX_REPLAY_RING + 1;
+        let too_big = |node: NodeConfig| {
+            let name = node.name().to_owned();
+            errors_of(vec![node], vec![]).iter().any(|e| {
+                matches!(e, ValidationError::NumericOutOfRange { node, field: "replay_ring", value, .. }
+                    if *node == name && *value == over as u64)
+            })
+        };
+        assert!(too_big(serial_with("usb0", |n| {
+            if let NodeConfig::Serial { replay_ring, .. } = n {
+                *replay_ring = over;
+            }
+        })));
+        assert!(too_big(NodeConfig::Codec {
+            name: "mux".into(),
+            codec: "reference".into(),
+            faces: Facing::Target,
+            channels: vec!["c0".into()],
+            arbitration: Arbitration::Exclusive,
+            replay_ring: over,
+            attributes: toml::Table::new(),
+        }));
+        assert!(too_big(NodeConfig::Map {
+            name: "m".into(),
+            hostward: vec![],
+            targetward: vec![],
+            arbitration: Arbitration::Exclusive,
+            replay_ring: over,
+        }));
+        assert!(too_big(NodeConfig::Leg {
+            name: "uplink".into(),
+            faces: Facing::Host,
+            transport: Transport::Unix,
+            role: LegRole::Listen,
+            address: "/run/snx/leg.sock".into(),
+            insecure_bind: false,
+            reconnect_initial_ms: 200,
+            reconnect_max_ms: 5_000,
+            idle_release_ms: 1_000,
+            purge_on_reconnect: true,
+            arbitration: Arbitration::Exclusive,
+            replay_ring: over,
+            channels: vec!["c0".into()],
+        }));
+
+        // The two ends of the accepted range: `0` is the documented opt-out and the
+        // cap itself is legal, so neither is reported.
+        for cap in [0, MAX_REPLAY_RING] {
+            let node = serial_with("usb0", |n| {
+                if let NodeConfig::Serial { replay_ring, .. } = n {
+                    *replay_ring = cap;
+                }
+            });
+            assert!(
+                !errors_of(vec![node], vec![])
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::NumericOutOfRange { .. })),
+                "replay_ring = {cap} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn oversize_hostward_buffer_is_rejected() {
+        // The zero case keeps its own message (ZeroHostwardBuffer); the ceiling is
+        // new. Unbounded, the depth panics inside tokio's bounded channel — and under
+        // `load --replace` that panic lands *after* the good graph is gone (§15.26).
+        let pty = |depth: usize| NodeConfig::Pty {
+            name: "console".into(),
+            path: "/run/serial_nexus/console".into(),
+            owner: None,
+            group: None,
+            mode: None,
+            advertised_baud: 115_200,
+            hostward_buffer: depth,
+        };
+        let over = MAX_HOSTWARD_BUFFER + 1;
+        assert!(
+            errors_of(vec![pty(over)], vec![]).iter().any(|e| {
+                matches!(e, ValidationError::NumericOutOfRange { field: "hostward_buffer", value, max, .. }
+                    if *value == over as u64 && *max == MAX_HOSTWARD_BUFFER as u64)
+            }),
+            "an oversize hostward_buffer must be structural"
+        );
+        // The cap itself is accepted, and the zero case still reports the dedicated
+        // message rather than the generic range one.
+        assert!(
+            errors_of(vec![pty(MAX_HOSTWARD_BUFFER)], vec![]).is_empty(),
+            "hostward_buffer = MAX is accepted"
+        );
+        let zero = errors_of(vec![pty(0)], vec![]);
+        assert!(
+            zero.iter()
+                .any(|e| matches!(e, ValidationError::ZeroHostwardBuffer { .. }))
+                && !zero
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::NumericOutOfRange { .. })),
+            "zero keeps its own message: {zero:?}"
+        );
+    }
+
+    #[test]
+    fn leg_timers_and_log_padding_and_baud_are_range_checked() {
+        // The rest of the numeric surface (§7.4, §7.3, §7.1). None of these can crash
+        // the daemon; all of them load a graph that is quietly useless, which §11's
+        // "validated before anything is created" exists to prevent.
+        let leg = |initial: u64, max: u64, idle: u64| NodeConfig::Leg {
+            name: "uplink".into(),
+            faces: Facing::Target,
+            transport: Transport::Unix,
+            role: LegRole::Connect,
+            address: "/run/snx/leg.sock".into(),
+            insecure_bind: false,
+            reconnect_initial_ms: initial,
+            reconnect_max_ms: max,
+            idle_release_ms: idle,
+            purge_on_reconnect: true,
+            arbitration: Arbitration::Exclusive,
+            replay_ring: DEFAULT_REPLAY_RING,
+            channels: vec!["c0".into()],
+        };
+        let field_reported = |node: NodeConfig, field: &str| {
+            errors_of(vec![node], vec![]).iter().any(
+                |e| matches!(e, ValidationError::NumericOutOfRange { field: f, .. } if *f == field),
+            )
+        };
+        assert!(field_reported(
+            leg(MAX_TIMER_MS + 1, 5_000, 1_000),
+            "reconnect_initial_ms"
+        ));
+        assert!(field_reported(
+            leg(200, u64::MAX, 1_000),
+            "reconnect_max_ms"
+        ));
+        assert!(field_reported(
+            leg(200, 5_000, MAX_TIMER_MS + 1),
+            "idle_release_ms"
+        ));
+        assert!(
+            errors_of(vec![leg(0, MAX_TIMER_MS, 0)], vec![]).is_empty(),
+            "the range ends are legal (0 is a valid immediate release)"
+        );
+
+        // A log's rotation padding: a u64 counter is at most twenty digits wide.
+        let log = |padding: u8| NodeConfig::Log {
+            name: "cap".into(),
+            directory: "/tmp".into(),
+            filename: "c.log".into(),
+            overflow: OverflowPolicy::DropOldest,
+            rotation_padding: padding,
+        };
+        assert!(field_reported(
+            log(MAX_ROTATION_PADDING + 1),
+            "rotation_padding"
+        ));
+        assert!(errors_of(vec![log(MAX_ROTATION_PADDING)], vec![]).is_empty());
+
+        // Baud: no ceiling (§7.1/§13 buy nonstandard rates deliberately), but B0
+        // means "hang up the line" on Linux, not "zero symbols per second".
+        let zero_baud = serial_with("usb0", |n| {
+            if let NodeConfig::Serial { baud, .. } = n {
+                *baud = 0;
+            }
+        });
+        assert!(field_reported(zero_baud, "baud"));
+        // A wildly nonstandard but positive rate stays legal.
+        assert!(errors_of(vec![serial("usb0")], vec![]).is_empty());
+    }
+
+    #[test]
+    fn serial_faces_target_is_rejected_as_unimplemented() {
+        // §7.1 describes the output-leg role; no wiring for it exists, so such a node
+        // would seize the port with TIOCEXCL and be attached to nothing. Refused
+        // structurally and named, with the deferral (§14) stated in the message.
+        let node = serial_with("outleg", |n| {
+            if let NodeConfig::Serial { faces, .. } = n {
+                *faces = Facing::Target;
+            }
+        });
+        let errs = errors_of(vec![node], vec![]);
+        assert!(
+            errs.iter().any(
+                |e| matches!(e, ValidationError::SerialFacesTarget { node } if node == "outleg")
+            ),
+            "expected SerialFacesTarget, got {errs:?}"
+        );
+        let msg = errs
+            .iter()
+            .find(|e| matches!(e, ValidationError::SerialFacesTarget { .. }))
+            .unwrap()
+            .to_string();
+        assert!(
+            msg.contains("not implemented") && msg.contains("§14"),
+            "the message must be honest about the deferral: {msg}"
+        );
+
+        // A codec's and a leg's `faces = "target"` are ordinary and must keep working.
+        assert!(
+            errors_of(
+                vec![NodeConfig::Codec {
+                    name: "mux".into(),
+                    codec: "reference".into(),
+                    faces: Facing::Target,
+                    channels: vec!["c0".into()],
+                    arbitration: Arbitration::Exclusive,
+                    replay_ring: DEFAULT_REPLAY_RING,
+                    attributes: toml::Table::new(),
+                }],
+                vec![]
+            )
+            .is_empty(),
+            "a demux codec faces target normally"
+        );
+    }
+
+    #[test]
+    fn codec_multiplexed_edge_must_be_held_or_never() {
+        // §5's no-drop invariant, made structural: the multiplexed side's targetward
+        // pump is only ever granted the lock as a *held* origin, so an on-demand
+        // origin parks on its first chunk forever while `send` reports success.
+        let nodes = || {
+            vec![
+                serial("usb0"),
+                NodeConfig::Codec {
+                    name: "mux".into(),
+                    codec: "reference".into(),
+                    faces: Facing::Target,
+                    channels: vec!["c0".into()],
+                    arbitration: Arbitration::Exclusive,
+                    replay_ring: DEFAULT_REPLAY_RING,
+                    attributes: toml::Table::new(),
+                },
+            ]
+        };
+        let mux_edge = |write_mode: WriteMode| EdgeConfig {
+            a: EndpointAddr::node("usb0"),
+            b: EndpointAddr::node("mux"),
+            write_mode,
+        };
+        // The reported shape: an omitted write_mode is the generic on-demand default.
+        assert_eq!(
+            WriteMode::default(),
+            WriteMode::OnDemand,
+            "the premise: an omitted write_mode is on-demand"
+        );
+        let errs = errors_of(nodes(), vec![mux_edge(WriteMode::OnDemand)]);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::MultiplexedEdgeNotHeld { edge: 0, origin, mux, write_mode: WriteMode::OnDemand }
+                    if origin.to_string() == "usb0" && mux.to_string() == "mux"
+            )),
+            "expected MultiplexedEdgeNotHeld naming both endpoints, got {errs:?}"
+        );
+
+        // `held` is the working mode; `never` is the deliberate read-only one.
+        for mode in [WriteMode::Held, WriteMode::Never] {
+            assert!(
+                errors_of(nodes(), vec![mux_edge(mode)]).is_empty(),
+                "write_mode = {mode} must be accepted on a multiplexed edge"
+            );
+        }
+
+        // The rule is about the *multiplexed* endpoint only: a codec's channel
+        // endpoints are ordinary host-facing endpoints and stay on-demand-able.
+        let mut nodes = nodes();
+        nodes.push(NodeConfig::Pty {
+            name: "con".into(),
+            path: "/run/serial_nexus/con".into(),
+            owner: None,
+            group: None,
+            mode: None,
+            advertised_baud: 115_200,
+            hostward_buffer: 32,
+        });
+        assert!(
+            errors_of(
+                nodes,
+                vec![
+                    mux_edge(WriteMode::Held),
+                    EdgeConfig {
+                        a: EndpointAddr::channel("mux", "c0"),
+                        b: EndpointAddr::node("con"),
+                        write_mode: WriteMode::OnDemand,
+                    },
+                ],
+            )
+            .is_empty(),
+            "a codec channel edge is an ordinary on-demand origin"
+        );
+    }
+
+    #[test]
+    fn effective_write_mode_reproduces_the_runtime_promotions() {
+        // The single source of truth for the two promotions the data plane applies
+        // (§16, one rule one place). A log target forces `never`; a map's raw
+        // endpoint promotes an omitted/on-demand mode to `held`; everything else is
+        // the declared mode verbatim.
+        let cfg = GraphConfig {
+            nodes: vec![
+                serial("usb0"),
+                NodeConfig::Log {
+                    name: "cap".into(),
+                    directory: "/tmp".into(),
+                    filename: "c.log".into(),
+                    overflow: OverflowPolicy::DropOldest,
+                    rotation_padding: 3,
+                },
+                NodeConfig::Map {
+                    name: "m".into(),
+                    hostward: vec![],
+                    targetward: vec![],
+                    arbitration: Arbitration::Exclusive,
+                    replay_ring: DEFAULT_REPLAY_RING,
+                },
+                NodeConfig::Pty {
+                    name: "con".into(),
+                    path: "/run/serial_nexus/con".into(),
+                    owner: None,
+                    group: None,
+                    mode: None,
+                    advertised_baud: 115_200,
+                    hostward_buffer: 32,
+                },
+            ],
+            edges: vec![],
+        };
+        let mode = |a: EndpointAddr, b: EndpointAddr, declared: WriteMode| {
+            cfg.effective_write_mode(&EdgeConfig {
+                a,
+                b,
+                write_mode: declared,
+            })
+        };
+
+        // 1. A log target is forced to `never`, whatever the edge declares.
+        for declared in [WriteMode::Never, WriteMode::OnDemand, WriteMode::Held] {
+            assert_eq!(
+                mode(
+                    EndpointAddr::node("usb0"),
+                    EndpointAddr::node("cap"),
+                    declared
+                ),
+                WriteMode::Never,
+                "a log target forces never (declared {declared})"
+            );
+        }
+        // 2. A map's raw endpoint promotes on-demand (the omitted default) to held,
+        //    passes an explicit held through, and preserves `never` (a read-only map).
+        let raw = || EndpointAddr::channel("m", MAP_RAW_ENDPOINT);
+        assert_eq!(
+            mode(EndpointAddr::node("usb0"), raw(), WriteMode::OnDemand),
+            WriteMode::Held
+        );
+        assert_eq!(
+            mode(EndpointAddr::node("usb0"), raw(), WriteMode::Held),
+            WriteMode::Held
+        );
+        assert_eq!(
+            mode(EndpointAddr::node("usb0"), raw(), WriteMode::Never),
+            WriteMode::Never
+        );
+        // 3. Everything else is the declared mode — including the map's *mapped*
+        //    (host-facing, default) endpoint, which is an ordinary origin.
+        for declared in [WriteMode::Never, WriteMode::OnDemand, WriteMode::Held] {
+            assert_eq!(
+                mode(EndpointAddr::node("m"), EndpointAddr::node("con"), declared),
+                declared,
+                "an ordinary edge keeps its declared mode"
+            );
+        }
+        // 4. A dangling edge is never wired at all, so the declared value is honest.
+        assert_eq!(
+            mode(
+                EndpointAddr::node("ghost"),
+                EndpointAddr::node("con"),
+                WriteMode::OnDemand
+            ),
+            WriteMode::OnDemand
+        );
+    }
+
+    #[test]
+    fn two_held_origins_on_one_endpoint_are_rejected() {
+        // §6: "held" is acquire-on-attach and held *indefinitely*, which two origins
+        // cannot both have — the lock picks a winner arbitrarily and the loser can
+        // never write, never queues as a waiter, and shows up nowhere in `state`.
+        let map = |name: &str| NodeConfig::Map {
+            name: name.into(),
+            hostward: vec![],
+            targetward: vec![],
+            arbitration: Arbitration::Exclusive,
+            replay_ring: DEFAULT_REPLAY_RING,
+        };
+        // The reachable shape: two maps on one upstream endpoint with `write_mode`
+        // written NOWHERE — both promoted to held by the §7.8 rule. This is why the
+        // rule consults effective_write_mode rather than the declared value.
+        let edges = vec![
+            EdgeConfig {
+                a: EndpointAddr::node("usb0"),
+                b: EndpointAddr::channel("m1", MAP_RAW_ENDPOINT),
+                write_mode: WriteMode::default(),
+            },
+            EdgeConfig {
+                a: EndpointAddr::node("usb0"),
+                b: EndpointAddr::channel("m2", MAP_RAW_ENDPOINT),
+                write_mode: WriteMode::default(),
+            },
+        ];
+        let errs = errors_of(vec![serial("usb0"), map("m1"), map("m2")], edges.clone());
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::ConflictingHeldEdges { endpoint, first, second }
+                    if endpoint.to_string() == "usb0"
+                        && first.to_string() == "m1/raw"
+                        && second.to_string() == "m2/raw"
+            )),
+            "expected ConflictingHeldEdges naming BOTH offenders, got {errs:?}"
+        );
+
+        // A free-for-all endpoint has no lock at all (§6), so two held origins there
+        // are the operator's explicit, working choice — exempt.
+        let ffa = serial_with("usb0", |n| {
+            if let NodeConfig::Serial { arbitration, .. } = n {
+                *arbitration = Arbitration::FreeForAll;
+            }
+        });
+        assert!(
+            !errors_of(vec![ffa, map("m1"), map("m2")], edges)
+                .iter()
+                .any(|e| matches!(e, ValidationError::ConflictingHeldEdges { .. })),
+            "a free-for-all endpoint is exempt"
+        );
+
+        // One held origin alongside any number of on-demand/never ones is the normal,
+        // legal shape (the demux topology) and must stay silent.
+        assert!(
+            errors_of(
+                vec![
+                    serial("usb0"),
+                    map("m1"),
+                    NodeConfig::Pty {
+                        name: "spy".into(),
+                        path: "/run/serial_nexus/spy".into(),
+                        owner: None,
+                        group: None,
+                        mode: None,
+                        advertised_baud: 115_200,
+                        hostward_buffer: 32,
+                    },
+                ],
+                vec![
+                    EdgeConfig {
+                        a: EndpointAddr::node("usb0"),
+                        b: EndpointAddr::channel("m1", MAP_RAW_ENDPOINT),
+                        write_mode: WriteMode::Held,
+                    },
+                    EdgeConfig {
+                        a: EndpointAddr::node("usb0"),
+                        b: EndpointAddr::node("spy"),
+                        write_mode: WriteMode::OnDemand,
+                    },
+                ],
+            )
+            .is_empty(),
+            "one held origin plus on-demand fan-out is the normal shape"
+        );
+    }
+
+    #[test]
+    fn unknown_node_field_is_rejected() {
+        // CP-2/CFG-3 (§11): a key nobody reads is a validation that silently did not
+        // happen — and `[[nodez]]` used to parse to an empty graph, which turns
+        // `load --replace` into an unannounced teardown reporting success.
+        //
+        // (a) A valid config still parses, tag and all.
+        let ok: GraphConfig = toml::from_str(
+            r#"
+            [[node]]
+            type = "pty"
+            name = "console"
+            path = "/tmp/c"
+            advertised_baud = 9600
+            [[edge]]
+            a = "usb0"
+            b = "console"
+        "#,
+        )
+        .expect("a valid config must still parse (the `type` tag is accepted)");
+        assert_eq!(ok.nodes.len(), 1);
+        assert_eq!(ok.edges.len(), 1);
+
+        // (b) A misspelled field is rejected, naming the offending key.
+        let err = toml::from_str::<GraphConfig>(
+            r#"
+            [[node]]
+            type = "pty"
+            name = "console"
+            path = "/tmp/c"
+            advertized_baud = 9600
+        "#,
+        )
+        .expect_err("a misspelled field must be rejected");
+        assert!(
+            err.to_string().contains("advertized_baud"),
+            "the parse error must name the offending key: {err}"
+        );
+
+        // (c) A misspelled top-level table is rejected too, rather than parsing to
+        //     the empty graph that made `--replace` a silent teardown.
+        let err = toml::from_str::<GraphConfig>(
+            r#"
+            [[nodez]]
+            type = "log"
+            name = "x"
+        "#,
+        )
+        .expect_err("a misspelled table name must be rejected");
+        assert!(
+            err.to_string().contains("nodez"),
+            "the parse error must name the offending table: {err}"
+        );
+
+        // An unknown edge key is caught the same way.
+        assert!(
+            toml::from_str::<GraphConfig>(
+                r#"
+                [[edge]]
+                a = "x"
+                b = "y"
+                write_moad = "held"
+            "#,
+            )
+            .is_err(),
+            "an unknown edge key must be rejected"
+        );
+
+        // A codec's `attributes` table stays OPEN by construction (§8): the codec
+        // validates it against its own schema, so arbitrary keys must survive.
+        let codec: GraphConfig = toml::from_str(
+            r#"
+            [[node]]
+            type = "codec"
+            name = "mux"
+            codec = "exec"
+            channels = ["c0"]
+            [node.attributes]
+            argv = ["/usr/bin/thing", "--flag"]
+            anything_at_all = 7
+        "#,
+        )
+        .expect("codec attributes are opaque and stay open (§8)");
+        match &codec.nodes[0] {
+            NodeConfig::Codec { attributes, .. } => {
+                assert!(attributes.contains_key("anything_at_all"))
+            }
+            other => panic!("expected codec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_parse_is_detectable() {
+        // The other half of CP-2/CFG-3: a comment-only file parses to an empty graph,
+        // which `load --replace` would turn into a silent teardown. An empty graph is
+        // legal (teardown persists one), so this is a query the load path pairs with
+        // "was the source text non-empty?" — not a validation failure.
+        let commented: GraphConfig = toml::from_str("# nothing here\n").expect("parse");
+        assert!(commented.is_empty());
+        assert!(
+            commented.validate().is_empty(),
+            "an empty graph is structurally valid; only `load` judges it"
+        );
+        assert!(
+            !GraphConfig {
+                nodes: vec![serial("usb0")],
+                edges: vec![],
+            }
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn flow_control_accepts_the_designs_spellings_and_dumps_kebab_case() {
+        // §7.1 spells these `xonxoff` and `rtscts`; the canonical serde form is
+        // kebab-case. Both parse (the design wins), and `dump` still emits the
+        // canonical spelling so round-trips are unchanged.
+        let parse = |spelling: &str| -> FlowControl {
+            let cfg: GraphConfig = toml::from_str(&format!(
+                r#"
+                [[node]]
+                type = "serial"
+                name = "usb0"
+                device = "/dev/ttyUSB0"
+                flow_control = "{spelling}"
+            "#
+            ))
+            .unwrap_or_else(|e| panic!("flow_control = {spelling:?} must parse: {e}"));
+            match &cfg.nodes[0] {
+                NodeConfig::Serial { flow_control, .. } => *flow_control,
+                other => panic!("expected serial, got {other:?}"),
+            }
+        };
+        assert_eq!(parse("xon-xoff"), FlowControl::XonXoff);
+        assert_eq!(parse("xonxoff"), FlowControl::XonXoff, "§7.1's spelling");
+        assert_eq!(parse("rts-cts"), FlowControl::RtsCts);
+        assert_eq!(parse("rtscts"), FlowControl::RtsCts, "§7.1's spelling");
+        assert_eq!(parse("none"), FlowControl::None);
+
+        // Dump canonicalisation: whichever spelling was loaded, `dump` emits the
+        // kebab-case one, so a dump→load cycle is stable.
+        let dumped = toml::to_string(&GraphConfig {
+            nodes: vec![NodeConfig::Serial {
+                name: "usb0".into(),
+                device: "/dev/ttyUSB0".into(),
+                baud: 115_200,
+                data_bits: DataBits::Eight,
+                parity: Parity::None,
+                stop_bits: StopBits::One,
+                flow_control: FlowControl::XonXoff,
+                faces: Facing::Host,
+                arbitration: Arbitration::Exclusive,
+                hostward_buffer: 256,
+                purge_on_reconnect: true,
+                replay_ring: DEFAULT_REPLAY_RING,
+                modem: ModemLines::default(),
+            }],
+            edges: vec![],
+        })
+        .expect("serialize");
+        assert!(
+            dumped.contains("flow_control = \"xon-xoff\""),
+            "dump stays kebab-case: {dumped}"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_channel_identity_is_rejected() {
+        // AGENTS §6 invariant 7 / §12: a whitespace-only identity is the empty one in
+        // disguise. Config-level proof for a leg's operator-declared channel list;
+        // the node-name and codec-channel cases live in graph.rs's model tests.
+        let cfg = GraphConfig {
+            nodes: vec![NodeConfig::Leg {
+                name: "uplink".into(),
+                faces: Facing::Target,
+                transport: Transport::Unix,
+                role: LegRole::Connect,
+                address: "/run/snx/leg.sock".into(),
+                insecure_bind: false,
+                reconnect_initial_ms: 200,
+                reconnect_max_ms: 5_000,
+                idle_release_ms: 1_000,
+                purge_on_reconnect: true,
+                arbitration: Arbitration::Exclusive,
+                replay_ring: DEFAULT_REPLAY_RING,
+                channels: vec![" ".into()],
+            }],
+            edges: vec![],
+        };
+        assert!(
+            cfg.validate().iter().any(|e| matches!(
+                e,
+                ValidationError::BlankName { node, endpoint: Some(c) }
+                    if node == "uplink" && c == " "
+            )),
+            "expected BlankName for a whitespace channel identity, got {:?}",
+            cfg.validate()
+        );
+    }
+
     // Proptest strategies producing well-typed (not necessarily graph-valid)
     // configurations, to prove serde round-trips. Every enum variant, every
     // Some/None option, non-default numerics, and edges are all reachable, so a
@@ -1642,6 +2654,61 @@ mod tests {
     }
 
     proptest! {
+        /// The guard the review asked for by name: run the numeric surface over its
+        /// whole domain — including the values that abort the allocator and panic
+        /// tokio — and pin the accept/reject split *exactly*, boundaries included.
+        /// A range check that is merely "present" is not the property; a range check
+        /// that fires on precisely the out-of-range values is (§11).
+        #[test]
+        fn prop_numeric_ranges_are_enforced_exactly(
+            ring in prop_oneof![0usize..=MAX_REPLAY_RING, (MAX_REPLAY_RING + 1)..=usize::MAX],
+            depth in prop_oneof![0usize..=MAX_HOSTWARD_BUFFER, (MAX_HOSTWARD_BUFFER + 1)..=usize::MAX],
+            timer in prop_oneof![0u64..=MAX_TIMER_MS, (MAX_TIMER_MS + 1)..=u64::MAX],
+        ) {
+            let cfg = GraphConfig {
+                nodes: vec![
+                    serial_with("usb0", |n| {
+                        if let NodeConfig::Serial { replay_ring, hostward_buffer, .. } = n {
+                            *replay_ring = ring;
+                            *hostward_buffer = depth;
+                        }
+                    }),
+                    NodeConfig::Leg {
+                        name: "uplink".into(),
+                        faces: Facing::Target,
+                        transport: Transport::Unix,
+                        role: LegRole::Connect,
+                        address: "/run/snx/leg.sock".into(),
+                        insecure_bind: false,
+                        reconnect_initial_ms: timer,
+                        reconnect_max_ms: timer,
+                        idle_release_ms: timer,
+                        purge_on_reconnect: true,
+                        arbitration: Arbitration::Exclusive,
+                        replay_ring: DEFAULT_REPLAY_RING,
+                        channels: vec!["c0".into()],
+                    },
+                ],
+                edges: vec![],
+            };
+            let errors = cfg.validate();
+            let reported = |field: &str| {
+                errors.iter().any(|e| matches!(
+                    e,
+                    ValidationError::NumericOutOfRange { field: f, .. } if *f == field
+                ))
+            };
+            prop_assert_eq!(reported("replay_ring"), ring > MAX_REPLAY_RING);
+            prop_assert_eq!(reported("idle_release_ms"), timer > MAX_TIMER_MS);
+            // The zero depth keeps its own, more specific message, so the generic
+            // range error must NOT also fire there.
+            prop_assert_eq!(reported("hostward_buffer"), depth > MAX_HOSTWARD_BUFFER);
+            prop_assert_eq!(
+                errors.iter().any(|e| matches!(e, ValidationError::ZeroHostwardBuffer { .. })),
+                depth == 0
+            );
+        }
+
         #[test]
         fn prop_config_round_trips_through_toml(
             nodes in prop::collection::vec(node_strategy(), 0..8),

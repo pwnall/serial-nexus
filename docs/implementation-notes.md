@@ -1,9 +1,13 @@
 # serial_nexus — implementation notes & handoff
 
 **As of:** 2026-07-25 (**phases 0-8 + simplification + extension + web-console + v10 + v11
-console-map tracks done**; the **`serialnexusweb` web console is now REAL-BROWSER validated** over the
-FTDI crossover rig — see the top track — with **one UI follow-up open**: `load --replace` freezes a
-live console's OPFS-restored view; a browser-only fix is proposed but not yet implemented).
+console-map tracks done**, plus the **review-26 remediation track** — all 93 findings of
+`docs/26-claude-opus-code-review.md` dispositioned, ledger in
+`docs/27-review-26-remediation-ledger.md`, design §15.34, plan §13. The
+**`serialnexusweb` web console is REAL-BROWSER validated** over the FTDI crossover rig;
+the `load --replace` OPFS freeze that was open there is now fixed on both sides — the
+daemon says `tap.closed`, and the client re-anchors its offset space — but the browser
+half is checklist-verified, not CI-verified, per §16.7.)
 **Branch:** `implementation` (off `main`).
 **Normative docs are now v11:** `docs/24-design-claude-fable-v11.md` (design) and
 `docs/25-implementation-plan-claude-fable-v11.md` (plan). v1–v10 docs are in
@@ -11,26 +15,97 @@ live console's OPFS-restored view; a browser-only fix is proposed but not yet im
 
 ---
 
+## REVIEW-26 REMEDIATION — all 93 findings dispositioned (2026-07-25 session, uncommitted)
+
+The findings in `docs/26-claude-opus-code-review.md` are addressed. The finding-by-finding
+ledger is **`docs/27-review-26-remediation-ledger.md`** — read that before re-filing
+anything from the review; several items are *deliberately declined* with reasons, and
+re-fixing a cleared candidate is its own defect. Design §15.34 records the pattern-level
+lessons; plan §13 is the track.
+
+**Scale.** 69 files, ~12k insertions. Suite **265 → 435 passing / 0 failing**; nine new
+`nexus-itest` files (`p9_*`), three new fuzz targets, two new meta-gates. `cargo fmt`,
+`cargo clippy` (full **and** minimal-daemon), `cargo deny`, the macOS cross-check and
+`nexus-doctor --json | jq -f expectations/linux.jq` are all green.
+
+**The shape of the fixes, which matters more than the list.** Every headline defect was an
+invariant upheld in a layer that could not enforce it, so the fixes moved each one down:
+
+- **Structural validation instead of runtime surprise.** `replay_ring`, `hostward_buffer`,
+  the leg timers and the log padding are range-checked in `GraphConfig::validate`; a
+  codec/exec multiplexed edge must be `held` or `never`; at most one effectively-held edge
+  per host endpoint; `faces = "target"` on a serial node is refused as §14-deferred;
+  unknown keys *and* unknown tables are rejected; names are non-blank and length-bounded.
+  All of it runs **before** `load --replace` tears anything down — which is the whole
+  point, because two of these used to load cleanly and then kill the daemon.
+- **One implementation per rule.** Write-mode promotion is `GraphConfig::effective_write_mode`,
+  called by both the validator and `Wiring::build`. Hostward fan-out is `runtime::fan_out`,
+  called by all five producers — which is what made the map's missing unattached-loss
+  counter impossible rather than merely fixed. Purge-to-quiescence is
+  `boundary::drain_to_quiescence`, shared by serial and leg.
+- **Fail-safe instead of fail-open.** The web bridge screens a *parsed* value and forwards
+  the re-serialised one behind an **allowlist**; a denylist admitted every verb §10 grows
+  later and held only while someone remembered to extend it.
+- **A gate that cannot silently disarm.** The clippy `RefCell` ban now exists in both
+  crates *and* is backed by a `meta_gates` test that fails when a new crate starts holding
+  daemon state — because the original broke by a crate move and nobody noticed for a
+  release. Invariant 1 (no `AsyncFd`) got the same treatment.
+- **A precondition that can fail.** Doctor P5 folds the rig certificate into its verdict.
+
+**Two things a future session should know.**
+
+1. **The same defect had two more homes than the review found.** MAP-1 — an interior node
+   dropping a targetward receiver while its senders stay live, which closes the channel
+   under a pty origin and takes presence latching and detach-release with it — was
+   reported against the map. Fixing the map was not enough: the adversarial verification
+   reproduced it live in `codec` and `exec`, reached through their *early-return* paths
+   rather than their read-only mode. The guard is now written against the rule for all
+   three kinds (`p9_unwired_interior.rs`), not against one node. When a finding names one
+   node, check its siblings.
+2. **`spchex` changes the bytes an existing configuration produces.** It now matches
+   picocom's `M_SPCHEX` (DEL plus C0 except TAB/LF/CR) where it matched SPACE. Verified
+   against upstream `picocom.c`'s `do_map`/`map2hex`, fetched and read — not against the
+   review's transcription of it. `packaging/README.md` carries the operator-facing upgrade
+   notes for this and everything else that used to load and now does not.
+
+**Manual checklist addition (§16.7).** `app.js`'s console-switching logic — WEB-4's
+re-entrancy generation guard, and the new `tap.closed` / offset-space-reset handling that
+closes the browser half of the `load --replace` freeze — is exercisable only by a real
+browser. Per §16.7 it goes on the real-browser checklist rather than being counted as
+covered: select two consoles in rapid succession and confirm exactly one tap survives in
+`state.taps`; then `load --replace` from a second client and confirm the pane says it was
+detached and, on re-selection, resumes rendering across the offset restart. The pure
+modules under it (`history.mjs`, `saver.mjs`) are `node --test`-covered per push.
+
+---
+
 ## OPUS COMPREHENSIVE CODE REVIEW #2 — `docs/26-claude-opus-code-review.md` (2026-07-25)
 
 A second full-workspace review (multi-agent + adversarial verification + live reproductions) landed at
-`docs/26-claude-opus-code-review.md`. **Nothing from it is fixed yet** — read its §1 action table
-before touching the web bridge, the config validation path, `Wiring::build`'s write-mode promotion,
-`nexus-core/src/map.rs`, or the leg's Unix listener. Its four **justified** deviations are recorded
-below as §3.15–§3.18 (flow-control spelling, per-node `arbitration`, the runtime-side map `held`
-promotion, and `nexus_core::data` as specification-not-path — the last also corrects §3.3).
+`docs/26-claude-opus-code-review.md`. **The review file is a frozen record of the review as
+delivered** — it still reads "nothing is fixed yet", because it was written before the remediation
+that followed it. Read the remediation entry above it for what is true now, and read the review for
+*why*: its §1 action table, its §6 list of the 20 refuted candidates (which need no action and should
+not be re-filed), and its §7 reproduction log. Its **justified** deviations are recorded below as
+§3.16–§3.18 (per-node `arbitration`, the map's `held` raw-edge promotion, and `nexus_core::data` as
+specification-not-path — the last also corrects §3.3). A fourth, §3.15 (flow-control spelling), was
+**withdrawn**: blind re-verification showed it was a real defect, not a deviation.
 
-Highest-impact confirmed items, all reproduced on a live daemon: the web bridge's verb denylist is
-bypassed by a newline inside one WebSocket frame (`teardown`/`shutdown` executed); `replay_ring` and
-`hostward_buffer` are unbounded, the first aborting the process on the next hostward byte (and
+Highest-impact confirmed items **as found** (each was reproduced on a live daemon at `b8d8ed8`, and
+each now has a regression guard): the web bridge's verb denylist was bypassed by a newline inside one
+WebSocket frame (`teardown`/`shutdown` executed from the browser); `replay_ring` and
+`hostward_buffer` were unbounded, the first aborting the process on the next hostward byte (and
 crash-looping via the persisted config), the second panicking *after* a `--replace` teardown; a
-codec/exec multiplexed edge with an omitted `write_mode` silently parks every targetward byte while
-`send` reports success; `spchex` implements SPACE→hex where picocom's `M_SPCHEX` is the
-control-character class (checked against upstream source), leaving no rule able to hex a control byte;
-and a pipelined request during a waiting verb tears down the whole control connection, which now kills
-web-console sessions. Also: the clippy `RefCell` ban (invariant #5) stopped covering `nexus-daemon` at
-the v8 library split — proven with a planted `RefCell` plus a lint canary — so AGENTS.md §6 and
-`cell.rs` currently overstate it.
+codec/exec multiplexed edge with an omitted `write_mode` silently parked every targetward byte while
+`send` reported success; `spchex` implemented SPACE→hex where picocom's `M_SPCHEX` is the
+control-character class, leaving no rule able to hex a control byte; and a pipelined request during a
+waiting verb tore down the whole control connection, which killed web-console sessions. Also: the
+clippy `RefCell` ban (invariant #5) had stopped covering `nexus-daemon` at the v8 library split —
+proven with a planted `RefCell` plus a lint canary — so AGENTS.md §6 and `cell.rs` overstated it.
+That last one is the one to remember for its shape rather than its severity: a `clippy.toml` disarms
+**silently** when the code it governs moves to a sibling crate, which is why the ban is now duplicated
+into `nexus-daemon/clippy.toml` *and* backed by a `meta_gates` test that fails when a new crate starts
+holding daemon state.
 
 The review's §7 is a reproduction log (22 live reproductions). **Verification is complete and was
 independently re-verified**: all 113 candidate findings faced an adversarial verifier, and 21 of them
@@ -134,6 +209,18 @@ line-by-line:
   (D) carry `ingested` forward per endpoint identity — semantically dishonest (concatenates two unrelated
   streams with no gap). A doc-only note at `tap.rs:196-200` recording that `load --replace`/hub rebuild
   also resets the offset space without a nonce change is worthwhile regardless.
+- **Update after the review-26 remediation — still open, but the daemon half moved.** The review
+  confirmed this and found the wider defect underneath it (TAP-1): the browser was only the loudest
+  victim; `teardown`/`load --replace`/`remove-node` cleared `tap_hubs` beneath *every* open tap, and the
+  client-side handles survived, so any tap client sat on an open connection receiving nothing, with no
+  notification and no error. That half is **fixed**: a hub dropped beneath live taps now sends a terminal
+  **`tap.closed`** notification naming the tap, the endpoint, and a stable reason token
+  (`endpoint removed` / `graph replaced` / `teardown`), terminal for the tap and not for the connection.
+  `history.mjs`'s `offsetSpaceReset` (Option A) is **still not implemented** and `app.js` does not yet
+  act on `tap.closed`, so a browser session still stops rendering across a `--replace` — now because its
+  tap is explicitly closed rather than because it is silently splicing into a dead offset space. Fixing
+  the browser half is the remaining work, and `tap.closed` makes it easier: re-open the tap and re-anchor
+  on the new `from_offset` rather than inferring a reset.
 
 **Secondary UI observation (not a data bug):** under a sustained firehose the tab's main thread gets
 pegged rendering the backlog (the extension connection briefly dropped), and `#pane-drops` lags reality
@@ -165,9 +252,28 @@ transform** (the first *non-codec* one), slotting into the endpoint-keyed wiring
   picocom names), `MapDirection` (a compiled 256-entry first-match table + `k×` expansion bound),
   `MapDirection::apply(input, out, on_rule)` — a stateless byte→byte-sequence substitution, first
   match per byte wins, `on_rule` decouples the pure module from the daemon's `Cell` counters.
-  Faithful to picocom's `do_map`/`map2hex` (verified against source): hex form is `[xx]` lowercase;
-  `nrmhex` range is `0x20..=0x7e` (space included); `8bithex` is `0x80..=0xff`. Unit + proptests:
-  256-byte oracle per mapping, first-match ordering, k× output bound, chunk-boundary irrelevance.
+  Hex form is `[xx]` lowercase; `nrmhex` range is `0x20..=0x7e` (space included); `8bithex` is
+  `0x80..=0xff`. Unit + proptests: 256-byte oracle per mapping, first-match ordering, k× output
+  bound, chunk-boundary irrelevance.
+  **CORRECTION (review 26, MAP-1).** This entry, and `map.rs`'s own module doc, claimed the
+  vocabulary was "verified against picocom source". **It was not** — it was taken from the manual
+  page, and one rule was wrong: `spchex` was implemented as `b == 0x20` (SPACE), where upstream's
+  `M_SPCHEX` arm of `do_map` is `c == '\x7f' || (c < 0x20 && c != '\x09' && c != '\x0a' && c !=
+  '\x0d')` — DEL plus every C0 control except TAB/LF/CR. The consequence was two-sided: an operator
+  who reached for `spchex` to hunt stray `0x00`/`0x1b` bytes instead had **every space rewritten as
+  `[20]`** in the console, its logs, its taps and the web view, while the bytes being hunted still
+  passed through invisibly — and since `nrmhex` is `0x20..=0x7e` and `8bithex` is `0x80..=0xff`,
+  `0x00..=0x1f` and `0x7f` were **unreachable by any rule in the vocabulary**, so §7.8's "cheap way
+  to discover which quirk a mystery console actually has" did not exist. Now fixed against the
+  upstream source (each rule transcribed in `map.rs`'s module doc and re-derived independently by
+  the 256-byte oracle), which makes the hex family partition the whole byte space.
+  *Upgrade note:* a graph whose `hostward`/`targetward` list contains `spchex` **emits different
+  bytes after this change** — spaces are no longer hexed, control bytes now are. Anyone who added
+  `spchex` to get `[20]` for spaces wants `nrmhex` (which hexes SPACE along with the rest of
+  printable ASCII); no rule hexes SPACE alone, because picocom has none. No other mapping changed,
+  configuration round-trips unaltered, and the map is stateless, so the new behavior simply takes
+  effect at the next `load` with no migration. Same family as §3.14's RESOLV-1 note: a visible
+  on-upgrade behavior change, safe and operator-recoverable, worth saying out loud.
 - **Config** `nexus-core/src/config.rs`: `NodeConfig::Map { name, hostward, targetward, arbitration,
   replay_ring }`; `shape()` = a **host-facing default endpoint** (the mapped side, standard
   lock/fan-out/tap/ring machinery) + a **target-facing `raw` endpoint** (`MAP_RAW_ENDPOINT = "raw"`,
@@ -883,32 +989,28 @@ the items below are refinements consistent with the design, none contradict it.
 | 7 | Identity & resilience | **done** — resolver (§12) + faulted-and-wait/reopen (§7.1) + state file (§11) + `add-node`/`remove-node --cascade`/`load --replace` + serial-signal verbs (§7.1) + doctor P5 + `nexus-sim nullmodem`; audited (§6e, §15.25) |
 | 8 | Hardening & release | **done** — macOS build+cfg-gating (cross-checked via `--target x86_64-apple-darwin`) + macOS CI lane + `docs/macos.md`; docs (README, `docs/security.md`, `docs/codec-authors.md`, `docs/rpc/`); packaging (systemd unit, udev, example config); cargo-fuzz targets (`fuzz/`, nightly); `phase8/{quickstart,agent-task,soak}.sh` + CI wiring; audited (§6f) |
 
-**Quality gates (all green):** `cargo fmt --all --check`, `cargo clippy
---workspace --all-targets --locked -- -D warnings`, `cargo test --workspace` (87
-pass), `cargo check --target x86_64-apple-darwin --workspace` (macOS portability,
-clean), and `bash scripts/validate/all.sh --through 8` (**42 pass, 0 fail**). Phase 8
-scripts: `phase8/{quickstart,agent-task,soak}.sh`; phase 7
-scripts: `phase7/{unplug,replug,squatter,matrix,crash-recovery,signals,p5}.sh`;
-phase 6 scripts: `phase6/{reference,binding,hostility,insecure-bind,outage,head-of-line}.sh`;
-phase 5 scripts: `phase5/{envelope,demux,resync,held,bad-attributes,exec-crash}.sh`;
-phase 4 scripts: `phase4/{exclusivity,purge,free-for-all,held,send,steal-lease,waiting}.sh`;
-phase 3 added `counters.sh`, `log.sh`, `log-enospc.sh`, `subscribe.sh`,
-`firehose.sh`, `exact-loss.sh`, `benchmark.sh`.
+**Quality gates (all green):** `cargo fmt --all --check`, `cargo clippy --workspace
+--all-targets --locked -- -D warnings` (plus the minimal-daemon clippy), `cargo build
+--workspace --locked` **then** `cargo test --workspace --locked` — one suite now carrying
+the unit/property tests *and* the whole `nexus-itest` integration harness — `cargo check
+--target x86_64-apple-darwin --workspace --exclude serialnexusweb` (macOS portability), and
+`cargo deny check licenses bans sources`. The per-phase counts this section used to quote
+(87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
+`scripts/validate/**` into the harness; AGENTS.md §4 carries the exact current command block.
 
-**Hardware integration test (Tier-3, opt-in):**
-`scripts/validate/hardware/crossover-rig.sh` — the first end-to-end test on *real*
-silicon (design §13/§15.17/§15.21, plan §5). It requires exactly two USB-serial
-adapters wired together with a crossover UART cable (else it SKIPs, exit 0, a valid
-verdict) and self-judges with the usual `{"check":...,"pass":...}` line. It runs
-`nexus-doctor` P5 to certify the rig FIRST (the §15.21 precondition — a failure is
-attributed to a loose wire, not the daemon), then drives the daemon through the
-physical rig: identity resolution both directions (§12), byte-exact bidirectional
-data path (§4/§5/§7.1), the `send` verb, far-side break reception, TIOCEXCL
-exclusivity, exclusive arbitration (lock→LOCKED→steal, §6), slow-consumer
-drop-with-counters isolation (§5, exact `received+dropped==sent` accounting), and
-observable framing/parity error counters under deliberate baud/parity mismatch. Not
-in the per-push `all.sh` sweep (no hardware there); wire into a hardware CI lane if a
-rig exists. Verified passing on a cross-wired FTDI FT232R pair (~47s, deterministic).
+**Hardware integration test (Tier-3, opt-in):** `nexus-itest/tests/serial_hardware.rs` — the
+end-to-end test on *real* silicon (design §13/§15.17/§15.21, plan §5), which replaced the
+retired `hardware/crossover-rig.sh`. It requires two USB-serial adapters wired together with a
+crossover UART cable, auto-detected by `crossover_ports()` (`/dev/cu.usbserial-*` on macOS, or
+`SNX_CROSSOVER_A`/`_B`), and **self-skips** when none is present — a skip is a valid verdict.
+Its four tests drive the daemon through the physical rig: byte-exact bidirectional data path
+by SHA-256 (§4/§5/§7.1) at 115200 and at the custom rate 250000, the `send` verb reaching the
+far port, `TIOCEXCL` exclusivity against a second opener, the serial signal verbs
+(`send-break`/`set-modem`/`pulse-dtr`) — unreachable on the pts that `p7_signals` uses — and
+the v11 map node in both directions. They share a process-wide mutex, so the two ports are
+never contended. Certify the rig first with `nexus-doctor --port … --port …` (the §15.21
+precondition: a failure is attributable to a loose wire, not the daemon). Verified passing on
+a cross-wired FTDI FT232R pair.
 
 **Kernel matrix:** every kernel-behavior probe is `supported` on **Linux 7.0.0**
 (dev box, Ubuntu 26.04) and **Linux 6.18.14** (Debian rodete) with **zero
@@ -930,18 +1032,23 @@ are de-risked across the support matrix.
 | `serialnexusd` | the daemon | control plane + node lifecycle + data plane + codecs + leg/wire done |
 | `serialnexusctl` | the CLI (thin RPC client + `--json`) | `load [--replace]`/`add-node`/`remove-node [--cascade]`/`dump`/`state`/`subscribe`/`rotate`/`lock`/`unlock`/`send`/`send-break`/`set-modem`/`pulse-dtr`/`teardown`/`shutdown` |
 
-`serialnexusd` modules: `main.rs` (runtime, socket policy, shutdown),
-`control.rs` (JSON-RPC over UDS), `daemon.rs` (graph state + method impls),
-`runtime.rs` (endpoint-keyed data-plane `Wiring` + `LockCell` + poll-based I/O helpers),
-`nodes/{mod,serial,pty,log,codec,exec,leg}.rs` (node runtimes; `codec` = the in-process
-demux/remux + registry, `exec` = the child-process codec, `leg` = the cross-daemon
-socket transport + link codec, §15.24), `sys.rs` (the single unsafe-bearing module:
-`TIOCEXCL`/`TIOCPKT` ioctls, raw `read`/`write`/`fcntl`, and the non-blocking
-`poll_ready`).
+Daemon modules (the v8 library/binary split moved all of these out of `serialnexusd`
+into the `nexus-daemon` library, §15.26; `serialnexusd` is now flags + tracing + a
+`run` call): `lib.rs` (entry surface, socket and state-file policy), `control.rs`
+(JSON-RPC over UDS), `daemon.rs` (graph state + method impls), `runtime.rs`
+(endpoint-keyed data-plane `Wiring` + the shared fragmentation and fan-out helpers),
+`boundary.rs`, `cell.rs`, `registry.rs`, `tap.rs`, and
+`nodes/{mod,serial,pty,log,codec,exec,leg,map}.rs`. The single unsafe-bearing module
+is the separate `nexus-sys` crate (ioctls, raw `read`/`write`/`fcntl`,
+`poll_ready`/`poll_blocking`). AGENTS.md §3 carries the current crate-by-crate table
+and is the one to keep in sync.
 
-Validation scripts are the canonical exit criteria (plan §3):
-`scripts/validate/phaseN/*.sh`, each self-judging with a JSON verdict and exit
-code. Helpers in `scripts/lib/` (`wait-for.sh`, `semantic-diff.sh`).
+The integration harness is the canonical exit criterion (plan §3): the `nexus-itest`
+crate, run by `cargo test` like any other. It replaced the bash `scripts/validate/**`
+maze in §16.11 — `scripts/` is **deleted**, `bash` appears nowhere in the gates, and each
+former phase script is a `nexus-itest/tests/*.rs`. Where a section below still names a
+`phaseN/*.sh`, read it as a dated record of what ran at the time, and see the migration
+entry above for the script→test mapping.
 
 ---
 
@@ -977,16 +1084,23 @@ presence detection via POLLHUP is uniform from the start. This step is not in th
 design text; it is a faithful refinement of §7.2's model, confirmed identical on
 7.0 and 6.18.
 
-### 3.3 Data-plane holdover needs an explicit `flush` on resume
+### 3.3 Data-plane holdover needs an explicit `flush` on resume — *in the model*
 **Design:** §5 — a transform that has emitted output when downstream refuses
 "parks it in its holdover slot."
 **Refinement:** a chunk parked on the *last* offer would be stranded if the
 runtime only retries on new origin input. `nexus-core::data::TargetwardSink` has
-a `flush()` method the runtime calls when a boundary becomes writable,
-independent of new input, draining parked holdovers in order. Caught by a
-property test (`prop_targetward_no_loss_bounded_interior`). v4 §5 now names this
-explicitly ("boundaries announce writability, and the runtime drains parked
-holdover frames on that signal, independent of any new origin input").
+a `flush()` method that drains parked holdovers in order, independent of new
+input. Caught by a property test (`prop_targetward_no_loss_bounded_interior`). v4 §5
+now names this explicitly ("boundaries announce writability, and the runtime drains
+parked holdover frames on that signal, independent of any new origin input").
+**Correction (review 26, F3/LOCK-3):** this entry used to say "the runtime calls
+`flush()`". It does not, and never did — nothing outside `data.rs` calls it, because
+`nexus_core::data` is the executable *specification* of §5, not the shipped data path
+(§3.18). The anti-stranding property is real and is carried in the daemon by the
+channel-plus-`send().await` shape: a paused origin is literally a task suspended inside
+`tx.send(chunk).await`, and resumption *is* the bounded channel waking it, so there is
+no separate writability signal to drain on. `data.rs`'s module doc now states the
+model/path split outright; read the two together.
 
 ### 3.4 `EndpointAddr` serializes as its display string
 **Design:** §3/§15.12 — display form is `node/channel`; neither part contains `/`.
@@ -1246,23 +1360,17 @@ per-`state`-call reparse) is **deliberately deferred** — it is a cross-cutting
 itself recommends landing it as an isolated follow-up commit rather than bundling it with
 the correctness fixes; the mechanical dedup it enables (OPSIMP-4/5) is already in place.
 
-### 3.15 WITHDRAWN — `flow_control` spelling is a defect, not a justified deviation
+### 3.15 WITHDRAWN — `flow_control` spelling was a defect, not a justified deviation
 This slot briefly held "the design text should follow the code" for `flow_control`'s kebab-case
-values. **That disposition was wrong and is withdrawn.** A blind re-verification (a verifier working
-from a pristine checkout that contained neither this entry nor the review that proposed it) *ran the
-parser*: `xonxoff` and `rtscts` — the exact spellings normative design §7.1 lists — fail to
-deserialize with `unknown variant`, and because that is a TOML parse error the **entire configuration
-file is rejected**. `docs/rpc/configuration.md` documents no serial termios attributes at all, so
-§7.1 is the only operator-facing reference for this value and following it does not work.
+values. It was wrong: `xonxoff`/`rtscts` — the exact spellings normative §7.1 lists — failed to
+deserialize, and since that is a TOML parse error the *entire* configuration file was rejected. It
+is now fixed as CFG-1 (`#[serde(alias = …)]` on both, kebab-case still canonical so `dump`
+round-trips unchanged), so there is no deviation left to record.
 
-Per AGENTS.md ("when this file and the design disagree, the design wins") the code is the deviating
-side. Tracked as a low-severity should-fix in `docs/26` (CFG-1); the suggested fix is
-`#[serde(alias = "xonxoff")]` / `#[serde(alias = "rtscts")]`, keeping kebab-case canonical so `dump`
-round-trips unchanged, plus documenting the accepted values.
-
-The entry is left in place rather than deleted because *how* it was wrong is worth keeping: the
-original verdict that made it look settled came from a verifier that had read this very entry.
-The slot number is retired; do not reuse §3.15.
+The heading is kept as a marker rather than deleted, because *how* it was wrong is the useful part:
+the verdict that made this look settled came from a verifier that had read this very entry. Blind
+re-verification against a checkout containing neither the entry nor the review that proposed it
+reversed it. **The slot number is retired; do not reuse §3.15.**
 
 ### 3.16 `arbitration` is configured per node, applied to every host-facing endpoint
 **Design:** §6 calls `arbitration = exclusive | free-for-all` "a per-endpoint attribute", and
@@ -1276,12 +1384,11 @@ per-endpoint override is additive later (a channel-level attribute overriding th
 no change to the lock machinery, which is already keyed per endpoint. The observable surface
 already matches the design's wording. (Opus review `docs/26`, DM-6.)
 
-### 3.17 The map's `held` raw-edge default lives in the runtime, not the config default
+### 3.17 The map's `held` raw-edge default is a runtime promotion, not a config default
 **Design:** §7.8 — "The map's targetward edge into the upstream endpoint defaults to `held`".
-**Reality:** `EdgeConfig::write_mode`'s serde default is `on-demand` like every other edge;
-`runtime::Wiring::build` promotes an omitted/`on-demand` edge whose target is a map's `raw`
-endpoint to `held` (explicit `held` passes through, explicit `never` is preserved for a
-read-only map).
+**Reality:** `EdgeConfig::write_mode`'s serde default is `on-demand` like every other edge; an
+omitted/`on-demand` edge whose target is a map's `raw` endpoint is promoted to `held` (explicit
+`held` passes through, explicit `never` is preserved for a read-only map).
 **Decision:** keep the code. Promotion at wiring time — mirroring the log→`never` override —
 keeps `dump` faithful to what the operator actually wrote, which is the §11 round-trip
 property; folding the default into the config layer would make `dump` emit a mode the operator
@@ -1289,6 +1396,13 @@ never typed, and would need the edge default to depend on the *other* endpoint's
 The cost is that the runtime mode and the dumped mode differ for an omitted value, which is
 why `EdgeConfig`'s doc comment and `docs/rpc/configuration.md` both state the promotion
 explicitly. (Opus review `docs/26`; the "dump round-trips wrongly" reading was refuted.)
+**Refinement since (review 26, RV-4):** the promotion no longer *lives* in `Wiring::build`. Both
+promotions are now `GraphConfig::effective_write_mode`, which `Wiring::build` calls and which
+`GraphConfig::validate` also calls for the at-most-one-`held`-origin-per-endpoint rule. That
+sharing is the point: the reachable failure was two maps attached to one upstream endpoint with
+`write_mode` written nowhere, both promoted to `held`, one starved forever and invisible in
+`state`. A validator re-deriving the rule would have missed the promoted shape; calling the same
+function cannot.
 
 ### 3.18 `nexus_core::data` is the executable specification of §5, not the shipped data path
 **Design:** §5 — the deliver contracts, the one-chunk holdover, boundary-only policy.
@@ -1297,14 +1411,18 @@ explicitly. (Opus review `docs/26`; the "dump round-trips wrongly" reading was r
 the `Chunk` type alias escapes the module. The daemon implements the same semantics directly
 on bounded `tokio::sync::mpsc` channels in `runtime.rs` and each `nodes/*.rs`.
 **Decision:** recorded rather than changed here, with two consequences a reader must know.
-(a) **§3.3 above is stale on one point:** the runtime does *not* call
-`TargetwardSink::flush()`; the anti-stranding property it describes is real but is carried by
-the channel-plus-`send().await` shape, and `flush()` exists only in the model. (b) The `data`
-property tests are evidence about the *contract*, not about the shipped boundaries — the
-per-node fan-out loops are hand-rolled (five copies) and have diverged at least once in
-accounting (the map's missing unattached-loss counter). Treat a change to §5 semantics as
-requiring edits in both places until the loops are rebased onto one helper, which is design
-§16.1 applied to the data plane and is the recommended fix. (Opus review `docs/26`, F3.)
+(a) **§3.3 above asserted something untrue and is corrected in place:** the runtime does *not*
+call `TargetwardSink::flush()`; the anti-stranding property it describes is real but is carried
+by the channel-plus-`send().await` shape, and `flush()` exists only in the model. (b) The `data`
+property tests are evidence about the *contract*, not about the shipped boundaries. Treat a
+change to §5 semantics as requiring edits in both places. `data.rs`'s module doc now says all
+of this at the top of the file, so a reader cannot mistake a green property test there for
+coverage of the data plane. (Opus review `docs/26`, F3/LOCK-3.)
+**Since:** the divergence this entry warned about — the per-node hostward fan-out hand-rolled
+five times, only the serial copy counting the all-sinks-closed case, which is how the map
+shipped without an unattached-loss counter — is closed: all five producers now broadcast through
+`runtime::fan_out`, which charges that case inside the helper (§16.1 applied to the data plane,
+F1/DM-3). The targetward half is still per-node, so the two-places rule above still stands.
 
 ---
 
@@ -1329,10 +1447,17 @@ Full report: `docs/nexus-doctor.md`. Re-runnable per system with
 ## 5. How to build, test, run
 
 ```bash
-cargo build --workspace
-cargo test --workspace
+# `cargo build` first is NOT optional: the nexus-itest harness boots the plain
+# target/debug/{serialnexusd,nexus-sim,serialnexusweb,nexus-doctor} artifacts, which only
+# `cargo build` emits — `cargo test` alone on a clean tree fails every itest.
+cargo build --workspace --locked
+# The one suite: unit + property tests AND the whole integration harness. There is no
+# separate validation step any more — `scripts/` was deleted in §16.11 and every former
+# phase script is now a `nexus-itest/tests/*.rs` (§5 of AGENTS.md).
+cargo test --workspace --locked
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
-bash scripts/validate/all.sh --through 2      # every phase gate so far
+cargo test -p nexus-itest --test p4_steal_lease     # one former phase script
+cargo test -p nexus-itest --test p8_soak -- --ignored   # the endurance soak
 
 # Capability report on this machine (attach to any bug report):
 cargo run -p nexus-doctor                      # Markdown

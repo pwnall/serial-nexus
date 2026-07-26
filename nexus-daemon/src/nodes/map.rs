@@ -29,17 +29,16 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use nexus_core::Chunk;
-use nexus_core::NodeStatus;
 use nexus_core::config::{MAP_RAW_ENDPOINT, NodeConfig};
 use nexus_core::graph::EndpointAddr;
 use nexus_core::lock::OriginId;
 use nexus_core::map::MapDirection;
+use nexus_core::state::{NodeState, NodeStatus};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
-use crate::runtime::{DropCounters, HostwardSink, SharedLock, Wiring, reacquire_held};
+use crate::runtime::{DropCounters, HostwardSink, SharedLock, Wiring, fan_out, reacquire_held};
 use crate::tap::TapFeed;
 
 /// Per-direction observed counters (§7.8). All access is on the one runtime thread
@@ -121,8 +120,23 @@ pub struct MapNode {
     /// (the map's mirror of the codec's multiplexed-side drop count). Claimed from
     /// the wiring at start.
     raw_counters: Option<Arc<DropCounters>>,
+    /// Mapped bytes that reached no live consumer of the mapped endpoint — none
+    /// bound, or every one cascade-removed. §7.8 gives the map a default replay
+    /// ring, so without this counter its bytes would be visible in a tap while
+    /// silently absent from the graph: exactly the pairing §5's accounting doctrine
+    /// forbids ("a ring can never silently hide loss"). The ring/tap mirror is a spy
+    /// *outside* the graph and never suppresses this (DM-3).
+    hostward_unattached: Rc<Cell<u64>>,
+    /// Targetward bytes discarded because this map has no writable raw edge — the
+    /// read-only/display map (`write_mode = "never"` on the raw edge, §7.8) or an
+    /// unattached raw side. The receiver is kept alive and drained rather than
+    /// dropped, so a writer upstream of the map stays healthy; the bytes are still
+    /// loss, so they are counted (§5), mirroring the exec codec's
+    /// `mux_discarded_targetward`.
+    targetward_discarded: Rc<Cell<u64>>,
     tasks: Vec<JoinHandle<()>>,
-    status: NodeStatus,
+    /// The node's observed status *and the moment it entered it* (§7).
+    status: NodeState,
 }
 
 impl MapNode {
@@ -157,8 +171,10 @@ impl MapNode {
             hostward,
             targetward,
             raw_counters: None,
+            hostward_unattached: Rc::new(Cell::new(0)),
+            targetward_discarded: Rc::new(Cell::new(0)),
             tasks: Vec::new(),
-            status: NodeStatus::Active,
+            status: NodeState::new(NodeStatus::Active),
         })
     }
 
@@ -186,11 +202,12 @@ impl MapNode {
                 rx,
                 mapped_sinks,
                 mapped_feed,
+                self.hostward_unattached.clone(),
             ))),
             None => {
-                self.status = NodeStatus::Waiting {
+                self.status.set(NodeStatus::Waiting {
                     reason: "raw side has no attached upstream".to_owned(),
-                };
+                });
             }
         }
 
@@ -202,40 +219,84 @@ impl MapNode {
         let mapped_targetward_rx = wiring.host_targetward_rx.remove(&mapped);
         let raw_targetward_tx = wiring.target_targetward_tx.remove(&raw);
         let raw_lock = wiring.origin_locks.remove(&raw);
-        if let (Some(rx), Some(up_tx), Some((lock, id))) =
-            (mapped_targetward_rx, raw_targetward_tx, raw_lock)
-        {
-            self.tasks.push(tokio::task::spawn_local(targetward_map(
-                self.targetward.clone(),
-                rx,
-                up_tx,
-                lock,
-                id,
-            )));
+        match (mapped_targetward_rx, raw_targetward_tx, raw_lock) {
+            (Some(rx), Some(up_tx), Some((lock, id))) => {
+                self.tasks.push(tokio::task::spawn_local(targetward_map(
+                    self.targetward.clone(),
+                    rx,
+                    up_tx,
+                    lock,
+                    id,
+                )));
+            }
+            // No writable raw edge: the read-only/display map (`write_mode = "never"`,
+            // §7.8) or an unattached raw side. The receiver must NOT be dropped —
+            // senders stay live in `GraphState::endpoint_targetward` and in every
+            // writer origin attached to the mapped endpoint, and a closed channel
+            // makes the next targetward write fail. In the pty case that ends
+            // `read_and_poll` outright, taking presence latching, `handle_last_close`,
+            // termios reconciliation and detach-release with it — a read-only map
+            // silently killing its own writer (MAP-1). Keep it alive in a draining
+            // task instead, so the map is *inert* rather than destructive, and count
+            // the bytes it swallows (§5).
+            (Some(rx), _, _) => {
+                self.tasks.push(tokio::task::spawn_local(targetward_drain(
+                    rx,
+                    self.targetward_discarded.clone(),
+                )));
+            }
+            // No mapped targetward receiver at all: `Wiring::build` gives every
+            // host-facing endpoint one, so this is unreachable post-wiring; there is
+            // nothing to keep alive.
+            (None, _, _) => {}
         }
     }
 
-    pub fn status(&self) -> NodeStatus {
+    pub fn status(&self) -> NodeState {
         self.status.clone()
     }
 
     pub fn state_extra(&self) -> Value {
         // Per-direction byte and per-rule substitution counters (§7.8) — the cheap
-        // way to discover which quirk a mystery console actually has — plus the
-        // raw-side intake drop count (the map falling behind the upstream, §5).
+        // way to discover which quirk a mystery console actually has — plus the two
+        // §5 loss counters: mapped bytes that reached no consumer, and targetward
+        // bytes a read-only map swallowed. `json!` builds objects, so the inserts
+        // below always find one; `as_object_mut` keeps it non-panicking anyway.
+        let mut hostward = self.hostward.state();
+        if let Some(obj) = hostward.as_object_mut() {
+            obj.insert(
+                "discarded_unattached".to_owned(),
+                json!(self.hostward_unattached.get()),
+            );
+        }
+        let mut targetward = self.targetward.state();
+        if let Some(obj) = targetward.as_object_mut() {
+            obj.insert(
+                "discarded_no_raw_edge".to_owned(),
+                json!(self.targetward_discarded.get()),
+            );
+        }
         json!({
-            "hostward": self.hostward.state(),
-            "targetward": self.targetward.state(),
+            "hostward": hostward,
+            "targetward": targetward,
             "raw": {
                 "dropped_slow_consumer": self.raw_counters.as_ref().map_or(0, |c| c.dropped_full()),
             },
         })
     }
 
-    pub fn teardown(&mut self) {
+    /// Ask this node's tasks to stop, without waiting (§16.1, BND-1). A map owns no
+    /// blocking thread and no environment to release, so signalling *is* its whole
+    /// teardown; the method exists so the daemon can signal every node uniformly
+    /// before it pays any node's join cost.
+    pub fn signal_stop(&mut self) {
         for t in self.tasks.drain(..) {
             t.abort();
         }
+    }
+
+    pub fn teardown(&mut self) {
+        self.signal_stop();
     }
 }
 
@@ -257,6 +318,7 @@ async fn hostward_map(
     mut rx: mpsc::Receiver<Chunk>,
     sinks: Vec<HostwardSink>,
     feed: Option<TapFeed>,
+    unattached: Rc<Cell<u64>>,
 ) {
     while let Some(chunk) = rx.recv().await {
         let mapped = dir.transform(&chunk);
@@ -266,18 +328,37 @@ async fn hostward_map(
         let mapped = Chunk::from(mapped);
         // Mirror to the tap hub for taps and the replay ring (§17), independent of
         // whether a graph consumer is bound — a tapped-but-unconsumed map still
-        // reaches its observer.
+        // reaches its observer. Deliberately *outside* the fan-out's accounting: the
+        // ring is a spy out of the graph, so it must never suppress the unattached
+        // count below (§5, AGENTS.md invariant 9).
         if let Some(feed) = &feed {
             feed.mirror(&mapped);
         }
-        let n = mapped.len() as u64;
-        for (tx, counters) in &sinks {
-            match tx.try_send(mapped.clone()) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => counters.add_full(n),
-                Err(TrySendError::Closed(_)) => {}
-            }
-        }
+        // The one shared hostward fan-out (§5, F1). It charges a slow consumer's
+        // full-buffer drop to that consumer, and — the case the map used to ignore
+        // entirely (DM-3) — an empty or all-`Closed` sink set to `unattached`.
+        fan_out(&mapped, &sinks, &*unattached);
+    }
+}
+
+/// Keep a read-only map's mapped-endpoint targetward receiver alive, discarding and
+/// counting what arrives (§5, MAP-1).
+///
+/// A map with no writable raw edge (`write_mode = "never"` on it — the documented
+/// read-only/display map, §7.8 — or an unattached raw side) has nowhere to forward
+/// consumer writes. Dropping the receiver would be the destructive answer: its
+/// senders stay live (the `send` verb's clone in `GraphState`, plus every writer
+/// origin attached to the mapped endpoint), so the next targetward write hits a
+/// closed channel and, for a pty origin, ends its reader task along with presence
+/// latching, last-close handling, termios reconciliation and detach-release. Draining
+/// makes the map inert instead: a writer stays healthy, its bytes simply go nowhere,
+/// and the loss is visible in `state` rather than silent.
+async fn targetward_drain(mut rx: mpsc::Receiver<Chunk>, discarded: Rc<Cell<u64>>) {
+    while let Some(chunk) = rx.recv().await {
+        // The *arriving* bytes are what is lost; the transform is deliberately not
+        // run, so a read-only map's per-rule counters do not claim substitutions on
+        // bytes that never left the node.
+        discarded.set(discarded.get() + chunk.len() as u64);
     }
 }
 
@@ -308,5 +389,103 @@ async fn targetward_map(
         if up_tx.send(Chunk::from(mapped)).await.is_err() {
             return; // upstream gone
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::DropCounters;
+
+    fn identity_direction() -> Rc<Direction> {
+        // No rules: a pure pass-through, so the tests assert on the fan-out and the
+        // drain rather than on the (separately property-tested) transform.
+        let map = MapDirection::parse(&[]).expect("empty mapping list parses");
+        Rc::new(Direction {
+            stat: DirStat::new(map.rule_count()),
+            map,
+        })
+    }
+
+    /// DM-3/MAP-UNATTACHED-LOSS: the map is a hostward producer like any other, so
+    /// mapped bytes that reach no live consumer must be counted, not swallowed.
+    /// §7.8 gives it a default replay ring, so an uncounted drop would be visible in
+    /// a tap while silently absent from the graph (§5).
+    #[tokio::test]
+    async fn hostward_map_counts_bytes_that_reach_no_consumer() {
+        // Two shapes of "no consumer": no sinks at all, and one permanently Closed.
+        for closed_sink in [false, true] {
+            let (in_tx, in_rx) = mpsc::channel::<Chunk>(4);
+            let mut sinks: Vec<HostwardSink> = Vec::new();
+            if closed_sink {
+                let (tx, rx) = mpsc::channel::<Chunk>(4);
+                drop(rx); // consumer cascade-removed: the sink is permanently Closed
+                sinks.push((tx, Arc::new(DropCounters::default())));
+            }
+            let unattached = Rc::new(Cell::new(0u64));
+
+            in_tx
+                .send(Chunk::copy_from_slice(b"hello"))
+                .await
+                .expect("queued");
+            drop(in_tx); // close the source so the pump drains and returns
+
+            hostward_map(identity_direction(), in_rx, sinks, None, unattached.clone()).await;
+
+            assert_eq!(
+                unattached.get(),
+                5,
+                "closed_sink = {closed_sink}: unconsumed mapped bytes must be counted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hostward_map_does_not_count_bytes_a_live_consumer_took() {
+        let (in_tx, in_rx) = mpsc::channel::<Chunk>(4);
+        let (tx, mut rx) = mpsc::channel::<Chunk>(4);
+        let sinks: Vec<HostwardSink> = vec![(tx, Arc::new(DropCounters::default()))];
+        let unattached = Rc::new(Cell::new(0u64));
+
+        in_tx
+            .send(Chunk::copy_from_slice(b"hello"))
+            .await
+            .expect("queued");
+        drop(in_tx);
+
+        hostward_map(identity_direction(), in_rx, sinks, None, unattached.clone()).await;
+
+        assert_eq!(unattached.get(), 0);
+        let got = rx.try_recv().expect("the live consumer received the chunk");
+        assert_eq!(&got[..], b"hello");
+    }
+
+    /// MAP-1 (runtime): a read-only map must keep its mapped endpoint's targetward
+    /// receiver alive. The regression is silent and destructive — a dropped receiver
+    /// closes the channel under every writer origin, and a pty writer's task dies
+    /// with it — so assert the observable half: the sender stays usable and the
+    /// bytes are counted as loss (§5).
+    #[test]
+    fn targetward_drain_keeps_the_channel_open_and_counts_the_loss() {
+        // A current-thread runtime + LocalSet mirrors the daemon: the drain runs as
+        // a spawned local task while a "writer" sends into the same channel.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (tx, rx) = mpsc::channel::<Chunk>(4);
+            let discarded = Rc::new(Cell::new(0u64));
+            let handle = tokio::task::spawn_local(targetward_drain(rx, discarded.clone()));
+            tx.send(Chunk::copy_from_slice(b"abc"))
+                .await
+                .expect("a live drain keeps the channel open");
+            tx.send(Chunk::copy_from_slice(b"de"))
+                .await
+                .expect("still open on the second write");
+            drop(tx);
+            handle.await.expect("the drain task ends with its source");
+            assert_eq!(discarded.get(), 5);
+        });
     }
 }

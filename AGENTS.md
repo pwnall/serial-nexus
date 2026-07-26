@@ -60,13 +60,40 @@ endpoint, raw edge defaults to `held` with steal-to-bypass). `existing-terminal`
   stateless per-console character transform (picocom's byte mappings), the first non-codec
   interior transform, slotting into the endpoint-keyed wiring with no `Wiring::build`
   structural change. Its raw edge defaults to `held` (an omitted/on-demand map raw edge is
-  promoted to `held` in `Wiring::build`, mirroring the log→never override; `never` makes a
-  read-only map).
+  promoted to `held` by `GraphConfig::effective_write_mode`, mirroring the log→never override;
+  `never` makes a read-only map, which is now inert rather than destructive — the mapped
+  endpoint's targetward receiver is drained-and-counted instead of dropped).
 - **Deferred / not implemented on purpose:** design §14 items, and RPC verbs `connect` /
-  `disconnect` / `set-attribute` (they return `-32601`). `existing-terminal` node (§7.7).
-- **Open review items:** the Opus comprehensive code review is `docs/19-claude-opus-code-review.md`;
-  its remediation was committed (`b9d8a50`) and folded into v9. If you touch that area,
-  check the review's action table for anything still marked open before assuming it's clean.
+  `disconnect` / `set-attribute` (they return `-32601`). `existing-terminal` node (§7.7). A
+  serial node's `faces = "target"` output-leg role (§7.1) is *described* by the design and has
+  no wiring, so it is now **refused structurally** rather than loading a port it seizes with
+  `TIOCEXCL` and attaches to nothing; a standalone re-multiplexing codec (`faces = "host"`)
+  now comes up `waiting` with a §14 reason, which is what §7.5 promised, instead of `faulted`.
+- **Review remediation:** two full-workspace Opus reviews exist.
+  `docs/historical/19-claude-opus-code-review.md` was remediated in `b9d8a50` and folded into v9.
+  `docs/26-claude-opus-code-review.md` (2026-07-25, 93 surviving findings, 20 refuted) was
+  **remediated this session** — the review file itself is a frozen historical record and still
+  reads "nothing is fixed yet", so **read `docs/implementation-notes.md`, not the review, for
+  what is true now**. Its §6 lists the 20 refutations, which need no action and should not be
+  re-filed. Two dispositions the remediation deliberately kept rather than changed:
+  `nexus_core::data` stays the executable *specification* of §5 rather than being rebased onto
+  the shipped boundaries (notes §3.18 — its module doc now says so outright, so do not read a
+  green property test there as coverage of the data plane), and `arbitration` stays a per-node
+  attribute applied to each host-facing endpoint (notes §3.16). Notes **§3.15 was withdrawn**:
+  the `flow_control` spelling was a real defect, not a justified deviation, and `xonxoff` /
+  `rtscts` are now accepted as serde aliases beside the canonical kebab-case.
+- **Configurations that used to load and now do not** (all refused *structurally*, before
+  anything is created and before a `--replace` teardown): an unknown key anywhere outside a
+  codec's opaque `attributes` table (`deny_unknown_fields`); a numeric field out of range
+  (invariant 13); an edge into a codec/exec multiplexed endpoint whose mode is neither `held`
+  nor `never`; two effectively-`held` edges on one arbitrated host-facing endpoint; a serial
+  `faces = "target"`; a whitespace-only or over-256-byte name; and an operator `load` whose
+  non-empty source text parses to an empty graph (a mis-typed `[[nodez]]` used to make
+  `--replace` an unannounced `teardown` reporting success). Each names the offender.
+- **One behaviour change to existing working configs:** `spchex` now maps picocom's
+  control-byte class (DEL plus `0x00..=0x1f` except TAB/LF/CR) instead of SPACE, so a graph
+  that enabled it emits different bytes — see the v11 track entry in
+  `docs/implementation-notes.md`.
 
 ## 3. Workspace layout
 
@@ -78,7 +105,7 @@ Cargo workspace; `fuzz/` and `examples/external-codec/` are deliberately **exclu
 |-------|------|------|
 | `codec-api` | lib | Dependency-free codec contract (§8): the multi-channel `Codec` trait, the `Event` vocabulary (data/open/close/error), the versioned **envelope** + daemon-to-daemon **wire frame** (`Hello`, `WIRE_MAGIC`) encode/decode. Has a feature-gated `test_support` conformance kit. |
 | `codecs/reference` | lib | `codec-reference`: the reference framing codec over the v1 length-prefixed envelope; doubles as the first demux/re-mux codec and the link codec core; adds **length-guided resync** past corrupt frames (§7.5/§9). |
-| `nexus-core` | lib | Pure foundation: `graph` model + 3 structural rules, `data` deliver contracts + holdover, `lock` write-arbitration state machine, `config`/`state` split, `resolver` (dependency-free `/dev`+sysfs device-identity resolution, §12). Property-tested; no I/O. |
+| `nexus-core` | lib | Pure foundation: `graph` model + the 3 topological rules and the `ValidationError` vocabulary, `data` (the §5 contracts as an executable **specification**, not the shipped path — invariant 9/notes §3.18), `lock` write-arbitration state machine, `config`/`state` split (`GraphConfig::validate` owns everything the topology model cannot see: per-kind attributes, numeric ranges, and the two edge rules that depend on node kinds), `map` (the picocom transform engine, §7.8), `resolver` (dependency-free `/dev`+sysfs device-identity resolution, §12). Property-tested; no I/O. |
 | `nexus-rpc` | lib | Thin, stable JSON-RPC 2.0 framing (§10/§15.16): request/response/notification wire types over NDJSON, method params/results left as opaque `serde_json::Value`. Owns the single **`AppError` error-code registry** (§16.8) and dependency-free base64 for `tap.data`. |
 | `nexus-sys` | lib | **The workspace's only crate with `unsafe`** (§16.3). Centralizes every ioctl / `ptsname` / nonblocking read-write / `poll(2)` wrapper: `read_icounts` (TIOCGICOUNT), `set_exclusive` (TIOCEXCL), `set_packet_mode` (TIOCPKT), `read_modem_bits` (TIOCMGET), `poll_ready`/`poll_blocking` (**deliberately not tokio `AsyncFd`**, §15.18). Every other crate `#![forbid(unsafe_code)]`. |
 | `nexus-daemon` | lib | The daemon as an **embeddable library**: `run`/`RunOptions`/`Registry` entry surface. Wires boundary nodes, the single-thread tokio data-plane runtime, the JSON-RPC control plane, the persisted state file, and the compiled-in codec registry. Largest crate; see §4 for its modules. |
@@ -97,7 +124,7 @@ Dependency direction: `nexus-daemon` → {`nexus-core`, `nexus-rpc`, `nexus-sys`
 - `lib.rs` — public API (`run`/`RunOptions`/`Registry`); socket + state-file path policy; startup load.
 - `daemon.rs` — graph state + all RPC verb impls; the two-lane control plane (§15.20). Largest file.
 - `control.rs` — JSON-RPC 2.0 over NDJSON on the Unix socket; one task per connection; cancel-safe waiting.
-- `runtime.rs` — data-plane runtime: endpoint-keyed mpsc wiring, `poll(2)` readiness, and the shared **`frame_ranges`/`frame_payload_cap`** targetward-fragmentation helper (§5/§15.19/§15.27).
+- `runtime.rs` — data-plane runtime: endpoint-keyed mpsc wiring, `poll(2)` readiness, the shared **`frame_ranges`/`frame_payload_cap`/`data_frames`** targetward-fragmentation helpers (§5/§15.19/§15.27, invariant 3) and the shared hostward **`fan_out`** (invariant 9).
 - `boundary.rs` — shared boundary-supervisor primitives (park / race3 / `BlockingReader` / `Backoff`), property-tested (§16.1).
 - `cell.rs` — `CriticalCell`, the `RefCell` wrapper that makes "a borrow never crosses `.await`" a compile-shape fact (§16.2).
 - `registry.rs` — codec `Registry` value (`with_builtins`/`register`); **no dynamic loading** (§8/§15.26).
@@ -121,6 +148,9 @@ cargo build --workspace --locked
 # self-skip when the tool is absent.
 cargo test  --workspace --locked
 cargo fmt --all --check
+# The `disallowed-types` RefCell ban lives in BOTH `serialnexusd/clippy.toml` and
+# `nexus-daemon/clippy.toml` — clippy reads it from the crate manifest dir upward, and
+# the two are siblings, so one copy covers only one crate (invariant 5).
 cargo clippy --workspace --all-targets --locked -- -D warnings
 # The minimal daemon (no built-in codecs) must ALSO be warning-clean:
 cargo clippy -p serialnexusd -p nexus-daemon --no-default-features --locked -- -D warnings
@@ -152,7 +182,11 @@ which was not macOS-portable: `stat -c`, `nc -q`, `sha256sum`, `timeout`, and
 `/dev/serial/by-id` all diverge across Linux/macOS. Each former phase script became a
 `nexus-itest/tests/<name>.rs` (e.g. `p4_steal_lease.rs`, `p6_outage.rs`, `p8_web.rs`);
 `src/lib.rs` is the shared foundation. A test that cannot run on a platform **self-skips**
-(`eprintln!("SKIP …"); return`) — the same skip-is-valid discipline the bash rig had.
+(`eprintln!("SKIP …"); return`) — the same skip-is-valid discipline the bash rig had. The
+`p9_*` files are the newest family — "phase 9" by convention only, since the numbered phases
+ended at 8: they are the regression guards for `docs/26-claude-opus-code-review.md`, one file
+per defect area, each module doc naming the finding IDs it pins and the reviewer's live
+reproduction it replays. Put a new review-driven guard there rather than in a `p0`–`p8` file.
 
 **Iron conventions — follow them when adding tests:**
 - **Assert on structured RPC results / byte-exact SHA-256, never CLI text.** Drive the
@@ -167,9 +201,14 @@ which was not macOS-portable: `stat -c`, `nc -q`, `sha256sum`, `timeout`, and
   dedicated `serial_hardware.rs` test via `crossover_ports()` — it reads through the
   daemon's own fast, lossless reader (a flow-control-less UART drops bytes under a raw
   high-volume read, so *that* is where hardware byte-exactness is asserted).
-- **Meta-gates are proven, not assumed.** `tests/meta_gates.rs` scans the tree and
-  asserts `unsafe` is confined to `nexus-sys/` (with a planted-`unsafe` self-proof), and
-  asserts `nexus-doctor` reports no `unsupported` capability. The licensing gate is
+- **Meta-gates are proven, not assumed.** `tests/meta_gates.rs` scans the tree and asserts
+  `unsafe` is confined to `nexus-sys/`, that the `RefCell` ban covers every crate holding
+  daemon state (invariant 5), and that no `AsyncFd` appears in code anywhere (invariant 1); it
+  also asserts `nexus-doctor` reports no `unsupported` capability. **Each scanning gate plants
+  a synthetic violation first and proves its own detector fires** — and, for the two that must
+  read past prose legitimately naming the banned token, that it does *not* trip on a comment. A
+  gate whose detector silently stopped detecting is precisely the failure invariant 5 suffered.
+  The licensing gate is
   `tests/p0_license_gate.rs` (folded from bash in v10 §16.11): it plants a banned crate and
   asserts cargo-deny rejects it, self-skipping where cargo-deny is absent. `p8_external_codec.rs`
   builds the out-of-tree template from a consumer's position, and `p8_web_history.rs` runs
@@ -179,6 +218,21 @@ which was not macOS-portable: `stat -c`, `nc -q`, `sha256sum`, `timeout`, and
   remove the temp dir), so a panicking test never leaks a daemon or a socket.
 - **Heavy/endurance tests are `#[ignore]`d** (e.g. `p8_soak::soak_endurance`, SOAK_*-env
   parameterized) and run in the nightly `--include-ignored` sweep, not per push.
+- **Fuzzing is a separate toolchain and a separate answer to "which parsers".** `fuzz/` is
+  excluded from the workspace and runs `fuzz-nightly`. Its targets were all on the `codec-api`
+  layer — `envelope_decode`, `frame_decoder`, `wire_hello`, `reference_demux` — which left
+  every parser reachable *without a leg* uncovered (review 26 SEC-7). Three more now close
+  that: `rpc_request_line` (the daemon's front door — every byte written to the control
+  socket), `rpc_base64` (the hand-rolled codec carrying console bytes inside `tap.data`), and
+  `config_load` (`GraphConfig` deserialization + `validate`, the parser the two worst
+  configuration defects walked through). A new parser on an externally-reachable surface gets
+  a target. **Two of SEC-7's named parsers are deliberately still unfuzzed, and the reason is
+  a rule, not an oversight:** the daemon's `RequestLines` lives in a private module and
+  `serialnexusweb`'s HTTP head parser lives in a binary-only crate, so fuzzing either would
+  mean widening a published surface (§15.26 keeps `nexus-daemon`'s entry API to `run`/
+  `RunOptions`/`Registry`) purely for a test harness. Both are covered by their own unit
+  tests. If you are re-filing SEC-7: the answer is to lift the parser into a crate of its
+  own, never to make internals `pub`.
 
 **Hardware rig:** `serial_hardware.rs` — two USB-serial adapters cross-wired as a null
 modem (each is the other's target), auto-detected via `crossover_ports()`
@@ -197,23 +251,45 @@ These are settled by real bugs and benchmarks. Each cites where it lives.
    pty master (epoll reports ready forever while `read` gives EAGAIN), starving the
    current-thread runtime. Readiness for tty-family fds is non-blocking `poll(2)` with an
    adaptive idle backoff (`nexus-sys::poll_ready`, §15.18). Do not reintroduce `AsyncFd`
-   for pty/tty.
+   for pty/tty — or anywhere: `meta_gates::no_asyncfd_is_used_anywhere_in_the_workspace`
+   greps for it in *code* (the tree's only occurrences are prose explaining the ban), with an
+   empty allowlist and a planted-violation self-proof.
 2. **High-rate hostward paths run on dedicated blocking threads.** The serial reader and
    the PTY writer park in **blocking `poll(2)`** (`nexus-sys::poll_blocking`,
    `nexus-daemon/src/boundary.rs`): ~185 MiB/s, lossless, ~0 CPU idle. The async poll loop
    caps at ~1 MB/s — do **not** "simplify" the reader/writer back onto it (§15.19).
-3. **Never silently drop targetward bytes.** An oversize producer chunk is **fragmented**
-   across frames via the one shared helper `runtime::frame_ranges` — never skipped on an
-   encode error. This skip-on-error bug shipped three times in three framers before review
-   caught it (§5/§15.27). The in-process codec, `leg`, and `exec` all fragment through that
-   one helper. Guard test: `targetward_oversize_chunk_is_fragmented_never_dropped`.
+3. **Never silently drop targetward bytes: fragment, never skip on an encode error, and
+   count any residual.** An oversize producer chunk is **fragmented** across frames via the
+   one shared helper `runtime::frame_ranges` — never skipped. This skip-on-error bug shipped
+   three times in three framers before review caught it (§5/§15.27). The in-process codec,
+   `leg`, and `exec` all fragment on that one helper (the latter two through its envelope
+   wrapper `data_frames`). The *third* clause is newer and was the quieter bug: `data_frames`
+   used `map_while`, so a refused piece simply ended the iteration and truncated the chunk
+   without a trace. It now yields a `DataFrame::Piece`/`DataFrame::Residual` enum a caller has
+   to match, and **every writer charges the tail** — the codec to the channel's
+   `discarded_targetward`, `leg` and `exec` to `discarded_unframable`. Guards:
+   `targetward_oversize_chunk_is_fragmented_never_dropped`,
+   `data_frames_reports_the_residual_instead_of_truncating_in_silence`.
 4. **All `unsafe` lives in `nexus-sys`.** Every other crate is `#![forbid(unsafe_code)]`;
    `nexus-itest/tests/meta_gates.rs` (`unsafe_is_confined_to_nexus_sys`) proves the confinement.
-5. **No `std::cell::RefCell` in the daemon.** `serialnexusd/clippy.toml` bans it via
-   `disallowed-types`; daemon state lives in `nexus_daemon::cell::CriticalCell`, whose contents
+5. **No `std::cell::RefCell` in the daemon — and the ban needs a `clippy.toml` in *every*
+   crate it covers.** Daemon state lives in `nexus_daemon::cell::CriticalCell`, whose contents
    are reachable only inside a synchronous `with`/`with_mut` closure, so a borrow **cannot
    cross an `.await`** (§16.2). (`CriticalCell`'s own internal `RefCell` carries a localized
-   `#[allow]`.)
+   `#[allow]`.) The `disallowed-types` entry now lives in **both** `serialnexusd/clippy.toml`
+   **and** `nexus-daemon/clippy.toml`, deliberately duplicated. **The trap, which is the
+   reusable lesson: a `clippy.toml` disarms silently when the code moves.** Clippy resolves it
+   from `CARGO_MANIFEST_DIR` upward through *ancestors*; the file lived only in `serialnexusd/`,
+   and the v8 library split (§15.26) moved every line of daemon state into the *sibling* crate
+   `nexus-daemon/`, which is not a descendant. The ban stopped covering the code it was written
+   for and nothing said so until review 26 (INV5-CLIPPY-SCOPE), which proved it with a planted
+   `RefCell` plus a `len_zero` canary — only the canary was reported. If you move a
+   crate, move its lint configuration with it. The durable half of the fix is the meta-gate
+   `meta_gates::refcell_ban_covers_every_crate_that_holds_daemon_state`, which asserts the ban
+   crates hold no raw `RefCell`, that each really carries a `clippy.toml`, and — the clause that
+   would have caught the original break — that **every** crate whose sources use `CriticalCell`
+   is on the ban list. Prefer that shape for any lint-enforced invariant: it survives a crate
+   move, a `clippy.toml` does not.
 6. **MSRV 1.97 is a two-way constraint.** The code uses **let-chains** (need ≥1.88) and
    clippy 0.1.97's `collapsible_if` *requires* collapsing nested `if { if let }` **into**
    let-chains. 1.85 and 1.97 clippy are mutually incompatible here — do **not** lower MSRV
@@ -221,25 +297,83 @@ These are settled by real bugs and benchmarks. Each cites where it lives.
 7. **Config vs state split.** Configuration is operator-owned, round-trippable, and only
    fails on *structural* invalidity; state is environment-owned and never persisted.
    Environmental failure (missing device, unwritable dir) changes a node's *state*, never
-   the graph. Node names and channel identities may not contain `/` and may not be
-   empty/whitespace-only — structural validation errors (§3/§12).
+   the graph. A node name or channel identity may not contain `/` (`InvalidName`), may not be
+   whitespace-only (`BlankName` — the reserved *empty* default-endpoint name stays legal, so
+   the check is `!is_empty() && trim().is_empty()`), and may not exceed
+   `graph::MAX_NAME_LEN` = 256 **bytes** (`NameTooLong`); a node name may not be empty
+   (`EmptyName`). All are structural validation errors naming the offender (§3/§11/§12,
+   `nexus-core/src/graph.rs`). The length cap is not cosmetic: a channel identity rides in
+   every envelope frame header, so an oversize one shrinks the per-frame payload to nothing
+   and makes invariant 3's residual reachable rather than pathological.
 8. **Arbitration default is `exclusive`.** Only the write-lock holder's bytes are read
    targetward (non-holders are simply not read = backpressure, no drop). A lone PTY needs
    an explicit `lock` to write, or the node set to `arbitration = "free-for-all"`. The
    `send` verb self-acquires the lock. Do not weaken the gate to "fix" a test.
-9. **The replay ring is bulk-memcpy, and default-on (64 KiB).** Since v10 §15.32 every
-   host-facing endpoint carries a `replay_ring` (default 65536, opt out with `0`), so its
-   hostward mirror + hub run on the hot path of *every* endpoint. `tap::ReplayRing` MUST stay
-   a fixed circular `Vec<u8>` written with `copy_from_slice` — a byte-at-a-time `VecDeque`
-   `drain`+`extend` starved the runtime thread and collapsed the 256 MiB firehose from 2.5 s
-   to ~1.9 MB/s (measured, then fixed). Guard: `p3_firehose` completes well under its 60 s
-   bound. `discarded_unattached`/`discarded_no_client` accounting stays independent of the
-   mirror (the ring is a spy *outside* the graph, §5) — guard `active_tap_feed_does_not_hide_unattached_loss`.
-10. **`tap.data` offsets are monotonic per boot; `from_offset = ingested − ring.len()` never
-   underflows.** Every `ingest` both pushes to the ring and advances `ingested`, so the ring
-   holds `≤ ingested` bytes by construction (`nexus-daemon/src/tap.rs`, §11.8). `info.instance`
-   is a per-boot nonce so a client detects the offset reset across a restart. Do not stamp an
-   offset *after* advancing `ingested`, or splice-exactness breaks.
+9. **The replay ring is bulk-memcpy, and default-on (64 KiB); the hostward fan-out is one
+   helper.** Since v10 §15.32 every host-facing endpoint carries a `replay_ring` (default
+   65536, opt out with `0`), so its hostward mirror + hub run on the hot path of *every*
+   endpoint. `tap::ReplayRing` MUST stay a fixed circular `Vec<u8>` written with
+   `copy_from_slice` — a byte-at-a-time `VecDeque` `drain`+`extend` starved the runtime thread
+   and collapsed the 256 MiB firehose from 2.5 s to ~1.9 MB/s (measured, then fixed). Guard:
+   `p3_firehose` completes well under its 60 s bound. Every producing node — serial, codec,
+   exec, leg, map — now broadcasts through the single `runtime::fan_out(chunk, sinks,
+   unattached)`, which charges the no-live-sink case (empty **or** all-`Closed` sinks) to the
+   producer's unattached counter *inside the helper*, before the caller sees the result. That
+   consolidation is not cosmetic: the loop was hand-rolled five times and only the serial copy
+   counted it, which is exactly how the map shipped as the one hostward producer that never
+   counted consumer absence (F1/DM-3). Mirror to the tap/ring **before** calling `fan_out` and
+   pass it the graph sinks only: `discarded_unattached`/`discarded_no_client` accounting stays
+   independent of the mirror (the ring is a spy *outside* the graph, §5) — guard
+   `active_tap_feed_does_not_hide_unattached_loss`.
+10. **`tap.data` offsets are the *delivered-bytes* space, and loss beside it is signalled, not
+   folded in.** Every `ingest` both pushes to the ring and advances `ingested`, so the ring
+   holds `≤ ingested` bytes by construction and `from_offset = ingested − ring.len()` cannot
+   underflow (`nexus-daemon/src/tap.rs`, §11.8). Do not stamp an offset *after* advancing
+   `ingested`, or splice-exactness breaks. The other half of that contract used to disagree
+   with it: bytes dropped at the lossy `TapFeed::mirror` hop left the offset space *contiguous
+   across a real hole*, so a browser splicing by offset silently concatenated a holed stream.
+   Folding those drops into `ingested` is the wrong fix — it makes `ingested − ring.len()` no
+   longer the ring's true base offset, which is a silent corruption strictly worse than an
+   invisible gap. The hole is instead reported as **`gap_before`** on the first chunk drained
+   after it (from the shared `feed_dropped` atomic, against the hub's `feed_dropped_seen`
+   watermark), with `tap.open`'s `feed_dropped` as the client's baseline; ring-replay pieces
+   carry `gap_before: 0` because the ring is contiguous by construction. `info.instance` is a
+   per-boot nonce so a client detects the offset reset across a restart — but note it does
+   **not** rotate on a hub rebuild (`load --replace`), which is the known open issue in
+   `docs/implementation-notes.md`.
+11. **The web bridge is an allowlist, and it screens a *parsed* value and forwards that value
+   re-serialized.** Both halves are settled by a reproduced bypass (review 26 WEB-1/SEC-1).
+   The daemon's control socket is NDJSON, so one WebSocket frame carrying
+   `{…"method":"info"}\n{…"method":"teardown"}` used to split into two requests on the far
+   side of which only the first was screened — `teardown` and `shutdown` both executed from
+   the browser. Re-serializing one parsed object emits exactly one line, so what was screened
+   is exactly what is sent. And `bridge::ALLOWED` enumerates the verbs the console may invoke
+   rather than the ones it may not: a denylist fails **open** on every verb §10 grows
+   afterwards, which made §17's hard non-goal depend on someone remembering to extend it. Do
+   not invert either half, and do not forward raw frame text.
+12. **Write-mode promotion has exactly one implementation.** `GraphConfig::effective_write_mode`
+   (`nexus-core/src/config.rs`) is the single source of truth for the two
+   configuration-to-runtime promotions — a log target forced to `never`, and a map's `raw`
+   endpoint promoted from `on-demand` to `held` (§7.8) — and **both** the validator
+   (`GraphConfig::validate`, for the one-`held`-origin-per-endpoint rule) and the data plane
+   (`runtime::Wiring::build`) call it. Re-deriving a promotion in either place is how the
+   validator and the runtime come to disagree about what a graph actually does: the reachable
+   shape is two maps on one upstream endpoint with `write_mode` written nowhere, both silently
+   promoted to `held`, one of them starved forever and invisible in `state` (§16, review 26
+   RV-4). The declared value is what `dump` round-trips; the effective value is what runs
+   (notes §3.17).
+13. **Numeric configuration fields are range-validated *structurally*, in
+   `GraphConfig::validate`.** A bad number must be refused before anything is created and —
+   under `load --replace`, which composes teardown-then-load — before the running graph is torn
+   down (§11 atomicity, §15.26). This is not tidiness: `replay_ring` allocates lazily, so an
+   unbounded value **loaded cleanly and then aborted the process** out of the allocator on the
+   first hostward byte, on a configuration `load` had already persisted — a crash loop across
+   restarts; and an unbounded `hostward_buffer` panicked inside tokio's bounded channel *after*
+   `--replace` had already destroyed the good graph. The caps live beside the fields they bound
+   (`MAX_REPLAY_RING` 16 MiB, `MAX_HOSTWARD_BUFFER` 65536 chunks, `MAX_TIMER_MS` one hour,
+   `MAX_ROTATION_PADDING` 20 digits), every check goes through the one `range_error` helper,
+   and a proptest sweeps extreme values. A new numeric knob gets a range here on the day it is
+   added.
 
 For the deeper code-level invariants (purge-on-acquire runs synchronously at grant time;
 the exec pump polls stdin/stdout/stderr concurrently to avoid deadlock; serial

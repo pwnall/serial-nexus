@@ -30,6 +30,11 @@
 //!   that connection's bounded tap queue (`TAP_QUEUE_CAP` = 128 chunks) fills, and the
 //!   hub drops-with-counter. This is precisely the stalled-tab condition the bash
 //!   produced via `serialnexusctl tap … --stall-ms`.
+//! * DM-5 (below, every platform): the *endpoint-level* `feed_dropped` — the producer→hub
+//!   feed hop's own loss counter — must be readable with **no tap open**. It used to be
+//!   rendered only inside a per-tap object, so on a ring-only endpoint (the default for
+//!   every endpoint since §15.32) the counter existed and nothing could reach it, which
+//!   §5's accounting doctrine ("loss is always visible") does not allow.
 //! * 16 MiB (up from the bash's 8 MiB): the tap queue is 128 chunks of `READ_BUF`
 //!   (64 KiB) = up to 8 MiB, plus the two socket buffers, so 8 MiB is marginal for
 //!   *guaranteeing* a drop; 16 MiB comfortably overflows the tap boundary while the
@@ -230,4 +235,80 @@ b = "logx"
     // Clean up the stalled tap: dropping the subscription closes its connection, which
     // detaches the tap from its hub.
     drop(stalled_tap);
+}
+
+/// DM-5 — the endpoint's own `feed_dropped` is reachable in `state` on a **ring-only**
+/// endpoint, i.e. with no tap open. Before the fix the counter was rendered only inside
+/// a per-tap object, so the default configuration of every endpoint (a 64 KiB ring, no
+/// tap, §15.32) counted producer→hub feed loss into a value no operator could read —
+/// §5 requires loss to be *visible*, not merely tallied. The counter itself only moves
+/// under a firehose that outruns the hub, so what is guarded here is its **reachability
+/// and liveness**: it is present per endpoint with no tap attached, and the same object
+/// tracks the endpoint's open-tap count.
+///
+/// A tap hub exists for every host-facing endpoint from load, even while the serial node
+/// is `waiting` with an absent device (§15.8), so this needs no serial device and runs
+/// on every platform.
+#[test]
+fn endpoint_feed_dropped_is_readable_with_no_tap_open() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+
+    // Two host-facing endpoints: usb0 keeps the default 64 KiB ring, usb1 opts out.
+    // Both are hubs, and both must report their feed-loss counter.
+    let cfg = format!(
+        r#"
+[[node]]
+type = "serial"
+name = "usb0"
+device = "{dev0}"
+[[node]]
+type = "serial"
+name = "usb1"
+device = "{dev1}"
+replay_ring = 0
+"#,
+        dev0 = d.run().join("absent-usb0").display(),
+        dev1 = d.run().join("absent-usb1").display(),
+    );
+    rpc.load_toml(&cfg, false)
+        .expect("load two-endpoint config");
+
+    let st = rpc.state();
+    assert_eq!(st["taps"], json!([]), "no tap is open: {st}");
+    assert_eq!(
+        st["endpoints"],
+        json!([
+            { "endpoint": "usb0", "feed_dropped": 0, "taps": 0 },
+            { "endpoint": "usb1", "feed_dropped": 0, "taps": 0 },
+        ]),
+        "state must report each host endpoint's feed-loss counter with no tap open \
+         (DM-5), sorted so two reads agree: {st}"
+    );
+
+    // The view is live, not a constant: an open tap shows up on its endpoint's entry,
+    // and the per-tap object mirrors the same endpoint counter.
+    let tap = rpc.stream("tap.open", json!({ "endpoint": "usb0" }));
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            rpc.state()["endpoints"][0]["taps"] == json!(1)
+        }),
+        "the tap did not appear on its endpoint's entry: {}",
+        rpc.state()["endpoints"]
+    );
+    let st = rpc.state();
+    assert_eq!(
+        st["taps"][0]["feed_dropped"], st["endpoints"][0]["feed_dropped"],
+        "the per-tap mirror disagrees with the endpoint counter: {st}"
+    );
+
+    // …and it goes back down when the tap's connection drops.
+    drop(tap);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            rpc.state()["endpoints"][0]["taps"] == json!(0)
+        }),
+        "the detached tap is still counted on its endpoint: {}",
+        rpc.state()["endpoints"]
+    );
 }

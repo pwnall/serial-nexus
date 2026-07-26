@@ -172,12 +172,28 @@ async fn serve(options: RunOptions, registry: Registry) -> anyhow::Result<()> {
     // is the source of truth (it captured incremental surgery a `--config` file
     // never saw); otherwise fall back to the CLI `--config`. Restart, replug, and
     // first boot become one code path.
+    //
+    // **The two sources fail differently, on purpose** (RV-10). A `--config` file is
+    // one the operator *named* on the command line, so a bad one is fail-fast: they
+    // are standing there and will fix it. The state file is daemon-owned and nobody
+    // asked for it — a version-skewed or hand-edited one that refuses to parse would
+    // otherwise leave the operator with no daemon and no consoles for a file they
+    // never chose to load. §15.8's spirit is that trouble faults a node rather than
+    // removing the graph; here it is louder still (nothing loads), but it must not
+    // cost the daemon its life. So: log at `error` with the path and the parse error,
+    // note that the file is preserved untouched for inspection, and come up with an
+    // empty graph the operator can `load` into.
     if state_file.exists() {
-        startup_load(&daemon, &state_file)
-            .await
-            .with_context(|| format!("loading state file {}", state_file.display()))?;
+        if let Err(e) = startup_load(&daemon, &state_file, StartupSource::StateFile).await {
+            tracing::error!(
+                path = %state_file.display(),
+                "state file could not be loaded ({e:#}); starting with an EMPTY graph. \
+                 The file is preserved untouched — inspect or remove it, then `load` \
+                 your configuration."
+            );
+        }
     } else if let Some(config_path) = &options.config {
-        startup_load(&daemon, config_path)
+        startup_load(&daemon, config_path, StartupSource::Config)
             .await
             .with_context(|| format!("loading {}", config_path.display()))?;
     }
@@ -278,9 +294,36 @@ async fn prepare_socket(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn startup_load(daemon: &Daemon, config_path: &Path) -> anyhow::Result<()> {
+/// Which file a startup load came from — the two differ in exactly two rules
+/// (see [`startup_load`] and the `serve` call site).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupSource {
+    /// The operator's `--config` file.
+    Config,
+    /// The daemon-owned `<socket>.state.toml` snapshot (§11/§15.9).
+    StateFile,
+}
+
+async fn startup_load(
+    daemon: &Daemon,
+    config_path: &Path,
+    source: StartupSource,
+) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(config_path)?;
     let config: GraphConfig = toml::from_str(&text).context("parsing TOML configuration")?;
+    // An operator file that parses to *nothing* while its source text says otherwise
+    // is a typo, not an intent (CP-2/CFG-3): a mis-typed table name (`[[nodez]]`)
+    // yields an empty graph that loads with `{"loaded": 0}` and exit 0, and with
+    // `--replace` that is an unannounced `teardown` reported as success — the one
+    // input that breaks §15.8's operators-own-the-graph guarantee. Name the real
+    // mistake instead.
+    //
+    // **Never for the state file.** `teardown` persists an empty graph deliberately
+    // (§11), and an empty graph is a legal graph; the check exists only where a
+    // human wrote the file and a non-empty source proves they meant something.
+    if source == StartupSource::Config && config.is_empty() && !text.trim().is_empty() {
+        anyhow::bail!("{}", nexus_core::graph::ValidationError::EmptyConfig);
+    }
     let params = json!({ "config": serde_json::to_value(&config)? });
     daemon
         .dispatch("load", Some(params))
@@ -299,5 +342,69 @@ mod tests {
         // An embedder writing `RunOptions::default()` must get a resolver rooted at
         // `/`, not one silently rooted at the daemon's CWD (CTRL-2 / §12).
         assert_eq!(RunOptions::default().dev_root, PathBuf::from("/"));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("snx-startup-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join(name)
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, f)
+    }
+
+    // CP-2/CFG-3 (the second half): a file with content that nonetheless parses to
+    // an *empty* graph — everything commented out, or (before `deny_unknown_fields`
+    // caught it at the parser) a typo'd table name. From an operator's `--config`
+    // file that must be an error naming the mistake: with `--replace` the same input
+    // is an unannounced `teardown` reported as success (§11, §15.8).
+    #[test]
+    fn a_config_file_that_parses_to_nothing_is_refused() {
+        let path = scratch("typo.toml");
+        std::fs::write(
+            &path,
+            "# [[node]]\n# type = \"log\"\n# name = \"x\"\n# path = \"/tmp/x.log\"\n",
+        )
+        .unwrap();
+        let daemon = Daemon::default();
+        let err = block_on(startup_load(&daemon, &path, StartupSource::Config))
+            .expect_err("an empty parse of a non-empty operator file must be refused");
+        assert!(
+            format!("{err:#}").contains("declares no nodes and no edges"),
+            "the error must name the real mistake, got: {err:#}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // …and the same emptiness from the *state file* is legal: `teardown` persists an
+    // empty graph on purpose (§11), so the rule must not be applied there.
+    #[test]
+    fn an_empty_state_file_load_is_legal() {
+        let path = scratch("state.toml");
+        std::fs::write(&path, "# torn down\n").unwrap();
+        let daemon = Daemon::default();
+        block_on(startup_load(&daemon, &path, StartupSource::StateFile))
+            .expect("an empty state file is a legal empty graph");
+        std::fs::remove_file(&path).ok();
+    }
+
+    // A comment-only `--config` file is the same shape as the typo and gets the same
+    // answer; a genuinely empty file is not a mistake anyone can name, so it loads.
+    #[test]
+    fn a_wholly_empty_config_file_still_loads() {
+        let path = scratch("empty.toml");
+        std::fs::write(&path, "   \n\n").unwrap();
+        let daemon = Daemon::default();
+        block_on(startup_load(&daemon, &path, StartupSource::Config))
+            .expect("an empty file declares nothing and means nothing");
+        std::fs::remove_file(&path).ok();
     }
 }

@@ -179,16 +179,90 @@ impl BlockingReader {
         self.lost.clone()
     }
 
-    /// Signal the current reader to stop and join it (fd-reuse-safe). On the loss
-    /// path the thread has already exited, so this returns at once; on teardown of a
-    /// live device it costs at most one reader poll interval.
-    pub fn stop_join(&mut self) {
+    /// Ask the current reader to stop, and return immediately — the cheap,
+    /// non-blocking half of teardown (BND-1).
+    ///
+    /// Teardown used to be `stop_join` per node inside one critical section on the
+    /// single runtime thread, so `load --replace` and shutdown stalled the whole
+    /// daemon for the *sum* of every node's stop latency (each bounded by one poll
+    /// interval, but paid serially). Splitting the signal from the join lets the
+    /// caller signal *all* nodes first and then join them, paying the latency once
+    /// rather than N times. Nothing is joined here, so the fd this reader is
+    /// reading must stay alive until [`Self::join`] has run (§7.1 fd-reuse).
+    pub fn signal_stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Join the current reader thread, if any — the blocking half of teardown. Must
+    /// run before the fd the reader holds is dropped (fd-reuse-safe). On the loss
+    /// path the thread has already exited, so this returns at once; otherwise it
+    /// costs at most one reader poll interval *after* [`Self::signal_stop`].
+    pub fn join(&mut self) {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
+
+    /// Signal the current reader to stop and join it (fd-reuse-safe) — the thin
+    /// composition of [`Self::signal_stop`] and [`Self::join`], for a caller that is
+    /// tearing down exactly one reader and has nothing to overlap the wait with.
+    pub fn stop_join(&mut self) {
+        self.signal_stop();
+        self.join();
+    }
 }
+
+/// Drain `rx` to quiescence, returning the bytes purged (§6 purge invariant).
+///
+/// The bounded-rounds drain the serial node's purge-on-reconnect (§7.1) and the
+/// leg's (§7.4) both need: a plain synchronous `try_recv` loop frees channel
+/// permits but never yields, so an origin *suspended inside* `tx.send(chunk).await`
+/// — backpressured behind the full channel, holding one already-read outage-era
+/// chunk (§5) — resolves only on the caller's next await, after the node has gone
+/// active, and fires its stale chunk into the just-reopened (likely power-cycled)
+/// device. So: drain the channel, `yield_now` to let every freed-permit sender
+/// resolve, and drain again — a *bounded* few rounds, enough to flush the finite
+/// in-flight chunks (one per suspended sender) without unboundedly draining a
+/// continuously-producing origin, whose genuinely-post-reconnect bytes are kept.
+///
+/// Termination is by *whether a chunk was drained*, never a byte-count delta: a
+/// round that drains only zero-length chunks still made progress and must yield, or
+/// a backpressured non-empty chunk queued behind those empties would be stranded.
+/// The caller runs this while its boundary is quiescent (no reader/writer armed), so
+/// nothing reaches the device during the drain.
+pub async fn drain_to_quiescence(rx: &mut tokio::sync::mpsc::Receiver<nexus_core::Chunk>) -> u64 {
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    let mut purged = 0u64;
+    for _ in 0..DRAIN_ROUNDS {
+        let mut drained_any = false;
+        loop {
+            match rx.try_recv() {
+                Ok(chunk) => {
+                    purged += chunk.len() as u64;
+                    drained_any = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                // The senders are gone; the caller will observe close next.
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        // Nothing drained this pass: no origin was blocked behind the channel, so
+        // the pipeline is quiescent.
+        if !drained_any {
+            break;
+        }
+        // Let any origin blocked in `tx.send().await` behind the (now-drained) full
+        // channel resolve its in-flight chunk so the next pass drains it.
+        tokio::task::yield_now().await;
+    }
+    purged
+}
+
+/// How many drain+yield rounds [`drain_to_quiescence`] runs at most. Bounded so a
+/// continuously-producing origin cannot hold the purge open indefinitely; three is
+/// ample for the finite in-flight set (one chunk per suspended sender).
+const DRAIN_ROUNDS: usize = 3;
 
 #[cfg(test)]
 mod tests {
@@ -295,6 +369,134 @@ mod tests {
         })
         .expect("arm reader");
         r.stop_join(); // sets the flag, the thread exits, join succeeds
+    }
+
+    #[tokio::test]
+    async fn signal_stop_returns_before_the_thread_exits_and_join_waits_for_it() {
+        // BND-1: the two halves must be separable — `signal_stop` returns while the
+        // thread is still winding down (so a caller can signal N nodes and pay the
+        // latency once), and `join` is what actually waits.
+        let mut r = BlockingReader::default();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_thread = exited.clone();
+        r.arm("test-split".into(), move |stop, _lost| {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(30));
+            exited_thread.store(true, Ordering::Relaxed);
+        })
+        .expect("arm reader");
+        r.signal_stop();
+        assert!(
+            !exited.load(Ordering::Relaxed),
+            "signal_stop must not wait for the thread"
+        );
+        r.join();
+        assert!(exited.load(Ordering::Relaxed), "join must wait for it");
+        r.join(); // idempotent: the handle was already taken
+    }
+
+    // --- purge drain-to-quiescence ----------------------------------------------
+
+    /// XC-PURGE-1 (ported from `nodes/serial.rs` when the loop became this shared
+    /// helper): the drain must also collect a chunk an origin is blocked mid-`send`
+    /// behind the full channel — otherwise it fires into the reopened device on the
+    /// first post-reconnect `recv`. The count must stay exact.
+    #[test]
+    fn drain_to_quiescence_drains_a_backpressured_in_flight_chunk() {
+        // A current-thread runtime + LocalSet mirrors the daemon (single-threaded,
+        // cooperative): a producer blocked in `send().await` resolves only when the
+        // drain yields, which is exactly what the helper must do.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            // A capacity-2 channel, filled so a third send backpressures.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<nexus_core::Chunk>(2);
+            tx.send(nexus_core::Chunk::copy_from_slice(b"AAA"))
+                .await
+                .unwrap(); // 3 bytes
+            tx.send(nexus_core::Chunk::copy_from_slice(b"BBBB"))
+                .await
+                .unwrap(); // 4 bytes
+            // A backpressured origin: suspended inside `send().await` holding one
+            // already-read, outage-era chunk (§5). Keep `tx` alive so the channel
+            // stays connected, as real origins persist across a reopen.
+            let tx2 = tx.clone();
+            let producer = tokio::task::spawn_local(async move {
+                tx2.send(nexus_core::Chunk::copy_from_slice(b"CCCCC"))
+                    .await
+                    .unwrap(); // 5 bytes
+            });
+            tokio::task::yield_now().await; // let the producer reach its blocked send
+            assert!(!producer.is_finished(), "producer must be blocked in send");
+
+            let purged = drain_to_quiescence(&mut rx).await;
+
+            // The blocked send resolved and was drained+counted — not left to fire
+            // into the reopened device — and the count is exact.
+            assert!(producer.is_finished(), "blocked send must have resolved");
+            assert_eq!(purged, 3 + 4 + 5);
+            // Nothing outage-era remains for the writer to send.
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            drop(tx);
+        });
+    }
+
+    /// XC-PURGE-1 (empty-chunk guard, ported alongside the above): the loop must
+    /// terminate on whether a chunk was *drained*, not on a byte-count delta —
+    /// otherwise a round that drains only zero-length chunks reads as "no progress",
+    /// breaks without yielding, and strands a backpressured non-empty chunk queued
+    /// behind the empties (which then fires into the reopened device).
+    #[test]
+    fn drain_to_quiescence_drains_past_empty_chunks() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<nexus_core::Chunk>(2);
+            tx.send(nexus_core::Chunk::new()).await.unwrap(); // 0 bytes
+            tx.send(nexus_core::Chunk::new()).await.unwrap(); // 0 bytes — now full
+            let tx2 = tx.clone();
+            let producer = tokio::task::spawn_local(async move {
+                tx2.send(nexus_core::Chunk::copy_from_slice(b"CCCCC"))
+                    .await
+                    .unwrap(); // 5 bytes
+            });
+            tokio::task::yield_now().await;
+            assert!(!producer.is_finished(), "producer must be blocked in send");
+
+            let purged = drain_to_quiescence(&mut rx).await;
+
+            // The non-empty chunk behind the two empties resolved and was drained —
+            // not stranded to fire into the reopened device — and only its 5 bytes
+            // count (the empties contribute 0).
+            assert!(
+                producer.is_finished(),
+                "the send behind the empty chunks must have resolved"
+            );
+            assert_eq!(purged, 5);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            drop(tx);
+        });
+    }
+
+    #[tokio::test]
+    async fn drain_to_quiescence_on_an_empty_channel_purges_nothing() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<nexus_core::Chunk>(4);
+        assert_eq!(drain_to_quiescence(&mut rx).await, 0);
+        drop(tx);
+        // A disconnected channel is quiescent too, not an error.
+        assert_eq!(drain_to_quiescence(&mut rx).await, 0);
     }
 
     #[cfg(debug_assertions)]

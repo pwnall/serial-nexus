@@ -278,9 +278,20 @@ pub fn try_decode(buf: &[u8]) -> Result<Option<(Event, usize)>, EnvelopeError> {
 /// A streaming envelope decoder: accumulates bytes and yields whole [`Event`]s,
 /// holding at most one partial frame (bounded by [`MAX_FRAME_SIZE`]) — the §5
 /// interior contract for a codec's parser state.
+///
+/// Consumed frames are retired by advancing a read cursor, not by draining the
+/// front of the buffer: a single read batch carrying N small frames used to cost
+/// N memmoves of the whole remaining buffer, making decode O(frames × buffer) on
+/// a small-frame stream (review 26, CODECAPI-1/3). Compaction happens once per
+/// [`push`](Self::push) — one memmove per read batch — and the buffer is cleared
+/// outright whenever it drains empty, which is the common case. The decoded bytes
+/// are byte-for-byte unchanged: the golden vectors (§15.15) see the same decoder.
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
     buf: Vec<u8>,
+    /// Read cursor: `buf[..start]` is already decoded and dead, kept only until
+    /// the next compaction. Live bytes are `buf[start..]`.
+    start: usize,
 }
 
 impl FrameDecoder {
@@ -290,23 +301,47 @@ impl FrameDecoder {
 
     /// Append received bytes.
     pub fn push(&mut self, bytes: &[u8]) {
+        // Compact once per read batch (see the type comment): the dead prefix goes
+        // now, so the buffer never accumulates more than one batch of retired bytes
+        // and `buffered()` stays the honest bounded parser state.
+        self.compact();
         self.buf.extend_from_slice(bytes);
     }
 
     /// Decode the next available event, or `None` if more bytes are needed.
     pub fn next_event(&mut self) -> Result<Option<Event>, EnvelopeError> {
-        match try_decode(&self.buf)? {
+        match try_decode(&self.buf[self.start..])? {
             Some((event, consumed)) => {
-                self.buf.drain(..consumed);
+                self.start += consumed;
+                // Fully drained (the steady state between batches): drop the dead
+                // prefix immediately so an idle decoder holds no memory at all.
+                if self.start == self.buf.len() {
+                    self.buf.clear();
+                    self.start = 0;
+                }
                 Ok(Some(event))
             }
             None => Ok(None),
         }
     }
 
-    /// Bytes currently buffered (the bounded partial-frame state).
+    /// Bytes currently buffered (the bounded partial-frame state) — the *live*
+    /// bytes only; a retired prefix awaiting compaction is not parser state.
     pub fn buffered(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.start
+    }
+
+    /// Drop the retired prefix, restoring `start == 0`.
+    fn compact(&mut self) {
+        if self.start == 0 {
+            return;
+        }
+        if self.start == self.buf.len() {
+            self.buf.clear();
+        } else {
+            self.buf.drain(..self.start);
+        }
+        self.start = 0;
     }
 }
 
@@ -673,6 +708,95 @@ mod tests {
         assert_eq!(events[1], Event::data("a", Bytes::from_static(b"12345")));
         assert_eq!(events[2], Event::close("a"));
         assert_eq!(dec.buffered(), 0);
+    }
+
+    /// A batch of many small frames decodes identically whether it arrives whole
+    /// or byte-by-byte, and `buffered()` reports only the *live* bytes as the
+    /// cursor advances (review 26, CODECAPI-1/3 — the front-drain became a cursor,
+    /// and the observable behavior must not have moved).
+    #[test]
+    fn batched_small_frames_decode_identically_and_report_live_bytes() {
+        let events: Vec<Event> = (0..64)
+            .map(|i| Event::data("c", Bytes::from(format!("f{i}").into_bytes())))
+            .collect();
+        let mut wire = Vec::new();
+        for ev in &events {
+            encode(ev, &mut wire).unwrap();
+        }
+
+        // One batch: every frame comes out in order, and the live-byte count falls
+        // monotonically to zero even though the buffer is compacted only on push.
+        let mut dec = FrameDecoder::new();
+        dec.push(&wire);
+        assert_eq!(dec.buffered(), wire.len());
+        let mut got = Vec::new();
+        let mut last = dec.buffered();
+        while let Some(ev) = dec.next_event().unwrap() {
+            assert!(dec.buffered() < last, "live byte count must fall per frame");
+            last = dec.buffered();
+            got.push(ev);
+        }
+        assert_eq!(got, events);
+        assert_eq!(dec.buffered(), 0);
+
+        // Byte-at-a-time: the partial-frame state stays bounded by one frame, and
+        // the decoded stream is the same.
+        let mut dec = FrameDecoder::new();
+        let mut drip = Vec::new();
+        for b in &wire {
+            dec.push(std::slice::from_ref(b));
+            while let Some(ev) = dec.next_event().unwrap() {
+                drip.push(ev);
+            }
+            assert!(dec.buffered() <= MAX_FRAME_SIZE + 4);
+        }
+        assert_eq!(drip, events);
+        assert_eq!(dec.buffered(), 0);
+    }
+
+    /// A push arriving on a partially-consumed buffer compacts first, so the dead
+    /// prefix never accumulates across batches and the *next* frame still decodes
+    /// from the right offset (the cursor bug this shape could have introduced).
+    #[test]
+    fn push_after_partial_consumption_compacts_without_losing_bytes() {
+        let mut wire = Vec::new();
+        encode(&Event::open("a"), &mut wire).unwrap();
+        encode(&Event::data("a", Bytes::from_static(b"tail")), &mut wire).unwrap();
+
+        let mut dec = FrameDecoder::new();
+        dec.push(&wire);
+        assert_eq!(dec.next_event().unwrap(), Some(Event::open("a")));
+        let live = dec.buffered();
+        assert!(live > 0, "the second frame is still buffered");
+
+        // A new batch lands on top of a retired prefix: compaction must move the
+        // live bytes, not drop or duplicate them.
+        let mut more = Vec::new();
+        encode(&Event::close("a"), &mut more).unwrap();
+        dec.push(&more);
+        assert_eq!(dec.buffered(), live + more.len());
+        assert_eq!(
+            dec.next_event().unwrap(),
+            Some(Event::data("a", Bytes::from_static(b"tail")))
+        );
+        assert_eq!(dec.next_event().unwrap(), Some(Event::close("a")));
+        assert_eq!(dec.next_event().unwrap(), None);
+        assert_eq!(dec.buffered(), 0);
+    }
+
+    /// A malformed frame is still refused from the *cursor*, not from the front of
+    /// the raw buffer — a decode error after a good frame must name the malformed
+    /// frame's fault (§9 clause 6), not re-parse retired bytes.
+    #[test]
+    fn decode_error_after_a_good_frame_is_reported_from_the_cursor() {
+        let mut wire = Vec::new();
+        encode(&Event::open("a"), &mut wire).unwrap();
+        wire.extend_from_slice(&frame_body(&[9, 0, 1, b'x'])); // unknown type byte
+
+        let mut dec = FrameDecoder::new();
+        dec.push(&wire);
+        assert_eq!(dec.next_event().unwrap(), Some(Event::open("a")));
+        assert_eq!(dec.next_event(), Err(EnvelopeError::UnknownType(9)));
     }
 
     // ---- wire hello (§9) ----

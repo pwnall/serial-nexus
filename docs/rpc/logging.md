@@ -9,9 +9,24 @@ Method on this page: [`rotate`](#rotate).
 
 ## `rotate`
 
-Rotate a log node's file on demand (§7.3). The rotation is requested on the
-node's writer thread and flushed within the bounded wait; the returned index
-identifies the new generation — **higher is newer**.
+Rotate a log node's file on demand (§7.3). The request is **ordered against the
+node's queue**: a marker is pushed behind every byte already accepted and ahead
+of everything accepted from now on, so the writer renames the current file to
+`<name>.NNN` and reopens fresh at exactly that boundary — which is the operator's
+mental model of `rotate`. The verb returns as soon as the marker is queued, so
+it never blocks the control plane on the disk; the returned index identifies the
+new generation — **higher is newer**, and the first rotation is `0`
+(`<name>.000` with the default 3-digit `rotation_padding`). Rapid successive
+calls each queue their own marker and each get their own index. The counter is
+observed state, recovered at start by scanning the directory and never
+persisted.
+
+The ordering has a cost worth stating: because the marker sits *behind* the
+accepted backlog, a node with a deep queue rotates only once that backlog has
+been written. An operator rotating **because** the filesystem is struggling
+should expect the rename to lag the acknowledgement by however long the queue
+takes to drain — `state`'s `queued_bytes` for the node is the number to watch,
+and it now includes the batch the writer is holding, not just the pending one.
 
 ### Params
 
@@ -24,7 +39,7 @@ identifies the new generation — **higher is newer**.
 | Field | Type | Description |
 | --- | --- | --- |
 | `node` | string | the node named |
-| `rotated_to` | integer | the new rotation index (monotonic; higher is newer) |
+| `rotated_to` | integer | the new rotation index (monotonic; higher is newer; the first is `0`) |
 
 ### CLI
 
@@ -41,9 +56,17 @@ $ serialnexusctl rotate applog
 
 ```console
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"rotate","params":{"node":"applog"}}' \
-    | nc -U "$SOCK" | jq .result
+    | nc -N -U "$SOCK" | jq .result
 {
   "node": "applog",
-  "rotated_to": 1
+  "rotated_to": 0
 }
 ```
+
+The rotated-out file is the node's `filename` with `.000` appended; the node keeps
+writing to `filename`. A log node's `state` extras report the current file, the
+last completed rotation
+index, and the queue's `queued_bytes`/`dropped_bytes` plus
+`write_errors`/`last_write_error` — the pair that separates a slow consumer from
+a filesystem refusing every write (see
+[observation.md](observation.md#loss-counters-in-the-node-type-extras)).

@@ -95,7 +95,7 @@ nexus_daemon::run(options, registry)
 ```
 
 Everything else in the ecosystem — `serialnexusctl`, `nexus-sim`, `nexus-doctor`,
-the validation scripts — works against your custom binary **unchanged**, because
+the `nexus-itest` harness — works against your custom binary **unchanged**, because
 they speak the RPC surface and the envelope, never the codec list (§15.16); the
 daemon advertises your codec through the [`info`](rpc/observation.md#info) verb,
 and an unknown codec in configuration fails structurally with the available list in
@@ -154,7 +154,11 @@ Payload rules by type:
 - `open` / `close` — the payload is **empty**.
 
 Channel identities are UTF-8 and never contain `/` (§15.12), which keeps the
-`node/channel` display form unambiguous.
+`node/channel` display form unambiguous. Configuration validation also refuses an
+identity that is whitespace-only or longer than 256 bytes. The length cap is not
+cosmetic and is worth knowing when you name channels programmatically: the identity
+rides in **every frame's header**, so an oversize one leaves no room for payload and
+the daemon's targetward framer can no longer fit a single byte.
 
 ### The decode contract
 
@@ -371,7 +375,8 @@ path = "/run/serial_nexus/trace"
 
 # The multiplexed side (the codec's default endpoint, addressed by node name)
 # joins the serial's host-facing endpoint, and holds its write lock (§6): any
-# other writer would corrupt the mux framing.
+# other writer would corrupt the mux framing. `write_mode` is REQUIRED here — see
+# below.
 [[edge]]
 a = "modem"
 b = "mux"
@@ -388,6 +393,16 @@ a = "mux/trace"
 b = "trace-pty"
 write_mode = "never"          # a read-only spy channel
 ```
+
+**The `write_mode` on the multiplexed edge is not optional.** An edge into a codec's
+multiplexed endpoint must say `held` (the working mode: the demux owns the device's
+writes) or `never` (a deliberately read-only demux); anything else — including the
+generic `on-demand` you get by *omitting* the key — is refused at load, naming the
+edge. The constraint is structural because the alternative was silent: the
+multiplexed side's targetward pump is a held-origin pump, so an `on-demand` origin
+parks on its first chunk forever while `send` cheerfully answers
+`{"delivered": true}` — bytes accepted, acknowledged, and lost, which §5 forbids
+outright. If you are copying the block above, copy the `write_mode` with it.
 
 Load it with the daemon's `--config` at startup, or `serialnexusctl load`. Watch
 it with `serialnexusctl state` (or `--json` for the codec's per-channel

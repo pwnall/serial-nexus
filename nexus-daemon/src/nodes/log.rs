@@ -8,25 +8,36 @@
 //! node's hostward channel into the shared queue (applying the overflow policy);
 //! the writer thread drains the queue and does the blocking `write(2)`s. Loss is
 //! always counted — `dropped_bytes` — so a slow disk is visible, never silent.
+//! A refusing filesystem is counted *separately* (`write_errors`), because loss
+//! alone cannot tell a slow consumer from a disk that rejects every write.
 //!
 //! Rotation is on demand (`rotate <node>`, §7.3): the writer renames the current
 //! file to `<name>.NNN` (higher is newer, no shifting cascade) and reopens fresh
-//! at a byte boundary. The counter is *state*, recovered at start by scanning the
-//! directory and never persisted. Removal and clean shutdown flush the queue
-//! within a bounded wait before closing.
+//! at a byte boundary. It is ordered against the queue — `rotate` pushes a marker
+//! *item*, so everything accepted before the request lands in the old file and
+//! everything after in the new one. The counter is *state*, recovered at start by
+//! scanning the directory and never persisted.
+//!
+//! Removal and clean shutdown flush the queue within a bounded wait before
+//! closing, in **two phases**: [`LogNode::signal_stop`] is the cheap non-blocking
+//! half (stop ingest, tell the writer to close) and [`LogNode::teardown`] is the
+//! bounded collector. §7.3 mandates the bound; it does not sanction paying it
+//! serially on the runtime thread, so a caller signals every node first and only
+//! then collects — N wedged log directories then cost one `FLUSH_WAIT`, not N.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver as StdReceiver, RecvTimeoutError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle as ThreadHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nexus_core::Chunk;
-use nexus_core::NodeStatus;
 use nexus_core::config::{NodeConfig, OverflowPolicy};
+use nexus_core::{NodeState, NodeStatus};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -39,8 +50,18 @@ use crate::runtime::DropCounters;
 const QUEUE_CAP_BYTES: usize = 16 * 1024 * 1024;
 
 /// How long removal/shutdown waits for the writer to flush before detaching it
-/// (§7.3 "within a bounded wait").
+/// (§7.3 "within a bounded wait"). Measured from `signal_stop`, not from the
+/// moment this node's turn comes round — see the module header.
 const FLUSH_WAIT: Duration = Duration::from_secs(2);
+
+/// Creation mode for log files: owner read/write, group read, world nothing.
+/// Console bytes are frequently root shells, so they must not inherit a
+/// permissive umask (0664 was observed). The group bit is what a deployment
+/// widens by placing the directory under a group, mirroring the control
+/// socket's and the PTY slave's 0660 shape (§7.2/§10). `mode` applies only at
+/// creation, which is right here: an operator who has re-chmod'ed an existing
+/// log keeps their choice, and rotation's reopen creates the fresh file.
+const LOG_FILE_MODE: u32 = 0o640;
 
 /// State shared between the pump (async), the writer (thread), and `state`/
 /// `rotate` (control plane). One mutex guards the queue and its bookkeeping; the
@@ -50,18 +71,50 @@ struct Shared {
     cv: Condvar,
 }
 
+/// One entry in the writer's queue. Rotation is an *item* rather than a side
+/// flag so it happens at exactly its point in the byte stream (§7.3 "reopens
+/// fresh at a byte boundary"): bytes accepted after the operator's `rotate` can
+/// no longer land in the pre-rotation file.
+enum QueueItem {
+    Bytes(Chunk),
+    Rotate,
+}
+
+impl QueueItem {
+    fn len(&self) -> usize {
+        match self {
+            QueueItem::Bytes(chunk) => chunk.len(),
+            QueueItem::Rotate => 0,
+        }
+    }
+}
+
 struct Queue {
-    chunks: VecDeque<Chunk>,
+    items: VecDeque<QueueItem>,
     queued_bytes: usize,
+    /// Bytes drained into the writer's current batch but not yet written. The
+    /// batch vector holds them until it is dropped, so they are still resident
+    /// memory and `state` must keep counting them — zeroing `queued_bytes` at
+    /// drain understated the real in-flight depth.
+    draining_bytes: usize,
     dropped_bytes: u64,
+    /// Failed `write(2)`s the drop-oldest policy absorbed, and the most recent
+    /// one's message. §5 sanctions drop-oldest-with-counters for exactly the
+    /// full-disk case, so the node stays `active` — but then `dropped_bytes`
+    /// alone cannot tell "the consumer is slow" from "the filesystem is refusing
+    /// every write". These two separate them without changing the policy.
+    write_errors: u64,
+    last_write_error: Option<String>,
     /// Number of rotations requested but not yet performed by the writer. A
-    /// counter (not a flag) so rapid `rotate` calls don't collapse into one.
+    /// counter (not a flag) so rapid `rotate` calls don't collapse into one; it
+    /// mirrors the `QueueItem::Rotate` markers still in `items` and exists so
+    /// `rotate` can predict the number its request will carry.
     rotate_pending: u32,
     /// Highest rotation suffix on disk (`<name>.NNN`); `None` until the first
     /// rotation. Recovered by directory scan at start, never persisted.
     rotation: Option<u64>,
     closed: bool,
-    status: NodeStatus,
+    status: NodeState,
     overflow: OverflowPolicy,
 }
 
@@ -78,6 +131,10 @@ pub struct LogNode {
     /// Signalled by the writer when it exits, so teardown can bound its flush
     /// wait without an unbounded `join()`.
     writer_done: Option<StdReceiver<()>>,
+    /// When `signal_stop` ran. `teardown`'s bounded wait is measured from here,
+    /// so the bound is "how long the writer got after being told to close"
+    /// rather than "how long this node's turn in the teardown loop took".
+    stop_signalled_at: Option<Instant>,
 }
 
 impl LogNode {
@@ -111,13 +168,18 @@ impl LogNode {
 
         let shared = Arc::new(Shared {
             q: Mutex::new(Queue {
-                chunks: VecDeque::new(),
+                items: VecDeque::new(),
                 queued_bytes: 0,
+                draining_bytes: 0,
                 dropped_bytes: 0,
+                write_errors: 0,
+                last_write_error: None,
                 rotate_pending: 0,
                 rotation,
                 closed: false,
-                status: status.clone(),
+                // A freshly built node has no history, so the stamp is now
+                // (§7 "status … with reason and timestamp", §15.8).
+                status: NodeState::new(status),
                 overflow: *overflow,
             }),
             cv: Condvar::new(),
@@ -132,6 +194,7 @@ impl LogNode {
             pump: None,
             writer: None,
             writer_done: None,
+            stop_signalled_at: None,
         };
 
         // Start the blocking writer thread only if the file opened; a faulted
@@ -174,12 +237,12 @@ impl LogNode {
     }
 
     /// Request an on-demand rotation (§7.3). Non-blocking: it queues the request
-    /// and wakes the writer, which performs it between write batches — so the
-    /// control plane never blocks on a `write(2)`. Returns the number the next
-    /// completed rotation will carry.
+    /// and wakes the writer, which performs it when the queue reaches that point
+    /// — so the control plane never blocks on a `write(2)`. Returns the number
+    /// the next completed rotation will carry.
     pub fn rotate(&self) -> Result<u64, String> {
         let mut q = self.shared.q.lock().unwrap();
-        if let NodeStatus::Faulted { reason } = &q.status {
+        if let NodeStatus::Faulted { reason } = q.status.status() {
             return Err(format!("log node faulted: {reason}"));
         }
         let next = q
@@ -187,11 +250,15 @@ impl LogNode {
             .map_or(0, |n| n.saturating_add(1))
             .saturating_add(u64::from(q.rotate_pending));
         q.rotate_pending += 1;
+        // Ordered against the queue: the marker takes its place *behind* the
+        // bytes already accepted and *ahead* of everything accepted from now on,
+        // which is the operator's mental model of `rotate` (§7.3).
+        q.items.push_back(QueueItem::Rotate);
         self.shared.cv.notify_all();
         Ok(next)
     }
 
-    pub fn status(&self) -> NodeStatus {
+    pub fn status(&self) -> NodeState {
         self.shared.q.lock().unwrap().status.clone()
     }
 
@@ -200,28 +267,64 @@ impl LogNode {
         json!({
             "current_file": self.directory.join(&self.filename).display().to_string(),
             "rotation": q.rotation,
-            "queued_bytes": q.queued_bytes,
+            // Every byte still resident: waiting in the queue plus the batch the
+            // writer is holding while it writes (§7.3 "queued bytes").
+            "queued_bytes": q.queued_bytes + q.draining_bytes,
             // All hostward loss for this node: queue overflow plus any ingest
             // drops the serial reader counted against a full channel (§5).
             "dropped_bytes": q.dropped_bytes + self.ingest_counters.dropped_full(),
+            // Write refusals absorbed by the drop-oldest policy — the part of
+            // the loss that is the filesystem's doing, not the consumer's (§5).
+            "write_errors": q.write_errors,
+            "last_write_error": q.last_write_error.clone(),
         })
     }
 
-    /// Stop ingest, then flush and close the writer within a bounded wait (§7.3).
-    pub fn teardown(&mut self) {
+    /// Phase one of teardown: stop ingest and tell the writer to close, without
+    /// waiting for it. Cheap and non-blocking, so a caller tearing down several
+    /// nodes can signal them all before paying anybody's flush bound — §7.3
+    /// bounds the flush, it does not sanction paying that bound serially on the
+    /// thread that carries the data plane.
+    ///
+    /// Idempotent: a second call is a no-op and, in particular, does not restart
+    /// the flush deadline.
+    pub fn signal_stop(&mut self) {
         // Stop new bytes first so the writer drains a fixed backlog.
         if let Some(p) = self.pump.take() {
             p.abort();
         }
-        {
-            let mut q = self.shared.q.lock().unwrap();
-            q.closed = true;
-            self.shared.cv.notify_all();
+        if self.stop_signalled_at.is_some() {
+            return;
         }
+        self.stop_signalled_at = Some(Instant::now());
+        let mut q = self.shared.q.lock().unwrap();
+        q.closed = true;
+        self.shared.cv.notify_all();
+    }
+
+    /// Phase two: flush and close the writer within the bounded wait (§7.3).
+    /// Safe to call directly — it runs `signal_stop` first — but a multi-node
+    /// teardown should signal everyone first, because the bound runs from the
+    /// signal: N wedged log directories then cost one `FLUSH_WAIT` in total
+    /// instead of one each.
+    pub fn teardown(&mut self) {
+        self.signal_stop();
+        let remaining = self
+            .stop_signalled_at
+            .map_or(FLUSH_WAIT, |t| FLUSH_WAIT.saturating_sub(t.elapsed()));
+        // Measuring the budget from the *signal* rather than from here is what makes
+        // the total bound one `FLUSH_WAIT` instead of N (LOG-1), and it does not
+        // shorten anyone's flush: the writer is its own thread, so the time spent
+        // joining the nodes ahead of this one is time this writer spent draining.
+        // `remaining == 0` therefore means "this writer has already had the full
+        // bounded wait and is still going", which is precisely the wedged case §7.3
+        // says to detach — and `recv_timeout(ZERO)` still reports a writer that
+        // finished in the meantime, so a healthy node is joined, never abandoned.
+        //
         // Bounded flush wait: if the writer is wedged on a stuck disk we detach
         // it rather than block teardown indefinitely (§7.3).
         if let Some(done) = self.writer_done.take() {
-            match done.recv_timeout(FLUSH_WAIT) {
+            match done.recv_timeout(remaining) {
                 Ok(()) | Err(RecvTimeoutError::Disconnected) => {
                     if let Some(w) = self.writer.take() {
                         let _ = w.join();
@@ -248,133 +351,216 @@ impl Drop for LogNode {
 /// applying the overflow policy on a full queue (§7.3).
 async fn pump(shared: Arc<Shared>, mut rx: mpsc::Receiver<Chunk>) {
     while let Some(chunk) = rx.recv().await {
-        let len = chunk.len();
         let mut q = shared.q.lock().unwrap();
-        if q.queued_bytes + len > QUEUE_CAP_BYTES {
-            match q.overflow {
-                OverflowPolicy::DropOldest => {
-                    // Evict oldest until the new chunk fits (or the queue empties).
-                    while q.queued_bytes + len > QUEUE_CAP_BYTES {
-                        let Some(old) = q.chunks.pop_front() else {
-                            break;
-                        };
-                        q.queued_bytes -= old.len();
-                        q.dropped_bytes += old.len() as u64;
-                    }
-                }
-                OverflowPolicy::Fault => {
-                    q.dropped_bytes += len as u64;
-                    if q.status.is_active() {
-                        q.status = NodeStatus::Faulted {
-                            reason: "log queue overflow".to_owned(),
-                        };
-                    }
-                    continue; // do not enqueue past the bound
-                }
-            }
+        if enqueue(&mut q, chunk) {
+            shared.cv.notify_all();
         }
-        q.queued_bytes += len;
-        q.chunks.push_back(chunk);
-        shared.cv.notify_all();
     }
 }
 
-/// The blocking writer thread: drain the queue, `write(2)` each chunk, honor
-/// rotation requests between batches, and flush on close (§7.3).
+/// The pump's enqueue step: apply the overflow policy, then queue the chunk.
+/// Returns whether anything was queued (i.e. whether the writer needs waking).
+/// Factored out of [`pump`] so the policy is exercisable without a runtime.
+fn enqueue(q: &mut Queue, chunk: Chunk) -> bool {
+    let len = chunk.len();
+    if q.queued_bytes + len > QUEUE_CAP_BYTES {
+        match q.overflow {
+            OverflowPolicy::DropOldest => {
+                // Evict the oldest *bytes* until the new chunk fits (or no bytes
+                // remain). Rotation markers are stepped over, never evicted:
+                // dropping one would silently discard the operator's `rotate`
+                // and merge two files (§7.3).
+                while q.queued_bytes + len > QUEUE_CAP_BYTES {
+                    let Some(pos) = q
+                        .items
+                        .iter()
+                        .position(|it| matches!(it, QueueItem::Bytes(_)))
+                    else {
+                        break;
+                    };
+                    let Some(QueueItem::Bytes(old)) = q.items.remove(pos) else {
+                        break;
+                    };
+                    q.queued_bytes -= old.len();
+                    q.dropped_bytes += old.len() as u64;
+                }
+            }
+            OverflowPolicy::Fault => {
+                q.dropped_bytes += len as u64;
+                if q.status.is_active() {
+                    q.status.set(NodeStatus::Faulted {
+                        reason: "log queue overflow".to_owned(),
+                    });
+                }
+                return false; // do not enqueue past the bound
+            }
+        }
+    }
+    q.queued_bytes += len;
+    q.items.push_back(QueueItem::Bytes(chunk));
+    true
+}
+
+/// The blocking writer thread: drain the queue, `write(2)` each chunk, perform
+/// each rotation *at its place in the stream*, and flush on close (§7.3).
 fn writer_loop(shared: &Shared, dir: PathBuf, filename: String, padding: usize, mut file: File) {
     let current = dir.join(&filename);
     loop {
-        let (batch, rotations, closing) = {
+        let (batch, closing) = {
             let mut q = shared.q.lock().unwrap();
-            while q.chunks.is_empty() && !q.closed && q.rotate_pending == 0 {
+            // The previous batch's vector is gone, so its bytes are no longer
+            // resident.
+            q.draining_bytes = 0;
+            while q.items.is_empty() && !q.closed {
                 q = shared.cv.wait(q).unwrap();
             }
-            let batch: Vec<Chunk> = q.chunks.drain(..).collect();
+            let batch: Vec<QueueItem> = q.items.drain(..).collect();
+            // The drained bytes move from "queued" to "being written" — still
+            // held by `batch`, so the reported depth must not drop to zero.
+            q.draining_bytes = q.queued_bytes;
             q.queued_bytes = 0;
-            (batch, q.rotate_pending, q.closed)
+            (batch, q.closed)
         };
 
         // Write the drained batch (blocking). On error, honor the policy: fault
         // the node (and stop), or drop-and-count and keep going.
         let mut ok = true;
-        for (i, chunk) in batch.iter().enumerate() {
-            if let Err(e) = file.write_all(chunk) {
-                let mut q = shared.q.lock().unwrap();
-                match q.overflow {
-                    OverflowPolicy::Fault => {
-                        // The failing chunk and every remaining chunk of the
-                        // drained batch are abandoned; count them so reported
-                        // loss stays exact (§5 "all loss is counted").
-                        for lost in &batch[i..] {
-                            q.dropped_bytes += lost.len() as u64;
+        for (i, item) in batch.iter().enumerate() {
+            match item {
+                QueueItem::Bytes(chunk) => {
+                    if let Err(e) = file.write_all(chunk) {
+                        let mut q = shared.q.lock().unwrap();
+                        match q.overflow {
+                            OverflowPolicy::Fault => {
+                                // The failing chunk and every remaining item of
+                                // the drained batch are abandoned; count them so
+                                // reported loss stays exact (§5 "all loss is
+                                // counted").
+                                count_abandoned(&mut q, &batch[i..]);
+                                q.status.set(NodeStatus::Faulted {
+                                    reason: format!("write {}: {e}", current.display()),
+                                });
+                                shared.cv.notify_all();
+                                return; // stop draining; the pump drops-and-counts
+                            }
+                            OverflowPolicy::DropOldest => {
+                                q.dropped_bytes += chunk.len() as u64;
+                                // The node deliberately stays `active` here (§5
+                                // sanctions drop-oldest-with-counters for the
+                                // full-disk case), so record the refusal
+                                // separately — otherwise a disk that rejects
+                                // every write is indistinguishable from a merely
+                                // slow one. The fault arm above needs no
+                                // equivalent: its reason string says it.
+                                q.write_errors += 1;
+                                q.last_write_error =
+                                    Some(format!("write {}: {e}", current.display()));
+                            }
                         }
-                        q.status = NodeStatus::Faulted {
-                            reason: format!("write {}: {e}", current.display()),
-                        };
-                        shared.cv.notify_all();
-                        return; // stop draining; the pump drops-and-counts
-                    }
-                    OverflowPolicy::DropOldest => {
-                        q.dropped_bytes += chunk.len() as u64;
+                        ok = false;
                     }
                 }
-                ok = false;
+                QueueItem::Rotate => {
+                    match perform_rotation(shared, &dir, &filename, padding, &mut file) {
+                        Ok(f) => {
+                            file = f;
+                            ok = true; // fresh file; nothing is pending on the old one
+                        }
+                        Err(()) => {
+                            // Rotation faulted the node and the writer stops here,
+                            // so the rest of the drained batch is abandoned — count
+                            // it (§5 "all loss is counted").
+                            let mut q = shared.q.lock().unwrap();
+                            count_abandoned(&mut q, &batch[i + 1..]);
+                            shared.cv.notify_all();
+                            return;
+                        }
+                    }
+                }
             }
         }
         if ok {
             let _ = file.flush();
         }
 
-        // Perform any requested rotations (one file per request; higher is
-        // newer). Rotating renames the current file and reopens fresh, so bytes
-        // never cross a rotation boundary mid-chunk (§7.3).
-        for _ in 0..rotations {
-            let _ = file.flush();
-            let next = {
-                let q = shared.q.lock().unwrap();
-                q.rotation.map_or(0, |n| n.saturating_add(1))
-            };
-            let rotated = dir.join(format!("{filename}.{next:0padding$}"));
-            // A failed rename means nothing rotated: no `.NNN` file was created
-            // and the writer would otherwise keep appending to the unrotated
-            // file forever. Fault the node (like a write/reopen failure) rather
-            // than silently no-op the operator's `rotate` (§7.3).
-            if let Err(e) = std::fs::rename(&current, &rotated) {
-                let mut q = shared.q.lock().unwrap();
-                q.status = NodeStatus::Faulted {
-                    reason: format!("rotate {} -> {}: {e}", current.display(), rotated.display()),
-                };
-                q.rotate_pending = q.rotate_pending.saturating_sub(1);
-                shared.cv.notify_all();
-                return;
-            }
-            match open_append(&current) {
-                Ok(f) => file = f,
-                Err(e) => {
-                    let mut q = shared.q.lock().unwrap();
-                    q.status = NodeStatus::Faulted {
-                        reason: format!("reopen after rotate {}: {e}", current.display()),
-                    };
-                    q.rotate_pending = q.rotate_pending.saturating_sub(1);
-                    shared.cv.notify_all();
-                    return;
-                }
-            }
-            let mut q = shared.q.lock().unwrap();
-            q.rotation = Some(next);
-            q.rotate_pending = q.rotate_pending.saturating_sub(1);
-            shared.cv.notify_all();
-        }
-
         if closing {
+            {
+                let mut q = shared.q.lock().unwrap();
+                q.draining_bytes = 0;
+            }
             let _ = file.flush();
             return;
         }
     }
 }
 
+/// Count an abandoned tail of a drained batch as loss and clear the in-flight
+/// depth: the writer is returning, so those bytes are never written and nothing
+/// holds them any more (§5 "all loss is counted").
+fn count_abandoned(q: &mut Queue, rest: &[QueueItem]) {
+    for item in rest {
+        q.dropped_bytes += item.len() as u64;
+    }
+    q.draining_bytes = 0;
+}
+
+/// Perform one queued rotation exactly here in the stream (§7.3): flush, rename
+/// the current file to `<name>.NNN` (higher is newer), reopen fresh. Returns the
+/// reopened file, or `Err` after faulting the node — no bytes cross a rotation
+/// boundary mid-chunk either way.
+fn perform_rotation(
+    shared: &Shared,
+    dir: &Path,
+    filename: &str,
+    padding: usize,
+    file: &mut File,
+) -> Result<File, ()> {
+    let current = dir.join(filename);
+    let _ = file.flush();
+    let next = {
+        let q = shared.q.lock().unwrap();
+        q.rotation.map_or(0, |n| n.saturating_add(1))
+    };
+    let rotated = dir.join(format!("{filename}.{next:0padding$}"));
+    // A failed rename means nothing rotated: no `.NNN` file was created and the
+    // writer would otherwise keep appending to the unrotated file forever. Fault
+    // the node (like a write/reopen failure) rather than silently no-op the
+    // operator's `rotate` (§7.3).
+    if let Err(e) = std::fs::rename(&current, &rotated) {
+        let mut q = shared.q.lock().unwrap();
+        q.status.set(NodeStatus::Faulted {
+            reason: format!("rotate {} -> {}: {e}", current.display(), rotated.display()),
+        });
+        q.rotate_pending = q.rotate_pending.saturating_sub(1);
+        shared.cv.notify_all();
+        return Err(());
+    }
+    match open_append(&current) {
+        Ok(f) => {
+            let mut q = shared.q.lock().unwrap();
+            q.rotation = Some(next);
+            q.rotate_pending = q.rotate_pending.saturating_sub(1);
+            shared.cv.notify_all();
+            Ok(f)
+        }
+        Err(e) => {
+            let mut q = shared.q.lock().unwrap();
+            q.status.set(NodeStatus::Faulted {
+                reason: format!("reopen after rotate {}: {e}", current.display()),
+            });
+            q.rotate_pending = q.rotate_pending.saturating_sub(1);
+            shared.cv.notify_all();
+            Err(())
+        }
+    }
+}
+
 fn open_append(path: &std::path::Path) -> std::io::Result<File> {
-    OpenOptions::new().create(true).append(true).open(path)
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(LOG_FILE_MODE)
+        .open(path)
 }
 
 /// Scan `dir` for `<filename>.NNN` and return the highest N (§7.3 counter
@@ -406,6 +592,7 @@ fn rotation_padding(config: &NodeConfig) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A fresh, unique temp directory per call (tests may run in parallel).
@@ -415,6 +602,40 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("snx-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn log_config(dir: &Path, filename: &str, overflow: OverflowPolicy) -> NodeConfig {
+        NodeConfig::Log {
+            name: "lg".to_owned(),
+            directory: dir.to_string_lossy().into_owned(),
+            filename: filename.to_owned(),
+            overflow,
+            rotation_padding: 3,
+        }
+    }
+
+    /// A queue in the shape the writer expects, closed so `writer_loop` runs to
+    /// completion synchronously.
+    fn test_queue(overflow: OverflowPolicy) -> Queue {
+        Queue {
+            items: VecDeque::new(),
+            queued_bytes: 0,
+            draining_bytes: 0,
+            dropped_bytes: 0,
+            write_errors: 0,
+            last_write_error: None,
+            rotate_pending: 0,
+            rotation: None,
+            closed: true,
+            status: NodeState::new(NodeStatus::Active),
+            overflow,
+        }
+    }
+
+    /// Enqueue through the real pump path, so the queue bookkeeping under test
+    /// is the bookkeeping production uses.
+    fn push_bytes(q: &mut Queue, b: &'static [u8]) {
+        assert!(enqueue(q, Chunk::from_static(b)));
     }
 
     // LOG-6: under overflow=fault a write(2) error abandons the whole drained
@@ -427,26 +648,14 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
         let ro = OpenOptions::new().read(true).open(&path).unwrap();
 
-        let data: [Chunk; 3] = [
-            Chunk::from_static(b"aaaa"),
-            Chunk::from_static(b"bbbbbb"),
-            Chunk::from_static(b"cc"),
-        ];
-        let total: u64 = data.iter().map(|c| c.len() as u64).sum();
-        let queued: usize = data.iter().map(|c| c.len()).sum();
-        let chunks: VecDeque<Chunk> = data.into_iter().collect();
+        let mut queue = test_queue(OverflowPolicy::Fault);
+        push_bytes(&mut queue, b"aaaa");
+        push_bytes(&mut queue, b"bbbbbb");
+        push_bytes(&mut queue, b"cc");
+        let total = queue.queued_bytes as u64;
 
         let shared = Shared {
-            q: Mutex::new(Queue {
-                chunks,
-                queued_bytes: queued,
-                dropped_bytes: 0,
-                rotate_pending: 0,
-                rotation: None,
-                closed: true,
-                status: NodeStatus::Active,
-                overflow: OverflowPolicy::Fault,
-            }),
+            q: Mutex::new(queue),
             cv: Condvar::new(),
         };
 
@@ -460,9 +669,11 @@ mod tests {
             "the abandoned batch must be fully counted"
         );
         assert!(
-            matches!(q.status, NodeStatus::Faulted { .. }),
+            matches!(q.status.status(), NodeStatus::Faulted { .. }),
             "the node must fault"
         );
+        // LOG-4: the batch is gone, so nothing is in flight any more.
+        assert_eq!(q.draining_bytes, 0);
         drop(q);
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -477,17 +688,13 @@ mod tests {
         std::fs::write(&current, b"live").unwrap();
         let file = open_append(&current).unwrap();
 
+        let mut queue = test_queue(OverflowPolicy::DropOldest);
+        queue.rotate_pending = 1;
+        queue.rotation = Some(u64::MAX);
+        queue.items.push_back(QueueItem::Rotate);
+
         let shared = Shared {
-            q: Mutex::new(Queue {
-                chunks: VecDeque::new(),
-                queued_bytes: 0,
-                dropped_bytes: 0,
-                rotate_pending: 1,
-                rotation: Some(u64::MAX),
-                closed: true,
-                status: NodeStatus::Active,
-                overflow: OverflowPolicy::DropOldest,
-            }),
+            q: Mutex::new(queue),
             cv: Condvar::new(),
         };
 
@@ -513,15 +720,253 @@ mod tests {
     fn rotate_rpc_number_saturates_at_u64_max() {
         let tmp = unique_dir("panics-rpc");
         std::fs::write(tmp.join(format!("app.log.{}", u64::MAX)), b"").unwrap();
-        let config = NodeConfig::Log {
-            name: "lg".to_owned(),
-            directory: tmp.to_string_lossy().into_owned(),
-            filename: "app.log".to_owned(),
-            overflow: OverflowPolicy::DropOldest,
-            rotation_padding: 3,
-        };
-        let mut node = LogNode::create(&config);
+        let mut node = LogNode::create(&log_config(&tmp, "app.log", OverflowPolicy::DropOldest));
         assert_eq!(node.rotate().unwrap(), u64::MAX);
+        node.teardown();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // LOG-3: rotation is ordered against the queue. Bytes accepted before the
+    // `rotate` request belong to the old file, bytes accepted after to the new
+    // one (§7.3 "reopens fresh at a byte boundary"). Driven through the writer
+    // synchronously so the split is asserted, not raced.
+    #[test]
+    fn rotation_splits_the_stream_at_the_request_point() {
+        let tmp = unique_dir("log3-writer");
+        let current = tmp.join("app.log");
+        let file = open_append(&current).unwrap();
+
+        let mut queue = test_queue(OverflowPolicy::DropOldest);
+        push_bytes(&mut queue, b"before");
+        queue.rotate_pending = 1;
+        queue.items.push_back(QueueItem::Rotate);
+        push_bytes(&mut queue, b"after");
+
+        let shared = Shared {
+            q: Mutex::new(queue),
+            cv: Condvar::new(),
+        };
+        writer_loop(&shared, tmp.clone(), "app.log".to_owned(), 3, file);
+
+        assert_eq!(std::fs::read(tmp.join("app.log.000")).unwrap(), b"before");
+        assert_eq!(std::fs::read(&current).unwrap(), b"after");
+        assert_eq!(shared.q.lock().unwrap().rotation, Some(0));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // LOG-3, through the operator-facing path: a chunk enqueued *after*
+    // `LogNode::rotate` returns must land in the new file, whatever way the live
+    // writer thread happens to batch the three items.
+    #[test]
+    fn a_chunk_enqueued_after_rotate_lands_in_the_new_file() {
+        let tmp = unique_dir("log3-node");
+        let mut node = LogNode::create(&log_config(&tmp, "app.log", OverflowPolicy::DropOldest));
+
+        {
+            let mut q = node.shared.q.lock().unwrap();
+            push_bytes(&mut q, b"before");
+        }
+        node.shared.cv.notify_all();
+        assert_eq!(node.rotate().unwrap(), 0);
+        {
+            let mut q = node.shared.q.lock().unwrap();
+            push_bytes(&mut q, b"after");
+        }
+        node.shared.cv.notify_all();
+        node.teardown();
+
+        assert_eq!(std::fs::read(tmp.join("app.log.000")).unwrap(), b"before");
+        assert_eq!(std::fs::read(tmp.join("app.log")).unwrap(), b"after");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // LOG-3 corollary: drop-oldest eviction must step over a rotation marker.
+    // Evicting one would silently discard the operator's `rotate` and merge the
+    // two files.
+    #[test]
+    fn overflow_eviction_never_drops_a_rotation_marker() {
+        let mut q = test_queue(OverflowPolicy::DropOldest);
+        let big = Chunk::from(vec![0u8; QUEUE_CAP_BYTES - 1]);
+        assert!(enqueue(&mut q, big));
+        q.items.push_back(QueueItem::Rotate);
+
+        // One more byte would exceed the cap, so the oldest *bytes* are evicted.
+        assert!(enqueue(&mut q, Chunk::from_static(b"xy")));
+        assert_eq!(q.dropped_bytes, (QUEUE_CAP_BYTES - 1) as u64);
+        assert_eq!(q.queued_bytes, 2);
+        assert!(
+            q.items.iter().any(|it| matches!(it, QueueItem::Rotate)),
+            "the rotation marker must survive eviction"
+        );
+        // …and it must still precede the newly accepted bytes.
+        assert!(matches!(q.items.front(), Some(QueueItem::Rotate)));
+    }
+
+    // LOG-4: `queued_bytes` must report every byte still resident — the queue
+    // plus the batch the writer is holding. Built on a faulted node (unwritable
+    // directory) so no writer thread races the planted values.
+    #[test]
+    fn queued_bytes_counts_the_batch_the_writer_still_holds() {
+        let tmp = unique_dir("log4");
+        let node = LogNode::create(&log_config(
+            &tmp.join("no-such-dir"),
+            "app.log",
+            OverflowPolicy::DropOldest,
+        ));
+        assert!(node.writer.is_none(), "a faulted open starts no writer");
+        {
+            let mut q = node.shared.q.lock().unwrap();
+            q.queued_bytes = 10;
+            q.draining_bytes = 32;
+        }
+        assert_eq!(node.state_extra()["queued_bytes"], json!(42));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // LOG-2 (the surviving observability half): under the default drop-oldest
+    // policy a filesystem refusing every write is *specified* to keep the node
+    // `active` with rising `dropped_bytes` (§5). `write_errors` /
+    // `last_write_error` are what separate it from a merely slow consumer.
+    #[test]
+    fn write_refusals_are_counted_separately_from_slow_consumer_loss() {
+        let tmp = unique_dir("log2");
+        let path = tmp.join("ro.log");
+        std::fs::write(&path, b"").unwrap();
+        let ro = OpenOptions::new().read(true).open(&path).unwrap();
+
+        let mut queue = test_queue(OverflowPolicy::DropOldest);
+        push_bytes(&mut queue, b"aaaa");
+        push_bytes(&mut queue, b"bb");
+        let total = queue.queued_bytes as u64;
+
+        let shared = Shared {
+            q: Mutex::new(queue),
+            cv: Condvar::new(),
+        };
+        writer_loop(&shared, tmp.clone(), "ro.log".to_owned(), 3, ro);
+
+        let q = shared.q.lock().unwrap();
+        assert_eq!(q.write_errors, 2, "one per refused write(2)");
+        assert!(
+            q.last_write_error
+                .as_deref()
+                .is_some_and(|m| m.contains("ro.log")),
+            "the message names the file: {:?}",
+            q.last_write_error
+        );
+        assert_eq!(q.dropped_bytes, total);
+        assert!(
+            q.status.is_active(),
+            "drop-oldest is a sanctioned policy arm; it must not fault the node"
+        );
+        drop(q);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // SEC-4/RV-6: console bytes are frequently root shells, so a log file must
+    // not inherit a permissive umask (0664 was observed). `mode` is masked by
+    // the process umask, so assert the ceiling: no bit outside 0640.
+    #[test]
+    fn log_files_are_created_no_wider_than_0640() {
+        let tmp = unique_dir("sec4");
+        let mut node = LogNode::create(&log_config(&tmp, "app.log", OverflowPolicy::DropOldest));
+        let mode = std::fs::metadata(tmp.join("app.log"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode & !0o640,
+            0,
+            "log file mode {mode:o} is wider than 0640"
+        );
+        node.teardown();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // LOG-1: `signal_stop` is the cheap half — it closes the queue and returns
+    // without waiting — and the following `teardown` still flushes everything
+    // the writer had accepted (§7.3 bounded flush).
+    #[test]
+    fn signal_stop_closes_the_queue_and_teardown_still_flushes() {
+        let tmp = unique_dir("log1-signal");
+        let mut node = LogNode::create(&log_config(&tmp, "app.log", OverflowPolicy::DropOldest));
+        {
+            let mut q = node.shared.q.lock().unwrap();
+            push_bytes(&mut q, b"payload");
+        }
+        node.shared.cv.notify_all();
+
+        node.signal_stop();
+        assert!(
+            node.shared.q.lock().unwrap().closed,
+            "signal_stop must tell the writer to close"
+        );
+        assert!(node.stop_signalled_at.is_some());
+        // Idempotent: the second call must not restart the deadline.
+        let first = node.stop_signalled_at;
+        node.signal_stop();
+        assert_eq!(node.stop_signalled_at, first);
+
+        node.teardown();
+        assert_eq!(std::fs::read(tmp.join("app.log")).unwrap(), b"payload");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // LOG-1: the flush bound runs from `signal_stop`, not from the moment this
+    // node's turn in the teardown loop comes round — that is what makes N log
+    // nodes cost one FLUSH_WAIT instead of N. A writer that never reports done
+    // stands in for a wedged log directory.
+    #[test]
+    fn teardown_measures_the_flush_bound_from_signal_stop() {
+        let tmp = unique_dir("log1-deadline");
+        let mut node = LogNode::create(&log_config(&tmp, "app.log", OverflowPolicy::DropOldest));
+        node.teardown(); // retire the real writer thread first
+
+        let Some(long_ago) = Instant::now().checked_sub(FLUSH_WAIT) else {
+            eprintln!("SKIP teardown_measures_the_flush_bound_from_signal_stop: clock too young");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        };
+        // A never-signalled channel whose sender stays alive: recv_timeout can
+        // only end by timing out.
+        let (_keep_alive, wedged) = sync_channel::<()>(1);
+        node.writer_done = Some(wedged);
+        node.stop_signalled_at = Some(long_ago);
+
+        let t0 = Instant::now();
+        node.teardown();
+        assert!(
+            t0.elapsed() < FLUSH_WAIT / 4,
+            "teardown paid a fresh FLUSH_WAIT ({:?}) instead of the remainder",
+            t0.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // STATE-1: §7 wants "a status … with reason and timestamp". The node reports
+    // a NodeState, and the stamp is the age of the condition.
+    #[test]
+    fn status_carries_the_transition_timestamp() {
+        let tmp = unique_dir("state1");
+        let mut node = LogNode::create(&log_config(&tmp, "app.log", OverflowPolicy::DropOldest));
+        let active = node.status();
+        assert!(active.is_active());
+        assert!(active.since_unix_ms() > 0, "the transition must be stamped");
+
+        // A repeat of the identical status is not a transition, so the stamp
+        // stays the age of the condition rather than of the last poll.
+        {
+            let mut q = node.shared.q.lock().unwrap();
+            assert!(!q.status.set(NodeStatus::Active));
+            assert!(q.status.set(NodeStatus::Faulted {
+                reason: "disk gone".to_owned(),
+            }));
+        }
+        let faulted = node.status();
+        assert_eq!(faulted.reason(), Some("disk gone"));
+        assert!(faulted.since_unix_ms() >= active.since_unix_ms());
+
         node.teardown();
         let _ = std::fs::remove_dir_all(&tmp);
     }

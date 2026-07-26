@@ -302,6 +302,12 @@ pub enum AppError {
     HasEdges,
     /// `add-node` by raw path/serial with the device absent (§12).
     DeviceAbsent,
+    /// A request arrived on a connection whose waiting verb (`lock --wait`,
+    /// `send`) is still parked. §15.20 runs one waiting verb per connection; the
+    /// pipelined request is refused so the wait survives, because the alternative
+    /// the review found was silence — the connection died with no reply to either
+    /// request, taking a web console's subscription and taps with it (CTRL-1).
+    WaitInFlight,
 }
 
 impl AppError {
@@ -312,6 +318,7 @@ impl AppError {
         AppError::Locked,
         AppError::HasEdges,
         AppError::DeviceAbsent,
+        AppError::WaitInFlight,
     ];
 
     /// The numeric code, offset from [`error_codes::APP_ERROR_BASE`].
@@ -323,6 +330,7 @@ impl AppError {
                 AppError::Locked => 3,
                 AppError::HasEdges => 4,
                 AppError::DeviceAbsent => 5,
+                AppError::WaitInFlight => 6,
             }
     }
 
@@ -334,6 +342,7 @@ impl AppError {
             AppError::Locked => "locked",
             AppError::HasEdges => "has edges",
             AppError::DeviceAbsent => "device absent",
+            AppError::WaitInFlight => "waiting verb in flight",
         }
     }
 
@@ -352,6 +361,9 @@ impl AppError {
             }
             AppError::DeviceAbsent => {
                 "`add-node` by raw path or serial number, but the device is not present so its identity cannot be captured (§12)"
+            }
+            AppError::WaitInFlight => {
+                "a request was pipelined behind an in-flight waiting verb on the same connection; §15.20 runs one at a time, and the wait is left intact"
             }
         }
     }

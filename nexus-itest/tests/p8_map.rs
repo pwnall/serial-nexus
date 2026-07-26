@@ -21,7 +21,29 @@
 //! Properties 2–3 need a serial *device*, so they **skip** where a sim pty cannot be
 //! one (macOS: `serial2` → `ENOTTY`), per the harness doctrine (§5). Property 1 runs
 //! everywhere — a map is an interior transform with no device of its own.
+//!
+//! The audit (`docs/26-claude-opus-code-review.md`) added three more, all
+//! device-free and therefore running on **every** platform. They source their
+//! hostward bytes from a `leg` channel driven by a `nexus-sim wire` peer rather than
+//! from a UART — the map neither knows nor cares which host-facing endpoint feeds
+//! its raw side:
+//!
+//! 4. **`spchex` is picocom's control class, end to end** (MAP-1) — the rule shipped
+//!    as `b == 0x20` (SPACE) through v11, so the one rule an operator reaches for to
+//!    reveal stray control bytes rewrote every space instead, and `0x00..=0x1f`/`0x7f`
+//!    were unreachable by *any* rule in the vocabulary.
+//! 5. **The map counts consumer absence** (DM-3) — mapped bytes that reach no graph
+//!    consumer are counted even though a tap and the default ring saw every one of
+//!    them: a ring is a spy outside the graph and may never suppress a loss count
+//!    (§5, AGENTS.md invariant 9).
+//! 6. **A read-only map is inert, not destructive** (MAP-1 runtime) — the reviewer's
+//!    controlled A/B, one attribute apart: with `write_mode = "never"` on the raw
+//!    edge the map used to drop its mapped endpoint's targetward receiver while its
+//!    senders stayed live, which killed a writing PTY's reader task outright and
+//!    froze `client_present` at `true`.
 
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -44,6 +66,29 @@ fn oracle_hostward(input: &[u8]) -> Vec<u8> {
             out.extend_from_slice(&hex4(b));
         } else if b == 0x0d {
             out.push(0x0a);
+        } else {
+            out.push(b);
+        }
+    }
+    out
+}
+
+/// picocom's `M_SPCHEX` class, **enumerated** rather than restated as a predicate:
+/// DEL plus every C0 control except TAB/LF/CR, which have rules of their own. Written
+/// this way on purpose — an oracle that repeated `nexus_core::map`'s range test would
+/// agree with a wrong implementation, which is exactly how the SPACE-for-control
+/// defect survived a 256-byte sweep (MAP-1).
+fn is_picocom_special(b: u8) -> bool {
+    matches!(b, 0x00..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f | 0x7f)
+}
+
+/// The hostward oracle for `["spchex"]`: every special byte → `[xx]`, everything
+/// else — SPACE emphatically included — verbatim.
+fn oracle_spchex(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &b in input {
+        if is_picocom_special(b) {
+            out.extend_from_slice(&hex4(b));
         } else {
             out.push(b);
         }
@@ -360,6 +405,23 @@ write_mode = "held"
         node["hostward"]["rules"]["crlf"].as_u64(),
         Some(cr),
         "crlf substitution count must match the oracle: {node}"
+    );
+
+    // DM-3 (§5, AGENTS.md invariant 9): nothing in the *graph* consumes the mapped
+    // endpoint here — the two taps are spies outside it — so every mapped byte is
+    // consumer-absent loss and must be counted as such, even though the tap above
+    // received all of it byte-exactly a few assertions ago. The reviewer's
+    // reproduction 20 found `bytes_in: 35`, `bytes_out: 40` and no such counter at
+    // all on the node.
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            rpc.node("console")
+                .and_then(|n| n["hostward"]["discarded_unattached"].as_u64())
+                == Some(mapped.len() as u64)
+        }),
+        "mapped bytes that reached no graph consumer must be counted (DM-3), and the \
+         tap/ring mirror must not suppress the count: {:?}",
+        rpc.node("console").map(|n| n["hostward"].clone())
     );
 
     // The map's default replay ring holds the mapped tail: a fresh replay tap opened
@@ -756,4 +818,318 @@ write_mode = "never"
         Some(2),
         "ignlf must have deleted both LFs: {node}"
     );
+}
+
+// ---- 4/5: spchex over the control range, and the map's unattached accounting ----
+
+#[test]
+fn spchex_hexes_the_control_class_never_space_and_counts_unattached_loss() {
+    // MAP-1 + DM-3, end to end through a live map node, with **no serial device**:
+    // the hostward bytes come from a `leg` channel a `nexus-sim wire` peer drives,
+    // so this runs on every platform (a map does not care which host-facing
+    // endpoint feeds its raw side).
+    //
+    // The payload is the sim's seeded stream — uniform over 0x00..=0xff, so one 4 KiB
+    // batch carries hundreds of C0 controls, several DELs and a few dozen spaces:
+    // the exact byte classes the defect confused. The expectation is computed by
+    // `oracle_spchex`, which enumerates picocom's class instead of restating the
+    // implementation's predicate.
+    const N: usize = 4096;
+    const SEED: u64 = 5;
+    let seeded = seeded_bytes(SEED, N);
+    let expected = oracle_spchex(&seeded);
+
+    // The defect's two halves, stated as preconditions so the test can never pass
+    // vacuously: the batch must actually contain the bytes an operator is hunting,
+    // and it must contain spaces for the rule to wrongly rewrite.
+    let specials = seeded.iter().filter(|&&b| is_picocom_special(b)).count();
+    let spaces = seeded.iter().filter(|&&b| b == 0x20).count();
+    assert!(
+        specials > 0 && spaces > 0,
+        "degenerate batch: the seeded source must carry both control bytes and spaces"
+    );
+    assert!(
+        seeded.contains(&0x00) && seeded.contains(&0x1b),
+        "the batch must carry the 0x00/0x1b an operator reaches for spchex to find"
+    );
+
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let leg = d.run().join("leg.sock");
+
+    // downlink/c0 (leg, host-facing) --held--> console/raw (map) --> [no consumer].
+    // The raw edge omits write_mode deliberately (promoted to `held`, §7.8/§3.17).
+    let cfg = format!(
+        r#"
+[[node]]
+type = "leg"
+name = "downlink"
+faces = "host"
+transport = "unix"
+role = "listen"
+address = "{leg}"
+arbitration = "free-for-all"
+channels = ["c0"]
+[[node]]
+type = "map"
+name = "console"
+hostward = ["spchex"]
+[[edge]]
+a = "downlink/c0"
+b = "console/raw"
+"#,
+        leg = leg.display(),
+    );
+    rpc.load_toml(&cfg, false).expect("load spchex map graph");
+    assert!(
+        rpc.wait_status("console", "active", Duration::from_secs(10)),
+        "map node not active: {:?}",
+        rpc.node("console")
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || leg.exists()),
+        "the leg's listen socket never appeared"
+    );
+
+    // Tap the mapped endpoint before the peer speaks, so no mapped byte predates it.
+    let mut tap = rpc.stream("tap.open", json!({ "endpoint": "console" }));
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            rpc.state()["taps"].as_array().map(Vec::len) == Some(1)
+        }),
+        "the tap did not register: {:?}",
+        rpc.state()["taps"]
+    );
+
+    let leg_str = leg.to_string_lossy().into_owned();
+    let _peer = Sim::spawn(
+        &[
+            "wire",
+            "--transport",
+            "unix",
+            "--address",
+            &leg_str,
+            "--announce",
+            "c0",
+            "--send",
+            &format!("c0={N}"),
+            "--seed",
+            &SEED.to_string(),
+            "--hold-ms",
+            "8000",
+            "--timeout-ms",
+            "20000",
+        ],
+        None,
+    );
+
+    let got = collect_tap(&mut tap, expected.len(), Duration::from_secs(20));
+
+    // The whole batch, byte-for-byte against the independent oracle.
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "mapped tap delivered {} bytes, expected {}",
+        got.len(),
+        expected.len()
+    );
+    assert_eq!(
+        sha256_hex(&got),
+        sha256_hex(&expected),
+        "the spchex stream did not match picocom's control-byte class"
+    );
+
+    // The two halves of the defect, each pinned on its own so a failure names which
+    // one regressed rather than just "the checksum differs".
+    assert_eq!(
+        got.iter().filter(|&&b| b == 0x20).count(),
+        spaces,
+        "spchex rewrote SPACE — hexing a space is nrmhex's job (MAP-1)"
+    );
+    for probe in [&b"[00]"[..], &b"[1b]"[..]] {
+        assert!(
+            got.windows(4).any(|w| w == probe),
+            "no rule rendered {:?}: the hex family must reach the control range (§7.8)",
+            String::from_utf8_lossy(probe)
+        );
+    }
+
+    // Per-rule counters cross-check the oracle's tally, and the byte totals show the
+    // 4× expansion the class actually took.
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            rpc.node("console")
+                .and_then(|n| n["hostward"]["bytes_in"].as_u64())
+                == Some(N as u64)
+        }),
+        "hostward counters did not settle: {:?}",
+        rpc.node("console")
+    );
+    let node = rpc.node("console").expect("map node in state");
+    assert_eq!(
+        node["hostward"]["rules"]["spchex"].as_u64(),
+        Some(specials as u64),
+        "spchex substitution count must match the oracle's control-class tally: {node}"
+    );
+    assert_eq!(
+        node["hostward"]["bytes_out"].as_u64(),
+        Some(expected.len() as u64),
+        "hostward bytes_out must equal the mapped length: {node}"
+    );
+
+    // DM-3, on a graph with no consumer at all on the mapped side (reproduction 20):
+    // every mapped byte is consumer-absent loss and is counted, while the tap above
+    // received every one of them — the ring/tap mirror is a spy outside the graph and
+    // never suppresses the count (§5, AGENTS.md invariant 9).
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            rpc.node("console")
+                .and_then(|n| n["hostward"]["discarded_unattached"].as_u64())
+                == Some(expected.len() as u64)
+        }),
+        "the map must count mapped bytes that reached no graph consumer (DM-3): {:?}",
+        rpc.node("console").map(|n| n["hostward"].clone())
+    );
+}
+
+// ---- 6: the read-only map is inert, not destructive (the controlled A/B) --------
+
+#[test]
+fn a_read_only_map_leaves_its_writers_pty_alive() {
+    // MAP-1 (runtime), as the reviewer's reproduction 21 isolated it: one graph, one
+    // attribute changed. `write_mode = "never"` on the raw edge is the documented
+    // read-only/display map (§7.8). The map used to drop the mapped endpoint's
+    // targetward receiver in that arm while its senders stayed live, so the first
+    // byte a PTY writer sent hit a closed channel and ended `read_and_poll` — taking
+    // presence latching, last-close handling, termios reconciliation and
+    // detach-release with it. `client_present` then froze at `true` forever.
+    //
+    // Both arms run, so the A/B is in the suite rather than in a review appendix.
+    // No serial device: `usb0`'s device is absent (`waiting`), which is enough for
+    // the lock, the origin and the targetward receiver that make this test go.
+    const TYPED: u64 = 64;
+    for write_mode in ["never", "held"] {
+        let d = Daemon::start();
+        let rpc = d.rpc();
+        let p0 = d.run().join("p0");
+        let cfg = format!(
+            r#"
+[[node]]
+type = "serial"
+name = "usb0"
+device = "{dev}"
+[[node]]
+type = "map"
+name = "console"
+targetward = ["lfcrlf"]
+[[node]]
+type = "pty"
+name = "p0"
+path = "{p0}"
+[[edge]]
+a = "usb0"
+b = "console/raw"
+write_mode = "{write_mode}"
+[[edge]]
+a = "console"
+b = "p0"
+"#,
+            dev = d.run().join("absent-device").display(),
+            p0 = p0.display(),
+        );
+        rpc.load_toml(&cfg, false)
+            .unwrap_or_else(|e| panic!("[{write_mode}] load: {e:?}"));
+        assert!(
+            rpc.wait_status("p0", "active", Duration::from_secs(10)),
+            "[{write_mode}] p0 not active: {:?}",
+            rpc.node("p0")
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || p0.exists()),
+            "[{write_mode}] p0 symlink never appeared"
+        );
+
+        // The PTY takes the mapped endpoint's write lock, then a client attaches and
+        // is *observed* before it types — which is what makes the frozen-presence
+        // failure the reviewer saw the one this reproduces (rather than a reader that
+        // died before ever latching). The client is driven from this process so the
+        // ordering is ours, not a subprocess's.
+        rpc.lock("p0", false, false, None)
+            .unwrap_or_else(|e| panic!("[{write_mode}] lock p0: {e:?}"));
+        let mut client = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(&p0)
+            .unwrap_or_else(|e| panic!("[{write_mode}] open pty slave: {e}"));
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                rpc.node("p0")
+                    .and_then(|n| n.get("client_present").and_then(Value::as_bool))
+                    == Some(true)
+            }),
+            "[{write_mode}] the client never became present"
+        );
+        client
+            .write_all(&vec![b'x'; TYPED as usize])
+            .expect("type at the console");
+        client.flush().expect("flush");
+
+        // The property: the client exits, and the PTY's reader must still be alive to
+        // notice. With the dropped receiver, the first typed byte hit a closed channel
+        // and ended `read_and_poll`, so this stayed `true` indefinitely.
+        drop(client);
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                rpc.node("p0")
+                    .and_then(|n| n.get("client_present").and_then(Value::as_bool))
+                    == Some(false)
+            }),
+            "[{write_mode}] client_present never went false after the client exited — \
+             the PTY's reader task died with its targetward channel (MAP-1): {:?}",
+            rpc.node("p0")
+        );
+        // And the detach released the on-demand holder's lock, which is the same
+        // reader task's job (§6) — proof the task survived rather than merely that
+        // presence happened to flip.
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                rpc.node("console")
+                    .and_then(|n| n.pointer("/lock/holder").cloned())
+                    == Some(Value::Null)
+            }),
+            "[{write_mode}] the mapped endpoint's lock was not detach-released: {:?}",
+            rpc.node("console").map(|n| n["lock"].clone())
+        );
+
+        // The typed bytes went somewhere defensible, and *which* somewhere is the
+        // whole difference between the two arms.
+        let settled = wait_until(Duration::from_secs(10), || {
+            let n = rpc.node("console").unwrap_or(Value::Null);
+            match write_mode {
+                "never" => n["targetward"]["discarded_no_raw_edge"].as_u64() == Some(TYPED),
+                _ => n["targetward"]["bytes_in"].as_u64() == Some(TYPED),
+            }
+        });
+        let node = rpc.node("console").expect("map node in state");
+        assert!(
+            settled,
+            "[{write_mode}] targetward accounting did not settle: {node}"
+        );
+        if write_mode == "never" {
+            // Inert: the bytes are swallowed and counted (§5), and the transform is
+            // deliberately not run, so no rule claims a substitution it never made.
+            assert_eq!(
+                node["targetward"]["bytes_in"].as_u64(),
+                Some(0),
+                "a read-only map must not claim to have transformed anything: {node}"
+            );
+        } else {
+            assert_eq!(
+                node["targetward"]["discarded_no_raw_edge"].as_u64(),
+                Some(0),
+                "a writable map must discard nothing: {node}"
+            );
+        }
+    }
 }

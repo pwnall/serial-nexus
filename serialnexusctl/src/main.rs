@@ -115,7 +115,23 @@ enum Cmd {
         node: String,
         #[arg(long, default_value_t = 100)]
         ms: u64,
-        #[arg(long, default_value_t = true)]
+        /// The level to hold during the pulse (then reset to its opposite).
+        // `ArgAction::Set` deliberately, not clap's inferred `SetTrue` for a `bool`:
+        // the RPC's low-then-high pulse is `assert = false`, and a `SetTrue` flag with
+        // `default_value_t = true` can only ever send `true`, making the documented
+        // `--assert false` unreachable (review 26, CLI-1). `num_args = 0..=1` plus
+        // `default_missing_value` keeps the bare `--assert` spelling working — it was
+        // a harmless no-op in operator scripts before, and turning it into a hard
+        // error would be a gratuitous break. Kept as a `//` comment, not a doc
+        // comment: clap renders `///` verbatim into `--help`, where this rationale
+        // is noise to an operator.
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            default_value_t = true
+        )]
         assert: bool,
     },
     /// Acquire the exclusive write lock for an origin (§6): only its bytes are
@@ -160,6 +176,32 @@ enum Cmd {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let json = cli.json;
+    match run(cli) {
+        Ok(()) => Ok(()),
+        // A *client-side* failure — an unreadable file, a TOML parse error, a socket
+        // that will not connect — must be as machine-readable as a daemon error when
+        // `--json` is on (review 26, CLI-4). Otherwise an agent driving the documented
+        // JSON mode still has to parse human text for half the failures it can hit.
+        // These carry no JSON-RPC code, so they take the standard internal-error code
+        // and say plainly where they came from; the shape is the same envelope, so a
+        // caller has exactly one thing to parse.
+        Err(e) if json => {
+            let envelope = json!({
+                "error": {
+                    "code": nexus_rpc::error_codes::INTERNAL_ERROR,
+                    "message": format!("{e:#}"),
+                    "data": { "origin": "client" },
+                }
+            });
+            println!("{}", serde_json::to_string_pretty(&envelope)?);
+            std::process::exit(1);
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn run(cli: Cli) -> anyhow::Result<()> {
     let socket = resolve_socket(cli.socket.clone());
 
     // `subscribe` and `tap` are streams, not single request/response — handle them
@@ -181,9 +223,21 @@ fn main() -> anyhow::Result<()> {
     let response = call(&socket, method, params)?;
 
     if let Some(err) = response.error {
-        eprintln!("error {}: {}", err.code, err.message);
-        if let Some(data) = err.data {
-            eprintln!("{}", serde_json::to_string_pretty(&data)?);
+        if cli.json {
+            // `--json` is the machine-readable mode, so its *error* path must be
+            // machine-readable too — otherwise an agent driving it has to parse
+            // human text to learn what failed (review 26, CLI-4). The daemon's
+            // JSON-RPC error object goes to stdout under an `error` key, which
+            // cannot collide with the success path: that is a raw pass-through of
+            // the daemon `result` (§15.16) and is never printed alongside this.
+            // The exit code stays non-zero.
+            let envelope = json!({ "error": serde_json::to_value(&err)? });
+            println!("{}", serde_json::to_string_pretty(&envelope)?);
+        } else {
+            eprintln!("error {}: {}", err.code, err.message);
+            if let Some(data) = err.data {
+                eprintln!("{}", serde_json::to_string_pretty(&data)?);
+            }
         }
         std::process::exit(1);
     }
@@ -207,12 +261,13 @@ fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
             )
         }
         Cmd::AddNode { file } => {
-            // A single-node TOML configuration; take its one node.
+            // A single-node TOML configuration; take its one node — and refuse
+            // anything larger rather than adding the first node and dropping the
+            // rest (review 26, CLI-2). Silently discarding a `[[node]]` is bad; a
+            // discarded `[[edge]]` is unrecoverable, because `connect` is deferred
+            // (§14) — there is no verb that could add it afterwards.
             let config = read_config(file)?;
-            let node = config
-                .nodes
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("{}: no [[node]] to add", file.display()))?;
+            let node = single_node(&config, file)?;
             (
                 "add-node",
                 Some(json!({ "node": serde_json::to_value(node)? })),
@@ -275,7 +330,54 @@ fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
 /// message that names the file (shared by `load` and `add-node`).
 fn read_config(file: &Path) -> anyhow::Result<GraphConfig> {
     let text = std::fs::read_to_string(file)?;
-    toml::from_str(&text).map_err(|e| anyhow::anyhow!("parsing {}: {e}", file.display()))
+    let config: GraphConfig =
+        toml::from_str(&text).map_err(|e| anyhow::anyhow!("parsing {}: {e}", file.display()))?;
+    // A file with content that parses to *nothing* is the one input that turns
+    // `load --replace` into an unannounced `teardown` reported as success (review 26,
+    // CP-2/CFG-3): a typo'd table name — `[[nodez]]` — yields an empty graph, and
+    // §11's "the entire file is validated before anything is created" cannot catch it
+    // because there is nothing to validate. Unknown *keys* are now rejected by serde;
+    // an unknown *table* has no variant to reject it, so name the mistake here.
+    // (An empty graph is legitimate over RPC — `teardown` persists one — so this is a
+    // property of "the operator handed me this file", not of the config type.)
+    if config.is_empty() && !text.trim().is_empty() {
+        anyhow::bail!(
+            "{}: parsed to an empty graph although the file is not empty — no [[node]] \
+             or [[edge]] table was recognised (a misspelled table name such as \
+             `[[nodez]]` parses to nothing). Nothing was sent.",
+            file.display()
+        );
+    }
+    Ok(config)
+}
+
+/// The one `[[node]]` an `add-node` file may contain — or an error naming what
+/// was actually found (review 26, CLI-2).
+///
+/// `add-node` adds exactly one node and no edges (§11), so a file carrying more
+/// than that is an operator mistake, not an instruction to take the first node:
+/// the surplus nodes would be dropped, and a dropped `[[edge]]` cannot be added
+/// afterwards at all (`connect` is deferred, §14). `load` / `load --replace` is
+/// the multi-node verb, so the message points there.
+fn single_node<'c>(
+    config: &'c GraphConfig,
+    file: &Path,
+) -> anyhow::Result<&'c nexus_core::config::NodeConfig> {
+    let (nodes, edges) = (config.nodes.len(), config.edges.len());
+    if nodes == 0 {
+        anyhow::bail!("{}: no [[node]] to add", file.display());
+    }
+    if nodes > 1 || edges > 0 {
+        anyhow::bail!(
+            "{}: add-node takes a single [[node]] and no [[edge]], but this file has \
+             {nodes} node(s) and {edges} edge(s) — nothing was added. Use \
+             `serialnexusctl load` (or `load --replace` over a running graph) for a \
+             multi-node configuration: edges cannot be added afterwards, because \
+             `connect` is deferred (§14).",
+            file.display(),
+        );
+    }
+    Ok(&config.nodes[0])
 }
 
 /// Render a successful result for humans (the `--json` path bypasses this).
@@ -579,4 +681,97 @@ fn resolve_socket(override_path: Option<PathBuf>) -> PathBuf {
         return PathBuf::from(dir).join("serialnexusd.sock");
     }
     PathBuf::from(format!("/tmp/serialnexusd-{}.sock", nix::unistd::getuid()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(text: &str) -> GraphConfig {
+        toml::from_str(text).expect("test configuration parses")
+    }
+
+    /// `add-node` adds one node and no edges (§11). A file with more must be
+    /// refused, naming the counts — never "add the first node and drop the rest",
+    /// because a dropped edge is unrecoverable with `connect` deferred (§14).
+    /// Review 26, CLI-2.
+    #[test]
+    fn add_node_refuses_files_carrying_more_than_one_node_or_any_edge() {
+        let file = Path::new("rig.toml");
+
+        let one = cfg(
+            "[[node]]\ntype = \"log\"\nname = \"a\"\ndirectory = \"/tmp\"\nfilename = \"a.log\"\n",
+        );
+        assert!(single_node(&one, file).is_ok());
+
+        let two = cfg(
+            "[[node]]\ntype = \"log\"\nname = \"a\"\ndirectory = \"/tmp\"\nfilename = \"a.log\"\n\
+             [[node]]\ntype = \"log\"\nname = \"b\"\ndirectory = \"/tmp\"\nfilename = \"b.log\"\n",
+        );
+        let err = single_node(&two, file).unwrap_err().to_string();
+        assert!(err.contains("2 node(s)"), "counts not named: {err}");
+        assert!(err.contains("nothing was added"), "no reassurance: {err}");
+        assert!(err.contains("load"), "does not point at load: {err}");
+
+        // One node plus an edge: the edge is the unrecoverable part.
+        let edged = cfg(
+            "[[node]]\ntype = \"log\"\nname = \"a\"\ndirectory = \"/tmp\"\nfilename = \"a.log\"\n\
+             [[edge]]\na = \"usb0\"\nb = \"a\"\n",
+        );
+        let err = single_node(&edged, file).unwrap_err().to_string();
+        assert!(err.contains("1 edge(s)"), "edge count not named: {err}");
+
+        let none = cfg("");
+        assert!(
+            single_node(&none, file)
+                .unwrap_err()
+                .to_string()
+                .contains("no [[node]]")
+        );
+    }
+
+    /// `--assert false` must reach the RPC as `assert: false` — the documented
+    /// low-then-high pulse (§7.1, `docs/rpc/serial-signals.md`). A clap-inferred
+    /// `SetTrue` flag could only ever send `true` (review 26, CLI-1/DOC-4).
+    #[test]
+    fn pulse_dtr_accepts_an_explicit_assert_value_in_both_spellings() {
+        for argv in [
+            vec!["serialnexusctl", "pulse-dtr", "usb0", "--assert", "false"],
+            vec!["serialnexusctl", "pulse-dtr", "usb0", "--assert=false"],
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).expect("--assert false parses");
+            let (method, params) = build_request(&cli.cmd).unwrap();
+            assert_eq!(method, "pulse-dtr");
+            assert_eq!(params.unwrap()["assert"], json!(false), "argv {argv:?}");
+        }
+
+        // The default is unchanged: a bare `pulse-dtr` still asserts high.
+        let cli = Cli::try_parse_from(["serialnexusctl", "pulse-dtr", "usb0"]).unwrap();
+        let (_, params) = build_request(&cli.cmd).unwrap();
+        let params = params.unwrap();
+        assert_eq!(params["assert"], json!(true));
+        assert_eq!(params["ms"], json!(100));
+
+        // And a *bare* `--assert` still means `true`. It was a harmless no-op in
+        // operator scripts before `ArgAction::Set` landed; making the CLI-1 fix turn
+        // it into a hard error would have been a gratuitous break, so `num_args`
+        // plus `default_missing_value` keep the spelling alive.
+        let cli = Cli::try_parse_from(["serialnexusctl", "pulse-dtr", "usb0", "--assert"]).unwrap();
+        let (_, params) = build_request(&cli.cmd).unwrap();
+        assert_eq!(params.unwrap()["assert"], json!(true), "bare --assert");
+    }
+
+    /// The sibling signal verb takes `Option<bool>` values, which clap already
+    /// parses as `--dtr false` (and omitting a line leaves it untouched, §7.1).
+    /// Pinned so the CLI-1 shape cannot reappear here.
+    #[test]
+    fn set_modem_takes_explicit_levels_and_leaves_omitted_lines_null() {
+        let cli =
+            Cli::try_parse_from(["serialnexusctl", "set-modem", "usb0", "--dtr", "false"]).unwrap();
+        let (method, params) = build_request(&cli.cmd).unwrap();
+        assert_eq!(method, "set-modem");
+        let params = params.unwrap();
+        assert_eq!(params["dtr"], json!(false));
+        assert_eq!(params["rts"], Value::Null);
+    }
 }

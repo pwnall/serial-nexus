@@ -13,6 +13,25 @@
 //!    across a daemon restart (offsets reset to 0 then), so a client keyed on it starts
 //!    a fresh history rather than splicing across the reset. Pure control-plane fact —
 //!    runs on every platform.
+//! 3. **A hole is visible, never silently spliced (TAP-1b).** The offset space counts
+//!    *delivered* bytes, so bytes lost at the lossy producer→hub feed hop would leave the
+//!    offsets contiguous across a real gap — a browser splicing by offset would
+//!    concatenate a holed stream and never know. Of the two sanctioned fixes the daemon
+//!    took the second: the offset space stays the delivered-bytes space (which is what
+//!    keeps invariant 10 and the exact replay splice true) and the loss is signalled
+//!    *beside* it — `tap.open` reports the endpoint's `feed_dropped` baseline and every
+//!    `tap.data` carries `gap_before`, the bytes lost immediately before that chunk. This
+//!    file guards the wire contract and the accounting law (a lossless run has
+//!    `gap_before == 0` on every chunk and `feed_dropped == 0` on the endpoint, with
+//!    strictly contiguous offsets); the synthetic-gap semantics themselves are pinned by
+//!    `nexus-daemon/src/tap.rs`'s unit tests, which can inject a feed drop deterministically.
+//! 4. **Invariant 10, on the wire.** `from_offset = ingested − ring.len()` never
+//!    underflows and never lies: with a full ring `from_offset + replay_bytes` lands
+//!    exactly on the live edge, so replay and live meet with no gap and no overlap.
+//!    Also, the offset space resets to 0 when the *graph* is replaced while
+//!    `info.instance` does **not** change — the daemon-side half of the known OPFS
+//!    console freeze, and the reason `tap.closed` (TAP-1) is the signal a client must
+//!    key on rather than the nonce.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -71,11 +90,13 @@ struct OffsetTap {
 }
 
 impl OffsetTap {
-    fn open_replay(socket: &Path, endpoint: &str) -> (u64, Self) {
+    /// Open a tap and return the whole `tap.open` ack beside the connection, so a test
+    /// can assert the ack's full shape (`from_offset`, `replay_bytes`, `feed_dropped`).
+    fn open(socket: &Path, endpoint: &str, replay: bool) -> (Value, Self) {
         let mut stream = UnixStream::connect(socket).expect("connect tap socket");
         let req = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tap.open",
-            "params": { "endpoint": endpoint, "replay": true },
+            "params": { "endpoint": endpoint, "replay": replay },
         });
         stream
             .write_all(format!("{req}\n").as_bytes())
@@ -87,10 +108,62 @@ impl OffsetTap {
         };
         let ack = conn.read_line(Duration::from_secs(10)).expect("ack line");
         let v: Value = serde_json::from_str(&ack).expect("parse ack");
-        let from_offset = v["result"]["from_offset"]
+        (v, conn)
+    }
+
+    fn open_replay(socket: &Path, endpoint: &str) -> (u64, Self) {
+        let (ack, conn) = OffsetTap::open(socket, endpoint, true);
+        let from_offset = ack["result"]["from_offset"]
             .as_u64()
             .unwrap_or_else(|| panic!("from_offset missing in ack: {ack}"));
         (from_offset, conn)
+    }
+
+    /// Drain `tap.data` frames as `(offset, gap_before, bytes)` until `want` bytes have
+    /// arrived or the bounded deadline passes. Every frame's `offset` and `gap_before`
+    /// are required to be present: their absence is the TAP-1b regression, not a
+    /// tolerable omission.
+    fn frames(&mut self, want: u64, timeout: Duration) -> Vec<(u64, u64, Vec<u8>)> {
+        let hard = Instant::now() + timeout;
+        let mut out: Vec<(u64, u64, Vec<u8>)> = Vec::new();
+        let mut got = 0u64;
+        while got < want && Instant::now() < hard {
+            let Some(line) = self.read_line(Duration::from_millis(500)) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if v.get("method").and_then(Value::as_str) != Some("tap.data") {
+                continue;
+            }
+            let p = v.get("params").expect("tap.data params");
+            let offset = p["offset"].as_u64().expect("tap.data carries an offset");
+            let gap = p["gap_before"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("tap.data carries no `gap_before` (TAP-1b): {v}"));
+            let bytes = base64_decode(p["data"].as_str().expect("tap.data data"));
+            got += bytes.len() as u64;
+            out.push((offset, gap, bytes));
+        }
+        out
+    }
+
+    /// Wait for this tap's terminal `tap.closed`, returning its `reason`.
+    fn wait_closed(&mut self, timeout: Duration) -> Option<String> {
+        let hard = Instant::now() + timeout;
+        while Instant::now() < hard {
+            let Some(line) = self.read_line(Duration::from_millis(500)) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if v.get("method").and_then(Value::as_str) == Some("tap.closed") {
+                return v["params"]["reason"].as_str().map(str::to_owned);
+            }
+        }
+        None
     }
 
     fn read_line(&mut self, timeout: Duration) -> Option<String> {
@@ -314,5 +387,241 @@ fn info_instance_nonce_is_stable_within_a_boot_and_changes_on_restart() {
     assert_ne!(
         first, second,
         "instance nonce did not change across a daemon restart"
+    );
+}
+
+/// §11.8 properties 3 + 4 (TAP-1b, and invariant 10 on the wire): every `tap.data`
+/// carries a `gap_before` beside its `offset`, the offset space is strictly contiguous,
+/// and a lossless paced run leaves both the per-chunk gaps and the endpoint's
+/// `feed_dropped` at zero — so a consumer that reads `gap_before` can tell a hole from
+/// a clean stream instead of splicing across it. The closing half pins invariant 10:
+/// with the ring full, `from_offset + replay_bytes` lands exactly on the live edge
+/// (`from_offset = ingested − ring.len()`, which therefore cannot underflow or drift).
+/// Needs a paced software serial source, so it skips off Linux (§5).
+#[test]
+fn tap_data_carries_a_gap_signal_and_a_contiguous_offset_space() {
+    let Some(probe) = serial_echo() else {
+        eprintln!(
+            "SKIP tap_data_carries_a_gap_signal_and_a_contiguous_offset_space: no serial dev"
+        );
+        return;
+    };
+    drop(probe); // we spawn our own gated, paced source below
+
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let dev = d.run().join("dev");
+    let go = d.run().join("go");
+    let logdir = d.run().join("logs");
+    std::fs::create_dir_all(&logdir).expect("mkdir logs");
+    let log = logdir.join("serial.log");
+
+    let (t, rate, seed) = (T.to_string(), RATE.to_string(), SEED.to_string());
+    let dev_s = dev.to_string_lossy().into_owned();
+    let go_s = go.to_string_lossy().into_owned();
+    let _source = Sim::spawn(
+        &[
+            "pty",
+            "--source",
+            "--bytes",
+            &t,
+            "--seed",
+            &seed,
+            "--rate",
+            &rate,
+            "--wait-file",
+            &go_s,
+            "--link",
+            &dev_s,
+            "--hold-ms",
+            "5000",
+            "--timeout-ms",
+            "60000",
+        ],
+        Some(&dev),
+    );
+
+    let cfg = format!(
+        r#"
+[[node]]
+type = "serial"
+name = "usb0"
+device = "{dev}"
+arbitration = "free-for-all"
+hostward_buffer = 16384
+replay_ring = {R}
+[[node]]
+type = "log"
+name = "logx"
+directory = "{logdir}"
+filename = "serial.log"
+[[edge]]
+a = "usb0"
+b = "logx"
+"#,
+        dev = dev.display(),
+        logdir = logdir.display(),
+    );
+    rpc.load_toml(&cfg, false).expect("load ring+log config");
+    assert!(
+        rpc.wait_status("usb0", "active", Duration::from_secs(20)),
+        "usb0 not active: {:?}",
+        rpc.node("usb0")
+    );
+
+    // Tap from the very first byte: an empty ring under `--replay` reports the explicit
+    // empty marker and a zero baseline — `from_offset = ingested − ring.len()` = 0, the
+    // no-underflow edge of invariant 10.
+    let (ack, mut tap) = OffsetTap::open(&d.socket(), "usb0", true);
+    assert_eq!(ack["result"]["replay_bytes"], json!(0), "ack: {ack}");
+    assert_eq!(ack["result"]["from_offset"], json!(0), "ack: {ack}");
+    assert_eq!(
+        ack["result"]["feed_dropped"],
+        json!(0),
+        "tap.open must report the endpoint's feed-loss baseline (TAP-1b): {ack}"
+    );
+
+    std::fs::File::create(&go).expect("touch GO");
+    let frames = tap.frames(T, Duration::from_secs(60));
+    let received: u64 = frames.iter().map(|(_, _, b)| b.len() as u64).sum();
+    assert_eq!(received, T, "the tap received {received} of {T} bytes");
+
+    // The lossless preconditions, asserted before the contiguity law so a genuine drop
+    // is diagnosed as a drop rather than as a mysterious offset jump.
+    let state = rpc.state();
+    assert_eq!(
+        state["taps"][0]["dropped"],
+        json!(0),
+        "the tap's own queue dropped bytes: {state}"
+    );
+    assert_eq!(
+        state["endpoints"][0]["feed_dropped"],
+        json!(0),
+        "the paced run lost bytes at the producer→hub feed hop: {state}"
+    );
+
+    // The law: offsets are strictly contiguous, and with no feed loss every chunk
+    // reports `gap_before == 0`. A `gap_before` that vanished (or that started
+    // double-counting) breaks this, as does an offset space that skipped.
+    let mut expect_at = 0u64;
+    for (i, (offset, gap, bytes)) in frames.iter().enumerate() {
+        assert_eq!(
+            *offset, expect_at,
+            "frame {i}: offset {offset} is not contiguous with the frontier {expect_at}"
+        );
+        assert_eq!(
+            *gap, 0,
+            "frame {i}: a gap of {gap} bytes was signalled in a lossless run"
+        );
+        expect_at += bytes.len() as u64;
+    }
+
+    // Byte-exact against the co-attached log: the contiguity above describes the same
+    // bytes the graph actually delivered (§5 ground truth, never a judgement).
+    assert!(
+        wait_until(Duration::from_secs(30), || file_len(&log) >= T),
+        "log never reached {T} bytes (got {})",
+        file_len(&log)
+    );
+    let logged = std::fs::read(&log).expect("read log");
+    let captured: Vec<u8> = frames.iter().flat_map(|(_, _, b)| b.clone()).collect();
+    assert_eq!(
+        sha256_hex(&captured),
+        sha256_hex(&logged[..T as usize]),
+        "the tap's contiguous stream is not the endpoint's stream"
+    );
+
+    // Invariant 10 with a *full* ring: the replay begins exactly one ring behind the
+    // live edge, and its pieces are contiguous and gap-free — so `ingested − ring.len()`
+    // is the ring's true base offset, which is what makes the splice exact.
+    let (ack2, _tap2) = OffsetTap::open(&d.socket(), "usb0", true);
+    let from2 = ack2["result"]["from_offset"].as_u64().expect("from_offset");
+    let replay2 = ack2["result"]["replay_bytes"]
+        .as_u64()
+        .expect("replay_bytes");
+    assert_eq!(replay2, R, "the ring should be full: {ack2}");
+    assert_eq!(
+        from2 + replay2,
+        expect_at,
+        "from_offset + replay_bytes must land on the live edge (ack: {ack2})"
+    );
+}
+
+/// The daemon-side half of the known OPFS console freeze (T6/§11.8): `load --replace`
+/// resets an endpoint's offset space to 0 while `info.instance` — the client's
+/// restart detector — deliberately does **not** change. A client keyed only on the
+/// nonce would splice new bytes at stale offsets; what it must key on instead is the
+/// terminal `tap.closed` the daemon now sends (TAP-1). Uses an echo device so the
+/// pre-replace offset is an exact, known value; skips off Linux (§5).
+#[test]
+fn tap_offsets_reset_on_load_replace_while_the_instance_nonce_does_not() {
+    let Some(echo) = serial_echo() else {
+        eprintln!(
+            "SKIP tap_offsets_reset_on_load_replace_while_the_instance_nonce_does_not: no serial dev"
+        );
+        return;
+    };
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let cfg = format!(
+        r#"
+[[node]]
+type = "serial"
+name = "usb0"
+device = "{dev}"
+"#,
+        dev = echo.device().display(),
+    );
+    rpc.load_toml(&cfg, false).expect("load echo config");
+    assert!(
+        rpc.wait_status("usb0", "active", Duration::from_secs(20)),
+        "usb0 not active: {:?}",
+        rpc.node("usb0")
+    );
+
+    // Six bytes ("ping1\n") round-trip through the echo device, so the endpoint's
+    // offset space has demonstrably advanced.
+    let (ack1, mut tap1) = OffsetTap::open(&d.socket(), "usb0", false);
+    assert_eq!(ack1["result"]["from_offset"], json!(0), "ack: {ack1}");
+    rpc.send("usb0", "ping1", false, 5000).expect("send ping1");
+    let frames = tap1.frames(6, Duration::from_secs(15));
+    assert_eq!(
+        frames.iter().map(|(_, _, b)| b.len()).sum::<usize>(),
+        6,
+        "the tap never saw the echoed line: {frames:?}"
+    );
+    let (ack_mid, _tap_mid) = OffsetTap::open(&d.socket(), "usb0", false);
+    assert_eq!(
+        ack_mid["result"]["from_offset"],
+        json!(6),
+        "the live edge did not advance with the delivered bytes: {ack_mid}"
+    );
+
+    let instance = rpc.info()["instance"].as_u64().expect("info.instance");
+
+    // Replace the graph: every hub is dropped and rebuilt.
+    rpc.load_toml(&cfg, true).expect("load --replace");
+    assert_eq!(
+        tap1.wait_closed(Duration::from_secs(5)).as_deref(),
+        Some("graph replaced"),
+        "the tap was orphaned instead of being told its endpoint was replaced (TAP-1)"
+    );
+    // The rebuilt node's *device* state is deliberately not asserted here: a tap hub
+    // exists for every host-facing endpoint from load onward, whatever the device is
+    // doing (§15.8), and this test is about the endpoint's offset space, not the port.
+
+    // The nonce is unchanged — it tracks the daemon *process*, not the graph …
+    assert_eq!(
+        rpc.info()["instance"].as_u64(),
+        Some(instance),
+        "info.instance changed on a graph replace"
+    );
+    // … while the offset space restarted at 0. A client that spliced by offset across
+    // this would corrupt its history; `tap.closed` is what tells it not to.
+    let (ack2, _tap2) = OffsetTap::open(&d.socket(), "usb0", false);
+    assert_eq!(
+        ack2["result"]["from_offset"],
+        json!(0),
+        "the rebuilt endpoint did not restart its offset space: {ack2}"
     );
 }

@@ -9,13 +9,16 @@
 //! future is cancelled (dropped), which runs the waiter's cleanup guard and
 //! removes it from the FIFO queue (§6 cancel-safe waiting). The race uses a
 //! `biased` select so an immediately-ready fast verb is never pre-empted by a
-//! spuriously-read next line.
+//! spuriously-read next line. The second lane **discriminates** what it read
+//! (CTRL-1): only an EOF or a read error cancels, because only those are the
+//! disconnect §15.20 sanctions; a *pipelined* request is answered with an error
+//! carrying its own id and the wait continues.
 
 use std::io;
 use std::rc::Rc;
 
 use nexus_rpc::{
-    Notification, Response, RpcError, base64_encode, error_codes, parse_incoming_request,
+    AppError, Notification, Response, RpcError, base64_encode, error_codes, parse_incoming_request,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -34,6 +37,20 @@ use crate::tap::{OpenTap, TAP_QUEUE_CAP, TapMsg};
 /// §7). One MiB sits far above any real control verb, including a `load`'s inline
 /// graph JSON, and far below memory-pressure territory.
 const MAX_REQUEST_LINE: usize = 1 << 20;
+
+/// The refusal a *pipelined* request gets while a waiting verb is in flight on the
+/// same connection (CTRL-1). Answering it — with its own id, so the client can
+/// correlate — is what the design's §15.20 cancel-on-*disconnect* rule does not
+/// cover: a second request line is not a disconnect, and killing the connection
+/// there costs a §17 browser its whole session (one daemon connection carries
+/// `subscribe`, every tap, and `send`).
+///
+/// The code is [`AppError::WaitInFlight`], a registered application code (§16.8):
+/// the refusal is about the *connection's state*, not the request's contents, so a
+/// standard framing code would misdescribe it and a client could not tell "retry
+/// this once the wait resolves" from "this request is malformed".
+const WAIT_IN_FLIGHT_MESSAGE: &str = "a waiting verb is already in flight on this connection; only one is supported \
+     at a time — open a second connection, or retry once it resolves";
 
 /// The outcome of reading one request line.
 #[derive(Debug)]
@@ -126,7 +143,16 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = RequestLines::new(read_half);
     let mut notes = daemon.subscribe();
-    let mut subscribed = false;
+    // Counts this connection among the daemon's *subscribers* for as long as it is
+    // subscribed (OBS-1). A broadcast receiver is taken at accept — before any
+    // `subscribe` — so `receiver_count()` counts connections, not subscribers, and
+    // the 5 Hz full-graph snapshot was built for anyone merely connected. The tally
+    // decrements on drop, so a panicking connection task cannot leak a phantom
+    // subscriber and keep the daemon serializing state forever.
+    let mut subscribed = SubscriberTally {
+        daemon: daemon.clone(),
+        counted: false,
+    };
 
     // Per-connection tap plumbing (§17): the hubs of every tapped endpoint deliver
     // this connection's tap bytes into one bounded channel (the §5 boundary — a slow
@@ -208,8 +234,24 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                         Some(tap_id) => match open_taps.iter().position(|t| t.tap_id == tap_id) {
                             // Dropping the removed `OpenTap` detaches it from its hub.
                             Some(pos) => {
-                                drop(open_taps.remove(pos));
-                                Response::success(id, json!({ "closed": tap_id }))
+                                let handle = open_taps.remove(pos);
+                                // The graph may have dropped the endpoint out from
+                                // under this tap (`teardown`/`load --replace`/
+                                // `remove-node`, §17). The handle survives the hub's
+                                // removal from the daemon's endpoint map, so without
+                                // this check the close reports success while having
+                                // closed nothing — the silent half of TAP-1.
+                                if handle.is_orphaned() {
+                                    let endpoint = handle.endpoint();
+                                    Response::error(
+                                        id,
+                                        RpcError::invalid_params(format!(
+                                            "tap {tap_id} was already closed by the daemon: its endpoint {endpoint:?} is gone"
+                                        )),
+                                    )
+                                } else {
+                                    Response::success(id, json!({ "closed": tap_id }))
+                                }
                             }
                             None => Response::error(
                                 id,
@@ -230,24 +272,89 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                     // dispatch first, so a fast verb (ready on first poll) is taken
                     // without ever reading — and possibly losing — a following request.
                     //
-                    // Any resolution of the second lane — a dropped/half-closed connection
-                    // (EOF), a pipelined request (unsupported while a verb waits), an
-                    // over-cap line, or a read error — abandons the in-flight verb and
-                    // closes: the design's §15.20 cancel-on-disconnect is normative (a
-                    // killed `lock --wait` client must dequeue promptly), so a bare
-                    // write-half half-close is treated as a disconnect. `serialnexusctl`
-                    // keeps both halves open across the read, so its waiting verbs are
-                    // unaffected; a raw `socat` waiting-verb user must likewise keep the
-                    // write half open (CTRL-3: current behavior is design-correct).
+                    // The second lane discriminates what it read (CTRL-1):
+                    //
+                    // * **EOF or a read error** abandons the in-flight verb and closes.
+                    //   §15.20's cancel-on-disconnect is normative (a killed
+                    //   `lock --wait` client must dequeue promptly) and a bare write-half
+                    //   half-close is indistinguishable from a killed client at read
+                    //   time, so it is treated as a disconnect. `serialnexusctl` keeps
+                    //   both halves open across the read; a raw `socat` waiting-verb user
+                    //   must too (CTRL-3: declined on purpose, and still declined).
+                    // * **A pipelined request** is *not* a disconnect. It is answered
+                    //   with [`WAIT_IN_FLIGHT_MESSAGE`] carrying its own id, and the wait
+                    //   stays intact — a §17 browser drives `subscribe`, every tap and
+                    //   `send` down one connection, so killing it here silently costs the
+                    //   operator the whole session.
+                    // * **An over-cap line** keeps the read-path bound (CTRL-1): refuse
+                    //   with the null id and close, exactly as the first lane does.
+                    //
+                    // `next_line` keeps its partial line in `self.buf`, so a request that
+                    // straddles a cancelled read is never truncated.
                     let dispatch = daemon.dispatch(&method, params);
                     tokio::pin!(dispatch);
-                    tokio::select! {
-                        biased;
-                        result = &mut dispatch => match result {
-                            Ok(value) => Response::success(id, value),
-                            Err(err) => Response::error(id, err),
-                        },
-                        _ = lines.next_line() => break,
+                    let mut settled = None;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            result = &mut dispatch => {
+                                settled = Some(match result {
+                                    Ok(value) => Response::success(id.clone(), value),
+                                    Err(err) => Response::error(id.clone(), err),
+                                });
+                                break;
+                            }
+                            second = lines.next_line() => {
+                                // `close_after` separates "refuse and keep waiting"
+                                // (a pipelined or unparseable line) from "refuse and
+                                // close" (the read-path bound).
+                                let (refusal, close_after) = match second {
+                                    Ok(LineRead::Eof) | Err(_) => break, // cancel-on-disconnect
+                                    Ok(LineRead::TooLong) => (
+                                        Response::error_without_id(RpcError::new(
+                                            error_codes::INVALID_REQUEST,
+                                            format!(
+                                                "request line exceeds the {MAX_REQUEST_LINE}-byte limit"
+                                            ),
+                                        )),
+                                        true,
+                                    ),
+                                    Ok(LineRead::Line(pipelined)) => {
+                                        if pipelined.trim().is_empty() {
+                                            continue;
+                                        }
+                                        // Echo the pipelined request's own id so the
+                                        // client correlates the refusal with the request
+                                        // it refuses; an unparseable line keeps the
+                                        // spec's null id.
+                                        let resp = match parse_incoming_request(&pipelined) {
+                                            Ok(req) => Response::error(
+                                                req.id,
+                                                RpcError::new(
+                                                    AppError::WaitInFlight.code(),
+                                                    WAIT_IN_FLIGHT_MESSAGE,
+                                                ),
+                                            ),
+                                            Err(err) => Response::error_without_id(err),
+                                        };
+                                        (resp, false)
+                                    }
+                                };
+                                let wrote = write_half
+                                    .write_all(nexus_rpc::to_line(&refusal).as_bytes())
+                                    .await
+                                    .is_ok();
+                                if close_after || !wrote {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    match settled {
+                        Some(response) => response,
+                        // The second lane ended the connection; dropping `dispatch`
+                        // here runs the waiter's cleanup guard (§15.20).
+                        None => break,
                     }
                 };
 
@@ -258,11 +365,13 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                 {
                     break;
                 }
-                subscribed |= is_subscribe;
+                if is_subscribe {
+                    subscribed.subscribe();
+                }
             }
             // Only drain notifications once subscribed; before that the receiver
             // just buffers (and drops-oldest on lag), which we never read.
-            note = notes.recv(), if subscribed => match note {
+            note = notes.recv(), if subscribed.counted => match note {
                 Ok(note) => {
                     if write_half
                         .write_all(nexus_rpc::to_line(&note).as_bytes())
@@ -275,21 +384,40 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                 Err(RecvError::Lagged(_)) => {} // skipped snapshots; the next is current
                 Err(RecvError::Closed) => break,
             },
-            // Tap bytes for this connection (§17): base64-frame each into a `tap.data`
-            // notification and write it. `recv` yields `None` only when every sender
-            // is gone; the connection holds `tap_tx` for its whole life, so this only
-            // pends (no tap data) rather than firing spuriously.
+            // Tap deliveries for this connection (§17): base64-frame bytes into a
+            // `tap.data` notification, or relay the terminal `tap.closed`. Both ride
+            // this channel rather than the `subscribe` broadcast because §10 delivers
+            // a tap's stream *on that connection*, subscribed or not. `recv` yields
+            // `None` only when every sender is gone; the connection holds `tap_tx` for
+            // its whole life, so this only pends rather than firing spuriously.
             tap = tap_rx.recv() => if let Some(msg) = tap {
-                let note = Notification::new(
-                    "tap.data",
-                    Some(json!({
-                        "tap": msg.tap_id,
-                        // The endpoint hostward offset of this chunk's first byte
-                        // (§11.8), so a client splices replay and live exactly.
-                        "offset": msg.offset,
-                        "data": base64_encode(&msg.bytes),
-                    })),
-                );
+                let note = match msg {
+                    TapMsg::Data { tap_id, bytes, offset, gap_before } => Notification::new(
+                        "tap.data",
+                        Some(json!({
+                            "tap": tap_id,
+                            // The endpoint hostward offset of this chunk's first byte
+                            // (§11.8), so a client splices replay and live exactly.
+                            "offset": offset,
+                            // Bytes lost at the endpoint's producer→hub feed hop just
+                            // before these (§5, TAP-1b). Normally 0; non-zero means a
+                            // real hole the contiguous offsets cannot show.
+                            "gap_before": gap_before,
+                            "data": base64_encode(&bytes),
+                        })),
+                    ),
+                    // The graph dropped this tap's endpoint (TAP-1). Terminal for the
+                    // tap, not for the connection: its other taps and its subscription
+                    // keep running.
+                    TapMsg::Closed { tap_id, endpoint, reason } => Notification::new(
+                        "tap.closed",
+                        Some(json!({
+                            "tap": tap_id,
+                            "endpoint": endpoint,
+                            "reason": reason,
+                        })),
+                    ),
+                };
                 if write_half
                     .write_all(nexus_rpc::to_line(&note).as_bytes())
                     .await
@@ -298,6 +426,35 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                     break;
                 }
             },
+        }
+    }
+}
+
+/// Counts one control connection among the daemon's *subscribers* while it is
+/// subscribed (OBS-1). Every connection takes a broadcast receiver at accept, so
+/// `broadcast::Sender::receiver_count()` counts connections and the periodic
+/// full-graph snapshot was serialized for clients that never asked for it. Drop —
+/// including on a panicking connection task — decrements, so the count cannot drift
+/// upward and pin the daemon into snapshotting forever.
+struct SubscriberTally {
+    daemon: Rc<Daemon>,
+    counted: bool,
+}
+
+impl SubscriberTally {
+    /// Count this connection once, however many `subscribe` verbs it issues.
+    fn subscribe(&mut self) {
+        if !self.counted {
+            self.counted = true;
+            self.daemon.add_subscriber();
+        }
+    }
+}
+
+impl Drop for SubscriberTally {
+    fn drop(&mut self) {
+        if self.counted {
+            self.daemon.remove_subscriber();
         }
     }
 }
@@ -330,6 +487,112 @@ mod tests {
             _ => panic!("expected the second line"),
         }
         assert!(matches!(lines.next_line().await.unwrap(), LineRead::Eof));
+    }
+
+    // A pipelined request line must be distinguishable from EOF at the read layer:
+    // the cancel-on-disconnect rule (§15.20) applies to `Eof`, and only to `Eof`.
+    // Both arrive on the same lane, so the discrimination the CTRL-1 fix rests on is
+    // exactly this: `Line` before the half-close, `Eof` after it.
+    #[tokio::test]
+    async fn a_pipelined_line_is_not_an_eof() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (read_half, _write_half) = server.into_split();
+        let mut lines = RequestLines::new(read_half);
+
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"state\"}\n")
+            .await
+            .unwrap();
+        assert!(matches!(
+            lines.next_line().await.unwrap(),
+            LineRead::Line(_)
+        ));
+        client.shutdown().await.unwrap();
+        assert!(matches!(lines.next_line().await.unwrap(), LineRead::Eof));
+    }
+
+    // CTRL-1/CP-1, end to end over a real connection: a request pipelined behind an
+    // in-flight *waiting* verb must be answered — with its own id — while the wait
+    // stays intact, and the connection must survive. Before the fix both requests
+    // went unanswered and the connection was torn down, which for a §17 browser
+    // (one daemon connection carrying `subscribe`, every tap and `send`) silently
+    // cost the operator the whole session.
+    #[tokio::test]
+    async fn a_pipelined_request_is_refused_without_killing_the_waiting_verb() {
+        use crate::daemon::Daemon;
+        use crate::runtime::LockCell;
+        use nexus_core::Chunk;
+        use nexus_core::graph::WriteMode;
+        use nexus_core::lock::{Arbitration, EndpointLock, OriginId};
+        use nexus_rpc::{Id, Incoming};
+        use tokio::io::AsyncBufReadExt;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let daemon = Rc::new(Daemon::default());
+
+                // A host endpoint whose lock is already held by another origin, so a
+                // `send` against it parks in the FIFO queue (§6/§15.20).
+                let (notifier, _keep) = tokio::sync::broadcast::channel(8);
+                let lock = Rc::new(LockCell::new(
+                    "usb0",
+                    EndpointLock::new(Arbitration::Exclusive),
+                    notifier,
+                ));
+                let holder = OriginId(1);
+                lock.with_mut(|g| {
+                    g.register(holder, "console-a", WriteMode::OnDemand);
+                    let _ = g.acquire(holder);
+                });
+                let (tx, mut targetward_rx) = mpsc::channel::<Chunk>(4);
+                daemon.advertise_endpoint_for_test("usb0", lock.clone(), tx);
+
+                let (client, server) = UnixStream::pair().unwrap();
+                tokio::task::spawn_local(serve_connection(daemon.clone(), server));
+
+                let (client_read, mut client_write) = client.into_split();
+                let mut replies = BufReader::new(client_read).lines();
+
+                // A waiting verb (a generous deadline, so only the grant ends it),
+                // immediately followed by a pipelined second request.
+                client_write
+                    .write_all(
+                        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"send\",\
+                          \"params\":{\"endpoint\":\"usb0\",\"line\":\"go\",\"timeout_ms\":30000}}\n\
+                          {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"state\"}\n",
+                    )
+                    .await
+                    .unwrap();
+
+                // The pipelined request is answered first, correlated to *its* id.
+                let first = replies.next_line().await.unwrap().expect("a reply");
+                let Ok(Incoming::Response(resp)) = serde_json::from_str::<Incoming>(&first) else {
+                    panic!("expected a response, got {first}");
+                };
+                assert_eq!(
+                    resp.id,
+                    Id::Number(2),
+                    "the refusal must echo the pipelined id"
+                );
+                let err = resp.error.expect("the pipelined request is refused");
+                assert_eq!(err.code, AppError::WaitInFlight.code());
+                assert!(err.message.contains("waiting verb"), "{}", err.message);
+
+                // The wait survived: release the lock and the `send` completes on the
+                // same connection.
+                let _ = lock.with_mut(|g| g.release(holder));
+                lock.wake_waiters();
+
+                let second = replies.next_line().await.unwrap().expect("a second reply");
+                let Ok(Incoming::Response(resp)) = serde_json::from_str::<Incoming>(&second) else {
+                    panic!("expected a response, got {second}");
+                };
+                assert_eq!(resp.id, Id::Number(1), "the waiting verb still answers");
+                assert!(resp.is_success(), "the send should have been granted");
+                assert!(targetward_rx.try_recv().is_ok(), "the line was delivered");
+            })
+            .await;
     }
 
     // A connection streaming past the cap with no newline must not grow the read

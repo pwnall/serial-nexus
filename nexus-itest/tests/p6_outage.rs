@@ -315,3 +315,174 @@ write_mode = "on-demand"
         "post-restore checksum mismatch: {post}"
     );
 }
+
+// ---- LEG-3 / DM-2: the *receiving* side purges its own backlog too -------------
+
+/// `usb0`'s current lock holder / FIFO waiter queue on the receiving daemon (§6).
+fn holder(rpc: &Rpc) -> Option<String> {
+    rpc.node("usb0")?
+        .pointer("/lock/holder")?
+        .as_str()
+        .map(str::to_owned)
+}
+fn waiters(rpc: &Rpc) -> Vec<String> {
+    rpc.node("usb0")
+        .and_then(|n| n.pointer("/lock/waiters").cloned())
+        .and_then(|w| w.as_array().cloned())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_receiving_leg_purges_its_own_targetward_backlog_on_peer_disconnect() {
+    // §6/§7.4's purge-on-reconnect guarantee — "twenty minutes of buffered commands
+    // must not fire into its boot prompt" — held on the *sending* side (asserted by
+    // the test above) and, until LEG-3, silently did not on the receiving one: a
+    // `faces = target` leg owns a bounded queue of wire-arriving chunks plus the one
+    // it is currently trying to write, and nothing purged them when the peer went
+    // away. The code comment even denied the backlog existed.
+    //
+    // The backlog is built deterministically rather than by racing a proxy: a second
+    // writer (`hog`) holds the local endpoint's write lock, so the leg's channel task
+    // takes its first chunk, parks in the FIFO queue behind `hog` — visible in
+    // `usb0.lock.waiters` — and everything after it stacks up in the channel's
+    // inbound queue. That parked chunk *is* §6's "chunk held by a producer suspended
+    // mid-send", the case a single non-yielding `try_recv` pass misses.
+    //
+    // No serial device: `usb0`'s device is absent, so it is `waiting` while its lock
+    // and origins exist structurally — this runs on every platform.
+    const FRAMES: usize = 4;
+    const FRAME_LEN: u64 = 64;
+    const TOTAL: u64 = FRAMES as u64 * FRAME_LEN;
+
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let leg = d.run().join("leg.sock");
+    let cfg = format!(
+        r#"
+[[node]]
+type = "serial"
+name = "usb0"
+device = "{dev}"
+[[node]]
+type = "pty"
+name = "hog"
+path = "{hog}"
+[[node]]
+type = "leg"
+name = "uplink"
+faces = "target"
+transport = "unix"
+role = "listen"
+address = "{leg}"
+idle_release_ms = 60000
+channels = ["c0"]
+[[edge]]
+a = "usb0"
+b = "uplink/c0"
+write_mode = "on-demand"
+[[edge]]
+a = "usb0"
+b = "hog"
+"#,
+        dev = d.run().join("absent-device").display(),
+        hog = d.run().join("hog").display(),
+        leg = leg.display(),
+    );
+    rpc.load_toml(&cfg, false)
+        .expect("load receiving-leg graph");
+    assert!(
+        rpc.wait_status("hog", "active", Duration::from_secs(10)),
+        "hog pty not active: {:?}",
+        rpc.node("hog")
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || leg.exists()),
+        "the leg never bound its listen socket"
+    );
+
+    // A local writer holds the floor, so nothing the peer sends can be written.
+    rpc.lock("hog", false, false, None).expect("lock hog");
+    assert_eq!(holder(rpc).as_deref(), Some("hog"), "hog should hold usb0");
+
+    // The remote operator types four commands into the outage.
+    let leg_str = leg.to_string_lossy().into_owned();
+    let mut args: Vec<String> = vec![
+        "wire".into(),
+        "--transport".into(),
+        "unix".into(),
+        "--address".into(),
+        leg_str,
+        "--announce".into(),
+        "c0".into(),
+    ];
+    for _ in 0..FRAMES {
+        args.push("--send".into());
+        args.push(format!("c0={FRAME_LEN}"));
+    }
+    args.extend([
+        "--hold-ms".into(),
+        "30000".into(),
+        "--timeout-ms".into(),
+        "40000".into(),
+    ]);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let peer = Sim::spawn(&argv, None);
+
+    // The leg's channel task took the first chunk and is parked in the FIFO queue
+    // behind `hog`; the rest are queued behind it. That is the backlog under test.
+    assert!(
+        wait_until(Duration::from_secs(10), || waiters(rpc)
+            == vec!["uplink/c0".to_string()]),
+        "the leg's channel task never queued for the local write lock: {:?}",
+        rpc.node("usb0")
+    );
+
+    // The peer's machine vanishes mid-outage.
+    drop(peer);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            leg_connection(rpc, "uplink").as_deref() != Some("connected")
+        }),
+        "the leg never registered the peer's disconnect: {:?}",
+        rpc.node("uplink")
+    );
+
+    // The local floor frees. The leg is granted the lock it was queued for — and
+    // must then discard everything the dead connection left behind rather than fire
+    // it at a device that has moved on (§6).
+    rpc.unlock("hog").expect("unlock hog");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            purged_on_reconnect(rpc, "uplink", "c0") == TOTAL
+        }),
+        "the receiving side did not purge its outage-era backlog to quiescence \
+         (want {TOTAL} bytes, LEG-3/DM-2): {:?}",
+        rpc.node("uplink")
+    );
+    let node = rpc.node("uplink").expect("uplink node");
+    assert_eq!(
+        node.pointer("/channels/c0/accepted_targetward")
+            .and_then(Value::as_u64),
+        Some(0),
+        "an outage-era command reached the local graph: {node}"
+    );
+    // The purge is not a loss report in disguise: nothing is charged to the ordinary
+    // targetward discard counter (§5 keeps the two causes apart, LEG-4).
+    assert_eq!(
+        node.pointer("/channels/c0/discarded_targetward")
+            .and_then(Value::as_u64),
+        Some(0),
+        "purged bytes were also counted as an ordinary discard: {node}"
+    );
+    // …and the leg gave the local endpoint's floor back on the way out (§7.1).
+    assert!(
+        wait_until(Duration::from_secs(5), || holder(rpc).is_none()),
+        "the leg kept the local write lock after purging: {:?}",
+        rpc.node("usb0")
+    );
+}

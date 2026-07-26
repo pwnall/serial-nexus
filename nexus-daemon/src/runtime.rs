@@ -133,7 +133,15 @@ impl LockCell {
 
     /// Emit an immediate id-less `lock` notification to subscribers on a lock
     /// transition (§10: acquire, release, steal, lease expiry, detach-release). A
-    /// no-op when nobody is subscribed. Must be called with no outstanding borrow.
+    /// no-op when nobody is *connected*. Must be called with no outstanding borrow.
+    ///
+    /// This deliberately gates on `receiver_count()` — connections — where the 5 Hz
+    /// state snapshot gates on the daemon's exact subscriber tally (OBS-1). The two
+    /// answer the same question differently on purpose: the snapshot is periodic and
+    /// serialises the whole graph, so building it for a merely-connected client was
+    /// real waste; a lock transition is human-scale and rare, and the tally lives on
+    /// the `Daemon` rather than here, so threading it into every endpoint's lock
+    /// would buy nothing. A connected-but-unsubscribed receiver simply lags.
     pub fn emit_change(&self) {
         if self.notifier.receiver_count() == 0 {
             return;
@@ -226,25 +234,155 @@ pub(crate) fn frame_ranges(
     })
 }
 
-/// Split `bytes` into consecutive envelope [`Event::data`] frames on `channel`,
-/// yielding `(piece_len, frame)` per piece — the envelope-framing wrapper over the
-/// shared [`frame_ranges`] boundary helper (§15.24). The peer/child reassembles per
-/// channel. Shared by the leg's write half and the exec codec's stdin feed (§5
-/// no-drop / all-loss-counted).
+/// One item of the [`data_frames`] fragmentation stream.
+///
+/// The enum exists so the *residual* cannot be dropped on the floor: a caller
+/// matching on this has to say what happens to [`Self::Residual`], where the
+/// previous `map_while` shape simply ended the iteration and truncated the chunk
+/// in silence (RV-9). Invariant 3's stated shape is "fragment, never
+/// skip-on-error, **count any residual**" — this is the type that enforces the
+/// third clause.
+pub(crate) enum DataFrame {
+    /// A framed piece: `(payload_len, frame_bytes)`. `payload_len` is the number
+    /// of *source* bytes this frame carries, for the caller's throughput counters.
+    Piece(usize, Vec<u8>),
+    /// The unframable tail, in source bytes: `encode` refused a piece, so this
+    /// many bytes of the chunk were never framed. Terminal — the iterator ends
+    /// after yielding it — and the caller must count it (§5 all-loss-counted).
+    Residual(usize),
+}
+
+/// Split `bytes` into consecutive envelope [`Event::data`] frames on `channel` —
+/// the envelope-framing wrapper over the shared [`frame_ranges`] boundary helper
+/// (§15.24). The peer/child reassembles per channel. Shared by the leg's write half
+/// and the exec codec's stdin feed (§5 no-drop / all-loss-counted).
+///
+/// `encode` is infallible for any sane channel id (each range provably fits the
+/// frame bound once the header is added); it can only refuse when the channel
+/// identity itself is long enough that `frame_payload_cap`'s floor-at-1 still
+/// overflows [`MAX_FRAME_SIZE`]. That is pathological rather than impossible —
+/// nothing bounds identity length structurally today — so the tail is reported as
+/// [`DataFrame::Residual`] instead of vanishing.
 pub(crate) fn data_frames<'a>(
     channel: &'a str,
     bytes: &'a Chunk,
-) -> impl Iterator<Item = (usize, Vec<u8>)> + 'a {
-    frame_ranges(channel, bytes.len()).map_while(move |(off, end)| {
-        let mut frame = Vec::new();
-        // Encode is infallible for a sane channel id (the graph forbids the
-        // pathological ones); on the defensive error, stop fragmenting this chunk
-        // (`map_while` fuses the range iterator, matching the pre-refactor behavior).
-        if encode(&Event::data(channel, bytes.slice(off..end)), &mut frame).is_err() {
+) -> impl Iterator<Item = DataFrame> + 'a {
+    let total = bytes.len();
+    let mut ranges = frame_ranges(channel, total);
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
             return None;
         }
-        Some((end - off, frame))
+        let Some((off, end)) = ranges.next() else {
+            done = true;
+            return None;
+        };
+        let mut frame = Vec::new();
+        if encode(&Event::data(channel, bytes.slice(off..end)), &mut frame).is_err() {
+            // Stop fragmenting this chunk, but hand the caller the exact number of
+            // source bytes that never reached a frame so it can be attributed.
+            done = true;
+            return Some(DataFrame::Residual(total - off));
+        }
+        Some(DataFrame::Piece(end - off, frame))
     })
+}
+
+/// A monotonic byte counter a hostward [`fan_out`] charges its unattached loss to.
+///
+/// Two shapes exist in the daemon and both must work through one helper: the serial
+/// reader's `Arc<AtomicU64>` (its producer runs on a dedicated blocking thread,
+/// §15.19, so the counter has to be `Send`/`Sync`) and every interior node's
+/// single-threaded `Cell<u64>`. Taking the accounting as a trait object is what lets
+/// the five former hand-rolled fan-out loops collapse into one (§16, F1) without
+/// either side reshaping its counter.
+pub(crate) trait LossCounter {
+    fn add(&self, n: u64);
+}
+
+impl LossCounter for AtomicU64 {
+    fn add(&self, n: u64) {
+        self.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+impl LossCounter for Cell<u64> {
+    fn add(&self, n: u64) {
+        self.set(self.get() + n);
+    }
+}
+
+/// What one hostward [`fan_out`] did with its chunk, for the producer's own
+/// per-node/per-channel bookkeeping.
+pub(crate) struct FanOut {
+    /// Whether at least one *live* sink took the chunk (or was charged a
+    /// full-buffer drop for it). `false` means the chunk reached no live graph
+    /// consumer at all — the empty-sinks and all-`Closed` cases — and its bytes
+    /// have already been charged to the caller's unattached counter.
+    pub live: bool,
+    /// Bytes dropped at a sink whose bounded buffer was full. Already charged to
+    /// that sink's own [`DropCounters`] (§5: loss is counted at the boundary that
+    /// drops it); returned so a producer that *also* mirrors full-buffer loss in a
+    /// per-channel counter (the leg's `discarded_hostward`) needs no second loop.
+    pub dropped_full: u64,
+}
+
+/// Broadcast one hostward chunk to every attached sink, accounting for all loss
+/// (§5) — the **one** shared hostward fan-out, previously hand-rolled once per
+/// producing node (serial, codec, exec, leg, map) with only the serial copy
+/// counting the all-sinks-closed case (F1/DM-3, design §16).
+///
+/// Delivery is lossy at the consuming boundary: a full bounded buffer costs that
+/// consumer its bytes and nobody else (`try_send`, never `await`), which is what
+/// keeps a slow spy from backpressuring the device. Three outcomes, each accounted:
+///
+/// * **Delivered** — the sink took it; nothing to count.
+/// * **Full** — the consumer has fallen behind; the drop is charged to *its*
+///   [`DropCounters`] and the consumer is still live.
+/// * **Closed** — the receiver is gone (whole-node teardown, or a consumer
+///   cascade-removed while this producer survives, which leaves a permanently
+///   `Closed` sink in the producer's snapshot). Counted only if *no* sink took the
+///   chunk, so a live neighbour is not charged for a dead one.
+///
+/// Taking `unattached` by parameter — rather than returning "nobody took it" and
+/// trusting each caller to remember — is the point: the all-sinks-closed case is
+/// charged here, by construction, before the caller sees the result. The tap/ring
+/// mirror is deliberately *not* part of this: it is a spy outside the graph with its
+/// own accounting (§5, AGENTS.md invariant 9), so it must never suppress the
+/// unattached count. Mirror before calling this, and pass the graph sinks only.
+pub(crate) fn fan_out(
+    chunk: &Chunk,
+    sinks: &[HostwardSink],
+    unattached: &dyn LossCounter,
+) -> FanOut {
+    let n = chunk.len() as u64;
+    let mut out = FanOut {
+        live: false,
+        dropped_full: 0,
+    };
+    for (tx, counters) in sinks {
+        match tx.try_send(chunk.clone()) {
+            // Delivered to a live consumer.
+            Ok(()) => out.live = true,
+            // Slow consumer: its bounded buffer is full — the drop is counted
+            // against it, and it is still live.
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                counters.add_full(n);
+                out.dropped_full += n;
+                out.live = true;
+            }
+            // Receiver gone; attributed below only if no sink took the chunk.
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+    if !out.live {
+        // No live graph consumer took the chunk (empty or all-`Closed` sinks): count
+        // it where it was lost so §5's "loss is always visible and attributable"
+        // holds — independent of whether a tap or ring mirrored a copy.
+        unattached.add(n);
+    }
+    out
 }
 
 /// Hostward drop counters for one consuming boundary (§5). All hostward loss is
@@ -369,22 +507,16 @@ impl Wiring {
     /// Build the channel plan from the validated graph (load validates first,
     /// §11), keyed by endpoint. Every host-facing endpoint gets a lock, a fan-out
     /// sink list, and one arbitrated targetward channel; every edge wires one
-    /// host↔target pair. A log target's write mode is inherently `never` (§7.3),
-    /// so it gets no targetward path; every other target keeps its declared mode.
+    /// host↔target pair with the mode
+    /// [`GraphConfig::effective_write_mode`](nexus_core::config::GraphConfig::effective_write_mode)
+    /// reports — the single source of truth for the log⇒`never` and
+    /// map-`raw`⇒`held` promotions, shared with the validator so the two halves
+    /// cannot disagree about what a graph actually does (§16).
     pub fn build(config: &GraphConfig, notifier: &broadcast::Sender<Notification>) -> Wiring {
         // Every endpoint's facing + arbitration, keyed by its address (§4). Derived
         // from each node's shape, so codec channels and multiplexed sides appear
         // alongside single-endpoint boundary nodes.
         let mut facing: HashMap<EndpointAddr, (Facing, Arbitration)> = HashMap::new();
-        let mut is_log: HashMap<&str, bool> = HashMap::new();
-        // A map node's raw (target-facing) endpoint addresses (§7.8). The map's edge
-        // into the upstream is `held` by default — the map owns the console's writes,
-        // with steal-to-bypass as the sanctioned raw path — but the generic edge
-        // default is `on-demand`, which a held-origin interior pump cannot drive (it
-        // would park forever), so an omitted/on-demand map raw edge is promoted to
-        // `held` below, mirroring the log→never override.
-        let mut is_map_raw: std::collections::HashSet<EndpointAddr> =
-            std::collections::HashSet::new();
         // A serial node's configured hostward-consumer drop policy (§5, §7.1): the
         // fan-out buffer depth to each of its consumers. Other producers (codec
         // channels) use the built-in default.
@@ -410,18 +542,11 @@ impl Wiring {
                     host_ring_cap.insert(addr, cap);
                 }
             }
-            is_log.insert(n.name(), matches!(n, NodeConfig::Log { .. }));
             if let NodeConfig::Serial {
                 hostward_buffer, ..
             } = n
             {
                 host_hostward_depth.insert(n.name(), *hostward_buffer);
-            }
-            if matches!(n, NodeConfig::Map { .. }) {
-                is_map_raw.insert(EndpointAddr::channel(
-                    n.name(),
-                    nexus_core::config::MAP_RAW_ENDPOINT,
-                ));
             }
         }
 
@@ -478,25 +603,13 @@ impl Wiring {
 
             // Register this attachment as an origin on the host endpoint's lock
             // (§6), labelled by the target's address so `lock`/`unlock` can name
-            // it. A log target is inherently `never`; a map's raw edge is `held` by
-            // default (§7.8); every other edge carries its declared mode. The
-            // origin's label is its display address.
-            let mode = if is_log.get(target.node.as_str()).copied().unwrap_or(false) {
-                WriteMode::Never
-            } else if is_map_raw.contains(target) && edge.write_mode == WriteMode::OnDemand {
-                // A map's edge into the upstream endpoint defaults to `held` (§7.8):
-                // the map owns the console's writes and holds the upstream lock, with
-                // steal-to-bypass as the sanctioned raw path. The generic edge default
-                // is `on-demand`, which the held-origin targetward pump cannot drive
-                // (`reacquire_held` only grants a `held` origin, so on-demand would
-                // park forever). Promote the default here — mirroring the log→never
-                // override — so an omitted `write_mode` yields the working held path.
-                // Explicit `held` passes through unchanged; explicit `never` is
-                // preserved for a read-only/display map (no targetward path).
-                WriteMode::Held
-            } else {
-                edge.write_mode
-            };
+            // it. The two configuration-to-runtime promotions — a log target forces
+            // `never` (§7.3), a map's `raw` endpoint promotes `on-demand` to `held`
+            // (§7.8) — live in `GraphConfig::effective_write_mode`, not here: the
+            // validator reasons about the same effective modes the wiring registers,
+            // so the two can never drift (§16 "one rule, one place"). The origin's
+            // label is its display address.
+            let mode = config.effective_write_mode(edge);
             let origin_id = OriginId(next_origin);
             next_origin += 1;
             if let Some(lock) = wiring.endpoint_locks.get(host) {
@@ -588,4 +701,226 @@ pub async fn write_all(fd: RawFd, mut data: &[u8]) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- fragmentation boundary (invariant 3's single shared helper) ------------
+
+    #[test]
+    fn frame_payload_cap_reserves_the_envelope_header() {
+        // 1 type byte + 2 channel-length bytes + the channel id (`codec_api::encode`).
+        assert_eq!(frame_payload_cap(""), MAX_FRAME_SIZE - 3);
+        assert_eq!(frame_payload_cap("console"), MAX_FRAME_SIZE - 3 - 7);
+    }
+
+    #[test]
+    fn frame_payload_cap_is_floored_at_one_for_a_pathological_channel_id() {
+        // A channel id long enough to consume the whole frame would give a cap of 0
+        // and an iterator that never advances. The floor keeps `frame_ranges`
+        // productive; whether the resulting frame *encodes* is `data_frames`'
+        // problem, and it reports the residual rather than truncating silently.
+        let huge = "c".repeat(MAX_FRAME_SIZE * 2);
+        assert_eq!(frame_payload_cap(&huge), 1);
+        let exact = "c".repeat(MAX_FRAME_SIZE - 3);
+        assert_eq!(
+            frame_payload_cap(&exact),
+            1,
+            "0 would be the unfloored value"
+        );
+    }
+
+    #[test]
+    fn frame_ranges_covers_every_byte_exactly_once() {
+        let cap = frame_payload_cap("ch");
+        for total in [0usize, 1, cap - 1, cap, cap + 1, 2 * cap, 2 * cap + 7] {
+            let ranges: Vec<(usize, usize)> = frame_ranges("ch", total).collect();
+            // Contiguous, non-overlapping, in order, and never wider than the cap.
+            let mut expect_off = 0usize;
+            for (off, end) in &ranges {
+                assert_eq!(
+                    *off, expect_off,
+                    "ranges must be contiguous (total {total})"
+                );
+                assert!(end > off, "no empty range (total {total})");
+                assert!(end - off <= cap, "no range exceeds the cap (total {total})");
+                expect_off = *end;
+            }
+            assert_eq!(
+                expect_off, total,
+                "ranges must cover the chunk (total {total})"
+            );
+            assert_eq!(
+                ranges.len(),
+                total.div_ceil(cap),
+                "piece count (total {total})"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_ranges_of_an_empty_chunk_yields_nothing() {
+        assert_eq!(frame_ranges("ch", 0).count(), 0);
+    }
+
+    // --- data_frames: fragment, never skip-on-error, count any residual ---------
+
+    /// Reassemble a `data_frames` stream, returning `(payload, residual)`.
+    fn drive(channel: &str, bytes: &Chunk) -> (Vec<u8>, usize) {
+        let mut payload = Vec::new();
+        let mut residual = 0usize;
+        for item in data_frames(channel, bytes) {
+            match item {
+                DataFrame::Piece(len, frame) => {
+                    // The frame is `len` source bytes plus a 4-byte length prefix and
+                    // the 3 + channel.len() envelope header.
+                    assert_eq!(frame.len(), 4 + 3 + channel.len() + len);
+                    let start = frame.len() - len;
+                    payload.extend_from_slice(&frame[start..]);
+                }
+                DataFrame::Residual(n) => residual += n,
+            }
+        }
+        (payload, residual)
+    }
+
+    #[test]
+    fn data_frames_fragments_byte_exactly_with_no_residual() {
+        let cap = frame_payload_cap("console");
+        for total in [0usize, 1, cap, cap + 1, 3 * cap + 11] {
+            let src: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+            let chunk = Chunk::from(src.clone());
+            let (payload, residual) = drive("console", &chunk);
+            assert_eq!(
+                payload, src,
+                "reassembly must be byte-exact (total {total})"
+            );
+            assert_eq!(
+                residual, 0,
+                "a sane channel id never residuals (total {total})"
+            );
+        }
+    }
+
+    #[test]
+    fn data_frames_reports_the_residual_instead_of_truncating_in_silence() {
+        // RV-9: with a channel identity long enough that even a 1-byte payload
+        // overflows MAX_FRAME_SIZE, `encode` refuses every piece. The old `map_while`
+        // shape ended the iteration and lost the chunk without a trace; the residual
+        // is the whole chunk, and the caller is forced to see it.
+        let channel = "c".repeat(MAX_FRAME_SIZE);
+        let chunk = Chunk::copy_from_slice(b"twelve bytes");
+        let (payload, residual) = drive(&channel, &chunk);
+        assert!(payload.is_empty(), "nothing could be framed");
+        assert_eq!(residual, chunk.len(), "the whole chunk is reported as loss");
+    }
+
+    #[test]
+    fn data_frames_residual_is_terminal() {
+        let channel = "c".repeat(MAX_FRAME_SIZE);
+        let chunk = Chunk::copy_from_slice(b"twelve bytes");
+        let items: Vec<DataFrame> = data_frames(&channel, &chunk).collect();
+        assert_eq!(items.len(), 1, "the residual ends the stream");
+        assert!(matches!(items[0], DataFrame::Residual(12)));
+    }
+
+    // --- the shared hostward fan-out (F1) --------------------------------------
+
+    fn sink(cap: usize) -> (HostwardSink, mpsc::Receiver<Chunk>, Arc<DropCounters>) {
+        let (tx, rx) = mpsc::channel::<Chunk>(cap);
+        let counters = Arc::new(DropCounters::default());
+        ((tx, counters.clone()), rx, counters)
+    }
+
+    #[test]
+    fn fan_out_with_no_sinks_counts_the_whole_chunk_as_unattached() {
+        let unattached = Cell::new(0u64);
+        let chunk = Chunk::copy_from_slice(b"hello");
+        let out = fan_out(&chunk, &[], &unattached);
+        assert!(!out.live);
+        assert_eq!(out.dropped_full, 0);
+        assert_eq!(unattached.get(), 5);
+    }
+
+    #[test]
+    fn fan_out_with_all_sinks_closed_counts_unattached_not_full() {
+        // The consumer-cascade-removed case: a permanently `Closed` sink is not a
+        // slow consumer, so it must not be charged a full-buffer drop — and the
+        // chunk reached nobody, so it is unattached loss (§5).
+        let (s1, rx1, c1) = sink(4);
+        let (s2, rx2, c2) = sink(4);
+        drop(rx1);
+        drop(rx2);
+        let unattached = Cell::new(0u64);
+        let chunk = Chunk::copy_from_slice(b"hello");
+        let out = fan_out(&chunk, &[s1, s2], &unattached);
+        assert!(!out.live);
+        assert_eq!(unattached.get(), 5);
+        assert_eq!(c1.dropped_full(), 0);
+        assert_eq!(c2.dropped_full(), 0);
+    }
+
+    #[test]
+    fn fan_out_charges_a_full_sink_and_still_delivers_to_a_live_one() {
+        // One consumer has fallen behind (its bounded buffer is full) and one keeps
+        // up. The slow one is charged, the fast one is served, and nothing is
+        // unattached — a slow spy costs only itself (§5).
+        let (full_sink, _full_rx, full_counters) = sink(1);
+        full_sink
+            .0
+            .try_send(Chunk::copy_from_slice(b"x"))
+            .expect("fill the slow consumer's buffer");
+        let (live_sink, mut live_rx, live_counters) = sink(4);
+
+        let unattached = Cell::new(0u64);
+        let chunk = Chunk::copy_from_slice(b"hello");
+        let out = fan_out(&chunk, &[full_sink, live_sink], &unattached);
+
+        assert!(out.live);
+        assert_eq!(out.dropped_full, 5, "the full sink's drop is reported back");
+        assert_eq!(full_counters.dropped_full(), 5, "charged where it dropped");
+        assert_eq!(live_counters.dropped_full(), 0);
+        assert_eq!(unattached.get(), 0, "a live consumer took it");
+        assert_eq!(&live_rx.try_recv().expect("delivered")[..], b"hello");
+    }
+
+    #[test]
+    fn fan_out_counts_a_closed_sink_only_when_no_live_sink_took_the_chunk() {
+        // A dead neighbour must not be charged against a healthy one: with one live
+        // sink present, the closed sink contributes nothing to the unattached count.
+        let (dead_sink, dead_rx, _dead_counters) = sink(4);
+        drop(dead_rx);
+        let (live_sink, mut live_rx, _live_counters) = sink(4);
+        let unattached = Cell::new(0u64);
+        let chunk = Chunk::copy_from_slice(b"hello");
+        let out = fan_out(&chunk, &[dead_sink, live_sink], &unattached);
+        assert!(out.live);
+        assert_eq!(unattached.get(), 0);
+        assert!(live_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn fan_out_charges_an_atomic_counter_from_the_blocking_reader_shape() {
+        // The serial reader runs on a dedicated blocking thread (§15.19), so its
+        // counter is an `Arc<AtomicU64>` rather than a `Cell`. Both must work
+        // through the one helper (F1).
+        let unattached = Arc::new(AtomicU64::new(0));
+        let chunk = Chunk::copy_from_slice(b"hello");
+        assert!(!fan_out(&chunk, &[], &*unattached).live);
+        assert_eq!(unattached.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn fan_out_of_an_empty_chunk_still_reports_liveness_without_counting_bytes() {
+        let unattached = Cell::new(0u64);
+        let out = fan_out(&Chunk::new(), &[], &unattached);
+        assert!(!out.live);
+        assert_eq!(
+            unattached.get(),
+            0,
+            "a zero-length chunk is zero bytes of loss"
+        );
+    }
 }

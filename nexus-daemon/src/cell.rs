@@ -10,9 +10,19 @@
 //! a *synchronous* closure — [`CriticalCell::with`] / [`CriticalCell::with_mut`] —
 //! so the borrow guard is created and dropped inside the closure and can never be
 //! held across an `.await` (a non-async closure cannot even contain one). Raw
-//! `std::cell::RefCell` is banned in this crate by `serialnexusd/clippy.toml`'s
-//! `disallowed-types`; the single sanctioned instance is the one wrapped here, so
-//! the tripwire is a compile-shape fact rather than a thing reviewers must catch.
+//! `std::cell::RefCell` is banned by `disallowed-types` in **`nexus-daemon/clippy.toml`
+//! and `serialnexusd/clippy.toml` alike**; the single sanctioned instance is the one
+//! wrapped here, so the tripwire is a compile-shape fact rather than a thing
+//! reviewers must catch.
+//!
+//! Both files are needed, and that is the point of the trap this comment used to fall
+//! into: clippy resolves `clippy.toml` from `CARGO_MANIFEST_DIR` upward through
+//! *ancestors*, so when daemon state moved from `serialnexusd` to this sibling crate
+//! at the v8 library split, the ban silently stopped covering the code it was written
+//! for — proven with a planted `RefCell` plus a lint canary, and unnoticed for a
+//! release. A configuration gate disarms without a sound when its crate moves, so the
+//! durable half of the fix is the meta-gate test that greps for the type directly
+//! (`nexus-itest/tests/meta_gates.rs`), which survives the next move.
 //!
 //! It does **not** change re-entrancy: calling `with_mut` on a cell already
 //! borrowed panics, exactly as a nested `borrow_mut` would — that hazard was never

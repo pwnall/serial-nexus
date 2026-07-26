@@ -62,8 +62,9 @@ export XDG_RUNTIME_DIR=$(mktemp -d /tmp/snx.XXXX)
 BIN=$PWD/target/debug
 
 # 3. Stand a fake device where /dev/ttyUSB0 would be — an echoing PTY behind a
-#    stable symlink.
-"$BIN/nexus-sim" pty --echo --link "$XDG_RUNTIME_DIR/device" &
+#    stable symlink. --timeout-ms is the sim's *idle* timeout: it exits after that
+#    long with no traffic, and the 5 s default expires long before step 7.
+"$BIN/nexus-sim" pty --echo --link "$XDG_RUNTIME_DIR/device" --timeout-ms 60000 &
 
 # 4. Start the daemon. It creates $XDG_RUNTIME_DIR/serialnexusd.sock (mode 0600 —
 #    whoever can open the socket owns every console).
@@ -93,8 +94,8 @@ EOF
 #   -> loaded 2 node(s)
 
 "$BIN/serialnexusctl" state
-#   -> usb0     active
-#   -> console  active
+#   -> usb0             active
+#   -> console          active
 
 # 7. Send a line targetward through the endpoint; the fake device echoes it back,
 #    the serial node reads it hostward, and it fans out to the console PTY.
@@ -106,14 +107,26 @@ EOF
 ```
 
 To watch the echo arrive on the console instead of trusting the send count,
-attach any terminal to the pty before step 7 — for example `screen
-"$XDG_RUNTIME_DIR/console"`, or, without a terminal, drive it with the test
-double:
+attach any terminal to the pty — for example `screen "$XDG_RUNTIME_DIR/console"`
+— or, without a terminal, let the test double drive the whole round trip itself:
 
 ```sh
-"$BIN/nexus-sim" client --path "$XDG_RUNTIME_DIR/console" --drain &
-"$BIN/serialnexusctl" send usb0 --line "hello"   # the client reports 6 bytes received
+"$BIN/nexus-sim" client --path "$XDG_RUNTIME_DIR/console" --send seeded:64 --expect echo
+#   -> {"expect":"echo","mode":"client","pass":true,"received":64,"sent":64,
+#       "sha256_received":"6b612dc8…","sha256_sent":"6b612dc8…","tool":"nexus-sim"}
 ```
+
+The client writes 64 seeded bytes into the console PTY; they travel targetward
+through the serial node to the fake device, which echoes them, and the serial
+node reads them back hostward and fans them out to the same PTY. `pass` is the
+byte-exact verdict — it is `received == sent && sha256_received == sha256_sent`,
+not a count — and the sim's exit status is 0 only when `pass` is true, so the one
+line is scriptable as-is. Let the client both send and verify: a bare `--drain`
+reader started alongside `serialnexusctl send` races the send and reports only
+whatever it managed to read before its one-second quiet timer fires — which is
+routinely nothing. A drain that read nothing now *fails* (`pass: false`, exit 1),
+so the race is at least visible; it is still the wrong tool for confirming a
+round trip, because a drain has no expectation to check against.
 
 **Why `arbitration = "free-for-all"`?** Writing is arbitrated per endpoint, and
 the default is `exclusive`: a terminal attached to `console` would have to grab
@@ -164,8 +177,8 @@ hardening guidance.
 
 ## Documentation
 
-- [`docs/20-design-claude-fable-v9.md`](docs/20-design-claude-fable-v9.md) — the normative design document (concepts, node types, RPC contract, and the reasoning behind each decision).
-- [`docs/21-implementation-plan-claude-fable-v9.md`](docs/21-implementation-plan-claude-fable-v9.md) — the normative implementation plan (phases and post-1.0 tracks).
+- [`docs/24-design-claude-fable-v11.md`](docs/24-design-claude-fable-v11.md) — the normative design document (concepts, node types, RPC contract, and the reasoning behind each decision). A `§N` reference anywhere in this repository means this document.
+- [`docs/25-implementation-plan-claude-fable-v11.md`](docs/25-implementation-plan-claude-fable-v11.md) — the normative implementation plan (phases and post-1.0 tracks).
 - [`docs/rpc/`](docs/rpc/) — the JSON-RPC method reference (the stable contract of §10).
 - [`docs/codec-authors.md`](docs/codec-authors.md) — writing a codec: the trait, the event vocabulary, and the envelope protocol for external (any-language) codecs.
 - [`docs/security.md`](docs/security.md) — threat model and hardening.

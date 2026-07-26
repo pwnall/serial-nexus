@@ -38,18 +38,17 @@ use nexus_core::config::{
     StopBits as CfgStop,
 };
 use nexus_core::resolver::{DeviceKind, Resolver};
-use nexus_core::state::NodeStatus;
+use nexus_core::state::{NodeState, NodeStatus};
 use nix::poll::PollFlags;
 use serde_json::json;
 use serial2::{CharSize, FlowControl, Parity, SerialPort, Settings, StopBits};
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{Notify, mpsc::error::TryRecvError};
 use tokio::task::JoinHandle;
 
-use crate::boundary::BlockingReader;
+use crate::boundary::{self, BlockingReader};
 use crate::cell::CriticalCell;
-use crate::runtime::{self, HostwardSink, READ_BUF};
+use crate::runtime::{self, HostwardSink, READ_BUF, fan_out};
 use crate::tap::TapFeed;
 use nexus_sys as sys;
 
@@ -82,7 +81,10 @@ struct OpenParams {
 /// shared on the single runtime thread (Rc/[`CriticalCell`] — the reader thread
 /// touches only atomics, never this).
 struct SerialShared {
-    status: NodeStatus,
+    /// The node's observed status *and the moment it entered it* (§7). Reported
+    /// through [`NodeState`] so a flapping adapter's `waiting` stamp answers "since
+    /// when?" rather than "when was the last reconnect poll?".
+    status: NodeState,
     /// The currently-open port, or `None` while `waiting`/`faulted`. Retained for
     /// `state_extra` (driver counters) and the serial-signal verbs.
     port: Option<Rc<SerialPort>>,
@@ -167,7 +169,10 @@ impl SerialNode {
             device: device.clone(),
             resolver: resolver.clone(),
             params,
-            shared: Rc::new(CriticalCell::new(SerialShared { status, port })),
+            shared: Rc::new(CriticalCell::new(SerialShared {
+                status: NodeState::new(status),
+                port,
+            })),
             reader_slot: Rc::new(CriticalCell::new(BlockingReader::default())),
             discarded_unattached: Arc::new(AtomicU64::new(0)),
             purged_reconnect: Arc::new(AtomicU64::new(0)),
@@ -202,7 +207,7 @@ impl SerialNode {
         self.tasks.push(tokio::task::spawn_local(supervise(ctx)));
     }
 
-    pub fn status(&self) -> NodeStatus {
+    pub fn status(&self) -> NodeState {
         self.shared.with(|sh| sh.status.clone())
     }
 
@@ -253,17 +258,27 @@ impl SerialNode {
         })
     }
 
+    /// Ask this node's workers to stop, without waiting (§16.1, BND-1). Aborts the
+    /// supervisor — so it cannot re-arm a reader behind teardown's back — and sets
+    /// the reader thread's stop flag; the thread is *not* joined here and the port
+    /// is deliberately kept, since its fd must outlive the reader (§7.1 fd-reuse).
+    /// Teardown calls this on every node first, then pays the join cost once.
+    pub fn signal_stop(&mut self) {
+        for t in self.tasks.drain(..) {
+            t.abort();
+        }
+        self.reader_slot.with_mut(|slot| slot.signal_stop());
+    }
+
     /// Stop the supervisor and the reader thread, then drop the port. The reader is
     /// joined *before* the port drops so its fd stays valid throughout (fd-reuse
-    /// race). Called on teardown/shutdown.
+    /// race). Called on teardown/shutdown; idempotent after [`Self::signal_stop`].
     pub fn teardown(&mut self) {
         // Abort the supervisor first so it cannot re-arm a reader after we join.
         // Sync teardown holds the runtime thread, so the aborted task will not run
         // again before we finish; its dropped future releases its port clone after
         // the reader is already joined.
-        for t in self.tasks.drain(..) {
-            t.abort();
-        }
+        self.signal_stop();
         stop_join_reader(&self.reader_slot);
         self.shared.with_mut(|sh| sh.port = None);
     }
@@ -400,17 +415,11 @@ async fn active_step(
 /// accumulated while the node was `waiting`; draining them with a counter is the
 /// one sanctioned targetward drop. Post-reconnect commands are kept.
 ///
-/// A backpressured origin is parked inside `tx.send(chunk).await` holding one
-/// already-read, outage-era chunk. A synchronous `try_recv` loop frees channel
-/// permits but never yields, so that blocked send would resolve only on the
-/// supervisor's next await — after `set_active` — and fire its stale chunk into
-/// the just-reopened (likely power-cycled) device. So drain the channel, then
-/// `yield_now` to let every freed-permit sender resolve, and drain again — a
-/// *bounded* few rounds, enough to flush the finite in-flight chunks (one per
-/// suspended sender) without unboundedly draining a continuously-producing origin,
-/// whose genuinely-post-reconnect bytes are kept. Runs while the node is still
-/// `waiting` (no reader/writer armed), so nothing reaches the device during the
-/// drain.
+/// The bounded drain-then-yield rounds live in
+/// [`boundary::drain_to_quiescence`] — the leg's purge-on-reconnect (§7.4) needs
+/// the identical semantics, and re-deriving them per node is what §16.1 exists to
+/// stop. This runs while the node is still `waiting` (no reader/writer armed), so
+/// nothing reaches the device during the drain.
 async fn purge_on_reconnect(ctx: &mut SuperviseCtx) {
     if !ctx.params.purge_on_reconnect {
         return;
@@ -418,42 +427,7 @@ async fn purge_on_reconnect(ctx: &mut SuperviseCtx) {
     let Some(rx) = ctx.targetward.as_mut() else {
         return;
     };
-    let mut purged = 0u64;
-    // Drain the currently-buffered backlog, then give any origin suspended inside
-    // `tx.send().await` (backpressured, §5, holding one already-read outage-era
-    // chunk) a *bounded* chance to resolve and be drained+counted. A freed channel
-    // permit wakes a blocked sender, and one `yield_now` runs every currently-
-    // runnable one, so a couple of drain+yield rounds flush the finite in-flight
-    // chunks (one per suspended sender) without unboundedly draining a
-    // continuously-producing origin — a streaming leg's genuinely-post-reconnect
-    // bytes are kept, not purged. Termination is by *whether a chunk was drained*,
-    // never a byte-count delta: a round that drains only zero-length chunks still
-    // made progress and must yield, or a backpressured non-empty chunk behind those
-    // empties would be stranded. The node is still `waiting` here (no reader/writer
-    // armed), so nothing reaches the device during the drain.
-    for _ in 0..3 {
-        let mut drained_any = false;
-        loop {
-            match rx.try_recv() {
-                Ok(chunk) => {
-                    purged += chunk.len() as u64;
-                    drained_any = true;
-                }
-                Err(TryRecvError::Empty) => break,
-                // The senders are gone; the writer will observe close next.
-                Err(TryRecvError::Disconnected) => break,
-            }
-        }
-        // Nothing drained this pass: no origin was blocked behind the channel, so
-        // the pipeline is quiescent.
-        if !drained_any {
-            break;
-        }
-        // Let any origin blocked in `tx.send().await` behind the (now-drained) full
-        // channel resolve its in-flight chunk so the next pass drains it, before the
-        // node goes Active and the writer starts.
-        tokio::task::yield_now().await;
-    }
+    let purged = boundary::drain_to_quiescence(rx).await;
     if purged > 0 {
         ctx.purged.fetch_add(purged, Ordering::Relaxed);
     }
@@ -489,21 +463,24 @@ fn stop_join_reader(reader_slot: &Rc<CriticalCell<BlockingReader>>) {
 fn set_active(ctx: &SuperviseCtx, port: Rc<SerialPort>) {
     ctx.shared.with_mut(|sh| {
         sh.port = Some(port);
-        sh.status = NodeStatus::Active;
+        sh.status.set(NodeStatus::Active);
     });
 }
 
 fn set_waiting(ctx: &SuperviseCtx, reason: String) {
     ctx.shared.with_mut(|sh| {
         sh.port = None;
-        sh.status = NodeStatus::Waiting { reason };
+        sh.status.set(NodeStatus::Waiting { reason });
     });
 }
 
+/// Fault the node with `reason`. The reconnect poll re-derives the same reason on
+/// every failed retry, and [`NodeState::set`] re-stamps only on a real transition,
+/// so the reported age stays the age of the *fault*, not of the last poll (§7).
 fn fault(ctx: &SuperviseCtx, reason: String) {
     ctx.shared.with_mut(|sh| {
         sh.port = None;
-        sh.status = NodeStatus::Faulted { reason };
+        sh.status.set(NodeStatus::Faulted { reason });
     });
 }
 
@@ -557,41 +534,18 @@ fn reader_thread(
                         }
                         let chunk = Chunk::copy_from_slice(&buf[..n]);
                         // Mirror to the tap hub (lossy, never backpressures the
-                        // device — §5); excluded from the `any_live` accounting so a
-                        // spy tap never masks a real consumer's absence.
+                        // device — §5); done *before* the fan-out and excluded from
+                        // it, so a spy tap never masks a real consumer's absence.
                         if let Some(feed) = &tap_feed {
                             feed.mirror(&chunk);
                         }
-                        // Whether the chunk reached any live *graph* boundary. A consumer
-                        // cascade-removed while this node survives leaves a
-                        // permanently-Closed sink in this snapshot (never rebuilt);
-                        // if every sink is Closed the chunk would vanish uncounted,
-                        // so track liveness and attribute it below (§5).
-                        let mut any_live = false;
-                        for (tx, counters) in &hostward {
-                            match tx.try_send(chunk.clone()) {
-                                // Delivered to a live consumer.
-                                Ok(()) => any_live = true,
-                                // Slow consumer: its bounded buffer is full — the
-                                // drop is counted against it, and it is still live.
-                                Err(TrySendError::Full(_)) => {
-                                    counters.add_full(n as u64);
-                                    any_live = true;
-                                }
-                                // Receiver gone: whole-node teardown, or a consumer
-                                // cascade-removed while this node lives. Counted
-                                // below only if no sink took the chunk.
-                                Err(TrySendError::Closed(_)) => {}
-                            }
-                        }
-                        // No live graph consumer took the chunk (empty/all-Closed sinks):
-                        // count it as unattached loss so §5's "loss is always visible and
-                        // attributable" holds — independent of whether a tap or ring
-                        // mirrored a copy (that mirror has its own drop accounting, and
-                        // the ring keeps only its last bytes, so the loss is real).
-                        if !any_live {
-                            discarded_unattached.fetch_add(n as u64, Ordering::Relaxed);
-                        }
+                        // The one shared hostward fan-out (§5, F1): it delivers,
+                        // charges a slow consumer's full-buffer drop to that
+                        // consumer, and charges an all-`Closed`/empty sink set to
+                        // `discarded_unattached` — the case a consumer cascade-removed
+                        // while this node survives produces, which would otherwise
+                        // vanish uncounted.
+                        fan_out(&chunk, &hostward, &*discarded_unattached);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => {
@@ -792,9 +746,9 @@ mod tests {
             targetward,
             tap_feed: None,
             shared: Rc::new(CriticalCell::new(SerialShared {
-                status: NodeStatus::Waiting {
+                status: NodeState::new(NodeStatus::Waiting {
                     reason: "test".into(),
-                },
+                }),
                 port: None,
             })),
             reader_slot: Rc::new(CriticalCell::new(BlockingReader::default())),
@@ -803,83 +757,54 @@ mod tests {
         }
     }
 
-    /// XC-PURGE-1: purge-on-reconnect must also drain a chunk an origin is blocked
-    /// mid-`send` behind the full channel — otherwise it fires into the reopened
-    /// device on the first post-reconnect `recv`. The count must stay exact.
+    /// XC-PURGE-1 (wiring guard): the drain-to-quiescence *semantics* are tested
+    /// once, on the shared helper (`boundary::drain_to_quiescence`); what stays here
+    /// is that this node routes them correctly — the backlog is drained and the
+    /// count lands on `purged_on_reconnect` (§7.1).
     #[test]
-    fn purge_on_reconnect_drains_backpressured_in_flight_chunk() {
-        // A current-thread runtime + LocalSet mirrors the daemon (single-threaded,
-        // cooperative): a producer blocked in `send().await` resolves only when the
-        // purge yields, which is exactly what the fix must do.
+    fn purge_on_reconnect_drains_the_backlog_and_counts_it() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async {
-            // A capacity-2 targetward channel, filled so a third send backpressures.
-            let (tx, rx) = mpsc::channel::<Chunk>(2);
+            let (tx, rx) = mpsc::channel::<Chunk>(4);
             tx.send(Chunk::copy_from_slice(b"AAA")).await.unwrap(); // 3 bytes
             tx.send(Chunk::copy_from_slice(b"BBBB")).await.unwrap(); // 4 bytes
-            // A backpressured origin: suspended inside `send().await` holding one
-            // already-read, outage-era chunk (§5). Keep `tx` alive so the channel
-            // stays connected, as real origins persist across a reopen.
-            let tx2 = tx.clone();
-            let producer = tokio::task::spawn_local(async move {
-                tx2.send(Chunk::copy_from_slice(b"CCCCC")).await.unwrap(); // 5 bytes
-            });
-            tokio::task::yield_now().await; // let the producer reach its blocked send
-            assert!(!producer.is_finished(), "producer must be blocked in send");
 
             let mut ctx = test_ctx(Some(rx));
             purge_on_reconnect(&mut ctx).await;
 
-            // The blocked send resolved and was drained+counted — not left to fire
-            // into the reopened device — and the count is exact.
-            assert!(producer.is_finished(), "blocked send must have resolved");
-            assert_eq!(ctx.purged.load(Ordering::Relaxed), 3 + 4 + 5);
-            // Nothing outage-era remains for the writer to send.
+            assert_eq!(ctx.purged.load(Ordering::Relaxed), 3 + 4);
             let mut rx = ctx.targetward.take().unwrap();
-            assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
             drop(tx);
         });
     }
 
-    /// XC-PURGE-1 (empty-chunk guard): the drain loop must terminate on whether a
-    /// chunk was *drained*, not on a byte-count delta — otherwise a round that
-    /// drains only zero-length chunks reads as "no progress", breaks without
-    /// yielding, and strands a backpressured non-empty chunk queued behind the
-    /// empties (which then fires into the reopened device). A capacity-2 channel is
-    /// filled with two 0-byte chunks; a 3rd non-empty send backpressures.
+    /// `purge_on_reconnect = false` (§7.1) keeps the outage-era backlog: an operator
+    /// who wants their queued commands delivered after a replug must get them, and
+    /// nothing may be counted as purged.
     #[test]
-    fn purge_on_reconnect_drains_past_empty_chunks() {
+    fn purge_on_reconnect_disabled_keeps_the_backlog() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async {
-            let (tx, rx) = mpsc::channel::<Chunk>(2);
-            tx.send(Chunk::new()).await.unwrap(); // 0 bytes
-            tx.send(Chunk::new()).await.unwrap(); // 0 bytes — channel now full
-            let tx2 = tx.clone();
-            let producer = tokio::task::spawn_local(async move {
-                tx2.send(Chunk::copy_from_slice(b"CCCCC")).await.unwrap(); // 5 bytes
-            });
-            tokio::task::yield_now().await;
-            assert!(!producer.is_finished(), "producer must be blocked in send");
+            let (tx, rx) = mpsc::channel::<Chunk>(4);
+            tx.send(Chunk::copy_from_slice(b"AAA")).await.unwrap();
 
             let mut ctx = test_ctx(Some(rx));
+            ctx.params.purge_on_reconnect = false;
             purge_on_reconnect(&mut ctx).await;
 
-            // The non-empty chunk behind the two empties resolved and was drained —
-            // not stranded to fire into the reopened device — and only its 5 bytes
-            // count (the empties contribute 0).
-            assert!(
-                producer.is_finished(),
-                "the send behind the empty chunks must have resolved"
-            );
-            assert_eq!(ctx.purged.load(Ordering::Relaxed), 5);
+            assert_eq!(ctx.purged.load(Ordering::Relaxed), 0);
             let mut rx = ctx.targetward.take().unwrap();
-            assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+            assert!(matches!(rx.try_recv(), Ok(c) if c.len() == 3));
             drop(tx);
         });
     }

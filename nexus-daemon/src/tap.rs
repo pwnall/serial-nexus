@@ -10,10 +10,14 @@
 //! mutating the operator-owned graph (§8, §11).
 //!
 //! The **replay ring** is a per-host-facing-endpoint bounded ring of the most
-//! recent hostward bytes (`replay_ring = <bytes>`, default off). It is a feature
-//! buffer, explicitly *not* flow control: it never backpressures and costs nothing
-//! when unset. A tap opened with `--replay` receives the ring snapshot and then the
-//! live stream with an **exact splice** — no gap, no duplication.
+//! recent hostward bytes (`replay_ring = <bytes>`, **default 65536** on every
+//! host-facing endpoint since §15.32; `0` opts out). It is a feature buffer,
+//! explicitly *not* flow control: it never backpressures the device. Its cost is
+//! stated rather than hidden (§5) — bounded memory per endpoint plus one mirrored
+//! copy of each hostward chunk into the tap feed, which is why the ring must stay
+//! bulk-memcpy circular storage ([`ReplayRing`]) now that it sits on *every*
+//! endpoint's hot path. A tap opened with `--replay` receives the ring snapshot and
+//! then the live stream with an **exact splice** — no gap, no duplication.
 //!
 //! Both live in one per-endpoint [`TapHub`] behind `Rc<CriticalCell<TapHub>>` on
 //! the runtime thread. The producer mirrors hostward bytes into a bounded feed
@@ -56,16 +60,38 @@ pub const TAP_FEED_CAP: usize = 256;
 /// giant line. Matches the data-plane read buffer.
 const REPLAY_PIECE: usize = 64 * 1024;
 
-/// One tap-data delivery to a control connection: the hostward bytes for one tap.
-/// The connection base64-encodes `bytes` into a `tap.data` notification (§10).
-pub struct TapMsg {
-    pub tap_id: u64,
-    pub bytes: Chunk,
-    /// The endpoint's monotonic hostward byte offset of `bytes[0]` (§10/§15.32): the
-    /// count of hostward bytes ingested at this endpoint before these. Lets a
-    /// reconnecting client (the browser history of §17) splice replay and live
-    /// exactly, trimming any overlap instead of duplicating ring bytes on reload.
-    pub offset: u64,
+/// One delivery from a hub to a control connection over that connection's tap
+/// channel (§10/§17). Both variants become id-less notifications on the tap's own
+/// connection — `tap.data` carries bytes, `tap.closed` is the stream's terminal
+/// event — which is why they ride the tap channel and not the `subscribe`
+/// broadcast: §10 delivers a tap's stream *on that connection*, whether or not the
+/// client also subscribed.
+pub enum TapMsg {
+    /// Hostward bytes for one tap.
+    Data {
+        tap_id: u64,
+        bytes: Chunk,
+        /// The endpoint's monotonic hostward byte offset of `bytes[0]` (§10/§15.32):
+        /// the count of hostward bytes ingested at this endpoint before these. Lets a
+        /// reconnecting client (the browser history of §17) splice replay and live
+        /// exactly, trimming any overlap instead of duplicating ring bytes on reload.
+        offset: u64,
+        /// Bytes lost at this endpoint's producer→hub feed hop that are *not*
+        /// represented in the offset space — the hole the offsets alone cannot show
+        /// (§5 all-loss-counted, TAP-1b). See [`TapHub::ingest`] for why the offset
+        /// space deliberately stays the delivered-bytes space and the loss is
+        /// signalled beside it instead.
+        gap_before: u64,
+    },
+    /// The tap's endpoint went away beneath it — `teardown`, `load --replace`, or
+    /// `remove-node` dropped the hub while this tap was open (§17, TAP-1). Without
+    /// this the client sits on a live connection receiving nothing forever, with no
+    /// notification and no error.
+    Closed {
+        tap_id: u64,
+        endpoint: String,
+        reason: &'static str,
+    },
 }
 
 /// The outcome of registering a tap (§11.8): how many replay bytes were queued and the
@@ -75,6 +101,32 @@ pub struct TapMsg {
 pub struct Registered {
     pub replay_bytes: u64,
     pub from_offset: u64,
+    /// Bytes this endpoint has lost at the producer→hub feed hop so far (§5). The
+    /// offset space counts only delivered bytes, so this is the client's baseline
+    /// for the `gap_before` deltas that follow (TAP-1b).
+    pub feed_dropped: u64,
+}
+
+/// Why a hub was detached from beneath its open taps (§17 `tap.closed`). Static
+/// strings: the reason is a stable, machine-readable token in the notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapCloseReason {
+    /// `remove-node` dropped the endpoint's owning node.
+    EndpointRemoved,
+    /// `load --replace` rebuilt the whole graph.
+    GraphReplaced,
+    /// `teardown` (or clean shutdown) cleared the graph.
+    Teardown,
+}
+
+impl TapCloseReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TapCloseReason::EndpointRemoved => "endpoint removed",
+            TapCloseReason::GraphReplaced => "graph replaced",
+            TapCloseReason::Teardown => "teardown",
+        }
+    }
 }
 
 /// The producer side of a tap feed: where a host-facing producer mirrors its
@@ -98,7 +150,10 @@ impl TapFeed {
     /// drops — and that drop is counted (`feed_dropped`) so §5's "loss is always
     /// counted" holds even for this internal hop. A dropped chunk shows as a gap in
     /// the ring / every tap; the exact-splice guarantee is between the snapshot and
-    /// the live stream, not a promise the ring never loses under a firehose.
+    /// the live stream, not a promise the ring never loses under a firehose. The
+    /// counter is *shared* with the hub, which turns it into the per-chunk
+    /// `gap_before` a tap client sees ([`TapHub::ingest`]) — so the hole is visible,
+    /// not merely tallied.
     pub fn mirror(&self, chunk: &Chunk) {
         if self.active.load(Ordering::Relaxed) && self.tx.try_send(chunk.clone()).is_err() {
             self.feed_dropped
@@ -205,8 +260,19 @@ pub struct TapHub {
     /// Bytes lost at the producer→hub feed hop, shared with the [`TapFeed`] that
     /// counts them (§5); surfaced in `state`.
     feed_dropped: Arc<AtomicU64>,
-    /// The endpoint display, for diagnostics.
-    _endpoint: String,
+    /// The value of `feed_dropped` this hub has already reported to its taps, so
+    /// each [`Self::ingest`] can charge only the *new* loss as that chunk's
+    /// `gap_before` (TAP-1b).
+    feed_dropped_seen: u64,
+    /// Set once the graph dropped this hub out from under its taps
+    /// ([`Self::detach_all`]). Connection-side [`OpenTap`] handles outlive the
+    /// graph, so this is how a later `tap.close` learns the tap is already gone and
+    /// fails loudly instead of reporting a success that closed nothing (§17,
+    /// TAP-1).
+    orphaned: bool,
+    /// The endpoint display: reported in `state`, and named in the `tap.closed`
+    /// notification so a client learns *which* of its taps died.
+    endpoint: String,
 }
 
 /// A shared, single-threaded handle to one endpoint's [`TapHub`].
@@ -234,7 +300,9 @@ impl TapHub {
             ingested: 0,
             active: active.clone(),
             feed_dropped: feed_dropped.clone(),
-            _endpoint: endpoint.into(),
+            feed_dropped_seen: 0,
+            orphaned: false,
+            endpoint: endpoint.into(),
         };
         (Rc::new(CriticalCell::new(hub)), active, feed_dropped)
     }
@@ -244,19 +312,42 @@ impl TapHub {
     /// against its own drop counter and stays live; a tap whose `out` is closed
     /// (its connection dropped) is removed. Synchronous — no `.await` — so it never
     /// interleaves with [`Self::register`] (the exact-splice guarantee).
+    ///
+    /// **The offset space stays the delivered-bytes space, and feed loss is
+    /// signalled beside it** (TAP-1b, §11.8). `ingested` counts only bytes that
+    /// reached this hub, which is what keeps invariant 10 true in both halves: the
+    /// ring holds `≤ ingested` bytes by construction, `from_offset = ingested −
+    /// ring.len()` cannot underflow, *and* the ring stays contiguous in offset
+    /// space — the property [`Self::register`]'s exact splice rests on. Folding the
+    /// lossy [`TapFeed::mirror`] hop's drops into `ingested` would break that second
+    /// half: a hole inside the retained window makes `ingested − ring.len()` no
+    /// longer the ring's true base offset, and a browser splicing by offset would
+    /// then write replay bytes at offsets the live stream never uses — a silent
+    /// corruption strictly worse than the invisible gap. The drop also cannot be
+    /// *placed* exactly: it happens on the producer's (possibly blocking) thread
+    /// while up to [`TAP_FEED_CAP`] chunks are still queued ahead of it, and the
+    /// only cross-thread plumbing is the shared `feed_dropped` atomic. So the hole
+    /// is reported as `gap_before` on the first chunk drained after it — exact in
+    /// *size*, approximate in *position* (early by at most the feed depth) — which
+    /// is enough for a consumer to detect it, which is what §5 requires.
     pub fn ingest(&mut self, chunk: &Chunk) {
         if let Some(ring) = &mut self.ring {
             ring.push(chunk);
         }
         let n = chunk.len() as u64;
+        // New feed-hop loss since the last chunk: the gap this chunk follows.
+        let observed = self.feed_dropped.load(Ordering::Relaxed);
+        let gap_before = observed.wrapping_sub(self.feed_dropped_seen);
+        self.feed_dropped_seen = observed;
         // Offset of this chunk's first byte in the endpoint's hostward stream (§11.8),
         // stamped before advancing the running total.
         let offset = self.ingested;
         self.taps.retain(|tap| {
-            match tap.out.try_send(TapMsg {
+            match tap.out.try_send(TapMsg::Data {
                 tap_id: tap.id,
                 bytes: chunk.clone(),
                 offset,
+                gap_before,
             }) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -298,10 +389,13 @@ impl TapHub {
             for piece in snap.chunks(REPLAY_PIECE) {
                 let bytes = Chunk::copy_from_slice(piece);
                 let len = bytes.len() as u64;
-                match out.try_send(TapMsg {
+                match out.try_send(TapMsg::Data {
                     tap_id: id,
                     bytes,
                     offset: piece_off,
+                    // The ring is contiguous in offset space by construction, so a
+                    // replay piece never straddles a hole (see `ingest`).
+                    gap_before: 0,
                 }) {
                     Ok(()) => replay_bytes += len,
                     Err(mpsc::error::TrySendError::Full(_)) => {
@@ -317,6 +411,7 @@ impl TapHub {
         Registered {
             replay_bytes,
             from_offset,
+            feed_dropped: self.feed_dropped.load(Ordering::Relaxed),
         }
     }
 
@@ -327,10 +422,50 @@ impl TapHub {
         self.refresh_active();
     }
 
+    /// Detach every open tap because the graph dropped this hub's endpoint (§17,
+    /// TAP-1): `teardown`, `load --replace`, or `remove-node`. Each tap's owning
+    /// connection is told with a terminal [`TapMsg::Closed`] on its own tap channel
+    /// — best effort, since a connection that has stopped draining its bounded
+    /// queue is already counted as dropping — and the hub is marked `orphaned`, so
+    /// a later `tap.close` on the surviving handle fails instead of reporting a
+    /// success that closed nothing. Returns the ids that were live, for the caller's
+    /// log line.
+    ///
+    /// The ring is released here: connection-side [`OpenTap`] handles keep the hub
+    /// alive after the graph is gone, and a detached hub can never be tapped again
+    /// (the daemon has already removed it from its endpoint map), so retaining
+    /// scrollback nobody can reach is pure leak.
+    pub fn detach_all(&mut self, reason: TapCloseReason) -> Vec<u64> {
+        let ids: Vec<u64> = self.taps.iter().map(|t| t.id).collect();
+        for tap in &self.taps {
+            let _ = tap.out.try_send(TapMsg::Closed {
+                tap_id: tap.id,
+                endpoint: self.endpoint.clone(),
+                reason: reason.as_str(),
+            });
+        }
+        self.taps.clear();
+        self.ring = None;
+        self.orphaned = true;
+        self.active.store(false, Ordering::Relaxed);
+        ids
+    }
+
+    /// Whether the graph dropped this hub out from under its taps
+    /// ([`Self::detach_all`]).
+    pub fn is_orphaned(&self) -> bool {
+        self.orphaned
+    }
+
+    /// The endpoint display this hub observes.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     /// The hub is active (producer should mirror) while a ring is configured or any
-    /// tap is open. A ring keeps it active for the endpoint's whole life.
+    /// tap is open — never once orphaned, since its endpoint no longer exists.
     fn refresh_active(&self) {
-        let active = self.ring.is_some() || !self.taps.is_empty();
+        let active = !self.orphaned && (self.ring.is_some() || !self.taps.is_empty());
         self.active.store(active, Ordering::Relaxed);
     }
 
@@ -357,6 +492,19 @@ pub struct OpenTap {
     pub hub: SharedTapHub,
 }
 
+impl OpenTap {
+    /// Whether this tap's endpoint was dropped out from under it (§17, TAP-1) —
+    /// what makes a later `tap.close` an error rather than a hollow success.
+    pub fn is_orphaned(&self) -> bool {
+        self.hub.with(TapHub::is_orphaned)
+    }
+
+    /// The endpoint this tap observed, for the `tap.close` diagnostic.
+    pub fn endpoint(&self) -> String {
+        self.hub.with(|h| h.endpoint().to_owned())
+    }
+}
+
 impl Drop for OpenTap {
     fn drop(&mut self) {
         self.hub.with_mut(|h| h.close(self.tap_id));
@@ -378,7 +526,26 @@ mod tests {
     fn drain(rx: &mut mpsc::Receiver<TapMsg>) -> Vec<u8> {
         let mut out = Vec::new();
         while let Ok(msg) = rx.try_recv() {
-            out.extend_from_slice(&msg.bytes);
+            if let TapMsg::Data { bytes, .. } = msg {
+                out.extend_from_slice(&bytes);
+            }
+        }
+        out
+    }
+
+    /// `(offset, gap_before, bytes)` per delivered data message.
+    fn drain_data(rx: &mut mpsc::Receiver<TapMsg>) -> Vec<(u64, u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let TapMsg::Data {
+                offset,
+                gap_before,
+                bytes,
+                ..
+            } = msg
+            {
+                out.push((offset, gap_before, bytes.to_vec()));
+            }
         }
         out
     }
@@ -445,5 +612,91 @@ mod tests {
         hub.with_mut(|h| h.close(7));
         assert!(!active.load(Ordering::Relaxed));
         assert!(hub.with(|h| h.snapshot().taps.is_empty()));
+    }
+
+    // TAP-1b: bytes lost at the lossy producer→hub feed hop are invisible in the
+    // offset space (which counts delivered bytes only, so invariant 10 and the
+    // exact replay splice both survive), so the hub charges them to the *next*
+    // chunk's `gap_before`. Without it a client splicing by offset concatenates a
+    // holed stream and cannot tell.
+    #[test]
+    fn feed_loss_surfaces_as_gap_before_on_the_next_chunk() {
+        let (hub, _active, feed_dropped) = TapHub::new("usb0", 0);
+        let (tx, mut rx) = mpsc::channel(16);
+        let dropped = Rc::new(Cell::new(0));
+        hub.with_mut(|h| h.register(1, tx, dropped, false));
+
+        hub.with_mut(|h| h.ingest(&Chunk::from_static(b"aaaa")));
+        // The producer's `mirror` found the feed full and dropped 7 bytes.
+        feed_dropped.fetch_add(7, Ordering::Relaxed);
+        hub.with_mut(|h| h.ingest(&Chunk::from_static(b"bb")));
+        // No further loss: the gap is reported exactly once, not re-reported.
+        hub.with_mut(|h| h.ingest(&Chunk::from_static(b"c")));
+
+        assert_eq!(
+            drain_data(&mut rx),
+            vec![
+                (0, 0, b"aaaa".to_vec()),
+                (4, 7, b"bb".to_vec()),
+                (6, 0, b"c".to_vec()),
+            ]
+        );
+    }
+
+    // Invariant 10, re-verified against the TAP-1b fix: feed-hop loss must not
+    // enter `ingested`, or `from_offset = ingested − ring.len()` stops naming the
+    // ring's true base offset (and could underflow). The ring stays contiguous in
+    // offset space, so replay still splices exactly across a feed drop.
+    #[test]
+    fn feed_loss_does_not_shift_the_replay_offset_space() {
+        let (hub, _active, feed_dropped) = TapHub::new("usb0", 8);
+        hub.with_mut(|h| h.ingest(&Chunk::from_static(b"0123")));
+        feed_dropped.fetch_add(1000, Ordering::Relaxed); // a firehose overrun
+        hub.with_mut(|h| h.ingest(&Chunk::from_static(b"4567")));
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let dropped = Rc::new(Cell::new(0));
+        let reg = hub.with_mut(|h| h.register(1, tx, dropped, true));
+        // 8 delivered bytes, an 8-byte ring: replay is the whole stream from 0.
+        assert_eq!(reg.replay_bytes, 8);
+        assert_eq!(reg.from_offset, 0);
+        assert_eq!(reg.feed_dropped, 1000);
+        hub.with_mut(|h| h.ingest(&Chunk::from_static(b"89")));
+        assert_eq!(drain(&mut rx), b"0123456789");
+    }
+
+    // TAP-1: `teardown`/`load --replace`/`remove-node` drop the hub while taps are
+    // open. The client's `OpenTap` handle survives, so the tap must be told —
+    // terminal `tap.closed` on its own channel — and the hub must remember it was
+    // orphaned so a later `tap.close` fails instead of reporting a hollow success.
+    #[test]
+    fn detach_all_notifies_open_taps_and_marks_the_hub_orphaned() {
+        let (hub, active, _fd) = TapHub::new("mux/console", 64);
+        let (tx, mut rx) = mpsc::channel(8);
+        let dropped = Rc::new(Cell::new(0));
+        hub.with_mut(|h| h.register(3, tx, dropped, false));
+        hub.with_mut(|h| h.ingest(&Chunk::from_static(b"hi")));
+
+        let ids = hub.with_mut(|h| h.detach_all(TapCloseReason::GraphReplaced));
+        assert_eq!(ids, vec![3]);
+        assert!(hub.with(TapHub::is_orphaned));
+        // A ring alone used to keep the producer mirroring; an orphaned hub never does.
+        assert!(!active.load(Ordering::Relaxed));
+        assert!(hub.with(|h| h.snapshot().taps.is_empty()));
+
+        // The data chunk, then the terminal close carrying endpoint and reason.
+        assert!(matches!(rx.try_recv(), Ok(TapMsg::Data { .. })));
+        match rx.try_recv() {
+            Ok(TapMsg::Closed {
+                tap_id,
+                endpoint,
+                reason,
+            }) => {
+                assert_eq!(tap_id, 3);
+                assert_eq!(endpoint, "mux/console");
+                assert_eq!(reason, "graph replaced");
+            }
+            _ => panic!("expected a terminal TapMsg::Closed"),
+        }
     }
 }

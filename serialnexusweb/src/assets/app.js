@@ -12,7 +12,8 @@
 // tested); OPFS I/O is opfs.mjs; both degrade to memory-only where OPFS is absent.
 // (ES modules are always strict, so no "use strict" pragma is needed.)
 
-import { newHistory, fromStored, splice, bytesOf } from "/history.mjs";
+import { newHistory, fromStored, splice, bytesOf, offsetSpaceReset } from "/history.mjs";
+import { makeSaver } from "/saver.mjs";
 import { opfsAvailable, requestPersistence, load, save, clear } from "/opfs.mjs";
 
 const consolesEl = document.getElementById("consoles");
@@ -39,9 +40,16 @@ let decoder = new TextDecoder("utf-8", { fatal: false });
 let instanceNonce = null;           // daemon per-boot nonce (§11.8); history reset key
 let opfsOk = opfsAvailable();       // false → memory-only fallback
 let persistStatus = "unavailable";  // persisted | best-effort | unavailable
+let storageError = null;            // last persistence failure, shown in the badge
 let history = null;                 // current console's ConsoleHistory (history.mjs)
-let historyKey = null;              // OPFS key for the current console
+let historyKey = null;              // OPFS key for the current console — set with `history`
 let saveTimer = null;               // debounced persist handle
+let selectGen = 0;                  // selectConsole re-entrancy generation (see below)
+
+// At most one OPFS write in flight per key, newest snapshot wins: `createWritable()`
+// truncates, so two overlapping full-buffer rewrites of one console's scrollback let the
+// second truncate into the middle of the first. Failures are surfaced, not swallowed.
+const saver = makeSaver(save, (err) => storageFailed(err));
 
 function rpc(method, params) {
   return new Promise((resolve) => {
@@ -91,6 +99,7 @@ function onMessage(text) {
     case "state": lastState = msg.params; renderConsoles(); break;
     case "lock": renderConsoles(); break;
     case "tap.data": onTapData(msg.params); break;
+    case "tap.closed": onTapClosed(msg.params); break;
   }
 }
 
@@ -148,8 +157,24 @@ function updateHead() {
 }
 
 function renderStorageBadge() {
+  if (storageError) {
+    storageEl.textContent = "history: memory only (write failed)";
+    storageEl.title = storageError;
+    return;
+  }
   if (!opfsOk) { storageEl.textContent = "history: memory only"; return; }
   storageEl.textContent = `history: OPFS (${persistStatus})`;
+}
+
+// A failed persist drops us to memory-only *visibly* — in the badge, in the terminal,
+// and in the console log. Origin storage is evictable and quota-limited, so honesty
+// about best-effort persistence beats pretending (§15.32).
+function storageFailed(err) {
+  opfsOk = false;
+  storageError = String((err && err.message) || err);
+  console.error("serial_nexus: console history persistence failed", err);
+  renderStorageBadge();
+  appendMarker("— history persistence failed; scrollback is memory-only from here —\n");
 }
 
 // The OPFS key isolates history per daemon and per boot: the web origin (a stable
@@ -159,32 +184,67 @@ function keyFor(display) {
   return `${location.host}::${display}::${instanceNonce ?? "unknown"}`;
 }
 
+// Selecting a console spans three awaits, and clicks do not queue: a second click can
+// land in any of the gaps. A generation counter captured at entry and re-checked after
+// every await makes a superseded continuation abandon its work — otherwise the loser
+// leaks its daemon-side tap (it never reaches the `tap.close`) and, worse, pairs its own
+// bytes with the winner's storage key, where `save()` truncates and one console's
+// scrollback overwrites another's. `historyKey` and `history` are therefore adopted in
+// one synchronous step and never exist as a mismatched pair.
 async function selectConsole(display) {
-  flushSave();
-  if (currentTap !== null) { await rpc("tap.close", { tap: currentTap }); currentTap = null; }
+  const gen = ++selectGen;
+  flushSave();                       // persist the outgoing console under its own key
+
+  // Drop everything the previous console owned, synchronously. Clearing `currentTap`
+  // before the await means an overlapping selection neither closes it twice nor mistakes
+  // a stale tap's bytes for the new console's.
+  const closing = currentTap;
+  currentTap = null;
+  history = null;
+  historyKey = null;
   selected = display;
   decoder = new TextDecoder("utf-8", { fatal: false });
   termEl.textContent = "";
-  historyKey = keyFor(display);
+  renderConsoles();
+
+  if (closing !== null) {
+    await rpc("tap.close", { tap: closing });
+    if (gen !== selectGen) return;
+  }
 
   // Restore persisted scrollback (if any) before the ring replay, so the frontier trims
   // the ring's overlap and the terminal shows history-then-ring-then-live contiguously.
+  const key = keyFor(display);
   let stored = null;
-  if (opfsOk) { try { stored = await load(historyKey); } catch { stored = null; } }
+  if (opfsOk) { try { stored = await load(key); } catch { stored = null; } }
+  if (gen !== selectGen) return;
+
+  historyKey = key;
+  history = stored ? fromStored(stored.bytes, stored.endOffset) : newHistory();
   if (stored) {
-    history = fromStored(stored.bytes, stored.endOffset);
     appendMarker(`— stored history (${stored.bytes.length} bytes) —\n`);
     appendText(decoder.decode(stored.bytes, { stream: true }));
-  } else {
-    history = newHistory();
   }
 
   const res = await rpc("tap.open", { endpoint: display, replay: true });
+  if (gen !== selectGen) {
+    // A newer selection won while this open was in flight: close the tap we just
+    // opened rather than leaking it daemon-side, and touch no shared state.
+    if (res && res.tap !== undefined && res.tap !== null) rpc("tap.close", { tap: res.tap });
+    return;
+  }
   if (res) {
     currentTap = res.tap;
     // The tap's stream begins at res.from_offset; if we restored nothing, anchor the
     // history there so the first live chunk is not mistaken for offset 0.
     if (!stored) history.frontier = res.from_offset;
+    // The endpoint's offset space restarts whenever the daemon rebuilds its hub —
+    // `load --replace`, `remove-node`, `add-node` — while `instance` (per boot) does
+    // not change, so stored scrollback would otherwise reject every new chunk as
+    // already-seen and the console would freeze. Re-anchor and say so.
+    else if (offsetSpaceReset(history, res.from_offset)) {
+      appendMarker("\n— the daemon's graph was reconfigured; offsets restarted —\n");
+    }
     if (res.replay_bytes > 0) appendMarker(`— replay (${res.replay_bytes} bytes) —\n`);
     else if (!stored) appendMarker("— no history (set replay_ring to keep scrollback) —\n");
   }
@@ -198,11 +258,27 @@ function onTapData(params) {
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   // Fold by offset: overlap the ring re-sent (or already-stored bytes) is trimmed, so a
   // reconnect never double-renders or double-stores. Only the fresh tail is shown.
+  // The daemon lost bytes at its own producer→hub hop and says so (§5/§15.32). The
+  // offset space stays contiguous by design, so a silent splice here would conceal a
+  // real hole — show it instead.
+  if (params.gap_before) appendMarker(`\n— ${params.gap_before} bytes lost (daemon feed) —\n`);
   const fresh = splice(history, params.offset ?? history.frontier ?? 0, bytes);
   if (fresh.length) {
     appendText(decoder.decode(fresh, { stream: true }));
     scheduleSave();
   }
+}
+
+// The daemon detached this tap because its endpoint left the graph — `load --replace`,
+// `remove-node`, or `teardown` (§10). Without this the stream simply stops, which is
+// indistinguishable from a quiet console: the operator watches a dead pane believing
+// it is live. Say so, flush what we have, and drop the tap so the next selection
+// re-opens cleanly rather than closing an id the daemon has already retired.
+function onTapClosed(params) {
+  if (!params || params.tap !== currentTap) return;
+  flushSave();
+  currentTap = null;
+  appendMarker(`\n— console detached: ${params.reason || "endpoint gone"} —\n`);
 }
 
 function scheduleSave() {
@@ -214,12 +290,9 @@ function scheduleSave() {
 function flushSave() {
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
   if (!opfsOk || !historyKey || !history || history.frontier === null) return;
-  const key = historyKey;
-  save(key, bytesOf(history), history.frontier).catch(() => {
-    // A storage error drops us to best-effort visibly rather than silently.
-    opfsOk = false;
-    renderStorageBadge();
-  });
+  // Serialized per key by the saver: overlapping full-buffer rewrites of one console
+  // would truncate each other (WEB-5). Errors arrive at `storageFailed`.
+  saver.save(historyKey, bytesOf(history), history.frontier);
 }
 
 function appendText(s) {

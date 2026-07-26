@@ -1,21 +1,46 @@
-//! The data-plane contracts (design §5, §15.5).
+//! The data-plane contracts (design §5, §15.5) — as an **executable
+//! specification**, not as the shipped data path.
 //!
-//! The interior is queue-free and policy-free; all buffering, dropping, and
-//! flow control lives at the boundary types — serial ports, PTY masters,
-//! sockets, files, and the exec codec's child stdio pipes (§3/§5/§15.22; the
-//! last arrives with the phase-5 exec node). This module encodes the two
-//! delivery contracts and the single-chunk holdover slot as pure, testable
-//! types, with mock boundaries standing in for the real kernel objects that
-//! arrive in later phases.
+//! **Read this before trusting a test in this module.** Everything here except
+//! the [`Chunk`] alias is a *model*: pure, synchronous, allocation-simple types
+//! that state §5's rules precisely enough to property-test them. `serialnexusd`
+//! does not call [`HostFanout`], [`TargetwardSink`], [`Holdover`], [`Delivery`]
+//! or [`MockConsumer`] — the running daemon implements the same contracts
+//! per boundary, in async code against real kernel objects, and the daemon's own
+//! tests (plus the `nexus-itest` suite) are what cover *that* code. So a green
+//! property test here proves the rule is coherent and that the model obeys it;
+//! it does not prove the daemon obeys it. The two are kept honest against each
+//! other by review and by the integration suite, which is a documented
+//! shortcoming (F3/LOCK-3 in `docs/26-claude-opus-code-review.md`) and not a
+//! claim of coverage.
+//!
+//! The rules, and where each is *really* implemented:
 //!
 //! * **Hostward** ([`HostFanout`]) is infallible and immediate: a host-facing
 //!   endpoint broadcasts to every attached consumer, and each consuming
 //!   boundary applies its own drop policy. A slow consumer costs only itself.
+//!   Shipped as `nexus-daemon`'s endpoint-keyed `runtime::Wiring::host_sinks`
+//!   (a `Vec<HostwardSink>` per host-facing endpoint) — a lossy `try_send` per
+//!   sink with `runtime::DropCounters` doing what [`MockConsumer`]'s
+//!   capacity-and-counter does here — driven from each node's hostward loop in
+//!   `nodes/{serial,pty,log,codec,exec,leg,map}.rs`.
 //! * **Targetward** ([`Origin`], [`TargetwardSink`]) returns [`Delivery`] and
 //!   never blocks: `Busy` propagates back to the origin, which pauses (the
-//!   kernel buffers on the client side; nothing is dropped). A transform that
-//!   has already emitted output parks it in its [`Holdover`], capping interior
-//!   memory at one chunk per direction.
+//!   kernel buffers on the client side; nothing is dropped). Shipped as
+//!   bounded tokio mpsc channels: there is no `Delivery` value in the daemon and
+//!   nothing calls [`TargetwardSink::flush`] — a paused origin is literally a
+//!   task suspended inside `tx.send(chunk).await`, and resumption is the channel
+//!   waking it (`nodes/serial.rs`, `runtime.rs`).
+//! * **The single-chunk holdover** ([`Holdover`]) caps interior memory at one
+//!   chunk per direction. Shipped as the one already-framed chunk a codec/exec/
+//!   leg targetward task parks in a local while it waits for the write lock
+//!   (`nodes/codec.rs`'s `framed` slot, and its siblings) — the same "at most one
+//!   emitted chunk, never a queue" bound, expressed as a suspended task's stack
+//!   rather than as a slot in a struct.
+//!
+//! The interior is queue-free and policy-free; all buffering, dropping, and
+//! flow control lives at the boundary types — serial ports, PTY masters,
+//! sockets, files, and the exec codec's child stdio pipes (§3/§5/§15.22).
 
 use std::collections::VecDeque;
 

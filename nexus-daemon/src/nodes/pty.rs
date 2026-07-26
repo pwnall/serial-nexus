@@ -33,8 +33,8 @@ use std::thread::JoinHandle as ThreadHandle;
 use std::time::{Duration, Instant};
 
 use nexus_core::Chunk;
-use nexus_core::NodeStatus;
 use nexus_core::config::NodeConfig;
+use nexus_core::state::{NodeState, NodeStatus};
 use nix::fcntl::{OFlag, open};
 use nix::libc;
 use nix::poll::PollFlags;
@@ -101,7 +101,8 @@ pub struct PtyNode {
     /// *observes* — propagation to hardware is deferred (§14).
     client_termios: Rc<CriticalCell<Option<Value>>>,
     tasks: Vec<JoinHandle<()>>,
-    status: NodeStatus,
+    /// The node's observed status *and the moment it entered it* (§7).
+    status: NodeState,
 }
 
 impl PtyNode {
@@ -139,13 +140,14 @@ impl PtyNode {
             counters: Arc::new(DropCounters::default()),
             client_termios: Rc::new(CriticalCell::new(None)),
             tasks: Vec::new(),
-            status: NodeStatus::Active,
+            status: NodeState::new(NodeStatus::Active),
         };
 
-        node.status = match node.setup() {
+        let setup = match node.setup() {
             Ok(()) => NodeStatus::Active,
             Err(reason) => NodeStatus::Faulted { reason },
         };
+        node.status.set(setup);
         node
     }
 
@@ -249,9 +251,9 @@ impl PtyNode {
             return; // setup faulted; nothing to drive
         };
         if let Err(e) = sys::set_nonblocking(master.as_raw_fd()) {
-            self.status = NodeStatus::Faulted {
+            self.status.set(NodeStatus::Faulted {
                 reason: format!("set_nonblocking: {e}"),
-            };
+            });
             return;
         }
 
@@ -307,15 +309,15 @@ impl PtyNode {
                     // (§15.8): fault the node rather than panicking the runtime
                     // thread, matching setup()/apply_perms/the set_nonblocking path.
                     // The reader and pump tasks spawned above are aborted by teardown.
-                    self.status = NodeStatus::Faulted {
+                    self.status.set(NodeStatus::Faulted {
                         reason: format!("spawn pty writer thread: {e}"),
-                    };
+                    });
                 }
             }
         }
     }
 
-    pub fn status(&self) -> NodeStatus {
+    pub fn status(&self) -> NodeState {
         self.status.clone()
     }
 
@@ -348,15 +350,25 @@ impl PtyNode {
         drain_and_discard(master.as_raw_fd(), &mut buf)
     }
 
+    /// Ask this node's workers to stop, without waiting (§16.1, BND-1): set the
+    /// writer thread's stop flag and abort the async tasks. The writer is *not*
+    /// joined here and the master is deliberately kept, since the fd must outlive
+    /// the writer thread. Teardown calls this on every node first, so the daemon
+    /// pays the join latency once rather than once per node.
+    pub fn signal_stop(&mut self) {
+        self.writer_stop.store(true, Ordering::Relaxed);
+        for t in self.tasks.drain(..) {
+            t.abort();
+        }
+    }
+
     pub fn teardown(&mut self) {
         // Signal the writer thread to stop, abort the async tasks, then join the
         // thread before dropping the master so its fd stays valid throughout. The
         // stop flag (not the pump's sender drop) is what ends the thread, since
         // the runtime can't run the pump to completion while teardown blocks here.
-        self.writer_stop.store(true, Ordering::Relaxed);
-        for t in self.tasks.drain(..) {
-            t.abort();
-        }
+        // Idempotent after `signal_stop`.
+        self.signal_stop();
         if let Some(w) = self.writer.take() {
             let _ = w.join();
         }
@@ -629,9 +641,13 @@ async fn read_and_poll(
         // detached in one poll holding its lock forever (§6). Gating on `saw_data`
         // (a real `TIOCPKT_DATA` payload) keeps this an edge: a bare hangup with no
         // client data does not fire, and — crucially — the control packet that
-        // `handle_last_close`'s own `tcsetattr` leaves on the now-hung-up master is
-        // read back as data-less EOF, so it can't re-trigger the handler and spin
-        // the runtime. `saw_data` is cleared once the close is handled.
+        // `handle_last_close` cannot re-trigger on the following iterations, because
+        // `saw_data` is *cleared* the moment the close is handled: with `was` already
+        // false and the latch reset, neither disjunct can fire again until a new
+        // client attaches and sends a real `TIOCPKT_DATA` payload, which re-arms the
+        // latch. It is that latch reset — not the shape of the packet-mode read that
+        // `handle_last_close`'s own `tcsetattr` provokes — that keeps the handler
+        // from re-firing every poll and spinning the runtime (the `b8d8ed8` fix).
         let present_now = now && !closed;
         let was = present.swap(present_now, Ordering::Relaxed);
         if (was && !present_now) || (closed && saw_data) {
@@ -741,11 +757,21 @@ fn writer_thread(
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(chunk) => {
                 if present.load(Ordering::Relaxed) {
-                    if blocking_write_all(fd, &chunk, &stop).is_err() {
-                        // Peer hung up mid-write (or teardown set `stop` mid-write);
-                        // presence will flip and the next chunks are discarded-and-
-                        // counted until a client returns, or the loop-top stop check
-                        // ends the thread on teardown.
+                    // Peer hung up mid-write (or teardown set `stop` mid-write):
+                    // presence will flip and the next chunks are discarded-and-counted
+                    // until a client returns, or the loop-top stop check ends the
+                    // thread. The bytes of *this* chunk that never reached the master
+                    // are lost too, so charge the remainder to the same
+                    // no-client-took-them counter rather than dropping it silently
+                    // (§5 all-loss-counted, PTY-3).
+                    if let Err(short) = blocking_write_all(fd, &chunk, &stop) {
+                        counters.add_absent(short.unwritten as u64);
+                        tracing::debug!(
+                            target: "pty",
+                            unwritten = short.unwritten,
+                            "hostward write ended early: {}",
+                            short.error
+                        );
                     }
                 } else {
                     counters.add_absent(chunk.len() as u64);
@@ -761,34 +787,55 @@ fn writer_thread(
     }
 }
 
+/// A hostward write that ended before the chunk was fully delivered — the loss
+/// [`writer_thread`] has to attribute (§5, PTY-3). Carrying the remainder in the
+/// error is what makes the shortfall impossible to drop on the floor: the previous
+/// bare `io::Result<()>` told the caller *that* the write failed but not *how much*
+/// of the chunk had gone, so the unwritten tail vanished uncounted.
+struct WriteShortfall {
+    /// Bytes of the chunk that never reached the master.
+    unwritten: usize,
+    /// Why the write ended early: the peer hung up (`BrokenPipe`), teardown set the
+    /// stop flag mid-write (`Interrupted`), or the write itself failed.
+    error: std::io::Error,
+}
+
 /// Write every byte of `data` to the master, blocking the *thread* (not the async
 /// runtime) on `poll(2)` for writability between partial writes — line rate for a
 /// fast consumer, no busy loop. `Err` means the peer hung up, or teardown set
 /// `stop` while the write was blocked (§15.19): a present-but-stalled client keeps
 /// the pts buffer full with no POLLHUP, so this observes `stop` within one poll
 /// interval and returns instead of spinning on EAGAIN forever — the writer's join
-/// then never wedges the single runtime thread.
+/// then never wedges the single runtime thread. The error carries the number of
+/// bytes still unwritten so the caller can count them (§5).
 fn blocking_write_all(
     fd: std::os::fd::RawFd,
-    mut data: &[u8],
+    data: &[u8],
     stop: &AtomicBool,
-) -> std::io::Result<()> {
-    while !data.is_empty() {
-        match sys::write_fd(fd, data) {
-            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
-            Ok(n) => data = &data[n..],
+) -> Result<(), WriteShortfall> {
+    let mut rest = data;
+    // Every early return goes through this, so no exit path can forget the
+    // remainder — the shortfall is derived from `rest`, never re-counted by hand.
+    let short = |rest: &[u8], error: std::io::Error| WriteShortfall {
+        unwritten: rest.len(),
+        error,
+    };
+    while !rest.is_empty() {
+        match sys::write_fd(fd, rest) {
+            Ok(0) => return Err(short(rest, std::io::ErrorKind::WriteZero.into())),
+            Ok(n) => rest = &rest[n..],
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 let re = sys::poll_blocking(fd, PollFlags::POLLOUT | PollFlags::POLLHUP, 500);
                 if re.contains(PollFlags::POLLHUP) && !re.contains(PollFlags::POLLOUT) {
-                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                    return Err(short(rest, std::io::ErrorKind::BrokenPipe.into()));
                 }
                 // Teardown/removal asked us to stop while the peer stalled; bail
                 // within the poll interval so the supervisor's join returns promptly.
                 if stop.load(Ordering::Relaxed) {
-                    return Err(std::io::ErrorKind::Interrupted.into());
+                    return Err(short(rest, std::io::ErrorKind::Interrupted.into()));
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(short(rest, e)),
         }
     }
     Ok(())
@@ -865,17 +912,50 @@ mod tests {
             }
         }
         let stop = AtomicBool::new(true);
+        let payload = b"cannot be written while the peer stalls";
         let start = Instant::now();
-        let r = blocking_write_all(wfd, b"cannot be written while the peer stalls", &stop);
-        assert!(
-            matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::Interrupted),
-            "a stalled write with stop set must return Interrupted, got {r:?}"
+        let r = blocking_write_all(wfd, payload, &stop);
+        let Err(short) = r else {
+            panic!("a stalled write with stop set must fail");
+        };
+        assert_eq!(
+            short.error.kind(),
+            std::io::ErrorKind::Interrupted,
+            "a stalled write with stop set must report Interrupted, got {:?}",
+            short.error
         );
+        // PTY-3: the bytes that never reached the master are reported, so the
+        // caller can charge them (§5 all-loss-counted). Nothing was written here,
+        // because the peer's buffer was already full.
+        assert_eq!(short.unwritten, payload.len());
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "must bail within one poll interval, took {:?}",
             start.elapsed()
         );
         drop(peer); // keep the peer open across the assertion (no POLLHUP)
+    }
+
+    /// PTY-3: a hostward write to a *gone* peer reports the whole chunk as
+    /// unwritten, so `writer_thread` charges it to `discarded_no_client` instead of
+    /// losing it silently (§5).
+    #[test]
+    fn blocking_write_all_reports_the_full_remainder_when_the_peer_is_gone() {
+        let (peer, sender) = UnixStream::pair().expect("socketpair");
+        let wfd = sender.as_raw_fd();
+        sys::set_nonblocking(wfd).expect("nonblocking");
+        drop(peer); // the client detached
+
+        let stop = AtomicBool::new(false);
+        let payload = b"bytes for a client that already left";
+        // A socketpair write to a closed peer raises EPIPE; if some kernel accepted
+        // it instead there is no loss to count, which is why `Ok` is not a failure.
+        if let Err(short) = blocking_write_all(wfd, payload, &stop) {
+            assert_eq!(
+                short.unwritten,
+                payload.len(),
+                "a write to a hung-up peer delivers nothing, so all of it is loss"
+            );
+        }
     }
 }
