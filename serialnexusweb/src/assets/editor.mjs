@@ -146,7 +146,14 @@ export function render(root, ctx) {
   const run = async (label, method, params) => {
     const r = await ctx.rpc(method, params);
     if (r && r.error) {
-      const extra = r.error.data && r.error.data.errors ? ` — ${r.error.data.errors[0]}` : "";
+      // A structural refusal puts its *first* message in `error.message` and the
+      // whole list in `data.errors`, so appending the list wholesale prints the
+      // first rule twice. Show the first from `message` and only the ones it does
+      // not already carry — an operator who broke two rules should see both, and an
+      // operator who broke one should read it once.
+      const all = (r.error.data && r.error.data.errors) || [];
+      const rest = all.filter((e) => !r.error.message.includes(e));
+      const extra = rest.length ? `\n— ${rest.join("\n— ")}` : "";
       say(false, `${label} refused: ${r.error.message}${extra}`);
     } else {
       say(true, `${label} ok`);

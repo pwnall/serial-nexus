@@ -221,10 +221,42 @@ plus the minimal-daemon pass; `cargo deny check licenses bans sources`;
 `p10_edge_surgery.rs` (6), `serialnexusweb/src/assets/graph.test.mjs` (10 under
 `node --test`), plus four new `p8_web.rs` tests and one new meta-gate.
 
-**Still owed (§16.7):** the graph and editor pages are API-validated, not browser-validated.
-Their *rendering* — the view switch, the palette form, the cascade confirmation dialog —
-is exercisable only by a real browser and goes on the manual checklist beside `app.js`'s
-console-switching logic.
+**REAL-BROWSER VALIDATED (2026-07-26, same session).** Driven through Chrome against the
+FTDI crossover rig (`/dev/ttyUSB0` `BH00LL8O` as serial node `usb0`, an external
+echo+banner responder on `ttyUSB1`), so §16.7 owes nothing here now. What was exercised, in
+order: the console view streaming real device bytes with its replay-ring splice marker; the
+**graph page** rendering three node cards with facing-labelled endpoints, live
+`active`/`waiting` glyphs and the edge list; a **scripted fault from a second client**
+(`add-node` a map with no upstream, then `disconnect`) appearing on the open page with **no
+reload** — the new node in amber with its reason inline, the edge count dropping — and
+flipping back to green when `connect` gave it an upstream, with `usb0` then wearing the
+`🔒 mapped/raw` badge because the raw edge was promoted to `held`; the **editor page** with
+its device dropdown populated from `ports` by real identity (`usb:0403:6001:BH00LL8O:00 —
+FTDI FT232R USB UART, serial BH00LL8O, interface 00 (bound: usb0)`); an illegal `connect`
+refused inline in the daemon's own words; a **log node created and wired entirely from the
+browser** that then captured live rig bytes to disk; and the cascade confirmation naming all
+three edges (captured by stubbing `window.confirm` so no modal blocked the harness, and
+declined).
+
+**Two defects only a browser could show, both found here and fixed.** They are worth naming
+because they are the argument for doing this at all: an API test cannot see a stylesheet or
+a scroll offset.
+
+1. `[correctness]` The refusal line printed the broken rule **twice**. A structural error
+   carries its first message in `error.message` *and* in `data.errors[0]`, and the editor
+   appended the list wholesale. It now shows only the entries `message` does not already
+   carry — so an operator who broke two rules sees both, and one who broke one reads it once.
+2. `[confirmation]` The `[hidden]` fix from the audit is now confirmed *numerically*, not
+   just by eye: in the graph view `#pane-head`, `#sendform` and `#term` all compute to
+   `display: none` despite their author `display: flex` rules, which is only possible
+   because of the author-origin `[hidden]` rule. Likewise the terminal follows the tail
+   after a view round trip (`scrollTop + clientHeight >= scrollHeight`), which is the
+   `display:none`-resets-scroll fix. Both would have read as green in any API test.
+
+One rendering choice worth knowing rather than changing: the edge list shows the **declared**
+write mode, so `usb0 ↔ mapped/raw` reads `on-demand` even though the runtime promoted it to
+`held`. That is invariant 12 holding — the page must not re-derive a promotion the daemon
+owns — and the effective truth is visible right beside it, as the lock badge on `usb0`.
 
 ---
 
