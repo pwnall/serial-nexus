@@ -45,7 +45,7 @@ pub struct ServerConfig {
 /// The largest HTTP request head (request line + headers) we will read, so a
 /// hostile client cannot grow our buffer without bound — the §10 request-line cap,
 /// applied to the browser surface.
-const MAX_HEAD: usize = 16 * 1024;
+pub const MAX_HEAD: usize = 16 * 1024;
 
 /// How long a peer has to deliver a complete request head, and (with TLS) to finish
 /// the handshake. Without it, a peer that connects and sends nothing pins a task and
@@ -153,15 +153,19 @@ pub async fn run(
 }
 
 /// One parsed HTTP request head.
-struct Request {
-    method: String,
-    path: String,
-    query: String,
-    headers: Vec<(String, String)>,
+///
+/// `pub` with `pub` fields, but this module is private to the crate: the only way in
+/// from outside is the deliberate `unstable_fuzz_api` re-export in `lib.rs`, which
+/// states its own terms (not semver'd, may vanish).
+pub struct Request {
+    pub method: String,
+    pub path: String,
+    pub query: String,
+    pub headers: Vec<(String, String)>,
 }
 
 impl Request {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -169,7 +173,7 @@ impl Request {
     }
 
     /// The value of `cookie_name` from the `Cookie` header, if present.
-    fn cookie(&self, cookie_name: &str) -> Option<&str> {
+    pub fn cookie(&self, cookie_name: &str) -> Option<&str> {
         let cookies = self.header("cookie")?;
         for pair in cookies.split(';') {
             let pair = pair.trim();
@@ -326,7 +330,7 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + 'static>(
 /// Read the HTTP request head byte-by-byte up to the blank line terminating the
 /// headers, so no request-body / WebSocket-frame byte is consumed past the head
 /// (critical for the raw-socket WS handoff). Capped at [`MAX_HEAD`].
-async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Result<Option<Request>> {
+pub async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Result<Option<Request>> {
     let mut buf = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];
     loop {
@@ -450,7 +454,7 @@ fn session_cookie(token: &str, secure: bool) -> String {
 
 /// Split an authority (`host`, `host:port`, `[::1]`, `[::1]:8080`) into its host and
 /// explicit port. `None` means the authority is malformed (an unparsable port).
-fn split_authority(authority: &str) -> Option<(&str, Option<u16>)> {
+pub fn split_authority(authority: &str) -> Option<(&str, Option<u16>)> {
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
         let (inner, tail) = rest.split_once(']')?;
         (inner, tail.strip_prefix(':'))
@@ -487,7 +491,7 @@ fn split_authority(authority: &str) -> Option<(&str, Option<u16>)> {
 /// already pins the origin to us, and not demanding scheme equality keeps a
 /// TLS-terminating front end from breaking. `null` (a sandboxed iframe, a `file://`
 /// page) has no `://` and is refused.
-fn origin_matches_host(origin: &str, host_header: &str, secure: bool) -> bool {
+pub fn origin_matches_host(origin: &str, host_header: &str, secure: bool) -> bool {
     let Some((scheme, authority)) = origin.split_once("://") else {
         return false;
     };

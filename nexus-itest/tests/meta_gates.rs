@@ -480,3 +480,78 @@ fn doctor_reports_no_unsupported_capability() {
     let p1 = status("P1");
     assert!(p1 == "supported" || p1 == "degraded", "P1 was {p1}");
 }
+
+/// The `unstable_fuzz_api` bargain, enforced (design §15.26 amendment, notes §3.19).
+///
+/// `nexus-daemon` and `serialnexusweb` each expose a `pub mod unstable_fuzz_api` that
+/// re-exports internals the fuzz harness drives — a deliberate, named exception to
+/// §15.26's "everything else stays private", taken because the alternative (extracting
+/// two parsers into crates of their own) costs more than it buys. The exception is
+/// bounded by one rule: **an item re-exported there must have a fuzz target driving
+/// it.** Without that, the module is just a hole in the API boundary that grows
+/// whenever something is inconvenient to reach.
+///
+/// That is a rule someone has to remember, which is exactly the shape of the bug this
+/// file exists because of (INV5-CLIPPY-SCOPE: a configuration gate that disarmed
+/// silently and went unnoticed for a release). So it is a test.
+///
+/// Also asserts each module says what it is: the doc comment must disclaim stability,
+/// because the whole justification for the exception is that no embedder could depend
+/// on it by accident.
+#[test]
+fn every_unstable_fuzz_api_export_has_a_fuzz_target() {
+    let root = repo_root();
+    let fuzz_dir = root.join("fuzz/fuzz_targets");
+    assert!(
+        fuzz_dir.is_dir(),
+        "fuzz/fuzz_targets is missing; the exception below has no consumer"
+    );
+    let targets: String = std::fs::read_dir(&fuzz_dir)
+        .expect("read fuzz_targets")
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect();
+
+    let mut checked = 0usize;
+    for krate in ["nexus-daemon", "serialnexusweb"] {
+        let lib = root.join(krate).join("src/lib.rs");
+        let src =
+            std::fs::read_to_string(&lib).unwrap_or_else(|e| panic!("read {}: {e}", lib.display()));
+        let Some(at) = src.find("pub mod unstable_fuzz_api") else {
+            continue; // the module is allowed to disappear — that is its promise
+        };
+
+        // The disclaimer is load-bearing: it is what makes "no embedder can depend on
+        // this by accident" true rather than hopeful.
+        let doc = &src[..at];
+        assert!(
+            doc.contains("Not part of") && (doc.contains("fuzz harness") || doc.contains("fuzz")),
+            "{krate}'s unstable_fuzz_api must document that it is unsupported"
+        );
+
+        // Every identifier in the module's `pub use` list must appear in some target.
+        let body = &src[at..];
+        let body = &body[..body.find("\n}").expect("module body is brace-delimited")];
+        for item in body
+            .split("pub use")
+            .skip(1)
+            .flat_map(|u| u[..u.find(';').unwrap_or(u.len())].split(['{', '}', ',']))
+            .filter_map(|t| t.rsplit("::").next())
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        {
+            assert!(
+                contains_word(&targets, item),
+                "{krate}::unstable_fuzz_api re-exports `{item}`, but no fuzz target \
+                 under fuzz/fuzz_targets/ mentions it. The exception to §15.26 is \
+                 bounded by exactly this rule: re-export what the fuzzer drives, \
+                 nothing else. Add the target, or drop the re-export."
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 2,
+        "expected to check at least the two parsers SEC-7 named; checked {checked}"
+    );
+}

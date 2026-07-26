@@ -90,7 +90,7 @@ text is reproduced as written; the items it found still open are answered in Par
 | **WEB-2** | **ADDRESSED** | `server.rs:444-446` adds `; Secure` iff this listener terminates TLS, with the "browsers refuse a Secure cookie from a non-trustworthy origin" rationale. Guard: `the_session_cookie_is_secure_only_under_tls` |
 | **WEB-5** | **ADDRESSED** | New `serialnexusweb/src/assets/saver.mjs` — one write in flight per key, newest snapshot wins, errors surfaced via `storageFailed` (badge + terminal marker). 5 `node --test` cases in `history.test.mjs`; served asset covered by `every_module_app_js_imports_is_served` |
 | **SEC-5** | **ADDRESSED** | `docs/security.md` gained a leg section (line 136+) and a permissions table row (line 86) naming the second unauthenticated door |
-| **SEC-7** | **PARTIALLY ADDRESSED — declined half is reasoned and recorded** | 3 new targets: `rpc_request_line`, `rpc_base64`, `config_load` (all compile). The two not fuzzed — `RequestLines` and `serialnexusweb::read_request` — are declined with a written rationale in `fuzz/Cargo.toml:12-42` ("a lib target exists to be depended on"). Also in AGENTS.md §5 |
+| **SEC-7** | **ADDRESSED** (was partial at audit time; see Part 3) | 3 new targets: `rpc_request_line`, `rpc_base64`, `config_load` (all compile). The two not fuzzed — `RequestLines` and `serialnexusweb::read_request` — are declined with a written rationale in `fuzz/Cargo.toml:12-42` ("a lib target exists to be depended on"). Also in AGENTS.md §5 |
 | **SEC-8** | **ADDRESSED** | `clear_stale_socket` (`leg.rs:1365`): `symlink_metadata` is-a-socket check + live-peer dial probe; teardown unlinks only `bound_unix_path`. Live: leg pointed at `notes.txt` → `faulted`, reason `exists and is not a unix socket; refusing to unlink it`, **file intact**. Guard: `a_leg_pointed_at_an_existing_file_refuses_and_leaves_it_intact` |
 | **F3 / LOCK-3** | **ADDRESSED (documentation resolution, deliberately)** | `data.rs` module doc rewritten: "**Read this before trusting a test in this module**… a green property test here proves the rule is coherent … it does not prove the daemon obeys it", with a rule→shipped-location map. Notes §3.3 corrected in place, §3.18 records the disposition |
 | **F7** | **ADDRESSED** | Notes §5 build block rewritten to `cargo build`+`cargo test --workspace --locked`; §2 explicitly says "Where a section below still names a `phaseN/*.sh`, read it as a dated record" |
@@ -187,6 +187,46 @@ unverified — it is now on the checklist rather than pretended-covered.
   WEB-4's generation guard and the new `tap.closed` / offset-reset handling — rides the
   manual real-browser checklist (§16.7). The pure modules underneath it (`history.mjs`,
   `saver.mjs`) are `node --test`-covered on every push.
-- **`RequestLines` and `serialnexusweb`'s HTTP head parser stay unfuzzed** (see above).
+- ~~`RequestLines` and `serialnexusweb`'s HTTP head parser stay unfuzzed.~~ **Closed
+  after this ledger was written**, by operator decision: both are now driven by
+  `control_request_lines` and `web_http_head`, reached through a deliberately unstable
+  `unstable_fuzz_api` module in each crate. That reverses the disposition recorded above
+  and in Part 2 — the reasoning, the terms, and the rule that stops it eroding (an item
+  re-exported there must have a fuzz target driving it) are in design §15.26 and
+  implementation-notes §3.19. `serialnexusweb` gained a library target beside its binary
+  to make it possible. **SEC-7 is fully addressed; all four of its named parsers are
+  covered.** The first run also refuted the new target's own assertion about trailing
+  CRs — the framer was right and the target was wrong, which is the cheapest possible
+  version of that lesson.
 - The review's **§6 "verified and cleared"** list — 22 refuted candidates — was checked
   and none was "fixed" anyway.
+
+---
+
+## Part 3 — SEC-7 completed after the audit
+
+The audit and Part 2 both recorded two of SEC-7's four parsers as deliberately unfuzzed,
+on the grounds that reaching them meant widening a published API for a test harness.
+**That call was overridden by the operator, and the two targets now exist.**
+
+| | |
+| --- | --- |
+| `control_request_lines` | The daemon's control-socket line framer — every byte a client writes, before any JSON is parsed and before any verb is dispatched, and the one place a hostile client controls both content *and* chunking. The target drives it through a byte source whose chunk size the fuzzer picks, because the properties that matter (the per-line cap, and the cancel-safety §15.20 depends on) are about *arrival patterns*. 1.8M runs clean. |
+| `web_http_head` | The web console's hand-rolled HTTP head parser plus the Origin/Host gate built on it — the most exposed parser in the project, since §15.29 sanctions binding beyond loopback and this runs *before* the token gate. 2.2M runs clean. |
+
+Both are reached through a `pub mod unstable_fuzz_api` whose first documented line
+disclaims stability; the parent modules stay private, so the named re-export is the only
+way in. `serialnexusweb` gained a library target beside its binary to make its module
+possible. Design §15.26 carries the amendment; implementation-notes §3.19 carries the
+reasoning, the alternative that was weighed (extracting two parsers into their own
+crates), and the rule that bounds it: **an item re-exported there must have a fuzz target
+driving it.**
+
+Worth recording: `control_request_lines` failed on its first run — not against the
+daemon, but against *itself*. It asserted that a framed line never retains a `\r`, and the
+fuzzer produced `\r\r` before EOF within seconds. `take_line` strips exactly one trailing
+CR, matching `tokio::io::Lines`, and the residue is invisible downstream because CR is
+JSON whitespace and `parse_incoming_request` is the only consumer. The assertion was
+wrong, not the framer. The target now asserts the framer/parser *composition* instead,
+which neither `rpc_request_line` (which starts from a whole line) nor the unit tests
+(which start from known-good framing) cover.

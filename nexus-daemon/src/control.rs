@@ -23,7 +23,6 @@ use nexus_rpc::{
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::net::unix::OwnedReadHalf;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
@@ -36,7 +35,7 @@ use crate::tap::{OpenTap, TAP_QUEUE_CAP, TapMsg};
 /// the read-path analogue of the `SUN_LEN` socket-path bound (implementation-notes
 /// §7). One MiB sits far above any real control verb, including a `load`'s inline
 /// graph JSON, and far below memory-pressure territory.
-const MAX_REQUEST_LINE: usize = 1 << 20;
+pub const MAX_REQUEST_LINE: usize = 1 << 20;
 
 /// The refusal a *pipelined* request gets while a waiting verb is in flight on the
 /// same connection (CTRL-1). Answering it — with its own id, so the client can
@@ -54,7 +53,7 @@ const WAIT_IN_FLIGHT_MESSAGE: &str = "a waiting verb is already in flight on thi
 
 /// The outcome of reading one request line.
 #[derive(Debug)]
-enum LineRead {
+pub enum LineRead {
     /// A complete `\n`-terminated line (trailing `\r` stripped).
     Line(String),
     /// A clean end-of-stream on the read half (the peer closed or half-closed it).
@@ -65,6 +64,10 @@ enum LineRead {
 }
 
 /// A newline-delimited request reader with a hard per-line length cap (§10).
+///
+/// `pub`, but this module is private: the only way in from outside the crate is the
+/// deliberate `unstable_fuzz_api` re-export in `lib.rs`, which states its own terms
+/// (not semver'd, may vanish). §15.26's embeddable surface is unaffected.
 /// Unlike [`tokio::io::Lines`], whose accumulator grows without bound until it
 /// sees a newline, this refuses a line once it passes [`MAX_REQUEST_LINE`] so one
 /// connection cannot exhaust the shared daemon's memory (CTRL-1). The in-progress
@@ -72,13 +75,13 @@ enum LineRead {
 /// `fill_buf`'s own cancel-safety — keeps `next_line` cancel-safe: a partially
 /// read line survives the biased select dropping the read future mid-line, so a
 /// pipelined request is never truncated (§15.20).
-struct RequestLines {
-    reader: BufReader<OwnedReadHalf>,
+pub struct RequestLines<R> {
+    reader: BufReader<R>,
     buf: Vec<u8>,
 }
 
-impl RequestLines {
-    fn new(read_half: OwnedReadHalf) -> Self {
+impl<R: tokio::io::AsyncRead + Unpin> RequestLines<R> {
+    pub fn new(read_half: R) -> Self {
         RequestLines {
             reader: BufReader::new(read_half),
             buf: Vec::new(),
@@ -89,7 +92,7 @@ impl RequestLines {
     /// Cancel-safe: dropping the returned future retains any partial line in
     /// `self.buf`. A trailing `\r` is stripped to match `Lines`; invalid UTF-8
     /// surfaces as an `InvalidData` error (closing the connection, as before).
-    async fn next_line(&mut self) -> io::Result<LineRead> {
+    pub async fn next_line(&mut self) -> io::Result<LineRead> {
         loop {
             let available = self.reader.fill_buf().await?;
             if available.is_empty() {

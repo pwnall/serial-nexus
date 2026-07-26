@@ -59,6 +59,35 @@ pub use codec_api::WIRE_VERSION;
 /// A codec author pins against this; wire evolution must never break it.
 pub use codec_api::ENVELOPE_VERSION;
 
+/// **Not part of this crate's supported API. Exposed only so the fuzz harness can
+/// reach it, and free to change or disappear in any release, including a patch.**
+///
+/// §15.26 defines the embeddable surface as exactly `run`/[`RunOptions`]/[`Registry`]
+/// plus the version constants, and says everything else stays private. This module is
+/// a deliberate, named exception rather than an erosion of that rule — see
+/// `docs/implementation-notes.md` §3.19 for the reasoning and the terms.
+///
+/// The problem it solves: review 26's SEC-7 observed that every fuzz target sat on the
+/// `codec-api` layer, so the parsers an ordinary client reaches over the 0600 control
+/// socket — with no leg, no peer, no child process — were unfuzzed. The
+/// control-socket line reader is the daemon's front door: it frames *every* byte a
+/// client writes, before any JSON is parsed and before any verb is dispatched, and it
+/// is the one place a hostile client controls both the content and the chunking. Unit
+/// tests cover its contract; they cannot cover its input space.
+///
+/// If you are an embedder (§15.26): do not use this. Nothing here is semver'd, nothing
+/// here is documented as behaviour, and a future release may empty the module.
+pub mod unstable_fuzz_api {
+    /// The control plane's newline-delimited request framer, generic over its byte
+    /// source so a fuzzer can drive it from a `&[u8]` exactly as the socket does.
+    ///
+    /// Properties worth asserting from a target: it never yields a line longer than
+    /// [`MAX_REQUEST_LINE`]; a partial line survives the future being dropped
+    /// mid-read (cancel-safety — §15.20 relies on it, and it is what keeps a
+    /// pipelined request from being truncated); and it terminates on any input.
+    pub use crate::control::{LineRead, MAX_REQUEST_LINE, RequestLines};
+}
+
 /// How often the daemon publishes a state snapshot to `subscribe` streams (§10).
 /// Fine-grained enough to observe counter movement, coarse enough to stay cheap.
 const SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);

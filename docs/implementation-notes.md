@@ -1424,6 +1424,41 @@ shipped without an unattached-loss counter — is closed: all five producers now
 `runtime::fan_out`, which charges that case inside the helper (§16.1 applied to the data plane,
 F1/DM-3). The targetward half is still per-node, so the two-places rule above still stands.
 
+### 3.19 Two crates expose an `unstable_fuzz_api` module the design says should not exist
+**Design:** §15.26 — "the supported extension surface is exactly two contracts, both semver'd:
+`codec-api` for in-process codecs, and the narrow `nexus-daemon` entry API (run options,
+registry, version constants); **everything else stays private**."
+**Reality:** `nexus-daemon` and `serialnexusweb` each expose a `pub mod unstable_fuzz_api`
+re-exporting internals — the control-socket line framer (`RequestLines`, `LineRead`,
+`MAX_REQUEST_LINE`) and the web console's HTTP head parser (`read_request`, `Request`,
+`MAX_HEAD`, `split_authority`, `origin_matches_host`). `serialnexusweb` also gained a library
+target beside its binary so that its module can exist at all.
+**Decision: operator's call, taken deliberately, reversing the disposition this file carried
+one commit earlier.** Review 26's SEC-7 observed that all four fuzz targets sat on the
+`codec-api` layer, so every parser reachable *without* a leg was unfuzzed. Three of those were
+closed with no API change. The remaining two — the daemon's front door, and the most
+network-exposed parser in the project — were declined on §15.26 grounds, with the note that
+"the honest move is to lift the reader into a crate of its own, not to widen `nexus-daemon`."
+That rule is now suspended for these two modules: the stability promise is carried by a doc
+comment on each module stating in its first line that nothing inside is supported, semver'd, or
+guaranteed to exist next release, and that an embedder must not use it. The parent modules
+(`control`, `server`) stay private, so the *only* way in is the named re-export.
+**Why this is defensible rather than an erosion.** The §15.26 boundary exists so that internal
+churn cannot break an embedder; it is not an end in itself. A module whose name is
+`unstable_fuzz_api`, whose docs disclaim stability in their first sentence, and whose single
+in-tree consumer is `fuzz/`, does not create the coupling §15.26 protects against — no embedder
+can plausibly depend on it by accident. The alternative (extracting two parsers into crates)
+buys the same coverage at the cost of two more workspace members, two more published surfaces,
+and a seam through the middle of `control.rs` and `server.rs` that exists for a test harness.
+**What it bought immediately.** `control_request_lines` and `web_http_head` (1.8M and 2.2M runs
+clean). The first target *also* refuted its own author: it asserted a framed line never retains
+a `\r`, and the fuzzer produced `\r\r` before EOF in seconds — `take_line` strips exactly one
+trailing CR, which is harmless (CR is JSON whitespace and `parse_incoming_request` is the only
+consumer) but was not what the target claimed. The assertion was wrong, not the framer; the
+target now asserts the framer/parser *composition* instead, which no other target covers.
+**Watch item:** if either module grows an item that is not a parser under fuzz, that is the
+erosion this entry exists to catch. The rule is: a re-export here must have a target in `fuzz/`.
+
 ---
 
 ## 4. Findings carried forward (from nexus-doctor)

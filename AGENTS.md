@@ -225,14 +225,18 @@ reproduction it replays. Put a new review-driven guard there rather than in a `p
   that: `rpc_request_line` (the daemon's front door — every byte written to the control
   socket), `rpc_base64` (the hand-rolled codec carrying console bytes inside `tap.data`), and
   `config_load` (`GraphConfig` deserialization + `validate`, the parser the two worst
-  configuration defects walked through). A new parser on an externally-reachable surface gets
-  a target. **Two of SEC-7's named parsers are deliberately still unfuzzed, and the reason is
-  a rule, not an oversight:** the daemon's `RequestLines` lives in a private module and
-  `serialnexusweb`'s HTTP head parser lives in a binary-only crate, so fuzzing either would
-  mean widening a published surface (§15.26 keeps `nexus-daemon`'s entry API to `run`/
-  `RunOptions`/`Registry`) purely for a test harness. Both are covered by their own unit
-  tests. If you are re-filing SEC-7: the answer is to lift the parser into a crate of its
-  own, never to make internals `pub`.
+  configuration defects walked through). SEC-7's last two — the daemon's `RequestLines` and
+  `serialnexusweb`'s HTTP head parser — are now covered too, by `control_request_lines` and
+  `web_http_head`. A new parser on an externally-reachable surface gets a target.
+- **`unstable_fuzz_api` is a real exception to §15.26, with a rule attached.** Reaching those
+  last two meant widening two crates: `nexus-daemon` and `serialnexusweb` each expose a
+  `pub mod unstable_fuzz_api` re-exporting the parser (and `serialnexusweb` gained a library
+  beside its binary). The design says "everything else stays private"; this is an amendment,
+  not a drift — design §15.26 and `docs/implementation-notes.md` §3.19 carry the reasoning and
+  the terms. **The rule that keeps it from eroding: an item re-exported there must have a
+  target in `fuzz/` driving it.** The parent modules (`control`, `server`) stay private, so the
+  named re-export is the only door, and each module's first doc line disclaims stability. If
+  you are an embedder, do not use them; if you are adding to them, add the target first.
 
 **Hardware rig:** `serial_hardware.rs` — two USB-serial adapters cross-wired as a null
 modem (each is the other's target), auto-detected via `crossover_ports()`

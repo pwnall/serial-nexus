@@ -1,27 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! `serialnexusweb` — the serial_nexus web console (design §17).
-//!
-//! A pure RPC client of `serialnexusd` on one side, a loopback HTTP + WebSocket
-//! server on the other. The daemon does not link, serve, or know about this binary;
-//! everything it does rides the §10 RPC surface — `state`/`subscribe` for the
-//! console list and lock badges, `tap.open`/`tap.close` for bytes, `send` for
-//! input, `info` for provenance — which is §15.16's separation paying out a third
-//! time (§15.26): the web client works unchanged against any embedding daemon.
-//!
-//! Security (§15.29): a loopback TCP port is reachable by every local user, unlike
-//! the 0600 control socket, so every request and WebSocket upgrade requires a
-//! per-session bearer token (a cookie after the bootstrap URL), and the Host header
-//! is validated against localhost. The bind policy is three-tiered: loopback+token
-//! by default; `--tls`+token off loopback (the sanctioned mode); `--insecure-bind`
-//! as the named footgun, token still mandatory.
-
-mod assets;
-mod bridge;
-mod rpc;
-mod server;
-mod tls;
-mod wsclient;
+//! `serialnexusweb`'s binary: flag parsing, the tracing subscriber, and the runtime.
+//! Everything else lives in the library beside it (see `lib.rs` for the design
+//! rationale, §17) — the same thin-binary shape `serialnexusd` has (§15.26).
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
@@ -85,7 +66,7 @@ enum Cmd {
     /// Connect to a running web server's WebSocket as a headless client, tap one
     /// console, and checksum the byte stream — the browser-facing protocol exercised
     /// end to end without a browser (plan §11.3 validation).
-    Wsclient(wsclient::WsclientArgs),
+    Wsclient(serialnexusweb::WsclientArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -102,7 +83,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         // The headless test client is linear; no local tasks.
-        Some(Cmd::Wsclient(args)) => rt.block_on(wsclient::run(args)),
+        Some(Cmd::Wsclient(args)) => rt.block_on(serialnexusweb::wsclient(args)),
         // The server spawns `!Send` per-connection and bridge tasks (the daemon
         // socket is `!Send` through the bridge), so it runs on a `LocalSet` — the
         // same single-thread shape the daemon uses (§15.18).
@@ -150,7 +131,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         Some(t) => t,
         None => new_token(),
     };
-    let socket = rpc::resolve_socket(args.socket);
+    let socket = serialnexusweb::resolve_socket(args.socket);
 
     // Host values accepted off loopback (DNS-rebinding defense, §15.29): always the
     // localhost family, plus any operator-declared names.
@@ -172,19 +153,19 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         let key = args
             .tls_key
             .unwrap_or_else(|| PathBuf::from(&runtime).join("serialnexusweb.key"));
-        Some(tls::build_config(&cert, &key, &hosts)?)
+        Some(serialnexusweb::build_tls_config(&cert, &key, &hosts)?)
     } else {
         None
     };
 
-    let config = server::ServerConfig {
+    let config = serialnexusweb::ServerConfig {
         token,
         socket,
         hosts,
     };
-    // `server::run` prints the bootstrap URL after binding, so an ephemeral `:0`
+    // `serve` prints the bootstrap URL after binding, so an ephemeral `:0`
     // request reports the port the OS actually chose.
-    server::run(addr, config, tls).await
+    serialnexusweb::serve(addr, config, tls).await
 }
 
 /// A fresh 256-bit bearer token, hex-encoded (§15.29). `getrandom` reads the OS CSPRNG.
