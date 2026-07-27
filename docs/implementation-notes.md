@@ -1,16 +1,190 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-26 (**phases 0-8 + simplification + extension + web-console + v10 + v11
-console-map + review-26 remediation tracks done**, plus the **v12 graph-editing track** —
-`ports`, `connect`/`disconnect`, and the web console's graph and editor pages, design
-§15.35, plan §14. The **`serialnexusweb` web console is REAL-BROWSER validated** over the
-FTDI crossover rig for the *console* view; the graph and editor views are API-validated in
-`p8_web.rs` and go on the §16.7 manual checklist for their rendering half.)
+**As of:** 2026-07-27 (**phases 0-8 + simplification + extension + web-console + v10 + v11
+console-map + review-26 remediation + v12 graph-editing tracks done**, plus the
+**v13 browser-UI automation track** — a pinned Playwright suite in real headless
+Chromium, gated from `nexus-itest`, design §15.37/§15.38, plan §15. The web console's
+browser half is now **CI-verified** rather than checklist-verified: the OPFS splice, the
+`tap.closed` re-anchor and the editor flows are asserted where they run.)
 **Branch:** `implementation` (off `main`).
-**Normative docs are now v12:** `docs/28-design-claude-fable-v12.md` (design) and
-`docs/29-implementation-plan-claude-fable-v12.md` (plan). v1–v11 docs, the review and its
-remediation ledger are in `docs/historical/`. Section references (§) point at the v12
+**Normative docs are now v13:** `docs/30-design-claude-fable-v13.md` (design) and
+`docs/31-implementation-plan-claude-fable-v13.md` (plan). v1–v12 docs, the review and its
+remediation ledger are in `docs/historical/`. Section references (§) point at the v13
 design.
+
+---
+
+## v13 BROWSER-UI TRACK (plan §15 / design §15.37, §15.38) — DONE (2026-07-27 session)
+
+Two halves. First an **alignment pass on the v13 documents**, which had regenerated from a
+stale base exactly as the v12 pair did. Then the **Playwright track** — which failed three
+specs on its first run and turned out to be worth more for what it exposed than for what
+it asserts.
+
+**Gates:** 485 passed / 0 failed / 4 ignored (was 480); fmt; clippy (workspace +
+minimal-daemon); `cargo deny check licenses bans sources`; macOS cross-check;
+`linux.jq` green. The `load --replace` fix was additionally verified on this bench's real
+FTDI adapter, three consecutive replaces, `active` throughout with `purged_on_reconnect`
+at 0.
+
+### The document alignment pass (do this first on any new design generation)
+
+`docs/30-design-claude-fable-v13.md` and its plan were rebased from a pre-v12 text and
+silently dropped rules the code still enforces — the *same* failure the v12 track records
+above, and the second time in a row, so it is now a standing first step rather than an
+anecdote. **Nothing was a code deviation; the fix was to restore the text.** Restored into
+the design: §3's name-legality clause (`BlankName`/`NameTooLong`/`MAX_NAME_LEN`); §7.1's
+canonical kebab-case `flow_control` with the unhyphenated aliases; §8's and §15.26's
+`unstable_fuzz_api` amendment; §10's `ports` description (it enumerates *every* candidate
+and reports bound-ness as a field — §12 in the same document already said so, so v13
+contradicted itself); §11's connect/disconnect-are-shipped text and its empty-parse
+refusal and whitespace/length name rules; §15.21's P5 verdict folding; §15.34's four
+clauses (the single `fan_out` helper, `effective_write_mode` consulted by both validator
+and wiring, the empty-parse rule, and the frozen-tree clause for verifiers); §16.2's
+`RefCell`-ban *scope*; §16.10's supersession note; and §17's graph page reading topology
+from `dump` and status from `state` (which `graph.mjs` has always done). In the plan: §14's
+wiring-change paragraph and all four `Validation (executed)` blocks, plus the
+review-26 ledger's `docs/historical/` path and the paragraph boundary the new §3 doctrine
+block had split.
+
+Method that made this cheap and complete: a sentence-granular diff
+(`diff <(sed 's/\. /.\n/g' old) <(sed 's/\. /.\n/g' new)`), every hunk classified, every
+"the code still does this" claim checked against the code, and each claimed *code* change
+independently verified before acting. After the pass the diff is v12 plus only the
+intended new v13 content, which is the check to repeat.
+
+### §15.1 — the Playwright scaffold
+
+`serialnexusweb/ui-tests/`: pinned `@playwright/test` 1.62.0 (Apache-2.0) plus its
+lockfile, `playwright.config.mjs` (Chromium only, `workers: 1`, `fullyParallel: false`,
+**`retries: 0` on purpose** — §15.36's whole point is that a retry converts a mechanism
+into a mystery), traces and screenshots retained on failure. `node_modules`,
+`test-results` and `playwright-report` are gitignored; nothing here ships, and the
+console's own assets stay vendored and unbundled.
+
+`nexus-itest/tests/p8_web_ui.rs` is the gate. It builds the fixture in Rust — where every
+other test's fixture lives — and hands the browser a bootstrap URL plus a description of
+what it is looking at through the environment (`SNX_WEB_URL`, `SNX_ECHO_CONSOLE`,
+`SNX_FAULT_*`, `SNX_REPLACE_CFG`, `SNX_CTL`/`SNX_SOCKET`, …). Three points worth keeping:
+
+- **Skips are loud and defeatable.** `node`, `npx` and the installed package each
+  self-skip with the command that fixes them, and `SNX_WEB_UI=required` (set by the CI
+  job) turns every skip into a failure. A gate that can skip silently is a gate CI passes
+  over a hole — plan §3 rule 7, applied to a new gate on the day it landed.
+- **The gate asserts a spec-count floor**, not just "something passed". A filter typo or a
+  deleted spec file cannot shrink the suite quietly.
+- **`SNX_UI_GREP` narrows a run while debugging**, and `SNX_UI_SLOW=1` includes the
+  `@slow` specs. Per push the gate passes `--grep-invert @slow`, which is Playwright's
+  spelling of this repo's `#[ignore]` + nightly-sweep convention.
+
+### §15.2 — the behaviour suites, and the three defects they found
+
+13 specs per push plus one nightly. What matters is the first run: **three failed, and
+only one was a browser defect.** Each was independently adversarially verified before any
+fix shipped (§15.36 rule 5), and two of the five verifications materially corrected the
+diagnosis they reviewed — including one that corrected a comment this session had already
+written into the tree.
+
+**D1 — the client duplicated the replay ring into stored scrollback on every reload.**
+`offsetSpaceReset(h, from_offset)` returned "the offset space restarted" whenever
+`from_offset < frontier`. That is *also* what an ordinary reload looks like, by
+construction: `from_offset` is the ring *base* (`ingested − ring.len()`, `tap.rs`), and a
+ring exists precisely to re-send bytes the client already has. So every reload with any
+replay overlap threw the frontier back to the ring base, re-rendered the ring under a
+false "the graph was reconfigured" marker, and persisted the duplicate. Measured in
+Chromium: stored history 19 → 38 → 57 bytes over three reloads, one extra copy each time,
+unbounded to the 16 MiB cap. The existing unit test passed because it asserted the
+function against offsets that never occur (`--replay` "re-sends from at or after the
+frontier" — it does not).
+
+The obvious fix — decide on `from_offset + replay_bytes` instead — was proposed, verified,
+and **rejected on the verification**: `replay_bytes` counts only the pieces that fit the
+tap's 128-deep channel, so for a ring above 8 MiB the head under-reports and the bug
+survives; and because the head test fires on a strict subset of today's cases, it silently
+*loses* a genuine restart whenever the rebuilt hub has already ingested past the stored
+frontier, swallowing real output with no seam marker. Offsets cannot answer the question
+in either direction.
+
+So the daemon answers it. `TapHub` carries an **`epoch`** — process-global monotonic,
+unique per hub instance, never reused — reported by `tap.open`. The client persists it
+beside the scrollback (`opfs.mjs` grew a `SNXHIST2` magic-tagged 24-byte header; a record
+without the tag is treated as absent, which is the honest migration for best-effort
+scrollback) and re-anchors exactly when it changes. `history.mjs`'s `offsetSpaceReset` is
+replaced by `offsetSpaceChanged(storedEpoch, epoch)` + `reanchor(h, fromOffset)`. **This
+closes the recorded open issue** that `info.instance` — correctly per-*boot* — does not
+rotate when a hub is rebuilt.
+
+**D2 — `load --replace` faulted the serial port it was keeping.** `Daemon::load` is one
+synchronous critical section (§15.20): `teardown_with` then `Node::instantiate`, no yield.
+`SerialNode::signal_stop` only `abort()`s the supervisor, whose future still holds an
+`Rc<SerialPort>` clone across its `.await`, and an aborted `spawn_local` future is dropped
+only when the `LocalSet` gets the thread back — after `load` returns. So the replacement's
+`open(2)` lands while the outgoing fd is still open, and that fd carries `TIOCEXCL`. The
+daemon EBUSYs against itself. On real hardware, measured by strace: `openat = -1 EBUSY`,
+then `close` of its own fd 1.6 ms *later*, then a successful reopen one `RECONNECT_POLL`
+(1 s) on. During that second the node reports `faulted` with a reason that sends an
+operator hunting for a squatter that is the daemon — and **a `send` issued in the window
+is acknowledged and then purged**: "sent 20 byte(s)" followed by `purged_on_reconnect: 20`.
+§5 permits dropping hostward, never targetward. It reproduces through
+`remove-node --cascade` + `add-node` too.
+
+**Fix: one ioctl.** `SerialNode::teardown` calls `sys::set_exclusive(fd, false)` before
+releasing the port. `TIOCNXCL` existed in `nexus-sys` and had no caller. Exclusivity is a
+claim the node made, so the node gives it back when it stops; the unclaimed window is
+bounded by the same critical section and `open_port` re-takes it. Guard:
+`p11_replace_atomicity.rs`, **proved fail-first** (3 of its 4 tests fail against the
+unfixed tree with exactly the predicted reason; the fourth — that the port is still
+exclusive while a live node holds it — passes before and after, and exists so a "fix" that
+simply stopped taking `TIOCEXCL` cannot pass). Verified on the FTDI bench afterwards.
+
+**D3 — and why a pts made D2 findable.** `TIOCEXCL` lives on the tty and is cleared only
+at its *last* close. A pts whose master `nexus-sim` holds open never reaches that close, so
+the flag outlives the daemon's fd and **every** later `open(2)` is EBUSY — for the daemon
+and for anyone else (verified with an unrelated `python3` open). A one-second hardware flap
+is a permanent fault on a pts, which is the only reason it was visible at all. The same
+was true for every pty-backed serial device an operator might legitimately use — socat
+`PTY,link=`, QEMU `-serial pty` — and the D2 fix repairs all of them. §16.7's rule earns a
+corollary: **a double that turns a transient fault permanent is an amplifier worth
+keeping**, not only a coverage gap.
+
+**Two harness bugs of my own, recorded because both were briefly mistaken for product
+bugs.** The transport spec matched replies by arrival order, but the server auto-subscribes
+a fresh WebSocket and answers that first, so the indices were off by one; and a frame the
+server cannot parse as one request is refused with `-32600` and **no id**, so waiting for
+the smuggled request's id waits forever. Both are now matched on predicates. The lesson is
+the one §15.36 already recorded, in a new place: dump the frames before diagnosing.
+
+**One measurement recorded rather than fixed.** A console rendering a firehose surfaces its
+drop counter about **60 seconds** late — twice measured, with the daemon's numbers correct
+from its first snapshot. `tap.data` and `state` handlers share one renderer thread, and
+`appendText` sets `scrollTop = scrollHeight` per chunk, forcing a synchronous layout of a
+`<pre>` growing by megabytes (~45 KB/s). Hiding the terminal first does not help: the click
+that would hide it needs the same thread. Forcing the shed *before* the browser opens its
+tap does not work either — with no tap the hub only appends to a 64 KiB ring, far faster
+than the producer fills the feed, so nothing sheds; the loss genuinely requires a consumer
+that cannot keep up. That is honest behaviour for a control-and-observation tool at serial
+rates (§5), so the spec is tagged `@slow` and runs nightly. `p8_tap_drops.rs` keeps the
+daemon-side half byte-exact per push.
+
+### §15.3 — CI
+
+`web-ui` (per push) and `web-ui-nightly` (`schedule` only, `SNX_UI_SLOW=1`): node 24
+pinned, `npm ci` against the committed lockfile, `~/.cache/ms-playwright` cached on that
+lockfile's hash, `npx playwright install --with-deps chromium`, `cargo build --workspace`
+before the gate (the harness boots plain artifacts — see §5), `SNX_WEB_UI=required`, and
+`test-results` uploaded only `if: failure()`. The existing `check` job picks the gate up
+through `cargo test --workspace` and skips it, so the per-push Rust lane is unchanged.
+
+### §15.4 — checklist reduction (§16.7)
+
+**Moved from the manual checklist to CI-verified**, with the suite as the pointer: the
+OPFS round-trip and its offset splice (`history.spec.mjs`), the `tap.closed` re-anchor
+after `load --replace` (`lifecycle.spec.mjs`), the graph page's live indicators and the
+editor's add/remove/connect/disconnect flows including the daemon's verbatim structural
+refusal (`graph-editor.spec.mjs`), the storage badge, and export/clear. **Still manual:**
+rendering fidelity (fonts, terminal visuals, and a firehose's on-screen behaviour — see
+the measurement above), and real-rig interaction over the crossover hardware. `docs/security.md`
+and the doctor's report language are untouched by the reduction.
 
 ---
 

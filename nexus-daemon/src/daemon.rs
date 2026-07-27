@@ -1237,6 +1237,16 @@ impl Daemon {
                 // reconnecting client trims replay overlap against the last offset it
                 // stored, so a reload never duplicates ring bytes into its history.
                 "from_offset": reg.from_offset,
+                // Which offset space `from_offset` counts in (§11.8, §15.38). Unique
+                // per hub instance and never reused, so a client holding stored
+                // scrollback can tell an ordinary reconnect — where its frontier is
+                // still meaningful and replay overlap must be trimmed — from a hub
+                // rebuild (`load --replace`, `add-node`, `remove-node`), where offsets
+                // restarted at 0 beneath it and the frontier means nothing. Both look
+                // identical in offsets alone, which is why this is reported rather than
+                // inferred. `info.instance` remains the *per-boot* nonce; this is the
+                // per-endpoint-hub one it never claimed to be.
+                "epoch": reg.epoch,
                 // Bytes this endpoint has already lost at its producer→hub feed hop
                 // (§5, TAP-1b). The offset space counts delivered bytes only — which
                 // is what keeps replay's splice exact — so this is the baseline for

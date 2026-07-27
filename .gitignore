@@ -3,3 +3,9 @@
 /fuzz/corpus
 /fuzz/artifacts
 /examples/external-codec/target
+
+# Playwright dev-time dependency tree for the web console UI suite (design §15.37):
+# installed by `npm ci`, never shipped, never vendored into the binary.
+/serialnexusweb/ui-tests/node_modules
+/serialnexusweb/ui-tests/test-results
+/serialnexusweb/ui-tests/playwright-report

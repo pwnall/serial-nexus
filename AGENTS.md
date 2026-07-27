@@ -3,7 +3,11 @@
 Orientation for an AI agent (or human) picking this repo up cold. It captures what
 the code *is*, how to build/verify it, and the hard-won invariants you must not
 regress. When this file and the design disagree, **the design wins** — see
-`docs/28-design-claude-fable-v12.md`.
+`docs/30-design-claude-fable-v13.md`. One caveat learned twice: each new design
+generation so far has been rebased from a stale base and silently *dropped* rules the
+code still enforces. Before acting on "the design no longer says X", diff it against its
+predecessor in `docs/historical/` sentence by sentence; the fix has both times been to
+restore the text, not to delete working code (implementation notes, v12 and v13 tracks).
 
 ---
 
@@ -69,7 +73,11 @@ endpoint, raw edge defaults to `held` with steal-to-bypass). `existing-terminal`
   probing a port toggles DTR), the **`connect`/`disconnect`** edge-surgery verbs (live
   edge add/remove under the same critical-section validation as `load`), and the web
   console's **graph and editor pages** with the bridge allowlist widened to the
-  graph-editing verbs.
+  graph-editing verbs; and the **v13 browser-UI track** (design §15.37/§15.38 / plan §15):
+  a pinned **Playwright suite** (`serialnexusweb/ui-tests/`, Chromium only) driven by the
+  `nexus-itest` gate `p8_web_ui.rs`, which took the web console's browser half off the
+  §16.7 manual checklist. It found three real defects on its first run — see §2's
+  "What the browser suite found" below.
 - **Deferred / not implemented on purpose:** design §14 items, and the RPC verb
   `set-attribute` alone (it returns `-32601`; remove-and-re-add covers it). `connect` and
   `disconnect` **left that list in v12** (§15.35) and are implemented.
@@ -89,6 +97,18 @@ endpoint, raw edge defaults to `held` with steal-to-bypass). `existing-terminal`
   the `|| closed` arm that AGENTS §7 forbids deciding on 7.0 evidence. `nexus-doctor` gained
   **P6–P11** to settle the remaining kernel questions on 6.18 by diffing `--json`. Suite is
   480 passed / 0 failed / 4 ignored.
+- **What the browser suite found (2026-07-27), all fixed:** (1) the web client's
+  `offsetSpaceReset` inferred an offset-space restart from `from_offset < frontier`, which
+  is *also* what an ordinary reload with a replay ring looks like — so every reload
+  re-rendered and re-stored the ring, growing stored scrollback by one copy each time. The
+  daemon now reports a per-hub **`epoch`** on `tap.open` and the client re-anchors on that
+  (invariant 10), which also closes the old "`instance` does not rotate on a hub rebuild"
+  open issue. (2) `load --replace` opened a serial node's replacement device *before*
+  releasing the outgoing fd, so the daemon EBUSY'd against itself: on real hardware a
+  one-second `faulted` flap during which an accepted `send` was purged rather than
+  written. `SerialNode::teardown` now releases `TIOCEXCL`; guard
+  `p11_replace_atomicity.rs`, fail-first proved. (3) The same collision is *permanent* on
+  any pty-backed serial device (see §8). Suite is 485 passed / 0 failed / 4 ignored.
 - **Review remediation:** two full-workspace Opus reviews exist.
   `docs/historical/19-claude-opus-code-review.md` was remediated in `b9d8a50` and folded into v9.
   `docs/historical/26-claude-opus-code-review.md` (2026-07-25, 93 surviving findings, 20 refuted) was
@@ -138,6 +158,7 @@ Cargo workspace; `fuzz/` and `examples/external-codec/` are deliberately **exclu
 | `nexus-sim` | bin | Deterministic **test double** (plan §3): PTY doubles, client drivers, in-process null-modem, TCP link-outage proxy, wire/envelope/exec conformance batteries. Emits one machine-readable JSON verdict line per run. Uses the daemon's own permissive PTY/socket calls. `publish = false`. |
 | `nexus-doctor` | bin | Shipping **capability checker** (§15.17). Passive kernel probes P1 (EXTPROC/TIOCPKT), P2 (PTY POLLHUP presence), P4 (by-id resolver), **P6** (pty-master readiness after last-slave close), **P7** (evidence a collapsed session leaves), **P8** (epoll-vs-`read` on a pty master — invariant 1's premise, probed with raw epoll, *never* `AsyncFd`), **P9** (poll timeout granularity), **P10** (pty buffer depth) + opt-in real-port P3 (serial fit), P5 (rig cert) and **P11** (TIOCGICOUNT/TIOCMGET). Markdown or `--json`. **Attach its output to any bug report.** P6–P11 exist to be **diffed between kernels** — every one emits raw numbers in `--json`, and a differing kernel is `degraded` with the observation named, never `unsupported` (which `linux.jq` and `meta_gates` both gate on). |
 | `nexus-itest` | lib+tests | The **cross-platform integration harness** (§5), which replaced the bash `scripts/validate/**`. `src/lib.rs`: boots `serialnexusd` on a temp socket, an in-Rust JSON-RPC client (`Rpc`), a streaming `Subscription` (`subscribe`/`tap`), `nexus-sim` subprocess doubles, `serial_pair`/`serial_echo` (Linux sim) / `crossover_ports` (real HW) providers with self-skip, and `sha256_hex`. `tests/*.rs`: one file per former phase script. `publish = false`. |
+| `serialnexusweb/ui-tests` | npm | **Not a crate.** The pinned Playwright suite (design §15.37): `@playwright/test` 1.62.0 + lockfile, Chromium only, dev-time only, nothing ships. Run *only* through `cargo test -p nexus-itest --test p8_web_ui`, which boots the fixture and passes the bootstrap URL; running `npx playwright test` by hand fails loudly by design. |
 
 Dependency direction: `nexus-daemon` → {`nexus-core`, `nexus-rpc`, `nexus-sys`,
 `codec-api`, `codec-reference`}; both client bins → {`nexus-rpc`, `nexus-core`};
@@ -185,6 +206,12 @@ cargo check --target x86_64-apple-darwin --workspace --exclude serialnexusweb
 # gate that plants a banned crate and asserts cargo-deny rejects it (self-skips without it):
 cargo deny check licenses bans sources
 cargo test -p nexus-itest --test p0_license_gate --locked
+# The browser suite (design §15.37). Self-skips without node or the pinned Chromium;
+# the CI job sets SNX_WEB_UI=required so a skip there is a failure. First-time setup:
+#   (cd serialnexusweb/ui-tests && npm ci && npx playwright install --with-deps chromium)
+cargo test -p nexus-itest --test p8_web_ui
+SNX_UI_SLOW=1 cargo test -p nexus-itest --test p8_web_ui   # + the nightly @slow specs
+SNX_UI_GREP='reload splices' cargo test -p nexus-itest --test p8_web_ui  # one spec
 # Run one test file, or the #[ignore]d endurance soak:
 cargo test -p nexus-itest --test p4_steal_lease
 cargo test -p nexus-itest --test p8_soak -- --ignored
@@ -211,7 +238,8 @@ by convention only, since the numbered phases ended at 8 — one file per defect
 module doc naming the finding IDs it pins and the reviewer's live reproduction it replays.
 **Put a new review-driven guard there** rather than in a `p0`–`p8` file. A *feature* track
 gets its own family instead, so the two never blur: the v12 graph-editing track is `p10_*`
-(`p10_ports.rs`, `p10_edge_surgery.rs`). The web console is the one deliberate exception —
+(`p10_ports.rs`, `p10_edge_surgery.rs`) and the v13 browser-UI track is `p11_*`
+(`p11_replace_atomicity.rs`) plus the gate `p8_web_ui.rs`. The web console is the one deliberate exception —
 its §15.35 graph/editor tests went into `p8_web.rs`, because that file already carries
 several hundred lines of web-server harness (`WebServer`, a raw RFC 6455 client,
 `wsclient_rpc`) and a fourth copy of it would cost more than a slightly over-full file.
@@ -254,6 +282,15 @@ default — deepening it silently guts the test.
   asserts cargo-deny rejects it, self-skipping where cargo-deny is absent. `p8_external_codec.rs`
   builds the out-of-tree template from a consumer's position, and `p8_web_history.rs` runs
   the browser history module's `node --test` (self-skip without node). **No bash remains.**
+- **The browser half runs in a real browser** (§15.37). `p8_web_ui.rs` boots a daemon, sim
+  doubles and `serialnexusweb`, then hands a pinned Playwright suite the bootstrap URL. Its
+  three environmental prerequisites self-skip *with the command that fixes them*, and
+  `SNX_WEB_UI=required` turns every skip into a failure — prefer that shape for any gate
+  whose prerequisites are provisioned in CI but optional locally, because a gate that can
+  skip silently is a gate CI passes over a hole. It also asserts a **floor on the spec
+  count**, so a filter typo cannot shrink the suite quietly. Specs that cost real browser
+  time are tagged `@slow` and excluded per push (`--grep-invert @slow`) — Playwright's
+  spelling of `#[ignore]` + the nightly sweep.
 - **No bare sleeps.** Use `wait_until(Duration, || cond)` / `rpc.wait_status(…)` /
   `Subscription::wait_for(…)`. `Daemon`/`Sim`/`TempRun` clean up on `Drop` (kill children,
   remove the temp dir), so a panicking test never leaks a daemon or a socket.
@@ -484,6 +521,13 @@ running engineering log and the authoritative "why the code looks like this" rec
     `crossover_ports()` (`/dev/cu.usbserial-*`, or `SNX_CROSSOVER_A`/`_B`), self-skipping with
     no rig. `p8_web_history.rs` runs the browser history module under `node --test` and
     self-skips without `node`.
+- **`TIOCEXCL` on a pts outlives the fd that set it**, because the flag lives on the tty
+  and clears only at the tty's *last* close — which a pts whose master is held open (every
+  `nexus-sim pty` double, socat `PTY,link=`, QEMU `-serial pty`) never reaches. So a
+  reopen of the same pts by anyone, daemon included, is `EBUSY` forever. The daemon now
+  releases exclusivity in `SerialNode::teardown`, which repairs it; if you see a
+  permanently `faulted` serial node with `Device or resource busy` over a sim device,
+  check that release before blaming the sim.
 - **serial2, not serialport.** The MPL `serialport`/`mio-serial`/`tokio-serial` stack and
   LGPL `libudev` bindings are **banned in `deny.toml`**. `serial2` is opened blocking and
   driven by the daemon's own poll-based readiness; even `serial2-tokio` was dropped because

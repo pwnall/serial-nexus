@@ -540,6 +540,7 @@ Result:
 | `endpoint` | string | echoed |
 | `replay_bytes` | integer | bytes of ring replayed ahead of the live stream — `0` is the explicit empty-replay marker (ring off, or as-yet unfilled) |
 | `from_offset` | integer | the endpoint offset this tap's stream begins at (§11.8): with a non-empty replay, the ring's oldest byte; otherwise the live edge, i.e. the offset the next `tap.data` will carry. A reconnecting client trims replay against the last offset it stored |
+| `epoch` | integer | which offset space `from_offset` counts in (§15.38). Unique per endpoint *hub* within a daemon process and never reused, so a client holding stored scrollback can tell an ordinary reconnect — where its own frontier is still meaningful and replay overlap must be trimmed — from a hub rebuild (`load --replace`, `add-node`, `remove-node`), after which offsets restart at 0 while the per-*boot* `info.instance` nonce, correctly, does not change. The two are indistinguishable from offsets alone: both present as `from_offset` below the client's frontier, because a replay ring exists to re-send bytes the client already has. Persist it beside the stored offset and re-anchor exactly when it changes |
 | `feed_dropped` | integer | the endpoint's running producer→hub feed loss at open time — the baseline against which the `gap_before` deltas that follow are read (see [the offset contract](#tapdata-notification)) |
 
 Errors: `-32602` when the endpoint is unknown or not host-facing (only a
@@ -548,7 +549,7 @@ host-facing endpoint has a hub — a tap observes a hostward stream).
 ```console
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tap.open","params":{"endpoint":"console","replay":true}}' \
     | nc -U "$SOCK"
-{"jsonrpc":"2.0","id":1,"result":{"endpoint":"console","feed_dropped":0,"from_offset":0,"replay_bytes":0,"tap":0}}
+{"jsonrpc":"2.0","id":1,"result":{"endpoint":"console","epoch":1,"feed_dropped":0,"from_offset":0,"replay_bytes":0,"tap":0}}
 ```
 
 (Plain `nc -U` again: half-closing would end the connection and with it the tap.)

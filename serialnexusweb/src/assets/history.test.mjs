@@ -7,7 +7,15 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { newHistory, fromStored, splice, bytesOf, trim, offsetSpaceReset } from "./history.mjs";
+import {
+  newHistory,
+  fromStored,
+  splice,
+  bytesOf,
+  trim,
+  offsetSpaceChanged,
+  reanchor,
+} from "./history.mjs";
 import { makeSaver } from "./saver.mjs";
 
 // A byte range [start, end) whose byte at position p equals p & 0xff — so a concatenation
@@ -178,7 +186,9 @@ test("a restarted offset space re-anchors the log instead of freezing it", () =>
   const probe = fromStored(new Uint8Array([1, 2, 3]), 900_000);
   assert.equal(splice(probe, 0, new Uint8Array([9, 9])).length, 0, "the freeze itself");
 
-  assert.equal(offsetSpaceReset(h, 0), true, "a lower from_offset is a restart");
+  // The daemon reports which offset space the tap is in; a different one is a rebuild.
+  assert.equal(offsetSpaceChanged(7, 8), true, "a different epoch is a restart");
+  assert.equal(reanchor(h, 0), true);
   const fresh = splice(h, 0, new Uint8Array([9, 9]));
   assert.deepEqual(Array.from(fresh), [9, 9], "the new stream renders again");
   assert.equal(h.frontier, 2);
@@ -186,12 +196,49 @@ test("a restarted offset space re-anchors the log instead of freezing it", () =>
   assert.deepEqual(Array.from(bytesOf(h)), [1, 2, 3, 9, 9]);
 });
 
-test("an ordinary reconnect is not mistaken for a restart", () => {
+// The defect the v13 browser suite found (§15.38). The previous rule inferred a
+// restart from `from_offset < frontier` — which is *also* what an ordinary reload with
+// a non-empty replay ring looks like, by construction, because the ring exists to
+// re-send bytes the client already has. Every such reload was therefore declared a
+// restart, the frontier was thrown back to the ring base, the ring was re-rendered,
+// and the duplicate was written back to storage; in a real browser the stored
+// scrollback grew by one copy of the ring per reload (19 → 38 → 57 bytes over three
+// reloads, measured) under a false "the graph was reconfigured" marker.
+//
+// FAIL-FIRST: with the old two-argument rule this test's first assertion reads
+// `offsetSpaceReset(h, 934464) === false` against `frontier = 1_000_000`, which is
+// exactly the case that rule got wrong — it returned `true`.
+test("an ordinary reload with replay overlap is not mistaken for a restart", () => {
+  // A tab reloads: it stored 1 MB, and the daemon's 64 KiB ring replays the tail it
+  // already has. Same hub, therefore same epoch.
+  const EPOCH = 42;
+  const h = fromStored(seq(0, 256), 1_000_000);
+  assert.equal(
+    offsetSpaceChanged(EPOCH, EPOCH),
+    false,
+    "the same epoch is the same offset space, whatever the offsets look like",
+  );
+  assert.equal(h.frontier, 1_000_000, "the frontier is untouched");
+
+  // …and the replay that follows is trimmed rather than re-rendered.
+  const replay = seq(0, 64);
+  assert.equal(
+    splice(h, 934_464, replay).length,
+    0,
+    "the ring's overlap must not be re-rendered",
+  );
+  assert.equal(h.frontier, 1_000_000, "and must not move the frontier backwards");
+});
+
+test("a record stored before epochs existed re-anchors rather than freezing", () => {
+  // Absent is treated as changed: re-anchoring costs one duplicated ring, and the
+  // alternative — assuming continuity — costs the console (it freezes for good).
+  assert.equal(offsetSpaceChanged(null, 1), true);
+  assert.equal(offsetSpaceChanged(undefined, 1), true);
+});
+
+test("reanchor is a no-op when the frontier is already where the stream starts", () => {
   const h = fromStored(new Uint8Array([1, 2, 3]), 100);
-  // `--replay` re-sends from at or after the frontier: same space, no re-anchor.
-  assert.equal(offsetSpaceReset(h, 100), false, "equal offsets are continuous");
-  assert.equal(offsetSpaceReset(h, 140), false, "a forward jump is a gap, not a restart");
-  assert.equal(h.frontier, 100, "the frontier is untouched");
-  // And a never-anchored history has nothing to re-anchor.
-  assert.equal(offsetSpaceReset(newHistory(), 0), false);
+  assert.equal(reanchor(h, 100), false);
+  assert.equal(h.frontier, 100);
 });

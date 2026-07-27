@@ -12,7 +12,14 @@
 // tested); OPFS I/O is opfs.mjs; both degrade to memory-only where OPFS is absent.
 // (ES modules are always strict, so no "use strict" pragma is needed.)
 
-import { newHistory, fromStored, splice, bytesOf, offsetSpaceReset } from "/history.mjs";
+import {
+  newHistory,
+  fromStored,
+  splice,
+  bytesOf,
+  offsetSpaceChanged,
+  reanchor,
+} from "/history.mjs";
 import { makeSaver } from "/saver.mjs";
 import { opfsAvailable, requestPersistence, load, save, clear } from "/opfs.mjs";
 import { model as graphModel, render as renderGraph } from "/graph.mjs";
@@ -49,6 +56,7 @@ let persistStatus = "unavailable";  // persisted | best-effort | unavailable
 let storageError = null;            // last persistence failure, shown in the badge
 let history = null;                 // current console's ConsoleHistory (history.mjs)
 let historyKey = null;              // OPFS key for the current console — set with `history`
+let historyEpoch = 0;               // the tap's offset-space epoch (§11.8), stored with it
 let saveTimer = null;               // debounced persist handle
 let selectGen = 0;                  // selectConsole re-entrancy generation (see below)
 let view = "console";               // console | graph | editor (§17, §15.35)
@@ -365,14 +373,19 @@ async function selectConsole(display) {
   }
   if (res) {
     currentTap = res.tap;
+    historyEpoch = res.epoch ?? 0;
     // The tap's stream begins at res.from_offset; if we restored nothing, anchor the
     // history there so the first live chunk is not mistaken for offset 0.
     if (!stored) history.frontier = res.from_offset;
     // The endpoint's offset space restarts whenever the daemon rebuilds its hub —
     // `load --replace`, `remove-node`, `add-node` — while `instance` (per boot) does
     // not change, so stored scrollback would otherwise reject every new chunk as
-    // already-seen and the console would freeze. Re-anchor and say so.
-    else if (offsetSpaceReset(history, res.from_offset)) {
+    // already-seen and the console would freeze. The daemon now *says* which space it
+    // is talking about (§15.38), so this is a comparison rather than the guess it used
+    // to be: guessing from `from_offset` alone called every ordinary reload a restart
+    // and duplicated the ring into stored scrollback each time.
+    else if (offsetSpaceChanged(stored.epoch, historyEpoch)) {
+      reanchor(history, res.from_offset);
       appendMarker("\n— the daemon's graph was reconfigured; offsets restarted —\n");
     }
     if (res.replay_bytes > 0) appendMarker(`— replay (${res.replay_bytes} bytes) —\n`);
@@ -422,7 +435,7 @@ function flushSave() {
   if (!opfsOk || !historyKey || !history || history.frontier === null) return;
   // Serialized per key by the saver: overlapping full-buffer rewrites of one console
   // would truncate each other (WEB-5). Errors arrive at `storageFailed`.
-  saver.save(historyKey, bytesOf(history), history.frontier);
+  saver.save(historyKey, bytesOf(history), history.frontier, historyEpoch);
 }
 
 function appendText(s) {

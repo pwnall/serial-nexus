@@ -101,6 +101,10 @@ pub enum TapMsg {
 pub struct Registered {
     pub replay_bytes: u64,
     pub from_offset: u64,
+    /// The offset space `from_offset` is expressed in (§11.8, §15.38). Stable for
+    /// this hub's whole life and never reused, so a client that persists it beside
+    /// its scrollback knows — rather than infers — when the space restarted.
+    pub epoch: u64,
     /// Bytes this endpoint has lost at the producer→hub feed hop so far (§5). The
     /// offset space counts only delivered bytes, so this is the client's baseline
     /// for the `gap_before` deltas that follow (TAP-1b).
@@ -273,7 +277,32 @@ pub struct TapHub {
     /// The endpoint display: reported in `state`, and named in the `tap.closed`
     /// notification so a client learns *which* of its taps died.
     endpoint: String,
+    /// This hub's identity, and therefore its **offset space**'s (§11.8). Unique per
+    /// hub instance within a daemon process, monotonic, never reused.
+    ///
+    /// `ingested` is monotonic only for as long as *this* hub lives, and a hub is
+    /// rebuilt by `load --replace`, `add-node` and `remove-node` — after which
+    /// offsets restart at 0 while the per-*boot* `info.instance` nonce, quite
+    /// correctly, does not change. A client holding stored scrollback therefore had
+    /// no way to tell "the ring is replaying bytes I already have" (the ordinary
+    /// case, which its offsets already handle) from "the space restarted beneath me"
+    /// (where its frontier is meaningless), and inferring one from the other is not
+    /// possible: both look like `from_offset < my frontier`. Guessing sat in the
+    /// browser client for two revisions and was wrong in both directions — it
+    /// duplicated the ring into stored scrollback on every ordinary reload, and it
+    /// would have frozen a console outright had it guessed the other way.
+    ///
+    /// So the daemon says which space it is talking about, and the question stops
+    /// being a guess. Reported by `tap.open`; a client persists it beside its
+    /// scrollback and re-anchors exactly when it changes (§15.38).
+    epoch: u64,
 }
+
+/// Source of [`TapHub::epoch`]. Process-global and monotonic: uniqueness across the
+/// daemon's whole life is the property clients depend on, so a per-endpoint counter
+/// would be wrong — an endpoint removed and re-added would repeat an epoch and a
+/// client would splice across the seam it exists to mark.
+static NEXT_HUB_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 /// A shared, single-threaded handle to one endpoint's [`TapHub`].
 pub type SharedTapHub = Rc<CriticalCell<TapHub>>;
@@ -303,6 +332,7 @@ impl TapHub {
             feed_dropped_seen: 0,
             orphaned: false,
             endpoint: endpoint.into(),
+            epoch: NEXT_HUB_EPOCH.fetch_add(1, Ordering::Relaxed),
         };
         (Rc::new(CriticalCell::new(hub)), active, feed_dropped)
     }
@@ -411,6 +441,7 @@ impl TapHub {
         Registered {
             replay_bytes,
             from_offset,
+            epoch: self.epoch,
             feed_dropped: self.feed_dropped.load(Ordering::Relaxed),
         }
     }

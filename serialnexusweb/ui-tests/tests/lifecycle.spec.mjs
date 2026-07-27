@@ -1,0 +1,63 @@
+// The `tap.closed` re-anchor, in a real browser (design §15.37, plan §15.2).
+//
+// This is the one behaviour on §16.7's list that had no automated coverage at any
+// layer: a `load --replace` under an open console rebuilds the endpoint's hub, which
+// retires the tap and restarts the endpoint's offset space *without* rotating the
+// daemon's per-boot `instance` nonce (AGENTS.md invariant 10 records that as the known
+// open issue). The client's answer is `offsetSpaceReset`, and until now nothing
+// exercised it against a real stored history.
+
+import { test, expect } from "@playwright/test";
+import {
+  ECHO,
+  REPLACE_CFG,
+  countInTerminal,
+  ctl,
+  open,
+  selectConsole,
+  send,
+  token,
+  waitNodeActive,
+} from "./fixture.mjs";
+
+test("load --replace under an open console detaches, re-anchors, and does not duplicate", async ({
+  page,
+}) => {
+  test.skip(!ECHO, "no serial device on this platform (§5): nothing echoes");
+  await open(page);
+  await selectConsole(page, ECHO);
+
+  const before = token("pre-replace");
+  await send(page, before);
+  await expect(page.locator("#term")).toContainText(before);
+  await page.waitForTimeout(1500); // let the debounced OPFS snapshot land
+
+  // The browser cannot do this, by design: `load` is off the bridge's allowlist
+  // (§17/§15.35, invariant 11), so the operator's own path is the control socket. The
+  // gate wrote `REPLACE_CFG` from the same fixture it loaded, so the graph comes back
+  // identical and every console stays addressable.
+  ctl("load", "--replace", REPLACE_CFG);
+
+  // §10's `tap.closed`: without it the stream simply stops, which is
+  // indistinguishable from a quiet console — an operator watching a dead pane
+  // believing it is live.
+  await expect(page.locator("#term")).toContainText("console detached");
+
+  await waitNodeActive(ECHO);
+
+  // Re-selecting re-opens the tap. The endpoint's offsets restarted while `instance`
+  // did not, so the stored scrollback would otherwise reject every new chunk as
+  // already-seen and the console would freeze forever. The client says so and
+  // re-anchors.
+  await selectConsole(page, ECHO);
+  await expect(page.locator("#term")).toContainText("offsets restarted");
+
+  // The re-anchor must not duplicate what was already stored…
+  expect(await countInTerminal(page, before)).toBe(1);
+  // …and the console must be alive again, which is the failure this whole path exists
+  // to prevent.
+  const after = token("post-replace");
+  await send(page, after);
+  await expect(page.locator("#term")).toContainText(after);
+  expect(await countInTerminal(page, before)).toBe(1);
+});

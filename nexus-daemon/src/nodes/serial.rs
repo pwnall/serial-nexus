@@ -280,7 +280,36 @@ impl SerialNode {
         // the reader is already joined.
         self.signal_stop();
         stop_join_reader(&self.reader_slot);
-        self.shared.with_mut(|sh| sh.port = None);
+        self.shared.with_mut(|sh| {
+            // Give the exclusivity back before letting go of the port (§7.1).
+            //
+            // `sh.port = None` does NOT close the fd here: the aborted supervisor's
+            // future still holds an `Rc<SerialPort>` clone across its `.await`, and an
+            // aborted `spawn_local` task is only dropped once the `LocalSet` gets the
+            // runtime thread back — which cannot happen until the synchronous critical
+            // section that called us returns (§15.20). `load --replace` composes
+            // teardown-then-load inside one such section, so the *replacement* node's
+            // `open(2)` lands while this fd is still open, and `TIOCEXCL` made the
+            // daemon EBUSY against itself: on real hardware a one-second `faulted`
+            // flap during which an accepted `send` was purged rather than written; on a
+            // pty-backed device (socat `PTY,link=`, QEMU `-serial pty`, `nexus-sim`) a
+            // *permanent* one, because the flag lives on the tty and clears only at its
+            // last close, which a held master never reaches.
+            //
+            // Releasing it is one ioctl and it is the right one: exclusivity is a claim
+            // this node made, so this node gives it up when it stops. The unclaimed
+            // window is bounded by the same critical section, and whoever opens next
+            // re-takes it (`open_port`). A guaranteed outage is the worse trade.
+            // Guarded by `p11_replace_atomicity.rs`, including the clause that the port
+            // is still exclusive while a live node holds it.
+            if let Some(port) = sh.port.as_ref() {
+                // Best effort: a port whose fd the driver already invalidated (unplug)
+                // has nothing to release, and failing teardown over that would strand
+                // the node. The reopen path re-takes exclusivity regardless.
+                let _ = sys::set_exclusive(port.as_raw_fd(), false);
+            }
+            sh.port = None;
+        });
     }
 }
 

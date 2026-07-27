@@ -15,11 +15,11 @@
 // Storage-free and DOM-free (the write function is injected) so it is unit-testable
 // under `node --test` alongside the splice core.
 
-/// Build a saver over `write(key, bytes, endOffset) -> Promise`. `onError(err, key)` is
+/// Build a saver over `write(key, bytes, endOffset, epoch) -> Promise`. `onError(err, key)` is
 /// called once per failed write; the caller decides what a failure means (app.js drops to
 /// memory-only and says so).
 export function makeSaver(write, onError = () => {}) {
-  // key -> { pending: {bytes, endOffset} | null, running: boolean }
+  // key -> { pending: {bytes, endOffset, epoch} | null, running: boolean }
   const queues = new Map();
 
   function drain(key, q) {
@@ -28,7 +28,7 @@ export function makeSaver(write, onError = () => {}) {
         while (q.pending) {
           const next = q.pending;
           q.pending = null; // claim it before awaiting: a save during the write re-fills it
-          await write(key, next.bytes, next.endOffset);
+          await write(key, next.bytes, next.endOffset, next.epoch);
         }
       } catch (err) {
         q.pending = null;
@@ -45,13 +45,13 @@ export function makeSaver(write, onError = () => {}) {
     /// Persist a snapshot for `key`. Returns immediately; the write is serialized
     /// behind any write already in flight for that key, replacing any snapshot that
     /// was merely waiting.
-    save(key, bytes, endOffset) {
+    save(key, bytes, endOffset, epoch) {
       let q = queues.get(key);
       if (!q) {
         q = { pending: null, running: false };
         queues.set(key, q);
       }
-      q.pending = { bytes, endOffset };
+      q.pending = { bytes, endOffset, epoch };
       if (q.running) return;
       q.running = true;
       drain(key, q);

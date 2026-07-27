@@ -63,23 +63,40 @@ export function splice(h, offset, bytes) {
   return fresh;
 }
 
-/// Re-anchor the log when the daemon's offset space restarts beneath it, returning
-/// `true` iff it did.
+/// Whether stored scrollback belongs to a different offset space than the tap that was
+/// just opened — i.e. whether the daemon rebuilt the endpoint's hub beneath it.
 ///
 /// Hostward offsets are monotonic *per endpoint hub*, and `load --replace`,
 /// `remove-node` and `add-node` all rebuild those hubs — so offsets go back to 0 while
 /// the daemon `instance` nonce, which is per *boot*, does not change. A stored history
-/// whose frontier sits at (say) 900 000 then rejects every fresh chunk as
-/// already-seen, and the console silently freezes: the recorded `load --replace` OPFS
-/// freeze, from the client side.
+/// whose frontier sits at (say) 900 000 then rejects every fresh chunk as already-seen,
+/// and the console silently freezes.
+///
+/// **This is answered from the daemon's `epoch`, never inferred from offsets** (§15.38),
+/// because offsets cannot answer it. Both a rebuild and an ordinary reconnect present
+/// as `from_offset < frontier` — the second one by construction, since a replay ring
+/// exists precisely to re-send bytes the client already has. The version of this
+/// function that guessed from `from_offset` shipped for two revisions and was wrong in
+/// the common direction: every reload with any replay overlap was declared a restart,
+/// the ring was re-rendered, and the duplicate was written back to storage, so stored
+/// scrollback grew by one copy of the ring per reload. Guessing the other way would
+/// have frozen the console instead. There is no third answer available from offsets.
+///
+/// A stored record with no epoch (written before the daemon reported one) counts as
+/// changed: re-anchoring costs one duplicated ring, freezing costs the console.
+export function offsetSpaceChanged(storedEpoch, epoch) {
+  return storedEpoch === null || storedEpoch === undefined || storedEpoch !== epoch;
+}
+
+/// Move the log's frontier to where a new offset space actually starts, returning
+/// `true` iff it moved.
 ///
 /// The retained bytes are real and stay — they happened — but they belong to a space
-/// the daemon no longer counts in, so the frontier moves to where the new stream
-/// actually starts. The caller is expected to mark the seam, because concatenating two
-/// offset spaces without saying so is exactly the silent splice §10's offset contract
-/// exists to prevent.
-export function offsetSpaceReset(h, fromOffset) {
-  if (h.frontier === null || fromOffset >= h.frontier) return false;
+/// the daemon no longer counts in. The caller is expected to mark the seam, because
+/// concatenating two offset spaces without saying so is exactly the silent splice
+/// §10's offset contract exists to prevent.
+export function reanchor(h, fromOffset) {
+  if (h.frontier === fromOffset) return false;
   h.frontier = fromOffset;
   return true;
 }

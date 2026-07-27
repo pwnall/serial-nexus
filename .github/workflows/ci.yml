@@ -177,6 +177,70 @@ jobs:
           name: nexus-doctor-macos-report
           path: nexus-doctor-macos.md
 
+  # The web console's browser half, in real headless Chromium (design §15.37, plan §15).
+  # §16.7's doctrine only allows a behavior the sim cannot exercise to be checklist-
+  # verified or marked unverified — and a checklist does not run per push, which is what
+  # left the OPFS splice, the `tap.closed` re-anchor and the editor flows unasserted
+  # where they actually run. This job provisions node plus the pinned Chromium and runs
+  # `p8_web_ui`, which boots the daemon + sim fixture and hands a pinned Playwright suite
+  # a bootstrap URL.
+  #
+  # `SNX_WEB_UI=required` is the point of the job: the gate self-skips when node or the
+  # browser is missing (so a developer's `cargo test --workspace` is unaffected, and the
+  # `check` job above skips it), and this variable turns every one of those skips into a
+  # failure. Without it the job could go green having run nothing — the same shape as the
+  # fuzz loop that ran a stale list (§15.36 rule 7). The gate additionally asserts a floor
+  # on the number of specs that passed.
+  #
+  # `@slow` specs (today: the forced tap shed, which costs a minute of real renderer
+  # time) are excluded here and run in the nightly lane below — Playwright's spelling of
+  # this repo's `#[ignore]` convention.
+  web-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup toolchain install "$MSRV" --profile minimal && rustup default "$MSRV"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: serialnexusweb/ui-tests/package-lock.json
+      # `npm ci` installs exactly the committed lockfile — the dev-time dependency tree
+      # is pinned like every other tool version in this file (§15.37: "the browser and
+      # package versions are pinned").
+      - name: Install the pinned Playwright package
+        working-directory: serialnexusweb/ui-tests
+        run: npm ci
+      # Keyed on the lockfile, because the browser build Playwright wants is a function
+      # of the Playwright version. A miss costs the ~115 MiB download once.
+      - name: Cache the pinned Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('serialnexusweb/ui-tests/package-lock.json') }}
+      - name: Install the pinned Chromium
+        working-directory: serialnexusweb/ui-tests
+        run: npx playwright install --with-deps chromium
+      # The gate boots the plain `target/debug/{serialnexusd,nexus-sim,serialnexusweb}`
+      # artifacts, which only `cargo build` emits (see the `check` job).
+      - name: Build workspace binaries (the gate boots them as subprocesses)
+        run: cargo build --workspace --locked
+      - name: Browser suite
+        env:
+          SNX_WEB_UI: required
+        run: cargo test -p nexus-itest --test p8_web_ui --locked
+      # Traces and screenshots for a failing spec (§15.37). `if: failure()` so a green
+      # run uploads nothing.
+      - uses: actions/upload-artifact@v5
+        if: failure()
+        with:
+          name: playwright-traces
+          path: serialnexusweb/ui-tests/test-results
+          retention-days: 7
+
   # Nightly soak (§Phase 8 item 2): the reference-topology data plane under sustained
   # synthetic load, asserting bounded RSS, allowlisted counters, zero faults, and a
   # final checksum reconciliation. The `#[ignore]`d endurance test, parameterized by
@@ -219,6 +283,49 @@ jobs:
         run: cargo build --workspace --locked
       - name: Full suite including ignored (endurance/heavy)
         run: cargo test --workspace --locked -- --include-ignored
+
+  # Nightly browser lane: the same gate with the `@slow` specs included — today the
+  # forced tap shed, which drowns the renderer on purpose and therefore takes about a
+  # minute of real browser time to surface the counter it is asserting. Playwright's
+  # spelling of the `#[ignore]` + nightly-sweep convention the Rust suite already uses.
+  web-ui-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup toolchain install "$MSRV" --profile minimal && rustup default "$MSRV"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: serialnexusweb/ui-tests/package-lock.json
+      - name: Install the pinned Playwright package
+        working-directory: serialnexusweb/ui-tests
+        run: npm ci
+      - name: Cache the pinned Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('serialnexusweb/ui-tests/package-lock.json') }}
+      - name: Install the pinned Chromium
+        working-directory: serialnexusweb/ui-tests
+        run: npx playwright install --with-deps chromium
+      - name: Build workspace binaries (the gate boots them as subprocesses)
+        run: cargo build --workspace --locked
+      - name: Browser suite, slow specs included
+        env:
+          SNX_WEB_UI: required
+          SNX_UI_SLOW: '1'
+        run: cargo test -p nexus-itest --test p8_web_ui --locked
+      - uses: actions/upload-artifact@v5
+        if: failure()
+        with:
+          name: playwright-traces-nightly
+          path: serialnexusweb/ui-tests/test-results
+          retention-days: 7
 
   # Nightly fuzzing (§Phase 8, widened by review 26 SEC-7): every parser on an
   # externally-reachable surface, on top of the existing proptest coverage. Needs a
