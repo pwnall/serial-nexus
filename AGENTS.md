@@ -78,6 +78,17 @@ endpoint, raw edge defaults to `held` with steal-to-bypass). `existing-terminal`
   no wiring, so it is now **refused structurally** rather than loading a port it seizes with
   `TIOCEXCL` and attaches to nothing; a standalone re-multiplexing codec (`faces = "host"`)
   now comes up `waiting` with a §14 reason, which is what §7.5 promised, instead of `faulted`.
+- **CI flake remediation + 6.18 probes (2026-07-26/27):** CI had been red on four of the last six
+  pushes, on three *different* tests. All of it is fixed; see `docs/implementation-notes.md` for the
+  mechanisms. In short: the `p8_web` RFC 6455 test client was not frame-atomic w.r.t. its deadline
+  and desynced (**the obvious `pending`-buffer fix is insufficient — it was measured**; the shape is
+  fill-then-commit); `nexus-sim`'s echo double died on a bare pty `POLLHUP` and its null modem
+  busy-spun a core; nine test files asserted byte-exactness at the lossy console boundary (see the
+  new rule in §5); and — a **real product defect** found beside them — a collapsed pty session
+  carrying no data byte leaked the exclusive write lock, fixed kernel-independently rather than with
+  the `|| closed` arm that AGENTS §7 forbids deciding on 7.0 evidence. `nexus-doctor` gained
+  **P6–P11** to settle the remaining kernel questions on 6.18 by diffing `--json`. Suite is
+  480 passed / 0 failed / 4 ignored.
 - **Review remediation:** two full-workspace Opus reviews exist.
   `docs/historical/19-claude-opus-code-review.md` was remediated in `b9d8a50` and folded into v9.
   `docs/historical/26-claude-opus-code-review.md` (2026-07-25, 93 surviving findings, 20 refuted) was
@@ -125,7 +136,7 @@ Cargo workspace; `fuzz/` and `examples/external-codec/` are deliberately **exclu
 | `serialnexusctl` | bin | Thin JSON-RPC client CLI. Subcommands → requests over the Unix socket; renders structured replies; `--json` is a raw pass-through of the daemon `result`. |
 | `serialnexusweb` | bin | Standalone loopback HTTP+WebSocket console that is a **pure RPC client** of the daemon (the daemon gains no HTTP). Filtering JSON-RPC proxy; enforces per-session token + Host validation; **refuses graph/lifecycle verbs** (§17). Hand-rolled HTTP on tokio; `tokio-tungstenite` WS; TLS via `rustls`+`rcgen` pinned to the **ring** backend. |
 | `nexus-sim` | bin | Deterministic **test double** (plan §3): PTY doubles, client drivers, in-process null-modem, TCP link-outage proxy, wire/envelope/exec conformance batteries. Emits one machine-readable JSON verdict line per run. Uses the daemon's own permissive PTY/socket calls. `publish = false`. |
-| `nexus-doctor` | bin | Shipping **capability checker** (§15.17). Passive kernel probes P1 (EXTPROC/TIOCPKT), P2 (PTY POLLHUP presence), P4 (by-id resolver) + opt-in real-port P3 (serial fit) and P5 (rig cert). Markdown or `--json`. **Attach its output to any bug report.** |
+| `nexus-doctor` | bin | Shipping **capability checker** (§15.17). Passive kernel probes P1 (EXTPROC/TIOCPKT), P2 (PTY POLLHUP presence), P4 (by-id resolver), **P6** (pty-master readiness after last-slave close), **P7** (evidence a collapsed session leaves), **P8** (epoll-vs-`read` on a pty master — invariant 1's premise, probed with raw epoll, *never* `AsyncFd`), **P9** (poll timeout granularity), **P10** (pty buffer depth) + opt-in real-port P3 (serial fit), P5 (rig cert) and **P11** (TIOCGICOUNT/TIOCMGET). Markdown or `--json`. **Attach its output to any bug report.** P6–P11 exist to be **diffed between kernels** — every one emits raw numbers in `--json`, and a differing kernel is `degraded` with the observation named, never `unsupported` (which `linux.jq` and `meta_gates` both gate on). |
 | `nexus-itest` | lib+tests | The **cross-platform integration harness** (§5), which replaced the bash `scripts/validate/**`. `src/lib.rs`: boots `serialnexusd` on a temp socket, an in-Rust JSON-RPC client (`Rpc`), a streaming `Subscription` (`subscribe`/`tap`), `nexus-sim` subprocess doubles, `serial_pair`/`serial_echo` (Linux sim) / `crossover_ports` (real HW) providers with self-skip, and `sha256_hex`. `tests/*.rs`: one file per former phase script. `publish = false`. |
 
 Dependency direction: `nexus-daemon` → {`nexus-core`, `nexus-rpc`, `nexus-sys`,
@@ -204,6 +215,19 @@ gets its own family instead, so the two never blur: the v12 graph-editing track 
 its §15.35 graph/editor tests went into `p8_web.rs`, because that file already carries
 several hundred lines of web-server harness (`WebServer`, a raw RFC 6455 client,
 `wsclient_rpc`) and a fourth copy of it would cost more than a slightly over-full file.
+
+**A test must not assert byte-exactness at a boundary the design makes lossy.** A `pty` node's
+hostward path is a bounded bridge whose overflow is **dropped and counted** (`pty.rs`'s
+`sync_channel(hostward_buffer)` → `dropped_slow_consumer`), default depth 32 chunks, and design
+§5/§15.19 sanction that loss: "a slow spy costs itself data, never its neighbors." A test that
+streams ≥64 KiB through a console and asserts it arrives *complete* is therefore asserting more
+than the design guarantees, and it flakes on a loaded runner — `received + dropped_slow_consumer`
+equals `sent` to the byte, while the lossless sink (a `log`) stays byte-exact in the same run. Give
+that console pty an explicit `hostward_buffer = 8192` and cite §5/§15.19 in a comment. Raising the
+*serial* node's depth does **not** help: the pty pump drops rather than awaits, so it never
+backpressures upstream and the pty's own depth is the only buffer in the path. The exception that
+must not be "fixed": a node whose **loss is the subject** (a deliberately slow tap) keeps its
+default — deepening it silently guts the test.
 
 **Iron conventions — follow them when adding tests:**
 - **Assert on structured RPC results / byte-exact SHA-256, never CLI text.** Drive the
@@ -479,6 +503,16 @@ running engineering log and the authoritative "why the code looks like this" rec
   socket is always `$XDG_RUNTIME_DIR/serialnexusd.sock`.
 - **Device access:** the dev-box user is in the `dialout` group (both FTDI ports open r/w).
   The old "plugdev-not-dialout / access pending" note is stale.
+- **Before concluding anything from a failing test on the dev box, check the box.** `uptime` and
+  `pgrep -x yes`. Reproducing a load-sensitive flake usually means spawning CPU hogs, and hogs get
+  leaked: 16 stray `yes` processes once held this 8-core laptop at load ~19 for ten hours, which made
+  `p3_firehose`, `p5_resync`, `p8_tap_drops` and `p5_exec_crash` fail and cost a round of false
+  "did we regress?" investigation. Killed, `p3_firehose` ran in **2.53 s** — the healthy figure
+  invariant 9 records — and the suite went green. **Clean up every hog you start**, and prefer
+  bounding them with `timeout`. This is a shared machine the user is working on.
+- **`git stash` is as destructive as `git checkout --` when the tree holds a large uncommitted
+  change set**, which is the normal state mid-track here. To answer "is this failure ours?", add a
+  throwaway `git worktree` at the last commit, build there, and compare — it touches nothing.
 
 ## 9. How work has been done here (the working rhythm)
 

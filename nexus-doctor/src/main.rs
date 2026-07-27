@@ -4,9 +4,19 @@
 //!
 //! One consolidated binary that runs every kernel-behavior probe the design
 //! depends on (P1 EXTPROC/TIOCPKT, P2 PTY presence, P3 serial fit, P4 by-id
-//! resolution) plus environment checks, and emits a copy-pasteable Markdown
-//! report — the expected first attachment on any support request — with a
-//! `--json` twin for CI.
+//! resolution, P5 rig certification, P6 post-hangup pty readiness, P7 collapsed
+//! client-session evidence, P8 epoll vs read(2) on a pty master, P9 poll(2)
+//! timeout granularity, P10 pty buffer depth, P11 real-port line-state counters)
+//! plus environment checks, and emits a copy-pasteable Markdown report — the
+//! expected first attachment on any support request — with a `--json` twin for
+//! CI.
+//!
+//! The `--json` twin is also the **cross-kernel diff artifact**: production runs
+//! Linux 6.18 and this tree is developed on 7.0, so §13 forbids a one-way
+//! decision resting on 7.0-only evidence. Every probe emits its raw measurements
+//! (counts, flags, bytes in hex, microseconds, byte depths) beside its verdict so
+//! two runs can be diffed numerically — P6..P11 exist for exactly that, and each
+//! one measures a premise some shipped decision currently rests on.
 //!
 //! The daemon never consumes this output: its degradation paths (e.g. §7.2's
 //! reconciliation poll) are unconditional, so a wrong probe can mislead a
@@ -37,8 +47,9 @@ struct Cli {
     /// Emit Markdown (the default).
     #[arg(long)]
     markdown: bool,
-    /// A serial port to include in P3 (repeatable). Required to open any real
-    /// port — passive by default (§3).
+    /// A serial port to include in P3, P5 and P11 (repeatable). Required to open
+    /// any real port — passive by default (§3), because opening a port toggles
+    /// DTR on equipment that may be live.
     #[arg(long = "port")]
     ports: Vec<PathBuf>,
     /// Root prefix for /dev and /sys resolution — a test seam for fixture by-id
@@ -97,6 +108,29 @@ fn main() {
         let resolver = nexus_core::Resolver::with_roots(&cli.dev_root, &sys_root);
         probe_list.push(probes::p5_rig(&cli.ports, &resolver));
     }
+
+    // P6/P7 — the two pty last-close measurements (§6 detach-release, §7.2). Both
+    // are pty-only, so they are passive and need no `--port`, exactly like P1/P2.
+    // They run *after* P5 deliberately: P5's discovery window is wall-clock timed
+    // against live peers (and `p7_p5`'s hot-unplug test times a sim against it), so
+    // nothing new may be inserted ahead of it.
+    probe_list.push(probes::p6_last_close_readiness());
+    probe_list.push(probes::p7_collapsed_session());
+
+    // P8/P9/P10 — the data-plane shape measurements (invariant 1, §15.19's timer
+    // floor, the hostward_buffer defaults). Pty- and poll-only, so passive like
+    // P1/P2/P6/P7, and behind P5 for the same wall-clock reason. Together they add
+    // roughly 0.5 s to a run: P8 ~0.26 s (2 × 64 passes at a 1 ms timeout), P9
+    // ~0.26 s (4 timeouts × 16 samples), P10 milliseconds.
+    probe_list.push(probes::p8_epoll_readiness());
+    probe_list.push(probes::p9_poll_granularity());
+    probe_list.push(probes::p10_pty_buffer_depth());
+
+    // P11 — real-port line-state ioctls. Opt-in behind --port exactly like P3/P5:
+    // it opens a real device (which toggles DTR), though it transmits nothing and
+    // leaves the port's settings untouched. `p11_line_state` reports the skip
+    // itself when the list is empty, so there is no placeholder branch here.
+    probe_list.push(probes::p11_line_state(&cli.ports));
 
     let report = Report::new(generated_unix_ms, environment, probe_list);
 

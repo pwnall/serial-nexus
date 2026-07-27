@@ -142,8 +142,18 @@ channels = ["c0", "c1", "c2", "c3"]
             dev = dev.display(),
         );
         for ch in CHANNELS {
+            // `hostward_buffer = 8192` is load-bearing, not decoration — do not
+            // "simplify" it away. Property 1 below asserts each console received the
+            // manifest's byte count *exactly*, but a pty node's hostward path is a
+            // bounded bridge whose overflow is dropped and counted (design §5,
+            // §15.19: "a slow spy costs itself data, never its neighbors"). At the
+            // 32-chunk default a drain client descheduled under parallel-suite load
+            // sheds legally, and the test reads that as a lossy recovery — observed
+            // as `received 458752 != 524288` with the codec's own
+            // `delivered_hostward` still correct. Deepening the bridge keeps the
+            // assertion about *resync correctness*, which is what this file is for.
             cfg.push_str(&format!(
-                "[[node]]\ntype = \"pty\"\nname = \"con-{ch}\"\npath = \"{path}\"\n",
+                "[[node]]\ntype = \"pty\"\nname = \"con-{ch}\"\npath = \"{path}\"\nhostward_buffer = 8192\n",
                 path = run.join(&format!("tty-{ch}")).display(),
             ));
         }

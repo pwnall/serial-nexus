@@ -52,7 +52,11 @@
 //!   `wsclient` subcommand cannot produce, since it serialises its own request — so
 //!   this file carries a ~100-line RFC 6455 client ([`Ws`]): the handshake plus masked
 //!   client frames and unmasked server frames. No new dependency; the whole point is
-//!   to send bytes a well-behaved client never would.
+//!   to send bytes a well-behaved client never would. It reads **frame-atomically**
+//!   with respect to its deadline — a deadline landing inside a frame must cost no
+//!   bytes, because the daemon's 5 Hz `state` snapshots mean every tail deadline
+//!   expires into a live stream. That is apparatus, not a server property, so it has
+//!   its own scripted-peer guards under "(0)" rather than a numbered entry here.
 //! * The plaintext HTTP gates, the WS bridge relay/filter, the frame-smuggling and
 //!   Origin cases, the pre-auth bounds, the bind-policy refusal, and the TLS-tier
 //!   bind/key-mode/non-loopback/round-trip checks need **no serial device**, so they
@@ -60,11 +64,12 @@
 //!   ([`serial_echo`]) and so **skips** on macOS (§5).
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -303,9 +308,25 @@ fn daemon_alive(socket: &Path) -> bool {
 /// `serialnexusweb wsclient` cannot express: it serialises its own single request.
 struct Ws {
     stream: TcpStream,
+    /// Bytes taken off the socket but not yet handed to a caller. **It is only ever
+    /// appended to** — by [`Ws::fill`] — and drained at exactly two commit points: one
+    /// byte at a time while scanning the HTTP response head, and one *whole* frame at a
+    /// time in [`Ws::recv_message`]. That is what makes the client frame-atomic with
+    /// respect to its deadline: a deadline expiring part-way into a frame leaves every
+    /// byte already read sitting here, so the next call resumes on the same frame
+    /// instead of re-reading the middle of it as a header. See the guards under "(0)".
+    pending: Vec<u8>,
 }
 
 impl Ws {
+    /// Wrap a connected socket. The single place a `Ws` comes into existence.
+    fn new(stream: TcpStream) -> Ws {
+        Ws {
+            stream,
+            pending: Vec::new(),
+        }
+    }
+
     /// Open `/ws`, returning the client on a `101`, or `Err(status)` for whatever the
     /// server answered instead (403 for a refused Origin, 401 without the cookie).
     fn connect(
@@ -318,7 +339,7 @@ impl Ws {
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("set read timeout");
-        let mut ws = Ws { stream };
+        let mut ws = Ws::new(stream);
         // The key is not validated by the server (it only hashes it into the accept
         // digest), so RFC 6455 §1.3's own example nonce keeps this deterministic.
         let mut req = format!(
@@ -339,8 +360,9 @@ impl Ws {
         ws.stream.flush().expect("flush WS upgrade");
 
         // Byte-at-a-time to the blank line: the bridge subscribes to the daemon the
-        // instant it is built, so server frames follow the 101 immediately and a
-        // buffered read would swallow them.
+        // instant it is built, so server frames follow the 101 immediately. Reading
+        // greedily is safe now only because anything read past the `\r\n\r\n` stays in
+        // `pending` for `recv_message` — nothing is swallowed either way.
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut head = Vec::new();
         loop {
@@ -365,25 +387,45 @@ impl Ws {
         if status == 101 { Ok(ws) } else { Err(status) }
     }
 
-    /// Read exactly `n` bytes by `deadline`, or `None` (deadline, EOF, or error).
-    fn read_bytes(&mut self, n: usize, deadline: Instant) -> Option<Vec<u8>> {
-        let mut out = vec![0u8; n];
-        let mut got = 0;
-        while got < n {
+    /// Read until `self.pending` holds at least `n` bytes, or `deadline` passes (or the
+    /// peer EOFs/errors); report whether it does. **Non-consuming**: it only ever
+    /// *appends* to `pending`, so failing costs nothing — every byte already taken off
+    /// the socket is still there, and a retry with a fresh deadline resumes exactly
+    /// where this one stopped. Callers inspect `pending` in place and commit later.
+    fn fill(&mut self, n: usize, deadline: Instant) -> bool {
+        let mut buf = [0u8; 4096];
+        while self.pending.len() < n {
             let now = Instant::now();
             if now >= deadline {
-                return None;
+                return false;
             }
-            self.stream
+            if self
+                .stream
                 .set_read_timeout(Some((deadline - now).max(Duration::from_millis(1))))
-                .ok()?;
-            match self.stream.read(&mut out[got..]) {
-                Ok(0) => return None,
-                Ok(k) => got += k,
-                Err(_) => return None, // WouldBlock at the deadline, or closed
+                .is_err()
+            {
+                return false;
+            }
+            // A timed read returns as soon as *any* bytes are available, so a buffer
+            // larger than the shortfall never over-blocks — it just banks whatever the
+            // segment carried past this frame, which is exactly what we want.
+            match self.stream.read(&mut buf) {
+                Ok(0) => return false, // EOF
+                Ok(k) => self.pending.extend_from_slice(&buf[..k]),
+                Err(_) => return false, // WouldBlock at the deadline, or closed
             }
         }
-        Some(out)
+        true
+    }
+
+    /// Take exactly `n` bytes by `deadline`, or `None` (deadline, EOF, or error). The
+    /// consuming wrapper over [`Ws::fill`]: it commits only once all `n` are in hand,
+    /// so a failed call removes nothing.
+    fn read_bytes(&mut self, n: usize, deadline: Instant) -> Option<Vec<u8>> {
+        if !self.fill(n, deadline) {
+            return None;
+        }
+        Some(self.pending.drain(..n).collect())
     }
 
     /// Send one text frame, masked as RFC 6455 requires of a client.
@@ -408,39 +450,58 @@ impl Ws {
 
     /// The next complete server message's payload (continuation frames reassembled,
     /// control frames skipped, a close frame ending the stream), or `None`.
+    ///
+    /// **Fill-then-commit.** Every step below grows `pending` and inspects it *in
+    /// place*; not one byte leaves the buffer until the entire frame — header,
+    /// extended length, body — is present, at which point the whole frame is drained
+    /// in a single act. Returning `None` therefore never costs the caller a byte and
+    /// never shifts the client's phase: the next call re-reads this frame from its
+    /// first byte. Reading the three parts with three separately-failing `read_bytes`
+    /// calls is what desynced the client and turned a tail deadline landing inside a
+    /// frame into `assert!(!masked)` firing on a payload byte.
     fn recv_message(&mut self, deadline: Instant) -> Option<Vec<u8>> {
         let mut payload = Vec::new();
         loop {
-            let hdr = self.read_bytes(2, deadline)?;
-            let fin = hdr[0] & 0x80 != 0;
-            let opcode = hdr[0] & 0x0f;
-            let masked = hdr[1] & 0x80 != 0;
+            if !self.fill(2, deadline) {
+                return None;
+            }
+            let (b0, b1) = (self.pending[0], self.pending[1]);
+            let fin = b0 & 0x80 != 0;
+            let opcode = b0 & 0x0f;
+            let masked = b1 & 0x80 != 0;
             assert!(!masked, "a server frame must not be masked (RFC 6455 §5.1)");
-            let len = match hdr[1] & 0x7f {
+            // A server frame carries no mask key, so the header is the 2 base bytes
+            // plus whatever extended length follows.
+            let (header_len, len) = match b1 & 0x7f {
                 126 => {
-                    let b = self.read_bytes(2, deadline)?;
-                    u16::from_be_bytes([b[0], b[1]]) as usize
+                    if !self.fill(4, deadline) {
+                        return None;
+                    }
+                    let n = u16::from_be_bytes([self.pending[2], self.pending[3]]) as usize;
+                    (4, n)
                 }
                 127 => {
-                    let b = self.read_bytes(8, deadline)?;
+                    if !self.fill(10, deadline) {
+                        return None;
+                    }
                     let mut n = [0u8; 8];
-                    n.copy_from_slice(&b);
-                    u64::from_be_bytes(n) as usize
+                    n.copy_from_slice(&self.pending[2..10]);
+                    (10, u64::from_be_bytes(n) as usize)
                 }
-                n => n as usize,
+                n => (2, n as usize),
             };
-            let body = if len == 0 {
-                Vec::new()
-            } else {
-                self.read_bytes(len, deadline)?
-            };
+            if !self.fill(header_len + len, deadline) {
+                return None;
+            }
+            // The one commit point: the frame is whole, so take all of it at once.
+            let frame: Vec<u8> = self.pending.drain(..header_len + len).collect();
             if opcode == 0x8 {
                 return None; // close
             }
             if opcode >= 0x8 {
                 continue; // ping/pong — not part of a message
             }
-            payload.extend_from_slice(&body);
+            payload.extend_from_slice(&frame[header_len..]);
             if fin {
                 return Some(payload);
             }
@@ -468,6 +529,181 @@ impl Ws {
         }
         out
     }
+}
+
+// ---- (0) the raw client itself: frame atomicity across an expiring deadline -------
+//
+// [`Ws`] is test *apparatus*, and a broken apparatus does not fail loudly — it fails as
+// a mis-parse inside whichever property happens to be reading. So the apparatus gets
+// its own guards, driven by a scripted peer rather than a live server: exact bytes, on
+// the wire exactly when the test says so, with no daemon in the picture.
+//
+// The defect these pin: `recv_message` used to read one frame with three separate
+// `read_bytes` calls sharing one deadline, so a deadline expiring after the header (or
+// mid-body, or between the header and an extended length) *discarded* the bytes it had
+// already taken off the socket. The client was then one payload byte out of phase, and
+// the next frame's header was read out of the middle of the previous frame's payload —
+// surfacing as the `assert!(!masked)` panic in `web_ws_frame_cannot_smuggle_a_second_
+// request`, the one test that reuses a `Ws` across two `collect_replies` calls. The
+// stream is never idle (the daemon publishes a `state` snapshot at 5 Hz to every
+// subscriber and the bridge subscribes on construction), so a tail deadline always
+// expires *into* a live frame stream and the loss was a matter of timing, not of luck.
+//
+// Each guard therefore expires a deadline at a different point inside one frame and
+// asserts the very next `recv_message` still yields that frame, whole and correct.
+
+/// Encode one unmasked FIN text frame, exactly as a server sends it (RFC 6455 §5.1:
+/// server frames carry no mask).
+fn server_text_frame(payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0x81u8]; // FIN + opcode 1 (text)
+    if payload.len() < 126 {
+        frame.push(payload.len() as u8);
+    } else {
+        assert!(
+            payload.len() <= u16::MAX as usize,
+            "scripted frame too large"
+        );
+        frame.push(126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// A peer that writes exactly the byte pieces the test hands it, in order, and
+/// acknowledges each one *after* the write has flushed — so a test can be certain a
+/// piece is on the wire before it starts a deadline that must expire on the bytes that
+/// follow it. Returns the client end already connected. The thread ends when the
+/// sender is dropped, so a panicking test leaks nothing.
+fn scripted_peer() -> (Ws, Sender<Vec<u8>>, Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind scripted peer");
+    let port = listener.local_addr().expect("scripted peer address").port();
+    let (piece_tx, piece_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("scripted peer accept");
+        for piece in piece_rx {
+            if sock.write_all(&piece).is_err() || sock.flush().is_err() {
+                break;
+            }
+            if ack_tx.send(()).is_err() {
+                break;
+            }
+        }
+    });
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect scripted peer");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set read timeout");
+    (Ws::new(stream), piece_tx, ack_rx)
+}
+
+/// Hand one piece to the scripted peer and wait until it is flushed onto the wire.
+fn write_piece(tx: &Sender<Vec<u8>>, ack: &Receiver<()>, piece: &[u8]) {
+    tx.send(piece.to_vec()).expect("scripted peer gone");
+    ack.recv_timeout(Duration::from_secs(10))
+        .expect("scripted peer never flushed its piece");
+}
+
+/// How long a deliberately-expiring read is given. Long enough that the piece already
+/// flushed onto loopback has certainly arrived (so the read really does consume it and
+/// then starve), short enough to keep the guards quick.
+const EXPIRING: Duration = Duration::from_millis(500);
+/// How long a read that must succeed is given.
+const AMPLE: Duration = Duration::from_secs(10);
+
+/// A payload whose first two bytes are a *plausible* frame header with the mask bit
+/// set. If the client is left one frame out of phase, it parses these as a header and
+/// trips `recv_message`'s `assert!(!masked)` — the exact panic seen in the field —
+/// instead of quietly returning a plausible-looking wrong message.
+const DESYNC_BAIT: &[u8] = b"\x81\xffdesync-bait-payload";
+
+#[test]
+fn ws_client_keeps_a_frame_header_when_the_deadline_expires_before_the_body() {
+    let (mut ws, tx, ack) = scripted_peer();
+
+    // Warm-up: one whole frame, so a failure below is about atomicity and not about a
+    // peer that never connected.
+    write_piece(&tx, &ack, &server_text_frame(b"warm-up"));
+    assert_eq!(
+        ws.recv_message(Instant::now() + AMPLE).as_deref(),
+        Some(&b"warm-up"[..]),
+        "the scripted peer's first whole frame must arrive intact"
+    );
+
+    // The header lands; the body does not. The read must starve...
+    let frame = server_text_frame(DESYNC_BAIT);
+    write_piece(&tx, &ack, &frame[..2]);
+    assert!(
+        ws.recv_message(Instant::now() + EXPIRING).is_none(),
+        "no body was written, so this read must expire"
+    );
+
+    // ...and having starved, it must not have eaten the header on the way out.
+    write_piece(&tx, &ack, &frame[2..]);
+    assert_eq!(
+        ws.recv_message(Instant::now() + AMPLE).as_deref(),
+        Some(DESYNC_BAIT),
+        "a deadline that expired after the header must leave the client frame-aligned"
+    );
+}
+
+#[test]
+fn ws_client_keeps_a_partial_body_when_the_deadline_expires_mid_frame() {
+    let (mut ws, tx, ack) = scripted_peer();
+    write_piece(&tx, &ack, &server_text_frame(b"warm-up"));
+    assert_eq!(
+        ws.recv_message(Instant::now() + AMPLE).as_deref(),
+        Some(&b"warm-up"[..])
+    );
+
+    // Header plus the first four payload bytes, then silence. The bait sits at offset
+    // 4 so a client that discarded the partial body reads *it* as the next header.
+    let payload = b"body\x81\xffand-the-rest-of-the-payload";
+    let frame = server_text_frame(payload);
+    write_piece(&tx, &ack, &frame[..2 + 4]);
+    assert!(
+        ws.recv_message(Instant::now() + EXPIRING).is_none(),
+        "the body is incomplete, so this read must expire"
+    );
+
+    write_piece(&tx, &ack, &frame[2 + 4..]);
+    assert_eq!(
+        ws.recv_message(Instant::now() + AMPLE).as_deref(),
+        Some(&payload[..]),
+        "a deadline that expired mid-body must leave the client frame-aligned"
+    );
+}
+
+#[test]
+fn ws_client_keeps_a_frame_header_when_the_deadline_expires_before_the_extended_length() {
+    let (mut ws, tx, ack) = scripted_peer();
+    write_piece(&tx, &ack, &server_text_frame(b"warm-up"));
+    assert_eq!(
+        ws.recv_message(Instant::now() + AMPLE).as_deref(),
+        Some(&b"warm-up"[..])
+    );
+
+    // 200 bytes → the 126 extended-length form, which is what the daemon's ~600-byte
+    // `state` snapshots use in the field. The two length bytes for 200 are `00 c8`,
+    // whose second byte has the mask bit set, so a client that dropped the header
+    // parses the *length* as the next header and trips the same assertion.
+    let payload: Vec<u8> = (0..200u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let frame = server_text_frame(&payload);
+    assert_eq!(frame[1], 126, "the guard needs the extended-length form");
+    write_piece(&tx, &ack, &frame[..2]);
+    assert!(
+        ws.recv_message(Instant::now() + EXPIRING).is_none(),
+        "the extended length was never written, so this read must expire"
+    );
+
+    write_piece(&tx, &ack, &frame[2..]);
+    assert_eq!(
+        ws.recv_message(Instant::now() + AMPLE).as_deref(),
+        Some(&payload[..]),
+        "a deadline that expired before the extended length must leave the client \
+         frame-aligned"
+    );
 }
 
 // ---- (5) bind policy: a non-loopback plaintext bind is refused (§15.29) ----------
@@ -1224,12 +1460,27 @@ fn web_ws_byte_stream_end_to_end() {
     // A free-for-all serial node over an echo device, fed targetward by a pty console:
     // the seeded batch written into the console rides device → serial and echoes back
     // hostward, where the web tap on `usb0` observes it byte-for-byte.
+    //
+    // `hostward_buffer = 8192` on the console is load-bearing, not decoration — do not
+    // "simplify" it away. The measured subject here is the **web tap's** byte stream;
+    // the console is only the instrument that returns the batch, and the verdict below
+    // asserts its 256 KiB echo came back complete. But hostward flow is lossy at
+    // boundaries by design (§5, §15.19: "a slow spy costs itself data, never its
+    // neighbors") — the pty pump→writer bridge sheds with `dropped_slow_consumer`
+    // rather than blocking, so at the 32-chunk default depth a drain client
+    // descheduled under parallel-suite load legally loses part of the burst and the
+    // *web* assertion never even gets reached. `p3_log` measured that exact shape at
+    // 14/40 failures under sustained CPU load, 0/40 at 8192, with `received +
+    // dropped_slow_consumer == 262144` to the byte. Raising the *serial* node's depth
+    // does not help: the pty pump drops rather than awaits, so it never backpressures
+    // upstream and the pty node's own depth is the only buffer in the path.
     let cfg = format!(
         r#"
 [[node]]
 type = "pty"
 name = "console"
 path = "{console}"
+hostward_buffer = 8192
 [[node]]
 type = "serial"
 name = "usb0"

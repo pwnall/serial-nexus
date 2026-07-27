@@ -150,12 +150,29 @@ fn remove_node_cascade_flushes_the_log_fully() {
 
     // A free-for-all serial feeds every hostward byte to a capturing log; a console
     // pty injects a 256 KiB seeded batch the echo device returns hostward.
+    //
+    // `hostward_buffer = 8192` on the console is load-bearing, not decoration — do not
+    // "simplify" it away. The measured subject here is the **log** (does `--cascade`
+    // flush its queue whole?); the console is only the instrument that returns the
+    // batch, and the assertion below insists its 256 KiB echo came back complete. But
+    // hostward flow is lossy at boundaries by design (§5, §15.19: "a slow spy costs
+    // itself data, never its neighbors") — the pty pump→writer bridge sheds with
+    // `dropped_slow_consumer` rather than blocking, so at the 32-chunk default depth
+    // (`default_pty_hostward_buffer`) a descheduled drain client legally loses part of
+    // the burst and this test fails on a daemon that did nothing wrong. That is the
+    // same 256 KiB-through-a-default-console shape `p3_log` measured at 14/40 failures
+    // under sustained CPU load, 0/40 at 8192, with `received + dropped_slow_consumer ==
+    // 262144` to the byte in every failure — loss that was located and counted, not
+    // loss that escaped. Raising the *serial* node's depth does not help: the pty pump
+    // drops rather than awaits, so it never backpressures upstream and the pty node's
+    // own depth is the only buffer in the path.
     let cfg = format!(
         r#"
 [[node]]
 type = "pty"
 name = "console"
 path = "{console}"
+hostward_buffer = 8192
 [[node]]
 type = "serial"
 name = "usb0"

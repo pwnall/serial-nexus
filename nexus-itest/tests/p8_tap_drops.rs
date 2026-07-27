@@ -38,7 +38,11 @@
 //! * 16 MiB (up from the bash's 8 MiB): the tap queue is 128 chunks of `READ_BUF`
 //!   (64 KiB) = up to 8 MiB, plus the two socket buffers, so 8 MiB is marginal for
 //!   *guaranteeing* a drop; 16 MiB comfortably overflows the tap boundary while the
-//!   deep (16384-chunk) `hostward_buffer` keeps the co-attached log lossless.
+//!   serial node's deep (16384-chunk) `hostward_buffer` keeps the co-attached log
+//!   lossless. The tap is the *only* consumer meant to shed here, so the injecting
+//!   console carries a deep `hostward_buffer` of its own (see the config comment):
+//!   a pty's node-local pump→writer bridge is a separate bounded hop the serial
+//!   node's depth does not reach.
 
 use std::path::Path;
 use std::time::Duration;
@@ -111,15 +115,29 @@ fn slow_tap_drops_while_coattached_log_stays_byte_exact() {
 
     // A free-for-all serial node whose hostward stream fans out to a capturing log and
     // an injecting pty console (the console lets a `client` write targetward so the
-    // echo device returns the same bytes hostward — the sourced stream). The deep
-    // `hostward_buffer` keeps the log's fan-out lossless; the tap uses its own separate
-    // bounded queue.
+    // echo device returns the same bytes hostward — the sourced stream). The serial
+    // node's deep `hostward_buffer = 16384` sizes its fan-out channel to each graph
+    // consumer, which is what keeps the log lossless; the tap uses its own separate
+    // bounded queue and is the one consumer here meant to drop.
+    //
+    // The console needs its **own** deep `hostward_buffer` — the serial node's does not
+    // reach it — and that one is load-bearing too; do not "simplify" it away. A pty's
+    // hostward path is a second, node-local bounded bridge (pump→writer) that sheds
+    // with `dropped_slow_consumer` rather than blocking (§5, §15.19: "a slow spy costs
+    // itself data, never its neighbors"), and at the 32-chunk default a 16 MiB burst
+    // through it can legally lose bytes — failing the `received == 16 MiB` echo
+    // assertion below, which is a *precondition* here (it is how `sha256_sent` becomes
+    // the log's ground truth), not the loss this test is about. Deepening it cannot
+    // weaken either property: the tap drops because its own 128-chunk queue plus the
+    // socket buffers hold well under 16 MiB, a bound the console's depth does not
+    // touch.
     let cfg = format!(
         r#"
 [[node]]
 type = "pty"
 name = "console"
 path = "{console}"
+hostward_buffer = 8192
 [[node]]
 type = "serial"
 name = "usb0"

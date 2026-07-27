@@ -14,6 +14,261 @@ design.
 
 ---
 
+## CI FLAKE REMEDIATION + 6.18 KERNEL PROBES — DONE (2026-07-26/27 session)
+
+Started as "investigate the GitHub CI failures" and ended up covering three unrelated things: a
+CI-infrastructure bug that was already fixed, a family of **load-sensitive test-harness races** that
+had been red on four of the last six pushes, and one **real product defect** found beside them. Six
+new `nexus-doctor` probes were added on top, to settle on the production kernel the questions this
+work could only answer on 7.0.
+
+**Gates:** 480 passed / 0 failed / 4 ignored (was 459 at `548823e`); fmt; clippy (workspace +
+minimal-daemon); `cargo deny check licenses bans sources`; macOS cross-check; `linux.jq` green with
+17 supported / 0 degraded / 0 unsupported / 3 skipped.
+
+### The two stories in the CI history
+
+**Story 1 — already fixed.** Every red run from 2026-07-24 through 07-25 08:03 failed with
+`binary serialnexusd not found at target/debug/serialnexusd` (`nexus-itest/src/lib.rs:60`).
+`cargo test` builds test-instrumented binaries under `deps/`, not the plain artifacts the harness
+boots. `b81bb093` added `cargo build --workspace` to the four jobs that boot binaries and is an
+ancestor of both `main` and HEAD. `main`'s scheduled nightly still hit it at 08:18 on 07-26 only
+because `main` was still on `4311997`; it was fast-forwarded to `eb2446e` at 08:47 and passed.
+Nothing to do — recorded because the failure text looks alarming in the history and is not.
+
+**Story 2 — the live one.** Four of the last six pushes failed on *three different tests*. The proof
+they were nondeterministic rather than commit-linked: `eb2446e` failed `check` on `implementation`
+and passed completely on `main` fifteen seconds later — same SHA. Each was root-caused and then
+adversarially verified by an independent agent that re-derived the evidence; three of the five
+verifications materially corrected the diagnosis they reviewed, and those corrections are the
+reason several of the fixes below do not look like the obvious one.
+
+### F1 — `p8_web`'s RFC 6455 test client desynchronised (the macOS red on HEAD)
+
+`web_ws_frame_cannot_smuggle_a_second_request` panicked at `p8_web.rs:418`
+"a server frame must not be masked". The `Ws` client was **not frame-atomic with respect to its
+deadline**, in two places: `read_bytes` discarded bytes it had already consumed when the deadline
+expired, and — the dominant leak — `recv_message` read one frame with *three* `read_bytes` calls
+sharing one deadline, so a `None` from a later call threw away the header it had already been
+handed. The bytes were gone from the socket and from the caller.
+
+The stream is never idle: the daemon publishes a full `state` snapshot at 5 Hz
+(`nexus-daemon/src/lib.rs` `SNAPSHOT_INTERVAL`) and the bridge subscribes on construction, so
+`collect_replies`' tail deadline always expires *into* a live frame stream. This test is the only
+one in the file that reuses one `Ws` across two `collect_replies` calls, so call 1's desync
+corrupted call 2 and a payload byte parsed as a header with the mask bit set.
+
+**Not macOS-specific by mechanism** — it reproduced on Linux (2 failures in 120 runs under load, and
+~2% of deadline expiries desync even idle). `548823e` grew the file 10 → 14 tests without touching
+`Ws`; more concurrent daemons on a 3-core runner merely raised the probability. The product side was
+ruled out from source and from a wire capture: tungstenite never masks, and exactly one task owns the
+sink (`bridge.rs`).
+
+**The fix is fill-then-commit, and the obvious fix was measured and rejected.** Adding a `pending`
+buffer so `read_bytes` accumulates closes only the *rare* leak; a verifier implemented it and still
+saw 2 desyncs per 100 idle runs, and noted the originally-proposed regression guard would have passed
+against that patch. `Ws` now has a **non-consuming** `fill(n, deadline)` that only ever appends, and
+`recv_message` inspects the header and length *in place* and issues exactly one
+`pending.drain(..header_len + payload_len)` once the whole frame is buffered. Three new guards cover
+each expiry point inside a frame (header, extended length, body) against a scripted TCP peer, so they
+are deterministic and need no server. All three fail at `p8_web.rs:419` with the exact production
+message without the fix. The file is now 17 tests.
+
+Do **not** relax `assert!(!masked)` — it is the desync detector; removing it converts a loud flake
+into a silently mis-parsed WEB-1/SEC-1 security test. Do not lengthen the tail deadlines or stop
+`collect_replies` after the first reply either: that deletes the "exactly one reply" property that is
+the whole point of the invariant-11 guard.
+
+### F2 — `nexus-sim`'s echo double died on a slave close (`p7_p5` loopback → dangling)
+
+`pty_echo` treated a bare pty-master `POLLHUP` as terminal and exited its echo loop **forever**. On a
+pty master `POLLHUP` is level-triggered and set whenever no slave is open, so it fired on a mere
+*close*, not an unplug. `nexus-doctor` runs P3 (which opens and closes every port) before P5, and the
+close→reopen gap is ~22 µs — a wake-to-run race the doctor usually but not always wins. Measured
+survival against the unfixed double: 0% fatal at ≤16 µs, 36% at 20 µs, 92% at 30 µs. Lose it, and P5
+wrote into a dead peer for 4 s and reported `dangling (nothing wired to it)`.
+
+A jumper is stateless — it does not stop reflecting bytes because something unplugged from it once.
+`run_nullmodem_inner` was already built HUP-tolerant and its doc comment states that contract; the
+same treatment was never applied to `--echo`, which is exactly why run 1 of this test never flaked
+and run 2 did.
+
+**The verification found a third cause the diagnosis missed, and it changed the fix.**
+`run_nullmodem_inner` **busy-spun a whole core**: requesting `POLLIN` only does not suppress
+`POLLHUP` in `revents`, so once both slaves closed, `poll` returned immediately, no branch consumed
+the event, and there was no sleep. Measured 74.4% CPU standalone, and ~50% cumulative *inside the
+failing test* — it pegged a core through the whole of run 2. On a 2-core CI runner that is the
+scheduling pressure that pushed F2's window past its knee. So the null modem was not the precedent to
+copy; it was a co-conspirator. Both loops now pause (`NO_SLAVE_PAUSE`, 5 ms) on a bare hangup instead
+of breaking or spinning, tolerate `Ok(0)`/`EIO`, and make the reply write non-fatal;
+`wait_readable` requests `POLLIN` only, with a comment recording that `POLLHUP`/`POLLERR` arrive
+unrequested anyway. Verified: 0.3% CPU after both slaves close, flat.
+
+**The originally proposed regression guard was refuted and redesigned.** "Open the pts, close it,
+reopen and wait for a round trip" *passes* against the broken double, because in compiled Rust the
+reopen lands sub-microsecond after the close and `wait_until` evaluates its condition before its
+first sleep — the 0 µs column, where survival was 25/25. The guard now drives the real doctor over a
+**multi-port** rig, which widens the window to a measured 86–260 µs. The two-run split is gone with
+it: all four classes are exercised in one run, and `p7_p5.rs`'s module doc — which blamed CPU
+starvation — now records that the split was a workaround for this defect. Without the sim fix, both
+the merged classification test and the new dedicated guard fail **deterministically** on an idle box.
+
+### F3 — tests asserting byte-exactness at a lossy-by-design boundary (`p3_log` and eight siblings)
+
+`log_captures_hostward_stream_without_loss` failed with `received 238078, sent 262144`. This looked
+like an invariant-3 data-loss bug and is not. A `pty` node's hostward path is a **bounded bridge whose
+overflow is dropped and counted** (`nexus-daemon/src/nodes/pty.rs:301`, `:306-310`), default depth 32
+chunks, and design §5/§15.19 sanction that loss outright: "a slow spy costs itself data, never its
+neighbors." Under CPU contention the bridge fills and the pump sheds — legally.
+
+The decisive evidence: `received + dropped_slow_consumer == 262144` **to the byte** in 3/3
+reproductions, while the *log* — the sink the test exists to measure — was byte-exact with
+`dropped_bytes == 0` in those same runs. Invariants 3 and 9 both intact. The verification also ran the
+discriminator the diagnosis had skipped: raising the *serial* node's `hostward_buffer` does not help
+(4/5 still failed), because the pty pump drops rather than awaits and never backpressures upstream —
+the pty node's own depth is the only buffer in the path.
+
+Fix: `hostward_buffer = 8192` on the console pty wherever a test asserts a large hostward stream
+arrives **complete**, with a comment citing §5/§15.19 so it is not "simplified" away. Applied to
+`p3_log` (3 nodes), `p3_counters`, `p5_resync` (4 per-channel consoles), `p7_signals`, `p8_web`,
+`p5_exec_crash` (`con-c0` only — `con2`'s probes are 4–5 KiB), `p8_quickstart`, `data_path`, and
+`p8_tap_drops`' console. Deliberately **not** applied: `p6_outage` (its byte-clean round-trips are
+4 KiB and the 64 KiB burst is explicitly unasserted — a deeper bridge would retain more stale burst
+bytes to leak into the post-restore read), `p5_exec_crash`'s `con2`, and every node whose *loss* is
+the subject — `p8_tap_drops`' slow tap sheds through its own `TAP_QUEUE_CAP` and was untouched, so
+neither of its properties is gutted. `p8_tap_drops`' module doc was corrected: its existing
+`hostward_buffer = 16384` sits on the **serial** node and protects the log, not the console echo.
+
+Secondary, and the change that would have made the original failure self-diagnosing: `nexus-sim`'s
+`client` verdict could not distinguish a read deadline from real byte loss — `read_until` broke on its
+wall-clock deadline and returned the short buffer with no marker, so a timeout and a drop produced
+identical verdicts. It now emits `"timed_out": true` (additive; existing field names unchanged).
+
+### F4 — `p4_exclusivity` was already fixed, but a real product defect sat beside it
+
+The detach-release failure was fixed by `b8d8ed8` (an ancestor of HEAD; 9/9 clean runs including
+under the stress shape that reproduced it). The neighbouring defect was **not** fixed and had no
+guard: a collapsed pty client session carrying **no data byte** never released the exclusive write
+lock, leaving the endpoint dead to every other writer under the `exclusive` default (invariant 8).
+Deterministic, 0/10 across two shapes, with two clean controls.
+
+Mechanism: the last-close arm fired only on `(was && !present_now) || (closed && saw_data)`, and
+`saw_data` was set **only** for `buf[0] == TIOCPKT_DATA`; the `TIOCPKT_IOCTL` branch deliberately did
+not set it. A session that opens, calls `tcsetattr` and closes inside one 5 ms poll window fired
+neither arm — even though the master still held the evidence (`read = 1` returning `0x40`, then
+`EIO`). The gate was narrower than the evidence the code already had in `buf[0]`. Reachability is
+narrow but real: a scripted sub-poll-window probe (`stty`, a health check) or a starved reader — not
+a human quitting picocom, which latches presence normally.
+
+**The one-character fix `|| closed` was deliberately not taken.** `b8d8ed8`'s message records that an
+ungated `closed`-only attempt spun at 99% CPU; `p9_pty_collapse.rs`'s comment records that planting
+that same arm did *not* raise CPU on Linux 7.0. Two credible sources, opposite answers, and AGENTS.md
+§7 forbids a one-way decision on 7.0-only evidence. The shipped fix is **kernel-independent**: the
+latch (`saw_session`) arms on *any* successful read of `n >= 1`, and `handle_last_close`'s own
+`apply_baseline` packet — indistinguishable by type from a client's, and therefore capable of
+re-arming the widened latch every pass — is consumed by an unconditional drain afterwards, charged to
+`discarded_targetward` if it ever finds a data byte (§5 forbids the silent version). The drain runs
+only for a `may_write` endpoint: one not read from this pass is either a locked-out non-holder whose
+backlog `handle_last_close` has already purged-and-counted, or an endpoint with no edge at all, whose
+backlog is **parked** and must never be dropped (invariant 14).
+
+**Known limitation, deliberate:** a bare open→close touching nothing leaves *nothing* readable, so
+there is no evidence to latch on and it is not fixable this way. It is also the harmless case — such
+a client sent no command to purge — and it self-heals on the next observed session. P7 (below)
+measures exactly this and confirms it: shape (a) leaves 0 bytes.
+
+Guard: `p9_pty_collapse::a_collapsed_termios_only_session_still_releases_the_write_lock`, which drives
+a real `stty` (the actual `openat` → `TCGETS2` → `TCSETSW2` → `close` sequence — `nexus-itest` has no
+`nix` dependency and `libc`'s termios calls are `unsafe`, which invariant 4 confines to `nexus-sys`).
+Verified to fail without the latch fix and pass with it, with the two pre-existing properties still
+green in both states.
+
+### F5 — CI configuration
+
+`fuzz-nightly` ran **4 of 9** fuzz targets: `ci.yml`'s loop was still the pre-SEC-7 list, so
+`rpc_request_line`, `rpc_base64`, `config_load`, `control_request_lines` and `web_http_head` — every
+parser reachable *without a leg*, the five added to close review-26 SEC-7 — were built by
+`cargo fuzz build` and then never run. Aggravating: `meta_gates.rs`'s
+`every_unstable_fuzz_api_export_has_a_fuzz_target` asserts only that a target *file* exists, so the
+tree's own gate read green over the hole. The loop is now driven from `cargo +nightly fuzz list`, so a
+new target is picked up automatically.
+
+Also: `license-gate` gained the toolchain-install + cache pair every other job has (it was silently
+depending on the runner image's Rust and recompiling cargo-deny on every push); `cargo install` of
+cargo-deny and cargo-fuzz is version-pinned (`--locked` pins the tool's dependency graph, not the tool
+— and pinning is safe here because CI runs `licenses bans sources`, not `advisories`); the MSRV is
+pinned in every job that compiles repo code rather than only `check`; `actions/checkout` and
+`actions/upload-artifact` moved to `@v5` (the Node 20 deprecation); `timeout-minutes` and a
+`concurrency` group were added; a top-level `permissions: {contents: read}` was added; and the nested
+`cargo build`/`test` for `examples/external-codec/` now pass `--locked` so a drifted lock fails loudly
+instead of being silently regenerated. **No `rust-toolchain.toml`** — pinning contributors' local
+toolchains is a repo-owner decision, not a CI fix.
+
+### The six new `nexus-doctor` probes (P6–P11)
+
+Added so the owner can run `nexus-doctor --json` on **6.18** and diff it against the 7.0 baseline
+below. Every probe emits its raw measurements as structured JSON, not just a status word — a human
+diffing two runs must see the numbers. A probe reports what it *observed*: "this kernel differs" is
+`degraded` with the observation named, **never** `unsupported`, because `linux.jq` gates
+`.summary.unsupported == 0` and `meta_gates` asserts the doctor reports no unsupported capability.
+Both expectation files were extended and both still pass.
+
+- **P6 — pty-master readiness after the last slave closes.** The blocking question: does the master
+  keep asserting `POLLIN` after last-close? **On 7.0 it does not** — 64 passes, 0 with `POLLIN`, all
+  reads `EIO`. So an ungated `closed`-only arm would not spin *on the hangup* here, and the
+  `saw_session` latch is **not** what holds the anti-spin argument up on this kernel. But the probe
+  also caught the other route: the node's own last-close termios reset re-armed readability once
+  (1 byte), which makes the drain added in F4 load-bearing regardless. Diff before simplifying.
+- **P7 — what a collapsed session leaves readable.** Validates F4's premise. On 7.0: shape (a)
+  open→close leaves **0** bytes; shape (b) open→`tcsetattr`→close leaves **1** byte, leading `0x40`,
+  ioctl bit set; shape (c) open→write→close leaves 2 bytes with a data packet. So the widened latch
+  covers the realistic collapsed session here, and the known limitation is confirmed as (a).
+- **P8 — does epoll report a pty master readable while `read` returns EAGAIN?** The behaviour behind
+  invariant 1. Probed with **raw epoll through `nexus-sys`** — not `AsyncFd`, which invariant 1's
+  meta-gate bans workspace-wide with an empty allowlist, and which would have added tokio to the
+  doctor for nothing. Finding worth keeping: a bare level-triggered `EPOLLIN` registration on a pty
+  master **agrees with `poll(2)` on 7.0** and does not reproduce the busy-loop. That is not a
+  refutation of invariant 1 — the starvation §15.18 records is a property of tokio's readiness
+  *guard* (registration lifecycle plus a synchronously-completing ready future), not of `epoll_ctl`
+  in isolation. It is now written down where the next person to "just try AsyncFd" will read it.
+- **P9 — poll(2) timeout granularity**, informing §15.19's timer floor and the adaptive idle backoff.
+- **P10 — pty buffer depth**, informing the `hostward_buffer` defaults behind F3.
+- **P11 — real-port line-state counters** (`TIOCGICOUNT`/`TIOCMGET`), **opt-in behind `--port`** like
+  P3/P5, because opening a port toggles DTR on hardware that may be wired to live equipment.
+
+`nexus-sys` gained the epoll wrapper (`Epoll`, level-triggered only — an edge-triggered variant
+cannot exhibit the persistent-ready loop at all and would quietly report "no problem"),
+`pending_input_bytes` (FIONREAD) and `pending_output_bytes` (TIOCOUTQ), all documented as
+*instruments, not data-plane primitives*, with 5 new unit tests. It remains the workspace's only
+crate with `unsafe`.
+
+P5's verdict fold gained the hung-up class: a port whose peer went away mid-probe is now reported as
+`hung up (peer closed) — not classifiable` **and degrades the verdict**, instead of being reported as
+`dangling` (which hands the operator the opposite instruction) beside a `supported` verdict — the
+DOC-1b shape of an observation nobody acts on. It stays `degraded`, never `unsupported`, which is
+reserved for a rig that demonstrably ate bytes.
+
+### Process notes
+
+- **A verifier must not read the report, and the tree must not move under it** (AGENTS.md §9) — but
+  this session added a third clause worth keeping: *the verification is where the value was.* Three
+  of five verifications materially corrected the diagnosis they reviewed (the `Ws` fix was
+  insufficient; the `p7_p5` guard passed without the fix; the `p3_log` attribution rested on an
+  experiment that could not discriminate). Every one of those corrections would have shipped as a
+  believable-but-wrong fix.
+- **Do not spawn CPU load on the dev box without cleaning it up.** Diagnosis agents used `yes` hogs
+  and busy-loops to reproduce load-sensitive flakes; 16 of them leaked and pegged an 8-core laptop at
+  load ~19 for ten hours, which then made `p3_firehose`, `p5_resync`, `p8_tap_drops` and
+  `p5_exec_crash` fail and cost a round of false "is this a regression?" investigation. After killing
+  them, `p3_firehose` ran in **2.53 s** — exactly the healthy figure §15.32 records — and the whole
+  suite went green. If a test fails on the dev box, check `uptime` and `pgrep -x yes` **before**
+  concluding anything about the code.
+- The "is this ours?" question was settled with a throwaway `git worktree` at the last commit rather
+  than by stashing — the tree held a large uncommitted change set all session, and AGENTS.md §8's
+  warning about `git checkout --` applies just as much to `git stash`.
+
+---
+
 ## v12 GRAPH-EDITING TRACK (plan §14 / design §15.35) — DONE (2026-07-26 session)
 
 v12 is the first track since v10 that adds *capability* rather than closing findings. Its

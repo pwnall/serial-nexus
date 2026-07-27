@@ -1,5 +1,12 @@
 name: CI
 
+# Least privilege, declared once at the top: this workflow only reads the tree and
+# uploads build artifacts — it never writes to the repository, issues, releases or
+# packages. Without this block the default token scope applies, which is far wider
+# than anything here needs. A job that ever needs more may widen it locally.
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
@@ -8,9 +15,36 @@ on:
     # the fuzz battery — too slow for every push. 06:00 UTC daily.
     - cron: '0 6 * * *'
 
+# One in-flight run per (trigger, ref): a superseded push cancels its own predecessor
+# instead of burning a runner to finish testing a commit nobody will look at — the
+# macOS lane especially. `github.event_name` is part of the key, and cancellation is
+# disabled for `schedule`, ON PURPOSE: the nightlies run against the default branch's
+# own ref, so a key shared with pushes plus a blanket `cancel-in-progress` would let an
+# ordinary push kill a soak/sweep/fuzz run halfway and lose that night's coverage
+# silently. Nightlies are a day apart and never overlap, so their group never queues.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+# Toolchain policy: EVERY job that compiles repo code pins the MSRV, from this one
+# variable. AGENTS.md invariant 6 makes 1.97 a *two-way* constraint — the sources need
+# ≥1.88 for let-chains, and clippy 0.1.97's `collapsible_if` *requires* the let-chain
+# collapse that older clippy rejects — so a job floating on `stable` proves nothing
+# about the MSRV and can fail on a lint the pinned toolchain does not even have.
+# Bump MSRV here in lockstep with the workspace Cargo.toml `rust-version`.
+# `fuzz-nightly` is the one deliberate exception: cargo-fuzz requires nightly.
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  MSRV: '1.97'
+  # Tool versions are pinned, not floated: `--locked` pins a tool's dependency graph,
+  # never the tool itself, so an unpinned `cargo install` silently upgrades across
+  # majors — and cargo-deny has broken `deny.toml` schema compatibility across majors
+  # before, which would fail this repo's gate for a reason that is not this repo's.
+  # Safe to pin here because CI runs `cargo deny check licenses bans sources` and NOT
+  # `advisories`, so a pinned binary does not freeze any advisory data.
+  CARGO_DENY_VERSION: '0.19.9'
+  CARGO_FUZZ_VERSION: '0.13.2'
 
 jobs:
   # Unprivileged lane: builds, lints, and the WHOLE test suite — unit + property
@@ -22,15 +56,16 @@ jobs:
   # precede the test step (matching AGENTS.md §4's documented local flow). The
   # exec/envelope codec tests shell out to python3, which the runner image provides.
   # Runs on every push (§3). MSRV is pinned to the development toolchain (the code uses
-  # let-chains freely); bump in lockstep with the workspace Cargo.toml `rust-version`.
+  # let-chains freely); bump the `MSRV` env above in lockstep with Cargo.toml.
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
         run: |
-          rustup toolchain install 1.97 --profile minimal --component rustfmt,clippy
-          rustup default 1.97
+          rustup toolchain install "$MSRV" --profile minimal --component rustfmt,clippy
+          rustup default "$MSRV"
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
@@ -51,13 +86,19 @@ jobs:
   # The licensing gate proven, not assumed (§13). cargo-deny plus the nexus-itest test
   # that proves the gate rejects a banned crate (§16.11 folded the bash script into it;
   # it self-skips where cargo-deny is absent, so this job — which installs it — is where
-  # it runs for real).
+  # it runs for real). The job compiles repo code (that nexus-itest test), so it pins the
+  # MSRV like every other compiling job, and it caches: without `rust-cache` it rebuilt
+  # cargo-deny from source on every single push.
   license-gate:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup toolchain install "$MSRV" --profile minimal && rustup default "$MSRV"
+      - uses: Swatinem/rust-cache@v2
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
       - name: License and ban check
         run: cargo deny check licenses bans sources
       - name: Prove the gate rejects a banned crate
@@ -70,10 +111,11 @@ jobs:
   # job additionally archives the human report.)
   doctor:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        run: rustup toolchain install "$MSRV" --profile minimal && rustup default "$MSRV"
       - uses: Swatinem/rust-cache@v2
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -81,7 +123,7 @@ jobs:
         run: |
           cargo run -q --locked -p nexus-doctor -- --markdown | tee nexus-doctor-report.md
           cargo run -q --locked -p nexus-doctor -- --json | jq -e -f expectations/linux.jq
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: nexus-doctor-report
           path: nexus-doctor-report.md
@@ -92,13 +134,14 @@ jobs:
   # serves its `acme` codec alongside the built-ins. §16.11 folded the bash script into
   # nexus-itest tests/p8_external_codec.rs, which now builds the excluded template itself
   # (the `check` job's `cargo test --workspace` also exercises it; this job keeps an
-  # isolated stable-toolchain signal for the embedding pattern).
+  # isolated signal for the embedding pattern — a consumer building against the MSRV).
   external-codec:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        run: rustup toolchain install "$MSRV" --profile minimal && rustup default "$MSRV"
       - uses: Swatinem/rust-cache@v2
       - name: Build and exercise the out-of-tree template
         run: cargo test -p nexus-itest --test p8_external_codec --locked
@@ -111,10 +154,11 @@ jobs:
   # REAL gate (P2 is `degraded`, not `unsupported`). Deltas documented in docs/macos.md.
   macos:
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        run: rustup toolchain install "$MSRV" --profile minimal && rustup default "$MSRV"
       - uses: Swatinem/rust-cache@v2
       - name: Install jq
         run: brew install jq
@@ -128,7 +172,7 @@ jobs:
         run: |
           cargo run -q --locked -p nexus-doctor -- --markdown | tee nexus-doctor-macos.md
           cargo run -q --locked -p nexus-doctor -- --json | jq -e -f expectations/macos.jq
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: nexus-doctor-macos-report
           path: nexus-doctor-macos.md
@@ -141,10 +185,11 @@ jobs:
   soak-nightly:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        run: rustup toolchain install "$MSRV" --profile minimal && rustup default "$MSRV"
       - uses: Swatinem/rust-cache@v2
       # p8_soak boots serialnexusd + nexus-sim; `cargo test -p nexus-itest` would not
       # produce those plain artifacts, so build the workspace bins first.
@@ -163,10 +208,11 @@ jobs:
   sweep-nightly:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        run: rustup toolchain install "$MSRV" --profile minimal && rustup default "$MSRV"
       - uses: Swatinem/rust-cache@v2
       # `cargo test` never emits the plain workspace bins the nexus-itest harness boots.
       - name: Build workspace binaries (nexus-itest boots them as subprocesses)
@@ -174,25 +220,46 @@ jobs:
       - name: Full suite including ignored (endurance/heavy)
         run: cargo test --workspace --locked -- --include-ignored
 
-  # Nightly fuzzing (§Phase 8): the frame and envelope parsers, on top of the existing
-  # proptest coverage. Needs a nightly toolchain and libFuzzer.
+  # Nightly fuzzing (§Phase 8, widened by review 26 SEC-7): every parser on an
+  # externally-reachable surface, on top of the existing proptest coverage. Needs a
+  # nightly toolchain and libFuzzer — the one job that does NOT pin the MSRV.
   fuzz-nightly:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust nightly
         run: rustup toolchain install nightly --profile minimal && rustup default nightly
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION"
+      # cargo-fuzz has no `--locked` flag of its own (checked: 0.13.2 `build`/`run`),
+      # so the committed fuzz/Cargo.lock is asserted here instead — a drifted lock must
+      # fail loudly rather than be regenerated in silence. `fetch` also warms the deps
+      # the build below needs.
+      - name: Verify fuzz/Cargo.lock is current (cargo-fuzz takes no --locked)
+        working-directory: fuzz
+        run: cargo +nightly fetch --locked
       - name: Build fuzz targets
         working-directory: fuzz
         run: cargo +nightly fuzz build
-      - name: Fuzz each target briefly
+      # The target list comes from cargo-fuzz itself, never a hand-maintained copy:
+      # the literal list this replaced named four targets while `fuzz build` above
+      # built nine, so the five parsers added to close review-26 SEC-7 (the control
+      # socket's front door, the tap.data base64 codec, GraphConfig deserialize +
+      # validate, RequestLines, and the web HTTP head parser) were compiled every
+      # night and fuzzed never. A target added under fuzz/fuzz_targets/ is now fuzzed
+      # the night it lands. The empty-list guard matters for the same reason: a
+      # silently empty loop is exactly the failure mode being fixed, and it must not
+      # be able to report green.
+      - name: Fuzz every target briefly
         working-directory: fuzz
         run: |
-          for t in envelope_decode frame_decoder wire_hello reference_demux; do
+          targets="$(cargo +nightly fuzz list)"
+          echo "targets: $targets"
+          test -n "$targets"
+          for t in $targets; do
             echo "=== fuzzing $t ==="
             cargo +nightly fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=4096
           done

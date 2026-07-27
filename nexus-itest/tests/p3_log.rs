@@ -25,6 +25,15 @@
 //!   "log captures the hostward stream byte-exact, zero drops" property, over the
 //!   sanctioned single-device helper. Checks 1/2 need a serial device, so they skip
 //!   where none exists (macOS).
+//! * The `console` pty in every echo-driven check carries an explicit
+//!   `hostward_buffer = 8192`. The default is 32 chunks, and the pty pump→writer bridge
+//!   *sheds with a counter* when it fills rather than blocking — legal under §5
+//!   ("bounded buffering where configured, then counted drops") and §15.19. That made
+//!   check 1 fail intermittently under CPU contention on a daemon that had done nothing
+//!   wrong (14/40 at depth 32 vs 0/40 at 8192, same load). The counter is now printed on
+//!   failure (`console_drops`) so the two cases are distinguishable at a glance:
+//!   `received + dropped_slow_consumer == sent` is a legal shed, a short sum is a real
+//!   defect.
 //! * Check 3's directory-scan recovery is a pure log-node property independent of any
 //!   serial device, so it runs **everywhere** over a lone `log` node whose empty
 //!   rotations exercise scan recovery + no-clobber exactly as the bash's content-laden
@@ -69,6 +78,27 @@ fn echo_send(tty: &Path, send_spec: &str, seed: u64) -> Value {
     ])
 }
 
+/// The console PTY's hostward drop counters, rendered for a panic message.
+///
+/// A short echo round-trip through a pty console is **not** automatically a data-loss
+/// defect: the hostward direction is lossy at boundaries by design (§5 — "bounded
+/// buffering where configured, then counted drops"), so the pty pump sheds with a
+/// counter when its writer bridge fills (§15.19). A failing echo assertion must
+/// therefore say *where the bytes went*: if `received + dropped_slow_consumer == sent`
+/// the loss was located and counted (legal, and a sign the console's `hostward_buffer`
+/// is too shallow for the test's burst); if the sum falls short, bytes vanished
+/// uncounted and that is a real defect.
+fn console_drops(rpc: &Rpc, node: &str) -> String {
+    match rpc.node(node) {
+        Some(n) => format!(
+            "{node}: dropped_slow_consumer={} discarded_no_client={}",
+            n.get("dropped_slow_consumer").unwrap_or(&Value::Null),
+            n.get("discarded_no_client").unwrap_or(&Value::Null),
+        ),
+        None => format!("{node}: absent from state"),
+    }
+}
+
 /// Wait until the log node's observed `rotation` counter equals `want` (§7.3 state,
 /// never persisted). Bounded poll on structured RPC state — no bare sleep.
 fn wait_rotation(rpc: &Rpc, node: &str, want: u64, timeout: Duration) -> bool {
@@ -97,12 +127,28 @@ fn log_captures_hostward_stream_without_loss() {
 
     // A free-for-all serial node feeds every hostward byte to a capturing log; a pty
     // console injects a 256 KiB seeded batch that the echo device returns hostward.
+    //
+    // `hostward_buffer = 8192` on the console is load-bearing, not decoration — do not
+    // "simplify" it away. The measured subject here is the **log**; the console is only
+    // the instrument that returns the batch, and this test asserts its echo is
+    // byte-exact. But hostward flow is lossy at boundaries by design (§5): the pty
+    // pump→writer bridge sheds with `dropped_slow_consumer` rather than blocking, so
+    // under CPU contention the 32-chunk default depth (`default_pty_hostward_buffer`)
+    // legally drops part of a 256 KiB burst and the echo assertion fails on a daemon
+    // that did nothing wrong. Measured A/B under identical sustained CPU load: **14/40
+    // failures at depth 32, 0/40 at 8192** — and every failure showed
+    // `received + dropped_slow_consumer == 262144` to the byte, which is loss that was
+    // located and counted, not loss that escaped. A deep buffer absorbs the burst
+    // instead. Raising the *serial* node's depth does not help: the pty pump
+    // drops rather than awaits, so it never backpressures upstream and the pty node's
+    // own depth is the only buffer in the path (§15.19).
     let cfg = format!(
         r#"
 [[node]]
 type = "pty"
 name = "console"
 path = "{console}"
+hostward_buffer = 8192
 [[node]]
 type = "serial"
 name = "usb0"
@@ -144,12 +190,14 @@ b = "cap"
     assert_eq!(
         v["pass"].as_bool(),
         Some(true),
-        "256 KiB echo did not round-trip: {v}"
+        "256 KiB echo did not round-trip: {v} [{}]",
+        console_drops(rpc, "console")
     );
     assert_eq!(
         v["received"].as_u64(),
         Some(SIZE_256K),
-        "echo received != 256 KiB: {v}"
+        "echo received != 256 KiB: {v} [{}]",
+        console_drops(rpc, "console")
     );
     let sent_sha = v["sha256_sent"]
         .as_str()
@@ -201,12 +249,16 @@ fn rotation_loses_nothing_each_batch_in_its_own_file() {
     std::fs::create_dir_all(&logdir).expect("mkdir log directory");
     let console = d.run().join("console");
 
+    // `hostward_buffer = 8192` on the console for the same reason as check 1: the pty
+    // boundary sheds legally under contention (§5/§15.19), and each batch's echo is
+    // asserted byte-exact here too. Same shape, merely rarer exposure at 32 KiB.
     let cfg = format!(
         r#"
 [[node]]
 type = "pty"
 name = "console"
 path = "{console}"
+hostward_buffer = 8192
 [[node]]
 type = "serial"
 name = "usb0"
@@ -247,7 +299,12 @@ b = "rot"
 
     // Batch A -> current file; rotate -> rot.log.000 must equal exactly A.
     let a = echo_send(&console, "seeded:32KiB", 1);
-    assert_eq!(a["pass"].as_bool(), Some(true), "batch A echo failed: {a}");
+    assert_eq!(
+        a["pass"].as_bool(),
+        Some(true),
+        "batch A echo failed: {a} [{}]",
+        console_drops(rpc, "console")
+    );
     assert_eq!(a["received"].as_u64(), Some(SIZE_32K), "batch A short: {a}");
     let a_sha = a["sha256_sent"].as_str().expect("A sha256_sent").to_owned();
     assert!(
@@ -268,7 +325,12 @@ b = "rot"
 
     // Batch B -> fresh current file; rotate -> rot.log.001 must equal exactly B.
     let b = echo_send(&console, "seeded:32KiB", 2);
-    assert_eq!(b["pass"].as_bool(), Some(true), "batch B echo failed: {b}");
+    assert_eq!(
+        b["pass"].as_bool(),
+        Some(true),
+        "batch B echo failed: {b} [{}]",
+        console_drops(rpc, "console")
+    );
     assert_eq!(b["received"].as_u64(), Some(SIZE_32K), "batch B short: {b}");
     let b_sha = b["sha256_sent"].as_str().expect("B sha256_sent").to_owned();
     assert!(
@@ -291,7 +353,12 @@ b = "rot"
     // matching checksum (A->.000, B->.001, C->live), so rotation lost nothing and split
     // no chunk across a boundary.
     let c = echo_send(&console, "seeded:32KiB", 3);
-    assert_eq!(c["pass"].as_bool(), Some(true), "batch C echo failed: {c}");
+    assert_eq!(
+        c["pass"].as_bool(),
+        Some(true),
+        "batch C echo failed: {c} [{}]",
+        console_drops(rpc, "console")
+    );
     assert_eq!(c["received"].as_u64(), Some(SIZE_32K), "batch C short: {c}");
     let c_sha = c["sha256_sent"].as_str().expect("C sha256_sent").to_owned();
     assert!(
@@ -536,12 +603,18 @@ fn a_batch_accepted_after_rotate_never_lands_in_the_old_file() {
         .open(&live)
         .expect("open the log FIFO read end");
 
+    // `hostward_buffer = 8192` on the console for the same reason as check 1 — and it
+    // matters more here: this test reconstructs batch A byte for byte and asserts the
+    // pre-rotation file is a *prefix of it*, so a legal pty-boundary shed (§5/§15.19)
+    // would put a hole in the middle of the log's stream and fail the prefix check for
+    // a reason that has nothing to do with LOG-3's ordering property.
     let cfg = format!(
         r#"
 [[node]]
 type = "pty"
 name = "console"
 path = "{console}"
+hostward_buffer = 8192
 [[node]]
 type = "serial"
 name = "usb0"
@@ -579,7 +652,12 @@ b = "rot"
     // Batch A: 128 KiB through the echo device and back hostward into the log. The
     // writer takes the first ~64 KiB into the pipe and then blocks.
     let a = echo_send(&console, "seeded:128KiB", 11);
-    assert_eq!(a["pass"].as_bool(), Some(true), "batch A echo failed: {a}");
+    assert_eq!(
+        a["pass"].as_bool(),
+        Some(true),
+        "batch A echo failed: {a} [{}]",
+        console_drops(rpc, "console")
+    );
     assert_eq!(
         a["sha256_sent"].as_str(),
         Some(sha256_hex(&batch_a).as_str()),
@@ -606,7 +684,12 @@ b = "rot"
     // accepted strictly after the rotation request, so §7.3 places all of them in the
     // new file.
     let b = echo_send(&console, "seeded:16KiB", 22);
-    assert_eq!(b["pass"].as_bool(), Some(true), "batch B echo failed: {b}");
+    assert_eq!(
+        b["pass"].as_bool(),
+        Some(true),
+        "batch B echo failed: {b} [{}]",
+        console_drops(rpc, "console")
+    );
     assert_eq!(
         b["sha256_sent"].as_str(),
         Some(sha256_hex(&batch_b).as_str()),

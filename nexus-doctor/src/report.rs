@@ -243,11 +243,49 @@ impl Report {
     }
 }
 
+/// Render an observation value for the Markdown arm.
+///
+/// Scalars render bare. A structured value (P6/P7 report whole measurement
+/// blocks, because a verdict word is not diffable across kernels) renders as
+/// `key=value` pairs rather than raw JSON — the same facts the `--json` twin
+/// carries, in a line a human can read in an issue thread.
 fn render_value(v: &serde_json::Value) -> String {
     match v {
-        serde_json::Value::String(s) => md_escape(s),
+        serde_json::Value::Object(map) => md_escape(
+            &map.iter()
+                .map(|(k, val)| format!("{k}={}", inline_value(val)))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        serde_json::Value::Array(items) => md_escape(&inline_array(items)),
+        other => md_escape(&inline_value(other)),
+    }
+}
+
+/// One value inside a rendered structure: strings unquoted, containers compact.
+fn inline_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => inline_array(items),
+        serde_json::Value::Object(map) => format!(
+            "[{}]",
+            map.iter()
+                .map(|(k, val)| format!("{k}={}", inline_value(val)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
         other => other.to_string(),
     }
+}
+
+fn inline_array(items: &[serde_json::Value]) -> String {
+    if items.is_empty() {
+        return "(none)".to_owned();
+    }
+    format!(
+        "[{}]",
+        items.iter().map(inline_value).collect::<Vec<_>>().join(" ")
+    )
 }
 
 fn md_escape(s: &str) -> String {

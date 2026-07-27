@@ -82,8 +82,13 @@ fn external_codec_template_builds_and_serves_acme_alongside_builtins() {
     let target = template_target();
 
     // (1a) Build the closed-repo stand-in from its own manifest, at the consumer position.
+    // `--locked` is not decoration: `examples/external-codec/Cargo.lock` is committed, and
+    // without the flag a drifted lock is silently regenerated here — the template would
+    // build against whatever crates.io serves today while reporting green, which is the
+    // opposite of what a committed lock is for. Same reasoning as `--locked` everywhere
+    // else in the workspace (plan §2); a stale template lock must fail loudly.
     let built = Command::new("cargo")
-        .args(["build", "-q", "--manifest-path"])
+        .args(["build", "-q", "--locked", "--manifest-path"])
         .arg(&manifest)
         .arg("--target-dir")
         .arg(&target)
@@ -91,11 +96,13 @@ fn external_codec_template_builds_and_serves_acme_alongside_builtins() {
         .expect("run cargo build on the external-codec template");
     assert!(built.success(), "external-codec template build failed");
 
-    // (1b) The template's own conformance-kit test, from the consumer position.
+    // (1b) The template's own conformance-kit test, from the consumer position — also
+    // `--locked`, so the conformance run cannot resolve a different graph than (1a).
     let conformance = Command::new("cargo")
         .args([
             "test",
             "-q",
+            "--locked",
             "-p",
             "acme-codec",
             "--features",

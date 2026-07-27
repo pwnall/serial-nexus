@@ -23,6 +23,19 @@ nix::ioctl_none_bad!(tiocnxcl, libc::TIOCNXCL);
 #[cfg(target_os = "linux")]
 nix::ioctl_read_bad!(tiocgicount, libc::TIOCGICOUNT, SerialIcounts);
 nix::ioctl_read_bad!(tiocmget, libc::TIOCMGET, libc::c_int);
+// The two queue-depth ioctls are *probe instruments* (see the capability-probe
+// section at the foot of this file), but their bindings are declared up here with
+// every other ioctl on purpose: the argument for this crate existing is that one
+// file lists every raw ioctl the workspace issues, and that argument survives only
+// if the list is not split by who happens to call each entry.
+//
+// `FIONREAD` is POSIX-ubiquitous (Linux and the BSDs both export it, with different
+// request encodings that `ioctl_read_bad!` casts for us). `TIOCOUTQ` is exported by
+// libc only for Linux, so — exactly like `TIOCGICOUNT` above — the *binding* is
+// gated and the wrapper keeps a non-Linux `ENOTSUP` stub.
+nix::ioctl_read_bad!(fionread, libc::FIONREAD, libc::c_int);
+#[cfg(target_os = "linux")]
+nix::ioctl_read_bad!(tiocoutq, libc::TIOCOUTQ, libc::c_int);
 
 /// The kernel's `serial_icounter_struct` (TIOCGICOUNT): driver-maintained input
 /// counters the design surfaces in serial state *where supported* (§5, §7.1) —
@@ -251,6 +264,329 @@ pub fn poll_blocking(
     fds[0].revents().unwrap_or_else(nix::poll::PollFlags::empty)
 }
 
+// ---------------------------------------------------------------------------
+// Capability-probe helpers (§15.17) — instruments, not data-plane primitives
+//
+// Everything from here down exists for `nexus-doctor`: it *measures* a kernel
+// behaviour so the report can print the number that was observed. None of it is a
+// readiness or I/O primitive for `nexus-daemon` — the data plane's readiness is
+// `poll_ready`/`poll_blocking` above and nothing else (invariant 1, §15.18), and a
+// helper in this section must never become the answer to "how do I wait for this
+// fd" in a node.
+//
+// They live in this crate for the same reason the rest of the file does:
+// `nexus-doctor` is `#![forbid(unsafe_code)]`, so a raw syscall it needs is a safe
+// wrapper here or it does not exist (§16.3, invariant 4).
+//
+// Why measure at all: the production kernel is Linux 6.18 and the dev box is 7.0
+// (§7), and several design premises here rest on behaviour confirmed only on 7.0.
+// A premise like that has to be *re-observed* on 6.18, and "re-observed" means a
+// JSON number an operator can diff between two `nexus-doctor --json` runs — not a
+// recollection, and not a status word with the finding buried in prose.
+// ---------------------------------------------------------------------------
+
+/// `epoll_wait(2)` event bits, spelled as the kernel spells them (`EPOLLIN`,
+/// `EPOLLPRI`, `EPOLLOUT`, `EPOLLERR`, `EPOLLHUP`, `EPOLLRDHUP`).
+///
+/// Written as literals rather than re-exported from `libc` for one reason:
+/// [`EpollReady`] and [`EpollReady::flag_names`] must compile on macOS, where
+/// `libc` exports no `EPOLL*` at all (§13 best-effort). The values are Linux ABI
+/// and identical on every architecture, and the unit test
+/// `epoll_flag_constants_match_the_kernel_abi` proves each one against `libc`
+/// where `libc` has it, so this is a compile-time convenience and not a second
+/// source of truth.
+///
+/// `EPOLLERR` and `EPOLLHUP` are reported by the kernel whether or not they were
+/// requested, which is why a probe that registers only `EPOLLIN` can still observe
+/// a hangup.
+pub const EPOLLIN: u32 = 0x001;
+/// See [`EPOLLIN`].
+pub const EPOLLPRI: u32 = 0x002;
+/// See [`EPOLLIN`].
+pub const EPOLLOUT: u32 = 0x004;
+/// See [`EPOLLIN`].
+pub const EPOLLERR: u32 = 0x008;
+/// See [`EPOLLIN`].
+pub const EPOLLHUP: u32 = 0x010;
+/// See [`EPOLLIN`].
+pub const EPOLLRDHUP: u32 = 0x2000;
+
+/// One fd's readiness exactly as `epoll_wait(2)` reported it: the fd (recovered
+/// from the event's `u64` data word, which [`Epoll::add_level_readable`] stamps
+/// with it) and the raw event bitmask, **undecoded**.
+///
+/// The bitmask is carried out whole rather than reduced to a bool because a probe
+/// reports what it *observed*: a kernel that answers `EPOLLIN|EPOLLHUP` where
+/// another answers `EPOLLIN` is precisely the 6.18-vs-7.0 delta these instruments
+/// exist to make visible, and a bool would have thrown it away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpollReady {
+    /// The fd the event is about (this crate stamps the event's data word with it).
+    pub fd: RawFd,
+    /// The raw `events` bitmask, exactly as the kernel returned it.
+    pub events: u32,
+}
+
+impl EpollReady {
+    /// Whether `flag` (one of the `EPOLL*` constants above) is set.
+    pub fn contains(&self, flag: u32) -> bool {
+        self.events & flag != 0
+    }
+
+    /// The set bits by name, for a report a human diffs across two kernels — at
+    /// 6.18-vs-7.0 review time nobody should have to decode `0x11` by hand. Bits
+    /// outside the six named constants are deliberately *not* listed here;
+    /// [`EpollReady::events`] keeps the raw truth beside this, so a caller should
+    /// emit both.
+    pub fn flag_names(&self) -> Vec<&'static str> {
+        [
+            (EPOLLIN, "EPOLLIN"),
+            (EPOLLPRI, "EPOLLPRI"),
+            (EPOLLOUT, "EPOLLOUT"),
+            (EPOLLERR, "EPOLLERR"),
+            (EPOLLHUP, "EPOLLHUP"),
+            (EPOLLRDHUP, "EPOLLRDHUP"),
+        ]
+        .into_iter()
+        .filter(|&(bit, _)| self.contains(bit))
+        .map(|(_, name)| name)
+        .collect()
+    }
+}
+
+/// An owned `epoll(7)` set: the epoll fd is created by [`Epoll::new`] and closed
+/// on `Drop`, so a probe that panics or returns early cannot leak it.
+///
+/// # Why epoll exists here at all, when invariant 1 bans it
+///
+/// Invariant 1 bans epoll-based readiness *in the data plane*: on a pty master,
+/// tokio's readiness guard (epoll underneath) reports "readable" persistently
+/// while `read(2)` answers `EAGAIN`, so the ready future completes synchronously
+/// forever, the loop never yields, and the current-thread runtime starves with the
+/// control plane inside it (§15.18/§15.19). The tree's replacement is
+/// [`poll_ready`]/[`poll_blocking`], and `meta_gates` greps the whole workspace to
+/// keep it that way.
+///
+/// But that ban is a **claim about a kernel**, and a claim about a kernel is
+/// exactly what may differ between the production target (6.18) and the dev box
+/// (7.0). `nexus-doctor` therefore measures it rather than remembering it: register
+/// a pty master, ask epoll, then read, and report both answers as numbers. This is
+/// the one sanctioned *call site class* for epoll in the tree — a measuring
+/// instrument, never a readiness primitive, and nothing in `nexus-daemon` may use
+/// it. (The banned tokio identifier is not named in code here; the discussion of
+/// the ban is prose, which is this tree's existing convention and which
+/// `meta_gates::no_asyncfd_is_used_anywhere_in_the_workspace` skips by design.)
+///
+/// Registration is **level**-triggered on purpose — see
+/// [`Epoll::add_level_readable`].
+///
+/// # What this instrument measured on the dev box, so a caller does not overclaim
+///
+/// Measured with these wrappers on Linux 7.0.0-28-generic (2026-07-26): a bare
+/// level-triggered `EPOLLIN` registration on a pty master **agrees with
+/// `poll(2)`** in the obvious shapes — idle with the slave open, epoll returns 0
+/// events, `poll(2)` returns nothing, `read(2)` returns `EAGAIN`, `FIONREAD` 0;
+/// five bytes queued, epoll returns `EPOLLIN`, `FIONREAD` 5; slave closed, epoll
+/// returns `EPOLLHUP` and `read(2)` returns `EIO`.
+///
+/// That is not a refutation of invariant 1 and must not be reported as one: the
+/// starvation §15.18 records is a property of tokio's readiness *guard* (its
+/// registration lifecycle and its synchronously-completing ready future), not of
+/// `epoll_ctl` in isolation. The consequence for a probe is concrete — **a probe
+/// built on this must report the counts it saw, not degrade a box for failing to
+/// reproduce a busy-loop.** Numbers that match the line above are the healthy
+/// answer on 7.0, and the point of printing them is that 6.18 gets to answer for
+/// itself.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct Epoll {
+    fd: RawFd,
+}
+
+#[cfg(target_os = "linux")]
+impl Epoll {
+    /// Create an epoll set (`epoll_create1(EPOLL_CLOEXEC)`). `CLOEXEC` because the
+    /// doctor spawns nothing, and an instrument should not be the reason a future
+    /// child inherits a stray descriptor.
+    pub fn new() -> std::io::Result<Self> {
+        // Safety: `epoll_create1` takes no memory arguments; it returns a new fd or
+        // -1 with errno set.
+        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Epoll { fd })
+    }
+
+    /// Register `fd` for readability, **level**-triggered (`EPOLLIN`, no
+    /// `EPOLLET`), stamping the event's data word with `fd` so [`Epoll::wait`] can
+    /// name it.
+    ///
+    /// Level-triggering is not a default that happened; it is the measurement.
+    /// tokio's readiness guard registers level-triggered, so that is the mode
+    /// invariant 1 is a statement about — an edge-triggered registration would
+    /// answer a *different* question (it fires once per transition and so cannot
+    /// exhibit the persistent-ready loop at all), and would quietly report "no
+    /// problem here" on a kernel that still has one. There is deliberately no
+    /// edge-triggered variant on this type.
+    ///
+    /// `EPOLLERR`/`EPOLLHUP` arrive whether or not they are requested, so a caller
+    /// that registers this way still sees a hangup — worth reporting beside the
+    /// readable bit rather than masking off.
+    pub fn add_level_readable(&self, fd: RawFd) -> std::io::Result<()> {
+        let mut ev = libc::epoll_event {
+            events: EPOLLIN,
+            u64: fd as u64,
+        };
+        // Safety: EPOLL_CTL_ADD reads one `epoll_event` through the pointer, which
+        // lives across the call; `self.fd` is this type's own epoll fd and `fd` is
+        // owned and kept alive by the caller.
+        let rc = unsafe { libc::epoll_ctl(self.fd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Wait up to `timeout_ms` for up to `max_events` registered fds to become
+    /// ready, and return one [`EpollReady`] per event the kernel reported — so the
+    /// caller gets both *how many* fired and *which flags* each carried.
+    ///
+    /// The timeout is a `u16` for the same reason [`poll_blocking`]'s is: it makes
+    /// "block forever" unrepresentable. A diagnostic that can hang is a diagnostic
+    /// nobody runs on the machine they were trying to diagnose.
+    ///
+    /// An empty vector means the timeout expired with nothing ready — which, on a
+    /// pty master that `read(2)` also refuses, is the *good* answer and the one
+    /// worth printing.
+    pub fn wait(&self, timeout_ms: u16, max_events: usize) -> std::io::Result<Vec<EpollReady>> {
+        let capacity = max_events.max(1);
+        let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; capacity];
+        // Safety: `events` is valid for writes of `capacity` `epoll_event`s and
+        // outlives the call; `epoll_wait` writes at most `capacity` of them and
+        // returns how many (or -1 with errno set).
+        let n = unsafe {
+            libc::epoll_wait(
+                self.fd,
+                events.as_mut_ptr(),
+                capacity as libc::c_int,
+                i32::from(timeout_ms),
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(events[..n as usize]
+            .iter()
+            // `epoll_event` is `repr(packed)` on x86_64: these are field *reads*
+            // (both fields are `Copy`), never references into the packed struct.
+            .map(|e| EpollReady {
+                fd: e.u64 as RawFd,
+                events: e.events,
+            })
+            .collect())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Epoll {
+    fn drop(&mut self) {
+        // Safety: `self.fd` was created by `Epoll::new`, is never handed out, and
+        // this type is not `Clone`, so nothing else can be using or closing it.
+        // The result is ignored deliberately: `close` can only fail here in ways a
+        // probe cannot act on, and `Drop` has nowhere to report it.
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+/// Non-Linux stub. `epoll(7)` is a Linux interface with no portable equivalent —
+/// kqueue is a different mechanism, and the behaviour under measurement is
+/// specifically epoll's — so every method reports `ENOTSUP`, exactly as
+/// [`read_icounts`] does off Linux.
+///
+/// The contract for the caller is the same one `read_icounts` established: a
+/// probe turns this error into **`skipped`**, never `unsupported`. `unsupported`
+/// means a design premise was contradicted with no fallback; "this kernel has no
+/// epoll" contradicts nothing, since the data plane is forbidden from using epoll
+/// anyway (invariant 1) and macOS is best-effort (§13).
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub struct Epoll;
+
+#[cfg(not(target_os = "linux"))]
+impl Epoll {
+    /// Always `ENOTSUP` off Linux — see the type's documentation.
+    pub fn new() -> std::io::Result<Self> {
+        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
+    }
+
+    /// Always `ENOTSUP` off Linux — see the type's documentation.
+    pub fn add_level_readable(&self, _fd: RawFd) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
+    }
+
+    /// Always `ENOTSUP` off Linux — see the type's documentation.
+    pub fn wait(&self, _timeout_ms: u16, _max_events: usize) -> std::io::Result<Vec<EpollReady>> {
+        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
+    }
+}
+
+/// Bytes sitting in `fd`'s **input** queue right now (`FIONREAD`) — what a
+/// `read(2)` could return without blocking.
+///
+/// A probe instrument, not a data-plane call: the data plane reads until
+/// [`std::io::ErrorKind::WouldBlock`] and never needs to ask. It exists because
+/// invariant 1's claim deserves a third witness. If epoll ever says *readable*
+/// while [`read_fd`] answers `EAGAIN`, the two disagree and someone has to be
+/// believed; `FIONREAD` is the kernel stating the queue depth outright, which
+/// turns "do epoll and `read(2)` disagree about this pty master" from an
+/// inference into a number an operator can read off two `--json` runs.
+///
+/// It is meaningful on a pty master, which is not obvious and was worth checking:
+/// measured on Linux 7.0, a master with five bytes written from the slave reports
+/// `FIONREAD == 5`, and `0` when idle.
+///
+/// `Err` means the fd's driver does not implement it. Callers omit the number
+/// rather than faulting — the same treatment [`read_icounts`] gets (§5).
+pub fn pending_input_bytes(fd: RawFd) -> nix::Result<usize> {
+    let mut n: libc::c_int = 0;
+    // Safety: FIONREAD writes one `int` through the pointer; `n` outlives the call.
+    unsafe { fionread(fd, &mut n) }?;
+    Ok(n.max(0) as usize)
+}
+
+/// Bytes still queued for transmission on `fd` (`TIOCOUTQ`) — the write-side twin
+/// of [`pending_input_bytes`], for a probe that fills a buffer to discover its
+/// depth (fill with the non-blocking [`write_fd`] until `WouldBlock`, then ask
+/// where the bytes went).
+///
+/// **Report this number, do not judge it.** On a real UART it is the driver's
+/// untransmitted count. On a pty it is 0: a pty has no transmitter to drain, and
+/// the tty layer reports 0 when the line discipline offers no `chars_in_buffer`.
+/// That was *measured*, not assumed — Linux 7.0 answers 0 on a pty master in all
+/// three states (idle, five bytes queued, hung up). A probe that treated 0 as a
+/// failure would redden a healthy box; whether a given kernel accounts for a pty
+/// here at all is exactly the quiet 6.18-vs-7.0 difference this section exists to
+/// surface, so emit it as an observation and never as a verdict.
+///
+/// Linux-only (libc exports the request code only there); elsewhere this is the
+/// same `ENOTSUP` stub [`read_icounts`] uses, which a probe reports as `skipped`.
+#[cfg(target_os = "linux")]
+pub fn pending_output_bytes(fd: RawFd) -> nix::Result<usize> {
+    let mut n: libc::c_int = 0;
+    // Safety: TIOCOUTQ writes one `int` through the pointer; `n` outlives the call.
+    unsafe { tiocoutq(fd, &mut n) }?;
+    Ok(n.max(0) as usize)
+}
+
+/// Non-Linux stub for [`pending_output_bytes`]: no `TIOCOUTQ` request code is
+/// exported off Linux, so report "unsupported" the way [`read_icounts`] does and
+/// let the probe skip (§13 macOS best-effort).
+#[cfg(not(target_os = "linux"))]
+pub fn pending_output_bytes(_fd: RawFd) -> nix::Result<usize> {
+    Err(nix::errno::Errno::ENOTSUP)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +617,110 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// The `EPOLL*` constants are written as literals so [`EpollReady`] compiles
+    /// on macOS (where libc exports none of them). That convenience is only
+    /// allowed to exist if it is *proven* equal to the ABI rather than trusted, so
+    /// this checks each one against libc on the platform that has them. A silently
+    /// wrong bit would make a probe report the wrong kernel behaviour, which is
+    /// worse than no probe.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn epoll_flag_constants_match_the_kernel_abi() {
+        for (ours, theirs, name) in [
+            (EPOLLIN, libc::EPOLLIN, "EPOLLIN"),
+            (EPOLLPRI, libc::EPOLLPRI, "EPOLLPRI"),
+            (EPOLLOUT, libc::EPOLLOUT, "EPOLLOUT"),
+            (EPOLLERR, libc::EPOLLERR, "EPOLLERR"),
+            (EPOLLHUP, libc::EPOLLHUP, "EPOLLHUP"),
+            (EPOLLRDHUP, libc::EPOLLRDHUP, "EPOLLRDHUP"),
+        ] {
+            assert_eq!(ours, theirs as u32, "{name} does not match libc");
+        }
+    }
+
+    /// The epoll wrapper mechanically works: a registered fd with a byte waiting
+    /// comes back once, identified by fd, carrying `EPOLLIN`, with `FIONREAD`
+    /// agreeing on the depth.
+    ///
+    /// Note what this deliberately does **not** assert: the pty-master behaviour
+    /// behind invariant 1 (epoll ready while `read` says `EAGAIN`). That is the
+    /// thing `nexus-doctor` *measures* and reports, and a kernel that fixed it
+    /// must not turn this crate's test suite red — a probe reports what it
+    /// observed, a unit test pins what we implement. A socketpair is used because
+    /// its readiness is unambiguous on every Linux and needs no pty.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn epoll_reports_a_readable_fd_and_names_the_flag() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (mut tx, rx) = UnixStream::pair().expect("socketpair");
+        tx.write_all(b"x").expect("write one byte");
+
+        let ep = Epoll::new().expect("epoll_create1");
+        ep.add_level_readable(rx.as_raw_fd())
+            .expect("EPOLL_CTL_ADD");
+        let ready = ep.wait(500, 4).expect("epoll_wait");
+
+        assert_eq!(ready.len(), 1, "one registered fd, one event");
+        assert_eq!(ready[0].fd, rx.as_raw_fd(), "the event names its own fd");
+        assert!(ready[0].contains(EPOLLIN), "events={:#x}", ready[0].events);
+        assert!(ready[0].flag_names().contains(&"EPOLLIN"));
+        assert_eq!(
+            pending_input_bytes(rx.as_raw_fd()).expect("FIONREAD"),
+            1,
+            "FIONREAD must agree with the byte actually queued"
+        );
+    }
+
+    /// An idle registered fd yields an empty vector rather than an error — the
+    /// answer a probe prints when epoll and `read(2)` finally agree. Also pins the
+    /// `u16` timeout: this call must return, and it must return quickly.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn epoll_wait_returns_empty_on_timeout() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (_tx, rx) = UnixStream::pair().expect("socketpair");
+        let ep = Epoll::new().expect("epoll_create1");
+        ep.add_level_readable(rx.as_raw_fd())
+            .expect("EPOLL_CTL_ADD");
+
+        let start = std::time::Instant::now();
+        let ready = ep.wait(20, 4).expect("epoll_wait");
+        assert!(ready.is_empty(), "nothing was written: {ready:?}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// `Drop` really closes the epoll fd. A leak here would be invisible in a
+    /// single probe run and fatal in a probe that samples in a loop, so the test
+    /// creates far more sets than a typical 1024-fd soft limit allows: with a leak
+    /// this hits EMFILE long before the end.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn dropping_an_epoll_set_closes_its_fd() {
+        for i in 0..4096 {
+            Epoll::new().unwrap_or_else(|e| panic!("epoll_create1 failed at iteration {i}: {e}"));
+        }
+    }
+
+    /// `FIONREAD` reports the queue depth (and zero on an idle fd) on every
+    /// platform this crate builds for — it is the one probe instrument here that
+    /// is not Linux-only.
+    #[test]
+    fn pending_input_bytes_counts_what_is_queued() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (mut tx, rx) = UnixStream::pair().expect("socketpair");
+        assert_eq!(pending_input_bytes(rx.as_raw_fd()).expect("FIONREAD"), 0);
+        tx.write_all(b"hello").expect("write");
+        // The write is to a socketpair buffer, so it is readable on return.
+        assert_eq!(pending_input_bytes(rx.as_raw_fd()).expect("FIONREAD"), 5);
     }
 }

@@ -1,11 +1,39 @@
 //! The capability probes (design §15.17, plan §3): P1 EXTPROC/TIOCPKT, P2 PTY
-//! presence, P3 serial-port fit, P4 by-id resolution — plus environment checks.
-//! Each returns a self-judging [`Probe`]. The kernel probes (P1, P2) and the
-//! resolver probe (P4) are passive and always safe to run; P3 opens a real
-//! serial port and therefore runs only on an explicitly named `--port`.
+//! presence, P3 serial-port fit, P4 by-id resolution, P5 rig certification,
+//! P6/P7 — the two pty last-close measurements the §6/§7.2 write-lock lifecycle
+//! rests on — and P8..P11, the kernel-behaviour measurements the *data plane's*
+//! shape rests on: P8 epoll-vs-`read(2)` on a pty master (invariant 1), P9
+//! `poll(2)` timeout granularity (§15.19's timer floor), P10 pty buffer depth
+//! (the `hostward_buffer` defaults), P11 real-port line-state ioctls (§5/§7.1).
+//! Each returns a self-judging [`Probe`]. The kernel probes (P1, P2, P6, P7, P8,
+//! P9, P10) and the resolver probe (P4) are passive and always safe to run; P3,
+//! P5 and P11 open a real serial port and therefore run only on an explicitly
+//! named `--port`.
+//!
+//! **P6..P11 exist to be diffed across kernels.** Production runs Linux 6.18;
+//! this tree was developed on 7.0, and §13 forbids a one-way decision resting on
+//! 7.0-only evidence. Each probe therefore emits its *raw measurements* — pass
+//! counts, poll flags, read outcomes, packet bytes in hex, microseconds, byte
+//! depths — not just a verdict word, so `nexus-doctor --json` from a 6.18 box and
+//! a 7.0 box can be diffed and the disagreement, if any, read straight off the
+//! numbers. **Prose in the Markdown arm is a bonus; the JSON is the artifact.**
+//!
+//! None of them can report `unsupported`, and the rule behind that is worth
+//! stating once: `unsupported` means a design premise is contradicted *with no
+//! fallback*, and it is a live gate (`expectations/linux.jq` requires
+//! `.summary.unsupported == 0`, and `nexus-itest/tests/meta_gates.rs` asserts the
+//! same), so a probe that reddens a healthy box is a bug and not a finding. Every
+//! answer these probes can return is legitimate kernel behaviour the shipped code
+//! is already correct under — what varies is whether a *pending simplification* is
+//! safe (P6), whether a latch covers a realistic session shape (P7), whether a
+//! design's justification reproduces here (P8), and what numbers a tuning
+//! decision should be made against (P9, P10, P11). "This kernel behaves
+//! differently from the dev box" is `degraded` with the observation named, or
+//! `skipped` where the mechanism does not exist at all — never `unsupported`.
 
+use std::collections::BTreeMap;
 use std::io::Read;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -246,6 +274,1145 @@ fn new_master() -> anyhow::Result<PtyMaster> {
 }
 
 // ---------------------------------------------------------------------------
+// Shared pty machinery for P6/P7 (both measure a packet-mode master across a
+// client session's collapse, so they share the setup, the sampler and the
+// labels — a probe's numbers are only diffable across kernels if both kernels
+// were measured by the same code).
+// ---------------------------------------------------------------------------
+
+/// The §7.2 baseline termios the PTY node applies to every pair it owns — raw,
+/// echo off, **EXTPROC set** — mirroring `nexus-daemon::nodes::pty`'s
+/// `apply_baseline_fd`. Applied through whichever fd this platform lets us: the
+/// Linux master is a terminal and carries it; a BSD/macOS master answers
+/// `ENOTTY`, so the node applies it through a momentarily-opened slave (see
+/// `with_termios_fd`, and P2's `termios_settable`).
+///
+/// **EXTPROC is not decoration here, it is the mechanism under test.** Linux's
+/// `pty_set_termios` raises `TIOCPKT_IOCTL` on the master only when EXTPROC is
+/// set in the old or the new termios (or when the IXON flow-control state
+/// changes) — which is why the design's baseline sets it (§7.2) and why P1 probes
+/// it. Measuring P7 against a baseline *without* EXTPROC reports "a collapsed
+/// termios-only session leaves nothing readable" on a kernel where it plainly
+/// does: a false `degraded`, and precisely the wrong answer to carry to 6.18.
+fn set_baseline<Fd: AsFd>(fd: &Fd) -> nix::Result<()> {
+    let mut t = tcgetattr(fd)?;
+    cfmakeraw(&mut t);
+    t.local_flags.remove(LocalFlags::ECHO);
+    t.local_flags.insert(LocalFlags::EXTPROC);
+    tcsetattr(fd, SetArg::TCSANOW, &t)
+}
+
+/// Apply the baseline the way the node does at pty *creation*: through the
+/// master, falling back to a momentary slave open. **Never call this after the
+/// last close when the hangup itself is what is being measured** — the fallback
+/// opens a slave, which clears the hangup. Use [`set_baseline`] on the master
+/// directly there (that is what `handle_last_close` does).
+fn apply_pty_baseline(master: &PtyMaster, pts: &str) -> anyhow::Result<()> {
+    if set_baseline(&master).is_ok() {
+        return Ok(());
+    }
+    let slave = open(pts, OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+    set_baseline(&slave)?;
+    Ok(())
+}
+
+/// Name a `revents` bitmask stably (`POLLIN|POLLHUP`), and name any bit this
+/// table does not know rather than dropping it — an unknown bit on the
+/// production kernel is exactly the kind of thing this report exists to surface.
+fn revents_label(f: PollFlags) -> String {
+    const KNOWN: [(PollFlags, &str); 6] = [
+        (PollFlags::POLLIN, "POLLIN"),
+        (PollFlags::POLLPRI, "POLLPRI"),
+        (PollFlags::POLLOUT, "POLLOUT"),
+        (PollFlags::POLLERR, "POLLERR"),
+        (PollFlags::POLLHUP, "POLLHUP"),
+        (PollFlags::POLLNVAL, "POLLNVAL"),
+    ];
+    let mut parts: Vec<String> = Vec::new();
+    let mut named = PollFlags::empty();
+    for (flag, name) in KNOWN {
+        if f.contains(flag) {
+            parts.push((*name).to_owned());
+            named |= flag;
+        }
+    }
+    let residual = f.bits() & !named.bits();
+    if residual != 0 {
+        parts.push(format!("0x{:x}", residual as u16));
+    }
+    if parts.is_empty() {
+        "none".to_owned()
+    } else {
+        parts.join("|")
+    }
+}
+
+/// Classify one `read(2)` on the master: the outcome *class* (what a poll loop
+/// would branch on) and the bytes it produced.
+fn read_class(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return "EAGAIN".to_owned();
+    }
+    match e.raw_os_error() {
+        Some(libc::EIO) => "EIO".to_owned(),
+        Some(libc::EAGAIN) => "EAGAIN".to_owned(),
+        Some(n) => format!("errno:{n}"),
+        None => "error".to_owned(),
+    }
+}
+
+/// Read everything the master will hand over right now (the fd is non-blocking),
+/// bounded by `max_reads`. Returns the bytes, the read count, the **leading byte
+/// of every read** in hex — the packet-mode control byte, which is the whole
+/// finding in P7 — and the label of the read that ended the drain.
+fn read_available(fd: RawFd, buf: &mut [u8], max_reads: u32) -> (u64, u64, Vec<String>, String) {
+    let mut bytes = 0u64;
+    let mut reads = 0u64;
+    let mut leading = Vec::new();
+    for _ in 0..max_reads {
+        match sys::read_fd(fd, buf) {
+            Ok(0) => return (bytes, reads, leading, "eof".to_owned()),
+            Ok(n) => {
+                bytes += n as u64;
+                reads += 1;
+                leading.push(format!("0x{:02x}", buf[0]));
+            }
+            Err(e) => return (bytes, reads, leading, read_class(&e)),
+        }
+    }
+    (bytes, reads, leading, "capped".to_owned())
+}
+
+/// What repeated readiness passes on the master observed. Every field is
+/// reported: the verdict reads one of them, a kernel diff reads them all.
+#[derive(Default)]
+struct Readiness {
+    passes: u64,
+    pollin: u64,
+    pollhup: u64,
+    /// The spin signature: a pass where `poll(2)` said POLLIN and the following
+    /// `read(2)` produced **no bytes**. A poll loop that treats readable-with-EOF
+    /// as an event re-fires on every one of these.
+    pollin_no_data: u64,
+    bytes: u64,
+    elapsed_ms: u64,
+    /// Read-outcome class → count (`bytes` / `eof` / `EAGAIN` / `EIO` / …).
+    reads: BTreeMap<String, u64>,
+    /// `revents` label → count.
+    revents: BTreeMap<String, u64>,
+}
+
+impl Readiness {
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "passes": self.passes,
+            "elapsed_ms": self.elapsed_ms,
+            "pollin_passes": self.pollin,
+            "pollhup_passes": self.pollhup,
+            "pollin_with_no_data_passes": self.pollin_no_data,
+            "bytes_read": self.bytes,
+            "read_outcomes": self.reads,
+            "revents_seen": self.revents,
+        })
+    }
+}
+
+/// P6's sampling budget: bounded passes over a bounded wall clock, with a pause
+/// between passes near the PTY node's idle poll period (5 ms) so the sample
+/// resembles the loop whose behaviour is in question — and so the doctor itself
+/// never busy-spins while asking whether the kernel would make the daemon do so.
+const P6_PASSES: u32 = 64;
+const P6_WINDOW: Duration = Duration::from_millis(200);
+const P6_PASS_PAUSE: Duration = Duration::from_millis(2);
+/// Let a pty pair's traffic land before it is read/measured. The kernel delivers
+/// synchronously; this is insurance, and the doctor is a diagnostic, not a data
+/// path, so the milliseconds cost nothing.
+const PTY_SETTLE: Duration = Duration::from_millis(20);
+
+/// Poll the master repeatedly and record, per pass, the `revents` and what a
+/// `read(2)` then returned. Polls **exactly the interest the PTY node polls**
+/// (`POLLIN | POLLHUP`, `nodes/pty.rs`), because the question is what that loop
+/// would see. Reads on every pass regardless of POLLIN — the fd is non-blocking,
+/// so this cannot hang, and "what does read say when poll says nothing" is half
+/// the diff.
+fn sample_readiness(fd: RawFd, max_passes: u32, window: Duration) -> Readiness {
+    let mut o = Readiness::default();
+    let mut buf = [0u8; 4096];
+    let start = Instant::now();
+    let deadline = start + window;
+    for _ in 0..max_passes {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let re = sys::poll_ready(fd, PollFlags::POLLIN | PollFlags::POLLHUP);
+        o.passes += 1;
+        *o.revents.entry(revents_label(re)).or_default() += 1;
+        if re.contains(PollFlags::POLLIN) {
+            o.pollin += 1;
+        }
+        if re.contains(PollFlags::POLLHUP) {
+            o.pollhup += 1;
+        }
+        let (class, n) = match sys::read_fd(fd, &mut buf) {
+            Ok(0) => ("eof".to_owned(), 0usize),
+            Ok(n) => ("bytes".to_owned(), n),
+            Err(e) => (read_class(&e), 0),
+        };
+        *o.reads.entry(class).or_default() += 1;
+        o.bytes += n as u64;
+        if re.contains(PollFlags::POLLIN) && n == 0 {
+            o.pollin_no_data += 1;
+        }
+        std::thread::sleep(P6_PASS_PAUSE);
+    }
+    o.elapsed_ms = start.elapsed().as_millis() as u64;
+    o
+}
+
+// ---------------------------------------------------------------------------
+// P6 — pty-master readiness after the last slave closes (§6, §7.2, §13)
+// ---------------------------------------------------------------------------
+
+/// Does the master keep asserting `POLLIN` once its last slave fd is gone?
+///
+/// The record disagrees with itself. `b8d8ed8` reports that an *ungated*
+/// `closed`-only last-close arm in `nodes/pty.rs` spun at **99 % CPU** and
+/// starved the data plane; `nexus-itest/tests/p9_pty_collapse.rs` reports that
+/// planting that same arm did **not** raise the daemon's CPU on Linux 7.0,
+/// because the master stops reporting `POLLIN` after the last close so `closed`
+/// is set only in the poll that drains the final bytes. Both observations are
+/// credible; they were made on different kernels, and production is 6.18. The
+/// shipped code is safe either way — it consumes the packet its own reset
+/// provokes, so it needs no assumption about POLLIN at all — but nobody can
+/// *simplify* it until this is measured where it has to run.
+pub fn p6_last_close_readiness() -> Probe {
+    let p = Probe::new(
+        "P6",
+        "pty-master readiness after the last slave closes",
+        "Once a pty's last slave fd closes, does the master keep asserting POLLIN with nothing to read (the shape that spins a close-triggered poll loop)?",
+    );
+    match p6_inner() {
+        Ok((after_close, reset_applied, after_reset)) => {
+            let spun = after_close.pollin_no_data;
+            // The second half, called out flat so a jq one-liner can read it: if the
+            // node's own last-close reset makes the master readable again, the drain
+            // that consumes that packet is load-bearing whatever the first half says.
+            let rearm = if reset_applied {
+                format!(
+                    " The node's own last-close termios reset then re-armed readability {} time(s) ({} byte(s)), so the drain in `pty.rs` that consumes that packet stays load-bearing regardless: without it the handler re-arms itself and the runaway returns by that route rather than through a stuck POLLIN.",
+                    after_reset.pollin, after_reset.bytes
+                )
+            } else {
+                " The node's own last-close termios reset could not be applied through the master here (the §7.2 BSD arm), so its re-arm effect is unmeasured.".to_owned()
+            };
+            let p = p
+                .observe("after_last_close", after_close.observations())
+                .observe("handler_reset_applied", reset_applied)
+                .observe("handler_reset_readable_bytes", after_reset.bytes)
+                .observe("after_handler_termios_reset", after_reset.observations());
+            if spun == 0 {
+                p.verdict(
+                    Status::Supported,
+                    &format!(
+                        "POLLIN goes quiet after the last close on this kernel ({} passes, {} with POLLIN, none readable-with-nothing-to-read): an ungated `closed`-only last-close arm would NOT spin on the hangup alone here, so pty.rs's `saw_session` latch is not what holds the anti-spin argument up on this kernel.{rearm} This is a per-kernel reading — §13 forbids acting on it until the production kernel (6.18) reports the same numbers, so diff this block before simplifying anything.",
+                        after_close.passes, after_close.pollin
+                    ),
+                )
+            } else {
+                p.verdict(
+                    Status::Degraded,
+                    &format!(
+                        "The master keeps asserting POLLIN with nothing to read after the last close ({spun} of {} passes): an ungated `closed`-only arm WOULD re-fire every pass here — the 99%-CPU shape `b8d8ed8` records. pty.rs's `saw_session` latch (and the drain that consumes the handler's own control packet) is load-bearing on this kernel: do not simplify it.{rearm} The shipped code is correct as it stands; this is a warning about a pending simplification, not a fault.",
+                        after_close.passes
+                    ),
+                )
+            }
+        }
+        // Never `unsupported`: this probe measures which of two legitimate kernel
+        // behaviours applies, and the daemon copes with both. A probe that could
+        // not run leaves the question open — which means "do not simplify".
+        Err(e) => p.verdict(
+            Status::Degraded,
+            &format!(
+                "probe error ({e}) → post-hangup readiness unmeasured on this kernel; treat pty.rs's last-close latch as load-bearing."
+            ),
+        ),
+    }
+}
+
+fn p6_inner() -> anyhow::Result<(Readiness, bool, Readiness)> {
+    let master = new_master()?;
+    let pts = sys::ptsname(&master)?;
+    let fd = master.as_raw_fd();
+    // Non-blocking, packet mode, §7.2 baseline: the master exactly as the PTY node
+    // holds it (`nodes/pty.rs`), so the readings describe that loop's fd.
+    sys::set_nonblocking(fd)?;
+    apply_pty_baseline(&master, &pts)?;
+    sys::set_packet_mode(fd, true)?;
+
+    let mut buf = [0u8; 4096];
+    // A client attaches; drain everything setup and attach left, so the sampling
+    // below measures the hangup and nothing else.
+    let slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+    std::thread::sleep(PTY_SETTLE);
+    let _ = read_available(fd, &mut buf, 64);
+
+    // The last close — the §7.2 "client detached" edge, with no client data behind
+    // it (the bare-hangup shape `p9_pty_collapse` samples the daemon's CPU across).
+    drop(slave);
+    std::thread::sleep(PTY_SETTLE);
+    let after_close = sample_readiness(fd, P6_PASSES, P6_WINDOW);
+
+    // The other half of the same mechanism, recorded but not judged: the node's
+    // `handle_last_close` re-applies the baseline termios to the now-hung-up pair,
+    // which re-arms TIOCPKT_IOCTL on the master. pty.rs consumes that packet
+    // deliberately; if this kernel leaves POLLIN asserted afterwards, that drain is
+    // the load-bearing part. Applied through the master only — the slave fallback
+    // would clear the very hangup being measured.
+    let reset_applied = set_baseline(&master).is_ok();
+    std::thread::sleep(PTY_SETTLE);
+    let after_reset = sample_readiness(fd, P6_PASSES, P6_WINDOW);
+    Ok((after_close, reset_applied, after_reset))
+}
+
+// ---------------------------------------------------------------------------
+// P7 — what a collapsed client session leaves readable on the master (§6, §13)
+// ---------------------------------------------------------------------------
+
+/// The three client-session shapes, run against a packet-mode master and read
+/// *after* the hangup.
+#[derive(Clone, Copy)]
+enum SessionShape {
+    /// Open the slave and close it, touching nothing.
+    OpenClose,
+    /// Open, `tcsetattr` (the `stty`/health-check/scripted-probe shape), close.
+    Termios,
+    /// Open, write one byte, close.
+    Write,
+}
+
+impl SessionShape {
+    fn key(self) -> &'static str {
+        match self {
+            SessionShape::OpenClose => "a_open_close",
+            SessionShape::Termios => "b_open_tcsetattr_close",
+            SessionShape::Write => "c_open_write_close",
+        }
+    }
+}
+
+/// What one collapsed session left on the master after its hangup.
+struct ShapeResult {
+    bytes: u64,
+    reads: u64,
+    leading_hex: Vec<String>,
+    terminal: String,
+}
+
+impl ShapeResult {
+    fn ioctl_bit(&self) -> bool {
+        self.leading_hex
+            .iter()
+            .filter_map(|h| u8::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+            .any(|b| b & sys::TIOCPKT_IOCTL != 0)
+    }
+
+    fn data_packet(&self) -> bool {
+        self.leading_hex
+            .iter()
+            .filter_map(|h| u8::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+            .any(|b| b == sys::TIOCPKT_DATA)
+    }
+
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "bytes_readable_after_close": self.bytes,
+            "reads": self.reads,
+            "leading_bytes_hex": self.leading_hex,
+            "terminal_read": self.terminal,
+            "ioctl_bit_set": self.ioctl_bit(),
+            "data_packet_seen": self.data_packet(),
+        })
+    }
+}
+
+/// Which collapsed client sessions leave evidence on a packet-mode master?
+///
+/// `nodes/pty.rs` releases a detached client's write lock on
+/// `(was && !present_now) || (closed && saw_session)`. Both disjuncts require the
+/// reader to have *observed* something, so a session that opens, calls
+/// `tcsetattr` and closes inside one poll gap used to satisfy neither and leaked
+/// its write lock forever (§6 detach-release). The fix widened the latch from
+/// "saw a `TIOCPKT_DATA` payload" to "saw **any** readable packet", and it rests
+/// on one measured premise: that a client's `tcsetattr` leaves a `TIOCPKT_IOCTL`
+/// byte readable on the master *past the hangup* — observed on 7.0 at syscall
+/// level as `read(11, "A", 65536) = 1` (`0x41` = `TIOCPKT_IOCTL|TIOCPKT_FLUSHREAD`).
+/// If 6.18 leaves nothing there, the widened latch silently fails to cover the
+/// realistic collapsed session and the write-lock leak persists on the production
+/// kernel **with no signal at all**. That is what this probe catches.
+///
+/// The *value* of the leading byte is reported, never judged: `stty`'s
+/// `TCSETSW2`/`TCSETSF2` flushes, so it reads `0x41`
+/// (`TIOCPKT_IOCTL|TIOCPKT_FLUSHREAD`), while this probe's `tcsetattr(TCSANOW)`
+/// leaves a bare `0x40`. The latch arms on *any* successful read, so only
+/// "something was readable" gates the verdict — but the byte is in the JSON,
+/// because a kernel that changed which packet it emits is exactly the surprise a
+/// cross-kernel diff is for.
+pub fn p7_collapsed_session() -> Probe {
+    let p = Probe::new(
+        "P7",
+        "evidence a collapsed client session leaves on the master",
+        "After a pty client hangs up, which session shapes (bare open/close, tcsetattr-only, one byte written) leave a readable packet on the packet-mode master?",
+    );
+    let shapes = [
+        SessionShape::OpenClose,
+        SessionShape::Termios,
+        SessionShape::Write,
+    ];
+    let mut p = p;
+    let mut results: Vec<(SessionShape, ShapeResult)> = Vec::new();
+    for shape in shapes {
+        match p7_shape(shape) {
+            Ok(r) => {
+                p = p.observe(shape.key(), r.observations());
+                results.push((shape, r));
+            }
+            Err(e) => {
+                p = p.observe(shape.key(), format!("probe error: {e}"));
+            }
+        }
+    }
+
+    let termios = results
+        .iter()
+        .find(|(s, _)| matches!(s, SessionShape::Termios))
+        .map(|(_, r)| r);
+    let wrote = results
+        .iter()
+        .find(|(s, _)| matches!(s, SessionShape::Write))
+        .map(|(_, r)| r);
+    let covered = termios.map(|r| r.bytes > 0).unwrap_or(false);
+    let data_covered = wrote.map(|r| r.bytes > 0).unwrap_or(false);
+    p = p
+        .observe("latch_covers_termios_only_session", covered)
+        .observe("latch_covers_data_session", data_covered);
+
+    match (covered, termios) {
+        (true, Some(r)) => p.verdict(
+            Status::Supported,
+            &format!(
+                "A collapsed termios-only session leaves {} byte(s) readable past the hangup (leading {}, ioctl bit {}): pty.rs's widened last-close latch arms on it, so an `stty`/health-check/scripted client that opens, reconfigures and closes inside one poll gap still runs detach-release (§6). Diff this against the production kernel (6.18) before trusting the coverage there.",
+                r.bytes,
+                r.leading_hex.join(" "),
+                r.ioctl_bit()
+            ),
+        ),
+        // Never `unsupported`: nothing in the design is contradicted — the write
+        // lock is still releasable by every observed session, and by a `steal`. What
+        // is lost is coverage of one realistic shape, which is a degradation with a
+        // concrete consequence, named here so it cannot be read as a nit.
+        _ => p.verdict(
+            Status::Degraded,
+            &format!(
+                "A collapsed termios-only session leaves NOTHING readable on the master after the hangup on this kernel{}. pty.rs's last-close latch has nothing to arm on for that shape, so a client that opens, calls tcsetattr and closes inside one poll gap keeps its write lock until the node is removed or another writer steals it (§6 detach-release) — and it does so silently. Re-check `nodes/pty.rs`'s latch before relying on collapsed-session release here.",
+                if data_covered {
+                    ", though a session that wrote a byte does"
+                } else {
+                    ", and neither does one that wrote a byte"
+                }
+            ),
+        ),
+    }
+}
+
+fn p7_shape(shape: SessionShape) -> anyhow::Result<ShapeResult> {
+    let master = new_master()?;
+    let pts = sys::ptsname(&master)?;
+    let fd = master.as_raw_fd();
+    sys::set_nonblocking(fd)?;
+    apply_pty_baseline(&master, &pts)?;
+    sys::set_packet_mode(fd, true)?;
+
+    let mut buf = [0u8; 4096];
+    // Prime and quiesce exactly as the node does (open+close at creation, §7.2),
+    // then drain twice: once with the primer open, once after its hangup. What the
+    // measured session leaves behind must be its own, not the setup's.
+    {
+        let prime = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+        std::thread::sleep(PTY_SETTLE);
+        let _ = read_available(fd, &mut buf, 64);
+        drop(prime);
+    }
+    std::thread::sleep(PTY_SETTLE);
+    let _ = read_available(fd, &mut buf, 64);
+
+    // The measured session.
+    let slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+    match shape {
+        SessionShape::OpenClose => {}
+        SessionShape::Termios => {
+            // A real client change, through the same safe termios path P1/P2 use:
+            // re-enable ECHO, which the baseline cleared. This is the syscall
+            // sequence `stty -F <path> echo` performs (openat → TCGETS2 → TCSETSW2
+            // → close) and the shape `p9_pty_collapse` drives end to end.
+            let mut t = tcgetattr(&slave)?;
+            t.local_flags.insert(LocalFlags::ECHO);
+            tcsetattr(&slave, SetArg::TCSANOW, &t)?;
+        }
+        SessionShape::Write => {
+            nix::unistd::write(&slave, b"x")?;
+        }
+    }
+    std::thread::sleep(PTY_SETTLE);
+    // The collapse: the client is gone before the reader ever polled.
+    drop(slave);
+    std::thread::sleep(PTY_SETTLE);
+
+    let (bytes, reads, leading_hex, terminal) = read_available(fd, &mut buf, 64);
+    Ok(ShapeResult {
+        bytes,
+        reads,
+        leading_hex,
+        terminal,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// P8 — epoll vs read(2) on a pty master (invariant 1, §15.18, §13)
+//
+// Linux-only in substance, but NOT `#[cfg]`-gated: `nexus_sys::Epoll` keeps a
+// stub off Linux whose every method answers `ENOTSUP`, so this file has one code
+// path on every platform and the probe reports `skipped` where epoll does not
+// exist. A cfg arm here would be a second thing to keep in sync for no gain.
+// ---------------------------------------------------------------------------
+
+/// A ratio rounded to three decimals — enough to read off a report, few enough
+/// digits that two runs of the same kernel produce the *same* number and a diff
+/// shows only real differences.
+fn ratio3(num: u64, den: u64) -> f64 {
+    if den == 0 {
+        return 0.0;
+    }
+    ((num as f64 / den as f64) * 1000.0).round() / 1000.0
+}
+
+/// Name an epoll event bitmask stably (`EPOLLIN|EPOLLHUP`), keeping any bit
+/// `nexus-sys` does not name — same discipline as [`revents_label`]: an
+/// unfamiliar bit on the production kernel is the surprise this report exists to
+/// surface, so it is printed in hex rather than dropped.
+fn epoll_label(r: &sys::EpollReady) -> String {
+    const KNOWN: [u32; 6] = [
+        sys::EPOLLIN,
+        sys::EPOLLPRI,
+        sys::EPOLLOUT,
+        sys::EPOLLERR,
+        sys::EPOLLHUP,
+        sys::EPOLLRDHUP,
+    ];
+    let mut parts: Vec<String> = r.flag_names().into_iter().map(str::to_owned).collect();
+    let residual = r.events & !KNOWN.iter().fold(0u32, |a, b| a | b);
+    if residual != 0 {
+        parts.push(format!("0x{residual:x}"));
+    }
+    if parts.is_empty() {
+        "none".to_owned()
+    } else {
+        parts.join("|")
+    }
+}
+
+/// One epoll-vs-`read(2)` sampling phase on a pty master. Every field is emitted;
+/// the consequence line reads one of them, a cross-kernel diff reads them all.
+#[derive(Default)]
+struct EpollSpin {
+    /// `epoll_wait` calls made, and how many returned at least one event.
+    waits: u64,
+    ready_waits: u64,
+    events: u64,
+    /// epoll event-mask label → count.
+    flags: BTreeMap<String, u64>,
+    /// Read-outcome class → count (`bytes` / `eof` / `EAGAIN` / `EIO` / …).
+    reads: BTreeMap<String, u64>,
+    bytes: u64,
+    /// **The invariant-1 signature**: epoll reported the fd ready and the very
+    /// next `read(2)` answered `EAGAIN`. A readiness guard that treats "ready" as
+    /// an event and completes synchronously spins once per one of these.
+    ready_then_eagain: u64,
+    /// The broader form: epoll said ready and the read produced no bytes for any
+    /// reason (`EAGAIN` **or** `EIO` after a hangup). Reported separately because
+    /// a hung-up fd is level-ready forever by design, which is a different fact
+    /// from a spurious readable.
+    ready_then_no_data: u64,
+    /// `poll(2)`'s answer to the same question, sampled in the same pass — the
+    /// two disagreeing is the whole content of §15.18's claim.
+    poll2_pollin: u64,
+    /// The deepest `FIONREAD` seen: the kernel stating the queue depth outright,
+    /// so "epoll says ready, read says EAGAIN" is a measurement and not an
+    /// inference about who is lying.
+    fionread_max: u64,
+    elapsed_ms: u64,
+}
+
+impl EpollSpin {
+    fn observations(&self, timeout_ms: u16) -> serde_json::Value {
+        serde_json::json!({
+            "registration": "level-triggered EPOLLIN",
+            "epoll_wait_timeout_ms": timeout_ms,
+            "epoll_waits": self.waits,
+            "epoll_ready_waits": self.ready_waits,
+            "epoll_events": self.events,
+            "epoll_flags_seen": self.flags,
+            "poll2_pollin_passes": self.poll2_pollin,
+            "read_outcomes": self.reads,
+            "bytes_read": self.bytes,
+            "ready_then_eagain": self.ready_then_eagain,
+            "ready_then_no_data": self.ready_then_no_data,
+            "spin_ratio": ratio3(self.ready_then_eagain, self.waits),
+            "fionread_max": self.fionread_max,
+            "elapsed_ms": self.elapsed_ms,
+        })
+    }
+}
+
+/// P8's budget: 64 passes with a 1 ms epoll timeout and a 1 ms pause, twice —
+/// ~256 ms worst case. The pause matters in the hung-up phase, where a
+/// level-triggered set returns instantly on every call: without it the *doctor*
+/// would busy-spin while asking whether the kernel makes a daemon do so.
+const P8_PASSES: u32 = 64;
+const P8_TIMEOUT_MS: u16 = 1;
+const P8_PASS_PAUSE: Duration = Duration::from_millis(1);
+
+/// Does epoll report a pty master readable while `read(2)` returns `EAGAIN`?
+///
+/// This is the kernel behaviour behind **invariant 1**. The daemon polls every
+/// tty-family fd with non-blocking `poll(2)` plus an adaptive idle backoff
+/// (`nexus_sys::poll_ready`/`poll_blocking`) because tokio's readiness guard —
+/// epoll underneath — reported a pty master persistently readable while `read(2)`
+/// answered `EAGAIN`, so its ready future completed synchronously forever, the
+/// loop never yielded, and the current-thread runtime starved with the control
+/// plane inside it (§15.18/§15.19). That premise was never measured on the
+/// production kernel.
+///
+/// **This probe is informational and the shipped design does not depend on its
+/// answer** — the design is *justified* by it, and the justification survives
+/// either result, because `poll(2)` is correct whether or not epoll agrees. Two
+/// things follow, and both are deliberate:
+///
+/// * A box on which the busy-loop does **not** reproduce is `supported`, not
+///   degraded. The starvation §15.18 records is a property of a readiness
+///   *guard* (registration lifecycle plus a synchronously-completing ready
+///   future), not of `epoll_ctl` in isolation, so a bare level-triggered
+///   registration agreeing with `poll(2)` refutes nothing. The finding lives in
+///   the numbers; the verdict only says the numbers exist.
+/// * Both phases are measured, because they are different questions. With a
+///   slave open and the master drained, "ready" would be spurious. After the last
+///   slave closes, a level-triggered set reports `EPOLLHUP` on *every* call by
+///   design and `read(2)` answers `EIO` — genuinely persistent readiness, counted
+///   under `ready_then_no_data` rather than `ready_then_eagain` so the two are
+///   never conflated.
+pub fn p8_epoll_readiness() -> Probe {
+    let p = Probe::new(
+        "P8",
+        "epoll vs read(2) on a pty master",
+        "Does epoll report a pty master readable while read(2) returns EAGAIN — the busy-loop shape that made the data plane use poll(2) instead (invariant 1, §15.18)?",
+    );
+    match p8_inner() {
+        Ok((idle, hungup)) => {
+            let p = p
+                .observe("slave_open_idle", idle.observations(P8_TIMEOUT_MS))
+                .observe("after_slave_close", hungup.observations(P8_TIMEOUT_MS))
+                .observe("busy_loop_reproduced", idle.ready_then_eagain > 0)
+                .observe("epoll_agrees_with_poll2", idle.ready_waits == idle.poll2_pollin);
+            let finding = if idle.ready_then_eagain > 0 {
+                format!(
+                    "REPRODUCED: with a slave open and nothing to read, epoll reported the master ready on {} of {} waits and the following read(2) answered EAGAIN {} time(s) (poll(2) said POLLIN on {} passes, FIONREAD peaked at {}). This is §15.18's shape verbatim — a readiness guard built on it spins, and the daemon's poll(2)-plus-backoff readiness is load-bearing here.",
+                    idle.ready_waits, idle.waits, idle.ready_then_eagain, idle.poll2_pollin, idle.fionread_max
+                )
+            } else {
+                format!(
+                    "NOT reproduced at this layer: a bare level-triggered EPOLLIN registration agreed with poll(2) on this kernel ({} of {} waits ready, poll(2) POLLIN on {} passes, 0 reads answering EAGAIN after a ready report). Read that as scoped, not as a refutation — the starvation §15.18 records is a property of tokio's readiness guard (registration lifecycle + a synchronously-completing ready future), not of epoll_ctl alone, so invariant 1 stands and nothing here licenses putting epoll back in the data plane.",
+                    idle.ready_waits, idle.waits, idle.poll2_pollin
+                )
+            };
+            p.verdict(
+                Status::Supported,
+                &format!(
+                    "{finding} After the last slave closed, the level-triggered set reported an event on {} of {} waits ({} of them with no bytes to read) — persistent readiness on a hung-up fd is expected and is why the PTY reader branches on POLLHUP rather than looping on readability. Diff both blocks against the production kernel (6.18) before drawing any conclusion from either.",
+                    hungup.ready_waits, hungup.waits, hungup.ready_then_no_data
+                ),
+            )
+        }
+        // Never `unsupported`, and never `degraded`: the design does not rest on
+        // this answer, so a kernel without epoll (macOS, §13) or a probe that could
+        // not run leaves nothing at risk — it leaves a question unmeasured, which is
+        // what `skipped` says. The reason carries the errno so a failure is visible
+        // rather than silent.
+        Err(e) if is_unsupported_errno(&e) => p.verdict(
+            Status::skipped("epoll is Linux-only"),
+            "epoll(7) has no portable equivalent, and the data plane is forbidden from using it anyway (invariant 1) — nothing here is untested, only unmeasurable on this platform (§13).",
+        ),
+        Err(e) => p.verdict(
+            Status::skipped(format!("probe error: {e}")),
+            "The epoll/read comparison did not run; invariant 1's justification is unmeasured on this box, and the data plane's poll(2) readiness is unaffected either way (§15.18).",
+        ),
+    }
+}
+
+fn p8_inner() -> anyhow::Result<(EpollSpin, EpollSpin)> {
+    let master = new_master()?;
+    let pts = sys::ptsname(&master)?;
+    let fd = master.as_raw_fd();
+    // The master exactly as the PTY node holds it: non-blocking, §7.2 baseline,
+    // packet mode. Measuring some other fd's readiness would answer some other
+    // question (§15.18 is a claim about this fd in this configuration).
+    sys::set_nonblocking(fd)?;
+    apply_pty_baseline(&master, &pts)?;
+    sys::set_packet_mode(fd, true)?;
+
+    let mut buf = [0u8; 4096];
+    let slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+    std::thread::sleep(PTY_SETTLE);
+    // Drained first: "epoll says ready" is only interesting when there is provably
+    // nothing to read, so anything setup and attach left behind is consumed here.
+    let _ = read_available(fd, &mut buf, 64);
+    let idle = p8_phase(fd)?;
+
+    drop(slave);
+    std::thread::sleep(PTY_SETTLE);
+    let hungup = p8_phase(fd)?;
+    Ok((idle, hungup))
+}
+
+/// One sampling phase: a fresh epoll set (registering the same fd twice in one
+/// set is `EEXIST`), then `epoll_wait` → `poll(2)` → `FIONREAD` → `read(2)` per
+/// pass, so all four answers about the same fd come from the same instant.
+fn p8_phase(fd: RawFd) -> anyhow::Result<EpollSpin> {
+    let ep = sys::Epoll::new()?;
+    ep.add_level_readable(fd)?;
+
+    let mut o = EpollSpin::default();
+    let mut buf = [0u8; 4096];
+    let start = Instant::now();
+    for _ in 0..P8_PASSES {
+        let ready = ep.wait(P8_TIMEOUT_MS, 8)?;
+        o.waits += 1;
+        if !ready.is_empty() {
+            o.ready_waits += 1;
+        }
+        for r in &ready {
+            o.events += 1;
+            *o.flags.entry(epoll_label(r)).or_default() += 1;
+        }
+        if sys::poll_ready(fd, PollFlags::POLLIN).contains(PollFlags::POLLIN) {
+            o.poll2_pollin += 1;
+        }
+        if let Ok(n) = sys::pending_input_bytes(fd) {
+            o.fionread_max = o.fionread_max.max(n as u64);
+        }
+        // Read on every pass, not only the ready ones: "what does read(2) say when
+        // epoll said nothing" is the other half of the comparison, and the fd is
+        // non-blocking so it cannot hang.
+        let (class, n) = match sys::read_fd(fd, &mut buf) {
+            Ok(0) => ("eof".to_owned(), 0usize),
+            Ok(n) => ("bytes".to_owned(), n),
+            Err(e) => (read_class(&e), 0),
+        };
+        if !ready.is_empty() {
+            if n == 0 {
+                o.ready_then_no_data += 1;
+            }
+            if class == "EAGAIN" {
+                o.ready_then_eagain += 1;
+            }
+        }
+        *o.reads.entry(class).or_default() += 1;
+        o.bytes += n as u64;
+        std::thread::sleep(P8_PASS_PAUSE);
+    }
+    o.elapsed_ms = start.elapsed().as_millis() as u64;
+    Ok(o)
+}
+
+/// Whether an error is "this platform does not implement it" — the `ENOTSUP` the
+/// `nexus-sys` stubs answer off Linux (`Epoll`, `pending_output_bytes`,
+/// `read_icounts`). A probe turns *this* error into `skipped` with a platform
+/// reason, and any other error into `skipped` with the error text, so a genuine
+/// failure never hides behind "Linux-only".
+fn is_unsupported_errno(e: &anyhow::Error) -> bool {
+    if let Some(io) = e.downcast_ref::<std::io::Error>() {
+        return io.raw_os_error() == Some(libc::ENOTSUP);
+    }
+    if let Some(errno) = e.downcast_ref::<nix::Error>() {
+        return *errno == nix::errno::Errno::ENOTSUP;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// P9 — poll(2) timeout granularity (§15.19's timer floor, §13)
+// ---------------------------------------------------------------------------
+
+/// The requested timeouts, and how many samples each gets. Four timeouts × 16
+/// samples ≈ 0 + 16 + 80 + 160 ms ≈ **0.26 s** added to a doctor run — the
+/// doctor is run interactively, so the sample count is chosen to keep it under a
+/// third of a second rather than to please a statistician. Min/median/max over 16
+/// samples is enough to see a timer floor; it is not enough to characterize a
+/// tail, and the report says so.
+const P9_TIMEOUTS_MS: [u16; 4] = [0, 1, 5, 10];
+const P9_SAMPLES: usize = 16;
+
+/// What one requested timeout actually cost. Sampled in **nanoseconds** and
+/// reported in microseconds, plus `median_ns`: the 0 ms row is the cost of
+/// asking, which is sub-microsecond and would diff as a constant `0 µs` on every
+/// kernel — a number that cannot differ is not worth printing (P2 reports its
+/// zero-timeout poll in ns for the same reason).
+struct Granularity {
+    requested_ms: u16,
+    min_ns: u64,
+    median_ns: u64,
+    max_ns: u64,
+    /// Passes where the fd reported something instead of timing out. Must be 0
+    /// for the numbers to mean what they say — reported so a contaminated sample
+    /// is visible rather than averaged in silently.
+    ready_passes: u64,
+}
+
+impl Granularity {
+    fn median_us(&self) -> u64 {
+        self.median_ns / 1000
+    }
+
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "requested_ms": self.requested_ms,
+            "requested_us": u64::from(self.requested_ms) * 1000,
+            "samples": P9_SAMPLES,
+            "min_us": self.min_ns / 1000,
+            "median_us": self.median_us(),
+            "max_us": self.max_ns / 1000,
+            "median_ns": self.median_ns,
+            "overshoot_median_us": self.median_us() as i64 - i64::from(self.requested_ms) * 1000,
+            "ready_passes": self.ready_passes,
+        })
+    }
+}
+
+/// What does a requested `poll(2)` timeout actually cost?
+///
+/// Two shipped decisions read this number. §15.19's hybrid data plane exists
+/// because the async poll loop's per-iteration timer floor capped a pty writer at
+/// ~1 MB/s while a blocking `poll(2)` on a dedicated thread reached ~185 MiB/s —
+/// a conclusion about *timer* cost, not about `read(2)`. And
+/// `nexus_sys::poll_ready`'s adaptive idle backoff picks its sleep steps against
+/// the same floor: a backoff below the floor buys latency it cannot deliver and
+/// spends CPU pretending.
+///
+/// Measured through `nexus_sys::poll_blocking` — the shipped wrapper, not a raw
+/// syscall — because a difference introduced by the wrapper is as real as one
+/// introduced by the kernel, and on a pty master with an open slave, which is the
+/// fd class the daemon actually parks on.
+pub fn p9_poll_granularity() -> Probe {
+    let p = Probe::new(
+        "P9",
+        "poll(2) timeout granularity",
+        "For a never-ready tty fd, what does a requested poll(2) timeout of 0/1/5/10 ms actually cost (min/median/max, µs)?",
+    );
+    match p9_inner() {
+        Ok(rows) => {
+            let mut p = p;
+            let mut one_ms = 0u64;
+            let mut contaminated = 0u64;
+            for row in &rows {
+                p = p.observe(
+                    &format!("poll_timeout_{}ms", row.requested_ms),
+                    row.observations(),
+                );
+                if row.requested_ms == 1 {
+                    one_ms = row.median_us();
+                }
+                contaminated += row.ready_passes;
+            }
+            let zero = rows.first().map(|r| r.median_ns).unwrap_or(0);
+            p = p
+                .observe("median_us_for_1ms_request", one_ms)
+                .observe("median_ns_for_0ms_request", zero)
+                .observe("ready_passes_total", contaminated);
+            p.verdict(
+                Status::Supported,
+                &format!(
+                    "A zero timeout costs {zero} ns median (the cost of asking) and a requested 1 ms costs {one_ms} µs median on this kernel — that is the floor §15.19's hybrid data plane was built around and the floor poll_ready's idle backoff steps against. 16 samples per timeout: enough to see the floor, not enough to characterize a tail. Diff these against the production kernel (6.18) before tuning any backoff step or timer against them.{}",
+                    if contaminated > 0 {
+                        format!(" NOTE: {contaminated} pass(es) returned early because the fd reported an event, so those samples measure readiness rather than the timeout — treat the affected rows as suspect.")
+                    } else {
+                        String::new()
+                    }
+                ),
+            )
+        }
+        // Nothing in the design rests on a *measurement* being available — the
+        // floor is whatever it is, and the code copes with any value — so an
+        // unmeasured probe is `skipped`, never `unsupported` or `degraded`.
+        Err(e) => p.verdict(
+            Status::skipped(format!("probe error: {e}")),
+            "Timeout granularity unmeasured on this box; §15.19's blocking-thread hot path and poll_ready's backoff are unaffected (both are correct at any floor).",
+        ),
+    }
+}
+
+fn p9_inner() -> anyhow::Result<Vec<Granularity>> {
+    let master = new_master()?;
+    let pts = sys::ptsname(&master)?;
+    let fd = master.as_raw_fd();
+    sys::set_nonblocking(fd)?;
+    apply_pty_baseline(&master, &pts)?;
+    // The slave stays open for the whole measurement: a hung-up master reports
+    // POLLHUP and every poll returns instantly, which would measure nothing.
+    let _slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+    std::thread::sleep(PTY_SETTLE);
+    let mut buf = [0u8; 4096];
+    let _ = read_available(fd, &mut buf, 64);
+
+    let mut rows = Vec::new();
+    for requested_ms in P9_TIMEOUTS_MS {
+        let mut samples = Vec::with_capacity(P9_SAMPLES);
+        let mut ready_passes = 0u64;
+        for _ in 0..P9_SAMPLES {
+            let start = Instant::now();
+            let revents = sys::poll_blocking(fd, PollFlags::POLLIN, requested_ms);
+            samples.push(start.elapsed().as_nanos() as u64);
+            if !revents.is_empty() {
+                ready_passes += 1;
+            }
+        }
+        samples.sort_unstable();
+        rows.push(Granularity {
+            requested_ms,
+            min_ns: samples[0],
+            median_ns: samples[samples.len() / 2],
+            max_ns: samples[samples.len() - 1],
+            ready_passes,
+        });
+    }
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// P10 — pty buffer depth (§5 hostward_buffer defaults, §7.2)
+// ---------------------------------------------------------------------------
+
+/// Fill in 4 KiB chunks up to a hard 4 MiB ceiling. The ceiling is a backstop,
+/// not an expectation: a pty that never says `EAGAIN` (a kernel that grows the
+/// buffer, or a peer draining it) must end this probe by ceiling rather than by
+/// running until someone notices — **it must never block or hang**, which is why
+/// both fds are non-blocking and why the loop is bounded twice.
+const P10_CHUNK: usize = 4096;
+const P10_CEILING: u64 = 4 * 1024 * 1024;
+
+/// How long to let the tty's asynchronous flip-buffer work run before the second
+/// fill pass. See [`FillResult::settled_bytes`] for why there is a second pass at
+/// all.
+const P10_SETTLE: Duration = PTY_SETTLE;
+
+/// What one direction of a pty accepted before it would have blocked.
+struct FillResult {
+    bytes: u64,
+    writes: u64,
+    /// Bytes the *same* fd accepted after a short pause, with still nothing
+    /// draining the far end.
+    ///
+    /// This is not padding, it is the measurement's honesty. A tty moves bytes
+    /// from the driver buffer into the line discipline's read buffer on an
+    /// **asynchronous** work item, so a single-pass fill measures "how much fits
+    /// before EAGAIN *at this instant*" and lands 11776 or 13824 bytes on the same
+    /// kernel depending on whether that work ran mid-fill (both observed on 7.0,
+    /// the second only when several doctors ran concurrently). Reporting one
+    /// number would have handed the 6.18 diff a scheduling race dressed as a
+    /// cross-kernel difference. So both are reported, and the pair says which
+    /// happened: a first pass short by a chunk with a matching `settled_extra`
+    /// **is** the late-flip case.
+    ///
+    /// Neither figure is exact, and no arrangement of passes would make it so —
+    /// on 7.0 the first pass measured 11776–13824 and the total 13824–15360. Read
+    /// a one-chunk difference across kernels as noise and only an
+    /// order-of-magnitude one as signal; the number this probe exists to give is
+    /// the *scale* of the pipe under a `hostward_buffer`, not its last byte.
+    settled_bytes: u64,
+    settled_writes: u64,
+    ceiling_hit: bool,
+    /// Why the first fill stopped: `EAGAIN` (the answer being measured),
+    /// `ceiling`, or an errno. Classified by the same errno classifier the read
+    /// paths use — a write's `EAGAIN` is the same errno and means the same thing
+    /// here.
+    terminal: String,
+    /// Why the second (post-settle) fill stopped.
+    settled_terminal: String,
+    /// `FIONREAD` on the *reading* end after the settle: where the bytes went. A
+    /// depth short of `bytes` means the rest sits in a buffer the reader cannot
+    /// see yet (on Linux this caps at the ldisc read buffer, ~4 KiB, which is the
+    /// number that explains the second pass).
+    peer_pending_input: Option<u64>,
+    /// `TIOCOUTQ` on the written fd. **Reported, never judged** — a pty has no
+    /// transmitter to drain and answers 0 on Linux 7.0 in every state; whether a
+    /// given kernel accounts for a pty here at all is exactly the quiet
+    /// cross-kernel difference worth printing.
+    pending_output: Option<u64>,
+}
+
+impl FillResult {
+    fn total(&self) -> u64 {
+        self.bytes + self.settled_bytes
+    }
+
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "bytes_accepted_before_eagain": self.bytes,
+            "writes": self.writes,
+            "settled_extra_bytes": self.settled_bytes,
+            "settled_extra_writes": self.settled_writes,
+            "settle_ms": P10_SETTLE.as_millis() as u64,
+            "total_bytes_accepted": self.total(),
+            "chunk_bytes": P10_CHUNK,
+            "ceiling_hit": self.ceiling_hit,
+            "ceiling_bytes": P10_CEILING,
+            "terminal_write": self.terminal,
+            "terminal_write_after_settle": self.settled_terminal,
+            "peer_pending_input_bytes": self.peer_pending_input,
+            "pending_output_bytes": self.pending_output,
+        })
+    }
+}
+
+/// How many bytes will a pty accept with nothing draining the other end?
+///
+/// This sizes the queues that sit *above* it. `nexus-core`'s `hostward_buffer`
+/// defaults (256 chunks for a serial node, **32 for a pty**) bound the daemon's
+/// own mpsc depth per consumer; the kernel's pty buffer is the pipe underneath,
+/// and a daemon queue much larger than the pipe below it only defers the same
+/// backpressure while a much smaller one throws away headroom the kernel would
+/// have given for free. The 32-chunk pty default produced a CI flake this
+/// session, which is precisely the situation where knowing the real depth beats
+/// guessing at it.
+///
+/// Both directions are measured because they are different buffers: master→slave
+/// is what a `pty` node writes *targetward* to its client, slave→master is what a
+/// client writes and the node reads *hostward*. Each runs on its own pair so
+/// neither fill perturbs the other.
+pub fn p10_pty_buffer_depth() -> Probe {
+    let p = Probe::new(
+        "P10",
+        "pty buffer depth",
+        "How many bytes does a pty accept in each direction before it would block, with nothing draining the other end?",
+    );
+    match (p10_fill_direction(true), p10_fill_direction(false)) {
+        (Ok(targetward), Ok(hostward)) => {
+            let p = p
+                .observe("master_to_slave_targetward", targetward.observations())
+                .observe("slave_to_master_hostward", hostward.observations());
+            p.verdict(
+                Status::Supported,
+                &format!(
+                    "This kernel's pty accepts {} byte(s) master→slave (targetward, what a pty node writes to its client) and {} byte(s) slave→master (hostward, what the node reads) before answering EAGAIN, reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands (7.0 measured 11776–13824 first-pass, 13824–15360 total), so across kernels a one-chunk difference is noise and only an order-of-magnitude one is signal. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}",
+                    targetward.bytes,
+                    hostward.bytes,
+                    targetward.total(),
+                    hostward.total(),
+                    if targetward.ceiling_hit || hostward.ceiling_hit {
+                        format!(" NOTE: a direction hit the {P10_CEILING}-byte ceiling instead of EAGAIN, so its depth is a lower bound, not the depth.")
+                    } else {
+                        String::new()
+                    }
+                ),
+            )
+        }
+        // Nothing is contradicted by an unmeasured buffer depth: the defaults are
+        // configuration, and every one of them works at any depth (backpressure is
+        // the mechanism either way, §5). So `skipped`, never `unsupported`.
+        (Err(e), _) | (_, Err(e)) => p.verdict(
+            Status::skipped(format!("probe error: {e}")),
+            "Pty buffer depth unmeasured on this box; the hostward_buffer defaults are unaffected (they bound the daemon's own queue, and backpressure holds at any kernel depth, §5).",
+        ),
+    }
+}
+
+/// Fill one direction of a fresh pty pair. `targetward` selects master→slave
+/// (what the node writes to its client); otherwise slave→master.
+fn p10_fill_direction(targetward: bool) -> anyhow::Result<FillResult> {
+    let master = new_master()?;
+    let pts = sys::ptsname(&master)?;
+    let master_fd = master.as_raw_fd();
+    sys::set_nonblocking(master_fd)?;
+    apply_pty_baseline(&master, &pts)?;
+
+    let slave = open(
+        pts.as_str(),
+        OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_NONBLOCK,
+        Mode::empty(),
+    )?;
+    let slave_fd = slave.as_raw_fd();
+    // Belt and braces: the open flag above already asks for it, and a blocking fd
+    // here is the one way this probe could hang.
+    sys::set_nonblocking(slave_fd)?;
+    std::thread::sleep(PTY_SETTLE);
+
+    let (write_to, peer) = if targetward {
+        (master_fd, slave_fd)
+    } else {
+        (slave_fd, master_fd)
+    };
+    Ok(p10_fill(write_to, peer))
+}
+
+fn p10_fill(write_to: RawFd, peer: RawFd) -> FillResult {
+    // Pass one: what a writer hits right now.
+    let (bytes, writes, terminal, hit_a) = p10_fill_pass(write_to, 0);
+    // Let the tty's asynchronous flip work run, then sample where the bytes went
+    // and take pass two: the steady-state depth. Two passes, both bounded by the
+    // same ceiling — this cannot loop and cannot block (the fd is non-blocking).
+    std::thread::sleep(P10_SETTLE);
+    let peer_pending_input = sys::pending_input_bytes(peer).ok().map(|n| n as u64);
+    let pending_output = sys::pending_output_bytes(write_to).ok().map(|n| n as u64);
+    let (settled_bytes, settled_writes, settled_terminal, hit_b) = p10_fill_pass(write_to, bytes);
+    FillResult {
+        bytes,
+        writes,
+        settled_bytes,
+        settled_writes,
+        ceiling_hit: hit_a || hit_b,
+        terminal,
+        settled_terminal,
+        peer_pending_input,
+        pending_output,
+    }
+}
+
+/// One bounded fill pass. `already` is what earlier passes wrote, so the 4 MiB
+/// ceiling bounds the *total* rather than each pass — the backstop has to hold
+/// across the whole probe or it is not a backstop.
+fn p10_fill_pass(write_to: RawFd, already: u64) -> (u64, u64, String, bool) {
+    let chunk = [b'A'; P10_CHUNK];
+    let mut bytes = 0u64;
+    let mut writes = 0u64;
+    let mut ceiling_hit = false;
+    let terminal = loop {
+        if already + bytes >= P10_CEILING {
+            ceiling_hit = true;
+            break "ceiling".to_owned();
+        }
+        match sys::write_fd(write_to, &chunk) {
+            // A short write is fine and expected at the boundary; a zero-length
+            // one would loop forever, so it ends the fill and is named.
+            Ok(0) => break "wrote_zero".to_owned(),
+            Ok(n) => {
+                bytes += n as u64;
+                writes += 1;
+            }
+            Err(e) => break read_class(&e),
+        }
+    };
+    (bytes, writes, terminal, ceiling_hit)
+}
+
+// ---------------------------------------------------------------------------
 // P4 — by-id resolution ground truth (§12)
 // ---------------------------------------------------------------------------
 
@@ -360,13 +1527,80 @@ fn p5_write_all(sp: &SerialPort, mut data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// One read (up to the port's short read timeout): the bytes available now, or
-/// empty on timeout.
-fn p5_read_once(sp: &SerialPort) -> Vec<u8> {
+/// Whether an errno means *the peer is gone*, as opposed to merely silent.
+///
+/// A pts whose master closed, and a USB adapter yanked mid-probe, both answer
+/// `EIO` to every read and write; `ENXIO`/`ENODEV` are the same fact from a driver
+/// that has already torn the device down. None of them is a timeout, and that
+/// distinction is the whole point: a silent port is *dangling*, a gone port is
+/// *hung up*, and the two carry opposite instructions for the operator.
+fn is_hangup(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EIO) | Some(libc::ENXIO) | Some(libc::ENODEV)
+    )
+}
+
+/// One read (up to the port's short read timeout): the bytes available now,
+/// `Ok(empty)` on a timeout/would-block, or the error for a real failure.
+///
+/// The error used to be swallowed here (`Err(_) => Vec::new()`), which is how a
+/// hung-up peer read as a quiet one all the way up to the classifier.
+fn p5_read_result(sp: &SerialPort) -> std::io::Result<Vec<u8>> {
     let mut buf = [0u8; 4096];
     match sp.read(&mut buf) {
-        Ok(n) => buf[..n].to_vec(),
-        Err(_) => Vec::new(),
+        Ok(n) => Ok(buf[..n].to_vec()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::TimedOut
+                || e.kind() == std::io::ErrorKind::WouldBlock =>
+        {
+            Ok(Vec::new())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// One read, with any failure flattened to "nothing readable" — for the
+/// characterization paths, which judge on the bytes they got.
+fn p5_read_once(sp: &SerialPort) -> Vec<u8> {
+    p5_read_result(sp).unwrap_or_default()
+}
+
+/// What a port did during P5 discovery, beyond the bytes it carried.
+///
+/// Discovery answers "who heard whom"; this answers the question that used to be
+/// invisible beside it — whether the port was *able* to speak at all. A port that
+/// heard nothing is only dangling if it was otherwise healthy.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PortHealth {
+    /// Nonce writes attempted, and how many died of a hangup errno.
+    writes: u32,
+    write_hangups: u32,
+    /// Reads that failed with a hangup errno.
+    read_hangups: u32,
+    /// Poll passes that reported anything, and how many of those were a bare
+    /// `POLLHUP`/`POLLERR`/`POLLNVAL` (level-triggered, so a hung-up port sets it
+    /// on every pass for the rest of the window).
+    poll_wakes: u32,
+    hup_wakes: u32,
+    /// Bytes actually read off the port.
+    bytes_read: u64,
+}
+
+impl PortHealth {
+    /// Whether the peer hung up rather than never existing.
+    ///
+    /// Three independent proofs, any one of which is enough — a hot-unplug that
+    /// lands between two poll passes shows up in the writes, one that lands
+    /// mid-read shows up in the read errno, and one that happened before P5 even
+    /// started shows up as a `POLLHUP` on every pass. All of them require the port
+    /// to have carried **no** bytes: a port that spoke and then vanished was
+    /// already classified by what it said.
+    fn hung_up(&self) -> bool {
+        self.bytes_read == 0
+            && ((self.writes > 0 && self.write_hangups == self.writes)
+                || self.read_hangups > 0
+                || (self.poll_wakes > 0 && self.hup_wakes == self.poll_wakes))
     }
 }
 
@@ -648,13 +1882,23 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
     // triggers — while a truly dangling port hears nothing across the whole window.
     // The doctor is a diagnostic, not a data path, so the seconds cost nothing.
     let mut bufs: Vec<Vec<u8>> = vec![Vec::new(); ports.len()];
+    // Beside the bytes, record whether each port was *able* to carry them: a write
+    // that dies EIO and a poll stuck at POLLHUP are the signature of a peer that
+    // hung up, and folding that into "heard nothing" told the operator to wire up a
+    // port that was wired (§15.21).
+    let mut health: Vec<PortHealth> = vec![PortHealth::default(); ports.len()];
     let deadline = Instant::now() + Duration::from_millis(4000);
     let mut next_send = Instant::now();
     while Instant::now() < deadline {
         if Instant::now() >= next_send {
             for (i, sp) in sps.iter().enumerate() {
                 if let Some(sp) = sp {
-                    let _ = p5_write_all(sp, &p5_nonce(i));
+                    health[i].writes += 1;
+                    if let Err(e) = p5_write_all(sp, &p5_nonce(i))
+                        && is_hangup(&e)
+                    {
+                        health[i].write_hangups += 1;
+                    }
                 }
             }
             next_send = Instant::now() + Duration::from_millis(500);
@@ -674,12 +1918,26 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
             .collect();
         let _ = poll(&mut pfds, PollTimeout::from(200u16));
         for (idx, (i, sp)) in live.iter().enumerate() {
-            let ready = pfds[idx]
-                .revents()
-                .map(|r| r.intersects(PollFlags::POLLIN | PollFlags::POLLHUP))
-                .unwrap_or(false);
-            if ready {
-                bufs[*i].extend_from_slice(&p5_read_once(sp));
+            let revents = pfds[idx].revents().unwrap_or(PollFlags::empty());
+            // A hangup is still read (buffered bytes survive the peer's close), but
+            // it is also *counted*: on a hung-up port POLLHUP is level-triggered, so
+            // it repeats on every pass for the rest of the window.
+            let gone = PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL;
+            if !revents.is_empty() {
+                health[*i].poll_wakes += 1;
+                if revents.intersects(gone) {
+                    health[*i].hup_wakes += 1;
+                }
+            }
+            if revents.intersects(PollFlags::POLLIN | gone) {
+                match p5_read_result(sp) {
+                    Ok(got) => {
+                        health[*i].bytes_read += got.len() as u64;
+                        bufs[*i].extend_from_slice(&got);
+                    }
+                    Err(e) if is_hangup(&e) => health[*i].read_hangups += 1,
+                    Err(_) => {}
+                }
             }
         }
         // Yield the CPU each pass. A port stuck poll-ready (e.g. a `POLLHUP` on a
@@ -695,6 +1953,7 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
     // so an iterator loop does not fit.
     let mut clean = true;
     let mut pairs: Vec<(usize, usize)> = Vec::new();
+    let mut hung_up: Vec<String> = Vec::new();
     #[allow(clippy::needless_range_loop)]
     for i in 0..ports.len() {
         if sps[i].is_none() {
@@ -727,6 +1986,14 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
                     "HALF-CROSSED with {} (asymmetric — check TX/RX wiring)",
                     p5_name(&ports[j], resolver)
                 )
+            } else if health[i].hung_up() {
+                // Not "nothing wired to it": something *was* wired to it and went
+                // away while P5 was talking to it (a pts whose master closed, an
+                // adapter unplugged mid-probe). Saying `dangling` here hands the
+                // operator the wrong instruction — wire up a port that is wired —
+                // and P5 cannot classify a port whose peer is gone, so it says so.
+                hung_up.push(name.clone());
+                "hung up (peer closed) — not classifiable".to_string()
             } else {
                 "dangling (nothing wired to it)".to_string()
             }
@@ -776,7 +2043,7 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
         }
     }
 
-    let (status, consequence) = p5_verdict(clean, any_uart, &failures);
+    let (status, consequence) = p5_verdict(clean, any_uart, &failures, &hung_up);
     p.verdict(status, &consequence)
 }
 
@@ -792,7 +2059,12 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
 /// else is `Supported`, with the two pre-existing consequence lines preserved
 /// verbatim so the certified and the skipped-on-a-sim paths read as they always
 /// have.
-fn p5_verdict(clean: bool, any_uart: bool, failures: &[CertFailure]) -> (Status, String) {
+fn p5_verdict(
+    clean: bool,
+    any_uart: bool,
+    failures: &[CertFailure],
+    hung_up: &[String],
+) -> (Status, String) {
     let named = |integrity: bool| -> Vec<&str> {
         failures
             .iter()
@@ -822,6 +2094,28 @@ fn p5_verdict(clean: bool, any_uart: bool, failures: &[CertFailure]) -> (Status,
             Status::Degraded,
             format!(
                 "A rig is miswired (asymmetric/half-crossed) — named above; fix it before a tiered run so a tier failure is attributable to serial_nexus, not a loose wire (§15.21).{also}"
+            ),
+        );
+    }
+    if !hung_up.is_empty() {
+        // A port whose peer went away mid-probe is a rig fault, not a clean rig: P5
+        // could not classify it at all, so a tiered run started from this
+        // certificate would be leaning on a port nobody has established the wiring
+        // of. Folding it in here is the same rule §15.21 applies to miswiring and to
+        // an uncharacterized item — an observation the operator must act on cannot
+        // leave the verdict `supported` (DOC-1b). It stays `degraded`, never
+        // `unsupported`: the rig may well be fine once the peer is back, and
+        // `unsupported` is reserved for a rig that demonstrably ate bytes.
+        let also = if uncertified.is_empty() {
+            String::new()
+        } else {
+            format!(" Also uncertified: {}.", uncertified.join(", "))
+        };
+        return (
+            Status::Degraded,
+            format!(
+                "A port's peer hung up while P5 was probing it ({}) — it could not be classified, so the rig is not certified. Re-seat or re-open the peer and re-run P5 before any tier (§15.21).{also}",
+                hung_up.join(", ")
             ),
         );
     }
@@ -949,6 +2243,194 @@ fn is_permission_denied(e: &anyhow::Error) -> bool {
     e.downcast_ref::<std::io::Error>()
         .map(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
         .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// P11 — real-port line-state counters (§5, §7.1). OPT-IN behind --port, exactly
+// like P3 and P5: it opens a real device, and opening a port toggles DTR on
+// equipment that may be live. The default (passive) run reports `skipped`.
+// ---------------------------------------------------------------------------
+
+/// The modem lines `TIOCMGET` reports, named. DTR/RTS are outputs the daemon
+/// drives; CTS/DSR/DCD/RI are inputs §7.1 surfaces as presence and flow signals.
+const MODEM_LINES: [(libc::c_int, &str); 6] = [
+    (libc::TIOCM_DTR, "DTR"),
+    (libc::TIOCM_RTS, "RTS"),
+    (libc::TIOCM_CTS, "CTS"),
+    (libc::TIOCM_DSR, "DSR"),
+    (libc::TIOCM_CAR, "DCD"),
+    (libc::TIOCM_RNG, "RI"),
+];
+
+/// One port's line state: each ioctl's availability and, when it answers, its
+/// values. `Err` carries the errno text — "this driver does not implement it" is
+/// itself an observation worth diffing, not an absence.
+struct LineState {
+    icounts: Result<sys::SerialIcounts, String>,
+    modem: Result<libc::c_int, String>,
+}
+
+impl LineState {
+    fn observations(&self) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "tiocgicount_available": self.icounts.is_ok(),
+            "tiocmget_available": self.modem.is_ok(),
+        });
+        let map = v.as_object_mut().expect("object literal");
+        match &self.icounts {
+            Ok(c) => {
+                map.insert(
+                    "counters".to_owned(),
+                    serde_json::json!({
+                        "rx": c.rx, "tx": c.tx,
+                        "frame": c.frame, "overrun": c.overrun, "parity": c.parity,
+                        "brk": c.brk, "buf_overrun": c.buf_overrun,
+                        "cts": c.cts, "dsr": c.dsr, "rng": c.rng, "dcd": c.dcd,
+                    }),
+                );
+            }
+            Err(e) => {
+                map.insert("tiocgicount_error".to_owned(), e.as_str().into());
+            }
+        }
+        match &self.modem {
+            Ok(bits) => {
+                map.insert("modem_bits_hex".to_owned(), format!("0x{bits:04x}").into());
+                map.insert(
+                    "modem_lines_asserted".to_owned(),
+                    MODEM_LINES
+                        .iter()
+                        .filter(|(bit, _)| bits & bit != 0)
+                        .map(|(_, name)| serde_json::Value::from(*name))
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            Err(e) => {
+                map.insert("tiocmget_error".to_owned(), e.as_str().into());
+            }
+        }
+        v
+    }
+
+    /// The ioctls that did not answer, named for the verdict.
+    fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.icounts.is_err() {
+            out.push("TIOCGICOUNT");
+        }
+        if self.modem.is_err() {
+            out.push("TIOCMGET");
+        }
+        out
+    }
+}
+
+/// Do this box's real ports answer the two line-state ioctls the serial node's
+/// accounting is built on?
+///
+/// `TIOCGICOUNT` (`nexus_sys::read_icounts`) carries the driver's framing,
+/// parity, overrun and break counts — loss that is otherwise **invisible**,
+/// which is why §5/§7.1 surface them in `state` where supported — and
+/// `TIOCMGET` (`nexus_sys::read_modem_bits`) carries the modem lines §7.1's
+/// presence handling reads. Both are legitimately absent on some drivers (a pts
+/// answers neither `TIOCGICOUNT`; macOS has no `TIOCGICOUNT` at all), and the
+/// node already treats `Err` as "omit the counters" rather than as a fault — so
+/// an absent ioctl is `degraded` with the port and ioctl named, **never**
+/// `unsupported`.
+///
+/// Opt-in behind `--port` like P3/P5, and gentler than either: it opens the port
+/// with its **current settings unchanged** (no baud change, no raw mode) and
+/// transmits nothing. The open itself still toggles DTR, which is the whole
+/// reason the doctor never opens a port it was not handed.
+pub fn p11_line_state(ports: &[PathBuf]) -> Probe {
+    let mut p = Probe::new(
+        "P11",
+        "real-port line-state counters",
+        "Do TIOCGICOUNT (driver error/edge counters) and TIOCMGET (modem lines) answer on a real port, and what do they currently read (§5, §7.1)?",
+    );
+
+    let mut opened = 0usize;
+    let mut perm_denied = false;
+    let mut missing: Vec<String> = Vec::new();
+    for port in ports {
+        // Settings returned unchanged: serial2 hands the closure the port's
+        // current configuration, so this is the least invasive open the crate
+        // allows — P11 inspects, it does not configure.
+        match SerialPort::open(port, |s: Settings| Ok(s)) {
+            Ok(sp) => {
+                opened += 1;
+                let state = LineState {
+                    icounts: sys::read_icounts(sp.as_raw_fd()).map_err(|e| e.to_string()),
+                    modem: sys::read_modem_bits(sp.as_raw_fd()).map_err(|e| e.to_string()),
+                };
+                for ioctl in state.missing() {
+                    missing.push(format!("{}: {ioctl}", port.display()));
+                }
+                p = p.observe(&port.display().to_string(), state.observations());
+            }
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    perm_denied = true;
+                }
+                p = p.observe(&port.display().to_string(), format!("open error: {e}"));
+            }
+        }
+    }
+
+    let (status, consequence) = p11_verdict(ports.len(), opened, perm_denied, &missing);
+    p.verdict(status, &consequence)
+}
+
+/// Fold P11's per-port results into one verdict (the `p5_verdict` lesson: keep
+/// the judgement pure so it is testable without a bench, since the rest of the
+/// probe needs hardware).
+///
+/// `unsupported` is unreachable by construction and that is deliberate — an
+/// absent `TIOCGICOUNT` contradicts nothing: it is Linux-only, absent on several
+/// drivers, and the serial node omits the counters instead of faulting (§5). It
+/// is also a live gate (`expectations/linux.jq` requires
+/// `.summary.unsupported == 0`), so a probe that reddened on a healthy box with a
+/// plain adapter would be a bug, not a finding.
+fn p11_verdict(
+    named: usize,
+    opened: usize,
+    perm_denied: bool,
+    missing: &[String],
+) -> (Status, String) {
+    if named == 0 {
+        return (
+            Status::skipped("no --port named"),
+            "Re-run with --port /dev/ttyUSB0 to read the driver counters and modem lines a serial node's accounting depends on (a dangling converter is enough — no target device, §13).".to_owned(),
+        );
+    }
+    if opened == 0 {
+        let reason = if perm_denied {
+            "permission denied"
+        } else {
+            "no port opened"
+        };
+        return (
+            Status::skipped(reason),
+            "Grant access (udev GROUP=plugdev, or the dialout group) and re-run with --port."
+                .to_owned(),
+        );
+    }
+    if !missing.is_empty() {
+        return (
+            Status::Degraded,
+            format!(
+                "A named port does not implement every line-state ioctl ({}). The serial node omits what it cannot read rather than faulting (§5), so the port still works — what is lost is the error/overrun accounting that makes silent loss visible, and §7.1's modem-line presence where TIOCMGET is the missing one. Expected on a pts and on macOS (no TIOCGICOUNT); on a real Linux UART it is worth investigating.",
+                missing.join(", ")
+            ),
+        );
+    }
+    (
+        Status::Supported,
+        format!(
+            "Both line-state ioctls answer on {opened} of {named} named port(s): the driver counters (§5, §7.1) and the modem lines are readable, so serial state carries real error/overrun accounting rather than omitting it. Read the counts as a snapshot of a cumulative total, not as a measurement of this run — they count since the driver bound the device, and P3/P5 transmit on these same ports earlier in the same invocation (a nonzero `frame` here is usually P5's deliberate baud-mismatch item, not a fault). Across kernels, diff the ioctl *availability* and the field set; the absolute counts differ by construction."
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,11 +2575,11 @@ mod tests {
     /// `supported`, with their consequence lines unchanged.
     #[test]
     fn a_clean_rig_is_supported_certified_or_skipped() {
-        let (status, why) = p5_verdict(true, true, &[]);
+        let (status, why) = p5_verdict(true, true, &[], &[]);
         assert_eq!(status.label(), "supported");
         assert!(why.contains("certified"), "{why}");
 
-        let (status, why) = p5_verdict(true, false, &[]);
+        let (status, why) = p5_verdict(true, false, &[], &[]);
         assert_eq!(status.label(), "supported");
         assert!(why.contains("skipped on non-UART sims"), "{why}");
     }
@@ -1107,7 +2589,8 @@ mod tests {
     /// not report `supported` with exit code 0 (review 26, DOC-1b).
     #[test]
     fn a_data_integrity_failure_is_unsupported_and_names_the_item() {
-        let (status, why) = p5_verdict(true, true, &[fail("usb-A ↔ usb-B: rate_ladder", true)]);
+        let (status, why) =
+            p5_verdict(true, true, &[fail("usb-A ↔ usb-B: rate_ladder", true)], &[]);
         assert!(status.is_unsupported(), "verdict was {}", status.label());
         assert!(
             why.contains("usb-A ↔ usb-B: rate_ladder"),
@@ -1119,7 +2602,7 @@ mod tests {
     /// that item would be running uncertified.
     #[test]
     fn an_uncharacterized_item_degrades_and_names_the_item() {
-        let (status, why) = p5_verdict(true, true, &[fail("usb-A: break", false)]);
+        let (status, why) = p5_verdict(true, true, &[fail("usb-A: break", false)], &[]);
         assert_eq!(status.label(), "degraded");
         assert!(why.contains("usb-A: break"), "item not named: {why}");
     }
@@ -1128,10 +2611,24 @@ mod tests {
     /// certificate item that also failed — both facts reach the operator.
     #[test]
     fn miswiring_degrades_and_still_reports_uncertified_items() {
-        let (status, why) = p5_verdict(false, true, &[fail("usb-A: custom_baud", false)]);
+        let (status, why) = p5_verdict(false, true, &[fail("usb-A: custom_baud", false)], &[]);
         assert_eq!(status.label(), "degraded");
         assert!(why.contains("miswired"), "{why}");
         assert!(why.contains("usb-A: custom_baud"), "{why}");
+    }
+
+    /// A port whose peer hung up mid-probe degrades the verdict and names the port.
+    /// It is `degraded`, never `unsupported`: P5 could not classify the port, which
+    /// is a rig fault the operator must clear before a tier, but it is not the
+    /// demonstrated byte loss that `unsupported` is reserved for. Without this fold
+    /// the observation printed "hung up (peer closed) — not classifiable" beside a
+    /// `supported` verdict, which is the DOC-1b shape: an observation nobody acts on.
+    #[test]
+    fn a_hung_up_peer_degrades_and_names_the_port() {
+        let (status, why) = p5_verdict(true, false, &[], &["usb-A".to_string()]);
+        assert_eq!(status.label(), "degraded");
+        assert!(why.contains("usb-A"), "port not named: {why}");
+        assert!(why.contains("hung up"), "{why}");
     }
 
     /// Integrity outranks miswiring: a half-crossed rig that also corrupts data is
@@ -1142,6 +2639,7 @@ mod tests {
             false,
             true,
             &[fail("a: break", false), fail("a ↔ b: rate_ladder", true)],
+            &[],
         );
         assert!(status.is_unsupported());
     }
@@ -1154,14 +2652,14 @@ mod tests {
         assert_eq!(skipped.line, "skipped (not a UART)");
         assert!(skipped.failures.is_empty());
         assert_eq!(
-            p5_verdict(true, false, &skipped.failures).0.label(),
+            p5_verdict(true, false, &skipped.failures, &[]).0.label(),
             "supported"
         );
 
         let missing = Certificate::unavailable("pair reopen failed", "pair_reopen");
         assert_eq!(missing.failures, vec![fail("pair_reopen", false)]);
         assert_eq!(
-            p5_verdict(true, true, &missing.failures).0.label(),
+            p5_verdict(true, true, &missing.failures, &[]).0.label(),
             "degraded"
         );
     }
@@ -1173,6 +2671,213 @@ mod tests {
             fail("rate_ladder", true).qualified("usb-A ↔ usb-B"),
             fail("usb-A ↔ usb-B: rate_ladder", true)
         );
+    }
+
+    /// P6..P11 may never report `unsupported`, on any box.
+    ///
+    /// Each measures *which* of several legitimate kernel behaviours applies, and
+    /// the shipped daemon is correct under all of them — so none can contradict a
+    /// design premise, which is what `unsupported` means. It is also a live gate:
+    /// `expectations/linux.jq` requires `.summary.unsupported == 0` and
+    /// `nexus-itest/tests/meta_gates.rs` asserts the doctor reports no unsupported
+    /// capability, so a probe that reddened on a healthy box would fail CI. This
+    /// runs the real probes (about a second of ptys and polls) rather than reasoning
+    /// about the code, because the arm that would break the rule is one someone adds
+    /// later. P11 is included with **no** ports, which is its default shape: a
+    /// passive run must stay `skipped` and must never open anything.
+    #[test]
+    fn the_kernel_diff_probes_never_report_unsupported() {
+        for p in [
+            p6_last_close_readiness(),
+            p7_collapsed_session(),
+            p8_epoll_readiness(),
+            p9_poll_granularity(),
+            p10_pty_buffer_depth(),
+            p11_line_state(&[]),
+        ] {
+            assert!(
+                !p.status.is_unsupported(),
+                "{} reported unsupported, which reddens expectations/linux.jq and \
+                 meta_gates: {}",
+                p.id,
+                p.consequence
+            );
+            // A probe that RAN must carry numbers: the report is the diff artifact,
+            // so a verdict word alone is not enough (§13). A `skipped` one is exempt
+            // — it measured nothing by definition, and its reason says why (P11 with
+            // no --port, or P8 off Linux).
+            let skipped = p.status.label() == "skipped";
+            assert!(
+                skipped || !p.observations.is_empty(),
+                "{} emitted no measurements — the report is the diff artifact, so a \
+                 verdict word alone is not enough (§13)",
+                p.id
+            );
+        }
+    }
+
+    /// A passive run (no `--port`) must not open anything: P11 skips, names the
+    /// reason, and observes nothing. This is the doctor's standing rule — a listed
+    /// port may be wired to live equipment and opening it toggles DTR — and P11 is
+    /// the newest probe that could break it.
+    #[test]
+    fn p11_is_opt_in_and_reports_nothing_without_a_port() {
+        let p = p11_line_state(&[]);
+        assert_eq!(p.status.label(), "skipped");
+        assert!(p.observations.is_empty(), "a passive run opened a port");
+        let (status, why) = p11_verdict(0, 0, false, &[]);
+        assert_eq!(status.label(), "skipped");
+        assert!(why.contains("--port"), "{why}");
+    }
+
+    /// P11's fold: an unanswered ioctl degrades and **names the port and the
+    /// ioctl**, and every ioctl answering is `supported`. Neither is
+    /// `unsupported` — an absent `TIOCGICOUNT` is Linux-only-and-driver-specific,
+    /// and the serial node omits the counters rather than faulting (§5), so
+    /// reddening `.summary.unsupported` over it would be a false alarm on a pts
+    /// and on every macOS box.
+    #[test]
+    fn p11_degrades_on_a_missing_ioctl_and_never_reports_unsupported() {
+        let (status, why) = p11_verdict(1, 1, false, &["/dev/pts/9: TIOCGICOUNT".to_owned()]);
+        assert_eq!(status.label(), "degraded");
+        assert!(why.contains("/dev/pts/9: TIOCGICOUNT"), "{why}");
+
+        let (status, why) = p11_verdict(2, 2, false, &[]);
+        assert_eq!(status.label(), "supported");
+        assert!(why.contains("2 of 2"), "{why}");
+
+        for (named, opened, denied, missing) in [
+            (0usize, 0usize, false, vec![]),
+            (1, 0, true, vec![]),
+            (1, 1, false, vec!["p: TIOCMGET".to_owned()]),
+            (1, 1, false, vec![]),
+        ] {
+            assert!(
+                !p11_verdict(named, opened, denied, &missing)
+                    .0
+                    .is_unsupported()
+            );
+        }
+    }
+
+    /// The epoll label is the raw observation P8's cross-kernel diff is read off,
+    /// so — exactly like [`revents_label`] — it must name the known bits and must
+    /// **not** drop one it has never seen. `flag_names` deliberately lists only
+    /// the six it knows; the residual is this function's job.
+    #[test]
+    fn epoll_labels_name_known_flags_and_surface_unknown_bits() {
+        let ready = |events: u32| sys::EpollReady { fd: 7, events };
+        assert_eq!(epoll_label(&ready(0)), "none");
+        assert_eq!(epoll_label(&ready(sys::EPOLLIN)), "EPOLLIN");
+        assert_eq!(
+            epoll_label(&ready(sys::EPOLLIN | sys::EPOLLHUP)),
+            "EPOLLIN|EPOLLHUP"
+        );
+        // A bit outside the six named constants still appears, in hex.
+        let label = epoll_label(&ready(sys::EPOLLIN | 0x4000_0000));
+        assert!(
+            label.starts_with("EPOLLIN|0x"),
+            "unknown epoll bit dropped: {label}"
+        );
+    }
+
+    /// P8's spin ratio is a reported number, so it must be stable across two runs
+    /// of the same kernel (three decimals) and must not divide by zero when a
+    /// phase made no passes at all.
+    #[test]
+    fn the_spin_ratio_is_stable_and_safe_at_zero() {
+        assert_eq!(ratio3(0, 0), 0.0);
+        assert_eq!(ratio3(0, 64), 0.0);
+        assert_eq!(ratio3(64, 64), 1.0);
+        assert_eq!(ratio3(1, 3), 0.333);
+        assert_eq!(ratio3(2, 3), 0.667);
+    }
+
+    /// P10 must terminate on a bounded fill even if the fd never says `EAGAIN`.
+    /// The ceiling is the backstop that makes "it can never hang" a property of
+    /// the code rather than a hope about the kernel — proved here against a
+    /// bottomless sink (`/dev/null`), which accepts every byte forever.
+    #[test]
+    fn the_buffer_fill_stops_at_the_ceiling_on_a_bottomless_sink() {
+        let sink = open(
+            "/dev/null",
+            OFlag::O_WRONLY | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        )
+        .expect("open /dev/null");
+        let r = p10_fill(sink.as_raw_fd(), sink.as_raw_fd());
+        assert!(r.ceiling_hit, "fill did not stop: {}", r.terminal);
+        assert_eq!(r.terminal, "ceiling");
+        assert!(r.bytes >= P10_CEILING);
+        // The ceiling bounds the TOTAL, not each pass: the second pass must find
+        // the budget already spent and stop immediately, or a two-pass fill would
+        // write twice what the backstop promises.
+        assert_eq!(r.settled_bytes, 0, "the ceiling did not bound pass two");
+        assert_eq!(r.settled_terminal, "ceiling");
+        assert_eq!(r.total(), r.bytes);
+    }
+
+    /// The `revents` label is the raw poll observation a cross-kernel diff reads.
+    /// It must name every known flag and must **not** silently drop a bit this
+    /// table has never seen — an unfamiliar bit on the production kernel is
+    /// precisely the surprise the report exists to surface.
+    #[test]
+    fn revents_labels_name_known_flags_and_surface_unknown_bits() {
+        assert_eq!(revents_label(PollFlags::empty()), "none");
+        assert_eq!(
+            revents_label(PollFlags::POLLIN | PollFlags::POLLHUP),
+            "POLLIN|POLLHUP"
+        );
+        // A bit outside the table (POLLRDBAND here) still appears, in hex.
+        let exotic = PollFlags::from_bits_retain(PollFlags::POLLIN.bits() | 0x0080);
+        let label = revents_label(exotic);
+        assert!(
+            label.starts_with("POLLIN|0x"),
+            "unknown bit dropped: {label}"
+        );
+    }
+
+    /// Read outcomes are classified by errno, because "poll said readable and read
+    /// said EIO" is a different fact from "poll said readable and read said
+    /// EAGAIN" — the first is a hangup, the second a spurious wake.
+    #[test]
+    fn read_outcomes_are_classified_by_errno() {
+        assert_eq!(
+            read_class(&std::io::Error::from_raw_os_error(libc::EIO)),
+            "EIO"
+        );
+        assert_eq!(
+            read_class(&std::io::Error::from_raw_os_error(libc::EAGAIN)),
+            "EAGAIN"
+        );
+        assert_eq!(
+            read_class(&std::io::Error::from_raw_os_error(libc::ENOTTY)),
+            format!("errno:{}", libc::ENOTTY)
+        );
+    }
+
+    /// P7's packet classification decodes the same hex strings P7 emits. The
+    /// round-trip is the point: `ioctl_bit` parses text this file formatted, so a
+    /// mismatch between the two would report `ioctl_bit_set=false` on a kernel that
+    /// plainly sets it — a silent wrong answer in the artifact the 6.18 decision
+    /// is made from.
+    #[test]
+    fn packet_classification_decodes_the_hex_the_probe_emits() {
+        let shape = |bytes: &[u8]| ShapeResult {
+            bytes: bytes.len() as u64,
+            reads: bytes.len() as u64,
+            leading_hex: bytes.iter().map(|b| format!("0x{b:02x}")).collect(),
+            terminal: "EIO".to_owned(),
+        };
+        // 0x40 = TIOCPKT_IOCTL (a bare tcsetattr); 0x41 adds TIOCPKT_FLUSHREAD,
+        // which is what `stty`'s flushing TCSETSW2/TCSETSF2 leaves.
+        let termios = shape(&[sys::TIOCPKT_IOCTL]);
+        assert!(termios.ioctl_bit() && !termios.data_packet());
+        assert!(shape(&[0x41]).ioctl_bit());
+        let data = shape(&[sys::TIOCPKT_DATA]);
+        assert!(data.data_packet() && !data.ioctl_bit());
+        let nothing = shape(&[]);
+        assert!(!nothing.ioctl_bit() && !nothing.data_packet());
     }
 
     /// `fail_if` only records failures — a passing item leaves the certificate

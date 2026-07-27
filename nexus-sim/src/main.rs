@@ -506,13 +506,17 @@ fn baud_rate(rate: u32) -> Option<BaudRate> {
     })
 }
 
-/// Poll a fd for readability (or hangup) up to `ms`. Returns the revents.
+/// Poll a fd for readability up to `ms`. Returns the revents.
+///
+/// Only `POLLIN` is *requested*: `POLLHUP`/`POLLERR`/`POLLNVAL` are reported in
+/// `revents` whether or not they are asked for (POSIX), so asking for `POLLHUP`
+/// buys nothing and reads as if the caller could mask it. Callers that see a bare
+/// `POLLHUP` must decide for themselves whether it ends them — and if it does not,
+/// they must pause ([`NO_SLAVE_PAUSE`]), because on a pty master `POLLHUP` is
+/// *level*-triggered and set for as long as no slave is open.
 fn wait_readable<F: AsFd>(fd: &F, ms: u16) -> anyhow::Result<PollFlags> {
     let borrowed = fd.as_fd();
-    let mut fds = [PollFd::new(
-        borrowed,
-        PollFlags::POLLIN | PollFlags::POLLHUP,
-    )];
+    let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
     let n = poll(&mut fds, PollTimeout::from(ms))?;
     if n == 0 {
         Ok(PollFlags::empty())
@@ -520,6 +524,16 @@ fn wait_readable<F: AsFd>(fd: &F, ms: u16) -> anyhow::Result<PollFlags> {
         Ok(fds[0].revents().unwrap_or_else(PollFlags::empty))
     }
 }
+
+/// How long a "device" loop waits after a `poll` wake that no read consumed.
+///
+/// On a pty master `POLLHUP` is level-triggered and set the whole time no slave is
+/// open, so such a wake repeats immediately and cannot be masked away by requesting
+/// `POLLIN` alone. A loop that tolerates the hangup (as a stateless wire must) and
+/// does *not* pause therefore free-runs on a whole core until its idle timeout —
+/// measured at 74.4% of a CPU three seconds after one open+close of each slave, and
+/// that scheduling pressure is what tips the close/reopen races elsewhere in the rig.
+const NO_SLAVE_PAUSE: Duration = Duration::from_millis(5);
 
 fn is_eio(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(nix::libc::EIO)
@@ -635,7 +649,7 @@ fn run_nullmodem_inner(a: &NullModemArgs) -> anyhow::Result<Value> {
             PollFd::new(mb.as_fd(), PollFlags::POLLIN),
         ];
         // A short poll timeout bounds how quickly the idle-exit check fires.
-        let _ = poll(&mut fds, PollTimeout::from(100u16));
+        let events = poll(&mut fds, PollTimeout::from(100u16)).unwrap_or(0);
         let a_ready = fds[0]
             .revents()
             .map(|r| r.contains(PollFlags::POLLIN))
@@ -645,6 +659,7 @@ fn run_nullmodem_inner(a: &NullModemArgs) -> anyhow::Result<Value> {
             .map(|r| r.contains(PollFlags::POLLIN))
             .unwrap_or(false);
 
+        let mut forwarded = false;
         if a_ready {
             match ma.read(&mut buf) {
                 Ok(0) => {}
@@ -654,6 +669,7 @@ fn run_nullmodem_inner(a: &NullModemArgs) -> anyhow::Result<Value> {
                     let _ = mb.flush();
                     a_to_b += n as u64;
                     last_activity = Instant::now();
+                    forwarded = true;
                 }
                 Err(e) if is_eio(&e) => {} // slave (client) closed; tolerate
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -668,11 +684,22 @@ fn run_nullmodem_inner(a: &NullModemArgs) -> anyhow::Result<Value> {
                     let _ = ma.flush();
                     b_to_a += n as u64;
                     last_activity = Instant::now();
+                    forwarded = true;
                 }
                 Err(e) if is_eio(&e) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e.into()),
             }
+        }
+        // `poll` woke on something no branch above consumed — on a pty master that
+        // is the level-triggered POLLHUP raised for as long as no slave is open, and
+        // it is *not* suppressed by requesting POLLIN only. Tolerating it (which the
+        // bridge must, so a probe that opens and closes leaves it usable) without
+        // pausing means the loop free-runs on a full core until `timeout_ms`; the
+        // pause costs nothing while bytes are actually flowing, because a forwarded
+        // chunk skips it.
+        if events > 0 && !forwarded {
+            thread::sleep(NO_SLAVE_PAUSE);
         }
     }
 
@@ -685,27 +712,51 @@ fn run_nullmodem_inner(a: &NullModemArgs) -> anyhow::Result<Value> {
     }))
 }
 
+/// Reflect every byte written to the pts back to it: this double stands in for a
+/// TX↔RX jumper, and **a jumper is stateless**.
+///
+/// So a slave close is not the end of it. On a pty master `POLLHUP` is *level*-
+/// triggered and set whenever no slave is open — it means "nothing is plugged in
+/// right now", not "unplugged forever" — and `read` in that state gives `EIO` (or
+/// `Ok(0)`) for the same reason. Treating any of the three as terminal exited the
+/// echo loop for good on a mere close, and the next opener found a dead peer: that
+/// is exactly `nexus-doctor`'s P5 reporting `dangling (nothing wired to it)` after
+/// P3 (which opens and closes every port) had just run, a race the doctor won only
+/// most of the time (measured survival: 0% at a ≤16 µs close→reopen gap, 92% at
+/// 30 µs). Tolerate all three, pause so the level-triggered wake cannot free-run
+/// ([`NO_SLAVE_PAUSE`]), and let only `timeout_ms` of real idleness end the run.
 fn pty_echo(master: &mut PtyMaster, timeout_ms: u64) -> anyhow::Result<Value> {
     let mut echoed: u64 = 0;
     let mut buf = [0u8; 8192];
-    loop {
-        let re = wait_readable(master, timeout_ms.min(u16::MAX as u64) as u16)?;
-        if re.is_empty() {
-            break; // idle past the timeout — client done or never arrived
-        }
+    let idle_limit = Duration::from_millis(timeout_ms);
+    let mut last_activity = Instant::now();
+    // The exit is unchanged in meaning — idle past the timeout, client done or never
+    // arrived — but it is now measured from the last byte echoed rather than from a
+    // poll that returned nothing, because a bare POLLHUP makes poll return
+    // immediately and forever.
+    while let Some(remaining) = idle_limit.checked_sub(last_activity.elapsed()) {
+        let re = wait_readable(master, remaining.as_millis().min(u16::MAX as u128) as u16)?;
         if re.contains(PollFlags::POLLIN) {
             match master.read(&mut buf) {
-                Ok(0) => break,
+                // No slave open at the moment: wait for the next one.
+                Ok(0) => thread::sleep(NO_SLAVE_PAUSE),
                 Ok(n) => {
-                    master.write_all(&buf[..n])?;
+                    // A write with no slave open is an expected EIO, not a failure:
+                    // the far end went away mid-echo, which a jumper cannot notice.
+                    let _ = master.write_all(&buf[..n]);
+                    let _ = master.flush();
                     echoed += n as u64;
+                    last_activity = Instant::now();
                 }
-                Err(e) if is_eio(&e) => break, // slave (client) closed
+                Err(e) if is_eio(&e) || e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(NO_SLAVE_PAUSE)
+                }
                 Err(e) => return Err(e.into()),
             }
         } else if re.contains(PollFlags::POLLHUP) {
-            break;
+            thread::sleep(NO_SLAVE_PAUSE);
         }
+        // Otherwise `poll` timed out with nothing set; the loop head ends the run.
     }
     Ok(
         json!({"tool": "nexus-sim", "mode": "pty", "behavior": "echo", "bytes_echoed": echoed, "pass": true}),
@@ -759,10 +810,11 @@ fn pty_source(
 }
 
 fn pty_sink(master: &mut PtyMaster, n: usize, timeout_ms: u64) -> anyhow::Result<Value> {
-    let got = read_until(master, n, timeout_ms)?;
+    let (got, timed_out) = read_until(master, n, timeout_ms)?;
     Ok(json!({
         "tool": "nexus-sim", "mode": "pty", "behavior": "sink",
-        "received": got.len(), "sha256": sha256_hex(&got), "pass": got.len() == n
+        "received": got.len(), "sha256": sha256_hex(&got),
+        "timed_out": timed_out, "pass": got.len() == n
     }))
 }
 
@@ -887,7 +939,7 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
         w.flush()?;
     }
 
-    let received = read_handle
+    let (received, timed_out) = read_handle
         .join()
         .map_err(|_| anyhow::anyhow!("reader thread panicked"))??;
 
@@ -904,26 +956,40 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
         true
     };
 
+    // `timed_out` distinguishes the two ways a short `received` happens: the read
+    // deadline expired (the echo may still have been in flight) versus the peer
+    // genuinely losing bytes. Without it both render as `pass:false` with a short
+    // count, and a reader of the verdict cannot tell a slow rig from a broken one.
     Ok(json!({
         "tool": "nexus-sim", "mode": "client",
         "sent": n, "received": received.len(),
         "sha256_sent": sent_hash, "sha256_received": recv_hash,
-        "expect": a.expect, "pass": pass
+        "expect": a.expect, "timed_out": timed_out, "pass": pass
     }))
 }
 
 /// Read from a fd until `n` bytes are collected or the timeout elapses. `n == 0`
 /// returns immediately with nothing (used when no echo is expected).
-fn read_until<F: AsFd + Read>(mut fd: F, n: usize, timeout_ms: u64) -> anyhow::Result<Vec<u8>> {
+///
+/// Returns `(bytes, timed_out)`. The flag exists because a short buffer alone
+/// cannot say *why* it is short: a deadline that expired mid-stream and a peer that
+/// really dropped bytes produce the identical value, and the caller's verdict then
+/// reports a byte loss that may never have happened (that ambiguity cost a full
+/// investigation). Whoever renders a verdict must surface the flag.
+fn read_until<F: AsFd + Read>(
+    mut fd: F,
+    n: usize,
+    timeout_ms: u64,
+) -> anyhow::Result<(Vec<u8>, bool)> {
     let mut out = Vec::with_capacity(n);
     if n == 0 {
-        return Ok(out);
+        return Ok((out, false));
     }
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut buf = [0u8; 8192];
     while out.len() < n {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            break;
+            return Ok((out, true)); // deadline, not a loss — say so
         };
         let ms = remaining.as_millis().min(1000) as u16;
         let re = wait_readable(&fd, ms)?;
@@ -941,7 +1007,7 @@ fn read_until<F: AsFd + Read>(mut fd: F, n: usize, timeout_ms: u64) -> anyhow::R
             }
         }
     }
-    Ok(out)
+    Ok((out, false))
 }
 
 /// Receive hostward bytes, counting and checksumming them incrementally (so a

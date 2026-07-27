@@ -45,12 +45,29 @@ fn serial_pty_data_path_and_presence() {
     let tty_s = tty.to_string_lossy().into_owned();
 
     // serial(usb0, free-for-all so the PTY may write without a lock) → pty(console).
+    //
+    // `hostward_buffer = 8192` on the console is load-bearing, not decoration — do not
+    // "simplify" it away. THE DATA PATH check below asserts the 64 KiB echo returned
+    // byte-identical, but a pty node's hostward path is a bounded bridge whose overflow
+    // is dropped and counted (§5, §15.19: "a slow spy costs itself data, never its
+    // neighbors") — at the 32-chunk default a burst that outruns the pump→writer bridge
+    // sheds with `dropped_slow_consumer` rather than blocking, and the round-trip
+    // assertion fails on a daemon behaving exactly as designed. Like `p3_counters`' 64
+    // KiB console this is prophylactic (the measured failures were `p3_log`'s 256 KiB
+    // consoles: 14/40 under sustained CPU load, 0/40 at 8192), but the deep buffer is
+    // what entitles this file to ask a lossy-by-design consumer for losslessness — and
+    // "with nothing lost" is precisely what the module doc claims. Raising the *serial*
+    // node's depth would not work: the pty pump drops rather than awaits, so it never
+    // backpressures upstream and the pty's own depth is the only buffer in this path.
+    // The presence half of this file needs no such thing (no bytes flow), and the lone
+    // pty in `pty_client_presence_transitions` keeps the default deliberately.
     let cfg = format!(
         r#"
 [[node]]
 type = "pty"
 name = "console"
 path = "{tty}"
+hostward_buffer = 8192
 [[node]]
 type = "serial"
 name = "usb0"

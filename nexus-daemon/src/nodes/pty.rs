@@ -480,6 +480,12 @@ fn apply_baseline_fd(fd: BorrowedFd, advertised_baud: u32) -> Result<(), String>
 /// releases (detach-release), while a non-holder's un-forwarded targetward backlog
 /// is drained and discarded (purge-on-detach), counted, so a locked-out client's
 /// buffered commands never fire when the lock later frees.
+///
+/// The baseline reset here is itself observable: re-`tcsetattr`ing the pair re-arms
+/// a `TIOCPKT_IOCTL` notification on the master, which the caller must consume so it
+/// cannot be mistaken for a fresh client session (see the close block in
+/// [`read_and_poll`]). The purge-on-detach branch below consumes it in passing; the
+/// caller covers the branches that do not.
 fn handle_last_close(
     fd: RawFd,
     buf: &mut [u8],
@@ -569,13 +575,15 @@ async fn read_and_poll(
     let mut buf = vec![0u8; READ_BUF];
     let mut last_reconcile = Instant::now();
     let mut wait = ACTIVE_POLL;
-    // Set when this session's client has sent an actual data payload (a
-    // `TIOCPKT_DATA` packet), cleared by `handle_last_close`. It lets a collapsed
-    // session — one whose whole attach→stream→detach a starved task first observes
-    // only at the closing EOF, so `present` never latched true — still run the
-    // last-close handler, while a bare hangup (no client data) does not. See the
-    // close block below.
-    let mut saw_data = false;
+    // Set when this session's client left *anything* readable on the master — a
+    // `TIOCPKT_DATA` payload or a control packet such as the `TIOCPKT_IOCTL` a
+    // client's `tcsetattr` provokes — and cleared by the close block below. It lets
+    // a collapsed session, one whose whole attach→(traffic)→detach the task first
+    // observes only at the closing EOF so `present` never latched true, still run
+    // the last-close handler. It is deliberately *not* narrowed to data: a session
+    // that only configures the line writes no byte and still has to release its
+    // lock. See the close block below.
+    let mut saw_session = false;
     loop {
         let re = sys::poll_ready(fd, PollFlags::POLLIN | PollFlags::POLLHUP);
         let now = !re.contains(PollFlags::POLLHUP);
@@ -620,11 +628,15 @@ async fn read_and_poll(
                     }
                     Ok(n) if n >= 1 => {
                         did = true;
+                        // Evidence of a client session, whatever the packet says: a
+                        // read only succeeds while a client has been on the other
+                        // end. It arms the close arm below so a session collapsed
+                        // into one poll gap still releases — including the shape
+                        // that carries no data at all (open → `tcsetattr` → close),
+                        // which leaves exactly one `TIOCPKT_IOCTL` packet behind and
+                        // used to be read straight past.
+                        saw_session = true;
                         if buf[0] == sys::TIOCPKT_DATA {
-                            // Data packet: a real client wrote content this session
-                            // (never a self-issued control packet), so the close
-                            // below must run even if the rising edge was never seen.
-                            saw_data = true;
                             // Forward the payload targetward — or, with no writable
                             // edge (a read-only spy edge, or one `disconnect`
                             // removed), count it. Either way the bytes are
@@ -691,23 +703,38 @@ async fn read_and_poll(
         // backlog is purged-and-counted (purge-on-detach); a free-for-all writer,
         // already drained above, keeps its bytes.
         //
-        // The `saw_data && closed` arm covers a *collapsed* session: under load a
-        // starved task's first poll of a client can observe the attach, the whole
-        // stream, AND the closing EOF at once, so `present` never latches true and
-        // the `was` edge misses it — leaving an on-demand holder that streamed and
-        // detached in one poll holding its lock forever (§6). Gating on `saw_data`
-        // (a real `TIOCPKT_DATA` payload) keeps this an edge: a bare hangup with no
-        // client data does not fire, and — crucially — the control packet that
-        // `handle_last_close` cannot re-trigger on the following iterations, because
-        // `saw_data` is *cleared* the moment the close is handled: with `was` already
-        // false and the latch reset, neither disjunct can fire again until a new
-        // client attaches and sends a real `TIOCPKT_DATA` payload, which re-arms the
-        // latch. It is that latch reset — not the shape of the packet-mode read that
-        // `handle_last_close`'s own `tcsetattr` provokes — that keeps the handler
-        // from re-firing every poll and spinning the runtime (the `b8d8ed8` fix).
+        // The `saw_session && closed` arm covers a *collapsed* session: one poll of
+        // a client can observe the attach, all of its traffic, AND the closing EOF
+        // at once — a scripted sub-poll-window probe, or a starved task — so
+        // `present` never latches true and the `was` edge misses it, leaving an
+        // on-demand holder that attached and detached in one poll holding its lock
+        // forever, the endpoint dead to every other writer (§6).
+        //
+        // The latch is armed by **any** successful read, not by a `TIOCPKT_DATA`
+        // payload alone. Narrowing it to data was a real leak: a session that opens,
+        // calls `tcsetattr` and closes writes no byte, but the master still holds
+        // its `TIOCPKT_IOCTL` packet past the hangup (`read = 1`, then `EIO`), and
+        // both disjuncts read straight past that evidence. The one shape left
+        // uncovered is a bare open→close touching nothing, which leaves *nothing*
+        // readable to latch on; it is also the harmless one — a client that sent no
+        // command has none to purge — and the next observed session re-arms the
+        // handler.
+        //
+        // Two things together keep this an edge rather than a spin. The latch is
+        // *cleared* the moment the close is handled, so with `was` already false
+        // neither disjunct can fire until a new client leaves new evidence; and the
+        // drain below consumes the packet-mode notification that `handle_last_close`
+        // provokes itself — its `apply_baseline` re-`tcsetattr`s the pair (through
+        // the master on Linux, which the kernel redirects to the slave; through a
+        // momentary slave open on BSD), which re-arms `TIOCPKT_IOCTL` on the master.
+        // That packet is indistinguishable *by type* from a client's, so leaving it
+        // readable would re-arm the widened latch on the next poll and re-fire the
+        // handler every pass (the 99%-CPU shape the `b8d8ed8` note records). Consume
+        // it, and the anti-spin argument needs no assumption about POLLIN going
+        // quiet after a hangup — which is a kernel-version-dependent claim (§13).
         let present_now = now && !closed;
         let was = present.swap(present_now, Ordering::Relaxed);
-        if (was && !present_now) || (closed && saw_data) {
+        if (was && !present_now) || (closed && saw_session) {
             handle_last_close(
                 fd,
                 &mut buf,
@@ -717,7 +744,24 @@ async fn read_and_poll(
                 &client_termios,
                 &origin,
             );
-            saw_data = false;
+            saw_session = false;
+            // Consume what the handler's own termios reset left behind (above) —
+            // but only for an endpoint this pass actually read from. One that is
+            // *not* read from is either a locked-out non-holder, whose backlog
+            // `handle_last_close` has just purged-and-counted itself (purge-on-
+            // detach, §6), or an endpoint with no edge at all, whose client backlog
+            // is deliberately **parked** and must never be dropped (invariant
+            // 14/§5). A `may_write` endpoint, by contrast, was fully drained and
+            // forwarded by the loop above, so all this finds is the control packet.
+            // Any data byte it does find is the residual of a drain that ended early
+            // (a targetward send whose endpoint vanished), so it is charged, not
+            // swallowed: §5 forbids the silent version.
+            if may_write {
+                let residual = drain_and_discard(fd, &mut buf);
+                if residual > 0 {
+                    discarded_targetward.set(discarded_targetward.get() + residual);
+                }
+            }
         }
         // BSD/macOS only: the slave's termios resets to cooked when the last slave
         // fd closes (verified: a momentary daemon-side set does not survive to the

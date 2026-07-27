@@ -58,6 +58,22 @@ fn quickstart_echo_round_trip_under_budget() {
     assert_eq!(mode, 0o600, "control socket perms are {mode:o}, want 600");
 
     // 2. The demo config: serial (host-facing, free-for-all) -> pty (target-facing).
+    //
+    // `hostward_buffer = 8192` on the console is load-bearing, not decoration — do not
+    // "simplify" it away, and note the README prose stays free of it (the quickstart's
+    // *claim* is unchanged; this is the test instrument being made honest). Check 3
+    // asserts a byte-exact 64 KiB echo, but a pty node's hostward path is a bounded
+    // bridge whose overflow is dropped and counted (§5, §15.19: "a slow spy costs
+    // itself data, never its neighbors") — at the 32-chunk default a burst that
+    // outruns the pump→writer bridge sheds `dropped_slow_consumer` and the assertion
+    // fails on a daemon that did exactly what it promised. Like `p3_counters`' 64 KiB
+    // console this is prophylactic — the measured failures were `p3_log`'s 256 KiB
+    // consoles (14/40 under sustained CPU load, 0/40 at 8192) and 64 KiB has not been
+    // observed to lose the race — but the assertion asks for losslessness the design
+    // does not owe it, and the deep buffer is what makes the ask legitimate. Raising
+    // the *serial* node's depth would not do it: the pty pump drops rather than
+    // awaits, so it never backpressures upstream and the pty's own depth is the only
+    // buffer in this path.
     let console = d.run().join("console");
     let cfg = format!(
         r#"
@@ -70,6 +86,7 @@ arbitration = "free-for-all"
 type = "pty"
 name = "console"
 path = "{console}"
+hostward_buffer = 8192
 [[edge]]
 a = "usb0"
 b = "console"

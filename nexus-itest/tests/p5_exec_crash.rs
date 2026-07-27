@@ -179,6 +179,22 @@ fn exec_codec_crash_faults_restarts_and_data_plane_survives() {
     // echo probe). The exec codec's channel is free-for-all so the client writes freely.
     // `[node.attributes]` is a dotted sub-table (equivalent to the bash's inline table)
     // to avoid `{`/`}` colliding with `format!`.
+    //
+    // `hostward_buffer = 8192` on `con-c0` is load-bearing, not decoration — do not
+    // "simplify" it away. The measured subject is the **exec child's** crash and
+    // resume; `con-c0` is only the instrument, and `roundtrip`'s verdict asserts its
+    // 256 KiB echo came back complete and byte-exact (the sim's `pass` for
+    // `--expect echo` is `received == n && sha256_sent == sha256_received`). But a pty
+    // node's hostward path is a bounded bridge whose overflow is dropped and counted
+    // (§5, §15.19: "a slow spy costs itself data, never its neighbors") — at the
+    // 32-chunk default a drain client descheduled under parallel-suite load sheds
+    // legally, and the test reads that as "the child did not resume clean". `p3_log`
+    // measured exactly this shape at 14/40 failures under sustained CPU load and 0/40
+    // at 8192. `con2` keeps the default deliberately: its probes are 4 KiB/5 KiB, far
+    // inside the default depth. Raising the *serial* or *codec* depth would not help
+    // either console — the pty pump drops rather than awaits, so it never
+    // backpressures upstream and the pty node's own depth is the only buffer in the
+    // path.
     let cfg = format!(
         r#"
 [[node]]
@@ -201,6 +217,7 @@ restart_backoff_ms = 150
 type = "pty"
 name = "con-c0"
 path = "{tty_c0}"
+hostward_buffer = 8192
 
 [[node]]
 type = "serial"

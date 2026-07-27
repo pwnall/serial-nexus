@@ -21,7 +21,8 @@
 //! the write lock forever** — the endpoint is dead to every other writer until the
 //! node is removed. Nothing in the suite would have caught the fix's removal.
 //!
-//! Two properties, one per half of the fix's argument:
+//! Three properties, one per half of the fix's argument and one for the half of the
+//! *session* it originally missed:
 //!
 //! 1. [`collapsed_client_sessions_still_release_the_write_lock`] — a session whose
 //!    attach, write and close all happen inside **one** of the reader's idle poll
@@ -31,11 +32,29 @@
 //!    only at its EOF. Repeated, because the collapse is a race the test wins
 //!    ~99 times in 100 — one unlucky iteration proves nothing, eight prove it.
 //! 2. [`a_bare_hangup_leaves_the_daemon_cpu_bounded`] — the fix's *other* claim:
-//!    the `saw_data` latch is what keeps the handler from re-firing, so a hangup
-//!    with no client data must leave no busy loop behind. Measured as the daemon's
-//!    own `utime + stime` over an idle window (Linux-only `/proc/<pid>/stat`;
+//!    the latch is what keeps the handler from re-firing, so a hangup with no
+//!    client data must leave no busy loop behind. Measured as the daemon's own
+//!    `utime + stime` over an idle window (Linux-only `/proc/<pid>/stat`;
 //!    self-skips elsewhere). See the constant's comment for what planting the
 //!    ungated arm actually did on this kernel.
+//! 3. [`a_collapsed_termios_only_session_still_releases_the_write_lock`] — the
+//!    defect `b8d8ed8`'s latch left behind, found next to a CI failure and
+//!    confirmed at syscall level. Both of the original disjuncts required the
+//!    reader to have *observed* something: `was` a poll landing while the slave was
+//!    still open, and `saw_data` a `TIOCPKT_DATA` payload. A session that opens,
+//!    calls `tcsetattr` and closes inside one poll gap — a scripted probe, a health
+//!    check, an `stty` — satisfied neither, so it **leaked the write lock forever**
+//!    even though the master still held the evidence (an unread `TIOCPKT_IOCTL`
+//!    packet, readable past the hangup: `read(11, "A", …) = 1` then `EIO`). The
+//!    latch is now armed by *any* successful read, so this shape releases; the
+//!    property also pins the other direction, that a lock with **no** client
+//!    session at all is never released, because the widened latch must not fire on
+//!    the control packet the last-close handler's own termios reset provokes.
+//!
+//! One shape is still not covered, deliberately: a bare open→close that touches
+//! nothing leaves the master with *nothing readable*, so there is no evidence to
+//! latch on. It is the harmless one — such a client sent no command to purge — and
+//! it self-heals the next time a session is observed.
 //!
 //! Neither needs a serial *device*: the `usb0` node's device is deliberately
 //! absent, so it comes up `waiting` while its write lock, origins and targetward
@@ -45,6 +64,7 @@
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
@@ -58,7 +78,7 @@ use serde_json::Value;
 #[cfg(target_os = "linux")]
 use nexus_itest::bin;
 #[cfg(target_os = "linux")]
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 
 /// How many collapsed sessions one run drives. Each is an independent trial of a
 /// race the test wins with high probability (a ~50 µs client session against a
@@ -325,5 +345,134 @@ fn a_bare_hangup_leaves_the_daemon_cpu_bounded() {
     eprintln!(
         "SKIP a_bare_hangup_leaves_the_daemon_cpu_bounded: per-process CPU sampling \
          needs /proc/<pid>/stat (Linux)"
+    );
+}
+
+// ============================================================================
+// 3 — a collapsed session that only *configures* the line still releases.
+// ============================================================================
+
+/// How long one trial waits for the release. The reader polls every `IDLE_POLL`
+/// (5 ms) at its idlest, so a release that is going to happen has happened within
+/// milliseconds; this is three orders of magnitude of slack, not a guess.
+const RELEASE_WAIT: Duration = Duration::from_secs(3);
+
+/// Drive one `stty`-shaped client session against `console`: open the slave,
+/// `tcsetattr` it, close — and nothing else, no byte written. `stty -F <path>
+/// <setting>` is exactly that syscall sequence (verified by strace: `openat` →
+/// `TCGETS2` → `TCSETSW2` → `close`), which is why this spawns the real tool
+/// instead of reaching for a termios binding: `nexus-itest` has no `nix`
+/// dependency and `libc`'s termios calls are `unsafe`, which invariant 4 confines
+/// to `nexus-sys`.
+///
+/// The session is a handful of syscalls, so — exactly like [`collapsed_session`] —
+/// it lands *inside* one 5 ms idle poll window with high probability, and the
+/// daemon meets the whole thing at its hangup. `echo` is the setting because the
+/// node's baseline turns echo off (§7.2), so every trial is a real change and the
+/// tool cannot elide the `tcsetattr`.
+///
+/// `false` means `stty` is unusable here and the caller must skip.
+fn termios_only_session(console: &Path) -> bool {
+    // GNU and uutils spell the device flag `-F`; BSD `stty` spells it `-f`.
+    let flag = if cfg!(target_os = "linux") {
+        "-F"
+    } else {
+        "-f"
+    };
+    Command::new("stty")
+        .arg(flag)
+        .arg(console)
+        .arg("echo")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn a_collapsed_termios_only_session_still_releases_the_write_lock() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let console = d.run().join("console");
+    rpc.load_toml(&cfg(d.run()), false).expect("load graph");
+    assert!(
+        rpc.wait_status("console", "active", Duration::from_secs(10)),
+        "console pty not active: {:?}",
+        rpc.node("console")
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || console.exists()),
+        "console pty symlink never appeared"
+    );
+
+    // The *other* direction first, because widening the latch is what could break
+    // it: the trigger is evidence of a client **session**, so with no client at all
+    // the lock stays exactly where the operator put it. A latch that fired on any
+    // readable byte — the control packet the last-close handler's own termios reset
+    // provokes, or a stale one left on the master — would release here, silently
+    // and with nobody having attached.
+    let r = rpc
+        .lock("console", false, false, None)
+        .expect("lock console");
+    assert_eq!(
+        r.get("acquired").and_then(Value::as_bool),
+        Some(true),
+        "lock console did not acquire: {r}"
+    );
+    assert!(
+        !wait_until(Duration::from_millis(750), || holder(rpc).is_none()),
+        "the write lock was released with no client session at all — the last-close \
+         latch is firing on something that is not a client (§6, §7.2)"
+    );
+
+    let mut released = 0usize;
+    for i in 0..COLLAPSES {
+        // Re-arm: an on-demand holder that released last trial takes the lock
+        // again, the way an operator's `lock console` does before a probe runs.
+        if holder(rpc).as_deref() != Some("console") {
+            let r = rpc
+                .lock("console", false, false, None)
+                .unwrap_or_else(|e| panic!("lock console #{i}: [{}] {}", e.code, e.message));
+            assert_eq!(
+                r.get("acquired").and_then(Value::as_bool),
+                Some(true),
+                "lock console #{i} did not acquire: {r}"
+            );
+        }
+
+        if !termios_only_session(&console) {
+            eprintln!(
+                "SKIP a_collapsed_termios_only_session_still_releases_the_write_lock: \
+                 `stty` is unavailable or cannot drive {}",
+                console.display()
+            );
+            return;
+        }
+
+        if wait_until(RELEASE_WAIT, || holder(rpc).is_none()) {
+            released += 1;
+        } else {
+            // Leave the graph usable for the remaining trials, so the count at the
+            // end reports how many of them released rather than only the first.
+            let _ = rpc.unlock("console");
+        }
+    }
+
+    assert_eq!(
+        released, COLLAPSES,
+        "only {released}/{COLLAPSES} collapsed termios-only sessions released the \
+         write lock — a client that opens, calls tcsetattr and closes inside one \
+         poll window writes no data byte, so a latch armed only by TIOCPKT_DATA \
+         reads straight past the TIOCPKT_IOCTL packet it *did* leave and the \
+         endpoint stays dead to every other writer (§6, §7.2)"
+    );
+    // And the client is gone as far as state is concerned, too (§7.2).
+    assert_eq!(
+        rpc.node("console")
+            .and_then(|n| n.get("client_present").and_then(Value::as_bool)),
+        Some(false),
+        "client_present stuck true after the termios-only sessions"
     );
 }
