@@ -22,9 +22,19 @@ had been red on four of the last six pushes, and one **real product defect** fou
 new `nexus-doctor` probes were added on top, to settle on the production kernel the questions this
 work could only answer on 7.0.
 
-**Gates:** 480 passed / 0 failed / 4 ignored (was 459 at `548823e`); fmt; clippy (workspace +
-minimal-daemon); `cargo deny check licenses bans sources`; macOS cross-check; `linux.jq` green with
-17 supported / 0 degraded / 0 unsupported / 3 skipped.
+**Gates:** 480 passed / 0 failed / 4 ignored (was 459 at `548823e`) on **four consecutive**
+full-workspace runs on an idle box; fmt; clippy (workspace + minimal-daemon);
+`cargo deny check licenses bans sources`; macOS cross-check; `linux.jq` green with 17 supported /
+0 degraded / 0 unsupported / 3 skipped.
+
+**One honest gap in that record.** An earlier full-suite run — taken while the box was still
+settling from a build, 15-minute load average 5.65 — reported 479 passed / 1 failed, and the output
+was piped through `awk` before the failing test's name was captured. The four clean runs came after,
+at load < 1. So the suite is green on a quiet machine and there is a residual, unidentified
+load-sensitive failure that surfaced once. That is a lead, not a clean bill of health: **if CI shows
+a lone failure in a test not named in F1–F5 above, treat it as this one resurfacing rather than as
+something new**, and capture the name before re-running. The whole point of this track is that
+"flaky" is a symptom with a mechanism behind it, and this one has not been found yet.
 
 ### The two stories in the CI history
 
@@ -138,6 +148,15 @@ bytes to leak into the post-restore read), `p5_exec_crash`'s `con2`, and every n
 the subject — `p8_tap_drops`' slow tap sheds through its own `TAP_QUEUE_CAP` and was untouched, so
 neither of its properties is gutted. `p8_tap_drops`' module doc was corrected: its existing
 `hostward_buffer = 16384` sits on the **serial** node and protects the log, not the console echo.
+
+**How the ninth one was found, which is the reusable part.** The first eight came from reading the
+files. `p5_resync` came out of a full-workspace run instead — `channel c2: received 458752 !=
+manifest delivered 524288`, a 64 KiB shortfall from a per-channel console with no depth, under
+nothing more exotic than cargo running test binaries in parallel. Static reading of a file will not
+reliably find this class, because whether a given console sheds depends on how much else is running
+beside it. **Run the whole suite on a quiet box and then again under parallelism** — the shortfall
+always shows as `received + dropped_slow_consumer == sent`, which is the fingerprint to grep the
+failure message for.
 
 Secondary, and the change that would have made the original failure self-diagnosing: `nexus-sim`'s
 `client` verdict could not distinguish a read deadline from real byte loss — `read_until` broke on its
@@ -256,13 +275,34 @@ reserved for a rig that demonstrably ate bytes.
   insufficient; the `p7_p5` guard passed without the fix; the `p3_log` attribution rested on an
   experiment that could not discriminate). Every one of those corrections would have shipped as a
   believable-but-wrong fix.
-- **Do not spawn CPU load on the dev box without cleaning it up.** Diagnosis agents used `yes` hogs
-  and busy-loops to reproduce load-sensitive flakes; 16 of them leaked and pegged an 8-core laptop at
-  load ~19 for ten hours, which then made `p3_firehose`, `p5_resync`, `p8_tap_drops` and
-  `p5_exec_crash` fail and cost a round of false "is this a regression?" investigation. After killing
-  them, `p3_firehose` ran in **2.53 s** — exactly the healthy figure §15.32 records — and the whole
-  suite went green. If a test fails on the dev box, check `uptime` and `pgrep -x yes` **before**
-  concluding anything about the code.
+- **The machine confusion, recorded in full because the wrong turn was mine and it cost real time.**
+  Midway through, `p3_firehose` started failing its 60 s bound at ~94% of 256 MiB — roughly 4 MB/s
+  where §15.32 records 256 MiB in ~2.5 s, a ~24× shortfall. That is exactly the shape of an
+  invariant-9 regression (the replay-ring memcpy), so it had to be chased. Two things then happened,
+  one right and one wrong.
+
+  The right one: "is this ours?" was settled empirically, with a throwaway `git worktree` at the last
+  commit. It failed there too, identically — so not a regression. **Use a worktree for this, never
+  `git stash`**: the tree held a large uncommitted change set all session, and AGENTS.md §8's warning
+  about `git checkout --` applies to `git stash` just as much.
+
+  The wrong one: having established "not ours", I explained the slowness as *"a throttled sandbox"* —
+  an environmental cause asserted with no measurement behind it. It was wrong. The dev box is a
+  full-permission Linux laptop, and one `uptime` would have shown load **19.6 on 8 cores**. The cause
+  was 16 `yes` processes my own diagnosis agents had spawned to reproduce load-sensitive flakes and
+  then leaked; they had been pegging the machine for **ten hours**, and they were also why
+  `p5_resync`, `p8_tap_drops` and `p5_exec_crash` were failing. Killed, `p3_firehose` ran in
+  **2.53 s** — precisely the healthy figure — and the suite went green.
+
+  Two rules out of it, both now in AGENTS.md §8. **Measure the box before attributing anything to
+  it** (`uptime`, `pgrep -x yes`, `nproc`, cpufreq): a confident environmental guess is worse than no
+  answer, because it closes an investigation that was still open. And **clean up every
+  load-generating process a reproduction spawns** — prefer bounding them with `timeout`. This is a
+  machine someone else is working on.
+
+  Worth noting what the leak did *not* cost: because the worktree comparison was run under the same
+  load on both sides, its conclusion ("not our regression") was sound, and the fixes it cleared were
+  the right ones. The damage was a wrong explanation and a wasted round, not a wrong fix.
 - The "is this ours?" question was settled with a throwaway `git worktree` at the last commit rather
   than by stashing — the tree held a large uncommitted change set all session, and AGENTS.md §8's
   warning about `git checkout --` applies just as much to `git stash`.
