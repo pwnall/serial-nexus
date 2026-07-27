@@ -14,6 +14,44 @@ design.
 
 ---
 
+## OPUS COMPREHENSIVE CODE REVIEW #3 — `docs/32-claude-opus-code-review.md` (2026-07-27)
+
+**Read the review, not this paragraph, for the findings.** Recorded here so a fresh session knows it
+exists and knows its status: **nothing in it is fixed yet.** The review was taken at `cfb2187` against
+a tree whose full suite is green (485 passed / 0 failed / 4 ignored, re-measured during the review),
+which is its main point — the defects sit exactly where the suite does not look.
+
+99 candidate findings from 16 lenses (25 finder runs), each handed to an independent verifier that had
+**not** seen the report and was told to refute it, on a tree frozen for the whole pass (§15.34's second
+clause). **87 confirmed** (7 high, 27 medium, 44 low, 9 nit; 80 unique), **10 refuted**, 2
+already-known.
+
+The four clusters, each with one structural remedy rather than N patches:
+1. **The resolver's two §12 directions read disjoint sources** — capture walks sysfs, resolution and
+   the ambiguity guard read only `/dev/serial/by-id`. The duplicate-serial guard therefore cannot fire
+   for the hazard §12/§15.25 promise it closes (two clones collide on one udev link name), so a node
+   binds the wrong physical board; and a `usb:` identity captured without a by-id tree can never be
+   resolved back.
+2. **Exclusivity is released by exit path, not by ownership** — §15.38's D2 fix covers `teardown` and
+   *not* `open_port`'s error path, `set_waiting`/`fault`, or the reconnect window. One of those bricks
+   a pty-backed device permanently from an ordinary §7.1 modem-line config.
+3. **A parked waiting verb starves its own connection's streams** — measured at 11.2 MB of console
+   output dropped in one 6 s `lock --wait`, and a 2 s terminal blackout per contended browser
+   keystroke, because §17 mandates one daemon connection per browser.
+4. **§5's "loss is always visible" has holes at four boundaries** — most sharply a `faces = target` leg
+   that discards its own intake `DropCounters`.
+
+Plus: three gates that cannot fail (`p0_license_gate` passes vacuously on a `cargo metadata` failure —
+**proven** by deleting the ban entry; `p11_replace_atomicity`'s exclusivity guard; the `RefCell`
+meta-gate's file-name exemption), and a documentation cluster in the files a newcomer opens first.
+
+Its **§6 lists the 10 refutations and 2 already-knowns** — consult it before re-filing anything from
+this review, exactly as review 26's §6 serves that role. The refutations that exist because the *code*
+is right are additionally written up as **§3.20** below, in the deviations family, so they are findable
+from the same place as §3.1–§3.19.
+
+---
+
 ## v13 BROWSER-UI TRACK (plan §15 / design §15.37, §15.38) — DONE (2026-07-27 session)
 
 Two halves. First an **alignment pass on the v13 documents**, which had regenerated from a
@@ -2173,6 +2211,101 @@ consumer) but was not what the target claimed. The assertion was wrong, not the 
 target now asserts the framer/parser *composition* instead, which no other target covers.
 **Watch item:** if either module grows an item that is not a parser under fuzz, that is the
 erosion this entry exists to catch. The rule is: a re-export here must have a target in `fuzz/`.
+
+### 3.20 Justified deviations confirmed by review 32 (2026-07-27)
+
+The third comprehensive review (`docs/32-claude-opus-code-review.md`, 99 candidate findings each
+adversarially verified on a frozen tree) produced ten refutations and two already-known dispositions.
+Several of those exist because the **code is right and something else is wrong** — the design text, a
+doc comment, or the finder's model of the system. They are recorded here, in the same slot family as
+§3.1–§3.19, so the next review does not spend the effort again. Each names the finding id it retires.
+
+**(a) `load` deliberately does not resolve device identity; only `add-node` does.** *(review 32
+`CORE-1`/`DEV-1`, refuted.)* `Daemon::load` runs `config.validate()` + `precheck_codecs` and never
+calls `resolve_input`, so a malformed identity string (`usb:0403:6001`) loads and the node sits
+`waiting`, while the same string is refused `-32602` by `add-node`. That asymmetry looks like a
+validation hole and is in fact §12's central rule: *"adding a node by raw path requires the device
+present at that moment (identity must be captured); adding or loading by identity never does, which is
+why dump emits identities and why configurations survive cold starts with hardware unplugged."*
+Making `load` resolve would break cold-start recovery — the property the whole identity design exists
+for. The destructive-typo path this was feared to open is closed elsewhere and structurally:
+`deny_unknown_fields` refuses a mis-typed table with `-32602` **before** `--replace` reaches
+`teardown_with` (verified live; the running graph survived). Do not "fix" the asymmetry.
+
+**(b) The §11 empty-parse refusal belongs in the CLI and in `startup_load`, not in the `load` verb.**
+*(review 32 `RV-2`, refuted — reviewer-originated and correctly killed.)* §11 states the rule as
+"a non-empty source that parses to an *empty* graph is refused rather than obeyed", and its predicate
+is literally `config.is_empty() && !text.trim().is_empty()` — it needs the **source text**. The RPC
+verb receives a deserialized `GraphConfig`, never TOML, so the daemon cannot evaluate the rule even in
+principle; `config.rs`, `graph.rs` and `serialnexusctl/src/main.rs` all say so in comments. What
+remains reachable over raw RPC is a client *deliberately* sending `{"config":{},"replace":true}`,
+which is an operator act, not a typo. `docs/rpc/configuration.md` already documents the split. If
+anything changes here it should be design §11's wording, not the daemon.
+
+**(c) `nexus-sys::poll_ready`'s `unwrap_or_else(PollFlags::empty)` cannot silently swallow a real
+readiness bit.** *(review 32 `DOC-1`, refuted.)* nix's `revents()` returns `None` — not a truncated
+set — for any bit it does not model, which reads like a latent data-loss bug. It is unreachable:
+`poll(2)` masks `revents` to `requested | POLLERR | POLLHUP` (plus `POLLNVAL`), and every call site in
+this tree builds its interest from nix-modelled flags. Measured during the review: `events=POLLIN` on
+a hung-up socketpair yields `revents=0x0011` with POLLRDHUP (0x2000) *absent*; asking for POLLRDHUP
+makes it appear. So `probes.rs::revents_label`'s residual-hex branch is defensive, not dead-by-mistake.
+
+**(d) `GraphConfig::validate`'s `if let` chain does route a new numeric knob to invariant 13.**
+*(review 32 `SIMP-4`, refuted.)* The chain is non-exhaustive, so it looks like invariant 13 ("a new
+numeric knob gets a range here on the day it is added") is prose the compiler cannot enforce. Settled
+by experiment on a *copy* of the tree: adding a new `NodeConfig` variant produces four `E0004`
+non-exhaustive-match errors **in `config.rs` itself**, and adding a numeric field to an existing
+variant fails `cargo test --workspace` at seven initializer sites including the range-check test. An
+author adding a knob is routed to the right file by the build, not by memory.
+
+**(e) `EndpointLock::register` over a live registration is unreachable from the daemon.** *(review 32
+`LOCK-1`, refuted.)* Re-registering an attached origin does corrupt the holder/`may_write` pair when
+driven through the pure `nexus-core` API, but two deliberate mechanisms prevent the daemon from ever
+doing it — `SEND_ORIGIN_BASE` (so a transient CLI origin cannot collide with a real one) and
+`next_edge_origin`'s floor taken from `Wiring`'s own counter — and no verb mutates a registered
+origin's write mode. The remaining `register` call sites are `#[cfg(test)]`.
+
+**(f) `tap.open`'s `epoch` is covered, indirectly but genuinely.** *(review 32 `ITEST-2`, refuted;
+`TESTR-1` records the same observation.)* `grep -rni epoch nexus-itest/` really is zero hits, which
+looks like a brand-new protocol field shipping unguarded. But
+`p8_tap_offsets.rs::tap_offsets_reset_on_load_replace_while_the_instance_nonce_does_not` already
+asserts `tap.closed` with reason `"graph replaced"` — emitted **only** when the hub is dropped — *and*
+`from_offset == 0` on the reopen, which catches hub-reuse and offset-restart from opposite directions.
+A direct epoch assertion is still worth adding (it is cheap and names the contract), but this is an
+improvement, not a hole.
+
+**(g) The `unstable_fuzz_api` disclaimer is where an embedder would meet it.** *(review 32 `DOCR-7`,
+refuted.)* `lib.rs`'s crate doc says the entry surface is "the only public API" while
+`pub mod unstable_fuzz_api` exists, which reads as a contradiction an embedder could be misled by. The
+scenario requires finding the module through rustdoc's module list — which is exactly where the
+module's own first-line stability disclaimer renders. §3.19 above already carries the exception and
+the rule that bounds it.
+
+**(h) The web console *is* documented for operators.** *(review 32 `DOCR-8`, refuted.)*
+`packaging/README.md` carries a dedicated web-console section under its operator-facing "what changed
+for operators" heading, including the treat-the-token-as-shell-access warning. The finding reached the
+opposite conclusion by grepping only the binary name; the document names it in prose. Recorded because
+"grep found nothing" is a recurring way a documentation finding goes wrong.
+
+**(i) The `web-ui` gate is not known to be flaky.** *(review 32 `ITEST-3`, refuted.)* Two intermittent
+failures were reported against `lifecycle.spec.mjs:61` / `graph-editor.spec.mjs:145`. The verifier
+could not reproduce in **100 consecutive gate runs**, 30 of them CPU-constrained at loads well above
+the original observation — and a hang-shaped failure should get *more* likely under contention. The
+two observations remain unexplained. **If CI ever shows this, treat it as the residual load-sensitive
+lead §15.36 already records rather than as a new mechanism, and capture the failing spec name before
+re-running.** Do not add a retry: `retries: 0` is deliberate (§15.36).
+
+**(j) Two items were already dispositioned and were re-filed anyway.** The exec stdin feed losing an
+in-flight chunk uncounted (`EXEC-1`) was verified and cleared in review 26; `Daemon::state()`'s
+per-node endpoint rescan (`SIMP-5`) is review 19's `OPSIMP-3`, kept deliberately per §3.14. Both
+verdicts stand unchanged.
+
+**What this entry does *not* cover.** Review 32 confirmed 87 findings, and those are defects to fix,
+not deviations to justify — including four the design text gets wrong in the *other* direction
+(§17's browser-history key naming the epoch, §7.7's existing-terminal written as shipped and missing
+from §14's deferred list, §17's console rail promising node status, and §17's blur-closes-taps
+grace interval). Those are listed in the review's §2 with an (a)/(b)/(c) classification each; they
+belong in the design, not here.
 
 ---
 
