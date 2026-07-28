@@ -8,8 +8,8 @@
 # well-formed report and that the portable mechanisms did not regress, while letting
 # the Linux-only probes skip/degrade/report unsupported without failing CI:
 #
-#   - The report is structurally sound: a summary object and all eleven probes
-#     (P1..P11) present, each carrying a status. (`>= 11` rather than `== 11`
+#   - The report is structurally sound: a summary object and all twelve probes
+#     (P1..P12) present, each carrying a status. (`>= 12` rather than `== 12`
 #     because P3 emits one probe per --port.)
 #   - P2 (PTY presence, POLLHUP) is POSIX — it must NOT be `unsupported`
 #     (`supported` or `degraded` while unverified on a given macOS runner is fine).
@@ -47,7 +47,7 @@
 # Evaluates to `true` (exit 0) only when every clause below holds.
 
 (.summary != null)
-and (.probes | length >= 11)
+and (.probes | length >= 12)
 and (all(.probes[]; .status != null))
 and (any(.probes[]; .id == "P1"))
 and (any(.probes[]; .id == "P2" and (.status == "supported" or .status == "degraded")))
@@ -60,6 +60,14 @@ and (any(.probes[]; .id == "P8" and (.status == "supported" or .status == "skipp
 and (any(.probes[]; .id == "P9" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P10" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P11"))
+# P12 (session-boundary edge, §15.39) is the mechanism that carries §6's
+# detach-release on THIS platform — Darwin destroys the readable packet P7 measures
+# — so unlike every clause above it, macOS is where P12 is load-bearing and Linux is
+# where it is inert. `supported` or `degraded`, never `skipped`: a skip here means
+# the latch compiled out on the one platform that needs it, which is exactly the
+# silent regression a presence-only clause would wave through. Its numbers are the
+# point, like P6/P7's.
+and (any(.probes[]; .id == "P12" and (.status == "supported" or .status == "degraded")))
 # Provenance, same as `linux.jq` and for the same reason: a report that cannot say
 # which build produced it makes every cross-platform claim rest on an accident.
 # Structure only — `commit` may read `unknown` off a tarball build.

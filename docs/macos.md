@@ -238,9 +238,9 @@ reconciliation runs entirely off the `RECONCILE_INTERVAL` (3 s) backstop. That i
 exactly the fallback this delta describes, working as designed; only client-termios
 *latency* degrades. **verified.**
 
-**The one macOS defect on this path, open and operator-visible.** A pty client that
+**The one macOS defect on this path — found here, and fixed here.** A pty client that
 opens, calls `tcsetattr` and closes **inside one 5 ms reader poll gap** — a scripted
-probe, a health check, a bare `stty` — leaves its `usb0` write lock held forever.
+probe, a health check, a bare `stty` — used to leave its `usb0` write lock held forever.
 XNU's `ptsclose` → `ttyclose` flushes both tty queues at the slave's last close, so
 the packet above is destroyed before the daemon's next poll, and `read_and_poll`'s
 `saw_session` latch (§6 detach-release, invariant 16) has nothing to arm on: `was` is
@@ -252,20 +252,30 @@ Measured against the shipped daemon: **20 of 20** real `stty -f` invocations lea
 30 s, with another origin's `send` failing `-32003 … is locked`. It heals on the next
 *observed* (≳5 ms) session, or `lock --steal`.
 
-Two things follow, and both matter more than the defect. First, **the shipped
-predicate is right and must not be widened**: an ungated `|| closed` arm would fire on
-every 5 ms pass here (a Darwin master with no slave reports `POLLIN|POLLHUP` and
-`read → 0` forever — doctor P6, 64/64), releasing a lock an operator took with no
-client attached. Second, **this is a scope limit, not a kernel wall**: the session
-boundary survives as an *edge* even though no level state records it — a kqueue
-`EVFILT_READ | EV_CLEAR` knote on the master delivers it a full poll gap later
-(measured in a faithful model of that block: shipped predicate 0/8, plus an edge latch
-8/8, zero fires across idle controls). The fix is a `nexus-sys` BSD arm and needs an
-ADR distinguishing an edge latch from invariant 1's *readiness* ban, plus a doctor
-probe; it is **not** written. `nexus-doctor` P7 reports the gap
-(`latch_covers_termios_only_session`), and `p9_pty_collapse`'s third test gates on that
-observation **off Linux only** — on the kernel of record a `false` answer means the
-daemon is leaking locks and must go red rather than skip. **verified as a defect.**
+**The fix, and why it is not a widened predicate.** Level state cannot carry an edge,
+so no amount of looking harder at the observables above could answer it —
+`nexus_sys::SessionLatch` (design **§15.39**) does, via a kqueue
+`EVFILT_READ | EV_CLEAR` knote on the master, inert off Darwin. `p9_pty_collapse`'s
+third test now runs **unskipped on both platforms**, and it was proved fail-first here:
+0/8 sessions release with the latch neutered, 8/8 with it. Four things bind a future
+editor. (1) **Do not widen the predicate instead** — an ungated `|| closed` arm would
+fire on every 5 ms pass (a Darwin master with no slave reports `POLLIN|POLLHUP` and
+`read → 0` forever, doctor P6 64/64), releasing a lock an operator took with no client
+attached. (2) **The latch never marks the pass productive**, so the idle backoff is
+untouched: measured 1.62% → 1.75% of a core idle, against the 74%-of-a-core spin this
+area's other rules exist to prevent. (3) **The daemon forges these edges itself** — the
+baseline re-assert, the last-close flush, the reconciliation backstop — so `watch`
+swallows its own registration edge and the close block discards after running; removing
+either makes the handler re-fire on its own footsteps, which
+`collapsed_client_sessions_still_release_the_write_lock` catches. (4) **Invariant 1 is
+intact**: its ban is on `AsyncFd`/epoll as a *readiness* source, and readiness is still
+`poll(2)` alone. `nexus-doctor` **P7** measures the packet mechanism and the new **P12**
+the edge one, so a report always says which is carrying detach-release here.
+**verified as a defect, and fixed.**
+
+One asymmetry is recorded rather than levelled: the *bare* open→close that Linux leaves
+deliberately uncovered (nothing readable, nothing to latch on, harmless) **does** post
+an edge on Darwin, so macOS is here the stricter platform.
 
 A related consequence with no fix needed: **`discarded_at_last_close` is structurally
 always 0 on macOS.** §7.2's hostward flush counts what the *daemon* discards, and this

@@ -127,6 +127,13 @@ fn main() {
     // nothing new may be inserted ahead of it.
     probe_list.push(probes::p6_last_close_readiness());
     probe_list.push(probes::p7_collapsed_session());
+    // P12 is P7's sibling and belongs beside it: the same question asked of the
+    // *edge* mechanism rather than the readable-packet one, so the two are read
+    // together to see which of them carries detach-release on this kernel (§15.39).
+    // Numbered 12 rather than 8 because the probe set is append-only — an id is a
+    // diff key across kernels, and renumbering P8..P11 would silently invalidate
+    // every archived report.
+    probe_list.push(probes::p12_session_edge());
 
     // P8/P9/P10 — the data-plane shape measurements (invariant 1, §15.19's timer
     // floor, the hostward_buffer defaults). Pty- and poll-only, so passive like

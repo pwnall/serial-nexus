@@ -65,7 +65,36 @@ dial now retries to a bounded deadline. Generalised into an AGENTS §5 rule besi
 two, because all three are one mistake — a proxy standing in for the thing you need, in
 space or in time.
 
-**The fourth failure is a real macOS defect and is NOT fixed.** A collapsed *termios-only*
+**The fourth failure was a real macOS defect. It is now fixed — design §15.39.** After the
+test-only work above was committed and CI went green, the owner signed off on the product
+change, and it landed as `nexus_sys::SessionLatch`: a `kqueue` knote registered
+`EVFILT_READ | EV_CLEAR` on the pty master (Darwin), inert elsewhere, folded into
+`read_and_poll`'s existing `saw_session` rather than added as a third disjunct. Suite
+623 → **627** (the four new `nexus-sys` tests), and `p9_pty_collapse`'s third test now runs
+**unskipped on both platforms**. Proved fail-first on this box: **0/8** collapsed
+termios-only sessions release with the latch's one assignment commented out, **8/8** with
+it. Idle cost measured by A/B in the same binary: **1.62% → 1.75%** of a core, one
+non-blocking `kevent` per 5 ms pass, against the 74%-of-a-core spin this area's other rules
+exist to prevent. Four things a future editor must not undo, each of them measured rather
+than argued: the latch must not set `did` (an edge is not data, and marking the pass
+productive stops the idle backoff); `watch` must swallow the edge its own registration
+posts (registering on an already-hung-up master posts one immediately, and every pty node
+starts there because setup primes the slave); the last-close block must `discard` after
+running, because `apply_baseline` and `flush_hostward_queue` open the slave themselves and
+forge an identical edge — delete that and the handler re-fires on its own footsteps, which
+`collapsed_client_sessions_still_release_the_write_lock` catches, in a *different* test
+than the one the latch fixes; and invariant 1 is untouched, its ban being on `AsyncFd`/epoll
+as a **readiness** source while readiness stays `poll(2)` alone. `nexus-doctor` gained
+**P12** so the two mechanisms are diffable across kernels — gated tightly in `macos.jq`,
+where the edge is the only mechanism, and presence-only in `linux.jq`, where it is inert by
+design. One asymmetry is recorded rather than levelled: the bare open→close that Linux
+leaves deliberately uncovered *does* post an edge on Darwin, so macOS is here the stricter
+platform.
+
+The paragraph below is what the tree said before that landed, kept because the *diagnosis*
+is the durable part and because it is the record of a refutation worth remembering.
+
+A collapsed *termios-only*
 pty session — open, `tcsetattr`, close, inside one 5 ms poll gap — leaks its write lock.
 The first diagnosis called it unfixable ("nothing else reveals it", from an exhaustive sweep
 of level-triggered observables: poll revents, `FIONREAD`, `TIOCOUTQ`, `TIOCGPGRP`,

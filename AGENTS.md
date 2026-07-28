@@ -951,38 +951,37 @@ running engineering log and the authoritative "why the code looks like this" rec
     no Linux satisfies — a never-opened master doesn't HUP, §3.2), demoting native Linux to
     `Degraded`. If a fresh session sees P2 `degraded` on **Linux**, that is a real problem;
     on macOS it is expected.
-  - **A collapsed termios-only pty session leaks its write lock on macOS. This is an open
-    defect, measured 2026-07-28, and the guard for it skips there rather than being
-    retired.** A client that opens the pts, calls `tcsetattr` and closes **inside one 5 ms
-    reader poll gap** — a scripted probe, a health check, a bare `stty` — leaves
-    `usb0.lock.holder` set forever while `client_present` reads `false`; another origin's
-    `send` then fails `-32003 … is locked`. Measured 20 of 20 against the shipped daemon,
-    persisting past 30 s. It heals on the next *observed* (≳5 ms) session or a
-    `lock --steal`. Cause: XNU's `ptsclose` → `ttyclose` flushes both tty queues at the
-    slave's last close, destroying the packet `read_and_poll`'s `saw_session` latch arms on
-    (invariant 16); `was` is false because no poll landed during the ~53 µs session; and
-    every *level*-triggered observable — poll revents, `FIONREAD`, `TIOCOUTQ`, `TIOCGPGRP`,
-    `TIOCMGET`, `TIOCGWINSZ`, the pts inode's timestamps — is byte-identical to no session
-    at all. Two consequences bind a future editor. **Do not widen the predicate**: an
-    ungated `|| closed` arm fires on *every* pass here (a Darwin master with no slave
+  - **A collapsed termios-only pty session used to leak its write lock on macOS; it is
+    fixed by an *edge* latch, and the reasoning is design §15.39 — read it before touching
+    `read_and_poll`.** A client that opens the pts, calls `tcsetattr` and closes **inside
+    one 5 ms reader poll gap** — a scripted probe, a health check, a bare `stty` — used to
+    leave `usb0.lock.holder` set forever while `client_present` read `false`, with another
+    origin's `send` failing `-32003 … is locked` (20 of 20, past 30 s). Cause: XNU's
+    `ptsclose` → `ttyclose` flushes both tty queues at the slave's last close, destroying
+    the packet `saw_session` arms on (invariant 16); `was` is false because no poll landed
+    during the ~53 µs session; and every *level*-triggered observable — poll revents,
+    `FIONREAD`, `TIOCOUTQ`, `TIOCGPGRP`, `TIOCMGET`, `TIOCGWINSZ`, the pts inode's
+    timestamps — is byte-identical to no session at all. **Level state cannot carry an
+    edge**, which is why looking harder at those was never going to work:
+    `nexus_sys::SessionLatch` (a `kqueue` `EVFILT_READ | EV_CLEAR` knote on Darwin, inert
+    elsewhere) now supplies the boundary and `p9_pty_collapse` runs unskipped on both
+    platforms. Four things bind a future editor. (1) **Do not widen the predicate instead**:
+    an ungated `|| closed` arm fires on *every* pass here (a Darwin master with no slave
     reports `POLLIN|POLLHUP` and `read → 0` forever — doctor P6, 64/64), releasing a lock
-    an operator took with no client attached, which is the direction `p9_pty_collapse`
-    asserts first and which the daemon currently gets right. And **it is a scope limit, not
-    a kernel wall**: the session boundary survives as an *edge* — a kqueue
-    `EVFILT_READ | EV_CLEAR` knote on the master delivers it a poll gap later (modelled
-    faithfully against that code block: shipped predicate 0/8, plus an edge latch 8/8, zero
-    fires across idle controls). Landing that means a `nexus-sys` BSD arm (new `unsafe`,
-    invariant 4), an ADR separating an **edge latch** from invariant 1's *readiness* ban, a
-    `nexus-doctor` probe for the mechanism, and handling the daemon's own momentary slave
-    opens, which forge an identical edge. **Not written — it needs sign-off (§9).**
-    `nexus-doctor` **P7** reports the gap (`latch_covers_termios_only_session`), and the
-    guard consults it **off Linux only**: `expectations/linux.jq` admits P7 `degraded`, so
-    a P7-keyed skip on the kernel of record would retire the guard at exactly the moment
-    the daemon began leaking locks there. Treat P7's sibling `latch_covers_data_session`
-    with care — it reads `false` on Darwin for a shape the daemon demonstrably covers,
-    because the probe's harness has no master reader and BSD `ttywait` then blocks the
-    close ~600 ms, where under the live daemon the same close takes ~1 ms and the read arms
-    the latch.
+    an operator took with no client attached. (2) **The latch must never mark the pass
+    productive** — an edge is not data, so `did` stays unset and the idle backoff is
+    unaffected; measured cost 1.62% → 1.75% of a core idle. (3) **The daemon forges these
+    edges itself** — the baseline re-assert, the last-close flush, the reconciliation
+    backstop — so `watch` swallows its own registration edge and the close block discards
+    after running; delete either and the handler re-fires on its own footsteps, which
+    `collapsed_client_sessions_still_release_the_write_lock` catches. (4) **Invariant 1 is
+    intact**: its ban is on `AsyncFd`/epoll as a *readiness* source, and readiness is still
+    `poll(2)` alone. `nexus-doctor` **P7** measures the packet mechanism and **P12** the
+    edge one, so a reader can always tell which carries detach-release on the kernel in
+    front of them. Treat P7's sibling `latch_covers_data_session` with care — it reads
+    `false` on Darwin for a shape the daemon demonstrably covers, because the probe's
+    harness has no master reader and BSD `ttywait` then blocks the close ~600 ms, where
+    under the live daemon the same close takes ~1 ms and the read arms the latch.
   - **Doctor P1 on macOS is `degraded`, and the mechanism is now measured** (2026-07-28,
     15.7.8): a client `tcsetattr` *does* produce a packet, but Darwin's leading byte is
     `0x20` (`TIOCPKT_DOSTOP`), not `0x40` (`TIOCPKT_IOCTL`), so `read_and_poll`'s

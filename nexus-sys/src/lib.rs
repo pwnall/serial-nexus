@@ -265,6 +265,210 @@ pub fn poll_blocking(
 }
 
 // ---------------------------------------------------------------------------
+// SessionLatch — a session *edge*, which is not a readiness source
+// ---------------------------------------------------------------------------
+
+/// Did a pty slave open and close since the last time this was asked?
+///
+/// **This is not a readiness mechanism and must never become one** (invariant 1,
+/// §15.18). The ban there is on `AsyncFd`/epoll as the answer to *"is this fd
+/// readable"* on a tty-family fd, because epoll persistently reports a pty master
+/// readable while `read` gives `EAGAIN` and busy-loops the single-threaded
+/// runtime. Readiness is still [`poll_ready`]/[`poll_blocking`] and nothing else.
+/// What this answers is a different question — *"did a session boundary happen"* —
+/// which is a level-state question nowhere and an **edge** question everywhere, and
+/// the reason it needs its own mechanism is that on Darwin no level state records
+/// it at all.
+///
+/// # Why it exists
+///
+/// §6's detach-release frees an on-demand write lock when a pty client leaves, and
+/// `nodes/pty.rs`'s reader recognises "a client was here" from evidence the client
+/// left on the master (invariant 16): a `TIOCPKT_DATA` payload, or the
+/// `TIOCPKT_IOCTL` packet a `tcsetattr` provokes. Linux keeps that packet readable
+/// *past* the hangup, so a session collapsed inside one poll gap is still seen.
+/// **Darwin does not**: `ptsclose` → `ttyclose` flushes both tty queues at the
+/// slave's last close, and every level-triggered observable afterwards — poll
+/// revents, `FIONREAD`, `TIOCOUTQ`, `TIOCGPGRP`, `TIOCMGET`, `TIOCGWINSZ`, the pts
+/// inode's timestamps — is byte-identical to no session having happened. A client
+/// that opened, called `tcsetattr` and closed inside one 5 ms poll gap therefore
+/// kept its write lock forever, with the endpoint dead to every other writer
+/// (measured 20/20 against the shipped daemon before this existed).
+///
+/// A `kqueue` knote registered `EVFILT_READ | EV_CLEAR` does carry that edge.
+/// Measured on macOS 15.7.8 / Darwin 24.6.0 against a pair built the way
+/// `PtyNode::setup` builds one: a collapsed termios-only session posts `EV_EOF`
+/// 5 times out of 5, a bare open→close posts it too, and an idle hung-up master
+/// posts **nothing across 200 daemon-shaped poll+read passes** — which is the
+/// property that keeps this from re-firing the last-close handler forever, the
+/// 99%-CPU shape `b8d8ed8` records.
+///
+/// # Two rules for the caller, and both are measured forge sites
+///
+/// 1. **The edge must not feed the backoff.** Set the caller's session latch and
+///    nothing else; an edge is not data, so it must not mark the pass productive,
+///    or an idle console stops backing off toward `IDLE_POLL`.
+/// 2. **The daemon forges these edges itself.** Any momentary slave open the node
+///    performs — §7.2's baseline re-assert, the last-close hostward flush, the
+///    termios reconciliation backstop — posts an `EV_EOF` indistinguishable from a
+///    client's (measured 3/3). So [`discard`](Self::discard) after any block that
+///    opens the slave, and note that [`watch`](Self::watch) swallows the
+///    registration edge for the same reason: registering on a master that is
+///    *already* hung up posts one immediately, and every pty node starts there,
+///    because setup primes the slave and closes it.
+///
+/// # Platform
+///
+/// Real on macOS, inert everywhere else, and the split is `macos` rather than this
+/// crate's usual `linux`/not-`linux` because the claim is a *measurement* and macOS
+/// is where it was taken. Linux needs nothing — it retains the packet, which
+/// `nexus-doctor` P7 reports as `latch_covers_termios_only_session: true` on both
+/// kernels of record (6.18 and 7.0) — so there the latch is a no-op that costs one
+/// never-taken branch per poll. Other BSDs have `kqueue` and would very likely
+/// behave as Darwin does, but nobody has measured them, and a latch that silently
+/// claimed to work there would be exactly the unmeasured claim §15.17 exists to
+/// prevent. `nexus-doctor`'s P12 reports what this mechanism does on whatever
+/// kernel it runs on.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct SessionLatch {
+    kq: RawFd,
+}
+
+#[cfg(target_os = "macos")]
+impl SessionLatch {
+    /// Register an edge watch on `fd` (a pty master), consuming whatever the
+    /// registration itself posts. See the type's rule 2.
+    pub fn watch(fd: RawFd) -> std::io::Result<Self> {
+        // Safety: `kqueue()` takes no arguments and returns a fresh fd or -1.
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Constructed before the registration so an early return still closes the
+        // descriptor through `Drop` rather than leaking it.
+        let latch = SessionLatch { kq };
+        let change = libc::kevent {
+            ident: fd as libc::uintptr_t,
+            filter: libc::EVFILT_READ,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // Safety: `changelist` points at one initialized `kevent` the kernel reads
+        // and does not retain; `nevents` is 0, so it writes nothing through the
+        // null `eventlist`. `fd` need only be a valid descriptor at this instant —
+        // the knote holds the kernel's own reference to the file, so the caller may
+        // close `fd` afterwards without invalidating anything here.
+        let rc = unsafe {
+            libc::kevent(
+                latch.kq,
+                &change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        latch.discard();
+        Ok(latch)
+    }
+
+    /// Has a session boundary been posted since the last call? Consumes it.
+    pub fn took_edge(&self) -> bool {
+        self.drain_flags() & libc::EV_EOF != 0
+    }
+
+    /// Throw away anything pending — for use after the caller has itself opened
+    /// and closed the slave (the type's rule 2).
+    pub fn discard(&self) {
+        let _ = self.drain_flags();
+    }
+
+    /// Non-blocking drain of the whole queue, returning the OR of every event's
+    /// flags. Never blocks the runtime thread: the timeout is zero.
+    fn drain_flags(&self) -> u16 {
+        const BATCH: usize = 8;
+        let blank = libc::kevent {
+            ident: 0,
+            filter: 0,
+            flags: 0,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        let zero = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let mut flags: u16 = 0;
+        loop {
+            let mut evs = [blank; BATCH];
+            // Safety: `eventlist` points at `BATCH` initialized `kevent`s the
+            // kernel may overwrite, and it is told exactly that many; the zero
+            // `timeout` makes the call non-blocking.
+            let n = unsafe {
+                libc::kevent(
+                    self.kq,
+                    std::ptr::null(),
+                    0,
+                    evs.as_mut_ptr(),
+                    BATCH as libc::c_int,
+                    &zero,
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            let got = n as usize;
+            for ev in &evs[..got] {
+                flags |= ev.flags;
+            }
+            if got < BATCH {
+                break;
+            }
+        }
+        flags
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SessionLatch {
+    fn drop(&mut self) {
+        // Safety: `self.kq` came from `watch`, is never handed out, and this type
+        // is not `Clone`, so nothing else can be using or closing it. The result is
+        // ignored because `Drop` has nowhere to report it.
+        unsafe { libc::close(self.kq) };
+    }
+}
+
+/// Inert arm — see [`SessionLatch`]'s *Platform* section. Every method is the
+/// "nothing happened" answer, so a caller needs no `cfg` of its own.
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug)]
+pub struct SessionLatch;
+
+#[cfg(not(target_os = "macos"))]
+impl SessionLatch {
+    /// Always succeeds and watches nothing.
+    pub fn watch(_fd: RawFd) -> std::io::Result<Self> {
+        Ok(SessionLatch)
+    }
+
+    /// Always `false`: on Linux the retained packet is the mechanism (doctor P7).
+    pub fn took_edge(&self) -> bool {
+        false
+    }
+
+    /// Nothing to discard.
+    pub fn discard(&self) {}
+}
+
+// ---------------------------------------------------------------------------
 // Capability-probe helpers (§15.17) — instruments, not data-plane primitives
 //
 // Everything from here down exists for `nexus-doctor`: it *measures* a kernel
@@ -593,6 +797,179 @@ pub fn pending_output_bytes(_fd: RawFd) -> nix::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pty pair built the way `PtyNode::setup` builds one — baseline termios
+    /// through a momentary slave open, packet mode on the master, slave primed
+    /// once, master non-blocking — so [`SessionLatch`] is measured against the
+    /// pair it actually meets. Priming is load-bearing: a master whose slave has
+    /// *never* been opened does not hang up, so a test that skips it measures a
+    /// quiescent fd and passes whatever the latch does.
+    #[cfg(target_os = "macos")]
+    fn latch_pair() -> (nix::pty::PtyMaster, String) {
+        use nix::fcntl::OFlag;
+        use nix::pty::{grantpt, posix_openpt, unlockpt};
+        use std::os::fd::AsRawFd;
+
+        let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY).expect("posix_openpt");
+        grantpt(&master).expect("grantpt");
+        unlockpt(&master).expect("unlockpt");
+        let pts = ptsname(&master).expect("ptsname");
+        {
+            // Baseline through the slave (the BSD arm of §7.2), then prime.
+            let slave = open_slave(&pts);
+            let mut t = nix::sys::termios::tcgetattr(&slave).expect("tcgetattr");
+            nix::sys::termios::cfmakeraw(&mut t);
+            nix::sys::termios::tcsetattr(&slave, nix::sys::termios::SetArg::TCSANOW, &t)
+                .expect("tcsetattr");
+        }
+        set_packet_mode(master.as_raw_fd(), true).expect("TIOCPKT");
+        drop(open_slave(&pts)); // prime
+        set_nonblocking(master.as_raw_fd()).expect("nonblocking");
+        (master, pts)
+    }
+
+    /// Open the slave the way a client does — never adopting it as this process's
+    /// controlling terminal.
+    #[cfg(target_os = "macos")]
+    fn open_slave(pts: &str) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(pts)
+            .unwrap_or_else(|e| panic!("open pty slave {pts}: {e}"))
+    }
+
+    /// One collapsed *termios-only* session: open, `tcsetattr`, close, with no
+    /// data byte anywhere — the shape that leaves nothing on a Darwin master and
+    /// so leaked its write lock before the latch existed.
+    #[cfg(target_os = "macos")]
+    fn termios_only_session(pts: &str) {
+        let slave = open_slave(pts);
+        let mut t = nix::sys::termios::tcgetattr(&slave).expect("tcgetattr");
+        t.local_flags.toggle(nix::sys::termios::LocalFlags::ECHO);
+        nix::sys::termios::tcsetattr(&slave, nix::sys::termios::SetArg::TCSANOW, &t)
+            .expect("tcsetattr");
+    }
+
+    /// The property the whole type exists for: a session carrying **no data byte**
+    /// is still visible afterwards, on a kernel where no level state records it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_collapsed_termios_only_session_posts_a_session_edge() {
+        use std::os::fd::AsRawFd;
+        let (master, pts) = latch_pair();
+        let latch = SessionLatch::watch(master.as_raw_fd()).expect("watch the master");
+
+        for trial in 0..5 {
+            termios_only_session(&pts);
+            assert!(
+                latch.took_edge(),
+                "trial {trial}: a collapsed termios-only session left no edge — \
+                 `nodes/pty.rs`'s last-close handler has nothing to fire on, so an \
+                 on-demand holder that attached and left inside one poll gap keeps \
+                 its write lock (§6 detach-release, invariant 16)"
+            );
+        }
+    }
+
+    /// Rule 1 of the type's contract, and the anti-spin property: once consumed,
+    /// an idle hung-up master posts nothing. Without this the last-close handler
+    /// re-fires every pass — the 99%-CPU shape `b8d8ed8` records — and, worse, it
+    /// would release a write lock an operator took with *no client attached*.
+    ///
+    /// Shaped like the reader's own pass (poll, then read, then ask) because that
+    /// is the sequence whose side effects could re-arm the knote.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_idle_hung_up_master_posts_no_edge_across_many_passes() {
+        use std::os::fd::AsRawFd;
+        let (master, _pts) = latch_pair();
+        let fd = master.as_raw_fd();
+        let latch = SessionLatch::watch(fd).expect("watch the master");
+
+        let mut buf = [0u8; 256];
+        let mut spurious = 0;
+        for _ in 0..200 {
+            let _ = poll_ready(fd, nix::poll::PollFlags::POLLIN);
+            let _ = read_fd(fd, &mut buf);
+            if latch.took_edge() {
+                spurious += 1;
+            }
+        }
+        assert_eq!(
+            spurious, 0,
+            "an idle master posted {spurious} phantom session edges in 200 passes; \
+             each one re-fires the last-close handler and releases a lock nobody's \
+             client took"
+        );
+    }
+
+    /// Rule 2, the forge site closest to hand: registering on a master that is
+    /// *already* hung up posts an immediate `EV_EOF`, and every pty node starts
+    /// exactly there because `setup` primes the slave and closes it. `watch` must
+    /// swallow it, or the node's first pass invents a session that never happened.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn watch_swallows_the_edge_its_own_registration_posts() {
+        use std::os::fd::AsRawFd;
+        let (master, _pts) = latch_pair(); // leaves the pair primed and hung up
+        let latch = SessionLatch::watch(master.as_raw_fd()).expect("watch the master");
+        assert!(
+            !latch.took_edge(),
+            "registering on an already-hung-up master handed its own EV_EOF to the \
+             caller — the pty reader would take it for a client session on its very \
+             first pass (SessionLatch rule 2)"
+        );
+    }
+
+    /// The daemon opens the slave itself — §7.2's baseline re-assert, the
+    /// last-close hostward flush, the reconciliation backstop — and each of those
+    /// forges an edge indistinguishable from a client's. This pins that they *do*
+    /// forge one, so the caller's obligation to [`SessionLatch::discard`] after
+    /// such a block is a measured requirement rather than defensive habit.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_daemon_side_momentary_slave_open_forges_an_edge_that_discard_clears() {
+        use std::os::fd::AsRawFd;
+        let (master, pts) = latch_pair();
+        let latch = SessionLatch::watch(master.as_raw_fd()).expect("watch the master");
+
+        drop(open_slave(&pts)); // what `apply_baseline` / `flush_hostward_queue` do
+        assert!(
+            latch.took_edge(),
+            "a momentary slave open posted no edge, so this test can no longer \
+             prove why `discard` is required after the last-close block"
+        );
+        // And `discard` really clears it, which is the half the caller depends on.
+        drop(open_slave(&pts));
+        latch.discard();
+        assert!(
+            !latch.took_edge(),
+            "`discard` left an edge behind — the last-close handler's own slave \
+             opens would re-fire it on the next pass"
+        );
+    }
+
+    /// The inert arm is still a *type* the daemon compiles against, so keep one
+    /// assertion on it: it must answer "no session" rather than panicking or
+    /// failing to construct. On Linux that is the correct answer — the retained
+    /// `TIOCPKT_IOCTL` packet is the mechanism there (`nexus-doctor` P7
+    /// `latch_covers_termios_only_session: true` on both 6.18 and 7.0).
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_inert_latch_constructs_and_reports_no_session() {
+        use nix::fcntl::OFlag;
+        use nix::pty::posix_openpt;
+        use std::os::fd::AsRawFd;
+
+        let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY).expect("posix_openpt");
+        let latch = SessionLatch::watch(master.as_raw_fd()).expect("watch is infallible here");
+        assert!(!latch.took_edge());
+        latch.discard();
+        assert!(!latch.took_edge());
+    }
 
     /// Two masters resolved concurrently must each keep their *own* slave path
     /// (§7.2: the path becomes a `pty` node's stable symlink, so a swap is a

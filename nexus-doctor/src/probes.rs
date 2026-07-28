@@ -778,6 +778,179 @@ fn p7_shape(shape: SessionShape) -> anyhow::Result<ShapeResult> {
 }
 
 // ---------------------------------------------------------------------------
+// P12 — session-boundary EDGE evidence (§15.39, §6 detach-release)
+//
+// P7's sibling, and deliberately the same question asked of the *other*
+// mechanism. P7 measures what a collapsed session leaves **readable** on the
+// master; this measures whether the session boundary is reported as an **edge**
+// where it leaves nothing readable at all. Between them a reader can always tell
+// which of the two carries detach-release on the kernel in front of them — which
+// matters because the answer is different on Linux and Darwin and the failure
+// they guard against (a leaked write lock) looks identical either way.
+//
+// Not `#[cfg]`-gated for the reason P8 states: `nexus_sys::SessionLatch` has an
+// inert arm off macOS, so this file has one code path and the probe reports
+// `skipped` where the mechanism is not the one in use.
+// ---------------------------------------------------------------------------
+
+/// One trial's answer: did the latch report an edge for this session shape?
+fn p12_shape(shape: SessionShape) -> anyhow::Result<bool> {
+    let master = new_master()?;
+    let pts = sys::ptsname(&master)?;
+    let fd = master.as_raw_fd();
+    sys::set_nonblocking(fd)?;
+    apply_pty_baseline(&master, &pts)?;
+    sys::set_packet_mode(fd, true)?;
+    // Prime and quiesce exactly as `PtyNode::setup` does, then watch. `watch`
+    // swallows the registration edge, which is itself part of the contract being
+    // measured — a latch that handed that one back would report an edge here for
+    // every shape, including "nothing happened".
+    {
+        let prime = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+        std::thread::sleep(PTY_SETTLE);
+        drop(prime);
+    }
+    std::thread::sleep(PTY_SETTLE);
+    let latch = sys::SessionLatch::watch(fd)?;
+
+    let slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+    match shape {
+        SessionShape::OpenClose => {}
+        SessionShape::Termios => {
+            let mut t = tcgetattr(&slave)?;
+            t.local_flags.insert(LocalFlags::ECHO);
+            tcsetattr(&slave, SetArg::TCSANOW, &t)?;
+        }
+        SessionShape::Write => {
+            let _ = sys::write_fd(slave.as_raw_fd(), b"x");
+        }
+    }
+    drop(slave);
+    std::thread::sleep(PTY_SETTLE);
+    Ok(latch.took_edge())
+}
+
+/// The anti-spin half: how many edges does an **idle**, hung-up master post
+/// across `passes` reader-shaped passes? Anything but zero re-fires the last-close
+/// handler forever.
+fn p12_idle_edges(passes: u32) -> anyhow::Result<u64> {
+    let master = new_master()?;
+    let pts = sys::ptsname(&master)?;
+    let fd = master.as_raw_fd();
+    sys::set_nonblocking(fd)?;
+    apply_pty_baseline(&master, &pts)?;
+    sys::set_packet_mode(fd, true)?;
+    {
+        let prime = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+        std::thread::sleep(PTY_SETTLE);
+        drop(prime);
+    }
+    std::thread::sleep(PTY_SETTLE);
+    let latch = sys::SessionLatch::watch(fd)?;
+    let mut buf = [0u8; 256];
+    let mut edges = 0u64;
+    for _ in 0..passes {
+        // The reader's own shape: poll, read, then ask the latch — that sequence's
+        // side effects are what could re-arm the knote.
+        let _ = sys::poll_ready(fd, PollFlags::POLLIN | PollFlags::POLLHUP);
+        let _ = sys::read_fd(fd, &mut buf);
+        if latch.took_edge() {
+            edges += 1;
+        }
+    }
+    Ok(edges)
+}
+
+/// Does an edge latch on a pty master report a session that left nothing readable?
+///
+/// `nodes/pty.rs` releases a detached client's write lock on
+/// `!present_now && (was || saw_session)`, and `saw_session` is armed two ways: by
+/// a readable packet (P7's subject, the Linux mechanism) or by a session-boundary
+/// edge (`nexus_sys::SessionLatch`, §15.39, the Darwin one). Darwin's `ttyclose`
+/// flushes both tty queues at the slave's last close, so the packet is gone and
+/// **the edge is the only mechanism left**; a kernel where neither works leaks the
+/// write lock on every collapsed session, silently, which is precisely the failure
+/// P7's `degraded` arm describes and this probe's `degraded` arm inherits.
+///
+/// Three things are reported and all three are load-bearing. Whether the
+/// **termios-only** shape posts an edge is the property `p9_pty_collapse` asserts
+/// end to end. Whether an **idle** master posts one is the anti-spin property: a
+/// non-zero count there means the last-close handler re-fires forever *and*
+/// releases a lock no client ever took, which is worse than the leak it fixes. And
+/// the **bare open/close** shape is reported because Darwin covers it where Linux
+/// does not — an asymmetry worth seeing in a diff rather than discovering.
+pub fn p12_session_edge() -> Probe {
+    let p = Probe::new(
+        "P12",
+        "session-boundary edge on a pty master",
+        "Does an edge latch report a collapsed client session that left nothing readable on the master, and does it stay silent while idle?",
+    );
+    // The inert arm is not a failure: on Linux the retained packet is the
+    // mechanism and P7 measures it, so there is nothing here to be wrong.
+    if !cfg!(target_os = "macos") {
+        return p.verdict(
+            Status::skipped("nexus-sys's SessionLatch is inert on this platform"),
+            "The session boundary is carried by the retained `TIOCPKT_IOCTL` packet here, which P7 measures — nothing is untested, only unmeasurable by this route (§15.39, §13).",
+        );
+    }
+
+    let mut p = p;
+    let mut termios_edge = None;
+    for shape in [
+        SessionShape::OpenClose,
+        SessionShape::Termios,
+        SessionShape::Write,
+    ] {
+        match p12_shape(shape) {
+            Ok(edge) => {
+                p = p.observe(&format!("{}_edge", shape.key()), edge);
+                if matches!(shape, SessionShape::Termios) {
+                    termios_edge = Some(edge);
+                }
+            }
+            Err(e) => {
+                p = p.observe(
+                    &format!("{}_edge", shape.key()),
+                    format!("probe error: {e}"),
+                )
+            }
+        }
+    }
+
+    let idle = p12_idle_edges(200);
+    p = p.observe(
+        "idle_edges_in_200_passes",
+        match &idle {
+            Ok(n) => serde_json::json!(n),
+            Err(e) => serde_json::json!(format!("probe error: {e}")),
+        },
+    );
+
+    match (termios_edge, idle) {
+        (Some(true), Ok(0)) => p.verdict(
+            Status::Supported,
+            "A collapsed termios-only session posts a session-boundary edge and an idle hung-up master posts none in 200 reader-shaped passes: `pty.rs`'s `saw_session` latch is armed by the edge where this kernel keeps no readable evidence, so detach-release covers the `stty`/health-check/scripted shape (§6, §15.39). This is the mechanism `p9_pty_collapse` asserts end to end here.",
+        ),
+        // Any nonzero idle count is the dangerous direction and gets said first:
+        // it releases a lock nobody's client took, on every pass.
+        (_, Ok(n)) if n > 0 => p.verdict(
+            Status::Degraded,
+            &format!(
+                "An idle, hung-up master posted {n} session edge(s) in 200 passes. That re-fires `pty.rs`'s last-close handler on a pair no client has touched — releasing a write lock the operator took, and burning the runtime thread doing it. `SessionLatch`'s discard sites (§15.39) or this kernel's `EV_CLEAR` semantics have changed; re-check both before trusting detach-release here."
+            ),
+        ),
+        (Some(false), _) => p.verdict(
+            Status::Degraded,
+            "A collapsed termios-only session posts NO session-boundary edge on this kernel. With P7 also reporting nothing readable, `pty.rs`'s last-close latch has neither mechanism to arm on, so a client that opens, calls tcsetattr and closes inside one poll gap keeps its write lock until the node is removed or another writer steals it (§6) — silently. Read P7 beside this: if *it* is `supported`, the packet is carrying detach-release here and this is only an unused second route.",
+        ),
+        _ => p.verdict(
+            Status::Degraded,
+            "The session-edge measurement did not complete, so which mechanism carries detach-release on this kernel is unknown. Read P7: if it reports readable evidence, the packet route is intact regardless (§6, §15.39).",
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // P8 — epoll vs read(2) on a pty master (invariant 1, §15.18, §13)
 //
 // Linux-only in substance, but NOT `#[cfg]`-gated: `nexus_sys::Epoll` keeps a

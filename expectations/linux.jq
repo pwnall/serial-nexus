@@ -18,7 +18,7 @@
 #     reachable: it means the rig did not round-trip data, which §15.21 makes a
 #     stop condition before any tiered checklist item runs.
 #
-# The kernel-diff probes (P6..P11) are gated on PRESENCE, not on a particular
+# The kernel-diff probes (P6..P12) are gated on PRESENCE, not on a particular
 # answer. This is the 6.18 re-gate command (§7: `nexus-doctor --json | jq -e -f
 # expectations/linux.jq`), and its job there is to prove the *artifact* is
 # complete — every measurement block the 7.0 baseline has, so the two runs are
@@ -57,13 +57,20 @@ and (any(.probes[]; .id == "P8" and (.status == "supported" or .status == "skipp
 and (any(.probes[]; .id == "P9" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P10" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P11" and (.status == "supported" or .status == "degraded" or .status == "skipped")))
+# P12 (session-boundary edge, §15.39) is inert on Linux by design — the retained
+# `TIOCPKT_IOCTL` packet carries §6's detach-release here, which is P7's subject —
+# so `skipped` is the *expected* answer and the clause is presence-only. It is
+# gated tightly on macOS instead (`expectations/macos.jq`), which is the platform
+# where it is the only mechanism. `supported` would mean a Linux kernel grew the
+# edge too, which is interesting and not a failure.
+and (any(.probes[]; .id == "P12" and .status != "unsupported"))
 # And the clause that makes the ones above worth having: a kernel-diff probe that
 # RAN must carry measurements. A verdict word cannot be diffed, so a probe whose
 # observations went empty would pass every clause above while making the 6.18 run
 # useless. (`skipped` is exempt — it measured nothing by definition, and its
 # `reason` says why.)
 and (all(.probes[]; . as $p
-      | ((["P6","P7","P8","P9","P10"] | index($p.id)) == null)
+      | ((["P6","P7","P8","P9","P10","P12"] | index($p.id)) == null)
       or ($p.status == "skipped")
       or (($p.observations | length) > 0)))
 # And the clause that closes the hole the 2026-07-27 6.18 run walked through: an

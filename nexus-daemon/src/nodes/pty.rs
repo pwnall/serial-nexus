@@ -847,6 +847,22 @@ async fn read_and_poll(
     // that only configures the line writes no byte and still has to release its
     // lock. See the close block below.
     let mut saw_session = false;
+    // …and the second way that latch is armed, because on some kernels the
+    // evidence above does not survive the hangup at all. Darwin's `ttyclose`
+    // flushes both tty queues at the slave's last close, so a session collapsed
+    // inside one poll gap leaves the master byte-identical to no session having
+    // happened — the write lock then stayed held with the endpoint dead to every
+    // other writer (measured 20/20 before this). `SessionLatch` carries the
+    // boundary as an *edge* where no level state records it; it is emphatically
+    // **not** a readiness source (invariant 1's ban is on `AsyncFd`/epoll
+    // answering "is this fd readable", which is still `poll_ready`'s job and only
+    // its job — see the type's doc, §15.39).
+    //
+    // Inert on Linux, where the retained packet already arms `saw_session`
+    // (`nexus-doctor` P7 `latch_covers_termios_only_session: true` on 6.18 and
+    // 7.0), so this costs one never-taken branch per pass there. A `watch` that
+    // fails leaves `None`, which behaves exactly as before it existed.
+    let session_latch = sys::SessionLatch::watch(fd).ok();
     // A payload already read off the master that the host endpoint's bounded
     // targetward channel could not take yet (CONC-1). Holding it here — rather
     // than parking the task inside the drain on `send().await` — is what keeps the
@@ -1068,6 +1084,25 @@ async fn read_and_poll(
         // handler every pass (the 99%-CPU shape the `b8d8ed8` note records). Consume
         // it, and the anti-spin argument needs no assumption about POLLIN going
         // quiet after a hangup — which is a kernel-version-dependent claim (§13).
+        // The kernel's own answer to "was a client here", consumed once per pass.
+        // Deliberately folded into `saw_session` rather than added as a third
+        // disjunct below: it is the *same* fact — a session happened — arriving by
+        // another road, and one predicate is what keeps the close block's reasoning
+        // reviewable. Equally deliberately it does **not** touch `did`: an edge is
+        // not data, and marking the pass productive would stop an idle console
+        // backing off toward `IDLE_POLL` (`SessionLatch` rule 1).
+        //
+        // Safe to read on every pass, including while a client is attached. An edge
+        // taken then sets the latch early, but `was` is true by that point, so the
+        // close block fires on the presence edge exactly as it always did and clears
+        // the latch on its way out.
+        if session_latch
+            .as_ref()
+            .is_some_and(sys::SessionLatch::took_edge)
+        {
+            saw_session = true;
+        }
+
         let present_now = now && !closed;
         let was = present.swap(present_now, Ordering::Relaxed);
         if !present_now && (was || saw_session) {
@@ -1132,6 +1167,20 @@ async fn read_and_poll(
                 0
             };
             record_detach_purge(held + residual, &origin, &loss.targetward);
+            // The handler just opened the slave itself, twice — `apply_baseline`
+            // re-asserts the §7.2 baseline through a momentary open on BSD, and
+            // `flush_hostward_queue` opens it to drain the pair — and each of those
+            // posts an edge the kernel cannot distinguish from a client's (measured
+            // 3/3; `SessionLatch` rule 2). Consume them here, where `saw_session`
+            // has just been cleared, or the next pass reads the daemon's own
+            // footsteps as a new session and re-fires this block forever.
+            //
+            // This is the same shape as the `drain_and_discard` above it: both
+            // exist because the last-close handler is loud enough to re-trigger
+            // itself, on two different channels.
+            if let Some(latch) = &session_latch {
+                latch.discard();
+            }
         }
         // BSD/macOS only: the slave's termios resets to cooked when the last slave
         // fd closes (verified: a momentary daemon-side set does not survive to the
