@@ -1,0 +1,42 @@
+{
+  "enabledPlugins": {
+    "frontend-design@claude-plugins-official": true
+  },
+  "permissions": {
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(cargo check *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo deny *)",
+      "Bash(cargo metadata *)",
+      "Bash(cargo tree *)",
+      "Bash(./target/debug/nexus-doctor)",
+      "Bash(./target/debug/nexus-doctor --json)",
+      "Bash(./target/debug/nexus-doctor --markdown)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(git ls-files *)",
+      "Bash(git blame *)",
+      "Bash(rg *)",
+      "Bash(grep *)",
+      "Bash(sed -n *)",
+      "Bash(jq *)",
+      "Bash(ls *)",
+      "Bash(wc *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(du *)",
+      "Bash(uptime)",
+      "Bash(uname *)",
+      "Bash(pgrep *)",
+      "Bash(nproc)"
+    ]
+  }
+}

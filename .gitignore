@@ -9,3 +9,10 @@
 /serialnexusweb/ui-tests/node_modules
 /serialnexusweb/ui-tests/test-results
 /serialnexusweb/ui-tests/playwright-report
+
+# Claude Code. `/.claude/settings.json` IS tracked — it is shared project
+# configuration (the permission allowlist, the enabled plugins). What is excluded
+# is machine-local: a runtime lock, and the personal-override file whose whole
+# purpose is to not be shared.
+/.claude/scheduled_tasks.lock
+/.claude/settings.local.json

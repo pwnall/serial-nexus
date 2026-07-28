@@ -974,6 +974,18 @@ running engineering log and the authoritative "why the code looks like this" rec
 - **`git stash` is as destructive as `git checkout --` when the tree holds a large uncommitted
   change set**, which is the normal state mid-track here. To answer "is this failure ours?", add a
   throwaway `git worktree` at the last commit, build there, and compare — it touches nothing.
+- **`.claude/settings.json` is tracked, and its permission allowlist is deliberately narrow — the
+  omissions are the point.** It pre-approves the build/test/lint loop (`cargo build|test|check|clippy|
+  fmt|deny`), read-only git (`status`/`diff`/`log`/`show`/`ls-files`/`blame`) and read-only shell
+  (`rg`, `grep`, `sed -n`, `jq`, `ls`, `wc`, `head`, `tail`, `pgrep`). It does **not** carry
+  `Bash(git *)` or `Bash(cargo *)`, and must not grow them: a blanket `git` rule re-enables
+  `checkout --`, `stash`, `reset --hard` and `push` — three of which are the hazards listed
+  immediately above — and a blanket `cargo` rule covers `cargo run`/`install`. `pkill` is absent for
+  the §8 reason at the top of this list, and `find` for `-delete`/`-exec rm`. `nexus-doctor` is
+  allowed only in its **passive** forms, so a `--port` run still prompts: opening a port toggles DTR
+  on equipment that may be live, which is the same doctrine that makes those probes opt-in (§7.1,
+  design §15.17). `.claude/scheduled_tasks.lock` and `settings.local.json` are gitignored — machine
+  state and personal overrides, respectively.
 
 ## 9. How work has been done here (the working rhythm)
 
