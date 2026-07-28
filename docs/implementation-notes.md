@@ -1,6 +1,6 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-27 (**phases 0-8 + simplification + extension + web-console + v10 + v11
+**As of:** 2026-07-28 (**phases 0-8 + simplification + extension + web-console + v10 + v11
 console-map + review-26 remediation + v12 graph-editing tracks done**, plus the
 **v13 browser-UI automation track** — a pinned Playwright suite in real headless
 Chromium, gated from `nexus-itest`, design §15.37/§15.38, plan §15. The web console's
@@ -11,6 +11,155 @@ browser half is now **CI-verified** rather than checklist-verified: the OPFS spl
 `docs/31-implementation-plan-claude-fable-v13.md` (plan). v1–v12 docs, the review and its
 remediation ledger are in `docs/historical/`. Section references (§) point at the v13
 design.
+
+---
+
+## THE 6.18 KERNEL DIFF — taken at last, and it changed nothing (2026-07-28 session)
+
+P6–P11 were added on 2026-07-26/27 "so the owner can run `nexus-doctor --json` on 6.18 and diff it
+against the 7.0 baseline". **The owner ran it on 2026-07-27 and the diff is now taken.** The scope
+statement, the numbers and the residual gaps live in `docs/nexus-doctor.md`'s 6.18 section — this
+entry records what the exercise cost, what it settled, and the three things about it a future session
+will get wrong.
+
+**Verdict: no code change.** Not one shipped constant, comment, test premise or design claim is
+falsified by the 6.18 numbers. P6 and P7 came back **byte-identical** to a same-day HEAD 7.0 run; P8
+matched on every semantic field; P1/P2/P3's booleans matched; P9's 1/5/10 ms floor agreed within
+8–17 µs; P10 differed by exactly the flip-scheduling case the probe's own text teaches you to
+recognise. Every probe `supported` on both.
+
+**The trap, stated so nobody walks into it.** P6's consequence string says the `saw_session` latch
+"is not what holds the anti-spin argument up on this kernel", and now says it of *both* kernels. That
+reads like a license to delete the latch and it is not one, for three independent reasons. (1)
+`pty.rs` already disclaims dependence on POLLIN going quiet — the anti-spin argument was deliberately
+built kernel-independent, which is why the 7.0-only evidence was never load-bearing in the first
+place. (2) The latch's live justification is **invariant 16 rule (3)**: a collapsed-session write-lock
+leak, measured five of five against a saturated endpoint, about a drain that ends early when the
+endpoint refuses a payload. That is a correctness property no probe measures on any kernel, and it is
+guarded by `p12_pty_setup.rs`, not by the doctor. (3) P6's `handler_reset_readable_bytes: 1` reads
+**identically on 6.18**, which confirms the last-close drain load-bearing on the production kernel
+rather than removable. The run's only new positive is that P7's widened-latch premise holds there —
+`latch_covers_termios_only_session: true` — retiring the risk that probe was written to name.
+
+**Three named hedges the run positively answers.** `nexus-sys`'s TIOCOUTQ-on-a-pty comment called
+itself "exactly the quiet 6.18-vs-7.0 difference this section exists to surface": 6.18 answers
+`pending_output_bytes: 0` in both directions, same as 7.0. P7's own "if 6.18 leaves nothing there, the
+widened latch silently fails" is retired on the probe's terms. And P2's `hup_after_close: true` is the
+precondition `p12_sim_idle_cpu` reads out of `--json`, so that guard would *run* on the production
+kernel rather than self-skipping there — if the suite were ever run there, which it never has been.
+
+**What the diff cost, the instrumentation gap it exposed, and the fix.** Establishing that the 6.18
+report came from a **`fe1c52c`-vintage binary rather than HEAD** took forensics on a *section title*:
+its P4 block is the pre-`RES-2` "by-id resolution ground truth" shape. Nothing in the artifact said
+which build produced it — the header was a bare `nexus-doctor v0.2.0`, the JSON carried only
+`tool`/`version`/`generated_unix_ms`, and `to_markdown` dropped even that timestamp, so a *committed*
+6.18 Markdown would have dated itself only by its commit. `expectations/linux.jq` exists precisely to
+prove the artifact is "diffable field by field" and had no clause that could see it. The vintage turned
+out to be benign — `git diff fe1c52c a2d3b96 -- nexus-doctor/src/probes.rs` touches only
+`p4_resolver`, `environment()` and tests, so P1–P3 and P6–P11 are validly diffable — but that was luck,
+established after the fact.
+
+Both renderers now open with a **Build** block: `commit`, `probe set`, `generated` (UTC). **Two
+identifiers, because they answer different questions**, and the second is the load-bearing one. A
+commit hash says *which tree* and then requires the reader to work out what changed between two of
+them — which is exactly the manual step this session spent. The **probe-set fingerprint** answers what
+a diff actually needs, *are these two artifacts comparable*, in one glance and with no repository
+access. It digests each probe's `(id, title, question)` and deliberately **not** its observations or
+verdict: those are the measurements the diff exists to compare, two healthy boxes differ in them by
+design, and folding them in would report every real cross-kernel pair as incomparable — the field
+being wrong in the direction nobody would notice. FNV-1a over a *length-delimited* encoding, because
+concatenating raw fields lets a title's tail slide into the next question with no change in the digest.
+
+**The pre-commit review caught two blocking defects in this very work, and both are worth recording
+because both were self-defeating.** (1) The first fingerprint digested `(id, title, question)` — and
+P3's *title* embeds the device path while P3 is emitted once per `--port`. The 6.18 box has one
+adapter and the 7.0 box has two, so the very cross-kernel diff the Build block exists to underwrite
+would have carried unequal fingerprints and printed "the numbers below are not comparable field by
+field" over a valid comparison. It now digests the **deduplicated, sorted set of `(id, question)`**,
+and `main`'s no-`--port` placeholders were rewritten to carry `probes::P3_QUESTION` /
+`probes::P5_QUESTION` verbatim, because a paraphrased placeholder made a passive run and a rig run of
+the *same binary* disagree. Measured after the fix: passive, either single port, and both ports all
+report `68519e193e4c84d8`. (2) The new `.build.*` jq clauses **falsified two claims this same change
+set was making** — that the 2026-07-27 6.18 report satisfies every clause of `linux.jq` and that
+`linux.jq` is byte-identical across the two vintages. A `fe1c52c` binary emits no `build` object, so
+that artifact would now fail the gate. Both statements are corrected in place rather than deleted:
+the inference held against the file *as it stood*, and saying so is what keeps the re-run
+recommendation honest.
+
+The same review found two defects in the *Tier* work committed alongside. `RigFacts` counted
+certificate **attempts**, but `p5_certify_pair` returns early before the mismatch block whenever a
+port will not reopen — so P11 could still blame an item that never put a byte on the wire, which is
+the entire defect the thread was added to remove. And a discovered pair that failed to reopen left no
+observation, no failure and no fact, so `tier()` fell to 1 and P5 printed "**Tier 1** — a dangling
+converter" directly above its own observation line reading `paired with …`. Both are fixed by
+splitting the one count into two facts — `discovered_pairs` (the topology, which is what a *tier*
+is) and `mismatch_pairs` (traffic that actually reached the wire, gated on a new
+`Certificate::mismatch_transmitted`) — and by making the silent `continue` record an uncertified-pair
+failure, which is §15.21's degrade case. P5 now has a fourth sentence for Tier-3 wiring whose
+certificate did not complete, and P11's guidance is three-valued rather than two, since a Tier-2
+operator was being told to reason about "a dangling port" that was not theirs.
+
+Three implementation notes worth keeping. (1) **Dependency-free by requirement** — the doctor's
+dependency list is part of the licensing gate, so `build.rs` shells out to `git` with `std` alone (no
+`vergen`, no `git2`) and the UTC rendering is Hinnant's `civil_from_days` rather than a date crate;
+both are ~25 lines with unit tests, and the timestamps were cross-checked against `date -u` on the
+epoch, a 400-divisible leap day, an ordinary leap day and the day after a non-leap century. (2)
+**Every failure path degrades to `unknown`, never to a build failure or a guess** — verified by
+building against a `git` that exits non-zero, which still produced a usable artifact with the
+fingerprint intact. A stamp frozen at first-compile HEAD would be *confidently wrong* provenance, so
+`build.rs` emits `rerun-if-changed` on `.git/HEAD`, the resolved ref and `packed-refs`, and a
+worktree git refuses to read is reported `-unknown-worktree` rather than assumed clean. (3) The jq
+clause asserts **presence, not value**: `commit` may legitimately read `unknown` off a tarball build,
+and reddening a healthy box over that is the false negative P4's clause already refuses to make.
+Guards: `report::tests::{the_utc_stamp_agrees_with_date_on_the_cases_that_break_naive_conversions,
+the_probe_set_fingerprint_moves_on_a_probe_rewrite_and_not_on_a_measurement,
+both_renderers_carry_the_build_identity_and_the_timestamp}`, and the gate itself was proved able to
+fail (`jq 'del(.build)'` and an emptied fingerprint are both rejected).
+
+**Two report-text defects the run surfaced, both Tier-1 over-claims, both now fixed.** They were in
+the operator-facing report AGENTS §3 makes the first attachment on every bug report, and a Tier-1
+dangling converter is §13's *baseline* rig, so neither was exotic — both were on the page the owner
+pasted. (a) P11's consequence text said unconditionally that "a nonzero `frame` here is usually P5's
+deliberate baud-mismatch item", but `p5_certify_pair` runs only over discovered *pairs*, so on a
+one-port box that mechanism provably never transmitted — and the 6.18 report said it anyway over a
+real `frame=4`. (b) `p5_verdict` emitted "Rig discovered and **certified**; every tiered checklist run
+starts from this certificate (§15.21)" for any UART rig, including one where `pairs` was empty and
+neither `integrity` failure site could fire, telling an operator a Tier-2/3 run may start from a
+Tier-1 certificate and never naming the tier.
+
+**The fix is one fact, threaded rather than re-derived.** `p5_rig` now returns `RigFacts` beside its
+`Probe` — the pairs that actually *reached* `p5_certify_pair` (not the pairs discovery found: a pair
+whose ports will not reopen `continue`s past the mismatch) plus the loopback count, with a `tier()`
+of 3/2/1. P5's verdict names that tier and states what it did **not** run; P11 takes the same value
+and only offers the mismatch as an explanation when a pair was certified, otherwise reporting that the
+item did not transmit and how to tell history from crosstalk. The counter is taken where the
+certification happens because the tempting inference is wrong: **`named >= 2` is necessary but not
+sufficient** — two *dangling* ports are two named ports and no pair. Guards
+`probes::tests::the_certificate_names_its_tier_and_what_that_tier_did_not_run` (all three tiers name
+themselves, all three lines differ) and
+`probes::tests::p11_blames_the_baud_mismatch_only_when_a_pair_was_certified`. **Fail-first proved**:
+with both conditionals planted back, exactly those two tests fail and the other 21 pass — which is
+also the measurement of why the defects shipped, the existing folds being blind to the distinction.
+
+**Residual gaps, so "6.18 is confirmed" is not read wider than it is.** The binary vintage leaves
+HEAD's P4/`environment()` rewrite unmeasured there. The box is Tier 1 — one dangling adapter — so
+everything a *pair* certifies is unmeasured, no break was ever observed (`brk = 0`), and every
+`crossover_ports()`-gated test self-skips. Only Markdown was captured, so the `jq -e -f
+expectations/linux.jq` re-gate is satisfied clause by clause on inspection but has never been
+*executed*. And the largest one: **`cargo test --workspace` has never run on 6.18** — CI is
+`ubuntu-latest` + `macos-latest`, so the production kernel's evidence base is eleven probes and zero
+executed tests. One visit with a HEAD binary, both adapters cross-wired, `--json`, and a suite run
+closes all four.
+
+**Neither artifact is in the tree.** Both reports live in a session scratchpad. `docs/nexus-doctor.md`
+says "the report itself is the record" and no such record exists for either kernel, which makes
+"P6/P7 read field-for-field identical" a claim in three documents with nothing in-repo to check it
+against — DOCR-3's shape one level up. Committing both under `docs/doctor/` and pointing the prose at
+them is the fix; it was not done here because the 6.18 Markdown is a chat paste rather than a captured
+file, and a re-run that also closes the vintage and `--json` gaps would produce a better artifact to
+commit than this one. **That re-run is now worth more than it was**: any report it produces will carry
+its own commit, probe-set fingerprint and date, so committing it records provenance rather than
+asserting it.
 
 ---
 
@@ -863,7 +1012,11 @@ a human quitting picocom, which latches presence normally.
 **The one-character fix `|| closed` was deliberately not taken.** `b8d8ed8`'s message records that an
 ungated `closed`-only attempt spun at 99% CPU; `p9_pty_collapse.rs`'s comment records that planting
 that same arm did *not* raise CPU on Linux 7.0. Two credible sources, opposite answers, and AGENTS.md
-§7 forbids a one-way decision on 7.0-only evidence. The shipped fix is **kernel-independent**: the
+§7 forbids a one-way decision on 7.0-only evidence. **(6.18 has since answered: doctor P6 reads
+`pollin_passes: 0` there too, byte-identical to 7.0 — see the 2026-07-28 entry at the top of this
+file. That discharges §7's evidence rule and changes nothing, because the shipped fix never depended
+on it, and because what bars the arm today is invariant 16 rule (3) — a correctness property no probe
+measures.)** The shipped fix is **kernel-independent**: the
 latch (`saw_session`) arms on *any* successful read of `n >= 1`, and `handle_last_close`'s own
 `apply_baseline` packet — indistinguishable by type from a client's, and therefore capable of
 re-arming the widened latch every pass — is consumed by an unconditional drain afterwards, charged to
@@ -907,7 +1060,9 @@ toolchains is a repo-owner decision, not a CI fix.
 ### The six new `nexus-doctor` probes (P6–P11)
 
 Added so the owner can run `nexus-doctor --json` on **6.18** and diff it against the 7.0 baseline
-below. Every probe emits its raw measurements as structured JSON, not just a status word — a human
+below. **That diff was taken on 2026-07-27** — see the 2026-07-28 entry at the top of this file and
+`docs/nexus-doctor.md`'s 6.18 section; the 7.0 readings recorded here are confirmed on the production
+kernel, and none of them changed a line of code. Every probe emits its raw measurements as structured JSON, not just a status word — a human
 diffing two runs must see the numbers. A probe reports what it *observed*: "this kernel differs" is
 `degraded` with the observation named, **never** `unsupported`, because `linux.jq` gates
 `.summary.unsupported == 0` and `meta_gates` asserts the doctor reports no unsupported capability.
@@ -2233,10 +2388,19 @@ never contended. Certify the rig first with `nexus-doctor --port … --port …`
 precondition: a failure is attributable to a loose wire, not the daemon). Verified passing on
 a cross-wired FTDI FT232R pair.
 
-**Kernel matrix:** every kernel-behavior probe is `supported` on **Linux 7.0.0**
-(dev box, Ubuntu 26.04) and **Linux 6.18.14** (Debian rodete) with **zero
-deltas** — see `docs/nexus-doctor.md`. The kernel-sensitive PTY/serial mechanics
-are de-risked across the support matrix.
+**Kernel matrix:** all eleven probes report `supported` on **Linux 7.0.0** (dev
+box, Ubuntu 26.04, HEAD binary, cross-wired pair — 21 · 0 · 0 · 0) and on **Linux
+6.18.14** (Debian rodete, 2026-07-27, `fe1c52c`-vintage binary, one dangling
+adapter — 19 · 0 · 0 · 0). **P6 and P7 are byte-identical across the two**, P8
+matches on every semantic field, P1/P2/P3's booleans match, P9's timer floor
+agrees within 8–17 µs and P10 lands inside the band the probe declares for 7.0
+against itself; the two zero-timeout `poll(2)` costs that differ are box
+properties, not kernel ones (the same 6.18 kernel measured 605 ns and 1162 ns for
+the same code on two dates). So the kernel-sensitive PTY/serial mechanics are
+de-risked across the support matrix — but "zero deltas" would be the wrong
+sentence, and what the 6.18 run does *not* cover (HEAD's P4, everything a paired
+rig certifies, the `--json`/`jq` gate, and `cargo test` at all) is enumerated in
+`docs/nexus-doctor.md`. Read that section, not this line, before acting on it.
 
 ---
 
@@ -2249,7 +2413,7 @@ are de-risked across the support matrix.
 | `nexus-core` | graph model + validator (§4), data-plane deliver contracts + holdover (§5), lock state machine incl. `reclaim_held` (§6), config/state split (§15.8), **device-identity `resolver` (§12)** | done |
 | `nexus-rpc` | JSON-RPC 2.0 wire types — the stable §15.16 surface | done |
 | `nexus-sim` | test double: `pty`/`client`/`mux`/`envelope`/`wire`/`tcp-proxy`/`nullmodem` modes (§3) | done through phase 7 |
-| `nexus-doctor` | shipping capability checker: probes P1–P4 + env checks (§15.17) | done |
+| `nexus-doctor` | shipping capability checker: probes P1–P11 + env checks (§15.17) | done |
 | `serialnexusd` | the daemon | control plane + node lifecycle + data plane + codecs + leg/wire done |
 | `serialnexusctl` | the CLI (thin RPC client + `--json`) | `load [--replace]`/`add-node`/`remove-node [--cascade]`/`dump`/`state`/`subscribe`/`rotate`/`lock`/`unlock`/`send`/`send-break`/`set-modem`/`pulse-dtr`/`teardown`/`shutdown` |
 
@@ -2807,10 +2971,33 @@ Full report: `docs/nexus-doctor.md`. Re-runnable per system with
 - **P2 PTY presence — supported.** Drives the slave-priming refinement (§3.2).
 - **P3 serial fit — supported on real FTDI.** Custom baud (exact), `TIOCEXCL`,
   modem lines, break, `TIOCGICOUNT` all confirmed. Drives §3.1.
-- **P4 by-id resolution — supported.** Canonical `usb:vid:pid:serial:iface` via a
-  dependency-free sysfs *ancestor* walk (nearest `bInterfaceNumber` = interface;
-  first `idVendor` = device — stop there or you bind the root hub). This is the
-  reusable core of the phase-7 resolver.
+- **P4 device identity resolution — supported.** Canonical
+  `usb:vid:pid:serial:iface` via a dependency-free sysfs *ancestor* walk (nearest
+  `bInterfaceNumber` = interface; first `idVendor` = device — stop there or you
+  bind the root hub). This is the reusable core of the phase-7 resolver. Since
+  review 32 (`RES-2`) the probe asks about **devices**, reading the
+  `<sys>/class/tty` listing with `/dev/serial/by-id` as a fast path over it, so it
+  stays `supported` in a no-udev environment instead of skipping in the one place
+  §12's fallback exists for. **That rewrite has no 6.18 evidence** — the 2026-07-27
+  6.18 run predates it (the binary-vintage note in `docs/nexus-doctor.md`).
+- **P5 rig discovery/certification — supported on both kernels, at different
+  tiers.** 7.0 certifies a cross-wired *pair* (rate ladder, deliberate baud
+  mismatch); 6.18 has one dangling adapter, so it certifies per-port only. The
+  word is the same and the coverage is not.
+- **P6 post-hangup pty readiness, P7 collapsed-session evidence — supported, and
+  byte-identical on 7.0 and 6.18.** P6's `handler_reset_readable_bytes: 1` on both
+  is what makes `pty.rs`'s last-close drain load-bearing on the production kernel;
+  P7's two `latch_covers_*` booleans are true on both, retiring the probe's own
+  named risk. **Neither licenses a simplification** — see the 2026-07-28 session
+  entry at the top of this file.
+- **P8 epoll vs `read(2)` — supported, identical on both.** `busy_loop_reproduced:
+  false` on each; scoped to a layer below invariant 1's starvation (tokio's
+  readiness guard, not `epoll_ctl`), so it refutes nothing.
+- **P9 poll timeout granularity, P10 pty buffer depth — supported, numbers within
+  their declared noise on both.** No backoff step and no `hostward_buffer` default
+  moves.
+- **P11 line-state counters — supported.** Both ioctls answer on every named port
+  on both kernels; absolute counts differ by construction.
 
 ---
 

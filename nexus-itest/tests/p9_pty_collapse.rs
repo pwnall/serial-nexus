@@ -249,6 +249,15 @@ fn a_bare_hangup_leaves_the_daemon_cpu_bounded() {
     // this kernel does not exhibit. The guard is kept because it costs one sample
     // and pins the property the review asked for — a hangup leaves no busy loop
     // behind — not because it reproduces a historical failure.
+    //
+    // The production kernel now says the same thing: doctor P6 on 6.18 reads
+    // `pollin_passes: 0` over 64 passes, byte-identical to 7.0 (2026-07-27, see
+    // `docs/nexus-doctor.md`). So the mechanism is absent on *both* kernels and
+    // this comment is no longer a 7.0-scoped observation. That does **not** make
+    // the latch removable: what bars the ungated arm is AGENTS invariant 16
+    // rule (3) — the collapsed-session write-lock leak, a correctness property no
+    // probe measures — and P6's `handler_reset_readable_bytes: 1`, identical on
+    // both kernels, keeps the last-close drain load-bearing.
     const WINDOW: Duration = Duration::from_secs(2);
     const MAX_TICKS: u64 = 20;
 

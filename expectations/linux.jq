@@ -66,3 +66,17 @@ and (all(.probes[]; . as $p
       | ((["P6","P7","P8","P9","P10"] | index($p.id)) == null)
       or ($p.status == "skipped")
       or (($p.observations | length) > 0)))
+# And the clause that closes the hole the 2026-07-27 6.18 run walked through: an
+# artifact must say what produced it. That run came from a `fe1c52c`-vintage
+# binary rather than HEAD, and the only reason anyone noticed was that its P4
+# section still carried the pre-`RES-2` *title* — read by eye, after the fact.
+# Every clause above passed it, because none of them could see the probe set move.
+#
+# `probe_set` is the load-bearing half: two reports with the same fingerprint
+# asked the same questions of their kernels, which is precisely the precondition
+# "diffable field by field" names, and it is computable anywhere. `commit` must be
+# *present* but may read `unknown` — a build from a source tarball, or inside a
+# container without git, cannot know it, and failing a healthy box over that would
+# be the false negative this file's P4 clause already refuses to make.
+and (.build.probe_set | type == "string" and length > 0)
+and (.build.commit | type == "string" and length > 0)

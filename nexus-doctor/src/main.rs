@@ -3,8 +3,8 @@
 //! `nexus-doctor` — the serial_nexus capability checker (design §15.17).
 //!
 //! One consolidated binary that runs every kernel-behavior probe the design
-//! depends on (P1 EXTPROC/TIOCPKT, P2 PTY presence, P3 serial fit, P4 by-id
-//! resolution, P5 rig certification, P6 post-hangup pty readiness, P7 collapsed
+//! depends on (P1 EXTPROC/TIOCPKT, P2 PTY presence, P3 serial fit, P4 device
+//! identity resolution, P5 rig certification, P6 post-hangup pty readiness, P7 collapsed
 //! client-session evidence, P8 epoll vs read(2) on a pty master, P9 poll(2)
 //! timeout granularity, P10 pty buffer depth, P11 real-port line-state counters)
 //! plus environment checks, and emits a copy-pasteable Markdown report — the
@@ -76,10 +76,14 @@ fn main() {
         probes::p4_resolver(&cli.dev_root, &sys_root),
     ];
     if cli.ports.is_empty() {
+        // The question must be `probes::P3_QUESTION` verbatim, not a paraphrase:
+        // it feeds the probe-set fingerprint, so a placeholder that words the
+        // question differently makes a passive run and a rig run of the *same
+        // binary* report themselves as incomparable.
         probe_list.push(report::Probe::new(
             "P3",
             "serial-port fit",
-            "Custom baud, TIOCEXCL exclusivity, modem lines, and break on a real port (§7.1).",
+            probes::P3_QUESTION,
         ).verdict(
             report::Status::skipped("no --port named"),
             "Re-run with --port /dev/ttyUSB0 (a dangling converter is enough — no target device needed, §13).",
@@ -92,12 +96,17 @@ fn main() {
 
     // P5 rig discovery + certification (§15.21). Opt-in like P3 — it transmits, so
     // it runs only on explicitly named ports; it classifies them collectively.
+    //
+    // What it discovers outlives the probe: P11 below reads the same ports and
+    // must not explain their counters with an item P5 never transmitted. A skipped
+    // P5 leaves the default — no certified pair, which is exactly true.
+    let mut rig = probes::RigFacts::default();
     if cli.ports.is_empty() {
         probe_list.push(
             report::Probe::new(
                 "P5",
                 "rig discovery and certification",
-                "Classify named ports (dangling/loopback/paired) and certify the rig (§15.21).",
+                probes::P5_QUESTION,
             )
             .verdict(
                 report::Status::skipped("no --port named"),
@@ -106,7 +115,9 @@ fn main() {
         );
     } else {
         let resolver = nexus_core::Resolver::with_roots(&cli.dev_root, &sys_root);
-        probe_list.push(probes::p5_rig(&cli.ports, &resolver));
+        let (p5, facts) = probes::p5_rig(&cli.ports, &resolver);
+        probe_list.push(p5);
+        rig = facts;
     }
 
     // P6/P7 — the two pty last-close measurements (§6 detach-release, §7.2). Both
@@ -130,7 +141,13 @@ fn main() {
     // it opens a real device (which toggles DTR), though it transmits nothing and
     // leaves the port's settings untouched. `p11_line_state` reports the skip
     // itself when the list is empty, so there is no placeholder branch here.
-    probe_list.push(probes::p11_line_state(&cli.ports));
+    //
+    // It is handed P5's `RigFacts` because the counters it prints are only
+    // explicable against what P5 actually transmitted: the deliberate baud
+    // mismatch runs over a *certified pair* and nowhere else, so on a rig with
+    // none (the skip branch above, or a dangling converter) P11 must not offer it
+    // as the reason a `frame` count is nonzero.
+    probe_list.push(probes::p11_line_state(&cli.ports, rig));
 
     let report = Report::new(generated_unix_ms, environment, probe_list);
 

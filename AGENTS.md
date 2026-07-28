@@ -53,7 +53,7 @@ endpoint, raw edge defaults to `held` with steal-to-bypass). `existing-terminal`
   -D warnings` (+ the minimal-daemon clippy); `cargo deny check`. **The whole suite runs on
   macOS too** (serial-*device* tests self-skip there — §7 — and the real crossover-hardware
   test runs when a rig is attached).
-  Current figure: **630 passed / 0 failed / 4 ignored**.
+  Current figure: **636 passed / 0 failed / 4 ignored**.
 - **All planned phases 0–8 are done**, plus five post-1.0 tracks: the simplification
   track (design §16 / plan §9), the out-of-tree-codec extension track (design §15.26 /
   plan §10), the web console track (design §17 / plan §11.1–§11.6), the **v10 track**
@@ -95,9 +95,31 @@ endpoint, raw edge defaults to `held` with steal-to-bypass). `existing-terminal`
   busy-spun a core; nine test files asserted byte-exactness at the lossy console boundary (see the
   new rule in §5); and — a **real product defect** found beside them — a collapsed pty session
   carrying no data byte leaked the exclusive write lock, fixed kernel-independently rather than with
-  the `|| closed` arm that AGENTS §7 forbids deciding on 7.0 evidence. `nexus-doctor` gained
-  **P6–P11** to settle the remaining kernel questions on 6.18 by diffing `--json`. Suite is
-  480 passed / 0 failed / 4 ignored.
+  the `|| closed` arm §7 forbade deciding on 7.0-only evidence. (Two different constructs, so do not
+  merge them: that `|| closed` *disjunct* was rejected on the evidence rule, while invariant 16
+  rule (3) separately bars the `closed` **conjunct** for a reason no kernel touches. §7's rule is
+  discharged for P6/P7 now — see §7 — and rule (3) is not, because no probe speaks to it.) `nexus-doctor` gained **P6–P11** to settle the
+  remaining kernel questions on 6.18 by diffing two runs. **That diff was taken on 2026-07-27** and
+  is recorded in §7 and `docs/nexus-doctor.md`; it changed nothing in the daemon and licensed no
+  simplification, but it did surface **two over-claims in the doctor's own report text**, both fixed
+  on 2026-07-28 and both about a *Tier-1* rig, which §13 makes the baseline: P5 said "Rig discovered
+  and **certified**" for any UART rig, so a dangling converter's certificate invited a Tier-2/3 run
+  to start from it, and P11 offered "P5's deliberate baud-mismatch item" as the usual cause of a
+  nonzero `frame` on a rig where no pair existed to mismatch. `p5_rig` now returns `RigFacts`
+  (certified pairs, loopbacks, `tier()`) beside its `Probe`; P5 names the tier and what that tier did
+  **not** run, and P11 reads the same value rather than guessing — `named >= 2` is not the same
+  question, two dangling ports being two named ports and no pair. **And every report now says what
+  produced it**: both renderers open with a `commit` / `probe set` / `generated` (UTC) block, because
+  establishing that the 6.18 run predated HEAD took reading a *section title* by eye. The probe-set
+  fingerprint is the load-bearing half — it digests each probe's `(id, title, question)` and *not* its
+  measurements, so equal fingerprints mean "these two runs asked the same questions" without needing
+  the repository, where a commit hash needs the reader to diff two commits. `expectations/*.jq` gained
+  a **presence** clause for both fields (a tarball build legitimately reports `commit: unknown`, and
+  reddening it would be the false negative P4's clause already refuses). No new dependency: `build.rs`
+  shells to `git` with `std` alone and the UTC rendering is hand-rolled, the doctor's dependency list
+  being part of the licensing gate.
+  Suite at the close of *that* track was 480 passed / 0 failed / 4 ignored (the current figure is in
+  §2's opening bullet).
 - **What the browser suite found (2026-07-27), all fixed:** (1) the web client's
   `offsetSpaceReset` inferred an offset-space restart from `from_offset < frontier`, which
   is *also* what an ordinary reload with a replay ring looks like — so every reload
@@ -844,16 +866,31 @@ running engineering log and the authoritative "why the code looks like this" rec
 
 - **Linux is required** and is the kernel of record. **Production target is Linux 6.18;
   the dev box runs 7.0.** You can run code on 6.18 (the user can; an agent here cannot).
-  `nexus-doctor` was confirmed on 6.18 (Debian rodete, 2026-07-19) for **P1–P4 only, with zero
-  deltas from 7.0** — the probe set has since grown to eleven, and **P5–P11 have never been run
-  there.** P5 (rig discovery and certification) did not exist at that run and landed two days
-  later; P6–P11 came a week later, added precisely so that diff could be taken. So the 6.18
-  confirmation covers four of eleven probes, and in particular does *not* cover the ones whose own
-  output says "diff this block before simplifying anything" — P6 (last-close readiness) and P7
-  (collapsed-session evidence) most of all — nor the rig certification P5 performs. **Pause and check with the user before any one-way
-  (hard-to-reverse) decision that depends on a kernel ability confirmed only on 7.0**, and
-  keep the design's fallbacks live (the §7.2 termios reconciliation-poll backstop; P2
-  slave-priming for presence). Re-gate on 6.18 with
+  `nexus-doctor` has been run on 6.18 **twice**: P1–P4 on 2026-07-19 (`e93149d`), and **all eleven
+  probes on 2026-07-27**, both on `6.18.14-1rodete4-amd64` (Debian rodete). Everything reported
+  `supported` (19 · 0 · 0 · 0). **P6 and P7 came back byte-identical to 7.0** — including P6's
+  `handler_reset_readable_bytes: 1` and P7's `latch_covers_termios_only_session: true` — P8 agrees on
+  every semantic field, P1/P2/P3's booleans are identical, P9's 1/5/10 ms floor agrees within
+  8–17 µs, and P10 lands inside the band the probe declares for 7.0 against *itself*. So the two
+  probes whose own output says "diff this block before simplifying anything" are answered, and the
+  answer is that **nothing may be simplified**: P6 confirms the last-close drain load-bearing on the
+  production kernel rather than removable, and the `saw_session` latch is barred by invariant 16
+  rule (3) — a write-lock leak measured five of five — which no probe speaks to in either direction.
+  `docs/nexus-doctor.md`'s 6.18 section carries the numbers and what the run still does **not** cover:
+  it used a **`fe1c52c`-vintage binary**, so HEAD's P4 and the `environment()` by-id arm rewritten
+  beside it (review 32, `RES-2`) have no 6.18 evidence; that box is **Tier 1** — one dangling adapter —
+  so P5's paired rate ladder, its deliberate baud mismatch and every `crossover_ports()`-gated test
+  never ran there, and `brk = 0` means a break has never been *observed* on 6.18; only Markdown was
+  captured, so the re-gate command below has never been *executed* there — its content satisfied every
+  clause of `linux.jq` **as that file stood at the `fe1c52c` vintage**, and no longer would, the
+  2026-07-28 provenance work having added `.build.*` clauses a binary of that vintage cannot answer;
+  and **`cargo test --workspace` has never run on 6.18 at all** — CI is
+  `ubuntu-latest` + `macos-latest`, so the production kernel's evidence base is eleven probes and zero
+  executed tests. **Pause and check with the user before any one-way (hard-to-reverse) decision that
+  depends on a kernel ability confirmed only on 7.0** — the rule is a predicate over a set that
+  shrinks as probes get answered, not a fixed list — and keep the design's fallbacks live (the §7.2
+  termios reconciliation-poll backstop; P2 slave-priming for presence, which 6.18's
+  `hup_when_never_opened: false` makes *mandatory* there rather than droppable). Re-gate on 6.18 with
   `nexus-doctor --json | jq -e -f expectations/linux.jq`.
 - **macOS is best-effort** (`docs/macos.md`): the tree compiles and degrades gracefully;
   `#[cfg]`-gated blockers are `TIOCGICOUNT` and `ptsname_r` (Linux-only). The gating CI

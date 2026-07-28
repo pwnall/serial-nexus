@@ -567,7 +567,10 @@ pub fn pending_input_bytes(fd: RawFd) -> nix::Result<usize> {
 /// three states (idle, five bytes queued, hung up). A probe that treated 0 as a
 /// failure would redden a healthy box; whether a given kernel accounts for a pty
 /// here at all is exactly the quiet 6.18-vs-7.0 difference this section exists to
-/// surface, so emit it as an observation and never as a verdict.
+/// surface, so emit it as an observation and never as a verdict. **6.18 has since
+/// answered it and answered the same** — doctor P10 reads `pending_output_bytes:
+/// 0` in both directions there (2026-07-27, `docs/nexus-doctor.md`). The rule
+/// stands unchanged for the next kernel: report the number, do not judge it.
 ///
 /// Linux-only (libc exports the request code only there); elsewhere this is the
 /// same `ENOTSUP` stub [`read_icounts`] uses, which a probe reports as `skipped`.

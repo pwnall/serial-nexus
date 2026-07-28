@@ -1725,6 +1725,16 @@ impl CertFailure {
 struct Certificate {
     line: String,
     failures: Vec<CertFailure>,
+    /// Whether the deliberate baud-mismatch traffic was actually **transmitted**
+    /// on these ports — not whether it was observed to corrupt anything.
+    ///
+    /// P11 reads this (through [`RigFacts::mismatch_pairs`]) to decide whether it
+    /// may offer the mismatch as the explanation for a nonzero `frame` count, and
+    /// "the certificate ran" is not the same claim: [`p5_certify_pair`] returns
+    /// early *before* the mismatch block whenever a port will not reopen, so
+    /// counting certificate attempts would let P11 blame an item that never put a
+    /// byte on the wire — the exact defect the `RigFacts` thread exists to fix.
+    mismatch_transmitted: bool,
 }
 
 impl Certificate {
@@ -1733,6 +1743,7 @@ impl Certificate {
         Certificate {
             line: line.into(),
             failures: Vec::new(),
+            mismatch_transmitted: false,
         }
     }
 
@@ -1740,6 +1751,7 @@ impl Certificate {
     /// reopen). The rig may be fine; it is simply uncharacterized → degrade.
     fn unavailable(line: impl Into<String>, item: &str) -> Self {
         Certificate {
+            mismatch_transmitted: false,
             line: line.into(),
             failures: vec![CertFailure {
                 item: item.to_owned(),
@@ -1876,6 +1888,11 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> Certificate {
     let mut cert = Certificate::new(format!(
         "rate_ladder={ladder_ok} deliberate_mismatch_observed={mismatch_observed}"
     ));
+    // Reaching here means the bulk mismatch pattern was written to the wire —
+    // which is the claim P11 needs, independent of whether it was *observed* to
+    // corrupt anything. The two early returns above never get here, and that is
+    // the distinction: a certificate that bailed on a reopen transmitted nothing.
+    cert.mismatch_transmitted = true;
     // The ladder is the integrity item: a rung that did not round-trip means the
     // rig itself corrupts or loses data, so no tier failure measured through it is
     // attributable to serial_nexus (§15.21) — a stop condition, not a footnote.
@@ -1886,12 +1903,58 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> Certificate {
     cert
 }
 
-pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
-    let mut p = Probe::new(
-        "P5",
-        "rig discovery and certification",
-        "Classify each named port (dangling/loopback/paired, both directions) and certify the rig for a tiered checklist run (§13, §15.21).",
-    );
+/// What P5 established about the rig, carried to the probes that read the same
+/// ports afterwards.
+///
+/// It exists because two report sentences were explaining the operator's numbers
+/// with mechanisms that had not run. The rate ladder and the **deliberate baud
+/// mismatch** — the item that corrupts a nonce on purpose to prove the driver's
+/// error counters observable (§15.21) — transmit *only* inside
+/// [`p5_certify_pair`], which runs only over pairs P5 verified in **both**
+/// directions. `named >= 2` is necessary but not sufficient: two *dangling* ports
+/// are two named ports and no pair. So the counts are taken where the
+/// certification happens rather than inferred from the command line, and a
+/// probe that wants to say "that is the mismatch item" has to ask.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RigFacts {
+    /// Pairs **discovery** verified in both directions — what is physically
+    /// wired, which is what a *tier* is. Separate from `mismatch_pairs` because
+    /// certification can fail on a rig that is genuinely cross-wired, and
+    /// collapsing the two let P5 print "Tier 1 — a dangling converter" directly
+    /// above its own observation line reading `paired with …`.
+    pub discovered_pairs: usize,
+    /// Pairs whose deliberate baud-mismatch traffic was actually **transmitted**
+    /// ([`Certificate::mismatch_transmitted`]). This, not the number of
+    /// certificate *attempts*, is what P11 may cite as the cause of a nonzero
+    /// `frame` count: [`p5_certify_pair`] returns early before the mismatch block
+    /// when a port will not reopen, so an attempt count would reintroduce exactly
+    /// the defect this thread was added to fix.
+    pub mismatch_pairs: usize,
+    /// Ports discovered with TX↔RX jumpered.
+    pub loopbacks: usize,
+}
+
+impl RigFacts {
+    /// §13's hardware tier, from what discovery found — **the topology, not the
+    /// certificate**: **3** a cross-wired pair (independent clocks), **2** a
+    /// TX↔RX jumper (a real driver data path on one clock), **1** a dangling
+    /// converter. Tier 1 is this project's *baseline* rig, not an exotic case,
+    /// and it certifies strictly less than the bare word "certified" suggests —
+    /// which is why [`p5_verdict`] names the tier instead of implying the whole
+    /// certificate, and why it reports separately whether that tier's items ran.
+    pub fn tier(self) -> u8 {
+        if self.discovered_pairs > 0 {
+            3
+        } else if self.loopbacks > 0 {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> (Probe, RigFacts) {
+    let mut p = Probe::new("P5", "rig discovery and certification", P5_QUESTION);
 
     // Open every port for discovery.
     let mut sps: Vec<Option<SerialPort>> = Vec::new();
@@ -1915,9 +1978,12 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
         } else {
             "no port opened"
         };
-        return p.verdict(
-            Status::skipped(reason),
-            "Grant access (udev GROUP=plugdev, or dialout) and re-run with the rig's --ports.",
+        return (
+            p.verdict(
+                Status::skipped(reason),
+                "Grant access (udev GROUP=plugdev, or dialout) and re-run with the rig's --ports.",
+            ),
+            RigFacts::default(),
         );
     }
 
@@ -2001,6 +2067,7 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
     let mut clean = true;
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     let mut hung_up: Vec<String> = Vec::new();
+    let mut loopbacks = 0usize;
     #[allow(clippy::needless_range_loop)]
     for i in 0..ports.len() {
         if sps[i].is_none() {
@@ -2008,6 +2075,7 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
         }
         let name = p5_name(&ports[i], resolver);
         let classification = if heard(i, i) {
+            loopbacks += 1;
             "loopback (TX↔RX jumpered)".to_string()
         } else {
             let mut partner = None;
@@ -2071,11 +2139,42 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
         }
     }
     // Paired UARTs get the independent-clock certificate (rate ladder + mismatch).
+    //
+    // Two counts, because they are two facts. `discovered_pairs` is the topology
+    // and drives the tier; `mismatch_pairs` counts only the pairs whose mismatch
+    // traffic actually reached the wire, which is the narrower claim P11 is
+    // allowed to make. Counting certificate *attempts* would put back the defect
+    // this thread exists to remove — `p5_certify_pair` bails before the mismatch
+    // block whenever a port will not reopen.
+    let discovered_pairs = pairs.len();
+    let mut mismatch_pairs = 0usize;
     for (i, j) in pairs {
         let (Ok(a_uart), Ok(b_uart)) = (
             p5_open(&ports[i], 115_200, Parity::None).map(|sp| p5_is_uart(&sp)),
             p5_open(&ports[j], 115_200, Parity::None).map(|sp| p5_is_uart(&sp)),
         ) else {
+            // A pair discovery verified in both directions, whose ports then
+            // would not reopen, is *uncharacterized* — §15.21's degrade case. It
+            // used to `continue` in silence, leaving no observation, no failure
+            // and no fact, so the verdict read `supported` over a pair nothing
+            // had certified. Not an integrity failure: the rig carried data
+            // during discovery, it simply could not be characterized.
+            let subject = format!(
+                "{} ↔ {}",
+                p5_name(&ports[i], resolver),
+                p5_name(&ports[j], resolver)
+            );
+            p = p.observe(
+                format!("{subject} cert").as_str(),
+                "unavailable (pair would not reopen for characterization)",
+            );
+            failures.push(
+                CertFailure {
+                    item: "pair_reopen".to_owned(),
+                    integrity: false,
+                }
+                .qualified(&subject),
+            );
             continue;
         };
         if a_uart && b_uart {
@@ -2085,13 +2184,21 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> Probe {
                 p5_name(&ports[j], resolver)
             );
             let cert = p5_certify_pair(&ports[i], &ports[j]);
+            if cert.mismatch_transmitted {
+                mismatch_pairs += 1;
+            }
             p = p.observe(format!("{subject} cert").as_str(), cert.line);
             failures.extend(cert.failures.into_iter().map(|f| f.qualified(&subject)));
         }
     }
 
-    let (status, consequence) = p5_verdict(clean, any_uart, &failures, &hung_up);
-    p.verdict(status, &consequence)
+    let facts = RigFacts {
+        discovered_pairs,
+        mismatch_pairs,
+        loopbacks,
+    };
+    let (status, consequence) = p5_verdict(clean, any_uart, &failures, &hung_up, facts);
+    (p.verdict(status, &consequence), facts)
 }
 
 /// Fold discovery and every certificate into P5's one verdict (§15.21, DOC-1b).
@@ -2111,6 +2218,7 @@ fn p5_verdict(
     any_uart: bool,
     failures: &[CertFailure],
     hung_up: &[String],
+    facts: RigFacts,
 ) -> (Status, String) {
     let named = |integrity: bool| -> Vec<&str> {
         failures
@@ -2176,9 +2284,52 @@ fn p5_verdict(
         );
     }
     if any_uart {
+        // **Name the tier.** The bare sentence this replaced — "Rig discovered and
+        // certified; every tiered checklist run starts from this certificate" —
+        // was emitted for any UART rig, including a Tier-1 dangling converter
+        // where `pairs` was empty, so `p5_certify_pair` never ran and neither
+        // `integrity` failure site could fire. §15.21 makes this certificate the
+        // precondition a tiered run starts from, so an unqualified "certified"
+        // over a rig that certified only per-port items tells the operator a
+        // Tier-2/3 run may start from it. Tier 1 is the *baseline* rig here
+        // (§13's no-target doctrine), not a corner case, so this is the common
+        // reading, and the report never named the tier anywhere else either.
+        // The tier is the *topology* discovery found; whether that tier's items
+        // executed is a second fact. Deriving the sentence from one number let
+        // P5 print "Tier 1 — a dangling converter" directly above its own
+        // observation line reading `paired with …`, whenever a discovered pair
+        // failed to reopen for characterization.
+        let tier = facts.tier();
+        let scope = match tier {
+            3 if facts.mismatch_pairs > 0 => format!(
+                "**Tier 3** — {n} cross-wired {pair}, independent clocks, so the rate ladder and the deliberate baud mismatch ran.",
+                n = facts.mismatch_pairs,
+                pair = if facts.mismatch_pairs == 1 {
+                    "pair"
+                } else {
+                    "pairs"
+                },
+            ),
+            3 => "**Tier 3 wiring, uncertified** — a cross-wired pair was discovered, but its independent-clock certificate did not complete, so the rate ladder and the deliberate baud mismatch did **not** run. The pair's certificate line above says why."
+                .to_owned(),
+            2 => "**Tier 2** — a TX↔RX jumper: a real driver data path, but on one clock, so the rate ladder and the deliberate baud mismatch did **not** run (both need a cross-wired pair)."
+                .to_owned(),
+            _ => "**Tier 1** — a dangling converter: per-port items only. The rate ladder and the deliberate baud mismatch did **not** run, and no break was received by anything."
+                .to_owned(),
+        };
+        // The ceiling clause is only meaningful below a complete top-tier
+        // certificate — appending "may not start above Tier 3" would be vacuous
+        // advice in the one case where the operator has the whole thing.
+        let ceiling = if tier < 3 || facts.mismatch_pairs == 0 {
+            " and may not start *above* the tier named here, because the items a higher tier leans on did not execute"
+        } else {
+            ""
+        };
         (
             Status::Supported,
-            "Rig discovered and certified; every tiered checklist run starts from this certificate (§15.21).".to_owned(),
+            format!(
+                "Rig discovered and certified at {scope} A tiered checklist run starts from this certificate (§15.21){ceiling}."
+            ),
         )
     } else {
         (
@@ -2192,11 +2343,28 @@ fn p5_verdict(
 // P3 — serial-port fit (§7.1, §13). Runs only on an explicitly named --port.
 // ---------------------------------------------------------------------------
 
+/// P3's question, verbatim, shared by the real probe and by `main`'s
+/// no-`--port` placeholder.
+///
+/// **The duplication these consts remove was not cosmetic.** `Build::probe_set`
+/// digests each probe's question so two reports can be checked for
+/// comparability, and a placeholder whose wording drifted from the real probe's
+/// made a passive run and a rig run of the *same binary* fingerprint differently
+/// — which would have told the operator the 6.18-vs-7.0 diff was invalid.
+pub const P3_QUESTION: &str = "Custom baud acceptance, TIOCEXCL exclusivity, modem-line set/read, and break toggling on a real port (§7.1).";
+
+/// P5's question, verbatim. Shared for the reason [`P3_QUESTION`] gives.
+pub const P5_QUESTION: &str = "Classify each named port (dangling/loopback/paired, both directions) and certify the rig for a tiered checklist run (§13, §15.21).";
+
 pub fn p3_serial(port: &Path) -> Probe {
+    // The title carries the device path so a two-port run's entries are
+    // distinguishable; the *question* is the same on every port, which is what
+    // keeps the probe-set fingerprint a property of the binary rather than of
+    // how many ports were named.
     let p = Probe::new(
         "P3",
         &format!("serial-port fit ({})", port.display()),
-        "Custom baud acceptance, TIOCEXCL exclusivity, modem-line set/read, and break toggling on a real port (§7.1).",
+        P3_QUESTION,
     );
     match p3_inner(port) {
         Ok(o) => {
@@ -2390,7 +2558,7 @@ impl LineState {
 /// with its **current settings unchanged** (no baud change, no raw mode) and
 /// transmits nothing. The open itself still toggles DTR, which is the whole
 /// reason the doctor never opens a port it was not handed.
-pub fn p11_line_state(ports: &[PathBuf]) -> Probe {
+pub fn p11_line_state(ports: &[PathBuf], rig: RigFacts) -> Probe {
     let mut p = Probe::new(
         "P11",
         "real-port line-state counters",
@@ -2425,7 +2593,7 @@ pub fn p11_line_state(ports: &[PathBuf]) -> Probe {
         }
     }
 
-    let (status, consequence) = p11_verdict(ports.len(), opened, perm_denied, &missing);
+    let (status, consequence) = p11_verdict(ports.len(), opened, perm_denied, &missing, rig);
     p.verdict(status, &consequence)
 }
 
@@ -2444,6 +2612,7 @@ fn p11_verdict(
     opened: usize,
     perm_denied: bool,
     missing: &[String],
+    rig: RigFacts,
 ) -> (Status, String) {
     if named == 0 {
         return (
@@ -2472,10 +2641,40 @@ fn p11_verdict(
             ),
         );
     }
+    // **Only blame the mismatch item when the mismatch item ran.** The deliberate
+    // baud mismatch transmits inside `p5_certify_pair` and nowhere else, so on a
+    // rig P5 found no pair on — a dangling converter, §13's baseline — it never
+    // executed, and naming it as the usual cause of a nonzero `frame` sends the
+    // operator to a mechanism that was not present. Measured on the 2026-07-27
+    // 6.18 run: one dangling FT232R reporting `frame=4`, explained by this
+    // sentence as the mismatch item, on a box where no pair existed to mismatch.
+    //
+    // Three-valued, because the rig is: the mismatch either transmitted, or it
+    // did not and the port is jumpered, or it did not and nothing is wired to it.
+    // A two-valued version told a Tier-2 operator to reason about "a dangling
+    // port" that was not theirs.
+    let counters = if rig.mismatch_pairs > 0 {
+        "and P3/P5 transmit on these same ports earlier in the same invocation (a nonzero `frame` here is usually P5's deliberate baud-mismatch item, not a fault)".to_owned()
+    } else {
+        let where_from = match rig.tier() {
+            3 => {
+                "This rig is cross-wired, but its pair certificate did not complete, so the mismatch pattern never reached the wire; re-run once the pair certifies before reading anything into `frame`"
+            }
+            2 => {
+                "On a TX↔RX jumpered port, framing errors are your own transmit looping back — check the baud both ends of the jumper were set to"
+            }
+            _ => {
+                "On a dangling port that is either history since the driver bound the device or crosstalk into a floating RX; replug the adapter, which rebinds the driver and zeroes the counters, and re-run to tell the two apart"
+            }
+        };
+        format!(
+            "and P3/P5 transmit on these same ports earlier in the same invocation — but P5 transmitted **no deliberate baud mismatch** this run, so that item cannot account for a nonzero `frame` here. {where_from}"
+        )
+    };
     (
         Status::Supported,
         format!(
-            "Both line-state ioctls answer on {opened} of {named} named port(s): the driver counters (§5, §7.1) and the modem lines are readable, so serial state carries real error/overrun accounting rather than omitting it. Read the counts as a snapshot of a cumulative total, not as a measurement of this run — they count since the driver bound the device, and P3/P5 transmit on these same ports earlier in the same invocation (a nonzero `frame` here is usually P5's deliberate baud-mismatch item, not a fault). Across kernels, diff the ioctl *availability* and the field set; the absolute counts differ by construction."
+            "Both line-state ioctls answer on {opened} of {named} named port(s): the driver counters (§5, §7.1) and the modem lines are readable, so serial state carries real error/overrun accounting rather than omitting it. Read the counts as a snapshot of a cumulative total, not as a measurement of this run — they count since the driver bound the device, {counters}. Across kernels, diff the ioctl *availability* and the field set; the absolute counts differ by construction."
         ),
     )
 }
@@ -2644,6 +2843,29 @@ mod tests {
         CertFailure {
             item: item.to_owned(),
             integrity,
+        }
+    }
+
+    /// A Tier-3 rig: one cross-wired pair that reached `p5_certify_pair`, so the
+    /// rate ladder and the deliberate mismatch really ran. The failure-precedence
+    /// folds below are tier-independent and use this as their neutral input;
+    /// `RigFacts::default()` is the Tier-1 shape (no pair, no jumper).
+    fn paired() -> RigFacts {
+        RigFacts {
+            discovered_pairs: 1,
+            mismatch_pairs: 1,
+            loopbacks: 0,
+        }
+    }
+
+    /// A cross-wired pair discovery verified, whose characterization then failed:
+    /// Tier-3 *wiring*, no mismatch transmitted. The state that used to print
+    /// "Tier 1 — a dangling converter" over an observation reading `paired with`.
+    fn paired_uncertified() -> RigFacts {
+        RigFacts {
+            discovered_pairs: 1,
+            mismatch_pairs: 0,
+            loopbacks: 0,
         }
     }
 
@@ -2835,13 +3057,97 @@ mod tests {
     /// `supported`, with their consequence lines unchanged.
     #[test]
     fn a_clean_rig_is_supported_certified_or_skipped() {
-        let (status, why) = p5_verdict(true, true, &[], &[]);
+        let (status, why) = p5_verdict(true, true, &[], &[], paired());
         assert_eq!(status.label(), "supported");
         assert!(why.contains("certified"), "{why}");
 
-        let (status, why) = p5_verdict(true, false, &[], &[]);
+        let (status, why) = p5_verdict(true, false, &[], &[], RigFacts::default());
         assert_eq!(status.label(), "supported");
         assert!(why.contains("skipped on non-UART sims"), "{why}");
+    }
+
+    /// **A Tier-1 certificate must say Tier 1.** §15.21 makes P5's certificate the
+    /// precondition every tiered checklist run starts from, which only means
+    /// something if the certificate says what it covers. The unqualified sentence
+    /// this guards ("Rig discovered and certified; every tiered checklist run
+    /// starts from this certificate") was emitted for *any* UART rig — including a
+    /// dangling converter, §13's baseline, where `pairs` is empty, so
+    /// `p5_certify_pair` never runs, the rate ladder and the deliberate mismatch
+    /// never transmit, and neither integrity-failure site can fire. An operator
+    /// reading it starts a Tier-2/3 run from a Tier-1 certificate. Observed
+    /// verbatim on the 2026-07-27 6.18 report.
+    ///
+    /// Each tier must therefore name itself *and* name what did not run, so the
+    /// three lines are not interchangeable.
+    #[test]
+    fn the_certificate_names_its_tier_and_what_that_tier_did_not_run() {
+        let dangling = RigFacts::default();
+        let jumpered = RigFacts {
+            discovered_pairs: 0,
+            mismatch_pairs: 0,
+            loopbacks: 1,
+        };
+        assert_eq!(
+            (dangling.tier(), jumpered.tier(), paired().tier()),
+            (1, 2, 3)
+        );
+
+        let (status, why) = p5_verdict(true, true, &[], &[], dangling);
+        assert_eq!(status.label(), "supported");
+        assert!(why.contains("Tier 1"), "tier not named: {why}");
+        // The claim that matters: the mismatch is reported as *not* run.
+        assert!(
+            why.contains("deliberate baud mismatch did **not** run"),
+            "a Tier-1 certificate implied the pair items ran: {why}"
+        );
+
+        let (_, why) = p5_verdict(true, true, &[], &[], jumpered);
+        assert!(why.contains("Tier 2"), "tier not named: {why}");
+        assert!(
+            why.contains("did **not** run"),
+            "a Tier-2 certificate implied the pair items ran: {why}"
+        );
+
+        let (_, why) = p5_verdict(true, true, &[], &[], paired());
+        assert!(why.contains("Tier 3"), "tier not named: {why}");
+        assert!(
+            why.contains("deliberate baud mismatch ran"),
+            "a Tier-3 certificate did not claim the pair items: {why}"
+        );
+
+        // **A discovered pair is never described as a dangling converter.** When
+        // characterization fails, `mismatch_pairs` is 0 while `discovered_pairs`
+        // is not; deriving the sentence from a single count printed "Tier 1 — a
+        // dangling converter: per-port items only" directly above P5's own
+        // observation line reading `paired with …`.
+        assert_eq!(paired_uncertified().tier(), 3, "wiring is the tier");
+        let (_, why) = p5_verdict(true, true, &[], &[], paired_uncertified());
+        assert!(
+            !why.contains("dangling converter"),
+            "a cross-wired pair was described as dangling: {why}"
+        );
+        assert!(
+            why.contains("Tier 3 wiring, uncertified"),
+            "the uncertified-pair state was not named: {why}"
+        );
+        assert!(
+            why.contains("did **not** run"),
+            "an uncertified pair implied its items ran: {why}"
+        );
+
+        // And no state's line may be mistaken for another's.
+        let lines: Vec<String> = [dangling, jumpered, paired(), paired_uncertified()]
+            .iter()
+            .map(|f| p5_verdict(true, true, &[], &[], *f).1)
+            .collect();
+        assert_eq!(
+            lines
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4,
+            "two rig states produced the same certificate line"
+        );
     }
 
     /// A data-integrity failure is a stop condition: the certificate is the
@@ -2849,8 +3155,13 @@ mod tests {
     /// not report `supported` with exit code 0 (review 26, DOC-1b).
     #[test]
     fn a_data_integrity_failure_is_unsupported_and_names_the_item() {
-        let (status, why) =
-            p5_verdict(true, true, &[fail("usb-A ↔ usb-B: rate_ladder", true)], &[]);
+        let (status, why) = p5_verdict(
+            true,
+            true,
+            &[fail("usb-A ↔ usb-B: rate_ladder", true)],
+            &[],
+            paired(),
+        );
         assert!(status.is_unsupported(), "verdict was {}", status.label());
         assert!(
             why.contains("usb-A ↔ usb-B: rate_ladder"),
@@ -2862,7 +3173,7 @@ mod tests {
     /// that item would be running uncertified.
     #[test]
     fn an_uncharacterized_item_degrades_and_names_the_item() {
-        let (status, why) = p5_verdict(true, true, &[fail("usb-A: break", false)], &[]);
+        let (status, why) = p5_verdict(true, true, &[fail("usb-A: break", false)], &[], paired());
         assert_eq!(status.label(), "degraded");
         assert!(why.contains("usb-A: break"), "item not named: {why}");
     }
@@ -2871,7 +3182,13 @@ mod tests {
     /// certificate item that also failed — both facts reach the operator.
     #[test]
     fn miswiring_degrades_and_still_reports_uncertified_items() {
-        let (status, why) = p5_verdict(false, true, &[fail("usb-A: custom_baud", false)], &[]);
+        let (status, why) = p5_verdict(
+            false,
+            true,
+            &[fail("usb-A: custom_baud", false)],
+            &[],
+            paired(),
+        );
         assert_eq!(status.label(), "degraded");
         assert!(why.contains("miswired"), "{why}");
         assert!(why.contains("usb-A: custom_baud"), "{why}");
@@ -2885,7 +3202,13 @@ mod tests {
     /// `supported` verdict, which is the DOC-1b shape: an observation nobody acts on.
     #[test]
     fn a_hung_up_peer_degrades_and_names_the_port() {
-        let (status, why) = p5_verdict(true, false, &[], &["usb-A".to_string()]);
+        let (status, why) = p5_verdict(
+            true,
+            false,
+            &[],
+            &["usb-A".to_string()],
+            RigFacts::default(),
+        );
         assert_eq!(status.label(), "degraded");
         assert!(why.contains("usb-A"), "port not named: {why}");
         assert!(why.contains("hung up"), "{why}");
@@ -2900,6 +3223,7 @@ mod tests {
             true,
             &[fail("a: break", false), fail("a ↔ b: rate_ladder", true)],
             &[],
+            paired(),
         );
         assert!(status.is_unsupported());
     }
@@ -2912,14 +3236,18 @@ mod tests {
         assert_eq!(skipped.line, "skipped (not a UART)");
         assert!(skipped.failures.is_empty());
         assert_eq!(
-            p5_verdict(true, false, &skipped.failures, &[]).0.label(),
+            p5_verdict(true, false, &skipped.failures, &[], RigFacts::default())
+                .0
+                .label(),
             "supported"
         );
 
         let missing = Certificate::unavailable("pair reopen failed", "pair_reopen");
         assert_eq!(missing.failures, vec![fail("pair_reopen", false)]);
         assert_eq!(
-            p5_verdict(true, true, &missing.failures, &[]).0.label(),
+            p5_verdict(true, true, &missing.failures, &[], paired())
+                .0
+                .label(),
             "degraded"
         );
     }
@@ -2953,7 +3281,7 @@ mod tests {
             p8_epoll_readiness(),
             p9_poll_granularity(),
             p10_pty_buffer_depth(),
-            p11_line_state(&[]),
+            p11_line_state(&[], RigFacts::default()),
         ] {
             assert!(
                 !p.status.is_unsupported(),
@@ -2982,10 +3310,10 @@ mod tests {
     /// the newest probe that could break it.
     #[test]
     fn p11_is_opt_in_and_reports_nothing_without_a_port() {
-        let p = p11_line_state(&[]);
+        let p = p11_line_state(&[], RigFacts::default());
         assert_eq!(p.status.label(), "skipped");
         assert!(p.observations.is_empty(), "a passive run opened a port");
-        let (status, why) = p11_verdict(0, 0, false, &[]);
+        let (status, why) = p11_verdict(0, 0, false, &[], RigFacts::default());
         assert_eq!(status.label(), "skipped");
         assert!(why.contains("--port"), "{why}");
     }
@@ -2998,13 +3326,81 @@ mod tests {
     /// and on every macOS box.
     #[test]
     fn p11_degrades_on_a_missing_ioctl_and_never_reports_unsupported() {
-        let (status, why) = p11_verdict(1, 1, false, &["/dev/pts/9: TIOCGICOUNT".to_owned()]);
+        let (status, why) = p11_verdict(
+            1,
+            1,
+            false,
+            &["/dev/pts/9: TIOCGICOUNT".to_owned()],
+            RigFacts::default(),
+        );
         assert_eq!(status.label(), "degraded");
         assert!(why.contains("/dev/pts/9: TIOCGICOUNT"), "{why}");
 
-        let (status, why) = p11_verdict(2, 2, false, &[]);
+        let (status, why) = p11_verdict(2, 2, false, &[], paired());
         assert_eq!(status.label(), "supported");
         assert!(why.contains("2 of 2"), "{why}");
+    }
+
+    /// **P11 may only blame the deliberate baud mismatch when it ran.** That item
+    /// transmits inside `p5_certify_pair` and nowhere else, so on a rig P5 found
+    /// no pair on — a dangling converter, §13's *baseline* — it never executed and
+    /// cannot account for a nonzero `frame` count. The unconditional sentence this
+    /// guards did exactly that on the 2026-07-27 6.18 report: one dangling FT232R
+    /// reading `frame=4`, explained as P5's mismatch item, on a box where no pair
+    /// existed to mismatch. `named >= 2` would not have fixed it — two dangling
+    /// ports are two named ports and no pair — which is why the input is P5's own
+    /// certified-pair count.
+    #[test]
+    fn p11_blames_the_baud_mismatch_only_when_a_pair_was_certified() {
+        let (_, blamed) = p11_verdict(2, 2, false, &[], paired());
+        assert!(
+            blamed.contains("usually P5's deliberate baud-mismatch item"),
+            "a certified pair did not get the mismatch explanation: {blamed}"
+        );
+
+        // **Every rig state where the mismatch did not transmit must refuse to
+        // blame it** — including a genuinely cross-wired pair whose certificate
+        // did not complete, which `certified_pairs` (an *attempt* count) got
+        // wrong: `p5_certify_pair` returns early before the mismatch block when a
+        // port will not reopen, so an attempt count reinstated the whole defect.
+        for rig in [RigFacts::default(), paired_uncertified()] {
+            let (status, why) = p11_verdict(1, 1, false, &[], rig);
+            assert_eq!(status.label(), "supported");
+            assert!(
+                !why.contains("usually P5's deliberate baud-mismatch item"),
+                "P11 blamed an item that never transmitted ({rig:?}): {why}"
+            );
+            // Not merely silent — it says the item did not run.
+            assert!(
+                why.contains("no deliberate baud mismatch"),
+                "the absence was dropped rather than reported ({rig:?}): {why}"
+            );
+        }
+
+        // …and the guidance is scoped to the rig in front of the operator, not to
+        // a dangling port they may not have. Three states, three explanations.
+        let dangling = p11_verdict(1, 1, false, &[], RigFacts::default()).1;
+        assert!(dangling.contains("replug"), "{dangling}");
+        let jumpered = p11_verdict(
+            1,
+            1,
+            false,
+            &[],
+            RigFacts {
+                loopbacks: 1,
+                ..RigFacts::default()
+            },
+        )
+        .1;
+        assert!(
+            jumpered.contains("jumpered") && !jumpered.contains("dangling"),
+            "a jumpered rig was told to reason about a dangling port: {jumpered}"
+        );
+        let uncertified = p11_verdict(1, 1, false, &[], paired_uncertified()).1;
+        assert!(
+            uncertified.contains("cross-wired") && !uncertified.contains("dangling"),
+            "a cross-wired rig was told to reason about a dangling port: {uncertified}"
+        );
 
         for (named, opened, denied, missing) in [
             (0usize, 0usize, false, vec![]),
@@ -3012,11 +3408,13 @@ mod tests {
             (1, 1, false, vec!["p: TIOCMGET".to_owned()]),
             (1, 1, false, vec![]),
         ] {
-            assert!(
-                !p11_verdict(named, opened, denied, &missing)
-                    .0
-                    .is_unsupported()
-            );
+            for rig in [RigFacts::default(), paired(), paired_uncertified()] {
+                assert!(
+                    !p11_verdict(named, opened, denied, &missing, rig)
+                        .0
+                        .is_unsupported()
+                );
+            }
         }
     }
 

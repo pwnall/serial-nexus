@@ -60,3 +60,8 @@ and (any(.probes[]; .id == "P8" and (.status == "supported" or .status == "skipp
 and (any(.probes[]; .id == "P9" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P10" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P11"))
+# Provenance, same as `linux.jq` and for the same reason: a report that cannot say
+# which build produced it makes every cross-platform claim rest on an accident.
+# Structure only — `commit` may read `unknown` off a tarball build.
+and (.build.probe_set | type == "string" and length > 0)
+and (.build.commit | type == "string" and length > 0)
