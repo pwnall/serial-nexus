@@ -51,10 +51,29 @@
 //!    session at all is never released, because the widened latch must not fire on
 //!    the control packet the last-close handler's own termios reset provokes.
 //!
+//!    **That evidence is a measured kernel premise, not a portable one**, so this
+//!    third property gates on it (`nexus-doctor` P7, AGENTS §5's precondition rule)
+//!    — and only off Linux, because on the kernel of record a false answer means
+//!    the daemon is leaking write locks and must go red rather than skip.
+//!
 //! One shape is still not covered, deliberately: a bare open→close that touches
 //! nothing leaves the master with *nothing readable*, so there is no evidence to
 //! latch on. It is the harmless one — such a client sent no command to purge — and
 //! it self-heals the next time a session is observed.
+//!
+//! On a kernel that discards the pending packet at the slave's **last close**, the
+//! termios-only shape folds into that same uncovered class *for the current
+//! poll-only mechanism* — and there the cost is not harmless, so do not read the
+//! paragraph above as covering it. Darwin is such a kernel: `ttyclose` flushes both
+//! tty queues, and the shipped daemon was measured leaking the lock on 20 of 20
+//! real `stty -f` sessions, holding `usb0.lock.holder = "console"` while
+//! `console.client_present` read `false`, past 30 s, with another origin's `send`
+//! failing `-32003 … is locked`. It heals only on the next *observed* (≳5 ms)
+//! session or a `lock --steal`. This is a **scope** limit rather than a kernel
+//! wall: the session boundary survives as an *edge* even where no level state
+//! records it — a kqueue `EVFILT_READ | EV_CLEAR` knote on the master delivers it
+//! — so the fix is a `nexus-sys` BSD arm, tracked as such, not a fact about pty
+//! pairs (see the gate's comment in the third test).
 //!
 //! Neither needs a serial *device*: the `usb0` node's device is deliberately
 //! absent, so it comes up `waiting` while its write lock, origins and targetward
@@ -69,14 +88,13 @@ use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use nexus_itest::daemon_answers;
-use nexus_itest::{Daemon, Rpc, TempRun, wait_until};
+use nexus_itest::{Daemon, Rpc, TempRun, bin, wait_until};
 use serde_json::Value;
 
 // The CPU sampler and its hand-managed daemon exist only where `/proc/<pid>/stat`
 // does; what only they need is gated with them so the file stays warning-clean on
-// the platforms where the second test is a skip.
-#[cfg(target_os = "linux")]
-use nexus_itest::bin;
+// the platforms where the second test is a skip. (`bin` is no longer among them:
+// the third test's off-Linux premise gate spawns `nexus-doctor` with it.)
 #[cfg(target_os = "linux")]
 use std::process::Child;
 
@@ -400,6 +418,48 @@ fn termios_only_session(console: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Does this kernel leave anything readable on a packet-mode master after a
+/// collapsed *termios-only* session hangs up? `None` when the question could not be
+/// put.
+///
+/// Read from the shipped capability checker rather than re-derived here: P7's
+/// `latch_covers_termios_only_session` observation **is** this question, and
+/// `nexus-doctor` is the tree's authority on it (AGENTS §5's precondition rule, §7).
+/// This crate is `#![forbid(unsafe_code)]` and could not ask the kernel directly
+/// without growing a seam for it; `bin` panics when the doctor was never built, so a
+/// missing binary is loud rather than a silent skip.
+///
+/// **Compiled off Linux only, deliberately.** `expectations/linux.jq` admits P7
+/// `degraded`, so a P7-keyed skip on the kernel of record would retire the guard at
+/// exactly the moment the daemon started leaking locks there — §5's "a gate that can
+/// skip silently is a gate CI passes over a hole". P7 is also a *weaker* oracle than
+/// it looks: its sibling `latch_covers_data_session` reads `false` on Darwin for a
+/// shape the daemon demonstrably covers (the doctor's harness has no master reader,
+/// so BSD `ttywait` blocks the close ~600 ms; under the live daemon the same close
+/// takes ~1 ms and the read arms the latch), which is a second reason not to let this
+/// probe speak for anything but the termios-only shape it is consulted for here.
+#[cfg(not(target_os = "linux"))]
+fn master_retains_termios_evidence() -> Option<bool> {
+    let out = Command::new(bin("nexus-doctor"))
+        .arg("--json")
+        .output()
+        .ok()?;
+    let report: Value = serde_json::from_slice(&out.stdout).ok()?;
+    report
+        .get("probes")?
+        .as_array()?
+        .iter()
+        .find(|p| p.get("id").and_then(Value::as_str) == Some("P7"))?
+        .get("observations")?
+        .as_array()?
+        .iter()
+        .find(|o| {
+            o.get("key").and_then(Value::as_str) == Some("latch_covers_termios_only_session")
+        })?
+        .get("value")?
+        .as_bool()
+}
+
 #[test]
 fn a_collapsed_termios_only_session_still_releases_the_write_lock() {
     let d = Daemon::start();
@@ -435,6 +495,43 @@ fn a_collapsed_termios_only_session_still_releases_the_write_lock() {
         "the write lock was released with no client session at all — the last-close \
          latch is firing on something that is not a client (§6, §7.2)"
     );
+
+    // KNOWN PRODUCT GAP off Linux, gated on the tree's own authority for the kernel
+    // premise (`nexus-doctor` P7, AGENTS §5). Placement is load-bearing: the negative
+    // direction *above* keeps running on every platform, and Darwin is the harshest
+    // place for it — `read -> 0` with POLLIN set on every 5 ms pass is precisely the
+    // state in which the ungated `|| closed` arm a reader might reach for after
+    // seeing this skip would release an operator's lock with no client attached.
+    //
+    // This is a **scope** decision, not a kernel wall. Darwin's `ttyclose` flushes
+    // both tty queues at the slave's last close, so the `TIOCPKT_IOCTL` packet
+    // `read_and_poll`'s `saw_session` latch arms on is gone — but the session
+    // boundary survives as an *edge*: a kqueue `EVFILT_READ | EV_CLEAR` knote on the
+    // master delivers it a full poll gap later (measured on 15.7.8 in a faithful
+    // model of that block: shipped predicate 0/8, +edge latch 8/8, 3/3 reproducible,
+    // and zero fires across idle controls and 200 daemon-shaped poll+read passes).
+    // Until `pty.rs` grows that BSD arm the leak is real and operator-visible — 20/20
+    // real `stty -f` sessions, past 30 s, another origin's `send` failing -32003 —
+    // and the escape hatches are `lock --steal` and the next observed session
+    // (§6, §7.2). Landing that arm means deleting this gate, not widening it.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let premise = master_retains_termios_evidence();
+        if premise != Some(true) {
+            assert!(
+                std::env::var("SNX_PTY_COLLAPSE").as_deref() != Ok("required"),
+                "SNX_PTY_COLLAPSE=required, but this platform's pty last-close latch \
+                 does not cover the collapsed termios-only session (nexus-doctor P7 \
+                 latch_covers_termios_only_session = {premise:?})"
+            );
+            eprintln!(
+                "SKIP a_collapsed_termios_only_session_still_releases_the_write_lock: \
+                 known product gap off Linux (see the comment above); nexus-doctor P7 \
+                 latch_covers_termios_only_session = {premise:?}"
+            );
+            return;
+        }
+    }
 
     let mut released = 0usize;
     for i in 0..COLLAPSES {

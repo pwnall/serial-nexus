@@ -1589,16 +1589,52 @@ mod tests {
             "the pair still holds {after} bytes after the flush: a fresh client \
              session would open onto the previous session's output (§7.2)"
         );
-        // The flush reads the *slave*, so it must leave nothing readable on the
-        // master. A `tcflush` here would leave a TIOCPKT_FLUSHREAD packet, which
-        // the reader's next pass cannot tell from a client's own session evidence
-        // and which would re-arm the §15.36 last-close latch it just cleared.
-        let re = sys::poll_ready(master.as_raw_fd(), PollFlags::POLLIN | PollFlags::POLLHUP);
-        assert!(
-            !re.contains(PollFlags::POLLIN),
-            "the flush left something readable on the master ({re:?}) — the reader \
-             would take it for a new client session"
-        );
+        // The flush reads the *slave*, so it must leave no **session evidence** on
+        // the master. A `tcflush` here would leave a TIOCPKT_FLUSHREAD packet — one
+        // readable byte — which the reader's next pass cannot tell from a client's
+        // own evidence and which would re-arm the §15.36 last-close latch it just
+        // cleared; so would running `make_drainable`'s `tcsetattr` on Linux, which
+        // is why that arm is a no-op there.
+        //
+        // Asserted on the **read**, not on POLLIN, because "session evidence" is
+        // defined by what the reader latches on — `read_and_poll`'s
+        // `Ok(n) if n >= 1` arm, which sets `saw_session` whatever the packet says —
+        // and because POLLIN is a §13 kernel-version-dependent claim the product
+        // deliberately does not depend on (see that close block's anti-spin note).
+        // Measured on Darwin 24.6.0: a pty master with no slave open reports
+        // `POLLIN | POLLHUP` unconditionally and answers `read` with 0/EOF, where
+        // Linux reports the hangup and answers EIO. Both mean "nothing to latch
+        // on"; only the read says so on both. On Linux this is the *stronger*
+        // check — a readable packet byte implies POLLIN, so nothing the poll form
+        // caught escapes it, while a spurious POLLIN over an empty queue no longer
+        // fails a daemon that is behaving correctly.
+        //
+        // **Which device the claim needs** (§5). The packet-evidence regressions
+        // this discriminates on — the `tcflush` alternative, and deleting
+        // `make_drainable`'s Linux no-op — are observable on Linux and not on BSD,
+        // where every variant leaves the master answering `read -> 0` (measured).
+        // What it still catches *here* is a flush that leaks its slave fd, which
+        // leaves the pair attached and the master answering `Ok(1)` (measured,
+        // byte 0x13). So the assertion is non-vacuous on both platforms; it is the
+        // tcflush class specifically that only Linux can fail.
+        let master_fd = master.as_raw_fd();
+        let re = sys::poll_ready(master_fd, PollFlags::POLLIN | PollFlags::POLLHUP);
+        match sys::read_fd(master_fd, &mut buf) {
+            // Nothing to latch on: BSD answers EOF on a hung-up master, Linux EIO,
+            // and either answers EAGAIN when POLLIN was not set at all.
+            Ok(0) => {}
+            Err(e)
+                if e.raw_os_error() == Some(libc::EIO)
+                    || e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(n) => panic!(
+                "the flush left {n} readable byte(s) on the master (first = {:#04x}, \
+                 revents {re:?}) — the reader's next pass latches `saw_session` on \
+                 any read of n >= 1 and would take it for a new client session \
+                 (§15.36)",
+                buf[0]
+            ),
+            Err(e) => panic!("unexpected master read after the flush: {e} (revents {re:?})"),
+        }
         assert!(
             re.contains(PollFlags::POLLHUP),
             "the flush's momentary slave open left the pair looking attached \

@@ -14,6 +14,101 @@ design.
 
 ---
 
+## THE FIRST WHOLE-SUITE macOS RUN — four failures, three guards, one real defect (2026-07-28 session)
+
+Run on macOS 15.7.8 / Darwin 24.6.0, x86_64, with two FTDI adapters cross-wired as a null
+modem. **Result: 623 passed / 0 failed / 4 ignored**, `fmt`, both clippy gates, `cargo deny`,
+`p0_license_gate`, `p8_web_ui`, `p8_web_history` and `expectations/macos.jq` all green, and
+**all four `serial_hardware.rs` rig tests passing** — plus `p12_serial_exclusivity`'s
+rig-gated `a_break_straddled_by_a_replace_leaves_the_line_transmitting`, the invariant-15
+guard a pts structurally cannot run.
+
+**Why this had never happened.** CI's macOS lane runs `cargo test --workspace`, and *cargo
+test fail-fasts per crate*. One `nexus-daemon` unit test had been failing there, so the lane
+stopped before the integration harness every time: red on six consecutive pushes, always
+reported as the same single failure, with **three more sitting behind it that nobody had
+seen**. `--no-fail-fast` surfaced all four at once. That is now a rule in AGENTS §2 — when
+you are validating a *platform* rather than a change, pass `--no-fail-fast`, because the
+per-crate stop makes "one known failure" and "four unknown ones" look identical.
+
+**Three of the four were guards asserting a Linux-specific proxy** for a property the daemon
+satisfies portably. Each was diagnosed, then adversarially verified by two independent
+skeptics with different lenses (§9's bar), and in each case the portable form turned out
+**stricter on Linux** than what it replaced — which is the tell that the real property was
+found rather than the guard weakened:
+
+1. `pty.rs`'s §7.2 flush test asserted `!POLLIN` on the master. Darwin sets `POLLIN`
+   *unconditionally* on a slave-less master and answers `read` with `Ok(0)`; Linux reports
+   the hangup and answers `EIO`. The product was measured correct — `read_and_poll` latches
+   `saw_session` on `Ok(n) if n >= 1`, so the `Ok(0)` takes the `closed` arm and sets neither
+   `did` nor `saw_session` (no spin: 1.53% of a core against a 1.43% baseline; the lock
+   survived ~6000 such passes) — and `read_and_poll`'s own close-block comment already
+   disclaims "POLLIN goes quiet after a hangup" as a §13 kernel-dependent claim. The
+   assertion now reads the master, which is the predicate the product actually uses.
+2/3. The two LEG-2 guards required `accepted_targetward` to *settle nonzero*. That silently
+   assumed the AF_UNIX buffer is at least one wire frame wide: macOS's is **8192 bytes**
+   (`net.local.stream.sendspace`, measured — exactly 8192 absorbed with no reader) against
+   Linux's ~208 KiB, and the counter is credited per **completed frame**, so a 60 006-byte
+   frame never completes there and 0 is the correct reading. The ledger still closed to the
+   byte on macOS (`0 + 1 140 019 + 60 001 = 1 200 020 = sent`). The predicate is now "frozen
+   **while bytes are still owed**" — the portable form `p6_fragmentation` already used, and
+   stricter besides: the old one also accepted a plateau at `== sent`, a fully drained peer,
+   which is not the parked state at all. The constants stay at 20 × 60 000; shrinking them
+   would have hidden the assumption rather than removed it.
+
+**A fourth, pre-existing, unmasked by the fix.** Once those two stopped burning 30-second
+timeouts the suite's timing changed and `WirePeer::dial` began failing `ECONNREFUSED` — in
+the full suite, never in isolation, which is the shape that reads as flakiness and gets
+chased as one (§8). It is not a flake: the callers wait on `sock.exists()`, and **`bind(2)`
+creates the socket file one syscall before `listen(2)` stops `connect(2)` refusing**. The
+dial now retries to a bounded deadline. Generalised into an AGENTS §5 rule beside the other
+two, because all three are one mistake — a proxy standing in for the thing you need, in
+space or in time.
+
+**The fourth failure is a real macOS defect and is NOT fixed.** A collapsed *termios-only*
+pty session — open, `tcsetattr`, close, inside one 5 ms poll gap — leaks its write lock.
+The first diagnosis called it unfixable ("nothing else reveals it", from an exhaustive sweep
+of level-triggered observables: poll revents, `FIONREAD`, `TIOCOUTQ`, `TIOCGPGRP`,
+`TIOCMGET`, `TIOCGWINSZ`, pts inode timestamps, all byte-identical to no session at all).
+**Both skeptics refuted that, independently and by measurement**: level state cannot carry
+an *edge*, and a kqueue `EVFILT_READ | EV_CLEAR` knote on the master does — a faithful model
+of `read_and_poll`'s presence/last-close block went 0/8 → 8/8 with an edge latch, 3/3
+reproducible, zero fires across idle controls and 200 daemon-shaped poll+read passes. The
+conclusion had followed from the shape of the probe, and a measurement outranks it. Severity
+against the shipped daemon: 20/20 real `stty -f` sessions leak, past 30 s, with another
+origin's `send` failing `-32003`. **Deliberately left open**: the fix needs new `unsafe` in
+`nexus-sys` (invariant 4), an ADR separating an *edge latch* from invariant 1's *readiness*
+ban, a doctor probe for the mechanism, and handling the daemon's own momentary slave opens,
+which forge an identical edge — a §9 design decision, not a diagnosis-phase patch. Its guard
+**skips rather than being retired**, gated on `nexus-doctor` P7 and `cfg(not(linux))`: on the
+kernel of record a `false` answer means the daemon is leaking locks, and `linux.jq` admits P7
+`degraded`, so a P7-keyed skip there would retire the guard at exactly the wrong moment (§5's
+"a gate that can skip silently is a gate CI passes over a hole"). Full detail in
+AGENTS §7's macOS arm and `docs/macos.md` delta 3.
+
+**Two things the rig run answered that the docs had marked "needs a Mac" for four
+generations.** Doctor **P1 is `degraded`, and the mechanism is now measured, not inferred**:
+a client `tcsetattr` *does* produce a packet, but Darwin's leading byte is `0x20`
+(`TIOCPKT_DOSTOP`), not `0x40` (`TIOCPKT_IOCTL`), so `read_and_poll`'s IOCTL arm never
+matches and termios reconciliation runs entirely off the `RECONCILE_INTERVAL` backstop —
+the §7.2 fallback working exactly as designed, costing only latency. And
+`discarded_at_last_close` is **structurally always 0** on macOS, because the kernel destroys
+the pts's undelivered hostward queue at last close before the daemon can count it: §7.2's
+guarantee holds there for free, and the counter that names the discard has nothing to name.
+
+**One doctor over-claim fixed, the third in P5's prose.** With the rig named on `--port`, P5
+discovered the pair correctly in both directions and then reported both genuine FTDI adapters
+`skipped (not a UART)`, under a consequence line promising "the certificate populates on real
+adapters". The UART predicate is `p5_is_uart` = `read_icounts(fd).is_ok()` = **`TIOCGICOUNT`,
+which is Linux-only**, so off Linux it answers "no" for every port however real, and the
+advice was to replace hardware that was already correct. Both strings are now `#[cfg]`-split
+and say what was measured (§15.17). AGENTS §2's 6.18 entry records the other two over-claims;
+the guard `a_clean_rig_is_supported_certified_or_skipped` gained a portable clause — an
+uncertified rig must never borrow the certified arm's opening sentence — since that sentence
+is what a tiered checklist run reads to decide it may start (§15.21).
+
+---
+
 ## THE 6.18 KERNEL DIFF — taken at last, and it changed nothing (2026-07-28 session)
 
 P6–P11 were added on 2026-07-26/27 "so the owner can run `nexus-doctor --json` on 6.18 and diff it

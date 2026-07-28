@@ -5,6 +5,27 @@ the one every mechanism is specified against; macOS is supported where plain
 POSIX carries the design, and degrades — never crashes, never silently misbehaves
 — everywhere the design leans on a Linux-only facility.
 
+## Update — 2026-07-28 full-suite pass (macOS 15.7.8 / Darwin 24.6.0, x86_64, real FTDI crossover rig)
+
+The first pass to run the **whole** suite on a Mac. That had never happened: the macOS
+CI lane runs `cargo test --workspace`, which **fail-fasts at the first crate**, and one
+`nexus-daemon` unit test had been failing there since the probe set grew — so every
+macOS job since had stopped before the integration harness and the lane had been red on
+six consecutive pushes for one reason while three further failures sat behind it,
+unseen. `--no-fail-fast` surfaced all four at once. **623 pass, 0 fail** now.
+
+- **All four hardware-rig tests pass** (`serial_hardware.rs`): byte-exact both directions
+  at 115200 and 250000, the `send` verb on real silicon, `TIOCEXCL`, the signal verbs, and
+  the v11 `map` node both directions over the physical crossover. **verified.**
+- **Three of the four failures were guards asserting a Linux-specific proxy**, and the
+  daemon was measured correct on macOS in each case. They are now written against the
+  portable property (see deltas 3 and 4 below for the two mechanisms).
+- **The fourth is a real, operator-visible macOS defect, and it is *not* fixed** — the
+  collapsed termios-only pty session leaks its write lock (delta 3). Its guard skips here
+  rather than being retired, and the skip names the gap.
+- **P1 is answered on hardware** — this page said "needs a Mac" for four generations. It
+  is `degraded`, and the *mechanism* is now measured, not inferred (delta 3).
+
 ## Update — 2026-07-24 hands-on pass (macOS 15.7.8 / Darwin 24.6.0, x86_64, real FTDI crossover rig)
 
 The first hands-on pass on real hardware ran, and settled the open questions; a
@@ -208,7 +229,49 @@ client-termios *latency*; nothing in the data plane depends on the fast path. Th
 daemon never consults a probe to decide this — the poll is always running.
 
 `nexus-doctor` P1 reports the *actual* delta on a given Mac: `supported` means the
-fast path works; `degraded` means poll-only. **needs a Mac.**
+fast path works; `degraded` means poll-only. **Measured 2026-07-28 on 15.7.8:
+`degraded`** — and the mechanism, which the "unverified" wording left open, is now
+pinned. A packet **is** produced by a client `tcsetattr` while the slave is open, but
+Darwin's leading byte is `0x20` (`TIOCPKT_DOSTOP`), not `0x40` (`TIOCPKT_IOCTL`), so
+`read_and_poll`'s `buf[0] & sys::TIOCPKT_IOCTL != 0` arm never matches and termios
+reconciliation runs entirely off the `RECONCILE_INTERVAL` (3 s) backstop. That is
+exactly the fallback this delta describes, working as designed; only client-termios
+*latency* degrades. **verified.**
+
+**The one macOS defect on this path, open and operator-visible.** A pty client that
+opens, calls `tcsetattr` and closes **inside one 5 ms reader poll gap** — a scripted
+probe, a health check, a bare `stty` — leaves its `usb0` write lock held forever.
+XNU's `ptsclose` → `ttyclose` flushes both tty queues at the slave's last close, so
+the packet above is destroyed before the daemon's next poll, and `read_and_poll`'s
+`saw_session` latch (§6 detach-release, invariant 16) has nothing to arm on: `was` is
+false because no poll landed during the 53 µs session, and every level-triggered
+observable — poll revents, `FIONREAD`, `TIOCOUTQ`, `TIOCGPGRP`, `TIOCMGET`,
+`TIOCGWINSZ`, the pts inode's timestamps — is byte-identical to no session at all.
+Measured against the shipped daemon: **20 of 20** real `stty -f` invocations leak,
+`usb0.lock.holder = "console"` while `console.client_present` reads `false`, past
+30 s, with another origin's `send` failing `-32003 … is locked`. It heals on the next
+*observed* (≳5 ms) session, or `lock --steal`.
+
+Two things follow, and both matter more than the defect. First, **the shipped
+predicate is right and must not be widened**: an ungated `|| closed` arm would fire on
+every 5 ms pass here (a Darwin master with no slave reports `POLLIN|POLLHUP` and
+`read → 0` forever — doctor P6, 64/64), releasing a lock an operator took with no
+client attached. Second, **this is a scope limit, not a kernel wall**: the session
+boundary survives as an *edge* even though no level state records it — a kqueue
+`EVFILT_READ | EV_CLEAR` knote on the master delivers it a full poll gap later
+(measured in a faithful model of that block: shipped predicate 0/8, plus an edge latch
+8/8, zero fires across idle controls). The fix is a `nexus-sys` BSD arm and needs an
+ADR distinguishing an edge latch from invariant 1's *readiness* ban, plus a doctor
+probe; it is **not** written. `nexus-doctor` P7 reports the gap
+(`latch_covers_termios_only_session`), and `p9_pty_collapse`'s third test gates on that
+observation **off Linux only** — on the kernel of record a `false` answer means the
+daemon is leaking locks and must go red rather than skip. **verified as a defect.**
+
+A related consequence with no fix needed: **`discarded_at_last_close` is structurally
+always 0 on macOS.** §7.2's hostward flush counts what the *daemon* discards, and this
+kernel destroys the pts's undelivered hostward queue at last close first — so the
+guarantee ("a fresh session never inherits the previous operator's scrollback") holds
+here for free, and the counter that names the discard has nothing to name. **verified.**
 
 ### 4. Sockets and paths
 
@@ -218,6 +281,22 @@ fast path works; `degraded` means poll-only. **needs a Mac.**
   socket resolver falls through to **`/tmp/serialnexusd-<uid>.sock`** (see
   `nexus-daemon/src/lib.rs::resolve_socket`). This is short enough for the
   `sockaddr_un` length limit. Pass `--socket` to override.
+- **The AF_UNIX socket buffer is 26× smaller, and it is a trap for test authors.**
+  `net.local.stream.sendspace` and `recvspace` are **8192** bytes here against Linux's
+  ~208 KiB (`net.core.wmem_default`); measured, a writer whose peer never reads places
+  exactly 8192 bytes before `EWOULDBLOCK`. Nothing in the product depends on the size —
+  a full buffer is backpressure, which §5 sanctions targetward (delay, never drop) — but
+  it is **narrower than one 64 KiB wire frame**, and a `leg` credits
+  `accepted_targetward` only once a whole frame has cleared `write_all`. So against a
+  stalled peer a large-chunk test sees that counter legitimately pinned at **0** on
+  macOS where Linux shows it climb and plateau. Two LEG-2 guards were written against
+  the Linux number and hung for 30 s each here; the fix was to state the real predicate
+  — *frozen while bytes are still owed* — rather than "frozen at a nonzero value", which
+  is also strictly stricter on Linux (the old form accepted a plateau at `== sent`, a
+  fully drained peer, which is not the parked state at all). `p6_fragmentation` already
+  used the portable form. **If you assert on a socket-buffer-derived quantity, derive
+  the predicate from what the daemon promises, not from what Linux happens to buffer.**
+  **verified.**
 - **Stale PTY symlink after a crash:** the auto-recovery that silently reclaims a
   symlink dangling into devpts is keyed on the target starting with `/dev/pts`
   (`nexus-daemon/src/nodes/pty.rs::PtyNode::install_symlink`). On macOS, pts nodes are

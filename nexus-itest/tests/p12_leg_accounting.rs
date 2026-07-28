@@ -75,8 +75,37 @@ struct WirePeer {
 
 impl WirePeer {
     fn dial(address: &Path, channels: &[&str]) -> WirePeer {
-        let mut stream = UnixStream::connect(address)
-            .unwrap_or_else(|e| panic!("dial the leg at {}: {e}", address.display()));
+        // Retry until the leg is *connectable*, not merely until its socket file
+        // exists. The two are one syscall apart and the callers' readiness wait
+        // (`sock.exists()`) can only see the first: `bind(2)` creates the node,
+        // `listen(2)` is what stops `connect(2)` answering ECONNREFUSED, so a dial
+        // landing between them fails on a daemon that is coming up perfectly
+        // normally. Observed exactly there on macOS — `Connection refused (os error
+        // 61)` at this line, in the full suite and never in isolation, which reads
+        // as flakiness and gets chased as one (AGENTS §8).
+        //
+        // Bounded and condition-driven rather than slept on (§5): the loop ends on
+        // the first success, and the deadline matches the callers' own 10 s
+        // socket-appearance wait so a leg that never listens still fails loudly
+        // instead of hanging the suite.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            match UnixStream::connect(address) {
+                Ok(s) => break s,
+                Err(e) if std::time::Instant::now() < deadline => {
+                    if e.kind() != std::io::ErrorKind::ConnectionRefused
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        panic!("dial the leg at {}: {e}", address.display());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!(
+                    "dial the leg at {}: {e} (still not accepting after 10 s)",
+                    address.display()
+                ),
+            }
+        };
         stream
             .write_all(&hello_frame(channels))
             .expect("write hello");
@@ -201,17 +230,29 @@ fn bound(rpc: &Rpc, node: &str, ch: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Wait until a nonzero counter has stopped growing across several consecutive
-/// polls, and return its settled value. For `accepted_targetward` that *is* the
+/// Wait until a counter has stopped growing across several consecutive polls
+/// *while bytes are still owed*, and return its settled value. That plateau is the
 /// observable proof the write half is parked inside `write_all` with a chunk in
-/// hand — the state LEG-2 loses bytes from — so the wait is the condition itself,
-/// not a bare sleep (§5).
-fn wait_settled(rpc: &Rpc, node: &str, ch: &str, field: &str) -> u64 {
+/// hand — the state LEG-2 loses bytes from — because the only other place it parks
+/// is `next_send`, which returns the instant any bound sender has a chunk. So the
+/// wait is the condition itself, not a bare sleep (§5).
+///
+/// The predicate is "frozen **and** owing", never "frozen at a nonzero value". The
+/// counter is credited per *completed* frame (`leg.rs` — only after `write_all`
+/// returns), so on a kernel whose AF_UNIX buffer is narrower than one frame it
+/// settles legitimately at 0: macOS's is 8192 bytes (`net.local.stream.sendspace`,
+/// measured — exactly 8192 absorbed with no reader) against a 60 006-byte frame,
+/// where a `now > 0` clause times out on a daemon whose ledger still closes to the
+/// byte. `p6_fragmentation` guards the same finding with the same predicate for the
+/// same reason, and "owing" is *stricter* than "nonzero" on Linux too: the old form
+/// also accepted a plateau at `now == owed`, a fully drained peer, which is not the
+/// park state at all.
+fn wait_settled(rpc: &Rpc, node: &str, ch: &str, field: &str, owed: u64) -> u64 {
     let mut last = u64::MAX;
     let mut stable = 0u32;
     let settled = wait_until(Duration::from_secs(30), || {
         let now = counter(rpc, node, ch, field);
-        if now > 0 && now == last {
+        if now == last && now < owed {
             stable += 1;
         } else {
             stable = 0;
@@ -221,7 +262,7 @@ fn wait_settled(rpc: &Rpc, node: &str, ch: &str, field: &str) -> u64 {
     });
     assert!(
         settled,
-        "{node}/{ch}.{field} never settled (last {last}): {:?}",
+        "{node}/{ch}.{field} never froze below the {owed} bytes owed (last {last}): {:?}",
         rpc.node(node)
     );
     last
@@ -420,7 +461,11 @@ channels = ["c0"]
 fn leg2_body(kill: impl FnOnce(&WirePeer)) {
     // 20 × 60 KB is far past any socket send buffer, so the write half is certain to
     // park mid-chunk, and comfortably inside the endpoint's 256-chunk targetward
-    // queue, so every `send` is accepted without blocking the control plane.
+    // queue, so every `send` is accepted without blocking the control plane. What
+    // must *not* be inferred from that is a nonzero `accepted_targetward` while it
+    // parks: one chunk is one 60 006-byte frame, which is wider than the whole of
+    // macOS's 8 KiB AF_UNIX buffer, so the counter correctly stays 0 there — see
+    // `wait_settled`, whose predicate is "frozen while still owing" for this reason.
     const LINES: usize = 20;
     const LINE_LEN: usize = 60_000;
 
@@ -456,7 +501,7 @@ fn leg2_body(kill: impl FnOnce(&WirePeer)) {
 
     // The write half is now parked inside `write_all`, holding a chunk that is off
     // its receiver and not on the wire — the exact byte LEG-2 lost.
-    let accepted_before = wait_settled(rpc, "downlink", "c0", "accepted_targetward");
+    let accepted_before = wait_settled(rpc, "downlink", "c0", "accepted_targetward", sent);
     assert!(accepted_before < sent, "the peer's buffer never filled");
 
     kill(&peer);

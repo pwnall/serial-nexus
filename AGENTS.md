@@ -53,7 +53,13 @@ endpoint, raw edge defaults to `held` with steal-to-bypass). `existing-terminal`
   -D warnings` (+ the minimal-daemon clippy); `cargo deny check`. **The whole suite runs on
   macOS too** (serial-*device* tests self-skip there — §7 — and the real crossover-hardware
   test runs when a rig is attached).
-  Current figure: **636 passed / 0 failed / 4 ignored**.
+  Current figure: **636 passed / 0 failed / 4 ignored** on Linux; **623 / 0 / 4** on macOS
+  15.7.8 with a crossover rig (2026-07-28) — see the macOS bullet below.
+  **Run it with `--no-fail-fast` when you are validating a platform rather than a change.**
+  `cargo test` stops at the first failing *crate*, and that is how a single `nexus-daemon`
+  unit test hid three further macOS failures from CI for six consecutive red pushes: the
+  lane never reached the integration harness at all, so "macOS is red" looked like one
+  known problem and was four.
 - **All planned phases 0–8 are done**, plus five post-1.0 tracks: the simplification
   track (design §16 / plan §9), the out-of-tree-codec extension track (design §15.26 /
   plan §10), the web console track (design §17 / plan §11.1–§11.6), the **v10 track**
@@ -87,6 +93,32 @@ endpoint, raw edge defaults to `held` with steal-to-bypass). `existing-terminal`
   no wiring, so it is now **refused structurally** rather than loading a port it seizes with
   `TIOCEXCL` and attaches to nothing; a standalone re-multiplexing codec (`faces = "host"`)
   now comes up `waiting` with a §14 reason, which is what §7.5 promised, instead of `faulted`.
+- **macOS full-suite pass on a crossover rig (2026-07-28), and the one real defect it left
+  open.** The first run of the *whole* suite on a Mac — CI's macOS lane had been red on six
+  consecutive pushes, always the same `nexus-daemon` unit test, and because `cargo test`
+  fail-fasts per crate it had **never once reached the integration harness**. Four failures,
+  not one. All four hardware-rig tests pass (byte-exact both directions at 115200 and
+  250000, `send`, `TIOCEXCL`, the signal verbs, the v11 `map` node over the physical
+  crossover), as do `fmt`, both clippy gates, `cargo deny` and `expectations/macos.jq`.
+  **Three of the four were guards asserting a Linux-specific proxy for a property the
+  daemon satisfies portably**, and each is now written against the property itself: (1) the
+  §7.2 flush test asserted `!POLLIN` on the master, where a Darwin master with no slave
+  reports `POLLIN|POLLHUP` *unconditionally* and answers `read` with 0/EOF (Linux: EIO) —
+  it now asserts on the **read**, which is what `read_and_poll`'s `saw_session` actually
+  latches on (`Ok(n) if n >= 1`), and which is strictly stronger on Linux; (2) the two
+  LEG-2 guards required `accepted_targetward` to settle *nonzero*, which silently assumed
+  the AF_UNIX buffer is at least one 64 KiB wire frame wide — macOS's is **8192 bytes**
+  against Linux's ~208 KiB, so the counter correctly pins at 0 there (it credits per
+  *completed* frame) — the predicate is now "frozen while bytes are still owed", the
+  portable form `p6_fragmentation` already used and stricter on Linux besides (the old one
+  also accepted a plateau at `== sent`, a fully drained peer, which is not the parked state
+  at all). A fourth, pre-existing and unmasked once those two stopped burning 30 s
+  timeouts: `WirePeer::dial` raced the leg's `listen(2)`, because the callers' readiness
+  proxy is `sock.exists()` and **`bind(2)` creates the socket file one syscall before
+  `listen(2)` stops `connect(2)` answering ECONNREFUSED**; the dial now retries to a
+  bounded deadline. **The remaining one is a genuine, operator-visible macOS defect and is
+  NOT fixed** — see §7's macOS arm; its guard skips there rather than being retired, and
+  the skip names the gap.
 - **CI flake remediation + 6.18 probes (2026-07-26/27):** CI had been red on four of the last six
   pushes, on three *different* tests. All of it is fixed; see `docs/implementation-notes.md` for the
   mechanisms. In short: the `p8_web` RFC 6455 test client was not frame-atomic w.r.t. its deadline
@@ -433,6 +465,22 @@ that console pty an explicit `hostward_buffer = 8192` and cite §5/§15.19 in a 
 backpressures upstream and the pty's own depth is the only buffer in the path. The exception that
 must not be "fixed": a node whose **loss is the subject** (a deliberately slow tap) keeps its
 default — deepening it silently guts the test.
+
+**Assert the property, not a platform's spelling of it — and derive a readiness wait from
+what the syscall promises, not from what you can see.** Three of the four failures the
+2026-07-28 macOS pass found (§2) were one mistake in three costumes: a guard that named a
+Linux-shaped *proxy* for a portable property, on a daemon that satisfied the property
+everywhere. `!POLLIN` on a hung-up pty master stood in for "no session evidence" — but the
+product latches on a **read** (`Ok(n) if n >= 1`), and Darwin sets `POLLIN` unconditionally
+there while answering `read` with 0. A *nonzero* `accepted_targetward` stood in for "the leg's
+write half is parked mid-chunk" — but the counter credits per **completed frame**, so the
+proxy silently required a socket buffer at least one frame wide, which macOS's 8 KiB is not.
+In both cases the portable form is **stricter** on Linux, not looser, which is the tell that
+you have found the real property rather than weakened the guard. The fourth is the same error
+about *time*: `sock.exists()` stood in for "the leg accepts connections", and `bind(2)` creates
+that file one syscall before `listen(2)` stops `connect(2)` answering ECONNREFUSED — so wait
+on the operation you actually need to succeed, not on a side effect that precedes it. Ask what
+the daemon *promises*; a quantity you measured on one kernel is a fixture, not a contract.
 
 **A test that measures recovery after a leg outage must start from a known-quiet console.** A
 reconnect releases *two* backlogs and purges only one. Purge-on-reconnect is §6's one sanctioned
@@ -903,6 +951,53 @@ running engineering log and the authoritative "why the code looks like this" rec
     no Linux satisfies — a never-opened master doesn't HUP, §3.2), demoting native Linux to
     `Degraded`. If a fresh session sees P2 `degraded` on **Linux**, that is a real problem;
     on macOS it is expected.
+  - **A collapsed termios-only pty session leaks its write lock on macOS. This is an open
+    defect, measured 2026-07-28, and the guard for it skips there rather than being
+    retired.** A client that opens the pts, calls `tcsetattr` and closes **inside one 5 ms
+    reader poll gap** — a scripted probe, a health check, a bare `stty` — leaves
+    `usb0.lock.holder` set forever while `client_present` reads `false`; another origin's
+    `send` then fails `-32003 … is locked`. Measured 20 of 20 against the shipped daemon,
+    persisting past 30 s. It heals on the next *observed* (≳5 ms) session or a
+    `lock --steal`. Cause: XNU's `ptsclose` → `ttyclose` flushes both tty queues at the
+    slave's last close, destroying the packet `read_and_poll`'s `saw_session` latch arms on
+    (invariant 16); `was` is false because no poll landed during the ~53 µs session; and
+    every *level*-triggered observable — poll revents, `FIONREAD`, `TIOCOUTQ`, `TIOCGPGRP`,
+    `TIOCMGET`, `TIOCGWINSZ`, the pts inode's timestamps — is byte-identical to no session
+    at all. Two consequences bind a future editor. **Do not widen the predicate**: an
+    ungated `|| closed` arm fires on *every* pass here (a Darwin master with no slave
+    reports `POLLIN|POLLHUP` and `read → 0` forever — doctor P6, 64/64), releasing a lock
+    an operator took with no client attached, which is the direction `p9_pty_collapse`
+    asserts first and which the daemon currently gets right. And **it is a scope limit, not
+    a kernel wall**: the session boundary survives as an *edge* — a kqueue
+    `EVFILT_READ | EV_CLEAR` knote on the master delivers it a poll gap later (modelled
+    faithfully against that code block: shipped predicate 0/8, plus an edge latch 8/8, zero
+    fires across idle controls). Landing that means a `nexus-sys` BSD arm (new `unsafe`,
+    invariant 4), an ADR separating an **edge latch** from invariant 1's *readiness* ban, a
+    `nexus-doctor` probe for the mechanism, and handling the daemon's own momentary slave
+    opens, which forge an identical edge. **Not written — it needs sign-off (§9).**
+    `nexus-doctor` **P7** reports the gap (`latch_covers_termios_only_session`), and the
+    guard consults it **off Linux only**: `expectations/linux.jq` admits P7 `degraded`, so
+    a P7-keyed skip on the kernel of record would retire the guard at exactly the moment
+    the daemon began leaking locks there. Treat P7's sibling `latch_covers_data_session`
+    with care — it reads `false` on Darwin for a shape the daemon demonstrably covers,
+    because the probe's harness has no master reader and BSD `ttywait` then blocks the
+    close ~600 ms, where under the live daemon the same close takes ~1 ms and the read arms
+    the latch.
+  - **Doctor P1 on macOS is `degraded`, and the mechanism is now measured** (2026-07-28,
+    15.7.8): a client `tcsetattr` *does* produce a packet, but Darwin's leading byte is
+    `0x20` (`TIOCPKT_DOSTOP`), not `0x40` (`TIOCPKT_IOCTL`), so `read_and_poll`'s
+    `buf[0] & sys::TIOCPKT_IOCTL != 0` arm never matches and termios reconciliation runs
+    entirely off the `RECONCILE_INTERVAL` backstop — the §7.2 fallback the design keeps
+    live for exactly this. Only client-termios *latency* degrades. Relatedly,
+    `discarded_at_last_close` is structurally always **0** on macOS: the kernel destroys
+    the pts's undelivered hostward queue at last close before the daemon can count it, so
+    §7.2's guarantee holds there for free and the counter naming the discard has nothing
+    to name.
+  - **The AF_UNIX socket buffer is 8192 bytes on macOS** (`net.local.stream.sendspace`)
+    against Linux's ~208 KiB — *narrower than one 64 KiB wire frame*. Nothing in the
+    product depends on the size (a full buffer is backpressure, which §5 sanctions
+    targetward), but a test that derives a predicate from what Linux happens to buffer
+    will hang here; see §5's rule and `docs/macos.md` delta 4.
   - **The macOS local cross-check must exclude `serialnexusweb`:** `cargo check --target
     x86_64-apple-darwin --workspace --exclude serialnexusweb` — the `ring` crate (its TLS dep)
     cannot cross-build from Linux. The real macOS gate is `cargo test --workspace` *on the Mac*,

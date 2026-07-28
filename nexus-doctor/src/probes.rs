@@ -1518,9 +1518,11 @@ fn read_trimmed(p: &Path) -> Option<String> {
 // TX-emitting probe: it transmits a nonce, so it runs only on explicitly named
 // --ports (a listed port could be wired to live equipment). Discovery classifies
 // each named port (dangling / loopback / paired, both directions, so a
-// half-crossed pair is named); characterization certifies real UARTs and reports
-// `skipped (not a UART)` for the sim pts used in CI. The doctor certifies the
-// rig and stops — it never drives the daemon through it.
+// half-crossed pair is named); characterization certifies real UARTs and skips
+// with a reason otherwise — `not a UART` for the sim pts used in CI on Linux, and
+// a different sentence off Linux, where the UART predicate cannot answer at all
+// (see `P5_UNCHARACTERIZED`). The doctor certifies the rig and stops — it never
+// drives the daemon through it.
 // ---------------------------------------------------------------------------
 
 /// A unique, distinctive nonce for the port at index `i` — the index makes it
@@ -1684,6 +1686,28 @@ fn p5_name(port: &Path, resolver: &nexus_core::Resolver) -> String {
 fn p5_is_uart(sp: &SerialPort) -> bool {
     sys::read_icounts(sp.as_raw_fd()).is_ok()
 }
+
+/// Why [`p5_certify_port`] was not run for a port [`p5_is_uart`] rejected — and it
+/// is **not** the same sentence on both platforms, because the predicate does not
+/// mean the same thing on both.
+///
+/// The predicate is `TIOCGICOUNT`, which is Linux-only (`nexus-sys`'s non-Linux arm
+/// is a hard `ENOTSUP` stub). On Linux a port that answers it is a real driver and
+/// one that does not is the CI pts sim, so "not a UART" is exactly right. Off Linux
+/// it answers `false` for **every** port — a genuine FTDI adapter included — so the
+/// same words become a false statement about the operator's hardware. Measured
+/// 2026-07-28 on macOS 15.7.8 against two real FTDI adapters cross-wired as a null
+/// modem: P5 discovered the pair correctly in both directions and then reported both
+/// ports `skipped (not a UART)`.
+///
+/// A capability report may only claim what it measured (§15.17), and this is the
+/// third time that rule has had to be applied to P5's own prose — the other two are
+/// in AGENTS §2's 6.18 entry. What was measured here is "this kernel gives me no way
+/// to tell", so that is what it says.
+#[cfg(target_os = "linux")]
+const P5_UNCHARACTERIZED: &str = "not a UART";
+#[cfg(not(target_os = "linux"))]
+const P5_UNCHARACTERIZED: &str = "not characterizable here (TIOCGICOUNT is Linux-only)";
 
 /// One failed certificate item, named so the verdict can cite it (§15.21).
 ///
@@ -2132,7 +2156,7 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &nexus_core::Resolver) -> (Probe, Rig
                 drop(sp);
                 p5_certify_port(port)
             } else {
-                Certificate::skipped("not a UART")
+                Certificate::skipped(P5_UNCHARACTERIZED)
             };
             p = p.observe(format!("{name} cert").as_str(), cert.line);
             failures.extend(cert.failures.into_iter().map(|f| f.qualified(&name)));
@@ -2332,9 +2356,20 @@ fn p5_verdict(
             ),
         )
     } else {
+        // Two different reasons land here and they need different advice, for the
+        // reason `P5_UNCHARACTERIZED` documents: on Linux nothing answered
+        // TIOCGICOUNT, so these really are sims and a real adapter would certify;
+        // off Linux nothing *can* answer it, so telling the operator to attach real
+        // adapters is advice they may already have followed — measured 2026-07-28
+        // against two genuine FTDI adapters on macOS, which this arm then invited to
+        // be replaced with real ones.
+        #[cfg(target_os = "linux")]
+        let why = "characterization skipped on non-UART sims — the certificate populates on real adapters (§13, no-target doctrine)";
+        #[cfg(not(target_os = "linux"))]
+        let why = "characterization does not run on this platform at all — the UART predicate is TIOCGICOUNT, which is Linux-only, so no port certifies here however real it is. Discovery and pairing above are still measured; run the certificate on a Linux box (§13, best-effort tier)";
         (
             Status::Supported,
-            "Rig discovered and classified (above); characterization skipped on non-UART sims — the certificate populates on real adapters (§13, no-target doctrine).".to_owned(),
+            format!("Rig discovered and classified (above); {why}."),
         )
     }
 }
@@ -3054,7 +3089,7 @@ mod tests {
 
     /// The sim path (§15.21: "characterization reporting skipped on non-UARTs, so
     /// P5's logic never waits for a bench") and the fully certified rig both stay
-    /// `supported`, with their consequence lines unchanged.
+    /// `supported`, with their consequence lines explaining which one happened.
     #[test]
     fn a_clean_rig_is_supported_certified_or_skipped() {
         let (status, why) = p5_verdict(true, true, &[], &[], paired());
@@ -3063,7 +3098,21 @@ mod tests {
 
         let (status, why) = p5_verdict(true, false, &[], &[], RigFacts::default());
         assert_eq!(status.label(), "supported");
+        // *Why* nothing certified is platform-specific, because the UART predicate
+        // is (see `P5_UNCHARACTERIZED`): on Linux the ports really were sims; off
+        // Linux `TIOCGICOUNT` cannot answer for any port, real adapters included.
+        // Assert the arm this build ships — pinning the Linux wording everywhere is
+        // what failed this test on a Mac against code that had just become *more*
+        // accurate there.
+        #[cfg(target_os = "linux")]
         assert!(why.contains("skipped on non-UART sims"), "{why}");
+        #[cfg(not(target_os = "linux"))]
+        assert!(why.contains("TIOCGICOUNT, which is Linux-only"), "{why}");
+        // Portable and the clause with teeth: whichever arm ran, an uncertified rig
+        // must not borrow the certified arm's opening. That sentence is what a
+        // tiered checklist run reads to decide it may start (§15.21), and P5's prose
+        // has now over-claimed three times (AGENTS §2's 6.18 entry has the other two).
+        assert!(!why.contains("Rig discovered and certified"), "{why}");
     }
 
     /// **A Tier-1 certificate must say Tier 1.** §15.21 makes P5's certificate the

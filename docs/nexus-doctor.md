@@ -137,6 +137,14 @@ DOC-1b). The precedence is worst-first:
 - **`supported`** — discovered and certified, **at a named tier**. On a non-UART
   (the CI pts sim) characterization reports `skipped (not a UART)` and records
   **no** failure, by §15.21's design, so P5's logic never waits for a bench.
+  **Off Linux it always skips, and says so differently.** The UART predicate is
+  `TIOCGICOUNT`, which is Linux-only, so it answers "no" for every port on macOS —
+  a real FTDI adapter included. Measured 2026-07-28 on macOS 15.7.8 with two
+  genuine adapters cross-wired: discovery named the pair correctly in both
+  directions, and characterization reported `skipped (not characterizable here
+  (TIOCGICOUNT is Linux-only))` rather than calling the operator's hardware a
+  non-UART. So on a Mac, **read P5 for discovery and pairing only** — the
+  certificate a tiered checklist run starts from has to come from a Linux box.
 
 `supported` names the tier because the tiers certify different things and the word
 alone does not distinguish them: **Tier 3** (a cross-wired pair) is the only one
