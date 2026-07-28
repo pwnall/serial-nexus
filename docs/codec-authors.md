@@ -72,6 +72,31 @@ multiplexed bytes. Your resync policy is your own: the reference codec resyncs b
 length-guidance and counts one framing error; a codec on a reliable transport can
 treat any violation as fatal and never resync (§15.23).
 
+Returning `Err` from `demux` is not silent. The daemon counts the refusal as
+`demux_errors`, charges the chunk it handed you **less the `data` payload the same
+call emitted before it failed** to `multiplexed.discarded_hostward`, surfaces your
+message as `last_demux_error`, and **faults the node** with that reason — cleared automatically the moment a later chunk decodes, because an
+`Err`-then-`Ok` codec is legal too and latching would misreport a transient violation
+as a dead node for the rest of the session. That matters most for the never-resync
+policy above: such a codec is, after its first violation, permanently unable to
+deliver anything, while `framing_errors` is `resync_count()` and stays `0` for
+exactly the codecs that never resync. `active` is a claim about delivery, so a
+transform refusing the stream does not get to keep it.
+
+**Emitting before you error is supported, and accounted for.** Nothing in this
+trait says an implementation must emit nothing before returning `Err`, and the
+realistic non-resyncing shape does the opposite: decode the good frames out of a
+64 KiB chunk, hit a corrupt third one, `emit` the first two and refuse. Those two
+events are routed and credited to their channels' `delivered_hostward` exactly as
+if the call had succeeded, which is why the loss charge subtracts them — charging
+the whole chunk reported one payload as delivered *and* as lost, and two counters
+that cannot be reconciled are worse than one coarse counter. What the subtraction
+cannot remove is the framing overhead of the frames you salvaged, because the
+trait tells the daemon what you *emitted* and never how much input you consumed;
+that residual is charged, erring toward over-reporting loss rather than hiding it.
+A call that emits more than it was handed — legal, if you flush frames buffered
+from earlier chunks — charges zero rather than wrapping.
+
 Register it **by value** in the codec `Registry` (§8/§15.26) — there is no
 linker-magic auto-registration and no dynamic loading. A factory is an ordinary
 closure `Fn(&toml::Table) -> Result<Box<dyn Codec>, String>`; a duplicate or
@@ -246,10 +271,14 @@ writes.
 
 `open` / `close` / `error` on a real channel drive that channel's observable
 state: `open` (or any `data`) marks it active, `close` marks it inactive, `error`
-is logged. Emit events only on channel identities the node is configured with;
-data on an unconfigured identity is dropped as mux noise, and data on a configured
-channel with no consumer bound is discarded with a counter (`discarded_unattached`,
-a located §5 loss) — neither is an error, but neither reaches a consumer.
+is logged. Emit events only on channel identities the node is configured with; data
+on an unconfigured identity is dropped as mux noise — an announcement never grows the
+graph (§8) — but it is counted (`discarded_unconfigured_channel`) and the identity
+itself is named in the bounded, deduplicated `unconfigured_channels` list, so an
+operator can tell a mis-spelled channel from a stream the graph never enumerated;
+data on a configured channel with no consumer bound is discarded with a counter
+(`discarded_unattached`, a located §5 loss) — neither is an error, but neither
+reaches a consumer.
 
 ### stdin and stdout are boundaries, not interior plumbing
 
@@ -334,10 +363,13 @@ after writing, and if you buffer or amplify, pump both directions concurrently
 
 An exec codec is a codec node with `codec = "exec"`; its `argv`, `env`, and
 restart backoff live in the opaque `attributes` table, which the exec codec
-validates (`argv` is required and non-empty). The node's `faces` orients the
-multiplexed side (`target` for a demux; the default is `target`), and `channels`
-lists the channel identities — each becomes a host-facing channel endpoint. The
-following config loads and runs (verified against the daemon):
+validates (`argv` is required and non-empty; `restart_backoff_ms` is capped at
+3600000 — one hour — against the same constant the schema's other timers use, and an
+out-of-range value is a **structural** failure naming the field, refused before
+anything is created and before a `--replace` teardown, §11). The node's `faces`
+orients the multiplexed side (`target` for a demux; the default is `target`), and
+`channels` lists the channel identities — each becomes a host-facing channel
+endpoint. The following config loads and runs (verified against the daemon):
 
 ```toml
 # The device on the multiplexed side.
@@ -357,7 +389,7 @@ channels = ["console", "trace"]
 
   [node.attributes]
   argv = ["python3", "tests/ext-codec/passthrough-codec.py", "console"]
-  restart_backoff_ms = 250    # optional; default 200
+  restart_backoff_ms = 250    # optional; default 200, max 3600000 (one hour)
 
   [node.attributes.env]       # optional extra environment for the child
   MYTOOL_MODE = "framed"
@@ -402,12 +434,20 @@ edge. The constraint is structural because the alternative was silent: the
 multiplexed side's targetward pump is a held-origin pump, so an `on-demand` origin
 parks on its first chunk forever while `send` cheerfully answers
 `{"delivered": true}` — bytes accepted, acknowledged, and lost, which §5 forbids
-outright. If you are copying the block above, copy the `write_mode` with it.
+outright. If you are copying the block above, copy the `write_mode` with it. One
+exemption, because the hazard presumes a lock upstream: an origin endpoint whose node
+is `arbitration = "free-for-all"` has none, so `held` and `on-demand` are
+behaviourally identical there and no writer can park — the rule does not fire, rather
+than refusing a graph that runs (§6).
 
 Load it with the daemon's `--config` at startup, or `serialnexusctl load`. Watch
 it with `serialnexusctl state` (or `--json` for the codec's per-channel
-`delivered_hostward` / `discarded_unattached` counters and the exec node's
-`restart_count`).
+`delivered_hostward` / `discarded_unattached` counters and, beside them at the node
+level, `restart_count`, `discarded_unframable`, and the
+`discarded_unconfigured_channel` / `unconfigured_channels` / `unconfigured_overflow`
+triple every codec node reports — the same three an in-process codec reports, which
+additionally carries the `demux_errors` / `last_demux_error` pair a `Codec::demux`
+refusal raises).
 
 ## 6. Testing your codec
 
@@ -469,6 +509,16 @@ daemon. `nexus-sim` ships two modes:
   $ ./target/debug/nexus-sim exec-conformance --exec "python3 my_codec.py"
   {"checks":{"fragmentation":true,"golden":true,"liveness":true,"restart":true},"mode":"exec-conformance","pass":true,"tool":"nexus-sim"}
   ```
+
+  A codec that stops reading its stdin no longer hangs the battery. Every write to
+  the child is bounded by a five-second *idle* deadline — reset by each byte the
+  child accepts, so a slow codec is never failed for being slow, only for stopping —
+  and expiry prints `exec-conformance: child did not drain stdin within 5000 ms
+  (N of M bytes accepted)` on stderr, reports that one check `false`, and still
+  emits the single verdict line. That matters because `fragmentation` pushes a
+  near-`MAX_FRAME_SIZE` frame into a 64 KiB pipe: a child that never reads used to
+  park the harness in its `write` with no verdict and no exit at all, which is a
+  wedged CI job rather than a failing one.
 
 Both exec modes expect an identity passthrough, so run them against a passthrough
 build of your codec, not a channel-swapping demux. You can also feed your codec

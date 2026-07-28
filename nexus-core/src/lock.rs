@@ -50,8 +50,16 @@ pub enum Acquire {
     /// daemon maps `held_by` to a label via [`EndpointLock::label`].
     Denied { held_by: OriginId },
     /// The origin's edge is `write = never` (a log edge, a spy PTY): it cannot
-    /// contend for the lock at all (§6).
+    /// contend for the lock at all (§6). A statement about **configuration**.
     ReadOnly,
+    /// The id is not registered on this endpoint — its edge was `disconnect`ed, or
+    /// its node was removed, while it was contending (§6/§15.35). A statement about
+    /// the **graph as it is now**, and deliberately not [`Acquire::ReadOnly`]:
+    /// collapsing the two told a parked `lock --wait` whose edge had just been cut
+    /// that its origin was `write = never`, sending whoever debugged it to look for
+    /// a configuration value that had never existed (CTRL-2). The wait terminates
+    /// either way; only the diagnosis differed.
+    Unregistered,
 }
 
 /// The outcome of a steal (`lock --steal`, `send --steal`, §6).
@@ -71,7 +79,12 @@ pub enum Steal {
     /// to already hold, so a self-steal there is `Stolen { previous: None }`
     /// like any other.
     AlreadyHeld,
-    /// The origin is `write = never` and cannot hold the lock at all.
+    /// The origin cannot hold the lock: it is `write = never`, or it is no longer
+    /// registered on this endpoint. Unlike [`Acquire`], a steal is synchronous and
+    /// the daemon resolves the origin name in the same critical section, so the
+    /// unregistered case is not reachable from a verb and needs no variant of its
+    /// own (CTRL-2) — but the two states do arrive here as one, so the wording says
+    /// so rather than claiming a `write_mode` the caller may not have.
     ReadOnly,
 }
 
@@ -191,8 +204,13 @@ impl EndpointLock {
     /// fresh grant removes the caller from the queue (if it was waiting) and
     /// advances the generation.
     pub fn acquire(&mut self, id: OriginId) -> Acquire {
+        // The two refusals that are *not* about contention are kept apart at the
+        // source (CTRL-2): an unregistered id — its edge was `disconnect`ed or its
+        // node removed while it contended — is `Unregistered`; only a declared
+        // `write = never` is `ReadOnly`. Collapsing them made a parked waiter that
+        // had just lost its edge report a configuration value that never existed.
         match self.origins.get(&id) {
-            None => return Acquire::ReadOnly,
+            None => return Acquire::Unregistered,
             Some(o) if o.write_mode == WriteMode::Never => return Acquire::ReadOnly,
             Some(_) => {}
         }
@@ -541,6 +559,35 @@ mod tests {
         assert_eq!(lock.acquire(OriginId(9)), Acquire::ReadOnly);
         assert_eq!(lock.steal(OriginId(9)), Steal::ReadOnly);
         assert_eq!(lock.holder(), None);
+    }
+
+    /// CTRL-2: an id that is not registered here and an id whose mode is `never` are
+    /// two different states, and `acquire` must not answer them with one word. The
+    /// first is what a parked `lock --wait` sees when `disconnect` or `remove-node`
+    /// cuts its edge under it; the second is a claim about configuration.
+    #[test]
+    fn an_unregistered_origin_is_distinguished_from_a_read_only_one() {
+        let mut lock = EndpointLock::new(Arbitration::Exclusive);
+        lock.register(OriginId(1), "p0", WriteMode::OnDemand);
+        lock.register(OriginId(2), "p1", WriteMode::OnDemand);
+        lock.register(OriginId(9), "spy", WriteMode::Never);
+
+        // p0 holds; p1 is queued behind it — the parked-waiter shape.
+        assert_eq!(lock.acquire(OriginId(1)), Acquire::Granted);
+        assert!(matches!(lock.acquire(OriginId(2)), Acquire::Denied { .. }));
+        lock.enqueue(OriginId(2));
+
+        // p1's edge is cut. Its re-attempt after the wake must say *detached*, not
+        // `write = never` — nothing in this graph is ever `never` for p1.
+        lock.unregister(OriginId(2));
+        assert_eq!(lock.acquire(OriginId(2)), Acquire::Unregistered);
+        // The genuinely read-only origin still reports the configuration claim.
+        assert_eq!(lock.acquire(OriginId(9)), Acquire::ReadOnly);
+        // An id that was never registered at all is the same state as a detached one.
+        assert_eq!(lock.acquire(OriginId(77)), Acquire::Unregistered);
+        // Neither refusal disturbed the holder or the queue.
+        assert_eq!(lock.holder(), Some(OriginId(1)));
+        assert!(lock.waiters().next().is_none(), "unregister dequeued p1");
     }
 
     #[test]
@@ -918,7 +965,20 @@ mod tests {
             let mut last_gen = lock.generation();
             for op in ops {
                 match op {
-                    Op::Acquire(i) => { lock.acquire(OriginId(i as u64)); }
+                    Op::Acquire(i) => {
+                        let result = lock.acquire(OriginId(i as u64));
+                        // CTRL-2: registration is what `Unregistered` reports, and
+                        // nothing else does. Every origin here is on-demand, so a
+                        // `ReadOnly` would be a lie about configuration under any
+                        // schedule, and an attached origin must never be told it is
+                        // detached.
+                        if attached[i as usize] {
+                            prop_assert_ne!(result, Acquire::Unregistered);
+                            prop_assert_ne!(result, Acquire::ReadOnly);
+                        } else {
+                            prop_assert_eq!(result, Acquire::Unregistered);
+                        }
+                    }
                     Op::Release(i) => { lock.release(OriginId(i as u64)); }
                     Op::Detach(i) => {
                         lock.unregister(OriginId(i as u64));
@@ -1018,6 +1078,15 @@ mod tests {
                                 i
                             );
                         }
+                        // CTRL-2: `Unregistered` tracks registration exactly, and no
+                        // origin here is `write = never`, so `ReadOnly` is
+                        // unreachable whatever the schedule.
+                        prop_assert_ne!(result, Acquire::ReadOnly);
+                        prop_assert_eq!(
+                            result == Acquire::Unregistered,
+                            !attached[i as usize],
+                            "Unregistered must mean exactly 'not registered here'"
+                        );
                     }
                     HeldOp::Release(i) => { lock.release(OriginId(i as u64)); }
                     HeldOp::Detach(i) => {

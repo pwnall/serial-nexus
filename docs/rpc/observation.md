@@ -61,7 +61,7 @@ Each object in `endpoints`:
 | Field | Type | Description |
 | --- | --- | --- |
 | `endpoint` | string | the host-facing endpoint display (e.g. `usb0`, `mux/console`) |
-| `feed_dropped` | integer | bytes this endpoint has lost at the producer→hub feed hop (§5) — the hub falling behind the producer under a firehose. See [the offset contract](#tapdata-notification) |
+| `feed_dropped` | integer | hostward bytes this endpoint's producer→hub feed did not carry (§5): the hub fell behind the producer under a firehose, **or** nothing was listening at all — on a `replay_ring = 0` endpoint that is the whole window between one `tap.close` and the next `tap.open`, so such an endpoint accumulates this counter while untapped. See [the offset contract](#tapdata-notification) |
 | `taps` | integer | how many taps are currently open on it |
 
 Each object in `taps`:
@@ -87,22 +87,69 @@ where it happens") makes one family of them meaningful everywhere. Per kind:
   `purged_on_reconnect` (targetward backlog discarded when the device came back,
   §7.1), and `driver_counters` (`frame`/`overrun`/`parity`/`buf_overrun` from
   `TIOCGICOUNT`, `null` where the device does not support it).
-* **pty** — `discarded_no_client` (no process held the slave) and
-  `dropped_slow_consumer` (the client did not drain its bounded buffer).
-* **log** — `dropped_bytes` (queue overflow plus ingest drops), `queued_bytes`
-  (waiting in the queue *plus* the batch the writer is holding), and
-  `write_errors` / `last_write_error`, which separate "the filesystem is refusing
-  every write" from "the consumer is slow" — under the default drop-oldest
-  overflow policy both otherwise surface only as a rising `dropped_bytes`.
-* **codec** — `framing_errors` (resyncs past corrupt frames, §7.5),
-  `multiplexed.dropped_slow_consumer`, and per channel `discarded_unattached` /
-  `discarded_targetward`.
+* **pty** — `discarded_no_client` (no process held the slave),
+  `dropped_slow_consumer` (the client did not drain its bounded buffer),
+  `discarded_targetward` (client bytes read off the master that this node could
+  not hand on because its host-facing endpoint went away between the read and
+  the send, §15.35) and `discarded_at_last_close` (device bytes the kernel still
+  held for a client that never read them, discarded when that client detached so
+  the next session starts on an empty pair, §7.2). The last two are easy to
+  confuse and mean opposite directions: `discarded_targetward` is console→device
+  loss with no endpoint left to take it, and `discarded_at_last_close` is
+  device→console output nobody was there to read. Neither is where a *detaching*
+  client's un-delivered typing lands — that is §6's per-origin `purged`
+  ([`LockSnapshot`](#locksnapshot)), because it was purged on purpose at the
+  moment the floor question settled rather than lost, so a console with a
+  writable edge that merely came and went leaves `discarded_targetward` at `0`.
+  The exception is the case with no origin to attribute to — a read-only spy
+  edge, or one a `disconnect` cleared — where the node's own counter is the only
+  honest home and does take those bytes.
+* **log** — `dropped_bytes` (queue overflow, ingest drops, and — once the node's
+  writer has stopped, on a fatal write under `overflow = "fault"` or any failed
+  rotation — every byte offered afterwards), `queued_bytes` (waiting in the queue
+  *plus* the batch the writer is holding; it falls to `0` and stays there once the
+  writer has stopped, because nothing will drain that queue again, so those bytes
+  are loss rather than backlog), and `write_errors` / `last_write_error`, which
+  separate "the filesystem is refusing every write" from "the consumer is slow" —
+  under the default drop-oldest overflow policy both otherwise surface only as a
+  rising `dropped_bytes`.
+* **codec** — `framing_errors` (the *transform's own* resyncs past corrupt frames,
+  §7.5 — that is `Codec::resync_count()`, whose trait default is `0` for exactly
+  the codecs that never resync), `demux_errors` / `last_demux_error` /
+  `multiplexed.discarded_hostward` (the *daemon's* count of `Codec::demux`
+  refusals, the most recent message, and the multiplexed bytes those refusals
+  did **not** turn into payload — the chunk as it arrived, less the `data` bytes
+  the same `demux` call emitted before it failed, because a partial decode is the
+  realistic shape (a non-resyncing framer takes the good frames out of a 64 KiB
+  chunk and refuses on the corrupt tail) and those events are still delivered and
+  credited to their channels; charging the whole chunk reported one payload as
+  delivered *and* as lost. The framing overhead of the salvaged frames is
+  included in the charge, since the trait reports emitted payload and not
+  consumption — the residual errs toward reporting loss rather than hiding it. A
+  refusal also **faults** the node, so §7.5's sanctioned never-resync policy is
+  visible in `state` and not only in the daemon log),
+  `multiplexed.dropped_slow_consumer`, `multiplexed.discarded_targetward`, and per
+  channel `discarded_unattached` / `discarded_targetward`.
 * **exec** — `discarded_unframable`, `multiplexed.dropped_slow_consumer`,
   `multiplexed.discarded_targetward`, `restart_count`, and per channel
   `discarded_unattached`.
+* **codec and exec alike** — `discarded_unconfigured_channel` (bytes decoded onto
+  a channel identity the node is not configured for: still dropped, §8 — an
+  announcement never grows the graph — but counted where they are lost, §5), the
+  bounded, deduplicated `unconfigured_channels` list naming those identities, and
+  `unconfigured_overflow` for the occurrences the 256-entry cap refused to record.
+  These are the leg's `unbound` / `unbound_overflow` terms applied to a codec's
+  channels, and they are what distinguishes a mis-spelled channel from a stream
+  the graph never enumerated. An identity longer than 64 bytes is stored truncated
+  on a `char` boundary and marked `…(truncated)`.
 * **leg** — per channel `discarded_hostward`, `discarded_targetward`,
-  `discarded_unframable` and `purged_on_reconnect`; each drop is charged to the
-  direction it was actually travelling. Node-level `unbound_overflow` counts
+  `discarded_unframable`, `discarded_peer_gone` (the untransmitted tail of a chunk
+  the socket write half had already taken off its bounded receiver when the peer
+  went away) and `purged_on_reconnect`, plus `dropped_slow_consumer` — what an
+  upstream producer shed because a `faces = "target"` channel's intake was full,
+  structurally zero for `faces = "host"`, whose channel endpoints are host-facing
+  and have no such boundary; each drop is charged to the direction it was actually
+  travelling. Node-level `unbound_overflow` counts
   wire frames whose unconfigured channel identity the bounded `unbound` list
   refused to record, so a peer inventing identities is visible rather than
   silent; the identities it did record appear in `channels` as
@@ -259,7 +306,8 @@ A streaming client keeps both halves open.
 ## `info`
 
 Report the daemon's **capability surface** (§10, §15.26): its version, the wire
-and envelope protocol versions, and the names of every codec it can instantiate.
+and envelope protocol versions, and every codec name a configuration may use,
+including the built-in `exec`.
 Tools — and a version-skewed CLI — use it to *discover* what a daemon supports
 rather than assume it, which matters because the daemon is embeddable: a
 closed-source binary built on the `nexus-daemon` library registers its own codecs
@@ -282,7 +330,7 @@ None.
 | `daemon_version` | string | the `nexus-daemon` library (engine) version — what determines wire and behavior compatibility |
 | `wire_version` | integer | the daemon-to-daemon wire protocol version (§9) |
 | `envelope_version` | integer | the exec-codec envelope version (§8/§15.15) — a codec author pins against this |
-| `codecs` | array of string | the registered in-process codec names, sorted (the `exec` child-process codec is always available and is not listed here) |
+| `codecs` | array of string | every codec name a configuration may legally name, sorted: the registered in-process codecs **plus** the reserved `exec` child-process codec (§7.6), which is always available. `exec` is deliberately not a registry entry — it is a child *process*, routed before the registry is consulted — but that is an implementation fact, and leaving it out of this list made the discovery surface disagree with what a `codec = …` field accepts |
 | `instance` | integer | a per-boot nonce (§11.8). Tap byte offsets are only comparable within one daemon process; on restart the offsets reset to 0 and this value changes, so a client keyed on it (the web console's browser history, §17) detects the reset and starts fresh instead of splicing across it |
 
 ### CLI
@@ -304,7 +352,7 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"info"}' | nc -N -U "$SOCK" | 
   "daemon_version": "0.2.0",
   "wire_version": 1,
   "envelope_version": 1,
-  "codecs": ["reference"],
+  "codecs": ["exec", "reference"],
   "instance": 12719384756019283746
 }
 ```
@@ -319,20 +367,26 @@ would bind each one, and whether a node in the running graph already holds it
 plugged in, and what is still free", so an operator no longer has to learn device
 paths out-of-band before `add-node`.
 
-**Scope, stated precisely.** The sources are exactly the ones §15.35 names:
-`/dev/serial/by-id`, `/dev/serial/by-path`, and — on BSD/macOS — `cu.*` nodes under
-`/dev`. On Linux those trees are udev's USB-serial face, so a device with no entry
-in them is **not listed**: an on-board UART (`/dev/ttyS0`, `/dev/ttyAMA0`) or an
-adapter whose driver udev has no rule for. Those are still perfectly bindable — by
+**Scope, stated precisely.** Four sources (§12, §15.35), unioned and deduplicated
+by device node: `/dev/serial/by-id`, `/dev/serial/by-path`, the
+`<sys-root>/class/tty` listing — which covers a USB adapter udev named *nowhere*,
+a container handed only `--device=/dev/ttyUSB0`, an image without
+`60-serial.rules` — and, on BSD/macOS, `cu.*` nodes under `/dev`. A device none of
+the four yields is **not listed**: an on-board UART (`/dev/ttyS0`, `/dev/ttyAMA0`)
+is in `class/tty` like every other tty, but its sysfs ancestor walk finds no
+`idVendor`, so it produces no `usb:` identity and is filtered out — it is missing
+for want of a USB identity, not for want of a udev link, and the same is true of an
+adapter whose driver exposes none. Those are still perfectly bindable — by
 a `raw:` path, which is what §12's escape hatch is for — they simply do not appear
 here. `ports` is a discovery aid, not an inventory.
 
 **Strictly passive, and that is a contract rather than an implementation detail.**
 The whole result is built from `/dev/serial/by-id` and `/dev/serial/by-path`
-readlinks, a `<dev-root>/dev` listing for BSD/macOS `cu.*` callout nodes, and
-sysfs reads. No candidate device is opened, because opening a USB-serial adapter
-asserts DTR and resets the board behind it — on exactly the hardware people care
-about. `ports` is the verb you run to *look*.
+readlinks, a `<sys-root>/class/tty` listing and the sysfs reads its entries lead
+to, and a `<dev-root>/dev` listing for BSD/macOS `cu.*` callout nodes. Listings,
+readlinks and sysfs reads: no candidate device is opened, because opening a
+USB-serial adapter asserts DTR and resets the board behind it — on exactly the
+hardware people care about. `ports` is the verb you run to *look*.
 
 The `identity` field comes from the same §12 fallback chain `add-node` captures
 with (`usb:` → `by-path:` → `raw:`), so what `ports` shows is precisely what
@@ -460,7 +514,7 @@ on the connection that opened the tap, one per hostward chunk (and, right after
 | --- | --- | --- |
 | `tap` | integer | the tap id from the `tap.open` result |
 | `offset` | integer | the endpoint's monotonic hostward byte offset of this chunk's first byte (§11.8) — replay pieces carry their true stream offset, so a reconnecting client trims overlap and splices exactly. Offsets are comparable only within one daemon `instance` (see [`info`](#info)) |
-| `gap_before` | integer | bytes lost at this endpoint's producer→hub feed hop immediately before this chunk, and therefore **not** represented in the offset space. Normally `0` |
+| `gap_before` | integer | bytes this endpoint's producer→hub feed did not carry immediately before this chunk — the feed full, or nothing listening — and which are therefore **not** represented in the offset space. Normally `0` |
 | `data` | string | base64 of the chunk's bytes |
 
 ```json
@@ -479,12 +533,16 @@ corruption strictly worse than a gap.
 
 So the hole is reported **beside** the offsets instead. Each `tap.data` carries
 the feed-hop loss accumulated since the previous one as `gap_before`, and
-`tap.open` returns the endpoint's running `feed_dropped` as the client's
-baseline. The guarantee a client gets is therefore: *offsets are contiguous, and
-a hole is always announced* — `gap_before > 0` means bytes are missing between
-the previous chunk and this one. It is exact in size and approximate in position
-(the drop happens on the producer's thread with up to a feed's worth of chunks
-still queued ahead of it, so it is attributed at most that early), which is
+`tap.open` returns the feed loss the hub has **already charged** as the client's
+baseline — loss recorded since the hub's last chunk arrives instead as the first
+`gap_before`, so the two never overlap and `feed_dropped + Σgap_before` is the
+true loss rather than twice it. The guarantee a client gets is therefore:
+*offsets are contiguous, and a hole is always announced* — `gap_before > 0` means
+bytes are missing between the previous chunk and this one. It is exact in size and
+approximate in position (the drop happens on the producer's thread with up to a
+feed's worth of chunks still queued ahead of it, so it is attributed at most that
+early) — except for loss recorded while the feed was *inactive*, whose position is
+exact, the feed being empty by definition while nothing is listening — which is
 enough to detect the hole, which is what §5 requires. A client splicing by offset
 must treat a non-zero `gap_before` as a discontinuity rather than concatenating.
 
@@ -539,9 +597,9 @@ Result:
 | `tap` | integer | the new tap id (used by `tap.close` and in `tap.data`) |
 | `endpoint` | string | echoed |
 | `replay_bytes` | integer | bytes of ring replayed ahead of the live stream — `0` is the explicit empty-replay marker (ring off, or as-yet unfilled) |
-| `from_offset` | integer | the endpoint offset this tap's stream begins at (§11.8): with a non-empty replay, the ring's oldest byte; otherwise the live edge, i.e. the offset the next `tap.data` will carry. A reconnecting client trims replay against the last offset it stored |
+| `from_offset` | integer | the endpoint offset this tap's stream begins at (§11.8): with a non-empty replay, the ring's oldest byte — or, when the ring is deeper than the connection's tap channel can be handed at once, the oldest byte of the newest slice that fits, the snapshot being trimmed at its **head** so that `from_offset + replay_bytes` always lands exactly on the live edge; otherwise the live edge, i.e. the offset the next `tap.data` will carry. A reconnecting client trims replay against the last offset it stored |
 | `epoch` | integer | which offset space `from_offset` counts in (§15.38). Unique per endpoint *hub* within a daemon process and never reused, so a client holding stored scrollback can tell an ordinary reconnect — where its own frontier is still meaningful and replay overlap must be trimmed — from a hub rebuild (`load --replace`, `add-node`, `remove-node`), after which offsets restart at 0 while the per-*boot* `info.instance` nonce, correctly, does not change. The two are indistinguishable from offsets alone: both present as `from_offset` below the client's frontier, because a replay ring exists to re-send bytes the client already has. Persist it beside the stored offset and re-anchor exactly when it changes |
-| `feed_dropped` | integer | the endpoint's running producer→hub feed loss at open time — the baseline against which the `gap_before` deltas that follow are read (see [the offset contract](#tapdata-notification)) |
+| `feed_dropped` | integer | the endpoint's producer→hub feed loss that the hub has **already charged to its taps** at open time — the reported-so-far watermark, which may sit below the running counter [`state`](#state) shows. The difference is deliberately excluded: it is delivered to this tap as its first `tap.data`'s `gap_before`, so `feed_dropped + Σgap_before` is the true loss and not twice it (see [the offset contract](#tapdata-notification)) |
 
 Errors: `-32602` when the endpoint is unknown or not host-facing (only a
 host-facing endpoint has a hub — a tap observes a hostward stream).
@@ -573,15 +631,32 @@ that was not there.
 ### CLI
 
 ```console
-$ serialnexusctl tap console            # decoded bytes to stdout until the connection closes
+$ serialnexusctl tap console            # decoded bytes to stdout until the tap or the connection ends
 $ serialnexusctl tap console --replay   # ring first, then live (exact splice)
 $ serialnexusctl tap console --bytes 4096
 ```
 
 `serialnexusctl tap` opens the tap, prints the acknowledgement to stderr, and
 writes the base64-decoded `tap.data` bytes to stdout, exiting after `--bytes` of
-them or when the connection closes. A failed open exits non-zero. `--stall-ms`
-holds the tap open without reading, to exercise the bounded-queue drop path.
+them, on the terminal [`tap.closed`](#tapclosed-notification), or when the
+connection closes. A failed open exits non-zero. A `tap.closed` is reported on
+stderr as `tap closed: <endpoint> (<reason>) — N byte(s) received` and exits
+**0** — the bytes written are intact, and the connection the daemon deliberately
+keeps alive after it will never carry another byte for this tap — unless a
+`--bytes` budget was still outstanding, which is a short read and exits non-zero
+with `tap closed: <endpoint> (<reason>) — N of M requested byte(s) received`.
+
+Both discontinuity signals reach **stderr**, one line each, so stdout stays a
+clean byte stream: `tap gap: N bytes lost before offset X (daemon feed)` for a
+non-zero `gap_before`, and `tap gap: N bytes dropped before offset X (this tap's
+queue)` when `offset` exceeds the previous chunk's end. Each is printed *before*
+the bytes that follow it, so a stderr notice orders correctly against a stdout
+capture. (An `offset` that goes *backwards* is not a hole any client can act on
+and should not happen; it prints `tap warning: offset went backwards to X,
+expected Y` rather than being swallowed.)
+
+`--stall-ms` holds the tap open without reading, to exercise the bounded-queue
+drop path.
 
 ---
 
@@ -606,4 +681,4 @@ Each `OriginState` in `origins`:
 | `origin` | string | the origin display (a writer's node name) |
 | `write_mode` | string | `never`, `on-demand`, or `held` |
 | `holds_lock` | bool | whether this origin currently holds the lock |
-| `purged` | integer | bytes discarded from this origin's pre-grant backlog on acquire (§6) |
+| `purged` | integer | bytes discarded at each moment this origin's floor question settled (§6): its pre-grant backlog on acquire, and — for a pty origin — its un-delivered backlog at detach, which is both whatever remained in the console's kernel buffer and any payload the node's reader had already taken off it and could not hand on |

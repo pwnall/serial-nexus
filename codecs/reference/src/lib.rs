@@ -8,15 +8,33 @@
 //!
 //! **Resynchronization (§7.5 state: framing errors / resyncs).** A hardware mux
 //! rides a lossy serial line, so `demux` must recover from a corrupted frame
-//! rather than wedge. Because the envelope is length-prefixed, recovery is exact
-//! and needs no sync marker: on any body-decode error whose `body_len` prefix is
-//! intact, the decoder skips exactly that one frame (`4 + body_len` bytes),
-//! counts one framing error, and stays aligned on the next frame boundary. The
-//! only unrecoverable corruption is a mangled length prefix (`body_len` over the
-//! maximum), where the boundary is unknown; the decoder drops the 4-byte prefix
-//! and re-scans (best effort). This keeps §8's "one shared frame format" — the
-//! link codec over a *reliable* transport (phase 6) simply never hits the resync
-//! path, since TCP does not corrupt.
+//! rather than wedge. Recovery is exact and needs no sync marker **exactly when
+//! the length prefix survives**: on any body-decode error whose `body_len` prefix
+//! is intact, the decoder skips exactly that one frame (`4 + body_len` bytes),
+//! counts one framing error, and stays aligned on the next frame boundary.
+//!
+//! A *mangled length prefix* is the unrecoverable class, and it has two shapes —
+//! the second of which is worse than the first and is silent:
+//!
+//! - `body_len` **over** [`MAX_FRAME_SIZE`]: the boundary is unknown, so the
+//!   decoder drops the 4-byte prefix, counts a framing error, and re-scans (best
+//!   effort). Loss is bounded and visible in `framing_errors`.
+//! - `body_len` **under** the maximum: [`try_decode`] succeeds on the *phantom*
+//!   boundary, so `demux` emits a single `data` event on the corrupt frame's own
+//!   (configured, legitimate) channel whose payload is the raw framing bytes of
+//!   the frames that followed — and every real frame inside that span disappears
+//!   with **no framing error attributable to the merge**. The daemon does not
+//!   merely pass those bytes on: it mirrors them to the channel's replay ring,
+//!   broadcasts them to that channel's sinks, and counts them as
+//!   `delivered_hostward`. Detecting this needs a per-frame integrity field,
+//!   which §9 deliberately does not specify for v1 — so it is a recorded trade,
+//!   not an oversight, pinned by
+//!   `merged_frames_when_the_length_prefix_is_mangled_under_max` so it stays a
+//!   fact rather than a surprise.
+//!
+//! This keeps §8's "one shared frame format" — the link codec over a *reliable*
+//! transport (phase 6) simply never hits the resync path, since TCP does not
+//! corrupt.
 
 use codec_api::{Codec, CodecError, Event, MAX_FRAME_SIZE, encode, try_decode};
 
@@ -254,6 +272,66 @@ mod tests {
         );
         assert_eq!(codec.framing_errors(), 1, "one 4-byte-prefix drop counted");
         assert_eq!(codec.buffered(), 0);
+    }
+
+    #[test]
+    fn merged_frames_when_the_length_prefix_is_mangled_under_max() {
+        // Review 32 WIRE-3. The over-max prefix above is loud: one dropped prefix,
+        // one counted framing error. A prefix corrupted to a value that is still
+        // <= MAX_FRAME_SIZE is the opposite — `try_decode` accepts the phantom
+        // boundary, so the frames it swallows come back out as one frame's payload
+        // on a legitimate channel and nothing counts the merge. This test does not
+        // assert desirable behaviour; it pins the v1 trade §9 makes by specifying
+        // no per-frame integrity field, so the module doc above stays true.
+        let head = Event::data("c0", Bytes::from(vec![b'A'; 200]));
+        let tail = Event::data("c2", Bytes::from_static(b"tail"));
+
+        let mut wire = Vec::new();
+        let mut enc = ReferenceCodec::new();
+        enc.mux(&head, &mut wire).unwrap();
+        let head_frame_len = wire.len();
+        for i in 0..4u8 {
+            enc.mux(
+                &Event::data("c1", Bytes::from(vec![b'0' + i; 200])),
+                &mut wire,
+            )
+            .unwrap();
+        }
+        enc.mux(&tail, &mut wire).unwrap();
+        let tail_frame_len = mux_all(std::slice::from_ref(&tail)).len();
+
+        // Grow the FIRST frame's length prefix so its phantom body ends exactly on
+        // the tail frame's boundary — the realistic single-bit shape, and the one
+        // that shows the re-alignment is *accidental* rather than earned.
+        let swallowed = wire.len() - head_frame_len - tail_frame_len;
+        let mangled = (head_frame_len - 4 + swallowed) as u32;
+        assert!(mangled as usize <= MAX_FRAME_SIZE, "still a legal prefix");
+        wire[0..4].copy_from_slice(&mangled.to_be_bytes());
+
+        let mut codec = ReferenceCodec::new();
+        let got = demux_all(&mut codec, &wire);
+
+        assert_eq!(
+            got.len(),
+            2,
+            "the merged frame and the tail: the four c1 frames vanished"
+        );
+        assert_eq!(got[0].channel.as_str(), "c0", "on a legitimate channel");
+        let EventKind::Data(payload) = &got[0].kind else {
+            panic!("expected a data event, got {:?}", got[0].kind);
+        };
+        assert_eq!(
+            payload.len(),
+            200 + swallowed,
+            "the payload is the real 200 bytes plus the raw framing of what followed"
+        );
+        assert_eq!(&payload[..200], &[b'A'; 200][..]);
+        assert_eq!(got[1], tail, "re-alignment here is luck, not recovery");
+        assert_eq!(
+            codec.framing_errors(),
+            0,
+            "nothing counts the merge — that is exactly what the module doc must say"
+        );
     }
 
     #[test]

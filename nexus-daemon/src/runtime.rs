@@ -157,56 +157,122 @@ impl LockCell {
 /// A shared, single-threaded handle to one endpoint's [`LockCell`].
 pub type SharedLock = Rc<LockCell>;
 
+/// Park-and-retry an acquisition on `lock` until `attempt` settles it, or the
+/// endpoint is torn down (`None`). **The** implementation of the §15.20 lock-wait
+/// discipline, whose five clauses were hand-written three times before SIMPB-2:
+///
+/// 1. Re-check [`LockCell::is_closed`] at the top of *every* iteration, including
+///    right after a wake — teardown calls `close()` (which wakes) before the daemon's
+///    maps clear, so a waiter leaves the queue with a defined outcome instead of
+///    re-parking on an endpoint that is gone.
+/// 2. Create the [`Notified`] and `enable()` it **before** the attempt. This is the
+///    subtle clause and the reason this function exists: `Notify::notify_waiters`
+///    stores no permit, so a writer that checks first and registers interest second
+///    loses a wake landing in between and parks forever on a *free* lock — the
+///    stranded-waiter class §15.20 and §15.23 were written to close. Three separate
+///    comments used to be all that upheld it.
+/// 3. Attempt inside one synchronous `with_mut` critical section. No borrow can cross
+///    the await below, because [`CriticalCell`] makes that a compile-shape fact
+///    (§16.2, invariant 5) — `attempt` cannot leak the `&mut EndpointLock`.
+/// 4. `Some(_)` settles and returns; the caller decides what a *fresh* grant costs
+///    (only a fresh one is a lock transition that notifies, §10).
+/// 5. `None` parks on the lock's `Notify` and loops.
+///
+/// A deadline is deliberately *not* a parameter: the one caller that has one races
+/// this whole future against a single `sleep_until` and lets its own cancel-safety
+/// guard dequeue on the drop, which is both simpler and one timer instead of one per
+/// iteration.
+pub(crate) async fn await_grant<T>(
+    lock: &SharedLock,
+    mut attempt: impl FnMut(&mut EndpointLock) -> Option<T>,
+) -> Option<T> {
+    loop {
+        if lock.is_closed() {
+            return None;
+        }
+        let notified = lock.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(settled) = lock.with_mut(&mut attempt) {
+            return Some(settled);
+        }
+        notified.await;
+    }
+}
+
+/// How a parked acquisition settled, for the two callers that only need to know
+/// whether they may write now (§6). The third caller — the `lock --wait` verb — needs
+/// a finer vocabulary (it must tell a timeout from a teardown, and `write = never`
+/// from an unregistered origin) and maps [`EndpointLock::acquire`] to its own type
+/// through the same [`await_grant`] shell.
+pub(crate) enum Grant {
+    /// A fresh grant: this origin now holds the lock, and *only* this outcome is a
+    /// lock transition, so only it notifies (§10).
+    Fresh,
+    /// It already held the lock: an idempotent no-op, no notification.
+    AlreadyHeld,
+    /// It can never be granted, so waiting is pointless. Either the origin is
+    /// `write = never`, or it is no longer registered on this endpoint because
+    /// `disconnect`/`remove-node` took its edge (§15.35). The second is the clause
+    /// whose absence would wedge a pump forever: an unregistered id satisfies neither
+    /// `may_write` nor `reclaim_held` nor `acquire`, while the lock itself stays open
+    /// (the endpoint is fine — it is *this* origin that left), so the pump would park
+    /// holding the chunk it had already taken and a later `connect` could not revive
+    /// it, because the new edge gets a new id and nothing wakes the old wait.
+    Refused,
+}
+
+/// Park until this origin may write, reporting whether it may (§6/§15.20).
+///
+/// [`await_grant`] plus the shared post-grant step both write-gate pumps need: emit
+/// the lock-change notification on a **fresh** grant and on no other outcome. The
+/// callers differ only in the one line inside the critical section — held-priority
+/// reclaim ([`reacquire_held`]) versus an on-demand `acquire`-or-enqueue (the leg's
+/// `ensure_acquired`) — which is exactly the parameter.
+pub(crate) async fn await_write_grant(
+    lock: &SharedLock,
+    attempt: impl FnMut(&mut EndpointLock) -> Option<Grant>,
+) -> bool {
+    match await_grant(lock, attempt).await {
+        Some(Grant::Fresh) => {
+            lock.emit_change();
+            true
+        }
+        Some(Grant::AlreadyHeld) => true,
+        // Refused outright, or the endpoint was torn down under the wait.
+        Some(Grant::Refused) | None => false,
+    }
+}
+
 /// Ensure `id` holds its endpoint's write lock, re-acquiring through the FIFO
 /// queue if a `send --steal` transiently ousted the held origin (§6 held
-/// priority). Returns `false` if the endpoint was torn down. The fast path (the
-/// normal held case) is a single synchronous borrow; the slow path parks on the
-/// lock's `Notify`, holding no borrow across the await (§15.20). Shared by the
-/// in-process codec and the exec codec — the two held-origin targetward gates.
+/// priority). Returns `false` if the endpoint was torn down or this origin's edge
+/// went away. The fast path (the normal held case) is a single synchronous borrow;
+/// the slow path is the shared [`await_write_grant`] park, which holds no borrow
+/// across its await (§15.20). Shared by the in-process codec and the exec codec —
+/// the two held-origin targetward gates.
 pub(crate) async fn reacquire_held(lock: &SharedLock, id: OriginId) -> bool {
     if lock.with(|g| g.may_write(id)) {
         return true; // already holds it
     }
-    loop {
-        if lock.is_closed() {
-            return false;
+    // A held origin never enqueues: held priority is a rule *inside* `acquire`
+    // /`reclaim_held` (§15.23), so it takes a free lock whatever the queue holds.
+    // `reclaim_held` returns a bare bool and so cannot distinguish "denied now" from
+    // "never registered"; the explicit `write_mode` probe is how this attempt reports
+    // [`Grant::Refused`] where the on-demand callers get it from
+    // [`Acquire::Unregistered`](nexus_core::lock::Acquire::Unregistered).
+    await_write_grant(lock, |g| {
+        if g.write_mode(id).is_none() {
+            Some(Grant::Refused)
+        } else if g.may_write(id) {
+            Some(Grant::AlreadyHeld)
+        } else if g.reclaim_held(id) {
+            Some(Grant::Fresh)
+        } else {
+            None
         }
-        // The origin was **unregistered** — `disconnect` removed its edge (§15.35).
-        // Without this exit the loop is unreachable-forever: `may_write` and
-        // `reclaim_held` both consult `origins`, and an id that is not in it can
-        // never satisfy either, while the lock itself stays open (the endpoint is
-        // fine — it is *this* origin that left). The pump would park holding the
-        // chunk it had already taken, and a later `connect` could not revive it,
-        // because the new edge gets a *new* id and nothing wakes the old wait.
-        if lock.with(|g| g.write_mode(id).is_none()) {
-            return false;
-        }
-        // Enable the wake future before the reclaim attempt (lost-wakeup-free).
-        let notified = lock.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-
-        // Already holds (re-granted), or reclaim as a held origin ahead of any
-        // on-demand waiter (§6 held priority). Only a fresh reclaim emits a change.
-        let outcome = lock.with_mut(|g| {
-            if g.may_write(id) {
-                Some(false)
-            } else if g.reclaim_held(id) {
-                Some(true)
-            } else {
-                None
-            }
-        });
-        match outcome {
-            Some(fresh) => {
-                if fresh {
-                    lock.emit_change();
-                }
-                return true;
-            }
-            None => notified.await,
-        }
-    }
+    })
+    .await
 }
 
 /// The maximum envelope payload per frame carrying `channel`: [`MAX_FRAME_SIZE`]
@@ -270,9 +336,11 @@ pub(crate) enum DataFrame {
 /// `encode` is infallible for any sane channel id (each range provably fits the
 /// frame bound once the header is added); it can only refuse when the channel
 /// identity itself is long enough that `frame_payload_cap`'s floor-at-1 still
-/// overflows [`MAX_FRAME_SIZE`]. That is pathological rather than impossible —
-/// nothing bounds identity length structurally today — so the tail is reported as
-/// [`DataFrame::Residual`] instead of vanishing.
+/// overflows [`MAX_FRAME_SIZE`]. That is unreachable through configuration —
+/// `nexus_core::graph::MAX_NAME_LEN` = 256 bounds every channel identity, on every
+/// graph-creating path (§3) — but the arm is kept because invariant 3's third
+/// clause forbids a silent truncation if that ever changes, so the tail is
+/// reported as [`DataFrame::Residual`] instead of vanishing.
 pub(crate) fn data_frames<'a>(
     channel: &'a str,
     bytes: &'a Chunk,
@@ -299,14 +367,25 @@ pub(crate) fn data_frames<'a>(
     })
 }
 
-/// A monotonic byte counter a hostward [`fan_out`] charges its unattached loss to.
+/// A monotonic byte counter the data plane charges lost bytes to — the daemon's
+/// **one** "charge `n` bytes of loss" verb, in both directions (§5: all loss is
+/// counted where it happens).
 ///
 /// Two shapes exist in the daemon and both must work through one helper: the serial
 /// reader's `Arc<AtomicU64>` (its producer runs on a dedicated blocking thread,
 /// §15.19, so the counter has to be `Send`/`Sync`) and every interior node's
-/// single-threaded `Cell<u64>`. Taking the accounting as a trait object is what lets
-/// the five former hand-rolled fan-out loops collapse into one (§16, F1) without
-/// either side reshaping its counter.
+/// single-threaded `Cell<u64>` (reached through an `Rc` by deref, so a node's
+/// `Rc<Cell<u64>>` needs no impl of its own). Taking the accounting as a trait
+/// object is what lets the five former hand-rolled fan-out loops collapse into one
+/// (§16, F1) without either side reshaping its counter.
+///
+/// **Use `counter.add(n)`, never `counter.set(counter.get() + n)`** (SIMP-2). The
+/// longhand had been written out at ~20 targetward sites across five pumps while
+/// this trait already existed for the hostward half; a rule spelled out per site is
+/// a rule a new exit can silently omit, which is the shape of LEG-1, LEG-2, LEGD-2
+/// and LOGQ-1. *Credit* counters (`delivered_hostward`, `accepted_targetward`) stay
+/// explicit on purpose: a missed credit under-reports throughput, while a missed
+/// charge hides data loss, and only the second is worth a type.
 pub(crate) trait LossCounter {
     fn add(&self, n: u64);
 }
@@ -462,7 +541,7 @@ impl EdgeSlot {
     /// The writable binding — sender, lock, origin id — or `None` when this edge
     /// cannot write (read-only, or nothing attached). The one place the three parts
     /// are assembled, so a caller cannot pair a writer with the wrong id.
-    pub fn origin(&self) -> Option<(mpsc::Sender<Chunk>, SharedLock, OriginId)> {
+    pub fn origin(&self) -> Option<WritableOrigin> {
         self.state.with(|e| match (&e.writer, &e.registered) {
             (Some(tx), Some((lock, id))) => Some((tx.clone(), lock.clone(), *id)),
             _ => None,
@@ -509,14 +588,26 @@ impl TargetEdge {
     }
 }
 
+/// A writable targetward binding: the host endpoint's sender, its write lock, and
+/// the [`OriginId`] this origin is registered under (§6/§15.35).
+///
+/// Named because it is assembled in exactly one place ([`EdgeSlot::origin`], and so
+/// [`await_origin`]) and consumed by the shared send helpers below — a caller that
+/// never takes the three apart cannot pair a writer with the wrong id.
+pub type WritableOrigin = (mpsc::Sender<Chunk>, SharedLock, OriginId);
+
 /// Wait for `edge` to carry a writable origin, returning it (§15.35).
 ///
 /// The shared park used by every interior targetward pump. `None` means the edge
 /// is attached but read-only — the caller drains and counts rather than waiting,
 /// because that configuration will never become writable on its own.
-pub(crate) async fn await_origin(
-    edge: &SharedTargetEdge,
-) -> Option<(mpsc::Sender<Chunk>, SharedLock, OriginId)> {
+///
+/// Structurally a sibling of [`await_grant`] — the same enable-before-read
+/// lost-wakeup discipline — but over a *different* signal: the edge slot's
+/// `changed`, not the endpoint lock's `wake`. It stays separate because it has no
+/// `is_closed` clause and no critical section to attempt inside; the two are not one
+/// function, but a change to the discipline belongs in both.
+pub(crate) async fn await_origin(edge: &SharedTargetEdge) -> Option<WritableOrigin> {
     loop {
         // Enable the wake before reading, so a `connect` between the read and the
         // await is not lost.
@@ -528,6 +619,144 @@ pub(crate) async fn await_origin(
             return origin;
         }
         changed.await;
+    }
+}
+
+/// Source bytes a targetward step did **not** deliver, which the caller has to
+/// charge to a [`LossCounter`] (§5, invariant 3's third clause).
+///
+/// The type exists for the same reason [`DataFrame::Residual`] does. Targetward is
+/// the direction §5 forbids dropping on, so *every* non-delivery exit of *every*
+/// pump has to reach a counter — and "has to" was a review convention rather than a
+/// compiler rule, hand-written at ~20 sites across five pumps and twice shipped with
+/// an exit that charged nothing (CODEXEC-2's `reacquire_held` arm; the pty's
+/// held-payload handoff). `#[must_use]` plus a single consuming method makes a
+/// forgotten charge a warning at the site that forgot it, which is what
+/// [`DataFrame`] already does for the framing half (SIMP-2).
+#[must_use = "targetward loss must be charged where it happened (§5): call `charge`"]
+pub(crate) struct TargetwardLoss(u64);
+
+impl TargetwardLoss {
+    /// Everything arrived (or there was nothing to send).
+    fn none() -> TargetwardLoss {
+        TargetwardLoss(0)
+    }
+
+    /// `n` source bytes never reached the endpoint.
+    fn of(n: u64) -> TargetwardLoss {
+        TargetwardLoss(n)
+    }
+
+    /// Charge whatever did not arrive to `lost`, reporting whether the chunk was
+    /// delivered in full. The only way to consume the value, so `#[must_use]` above
+    /// cannot be satisfied without naming a counter.
+    pub(crate) fn charge(self, lost: &dyn LossCounter) -> bool {
+        if self.0 == 0 {
+            return true;
+        }
+        lost.add(self.0);
+        false
+    }
+}
+
+/// The shared targetward **send-and-charge** step: gate on the origin's write lock
+/// (§6), build the payload, hand it to the host endpoint, and report what did not
+/// arrive (SIMP-2).
+///
+/// Deliberately *not* a whole pump. The three states an edge can be in — forward /
+/// drain-and-count / park — are policy each node owns and must keep owning
+/// (invariant 14): an interior node parks on an unattached edge so its writers
+/// backpressure; the exec codec never parks, because its single stdout decode loop
+/// would stall every other channel behind one detached device edge; a leg drains,
+/// because a parked channel head-of-line blocks a whole cross-machine link (§9).
+/// What all of them share is this tail — and the tail is where exits get forgotten:
+/// the `reacquire_held`-failed arm is exactly the one CODEXEC-2 returned through
+/// without counting.
+///
+/// `cost` is a parameter rather than `chunk.len()` because the two are not always
+/// the same number: the map charges the bytes that *arrived* while sending the
+/// *mapped* bytes, so a substituting or deleting rule cannot make its loss count
+/// drift from its input. `payload` runs **after** the lock is held, which is also the
+/// map's ordering requirement — its per-rule substitution counters are bumped inside
+/// the transform, so a chunk that turns out to have nowhere to go must never have
+/// been transformed at all — and it may return `None` for "nothing left to write",
+/// which is not a loss (a fully deleted targetward chunk is the operator's explicit
+/// intent, §7.8).
+pub(crate) async fn forward_targetward(
+    origin: &WritableOrigin,
+    cost: u64,
+    payload: impl FnOnce() -> Option<Chunk>,
+) -> TargetwardLoss {
+    let (tx, lock, id) = origin;
+    // A `send --steal` transiently ousts a held origin; re-acquire FIFO once the
+    // stealer releases, so the chunk is delayed, never dropped (§6). `false` means
+    // the endpoint was torn down (or this origin cannot write): the bytes have
+    // nowhere left to go.
+    if !reacquire_held(lock, *id).await {
+        return TargetwardLoss::of(cost);
+    }
+    let Some(chunk) = payload() else {
+        return TargetwardLoss::none();
+    };
+    // The targetward channel closed between the grant and the send — its node was
+    // removed, or the graph was replaced.
+    if tx.send(chunk).await.is_err() {
+        return TargetwardLoss::of(cost);
+    }
+    TargetwardLoss::none()
+}
+
+/// What a non-blocking targetward handoff did with its chunk
+/// ([`try_forward_targetward`]).
+///
+/// `#[must_use]` for the same reason [`TargetwardLoss`] is, and it is the other half
+/// of that enforcement (SIMP-2): [`Self::Full`] hands the *undelivered chunk* back,
+/// so a call site written as the bare statement `try_forward_targetward(o, c, &l);`
+/// drops those bytes on the floor with no counter — targetward, the one direction §5
+/// forbids dropping on — and compiles clean. The blocking sibling could not be
+/// written that way; without this attribute the non-blocking one could, which left
+/// SIMP-2's stated failure scenario reachable on exactly the path the helper was
+/// introduced to make safe. Every variant has to be looked at: `Full` must be parked
+/// and retried, `Lost` is already charged, `Taken` is done.
+#[must_use = "a targetward handoff must be acted on: `Full` carries the undelivered \
+              chunk back and dropping it loses bytes silently (§5)"]
+pub(crate) enum Handoff {
+    /// The endpoint took it.
+    Taken,
+    /// The endpoint's bounded channel is full, so the chunk comes **back**: the
+    /// caller holds it and stops reading its source. Targetward backpressure, never
+    /// a drop (§5).
+    Full(Chunk),
+    /// The endpoint is gone. The bytes are lost and have already been charged.
+    Lost,
+}
+
+/// Hand one chunk targetward without ever suspending the caller (CONC-1) — the
+/// non-blocking sibling of [`forward_targetward`], with the same charge rule.
+///
+/// The pty reader is the one targetward producer that cannot `await` its send: the
+/// same loop owns presence latching, termios reconciliation and last-close handling
+/// (§7.2/§6), so parking it inside a full endpoint would freeze the console's whole
+/// lifecycle for as long as the endpoint stayed full. It `try_send`s and holds the
+/// refused chunk itself instead. The lock is *not* touched here — a held-over
+/// payload was read while this origin could write, and a steal landing afterwards
+/// must not strand it — so arbitration stays the caller's decision, exactly as
+/// today.
+pub(crate) fn try_forward_targetward(
+    origin: &WritableOrigin,
+    chunk: Chunk,
+    lost: &dyn LossCounter,
+) -> Handoff {
+    let n = chunk.len() as u64;
+    // The lock is bound and deliberately unused: see the note above.
+    let (tx, _lock, _id) = origin;
+    match tx.try_send(chunk) {
+        Ok(()) => Handoff::Taken,
+        Err(mpsc::error::TrySendError::Full(chunk)) => Handoff::Full(chunk),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            lost.add(n);
+            Handoff::Lost
+        }
     }
 }
 
@@ -557,10 +786,31 @@ pub(crate) struct FanOut {
     /// full-buffer drop for it). `false` means the chunk reached no live graph
     /// consumer at all — the empty-sinks and all-`Closed` cases — and its bytes
     /// have already been charged to the caller's unattached counter.
+    ///
+    /// **Not a delivery signal** — see [`Self::delivered`]. `live` answers "is
+    /// anything still attached here?", which is the question the unattached charge
+    /// turns on, and a consumer whose bounded buffer is full is very much attached.
     pub live: bool,
-    /// Bytes dropped at a sink whose bounded buffer was full. Already charged to
-    /// that sink's own [`DropCounters`] (§5: loss is counted at the boundary that
-    /// drops it); returned so a producer that *also* mirrors full-buffer loss in a
+    /// Bytes at least one sink actually **took**: `chunk.len()` when any sink
+    /// accepted it, `0` otherwise.
+    ///
+    /// A separate field from [`Self::live`] because the two answer different
+    /// questions and sharing one of them has now been wrong in both directions
+    /// (LEGD-2). Crediting delivery on `live` counted bytes a full sink never
+    /// received; the correction `n - dropped_full` then under-counted, because
+    /// `dropped_full` accumulates *per sink*, so a `[Ok, Full]` fan-out reported
+    /// `dropped_full == n` and credited **zero** delivered for a chunk a live
+    /// consumer had received in full. A mixed chunk is legitimately both delivered
+    /// (to one consumer) and discarded (at another): the two counters measure
+    /// different consumers, and only the chunk **no** sink accepted is unambiguously
+    /// undelivered. So delivery is decided here, from the sends themselves, and no
+    /// caller subtracts one counter from the other.
+    pub delivered: u64,
+    /// Bytes dropped at a sink whose bounded buffer was full, **summed over sinks**
+    /// — so with several slow consumers it can exceed `chunk.len()`, and it is not a
+    /// quantity any per-chunk arithmetic may subtract from. Already charged to each
+    /// sink's own [`DropCounters`] (§5: loss is counted at the boundary that drops
+    /// it); returned so a producer that *also* mirrors full-buffer loss in a
     /// per-channel counter (the leg's `discarded_hostward`) needs no second loop.
     pub dropped_full: u64,
 }
@@ -574,7 +824,9 @@ pub(crate) struct FanOut {
 /// consumer its bytes and nobody else (`try_send`, never `await`), which is what
 /// keeps a slow spy from backpressuring the device. Three outcomes, each accounted:
 ///
-/// * **Delivered** — the sink took it; nothing to count.
+/// * **Delivered** — the sink took it; nothing to count, and [`FanOut::delivered`]
+///   reports the chunk length so the caller never has to infer delivery from
+///   liveness or by subtracting the drops (LEGD-2).
 /// * **Full** — the consumer has fallen behind; the drop is charged to *its*
 ///   [`DropCounters`] and the consumer is still live.
 /// * **Closed** — the receiver is gone (whole-node teardown, or a consumer
@@ -596,12 +848,18 @@ pub(crate) fn fan_out(
     let n = chunk.len() as u64;
     let mut out = FanOut {
         live: false,
+        delivered: 0,
         dropped_full: 0,
     };
     for AttachedSink { tx, counters, .. } in sinks {
         match tx.try_send(chunk.clone()) {
-            // Delivered to a live consumer.
-            Ok(()) => out.live = true,
+            // Delivered to a live consumer. One sink taking the chunk is the whole
+            // chunk delivered — the same bytes going to a second consumer are not a
+            // second delivery — so this assigns rather than accumulates.
+            Ok(()) => {
+                out.live = true;
+                out.delivered = n;
+            }
             // Slow consumer: its bounded buffer is full — the drop is counted
             // against it, and it is still live.
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -620,6 +878,87 @@ pub(crate) fn fan_out(
         unattached.add(n);
     }
     out
+}
+
+/// The per-channel hostward accounting a multi-channel producer applies to one
+/// decoded `data` event, as a trait so [`route_channel_data`] can own the
+/// arithmetic once (SIMP-1).
+///
+/// Three producers decode channel events and hand them to local consumers — the
+/// in-process codec, the exec codec and the leg — and each keeps its own
+/// `ChannelStat` with its own field names, deliberately: a leg's
+/// `discarded_hostward` is documented as covering *both* the full-buffer drop and
+/// the no-consumer case, while a codec's narrower `discarded_unattached` covers only
+/// the second and leaves full-buffer loss to the consuming boundary's own
+/// [`DropCounters`]. The structs stay separate; only the *rule* — which counter gets
+/// which bytes — is shared. That one real difference is [`Self::add_dropped_full`],
+/// so it is now a visible property of one trait impl instead of a divergence between
+/// three hand-written copies of the same block that nothing would flag.
+pub(crate) trait HostwardChannelStat {
+    /// Latch the channel active: bytes have crossed it.
+    fn set_active(&self);
+    /// Credit bytes a live consumer actually took.
+    fn add_delivered(&self, n: u64);
+    /// Where bytes that reached no live consumer at all are charged.
+    fn unattached(&self) -> &dyn LossCounter;
+    /// Mirror the bytes a slow consumer's full buffer cost this channel. The two
+    /// codecs leave that loss to the consuming boundary's `DropCounters` and do
+    /// nothing here; the leg also reports it per channel, so it overrides.
+    fn add_dropped_full(&self, _n: u64) {}
+}
+
+/// Route one decoded channel `data` event hostward — the **one** per-channel
+/// hostward routing block, previously a verbatim clone between the codec and the
+/// exec codec and a third, differently-specified instance in the leg (SIMP-1,
+/// design §16).
+///
+/// The order is invariant 9's and is load-bearing: latch active, mirror to the
+/// tap/replay ring **first and outside the accounting** — the ring is a spy outside
+/// the graph, so it must never suppress the unattached count — then fan out to the
+/// graph sinks alone through [`fan_out`].
+///
+/// `stat` is `None` only for a channel identity the node was never configured for.
+/// There is no per-channel counter to charge and mis-charging a neighbour would be
+/// worse than not counting, so those bytes go to a local scratch counter; the caller
+/// has already surfaced the identity itself, which is the diagnosis that matters
+/// (`unconfigured` / `unbound` state, §8: an announcement never grows the graph).
+pub(crate) fn route_channel_data(
+    bytes: &Chunk,
+    feed: Option<&TapFeed>,
+    sinks: Option<&SharedFanOut>,
+    stat: Option<&dyn HostwardChannelStat>,
+) {
+    let n = bytes.len() as u64;
+    if let Some(s) = stat {
+        s.set_active();
+    }
+    if let Some(feed) = feed {
+        feed.mirror(bytes);
+    }
+    let scratch = Cell::new(0u64);
+    let unattached: &dyn LossCounter = match stat {
+        Some(s) => s.unattached(),
+        None => &scratch,
+    };
+    let Some(sinks) = sinks else {
+        // The channel has no fan-out at all: nothing is bound, so nothing took it.
+        unattached.add(n);
+        return;
+    };
+    let fan = sinks.broadcast(bytes, unattached);
+    let Some(s) = stat else {
+        return;
+    };
+    // Credit exactly what a sink took (`0` when none did), never what liveness
+    // suggests and never `n - dropped_full` (LEGD-2, both directions — see
+    // [`FanOut::delivered`]). With one consumer the two counters still partition the
+    // stream exactly, which is the reconciliation an operator does; with several,
+    // a chunk one consumer took while another's buffer was full is deliberately
+    // counted in both, because they measure different consumers.
+    s.add_delivered(fan.delivered);
+    // A no-op for the codecs; the leg's per-channel mirror of the full-buffer loss
+    // the sinks' own `DropCounters` already carry (§5).
+    s.add_dropped_full(fan.dropped_full);
 }
 
 /// Hostward drop counters for one consuming boundary (§5). All hostward loss is
@@ -698,6 +1037,153 @@ pub(crate) fn hostward_depth(config: &GraphConfig, host_node: &str) -> usize {
             _ => None,
         })
         .unwrap_or(CHANNEL_CAP)
+}
+
+/// The live handles one edge attachment binds together, plus the two identities it
+/// is registered under (§15.35). Consumed by [`attach_edge`].
+///
+/// Both attach paths already hold exactly these — `Wiring::build` reads them out of
+/// the plan it just made, `Daemon::connect` out of the display-keyed state maps
+/// `absorb_wiring` re-keyed them into — so bundling them is what lets one function
+/// be the single implementation of "attach one edge".
+pub(crate) struct EdgeParts {
+    /// The consuming (target-facing) endpoint's address. It is the origin's *label*
+    /// on the lock, the fan-out tag `disconnect` detaches by (§4 rule 2 makes it
+    /// unique), and the key both callers file the registration under.
+    pub target: EndpointAddr,
+    /// The id this attachment registers under on the host endpoint's lock. Allocated
+    /// by the caller on purpose: the two paths count from different places and must
+    /// not collide — `Wiring::build` counts up from 0 and publishes its ceiling as
+    /// [`Wiring::next_origin`], and `connect` allocates strictly above that.
+    pub origin: OriginId,
+    /// The host endpoint's write lock (§6). `None` only for a host-facing endpoint
+    /// that has none, which cannot occur post-validation; the edge then attaches
+    /// unarbitrated rather than not at all.
+    pub lock: Option<SharedLock>,
+    /// A targetward sender into the host endpoint — the same arbitrated channel the
+    /// `send` verb injects into. `None` under the same unreachable condition as
+    /// `lock`, with which it is populated and pruned in lockstep.
+    pub host_targetward: Option<mpsc::Sender<Chunk>>,
+    /// The host endpoint's live fan-out list, which this edge's hostward sink joins.
+    pub fanout: SharedFanOut,
+    /// The consuming endpoint's edge inbox: how its *already-running* pump is handed
+    /// this edge's hostward receiver, so nothing is spawned or aborted (invariant 14).
+    pub inbox: EdgeInboxTx,
+    /// The consuming endpoint's live edge binding, filled here.
+    pub slot: SharedTargetEdge,
+    /// The consuming endpoint's drop counters, shared with the hostward sink so the
+    /// producer's full-buffer drops and the consumer's own discards land in one place.
+    pub counters: Arc<DropCounters>,
+}
+
+/// What one [`attach_edge`] did, for its caller to finish (§15.35).
+pub(crate) struct AttachOutcome {
+    /// The lock and id this edge registered under, when the host endpoint has a lock.
+    /// Present for **every** effective mode, `never` included — the lock registers
+    /// every origin so `state` can list it, so every one of them must be
+    /// unregisterable (see [`TargetEdge::registered`]).
+    pub registered: Option<(SharedLock, OriginId)>,
+    /// Whether this edge is addressable by `lock`/`unlock`, i.e. whether the caller
+    /// should file [`Self::registered`] in its `origin_locks` map. Returned rather
+    /// than re-derived because the two callers spelled the condition differently
+    /// (`mode != never` in the plan, "a writer was installed" live) and only coincided
+    /// because `endpoint_locks` and the targetward senders are populated in lockstep
+    /// — a latent divergence of exactly the kind one-rule-one-place exists to remove.
+    pub addressable: bool,
+    /// Whether [`EndpointLock::register`] granted the lock to this origin outright — a
+    /// `held` origin on a free exclusive endpoint. That is a **fresh grant**, which §6
+    /// says runs purge-on-acquire before the origin's bytes flow: vacuous at load
+    /// (nothing has written yet), and the reason `connect` needs to know.
+    pub granted: bool,
+    /// Whether the consuming endpoint actually took the hostward receiver. `false`
+    /// means it has no pump at all — a pty whose setup faulted, or a `faces = "host"`
+    /// codec/exec channel whose driver is deferred (§14) — a dead edge that `load`
+    /// would have produced just the same, so it is reported, never refused (§15.8).
+    pub consumer_live: bool,
+}
+
+/// Attach one edge: the **single** implementation of it (§16 one-rule-one-place),
+/// shared by `Wiring::build`'s edge loop at load and by `Daemon::connect` on a
+/// running graph.
+///
+/// Its mirror was consolidated first — `GraphState::detach_edge_runtime` is shared by
+/// `disconnect` and `remove-node --cascade` because "two implementations of leaving
+/// the lock cleanly" is how the phantom holder came back once (§15.27) — and this is
+/// the attach half of the same argument (SIMPB-1). Assembling an edge is six ordered
+/// steps over five long-lived structures, and a change to any of them (an
+/// [`EdgeSlot`] field, a second counter, a per-edge epoch) must not be able to reach
+/// the loaded path and miss the live one.
+///
+/// `mode` is the **effective** write mode, which every caller must obtain from
+/// `GraphConfig::effective_write_mode` — the one implementation of the log⇒`never`
+/// and map-`raw`⇒`held` promotions, shared with the validator so the two halves
+/// cannot disagree about what a graph does (invariant 12). It is a parameter rather
+/// than derived here because the two callers hold different configurations at this
+/// point (the loaded graph; the validated *candidate*).
+///
+/// Nothing is spawned, aborted or restarted: the fan-out, the inbox and the edge slot
+/// all outlive individual edges, which is what makes a mid-stream `connect` join the
+/// stream instead of toggling DTR on the board behind a serial node (invariant 14).
+pub(crate) fn attach_edge(parts: EdgeParts, mode: WriteMode, depth: usize) -> AttachOutcome {
+    let EdgeParts {
+        target,
+        origin,
+        lock,
+        host_targetward,
+        fanout,
+        inbox,
+        slot,
+        counters,
+    } = parts;
+
+    // 1. Register the attachment as an origin on the host endpoint's lock (§6),
+    //    labelled by the target's address so `lock`/`unlock` can name it. First,
+    //    before any byte can flow, so arbitration is decided from the first chunk.
+    let registered = lock.map(|cell| {
+        cell.with_mut(|l| l.register(origin, target.to_string(), mode));
+        (cell, origin)
+    });
+    let granted = registered
+        .as_ref()
+        .is_some_and(|(cell, id)| cell.with(|l| l.holder() == Some(*id)));
+
+    // 2. Fill the consuming endpoint's live edge slot. `attached` is set whatever the
+    //    mode — a `never` edge is a real attachment that simply cannot write, and it
+    //    is that flag, not the writer, that decides `active` vs `waiting` (§7.5,
+    //    §15.8) — while the targetward path exists only for a writable mode.
+    let writer = (mode != WriteMode::Never)
+        .then_some(host_targetward)
+        .flatten();
+    let addressable = writer.is_some();
+    slot.with_mut(|e| {
+        e.attached = true;
+        e.registered = registered.clone();
+        e.writer = writer;
+    });
+
+    // 3. Hostward: one dedicated channel per (host, target) edge at the producing
+    //    node's configured depth (§5/§7.1), so a slow consumer's drops are isolated
+    //    to its own channel.
+    let (htx, hrx) = mpsc::channel(depth);
+    let sink = AttachedSink {
+        target,
+        tx: htx,
+        counters,
+    };
+    fanout.attach(sink);
+
+    // 4. Hand the consuming endpoint its receiver through the inbox its pump is
+    //    already parked on. A *full* inbox would mean that endpoint already has an
+    //    unconsumed edge, which §4 rule 2 has been validated against on both paths; a
+    //    *closed* one is the no-pump case [`AttachOutcome::consumer_live`] reports.
+    let consumer_live = inbox.try_send(hrx).is_ok();
+
+    AttachOutcome {
+        registered,
+        addressable,
+        granted,
+        consumer_live,
+    }
 }
 
 /// The channels the data plane hands to each node's `start`, keyed by **endpoint
@@ -878,68 +1364,54 @@ impl Wiring {
                 _ => continue,
             };
 
-            // Register this attachment as an origin on the host endpoint's lock
-            // (§6), labelled by the target's address so `lock`/`unlock` can name
-            // it. The two configuration-to-runtime promotions — a log target forces
+            // The three per-endpoint structures this edge joins. The facing loop
+            // above made one of each for *every* endpoint, so post-validation all
+            // three are present; the skip is the same defensive arm as the facing
+            // match, and skipping wholesale beats attaching an edge by halves.
+            let (Some(fanout), Some(inbox), Some(slot)) = (
+                wiring.host_fanout.get(host).cloned(),
+                wiring.target_inbox_tx.get(target).cloned(),
+                wiring.target_edges.get(target).cloned(),
+            ) else {
+                continue;
+            };
+
+            // The two configuration-to-runtime promotions — a log target forces
             // `never` (§7.3), a map's `raw` endpoint promotes `on-demand` to `held`
             // (§7.8) — live in `GraphConfig::effective_write_mode`, not here: the
             // validator reasons about the same effective modes the wiring registers,
-            // so the two can never drift (§16 "one rule, one place"). The origin's
-            // label is its display address.
+            // so the two can never drift (§16 "one rule, one place", invariant 12).
             let mode = config.effective_write_mode(edge);
             let origin_id = OriginId(next_origin);
             next_origin += 1;
-            if let Some(lock) = wiring.endpoint_locks.get(host) {
-                lock.with_mut(|l| l.register(origin_id, target.to_string(), mode));
-            }
-
-            // Targetward: only origins that can write (mode ≠ never) get a path to
-            // the host endpoint and a lock handle to gate their drain (§6). The
-            // binding goes into the target endpoint's live slot, which is the same
-            // slot `connect` fills on a running graph.
-            if let (Some(slot), Some(lock)) = (
-                wiring.target_edges.get(target),
-                wiring.endpoint_locks.get(host),
-            ) {
-                let writer = (mode != WriteMode::Never)
-                    .then(|| wiring.host_targetward_tx.get(host).cloned())
-                    .flatten();
-                slot.with_mut(|e| {
-                    e.attached = true;
-                    e.registered = Some((lock.clone(), origin_id));
-                    e.writer = writer;
-                });
-                if mode != WriteMode::Never {
-                    wiring
-                        .origin_locks
-                        .insert(target.clone(), (lock.clone(), origin_id));
-                }
-            }
-
-            // Hostward: one dedicated channel per (host, target) edge, so a slow
-            // consumer's drops are isolated to its own channel (§5). The endpoint's
-            // DropCounters ride with both ends — the producer counts full-buffer
-            // drops, the consumer counts its own boundary discards. Depth is the
-            // producing serial's configured hostward buffer (§7.1), else default.
-            let (htx, hrx) = mpsc::channel(hostward_depth(config, &host.node));
-            let counters = wiring
-                .target_counters
-                .get(target)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(fanout) = wiring.host_fanout.get(host) {
-                fanout.attach(AttachedSink {
+            // The one implementation of "attach one edge" (SIMPB-1), shared with
+            // `Daemon::connect` so a live edge is assembled exactly as a loaded one.
+            // Depth is the producing serial's configured hostward buffer (§7.1).
+            let attached = attach_edge(
+                EdgeParts {
                     target: target.clone(),
-                    tx: htx,
-                    counters,
-                });
-            }
-            // Hand the consuming endpoint its receiver through the same inbox
-            // `connect` uses. `try_send` cannot fail here: the inbox was created
-            // empty two loops ago and holds at most one edge per target endpoint
-            // (§4 rule 2, which validation has already enforced).
-            if let Some(inbox) = wiring.target_inbox_tx.get(target) {
-                let _ = inbox.try_send(hrx);
+                    origin: origin_id,
+                    lock: wiring.endpoint_locks.get(host).cloned(),
+                    host_targetward: wiring.host_targetward_tx.get(host).cloned(),
+                    fanout,
+                    inbox,
+                    slot,
+                    counters: wiring
+                        .target_counters
+                        .get(target)
+                        .cloned()
+                        .unwrap_or_default(),
+                },
+                mode,
+                hostward_depth(config, &host.node),
+            );
+            // Only a writable origin is addressable by `lock`/`unlock`; the read-only
+            // ones stay registered on the lock and reachable through the target
+            // endpoint's `TargetEdge::registered`, which is what `disconnect` undoes.
+            if attached.addressable
+                && let Some(registration) = attached.registered
+            {
+                wiring.origin_locks.insert(target.clone(), registration);
             }
         }
 
@@ -1144,6 +1616,7 @@ mod tests {
         let out = fan_out(&chunk, &[], &unattached);
         assert!(!out.live);
         assert_eq!(out.dropped_full, 0);
+        assert_eq!(out.delivered, 0);
         assert_eq!(unattached.get(), 5);
     }
 
@@ -1183,10 +1656,37 @@ mod tests {
 
         assert!(out.live);
         assert_eq!(out.dropped_full, 5, "the full sink's drop is reported back");
+        assert_eq!(
+            out.delivered, 5,
+            "a live consumer received the whole chunk, so it *was* delivered (LEGD-2)"
+        );
         assert_eq!(full_counters.dropped_full(), 5, "charged where it dropped");
         assert_eq!(live_counters.dropped_full(), 0);
         assert_eq!(unattached.get(), 0, "a live consumer took it");
         assert_eq!(&live_rx.try_recv().expect("delivered")[..], b"hello");
+    }
+
+    #[test]
+    fn fan_out_reports_no_delivery_when_every_live_sink_was_full() {
+        // The other side of the same distinction: `live` is true (a full consumer is
+        // attached) while `delivered` is 0, so a caller reading `live` as delivery
+        // credits bytes nobody received.
+        let (a, _a_rx, _ac) = sink(1);
+        let (b, _b_rx, _bc) = sink(1);
+        for s in [&a, &b] {
+            s.tx.try_send(Chunk::copy_from_slice(b"x"))
+                .expect("fill the slow consumer's buffer");
+        }
+        let unattached = Cell::new(0u64);
+        let out = fan_out(&Chunk::copy_from_slice(b"hello"), &[a, b], &unattached);
+        assert!(out.live);
+        assert_eq!(out.delivered, 0, "no sink took it");
+        assert_eq!(
+            out.dropped_full, 10,
+            "`dropped_full` sums over sinks and can exceed the chunk — which is why \
+             it is not something delivery may be derived from"
+        );
+        assert_eq!(unattached.get(), 0, "full is not unattached");
     }
 
     #[test]
@@ -1225,5 +1725,515 @@ mod tests {
             0,
             "a zero-length chunk is zero bytes of loss"
         );
+    }
+
+    // --- the shared per-channel hostward routing block (SIMP-1) -----------------
+
+    /// A `ChannelStat` stand-in with the codecs' rule: full-buffer loss belongs to
+    /// the consuming boundary, so `add_dropped_full` stays at its default.
+    #[derive(Default)]
+    struct CodecStat {
+        active: Cell<bool>,
+        delivered: Cell<u64>,
+        unattached: Cell<u64>,
+    }
+
+    impl HostwardChannelStat for CodecStat {
+        fn set_active(&self) {
+            self.active.set(true);
+        }
+        fn add_delivered(&self, n: u64) {
+            self.delivered.set(self.delivered.get() + n);
+        }
+        fn unattached(&self) -> &dyn LossCounter {
+            &self.unattached
+        }
+    }
+
+    /// The leg's rule: one counter covers both the full-buffer drop and the
+    /// no-consumer case, so this impl folds `dropped_full` in. The *only* legitimate
+    /// difference between the three producers, and now a property of one impl.
+    #[derive(Default)]
+    struct LegStat {
+        active: Cell<bool>,
+        delivered: Cell<u64>,
+        discarded: Cell<u64>,
+    }
+
+    impl HostwardChannelStat for LegStat {
+        fn set_active(&self) {
+            self.active.set(true);
+        }
+        fn add_delivered(&self, n: u64) {
+            self.delivered.set(self.delivered.get() + n);
+        }
+        fn unattached(&self) -> &dyn LossCounter {
+            &self.discarded
+        }
+        fn add_dropped_full(&self, n: u64) {
+            self.discarded.add(n);
+        }
+    }
+
+    #[test]
+    fn route_channel_data_credits_only_what_a_live_sink_took() {
+        let (live, mut rx, _c) = sink(4);
+        let sinks = FanOutList::new();
+        sinks.attach(live);
+        let stat = CodecStat::default();
+        route_channel_data(
+            &Chunk::copy_from_slice(b"hello"),
+            None,
+            Some(&sinks),
+            Some(&stat),
+        );
+        assert!(stat.active.get());
+        assert_eq!(stat.delivered.get(), 5);
+        assert_eq!(stat.unattached.get(), 0);
+        assert_eq!(&rx.try_recv().expect("delivered")[..], b"hello");
+    }
+
+    #[test]
+    fn route_channel_data_charges_a_channel_with_no_fan_out_at_all() {
+        let stat = CodecStat::default();
+        route_channel_data(&Chunk::copy_from_slice(b"hello"), None, None, Some(&stat));
+        assert_eq!(stat.delivered.get(), 0);
+        assert_eq!(stat.unattached.get(), 5, "nothing was bound to take it");
+    }
+
+    #[test]
+    fn route_channel_data_charges_an_all_closed_sink_set_as_unattached() {
+        let (dead, rx, _c) = sink(4);
+        drop(rx);
+        let sinks = FanOutList::new();
+        sinks.attach(dead);
+        let stat = CodecStat::default();
+        route_channel_data(
+            &Chunk::copy_from_slice(b"hello"),
+            None,
+            Some(&sinks),
+            Some(&stat),
+        );
+        assert_eq!(stat.delivered.get(), 0);
+        assert_eq!(stat.unattached.get(), 5);
+    }
+
+    #[test]
+    fn route_channel_data_does_not_credit_what_a_full_sink_dropped() {
+        // LEGD-2, now proved once for every producer rather than once per node: a
+        // full sink is still `live`, so crediting the whole chunk would report bytes
+        // delivered that no consumer received.
+        let (full, _full_rx, counters) = sink(1);
+        full.tx
+            .try_send(Chunk::copy_from_slice(b"x"))
+            .expect("fill the slow consumer");
+        let sinks = FanOutList::new();
+        sinks.attach(full);
+
+        let codec = CodecStat::default();
+        route_channel_data(
+            &Chunk::copy_from_slice(b"hello"),
+            None,
+            Some(&sinks),
+            Some(&codec),
+        );
+        assert_eq!(codec.delivered.get(), 0, "the full sink took nothing");
+        assert_eq!(
+            codec.unattached.get(),
+            0,
+            "a full sink is live, so this is not unattached loss"
+        );
+        assert_eq!(counters.dropped_full(), 5, "charged at the boundary (§5)");
+
+        // Same traffic, the leg's rule: the full-buffer loss is mirrored per channel.
+        let leg = LegStat::default();
+        route_channel_data(
+            &Chunk::copy_from_slice(b"hello"),
+            None,
+            Some(&sinks),
+            Some(&leg),
+        );
+        assert_eq!(leg.delivered.get(), 0);
+        assert_eq!(
+            leg.discarded.get(),
+            5,
+            "the leg's counter covers the full-buffer drop too"
+        );
+    }
+
+    #[test]
+    fn route_channel_data_credits_a_mixed_fan_out_to_the_consumer_that_took_it() {
+        // LEGD-2's *second* direction, and the one its first fix introduced: with
+        // sinks [Ok, Full] the per-sink `dropped_full` equals the chunk length, so
+        // `n - dropped_full` credited **zero** delivered for a chunk a live consumer
+        // received in full. A mixed chunk is legitimately both — the two counters
+        // measure different consumers — and only the chunk no sink accepted is
+        // undelivered. Fails against `add_delivered(n.saturating_sub(dropped_full))`.
+        let (full, _full_rx, full_counters) = sink(1);
+        full.tx
+            .try_send(Chunk::copy_from_slice(b"x"))
+            .expect("fill the slow consumer");
+        let (live, mut live_rx, live_counters) = sink(4);
+        let sinks = FanOutList::new();
+        sinks.attach(full);
+        sinks.attach(live);
+
+        let codec = CodecStat::default();
+        route_channel_data(
+            &Chunk::copy_from_slice(b"hello"),
+            None,
+            Some(&sinks),
+            Some(&codec),
+        );
+        assert_eq!(
+            &live_rx.try_recv().expect("the fast consumer got it")[..],
+            b"hello",
+            "the premise: one consumer really did receive the whole chunk"
+        );
+        assert_eq!(
+            codec.delivered.get(),
+            5,
+            "a chunk a live consumer received in full is a delivery (LEGD-2)"
+        );
+        assert_eq!(codec.unattached.get(), 0);
+        assert_eq!(
+            full_counters.dropped_full(),
+            5,
+            "charged at the boundary (§5)"
+        );
+        assert_eq!(live_counters.dropped_full(), 0);
+
+        // The leg mirrors the slow consumer's loss per channel, so the same chunk is
+        // reported as delivered *and* discarded. That is not double-counting: it is
+        // two consumers, and the alternative is under-reporting one of them.
+        let leg = LegStat::default();
+        route_channel_data(
+            &Chunk::copy_from_slice(b"hello"),
+            None,
+            Some(&sinks),
+            Some(&leg),
+        );
+        assert_eq!(leg.delivered.get(), 5);
+        assert_eq!(leg.discarded.get(), 5, "the slow consumer's own loss");
+    }
+
+    #[test]
+    fn route_channel_data_mirrors_to_the_feed_without_masking_unattached_loss() {
+        // Invariant 9: the ring is a spy *outside* the graph, so a tapped chunk that
+        // reached no graph consumer is still charged.
+        let (hub, active, feed_dropped) = TapHub::new("ep", 64);
+        let (tx, mut feed_rx) = mpsc::channel(TAP_FEED_CAP);
+        let feed = TapFeed {
+            tx,
+            active,
+            feed_dropped,
+        };
+        let stat = CodecStat::default();
+        route_channel_data(
+            &Chunk::copy_from_slice(b"hello"),
+            Some(&feed),
+            None,
+            Some(&stat),
+        );
+        assert_eq!(&feed_rx.try_recv().expect("mirrored")[..], b"hello");
+        assert_eq!(
+            stat.unattached.get(),
+            5,
+            "a spy outside the graph must not suppress the loss"
+        );
+        drop(hub);
+    }
+
+    #[test]
+    fn route_channel_data_absorbs_an_unconfigured_identity_without_a_stat() {
+        // No `ChannelStat` exists for an identity the node was never configured for;
+        // the caller reports the identity itself and this must not panic or
+        // mis-charge a neighbour.
+        route_channel_data(&Chunk::copy_from_slice(b"hello"), None, None, None);
+    }
+
+    // --- the shared §15.20 park-and-retry shell (SIMPB-2) -----------------------
+
+    /// An exclusive endpoint lock with no origins registered.
+    fn empty_lock() -> SharedLock {
+        let (notifier, _rx) = broadcast::channel(16);
+        Rc::new(LockCell::new(
+            "ep",
+            EndpointLock::new(Arbitration::Exclusive),
+            notifier,
+        ))
+    }
+
+    #[tokio::test]
+    async fn await_grant_leaves_a_closed_endpoint_instead_of_parking() {
+        // Clause (1): a torn-down endpoint ends the wait with a defined outcome rather
+        // than re-parking forever (§6/§15.20).
+        let lock = empty_lock();
+        lock.close();
+        let out: Option<()> = await_grant(&lock, |_| None).await;
+        assert!(out.is_none(), "a closed endpoint must not park");
+    }
+
+    #[tokio::test]
+    async fn await_grant_does_not_lose_a_wake_that_lands_during_the_attempt() {
+        // Clause (2), the whole reason this shell exists: the `Notified` is created and
+        // `enable()`d *before* the attempt, so a `wake_waiters` landing between the
+        // attempt and the park is not lost. `Notify::notify_waiters` stores no permit,
+        // so a shell that enabled *after* its attempt would park forever right here —
+        // the stranded-waiter class §15.20/§15.23 exist to close. The timeout is what
+        // turns that regression into a failure instead of a hang.
+        let lock = empty_lock();
+        let attempts = Cell::new(0u32);
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            await_grant(&lock, |_| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    // A release landing mid-attempt: the wake fires while this
+                    // critical section is still running.
+                    lock.wake_waiters();
+                    None
+                } else {
+                    Some(())
+                }
+            }),
+        )
+        .await
+        .expect("a wake landing during the attempt must not be lost");
+        assert_eq!(out, Some(()));
+        assert_eq!(attempts.get(), 2, "the waiter re-attempted after the wake");
+    }
+
+    #[tokio::test]
+    async fn reacquire_held_exits_when_its_edge_was_disconnected() {
+        // `disconnect` unregisters the origin (§15.35), and an id absent from `origins`
+        // satisfies neither `may_write` nor `reclaim_held` while the endpoint itself
+        // stays open — so without the `Grant::Refused` clause the pump parks forever
+        // holding the chunk it had already taken, and a later `connect` cannot revive
+        // it (the new edge gets a new id).
+        let lock = empty_lock();
+        let id = OriginId(3);
+        lock.with_mut(|g| g.register(id, "target", WriteMode::Held));
+        assert!(
+            reacquire_held(&lock, id).await,
+            "a held origin holds the lock"
+        );
+        lock.with_mut(|g| g.unregister(id)); // the edge goes away under the pump
+        let still_writable =
+            tokio::time::timeout(Duration::from_secs(5), reacquire_held(&lock, id))
+                .await
+                .expect("an unregistered origin must not park forever");
+        assert!(
+            !still_writable,
+            "an unregistered origin can never be granted"
+        );
+    }
+
+    // --- the shared edge attachment (SIMPB-1) -----------------------------------
+
+    /// One attached edge and everything a test inspects it through.
+    struct Attached {
+        out: AttachOutcome,
+        lock: SharedLock,
+        slot: SharedTargetEdge,
+        inbox: mpsc::Receiver<mpsc::Receiver<Chunk>>,
+        /// The host endpoint's targetward receiver, held so its channel stays open.
+        _host_rx: mpsc::Receiver<Chunk>,
+    }
+
+    /// Attach one edge with `mode` through the shared helper both callers use.
+    fn attach_one(mode: WriteMode) -> Attached {
+        let lock = empty_lock();
+        let (host_tx, host_rx) = mpsc::channel::<Chunk>(4);
+        let (inbox_tx, inbox_rx) = mpsc::channel(EDGE_INBOX_CAP);
+        let slot = TargetEdge::new();
+        let out = attach_edge(
+            EdgeParts {
+                target: "logger".parse().expect("address parses"),
+                origin: OriginId(9),
+                lock: Some(lock.clone()),
+                host_targetward: Some(host_tx),
+                fanout: FanOutList::new(),
+                inbox: inbox_tx,
+                slot: slot.clone(),
+                counters: Arc::new(DropCounters::default()),
+            },
+            mode,
+            4,
+        );
+        Attached {
+            out,
+            lock,
+            slot,
+            inbox: inbox_rx,
+            _host_rx: host_rx,
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_edge_registers_a_read_only_edge_without_making_it_addressable() {
+        // The distinction both callers now take from one place: a `never` edge is a
+        // *real* attachment — registered on the lock so `state` lists it and
+        // `disconnect` can unregister it — that has no writer and is not addressable
+        // by `lock`/`unlock`.
+        let mut a = attach_one(WriteMode::Never);
+        let (out, lock, slot) = (&a.out, &a.lock, &a.slot);
+        assert!(
+            out.registered.is_some(),
+            "every mode registers on the lock, `never` included"
+        );
+        assert!(!out.addressable, "a `never` edge is not lock-addressable");
+        assert!(!out.granted, "a `never` origin cannot hold the lock");
+        assert!(out.consumer_live, "the inbox took the hostward receiver");
+        assert!(slot.with(|e| e.attached), "attached, but not writable");
+        assert!(slot.origin().is_none(), "no writable origin");
+        assert_eq!(
+            lock.with(|g| g.write_mode(OriginId(9))),
+            Some(WriteMode::Never)
+        );
+        assert!(a.inbox.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn attach_edge_grants_a_held_edge_on_a_free_exclusive_endpoint() {
+        // The `granted` flag `connect` runs purge-on-acquire on (§6): `register`
+        // itself grants a `held` origin a free exclusive lock, and that is a *fresh*
+        // grant. At load it is vacuous; on a running graph it is the stale-command
+        // hazard, which is why the outcome reports it instead of the caller re-deriving
+        // `holder() == Some(id)`.
+        let a = attach_one(WriteMode::Held);
+        let (out, lock, slot) = (&a.out, &a.lock, &a.slot);
+        assert!(out.granted, "a held origin takes a free exclusive lock");
+        assert!(out.addressable, "and is addressable by `lock`/`unlock`");
+        assert_eq!(lock.with(|g| g.holder()), Some(OriginId(9)));
+        assert!(slot.origin().is_some(), "a writable origin was installed");
+    }
+
+    // --- the shared targetward send-and-charge step (SIMP-2) --------------------
+
+    #[test]
+    fn targetward_loss_charges_the_counter_and_reports_non_delivery() {
+        let lost = Cell::new(0u64);
+        assert!(TargetwardLoss::none().charge(&lost));
+        assert_eq!(lost.get(), 0);
+        assert!(!TargetwardLoss::of(7).charge(&lost));
+        assert_eq!(lost.get(), 7);
+    }
+
+    /// A held origin bound to `tx` — the shape [`EdgeSlot::origin`] hands out.
+    fn held_origin(tx: mpsc::Sender<Chunk>) -> WritableOrigin {
+        let id = OriginId(1);
+        let mut lock = EndpointLock::new(Arbitration::Exclusive);
+        lock.register(id, "origin", WriteMode::Held); // acquires on attach
+        let (notifier, _rx) = broadcast::channel(16);
+        (tx, Rc::new(LockCell::new("ep", lock, notifier)), id)
+    }
+
+    #[tokio::test]
+    async fn forward_targetward_delivers_and_charges_nothing() {
+        let (tx, mut rx) = mpsc::channel::<Chunk>(4);
+        let origin = held_origin(tx);
+        let lost = Cell::new(0u64);
+        let delivered = forward_targetward(&origin, 5, || Some(Chunk::copy_from_slice(b"hello")))
+            .await
+            .charge(&lost);
+        assert!(delivered);
+        assert_eq!(lost.get(), 0);
+        assert_eq!(&rx.recv().await.expect("delivered")[..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn forward_targetward_charges_the_cost_when_the_endpoint_is_gone() {
+        // The exit CODEXEC-2 returned through without counting, now unreachable
+        // without naming a counter.
+        let (tx, rx) = mpsc::channel::<Chunk>(4);
+        drop(rx);
+        let origin = held_origin(tx);
+        let lost = Cell::new(0u64);
+        let delivered = forward_targetward(&origin, 5, || Some(Chunk::copy_from_slice(b"hello")))
+            .await
+            .charge(&lost);
+        assert!(!delivered);
+        assert_eq!(lost.get(), 5);
+    }
+
+    #[tokio::test]
+    async fn forward_targetward_charges_the_cost_not_the_payload_length() {
+        // The map's case: it charges the bytes that *arrived* while sending the
+        // mapped bytes, so a substituting rule cannot make the loss count drift.
+        let (tx, rx) = mpsc::channel::<Chunk>(4);
+        drop(rx);
+        let origin = held_origin(tx);
+        let lost = Cell::new(0u64);
+        forward_targetward(&origin, 40, || Some(Chunk::copy_from_slice(b"xy")))
+            .await
+            .charge(&lost);
+        assert_eq!(
+            lost.get(),
+            40,
+            "the arriving byte count, not the mapped one"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_targetward_treats_an_empty_payload_as_no_loss() {
+        // A fully deleted targetward chunk is the operator's explicit intent (§7.8),
+        // not a §5 loss.
+        let (tx, mut rx) = mpsc::channel::<Chunk>(4);
+        let origin = held_origin(tx);
+        let lost = Cell::new(0u64);
+        assert!(forward_targetward(&origin, 9, || None).await.charge(&lost));
+        assert_eq!(lost.get(), 0);
+        assert!(rx.try_recv().is_err(), "nothing was written");
+    }
+
+    #[test]
+    fn try_forward_targetward_hands_a_full_endpoint_its_chunk_back_uncharged() {
+        // CONC-1: a full endpoint must not cost a byte — the caller holds the chunk
+        // and stops reading, which backpressures the client instead.
+        let (tx, _rx) = mpsc::channel::<Chunk>(1);
+        tx.try_send(Chunk::copy_from_slice(b"x")).expect("fill it");
+        let origin = held_origin(tx);
+        let lost = Cell::new(0u64);
+        match try_forward_targetward(&origin, Chunk::copy_from_slice(b"hello"), &lost) {
+            Handoff::Full(back) => assert_eq!(&back[..], b"hello", "handed back intact"),
+            _ => panic!("a full endpoint must return the chunk"),
+        }
+        assert_eq!(lost.get(), 0, "delayed, not dropped (§5)");
+    }
+
+    #[test]
+    fn try_forward_targetward_charges_a_closed_endpoint() {
+        let (tx, rx) = mpsc::channel::<Chunk>(1);
+        drop(rx);
+        let origin = held_origin(tx);
+        let lost = Cell::new(0u64);
+        assert!(matches!(
+            try_forward_targetward(&origin, Chunk::copy_from_slice(b"hello"), &lost),
+            Handoff::Lost
+        ));
+        assert_eq!(lost.get(), 5);
+    }
+
+    #[test]
+    fn try_forward_targetward_delivers_without_touching_the_lock() {
+        // The pty's held-payload retry is deliberately not gated on arbitration: the
+        // bytes are already out of the master and were read while this origin could
+        // write, so a steal landing in between must not strand them.
+        let (tx, mut rx) = mpsc::channel::<Chunk>(4);
+        let origin = held_origin(tx);
+        let thief = OriginId(2);
+        origin.1.with_mut(|g| {
+            g.register(thief, "stealer", WriteMode::OnDemand);
+            g.steal(thief);
+        });
+        assert!(!origin.1.with(|g| g.may_write(origin.2)), "ousted");
+        let lost = Cell::new(0u64);
+        assert!(matches!(
+            try_forward_targetward(&origin, Chunk::copy_from_slice(b"hello"), &lost),
+            Handoff::Taken
+        ));
+        assert_eq!(lost.get(), 0);
+        assert_eq!(&rx.try_recv().expect("delivered")[..], b"hello");
     }
 }

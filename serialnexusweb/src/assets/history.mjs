@@ -8,23 +8,30 @@
 // core is unit-testable under `node --test` (that is the §11.9 CI-run test).
 //
 // State shape (a plain object, easy to snapshot to storage):
-//   { cap, frontier, chunks: Uint8Array[], total, dropped }
-// `frontier` is the next hostward offset not yet stored; `dropped` counts bytes lost to
-// a real gap (the ring rotated past our frontier before we reconnected).
+//   { cap, frontier, epoch, chunks: Uint8Array[], total, dropped }
+// `frontier` is the next hostward offset not yet stored; `epoch` is the offset space
+// those offsets count in (§15.38), carried *inside* the object so the key, the buffer
+// and the epoch cannot be adopted as a mismatched triple (review HIST-4); `dropped`
+// counts bytes lost to a real gap (the ring rotated past our frontier before we
+// reconnected) and is read by the caller, which marks every hole it counts (HIST-1).
 
 /// The default per-console retention cap: 16 MiB, trim-oldest (§11.9).
 export const DEFAULT_CAP = 16 * 1024 * 1024;
 
-/// A fresh, empty history. `frontier === null` until the first chunk anchors it.
+/// A fresh, empty history. `frontier === null` until the first chunk anchors it, and
+/// `epoch === null` until the daemon says which offset space it is talking about — the
+/// caller treats that as "nothing honest to persist yet".
 export function newHistory(cap = DEFAULT_CAP) {
-  return { cap, frontier: null, chunks: [], total: 0, dropped: 0 };
+  return { cap, frontier: null, epoch: null, chunks: [], total: 0, dropped: 0 };
 }
 
 /// Rebuild a history around already-stored bytes ending at hostward offset `endOffset`
-/// (what a reload loads from OPFS). The stored bytes are one chunk; `frontier` is set to
-/// `endOffset` so the next `--replay` trims everything at or before it.
-export function fromStored(bytes, endOffset, cap = DEFAULT_CAP) {
+/// in offset space `epoch` (what a reload loads from OPFS). The stored bytes are one
+/// chunk; `frontier` is set to `endOffset` so the next `--replay` trims everything at or
+/// before it.
+export function fromStored(bytes, endOffset, epoch = null, cap = DEFAULT_CAP) {
   const h = newHistory(cap);
+  h.epoch = epoch ?? null;
   if (bytes && bytes.length) {
     h.chunks.push(bytes);
     h.total = bytes.length;
@@ -86,6 +93,31 @@ export function splice(h, offset, bytes) {
 /// changed: re-anchoring costs one duplicated ring, freezing costs the console.
 export function offsetSpaceChanged(storedEpoch, epoch) {
   return storedEpoch === null || storedEpoch === undefined || storedEpoch !== epoch;
+}
+
+/// Account the hole between the log's frontier and where a re-opened tap's stream
+/// actually begins, returning the number of bytes lost (0 when there is no hole).
+///
+/// This is the *same* offset space on both sides — the daemon's replay ring simply
+/// rotated past what we had stored while nobody was watching, which with the default
+/// 64 KiB ring is the ordinary outcome of leaving a talkative console (review HIST-1).
+/// The bytes are gone; the honest answer is to charge them to `dropped` and move the
+/// frontier to where the stream really starts, so the caller can say so. Splicing
+/// across it in silence — which is what happened while `dropped` was computed here and
+/// read nowhere — presents a fabricated adjacency as a continuous stream, the very
+/// thing §10's offset contract exists to prevent.
+///
+/// Charging it here rather than leaving it to `splice` is what keeps the hole reported
+/// exactly once: with the frontier moved, the first chunk of the replay is a plain
+/// append rather than a second gap.
+export function noteGap(h, fromOffset) {
+  if (h.frontier === null || !Number.isFinite(fromOffset) || fromOffset <= h.frontier) {
+    return 0;
+  }
+  const lost = fromOffset - h.frontier;
+  h.dropped += lost;
+  h.frontier = fromOffset;
+  return lost;
 }
 
 /// Move the log's frontier to where a new offset space actually starts, returning

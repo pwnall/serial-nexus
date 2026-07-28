@@ -229,7 +229,21 @@ answer three *different* questions — none substitutes for another (§15.29):
   **The cookie is marked `Secure` exactly when this server
   terminates TLS**, so in the `--tls` tier the token stops riding on any same-host
   plaintext request; it is omitted on the plaintext tiers because a browser refuses
-  to store a `Secure` cookie from a non-trustworthy origin at all.
+  to store a `Secure` cookie from a non-trustworthy origin at all. The cookie's
+  *name* is the listener's own — `nexus_session_<bound port>` — because a cookie's
+  jar key is (name, domain, path) and never the port (RFC 6265 §8.5): under one
+  fixed name the two-console arrangement §17 prescribes collided on a single jar
+  entry, and opening the second bootstrap URL silently logged the operator out of
+  the first, whose only recovery is a reload that `401`s (review 32, WEB-3). Every
+  value the browser sends under that name is checked, not just the first, so a page
+  on a sibling port cannot shadow the session by planting a longer-path cookie of
+  the same name — RFC 6265 §5.4 orders the longer path first, and a
+  first-value-wins reader saw only the plant: the assets (path `/`) still returned
+  `200` while `/ws` got `401`, a console that renders normally and never connects.
+  A headless client (`serialnexusweb wsclient`, `curl`) may instead present the
+  unscoped name `nexus_session`: it is handed a token rather than a cookie jar and
+  cannot know the bound port, which under the SSH forwarding §17 sanctions is not
+  even the port in its own URL.
 - **Host answers *was this addressed to a name we serve*.** Validated on every
   request against the localhost family plus any `--host` names, so a page that
   rebinds DNS to `127.0.0.1` still fails — its Host is its own, and it gets `403`.
@@ -244,7 +258,40 @@ answer three *different* questions — none substitutes for another (§15.29):
   cross-origin fetches, while non-browser clients (`serialnexusweb wsclient`,
   `curl`) never do, and refusing them would break the §17 headless client.
 
-None of those three answers a fourth question — ***who can read and replay***,
+**Residual: the session cookie is readable by any same-host service the operator's
+browser contacts.** Cookies are not port-scoped in *either* direction. The `Origin`
+check above closes the inbound half — a sibling-port page cannot make this server
+act — but nothing stops the browser from *sending* the cookie to a different service
+on another port of the same host, because to the browser that is the same site. If
+the operator navigates to a hostile local port while a console session is live, that
+service's access log contains the token, and the token is shell-equivalent: its
+holder can `add-node` an exec codec and run an arbitrary command line as the
+daemon's user. `HttpOnly` does not help (it stops a script reading the cookie, not
+the browser sending it), and neither does `SameSite=Strict` (same site is exactly
+the problem); naming the cookie after the listener, above, separates two consoles'
+jar entries but does not change which ports the browser replays it to.
+
+What *does* narrow it is the cookie's **path**, and that is what ships: the session
+cookie carrying the token is `Path=/ws` — the WebSocket upgrade route and nothing
+else — so a browser applying RFC 6265 §5.1.4 path-matching sends it only to requests
+whose path is `/ws` or below. A navigation to `http://127.0.0.1:9999/`, the shape the
+finding reproduced, no longer carries it. The static assets are authorized by a
+second, separate `nexus_assets_<port>` credential minted from the OS CSPRNG and
+unrelated to the token by construction rather than derived from it, so the value that
+*is* replayed across the whole path space is not the one that commands the daemon.
+
+The residual is therefore narrowed, not closed: a hostile sibling-port service that
+answers on the path `/ws` still receives the token if the operator's browser is made
+to request it. Closing it entirely means keeping the long-lived token out of a
+standing, auto-replayed cookie at all — holding it in `sessionStorage` and presenting
+it on the upgrade — which no browser permits for the WebSocket handshake without
+either a custom subprotocol value or a query parameter, both of which trade this
+exposure for a different one (a token in a URL is a token in logs and history). That
+trade was declined for now and is recorded rather than hidden. On a multi-user
+machine, treat the token as only as safe as every other local port the operator
+visits (review 32, WEBS-1).
+
+None of those three checks answers a fourth question — ***who can read and replay***,
 which is the *channel's* to answer and the bind policy's to enforce. A bearer
 token over plaintext HTTP is a secret broadcast to every on-path observer, who
 reads it once and holds console access — root shells, per above — indefinitely.
@@ -253,14 +300,49 @@ loopback.
 
 **Everything before the token check is reachable by an unauthenticated peer** in
 the sanctioned non-loopback tiers, so the pre-auth path is bounded in three
-dimensions rather than trusted: a **15-second deadline** covers the TLS handshake
-and the delivery of a complete request head (a peer that connects and says nothing
-is dropped, not held); the request head is capped at **16 KiB**; and in-flight
-connections are capped at **128**, the newest refused rather than queued. After
-the upgrade, incoming WebSocket messages are capped at **1 MiB** (frames at
-256 KiB) — the browser→server direction carries JSON-RPC requests only, so the cap
-costs nothing and bounds what one frame can make the server buffer. The hostward
-`tap.data` firehose flows the other way and is untouched.
+dimensions rather than trusted: a **5-second deadline** covers the TLS handshake
+and the delivery of a complete request head — a complete head is one round trip, and
+a peer that connects and says nothing is dropped, not held; the request head is
+capped at **16 KiB**; and the connection pool is split at the token gate (review
+32, WEB-5). **128** bounds the connections that have *passed* it — the permit is
+taken there, after the credential is known, and a request over the cap is answered
+`503` rather than queued, since a queue only moves the exhaustion. What bounds the
+population *before* the gate is a separate cap of **32**, and that one is enforced
+by **evicting its oldest member, never by refusing an accept**. The distinction is
+the whole finding rather than an implementation detail: the cookie cannot be read
+until the head is read, so anything that refuses at accept refuses the operator
+too. The first attempt at this split did exactly that — a second semaphore taken
+in the accept loop — and made the denial four times cheaper instead of closing it,
+32 silent sockets resetting every subsequent connection on `/app.js` and `/ws`
+alike where the single pool had cost 128. Under eviction a silent peer can no
+longer deny anyone; it can only be the thing that gets evicted, and the operator's
+browser — always the newest arrival, and out of the population entirely one round
+trip later when its cookie is read — is the last candidate rather than the
+structural victim. To make the console so much as retry, a flood would have to turn
+the whole pre-auth pool over inside that round trip. The residual is that an
+evicted connection's socket closes when its task is next polled, so a burst can
+leave evicted-but-unreaped tasks briefly alive; they are on their way out rather
+than holding a slot for the head deadline. A per-peer-IP cap is deliberately
+absent — on the loopback default every local user shares 127.0.0.1 with the
+operator, so it would ration the browser without separating it from the attacker. After the upgrade, incoming
+WebSocket messages are capped at **1 MiB** (frames at 256 KiB) — the browser→server
+direction carries JSON-RPC requests only, so the cap costs nothing and bounds what
+one frame can make the server buffer. The hostward `tap.data` firehose flows the
+other way and is untouched.
+
+**The served assets carry a `default-src 'none'` policy, and its `connect-src` is
+`'self'` alone.** Nothing the page needs is off-origin or inline — scripts and styles
+come from this server, the WebSocket is same-origin, the history export is a `blob:`
+URL — so the policy costs the console nothing while bounding what a future
+DOM-injection slip could do; and since a token holder can now edit the graph, such a
+slip would be code execution *as the operator's session* rather than a defaced page.
+The bare `ws:`/`wss:` scheme sources the policy used to carry are gone (review 32,
+WEBS-2): they let a script open a WebSocket to *any* host, which is exactly the
+silent, bidirectional, page-preserving exfiltration channel the rest of this section
+assumes is shut, and CSP3's `'self'` matches a same-origin `ws:`/`wss:` connection on
+both tiers — measured against this project's own pinned Chromium. Read it as defense
+in depth and not as a boundary: CSP cannot stop a top-level navigation to an
+attacker's URL, so what it removes is the quiet channel, not every channel.
 
 **The bind policy is three-tiered, and the tiers are not interchangeable:**
 
@@ -270,7 +352,20 @@ costs nothing and bounds what one frame can make the server buffer. The hostward
 2. **`--tls` + token (the sanctioned non-loopback mode).** rustls plus the token is
    the configuration in which "the bearer token is like an API key" is *actually
    true*, because every widely deployed API rides an encrypted channel. This is the
-   only non-loopback mode that is not a footgun.
+   only non-loopback mode that is not a footgun. **The cert and the key are one
+   atomic pair:** `--tls-cert`/`--tls-key` are *loaded* when both paths exist and a
+   self-signed lab pair is *generated* when **neither** does, while a half-present
+   pair is refused at startup, naming the file that is there and the one that is not.
+   The refusal is the substance rather than the tidiness: generating writes both
+   paths, so the ordinary CA workflow — make the key first, install the signed cert
+   later — used to truncate the operator's private key, unrecoverably, while the
+   server came up green and the one log line named only the cert (review 32,
+   WEB-1/WEB-2). Presence is decided with `symlink_metadata`, not `exists()`, so a
+   dangling symlink planted at either path counts as *present* rather than as an
+   invitation to write through it; both files are created with `create_new`; and the
+   generated key is narrowed to `0600` explicitly, because an open-time mode applies
+   only at creation and is masked by the umask, which is how a regenerate into a
+   pre-existing `0644` path once served a world-readable key.
 3. **`--insecure-bind` (the named footgun).** A non-loopback bind without TLS is
    refused outright unless this flag is set — the same "a named footgun beats a
    patched binary" reasoning as the legs' `insecure_bind`. The token stays mandatory,
@@ -441,7 +536,10 @@ default, replayable by anyone who can open the socket — set `replay_ring = 0` 
 the consoles where that matters. Cross-machine legs stay on loopback and ride SSH;
 reaching past loopback means writing `insecure_bind = true` on purpose. The web
 console gates on token, Host and `Origin`, refuses every verb outside its
-allowlist, and bounds its pre-auth path. The exec codec runs as the daemon's user,
+allowlist, and bounds its pre-auth path separately from its authenticated one — but
+the browser replays its session cookie to every service on every port of the same
+host, so that token is only as safe as the other local ports the operator visits.
+The exec codec runs as the daemon's user,
 so run that user small. There is no in-daemon crypto in v1 — that, and finer
 per-caller authorization via `SO_PEERCRED`, are named as future work, not present
 guarantees (§14, §10).

@@ -85,6 +85,12 @@ async fn connect(
         .as_str()
         .into_client_request()
         .map_err(|e| anyhow::anyhow!("bad --url {:?}: {e}", args.url))?;
+    // The *unscoped* cookie name, deliberately. Since review WEB-3 the server names the
+    // cookie it sets after its own bound port (`nexus_session_<port>`), so two consoles
+    // on one host stop evicting each other's jar entry — but a headless client is
+    // handed a token, not a jar, and cannot know the bound port: under the SSH
+    // forwarding §17 sanctions it is not even the port in `--url`. So the server also
+    // accepts the base name, and that is the one this client presents.
     req.headers_mut().insert(
         COOKIE,
         format!("nexus_session={}", args.token)

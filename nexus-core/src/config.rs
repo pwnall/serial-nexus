@@ -4,11 +4,16 @@
 //! [`crate::state`]). The split is enforced mechanically: state fields simply do
 //! not exist on configuration types.
 //!
-//! Phase 1 models the graph container and the first three boundary node kinds
-//! (serial, pty, log). Later phases extend [`NodeConfig`] with codec, leg,
-//! exec, and existing-terminal kinds; the format is designed to grow additively
-//! (§15.16). Node kinds are internally tagged by `type` with inline fields, so
-//! they serialize cleanly to TOML without `flatten`.
+//! The shipped node kinds are exactly [`NodeConfig`]'s variants — `serial`,
+//! `pty`, `log` (the boundary kinds), `codec`, `leg` and `map` (§7.1–§7.6, §7.8).
+//! Note two things this list does *not* contain. The exec codec (§7.6) is not a
+//! variant: it is an ordinary [`NodeConfig::Codec`] selected by `codec = "exec"`,
+//! with its child process configured in the opaque `attributes` table (see that
+//! variant's docs). And `existing-terminal` (§7.7) is design-specified but
+//! deliberately unimplemented (§14), so the daemon answers an `existing-terminal`
+//! node with serde's unknown-variant error. The format is designed to grow
+//! additively (§15.16); node kinds are internally tagged by `type` with inline
+//! fields, so they serialize cleanly to TOML without `flatten`.
 
 use serde::{Deserialize, Serialize};
 
@@ -160,6 +165,25 @@ impl GraphConfig {
         addr.is_default() && matches!(self.node_named(&addr.node), Some(NodeConfig::Codec { .. }))
     }
 
+    /// Whether the host-facing endpoint at `addr` **arbitrates at all** (§6) — i.e.
+    /// whether there is a write lock on it for an edge rule to reason about.
+    ///
+    /// A `free-for-all` endpoint has none: [`crate::lock::EndpointLock::may_write`]
+    /// returns true for every registered origin whose mode is not `never`, so no
+    /// origin can park waiting for a grant and no origin can hold the endpoint to
+    /// another's exclusion. Both kind-dependent edge rules in [`Self::validate`]
+    /// exist to prevent a lock hazard, so both are exempt there — and both said so
+    /// in their own words until one grew the exemption and the other did not
+    /// (review 32 `CORE-2`). One predicate, consulted twice (§16 "one rule, one
+    /// place").
+    ///
+    /// An unresolvable node is treated as arbitrating: the topology model reports
+    /// the dangling reference, and [`Self::edge_ends`] has already filtered such an
+    /// edge out before either rule runs.
+    fn endpoint_arbitrates(&self, addr: &EndpointAddr) -> bool {
+        self.node_named(&addr.node).map(NodeConfig::arbitration) != Some(Arbitration::FreeForAll)
+    }
+
     /// The runtime-effective write mode of `edge` (§6) — what the data plane will
     /// actually register, as opposed to what the operator declared.
     ///
@@ -281,6 +305,36 @@ impl GraphConfig {
                 // promise that line states are deterministic.
                 errors.extend(range_error(name, "baud", *baud as u64, 1, u32::MAX as u64));
             }
+            // A pty's slave permission bits (§7.2). Two rules coincide on one
+            // inclusive window, so one `range_error` states both:
+            //
+            //   * **Ceiling `0o777`** — a permission mode is nine bits. TOML rejects
+            //     leading-zero integers, so an operator must write `0o600`; writing
+            //     `mode = 666`, the octal spelling read as decimal, means 0o1232 —
+            //     owner `-w-`. Every three-digit decimal typo of an octal mode
+            //     exceeds 0o777 = 511, so the ceiling names the whole family.
+            //   * **Floor `0o600`** — the daemon's own access. `setup` chmods the
+            //     slave and then *opens* it to prime the session (`prime_slave`), so
+            //     a mode that denies the owner read+write faults the node by
+            //     construction, with `prime open /dev/pts/N: EACCES` — a message
+            //     that never mentions the mode and sends the operator hunting a
+            //     devpts problem. Inside the ceiling, "the owner has rw" is exactly
+            //     `mode >= 0o600`, which is why one range carries both rules; and it
+            //     catches what the ceiling misses by arithmetic accident (`mode =
+            //     154` is 0o232 — no owner read — and passes a 0o777 cap).
+            //
+            // The floor costs no working configuration: only a root daemon can open
+            // a slave whose owner bits deny it, and only root can chown the node to
+            // some *other* owner in the first place — a root daemon declaring a mode
+            // that locks its own owner out is confessing the typo this rejects.
+            if let NodeConfig::Pty {
+                name,
+                mode: Some(mode),
+                ..
+            } = node
+            {
+                errors.extend(range_error(name, "mode", *mode as u64, 0o600, 0o777));
+            }
             // A log's rotation-suffix padding (§7.3).
             if let NodeConfig::Log {
                 name,
@@ -389,8 +443,13 @@ impl GraphConfig {
             // else is an operator error worth naming, not a silent stall (§7.5/§7.6).
             // Only the *target-facing* multiplexed side is constrained: a
             // re-multiplexer's mux endpoint faces host and is an ordinary arbitrated
-            // endpoint, and a codec's channel endpoints are ordinary origins.
+            // endpoint, and a codec's channel endpoints are ordinary origins. And
+            // the whole hazard presumes a lock upstream: on a `free-for-all` host
+            // endpoint `held` and `on-demand` are behaviourally identical, so the
+            // refusal would reject a graph that runs, citing a stall that cannot
+            // happen there (§6, review 32 `CORE-2`).
             if self.is_multiplexed_endpoint(target)
+                && self.endpoint_arbitrates(host)
                 && !matches!(edge.write_mode, WriteMode::Held | WriteMode::Never)
             {
                 errors.push(ValidationError::MultiplexedEdgeNotHeld {
@@ -409,9 +468,11 @@ impl GraphConfig {
             // endpoint with `write_mode` written nowhere, both promoted to held.
             if self.effective_write_mode(edge) == WriteMode::Held
                 // A `free-for-all` endpoint has no lock at all (§6), so two held
-                // origins there are the operator's explicit, working choice.
-                && self.node_named(&host.node).map(NodeConfig::arbitration)
-                    != Some(Arbitration::FreeForAll)
+                // origins there are the operator's explicit, working choice — the
+                // same exemption the mux rule above takes, through the same
+                // predicate so it cannot be applied to one and forgotten on the
+                // other again.
+                && self.endpoint_arbitrates(host)
             {
                 match held_origin.entry(host) {
                     std::collections::hash_map::Entry::Occupied(prior) => {
@@ -2023,6 +2084,151 @@ mod tests {
         );
     }
 
+    /// CORE-2: both kind-dependent edge rules are exemptions from the *same*
+    /// condition — "does this host endpoint arbitrate at all?" — and the mux rule
+    /// used to ignore it while the held-uniqueness rule ten lines below took it.
+    #[test]
+    fn a_free_for_all_host_endpoint_exempts_both_edge_rules() {
+        // On a `free-for-all` endpoint there is no lock: `EndpointLock::may_write`
+        // is true for every origin that is not `never`, so an on-demand mux origin
+        // cannot park and two held origins cannot starve each other. The refusal
+        // would reject a graph that runs, with a stated reason that is false for it
+        // (§6, design §6's "both corollaries are conditioned on the endpoint
+        // arbitrating at all").
+        let nodes = || {
+            vec![
+                serial_with("usb0", |n| {
+                    if let NodeConfig::Serial { arbitration, .. } = n {
+                        *arbitration = Arbitration::FreeForAll;
+                    }
+                }),
+                NodeConfig::Codec {
+                    name: "mux".into(),
+                    codec: "reference".into(),
+                    faces: Facing::Target,
+                    channels: vec!["c0".into()],
+                    arbitration: Arbitration::Exclusive,
+                    replay_ring: DEFAULT_REPLAY_RING,
+                    attributes: toml::Table::new(),
+                },
+                NodeConfig::Codec {
+                    name: "mux2".into(),
+                    codec: "reference".into(),
+                    faces: Facing::Target,
+                    channels: vec!["c0".into()],
+                    arbitration: Arbitration::Exclusive,
+                    replay_ring: DEFAULT_REPLAY_RING,
+                    attributes: toml::Table::new(),
+                },
+            ]
+        };
+        let mux_edge = |mux: &str, write_mode: WriteMode| EdgeConfig {
+            a: EndpointAddr::node("usb0"),
+            b: EndpointAddr::node(mux),
+            write_mode,
+        };
+        // The rule under repair: an omitted (on-demand) mux write mode.
+        assert!(
+            errors_of(nodes(), vec![mux_edge("mux", WriteMode::OnDemand)]).is_empty(),
+            "an on-demand mux edge on a lock-less endpoint must be accepted"
+        );
+        // The sibling rule's exemption, unchanged — pinned here so the two stay
+        // visibly on one predicate.
+        assert!(
+            errors_of(
+                nodes(),
+                vec![
+                    mux_edge("mux", WriteMode::Held),
+                    mux_edge("mux2", WriteMode::Held),
+                ],
+            )
+            .is_empty(),
+            "two held origins on a lock-less endpoint are the operator's choice"
+        );
+        // And the exemption is *only* about arbitration: the same graph under the
+        // exclusive default is still refused, by both rules.
+        let exclusive = || {
+            let mut nodes = nodes();
+            if let Some(NodeConfig::Serial { arbitration, .. }) = nodes.first_mut() {
+                *arbitration = Arbitration::Exclusive;
+            }
+            nodes
+        };
+        assert!(
+            errors_of(exclusive(), vec![mux_edge("mux", WriteMode::OnDemand)])
+                .iter()
+                .any(|e| matches!(e, ValidationError::MultiplexedEdgeNotHeld { .. })),
+            "an arbitrated endpoint still refuses an on-demand mux edge"
+        );
+        assert!(
+            errors_of(
+                exclusive(),
+                vec![
+                    mux_edge("mux", WriteMode::Held),
+                    mux_edge("mux2", WriteMode::Held),
+                ],
+            )
+            .iter()
+            .any(|e| matches!(e, ValidationError::ConflictingHeldEdges { .. })),
+            "an arbitrated endpoint still refuses two held origins"
+        );
+    }
+
+    /// RV-4: a pty `mode` is range-checked structurally, so the octal/decimal typo
+    /// is named at `load` instead of faulting the node with an EACCES that never
+    /// mentions the mode.
+    #[test]
+    fn pty_mode_is_range_checked() {
+        let pty = |mode: Option<u32>| NodeConfig::Pty {
+            name: "con".into(),
+            path: "/run/serial_nexus/con".into(),
+            owner: None,
+            group: None,
+            mode,
+            advertised_baud: 115_200,
+            hostward_buffer: 32,
+        };
+        let rejected = |mode: u32| {
+            errors_of(vec![pty(Some(mode))], vec![]).iter().any(|e| {
+                matches!(e, ValidationError::NumericOutOfRange { node, field: "mode", value, .. }
+                    if node == "con" && *value == mode as u64)
+            })
+        };
+        // The reported typo: `0o600` written as `600`… and as `666`, `644`, `640`.
+        // Every three-digit decimal spelling of an octal mode exceeds 0o777.
+        for typo in [600, 666, 644, 640, 660, 777] {
+            assert!(
+                rejected(typo),
+                "mode = {typo} (decimal octal typo) must fail"
+            );
+        }
+        // What the ceiling alone would miss (the verifier's case): 154 = 0o232,
+        // owner `-w-`, which the daemon's own `prime_slave` open cannot use.
+        assert!(
+            rejected(154),
+            "a mode denying the owner read+write must fail"
+        );
+        assert!(rejected(0o477), "owner without write must fail");
+        assert!(rejected(0o277), "owner without read must fail");
+        // The window, and the two defaults `PtyNode::create` applies when `mode` is
+        // omitted (0o600 alone, 0o660 with a group) — neither may be refusable.
+        for mode in [0o600, 0o660, 0o666, 0o700, 0o777] {
+            assert!(
+                !errors_of(vec![pty(Some(mode))], vec![])
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::NumericOutOfRange { .. })),
+                "mode = {mode:o} must be accepted"
+            );
+        }
+        // An omitted mode is not a number and cannot be out of range.
+        assert!(
+            !errors_of(vec![pty(None)], vec![])
+                .iter()
+                .any(|e| matches!(e, ValidationError::NumericOutOfRange { .. })),
+            "an omitted mode must be accepted"
+        );
+    }
+
     #[test]
     fn effective_write_mode_reproduces_the_runtime_promotions() {
         // The single source of truth for the two promotions the data plane applies
@@ -2683,6 +2889,7 @@ mod tests {
             ring in prop_oneof![0usize..=MAX_REPLAY_RING, (MAX_REPLAY_RING + 1)..=usize::MAX],
             depth in prop_oneof![0usize..=MAX_HOSTWARD_BUFFER, (MAX_HOSTWARD_BUFFER + 1)..=usize::MAX],
             timer in prop_oneof![0u64..=MAX_TIMER_MS, (MAX_TIMER_MS + 1)..=u64::MAX],
+            mode in prop_oneof![0u32..0o600, 0o600u32..=0o777, 0o1000u32..=u32::MAX],
         ) {
             let cfg = GraphConfig {
                 nodes: vec![
@@ -2707,6 +2914,15 @@ mod tests {
                         replay_ring: DEFAULT_REPLAY_RING,
                         channels: vec!["c0".into()],
                     },
+                    NodeConfig::Pty {
+                        name: "con".into(),
+                        path: "/run/serial_nexus/con".into(),
+                        owner: None,
+                        group: None,
+                        mode: Some(mode),
+                        advertised_baud: 115_200,
+                        hostward_buffer: 32,
+                    },
                 ],
                 edges: vec![],
             };
@@ -2726,6 +2942,10 @@ mod tests {
                 errors.iter().any(|e| matches!(e, ValidationError::ZeroHostwardBuffer { .. })),
                 depth == 0
             );
+            // RV-4: the accepted window is `0o600 ..= 0o777` — the ceiling is a
+            // permission mode's bit width (which catches the decimal-octal typo
+            // family) and the floor is the daemon's own `prime_slave` open.
+            prop_assert_eq!(reported("mode"), !(0o600..=0o777).contains(&mode));
         }
 
         #[test]

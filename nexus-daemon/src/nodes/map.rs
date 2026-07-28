@@ -35,10 +35,11 @@ use nexus_core::map::MapDirection;
 use nexus_core::state::{NodeState, NodeStatus};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
+use crate::boundary::TaskSet;
 use crate::runtime::{
-    DropCounters, EdgeInbox, SharedFanOut, SharedTargetEdge, Wiring, await_origin, reacquire_held,
+    DropCounters, EdgeInbox, LossCounter, SharedFanOut, SharedTargetEdge, Wiring, await_origin,
+    forward_targetward,
 };
 use crate::tap::TapFeed;
 
@@ -139,7 +140,7 @@ pub struct MapNode {
     /// loss, so they are counted (§5), mirroring the exec codec's
     /// `mux_discarded_targetward`.
     targetward_discarded: Rc<Cell<u64>>,
-    tasks: Vec<JoinHandle<()>>,
+    tasks: TaskSet,
     /// The node's observed status *and the moment it entered it* (§7).
     status: NodeState,
 }
@@ -179,7 +180,7 @@ impl MapNode {
             raw_edge: None,
             hostward_unattached: Rc::new(Cell::new(0)),
             targetward_discarded: Rc::new(Cell::new(0)),
-            tasks: Vec::new(),
+            tasks: TaskSet::default(),
             status: NodeState::new(NodeStatus::Active),
         })
     }
@@ -313,22 +314,16 @@ impl MapNode {
     /// blocking thread and no environment to release, so signalling *is* its whole
     /// teardown; the method exists so the daemon can signal every node uniformly
     /// before it pays any node's join cost.
+    ///
+    /// It needs no `impl Drop`: [`TaskSet`] aborts what it holds when the node value
+    /// dies, so "a node's tasks die with the node" holds by type rather than by a
+    /// hand-written copy of this body (SIMPB-10).
     pub fn signal_stop(&mut self) {
-        for t in self.tasks.drain(..) {
-            t.abort();
-        }
+        self.tasks.abort_all();
     }
 
     pub fn teardown(&mut self) {
         self.signal_stop();
-    }
-}
-
-impl Drop for MapNode {
-    fn drop(&mut self) {
-        for t in self.tasks.drain(..) {
-            t.abort();
-        }
     }
 }
 
@@ -389,34 +384,31 @@ async fn targetward_map(
         // read-only one (`write_mode = "never"`) returns `None` and is drained:
         // inert, not destructive, and never wedging a writer on a configuration
         // that will never become writable (MAP-1).
-        let Some((up_tx, lock, id)) = await_origin(&edge).await else {
+        let cost = chunk.len() as u64;
+        let Some(origin) = await_origin(&edge).await else {
             // Count the *arriving* bytes; the transform is deliberately not run, so
             // a read-only map's per-rule counters do not claim substitutions on
             // bytes that never left the node.
-            discarded.set(discarded.get() + chunk.len() as u64);
+            discarded.add(cost);
             continue;
         };
-        // Gate on holding the upstream's write lock (the map's held origin) *before*
-        // transforming. Order matters for honesty, not for correctness: the per-rule
+        // The shared send-and-charge step (SIMP-2). It gates on holding the
+        // upstream's write lock (the map's held origin) *before* running the
+        // transform, which is this node's ordering requirement: the per-rule
         // substitution counters are bumped inside `transform`, so running it on a
         // chunk that then turns out to have nowhere to go would have the map claim
         // substitutions on bytes that never left the node — the same reason the
-        // no-origin arm above counts without transforming.
-        if !reacquire_held(&lock, id).await {
-            // The upstream endpoint was torn down, or this origin's edge was
-            // disconnected under us. Keep draining rather than returning: the
-            // receiver's senders are still live, and a `connect` may yet give this
-            // map a new upstream.
-            discarded.set(discarded.get() + chunk.len() as u64);
-            continue;
-        }
-        let mapped = dir.transform(&chunk);
-        if mapped.is_empty() {
-            continue; // fully deleted targetward: nothing to write
-        }
-        if up_tx.send(Chunk::from(mapped)).await.is_err() {
-            discarded.set(discarded.get() + chunk.len() as u64);
-        }
+        // no-origin arm above counts without transforming. Both of its loss exits
+        // charge the *arriving* byte count for that same reason. A fully deleted
+        // chunk yields `None`: nothing to write and nothing lost. And every failure
+        // keeps draining rather than returning — the receiver's senders are still
+        // live, and a `connect` may yet give this map a new upstream.
+        forward_targetward(&origin, cost, || {
+            let mapped = dir.transform(&chunk);
+            (!mapped.is_empty()).then(|| Chunk::from(mapped))
+        })
+        .await
+        .charge(&*discarded);
     }
 }
 

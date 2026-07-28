@@ -221,4 +221,32 @@ fn the_port_is_still_exclusive_while_the_node_holds_it() {
         verdict["pass"], false,
         "a second process opened a port the daemon holds exclusively: {verdict}"
     );
+    // **Assert the reason, not just the verdict** (review 32 ITEST-1). `nexus-sim
+    // client` reports `pass:false` in two structurally different shapes, and only one
+    // of them is exclusivity: the EBUSY *refusal* (`{"error":"Device or resource busy
+    // (os error 16)", …}`, `err_verdict`) and a **successful** open whose echo the
+    // daemon's own reader consumed first (`{"received":0,"timed_out":true, …}`). The
+    // second needs no `TIOCEXCL` at all — invariant 2's serial reader parks in blocking
+    // `poll(2)` and eats everything hostward — so a regression that simply stopped
+    // calling `sys::set_exclusive(fd, true)` produced a race, not a failure: measured
+    // against an LD_PRELOAD shim that swallows the ioctl, this test caught it only
+    // ~40 % of the time on an idle box and ~25 % under load. That is precisely the
+    // "cannot pass" claim in the doc comment above, undone by scheduling.
+    //
+    // `error` is present only on the refusal path, and `received` only on the open
+    // path, so either discriminates. Assert both, and name the ioctl in the message:
+    // the fix this file exists for *releases* exclusivity in `teardown`, and the way
+    // that fix goes wrong is by never taking it in the first place.
+    assert!(
+        verdict.get("received").is_none(),
+        "the stray process OPENED the port and merely lost the race for the echo — the \
+         daemon is not holding TIOCEXCL (§7.1): {verdict}"
+    );
+    assert!(
+        verdict["error"]
+            .as_str()
+            .is_some_and(|e| e.to_ascii_lowercase().contains("busy")),
+        "the second open failed for a reason that is not exclusivity, so this guard \
+         proves nothing about TIOCEXCL (§7.1): {verdict}"
+    );
 }

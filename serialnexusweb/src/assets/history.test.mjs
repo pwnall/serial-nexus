@@ -3,7 +3,9 @@
 // with `node --test history.test.mjs`; the nexus-itest `p8_web_history` test invokes
 // exactly this file and self-skips when `node` is absent, so it is the §11.9 CI-run
 // test — which is why saver.mjs's tests live here rather than in a sibling file the
-// gate would not run.
+// gate would not run. `opfs.mjs` is storage code and stays on the browser suite, with
+// one exception imported here: its key→filename mapping is pure, and a non-injective
+// one merged two consoles' records (review HIST-5).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -13,10 +15,12 @@ import {
   splice,
   bytesOf,
   trim,
+  noteGap,
   offsetSpaceChanged,
   reanchor,
 } from "./history.mjs";
 import { makeSaver } from "./saver.mjs";
+import { fileName, pruneForeign } from "./opfs.mjs";
 
 // A byte range [start, end) whose byte at position p equals p & 0xff — so a concatenation
 // is verifiable by value, and any gap or duplication shows up immediately.
@@ -241,4 +245,233 @@ test("reanchor is a no-op when the frontier is already where the stream starts",
   const h = fromStored(new Uint8Array([1, 2, 3]), 100);
   assert.equal(reanchor(h, 100), false);
   assert.equal(h.frontier, 100);
+});
+
+// ---- the browser-history cluster of review 32 -----------------------------------
+
+// HIST-1. The daemon's replay ring rotated past what this tab had stored — the ordinary
+// outcome of leaving a talkative console with the default 64 KiB ring — so the stream
+// resumes at an offset past our frontier, in the *same* offset space. The client used to
+// splice straight across it under a `— replay (N bytes) —` marker that positively
+// suggests continuity, while `dropped` counted the hole and nothing ever read it.
+//
+// FAIL-FIRST: `noteGap` did not exist, and the only other reader of this hole was
+// `splice`'s `h.dropped +=`, which no caller inspected.
+test("a ring that rotated past the stored history reports the hole, exactly once", () => {
+  // The verifier's own reproduction, to the byte: 264 stored, the tap re-opens at 2050.
+  const h = fromStored(seq(0, 264), 264, 1);
+  assert.equal(noteGap(h, 2050), 1786, "the hole is measured and handed to the caller");
+  assert.equal(h.dropped, 1786, "…and charged, so it is not lost accounting either");
+  assert.equal(h.frontier, 2050, "the log resumes where the stream really starts");
+
+  // The replay that follows is a plain append, not a second gap: charging the hole in
+  // `noteGap` is what keeps it reported once rather than twice.
+  const before = h.dropped;
+  const fresh = splice(h, 2050, seq(50, 60));
+  assert.deepEqual([...fresh], [...seq(50, 60)]);
+  assert.equal(h.dropped - before, 0, "the same hole must not be counted a second time");
+});
+
+test("noteGap is silent when the stream resumes at or behind the frontier", () => {
+  // The ordinary reload: the ring re-sends bytes we already have, which is what a ring
+  // is for. Nothing was lost, so nothing is said.
+  const h = fromStored(seq(0, 100), 100, 1);
+  assert.equal(noteGap(h, 40), 0);
+  assert.equal(noteGap(h, 100), 0);
+  assert.equal(h.frontier, 100, "and the frontier never moves backwards");
+  assert.equal(h.dropped, 0);
+  // A history that has not anchored yet has no frontier to measure a hole against.
+  assert.equal(noteGap(newHistory(), 500), 0);
+});
+
+// HIST-4. The key, the buffer and the epoch are one record; as three module globals the
+// epoch lagged the other two by an await, so a flush in that window stamped the previous
+// console's epoch onto this console's record — and because the daemon's hub epochs come
+// from a process-global counter, two endpoints never share one, so the stamp was wrong by
+// construction. The next selection then declared a false restart and re-rendered the ring.
+test("the epoch is part of the history object, adopted with the bytes and the frontier", () => {
+  const h = fromStored(seq(0, 8), 8, 7);
+  assert.equal(h.epoch, 7, "restored in the same synchronous step as the buffer");
+  assert.equal(h.frontier, 8);
+  assert.deepEqual([...bytesOf(h)], [...seq(0, 8)]);
+
+  // A fresh history has no offset space yet — the daemon has not said which one it is
+  // talking about — and app.js's `flushSave` treats that as "nothing honest to persist".
+  assert.equal(newHistory().epoch, null);
+  assert.equal(fromStored(new Uint8Array(0), 0).epoch, null, "absent stays absent");
+  assert.equal(offsetSpaceChanged(newHistory().epoch, 3), true);
+});
+
+// HIST-5. `/` is the endpoint separator and the one character §3 forbids inside a node
+// name; `_` is legal in one. Collapsing the first onto the second made the consoles
+// `mux/console` and `mux_console` share a record, and `save()`'s `createWritable()`
+// truncates, so the collision was a silent mutual overwrite.
+//
+// FAIL-FIRST: with the old sanitiser both keys produced `hist_mux_console.bin`.
+test("the storage filename distinguishes consoles that differ only by the separator", () => {
+  assert.notEqual(fileName("h::mux/console::9"), fileName("h::mux_console::9"));
+  // Injective over the characters that actually appear in a key — host, separator,
+  // endpoint address, nonce — plus the escape character itself, whose own escaping is
+  // what makes the mapping reversible.
+  const keys = [
+    "127.0.0.1:18099::mux/console::9",
+    "127.0.0.1:18099::mux_console::9",
+    "127.0.0.1:18099::mux%console::9",
+    "127.0.0.1:18099::mux console::9",
+    "127.0.0.1:18099::mux/console::10",
+    "[::1]:18099::mux/console::9",
+    "a%0025b",
+    "a%b",
+  ];
+  const names = keys.map(fileName);
+  assert.equal(new Set(names).size, keys.length, `collision among ${names.join(" ")}`);
+  for (const n of names) {
+    assert.match(n, /^hist_[A-Za-z0-9.%-]+\.bin$/, "a name OPFS will accept");
+  }
+});
+
+// HIST-3. The record key folds in the daemon's *per-boot* `instance` nonce, and the only
+// deletion the client had was `clear(key)` for the selected console — so every restart
+// orphaned one capped record per console, forever, until the origin hit its quota and
+// persistence died with no in-product way to reclaim the space. §15.32's retention model
+// is a per-console cap; this is what keeps it one.
+//
+// OPFS is browser-only, so the directory is a stub here — the subject is the *filter*,
+// which is where a sweep gets dangerous: too greedy and it deletes the record the client
+// is about to write.
+test("the sweep reclaims other boots' records and keeps this one's", async () => {
+  const keep = [fileName("h:1::usb0::7"), fileName("h:1::mux/console::7")];
+  const sweep = [
+    fileName("h:1::usb0::6"), // the previous daemon boot
+    fileName("h:1::usb0::70"), // a nonce this one is merely a prefix of
+    fileName("g:2::usb0::7"), // another origin's record, if one ever appears
+    "hist_h_1__usb0__7.bin", // an older client's non-injective escaping (HIST-5)
+  ];
+  const removed = [];
+  const dir = {
+    entries() {
+      return (async function* () {
+        for (const n of [...keep, ...sweep, "unrelated.txt"]) yield [n, { kind: "file" }];
+      })();
+    },
+    async removeEntry(name) {
+      removed.push(name);
+    },
+  };
+  const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { storage: { getDirectory: async () => dir } },
+  });
+  try {
+    assert.equal(await pruneForeign("h:1::", 7), sweep.length);
+    assert.deepEqual(removed.sort(), [...sweep].sort());
+  } finally {
+    if (original) Object.defineProperty(globalThis, "navigator", original);
+    else delete globalThis.navigator;
+  }
+});
+
+test("a browser that cannot enumerate its storage loses nothing but the sweep", async () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { storage: { getDirectory: async () => ({}) } }, // no `entries`
+  });
+  try {
+    assert.equal(await pruneForeign("h:1::", 7), 0, "degrades quietly, never throws");
+  } finally {
+    if (original) Object.defineProperty(globalThis, "navigator", original);
+    else delete globalThis.navigator;
+  }
+});
+
+// HISTC-2. `clear` competes with a debounced snapshot that may already be inside
+// `createWritable()`; an unordered `removeEntry` loses that race and the write re-creates
+// the record the operator just destroyed.
+test("a delete is serialized behind the write already in flight for that key", async () => {
+  const removed = [];
+  const { write, started, gates } = controllableWrites();
+  const saver = makeSaver(write, () => {}, (key) => {
+    removed.push(key);
+    return Promise.resolve();
+  });
+  saver.save("k", new Uint8Array(1), 10); // in flight
+  saver.remove("k"); // the operator clicks clear
+  assert.deepEqual(removed, [], "the delete must not overtake the running write");
+  gates[0].resolve();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(started.length, 1, "no second write was started");
+  assert.deepEqual(removed, ["k"], "and the delete lands after it, so the record is gone");
+  assert.equal(saver.busy("k"), false);
+});
+
+test("a delete supersedes a snapshot that was only waiting", async () => {
+  const removed = [];
+  const { write, started, gates } = controllableWrites();
+  const saver = makeSaver(write, () => {}, (key) => {
+    removed.push(key);
+    return Promise.resolve();
+  });
+  saver.save("k", new Uint8Array(1), 10); // in flight
+  saver.save("k", new Uint8Array(1), 20); // queued — taken before the clear
+  saver.remove("k");
+  gates[0].resolve();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(
+    started.map((s) => s.endOffset),
+    [10],
+    "the pre-clear snapshot must not be written after the clear",
+  );
+  assert.deepEqual(removed, ["k"]);
+});
+
+// The other direction, which the single `pending` slot got silently wrong (the audit of
+// review 32 reproduced exactly this against the real module: the log was [write, write]
+// and the delete never ran). It is HISTC-2 through a narrower window — the operator's
+// clear is queued behind a large in-flight snapshot, then a `pagehide`/`visibilitychange`
+// flush or the next debounce enqueues another snapshot on top of it. Losing the delete
+// there means the last *committed* record is the pre-clear scrollback.
+test("a save enqueued after a delete does not cancel the delete", async () => {
+  const removed = [];
+  const { write, started, gates } = controllableWrites();
+  const saver = makeSaver(write, () => {}, (key) => {
+    removed.push(key);
+    return Promise.resolve();
+  });
+  saver.save("k", new Uint8Array(1), 10); // in flight, inside createWritable()
+  saver.remove("k"); // the operator clicks clear
+  saver.save("k", new Uint8Array(1), 20); // a flush lands before the write finishes
+  gates[0].resolve();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(removed, ["k"], "the operator's clear must still happen");
+  assert.deepEqual(
+    started.map((s) => s.endOffset),
+    [10, 20],
+    "and the later snapshot follows it, rather than replacing it",
+  );
+  gates[1].resolve();
+});
+
+// Ordering, not just presence: every interruption point of `delete → write` leaves the
+// record absent or freshly written, never stale. `write → delete` would too, but
+// `write → write` (the defect) leaves the pre-clear record committed.
+test("a delete queued with a later save runs before it, not after", async () => {
+  const order = [];
+  const { write, gates } = controllableWrites();
+  const recording = (key, bytes, endOffset, epoch) => {
+    order.push("write");
+    return write(key, bytes, endOffset, epoch);
+  };
+  const saver = makeSaver(recording, () => {}, () => {
+    order.push("delete");
+    return Promise.resolve();
+  });
+  saver.save("k", new Uint8Array(1), 10);
+  saver.remove("k");
+  saver.save("k", new Uint8Array(1), 20);
+  gates[0].resolve();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(order, ["write", "delete", "write"]);
+  gates[1].resolve();
 });

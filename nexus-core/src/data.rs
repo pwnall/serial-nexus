@@ -19,11 +19,18 @@
 //! * **Hostward** ([`HostFanout`]) is infallible and immediate: a host-facing
 //!   endpoint broadcasts to every attached consumer, and each consuming
 //!   boundary applies its own drop policy. A slow consumer costs only itself.
-//!   Shipped as `nexus-daemon`'s endpoint-keyed `runtime::Wiring::host_sinks`
-//!   (a `Vec<HostwardSink>` per host-facing endpoint) — a lossy `try_send` per
-//!   sink with `runtime::DropCounters` doing what [`MockConsumer`]'s
-//!   capacity-and-counter does here — driven from each node's hostward loop in
-//!   `nodes/{serial,pty,log,codec,exec,leg,map}.rs`.
+//!   Shipped as `nexus-daemon`'s endpoint-keyed `runtime::Wiring::host_fanout`
+//!   (a `HashMap<EndpointAddr, SharedFanOut>`, where `SharedFanOut` is an
+//!   `Arc<FanOutList>` over a `Mutex<Vec<AttachedSink>>`), whose broadcast is the
+//!   single `runtime::fan_out` helper — a lossy `try_send` per sink with
+//!   `runtime::DropCounters` doing what [`MockConsumer`]'s capacity-and-counter
+//!   does here. Every producing node calls it through `FanOutList::broadcast`
+//!   (`nodes/{serial,codec,exec,leg,map}.rs`; `pty` and `log` only *consume*
+//!   hostward bytes). Two properties of the shipped shape this model deliberately
+//!   does not express: the list is behind a mutex because the serial reader
+//!   broadcasts from a dedicated blocking thread (invariant 2), and it is mutated
+//!   live by `connect`/`disconnect` rather than rebuilt, so a producer never
+//!   restarts to gain or lose a consumer (invariant 14).
 //! * **Targetward** ([`Origin`], [`TargetwardSink`]) returns [`Delivery`] and
 //!   never blocks: `Busy` propagates back to the origin, which pauses (the
 //!   kernel buffers on the client side; nothing is dropped). Shipped as

@@ -33,20 +33,20 @@ use std::sync::Arc;
 
 use codec_api::{Event, EventKind, FrameDecoder};
 use nexus_core::Chunk;
-use nexus_core::config::NodeConfig;
+use nexus_core::config::{MAX_TIMER_MS, NodeConfig};
 use nexus_core::graph::{EndpointAddr, Facing};
 use nexus_core::state::{NodeState, NodeStatus};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
-use crate::boundary;
+use crate::boundary::{self, TaskSet};
 use crate::cell::CriticalCell;
+use crate::nodes::codec::UnconfiguredChannels;
 use crate::runtime::{
-    CHANNEL_CAP, DataFrame, DropCounters, READ_BUF, SharedFanOut, SharedTargetEdge, Wiring,
-    data_frames, reacquire_held,
+    CHANNEL_CAP, DataFrame, DropCounters, HostwardChannelStat, LossCounter, READ_BUF, SharedFanOut,
+    SharedTargetEdge, Wiring, data_frames, forward_targetward, route_channel_data,
 };
 use crate::tap::TapFeed;
 
@@ -63,7 +63,8 @@ struct ExecAttributes {
     /// Extra environment for the child.
     #[serde(default)]
     env: HashMap<String, String>,
-    /// Backoff before restarting a crashed child.
+    /// Backoff before restarting a crashed child. Capped at
+    /// [`nexus_core::config::MAX_TIMER_MS`] by [`parse_attributes`] (invariant 13).
     #[serde(default = "default_backoff_ms")]
     restart_backoff_ms: u64,
 }
@@ -73,11 +74,36 @@ fn default_backoff_ms() -> u64 {
 }
 
 /// Parse and validate the exec attribute table (§8/§11: structural on failure).
+///
+/// **Every numeric knob here is range-checked** (AGENTS invariant 13). Codec
+/// attributes are opaque to `GraphConfig::validate`, so this is where the exec
+/// codec's own numerics get the treatment the schema's other timers get in
+/// `config.rs` — and against the *same* [`MAX_TIMER_MS`] constant, so the two timer
+/// families cannot drift apart. This function is called from both `load`
+/// (`daemon.rs`'s `precheck_codecs`) and `add-node`, in both cases **before**
+/// anything is created and before a `--replace` teardown, so the §11 atomicity
+/// guarantee comes for free: an out-of-range value refuses the whole operation with
+/// the running graph untouched and nothing spawned.
 pub fn parse_attributes(attributes: &toml::Table) -> Result<(), String> {
     let attrs = ExecAttributes::deserialize(attributes.clone())
         .map_err(|e| format!("exec codec attributes: {e}"))?;
     if attrs.argv.is_empty() {
         return Err("exec codec attributes: argv must be non-empty".to_owned());
+    }
+    // CORE-3: this was the one millisecond timer in the schema with no cap. An
+    // operator slipping three digits (`6000000` for six seconds, or `86400000` for
+    // "a day" — the exact value the leg's `reconnect_initial_ms` cap was written
+    // against) loaded clean and then, on the one event the backoff exists for, never
+    // respawned the crashed child again for the life of the daemon, with the node
+    // reporting `faulted … retrying` throughout. The wording deliberately mirrors
+    // `ValidationError::NumericOutOfRange` so an operator meets one sentence about
+    // out-of-range numbers, not two.
+    if attrs.restart_backoff_ms > MAX_TIMER_MS {
+        return Err(format!(
+            "exec codec attributes: restart_backoff_ms = {}, above the maximum {MAX_TIMER_MS} \
+             (a numeric field is range-checked before anything is created, §11)",
+            attrs.restart_backoff_ms
+        ));
     }
     Ok(())
 }
@@ -87,6 +113,29 @@ struct ChannelStat {
     delivered_hostward: Cell<u64>,
     discarded_unattached: Cell<u64>,
     active: Cell<bool>,
+}
+
+/// The §5 hostward accounting rule, shared with the in-process codec and the leg
+/// through the one [`route_channel_data`] implementation (SIMP-1). The two codecs'
+/// `ChannelStat`s stay separate structs — the counter *names* are part of `state`'s
+/// contract — but their arithmetic is now literally the same code, so an amendment
+/// to it cannot land on one kind and miss the other while byte-identical traffic
+/// reports different numbers. `add_dropped_full` keeps its no-op default: a slow
+/// consumer's loss is charged to that consumer's own [`DropCounters`] at the
+/// boundary that dropped it.
+impl HostwardChannelStat for ChannelStat {
+    fn set_active(&self) {
+        self.active.set(true);
+    }
+
+    fn add_delivered(&self, n: u64) {
+        self.delivered_hostward
+            .set(self.delivered_hostward.get() + n);
+    }
+
+    fn unattached(&self) -> &dyn LossCounter {
+        &self.discarded_unattached
+    }
 }
 
 pub struct ExecCodecNode {
@@ -117,11 +166,15 @@ pub struct ExecCodecNode {
     /// frame bound — and counted rather than truncated in silence (§5 all-loss-counted,
     /// invariant 3 "fragment, never skip-on-error, count any residual").
     unframable_discarded: Rc<Cell<u64>>,
+    /// Channel identities the child emitted on that this node has no channel for,
+    /// bounded and named (CODEC-1). Shares the codec node's one implementation, so
+    /// the two kinds report the same loss under the same names.
+    unconfigured: Rc<CriticalCell<UnconfiguredChannels>>,
     /// Shared with the supervisor task, which flips it to faulted on a crash and
     /// back to active once a child is running. Carries the transition timestamp
     /// (§7), so a restart loop's `faulted` stamp moves with each real restart.
     status: Rc<CriticalCell<NodeState>>,
-    tasks: Vec<JoinHandle<()>>,
+    tasks: TaskSet,
 }
 
 impl ExecCodecNode {
@@ -155,8 +208,9 @@ impl ExecCodecNode {
             restart_count: Rc::new(Cell::new(0)),
             mux_discarded_targetward: Rc::new(Cell::new(0)),
             unframable_discarded: Rc::new(Cell::new(0)),
+            unconfigured: Rc::new(CriticalCell::new(UnconfiguredChannels::default())),
             status: Rc::new(CriticalCell::new(NodeState::new(NodeStatus::Active))),
-            tasks: Vec::new(),
+            tasks: TaskSet::default(),
         }
     }
 
@@ -189,7 +243,7 @@ impl ExecCodecNode {
             let discarded = self.mux_discarded_targetward.clone();
             self.tasks.push(tokio::task::spawn_local(async move {
                 while let Some(bytes) = rx.recv().await {
-                    discarded.set(discarded.get() + bytes.len() as u64);
+                    discarded.add(bytes.len() as u64);
                 }
             }));
         }
@@ -292,6 +346,7 @@ impl ExecCodecNode {
                 restart_count: self.restart_count.clone(),
                 mux_discarded_targetward: self.mux_discarded_targetward.clone(),
                 unframable_discarded: self.unframable_discarded.clone(),
+                unconfigured: self.unconfigured.clone(),
                 status: self.status.clone(),
             })));
     }
@@ -332,7 +387,7 @@ impl ExecCodecNode {
                 (ch.clone(), obj)
             })
             .collect();
-        json!({
+        let mut obj = json!({
             "codec": "exec",
             "faces": self.faces.to_string(),
             "restart_count": self.restart_count.get(),
@@ -344,28 +399,28 @@ impl ExecCodecNode {
                 "discarded_targetward": self.mux_discarded_targetward.get(),
             },
             "channels": channels,
-        })
+        });
+        // CODEC-1's three fields, written by the one shared reporter the in-process
+        // codec uses, so the two kinds cannot name the same loss differently.
+        if let Value::Object(map) = &mut obj {
+            self.unconfigured.with(|u| u.report_into(map));
+        }
+        obj
     }
 
     /// Ask this node's tasks to stop, without waiting (§16.1, BND-1). The child
     /// process is `kill_on_drop`, so aborting the supervisor is the whole signal;
     /// the method exists so the daemon can signal every node uniformly.
+    ///
+    /// It needs no `impl Drop`: [`TaskSet`] aborts what it holds when the node value
+    /// dies, so "a node's tasks die with the node" holds by type rather than by a
+    /// hand-written copy of this body (SIMPB-10).
     pub fn signal_stop(&mut self) {
-        for t in self.tasks.drain(..) {
-            t.abort();
-        }
+        self.tasks.abort_all();
     }
 
     pub fn teardown(&mut self) {
         self.signal_stop();
-    }
-}
-
-impl Drop for ExecCodecNode {
-    fn drop(&mut self) {
-        for t in self.tasks.drain(..) {
-            t.abort();
-        }
     }
 }
 
@@ -381,6 +436,7 @@ struct SuperviseArgs {
     restart_count: Rc<Cell<u64>>,
     mux_discarded_targetward: Rc<Cell<u64>>,
     unframable_discarded: Rc<Cell<u64>>,
+    unconfigured: Rc<CriticalCell<UnconfiguredChannels>>,
     status: Rc<CriticalCell<NodeState>>,
 }
 
@@ -444,6 +500,7 @@ async fn supervise(mut a: SuperviseArgs) {
             stats: &a.stats,
             mux_discarded_targetward: &a.mux_discarded_targetward,
             unframable_discarded: &a.unframable_discarded,
+            unconfigured: &a.unconfigured,
         };
         let end = pump_child(stdin, stdout, stderr, &mut a.src_rx, &routing).await;
 
@@ -485,6 +542,8 @@ struct Routing<'a> {
     stats: &'a Rc<HashMap<String, Rc<ChannelStat>>>,
     mux_discarded_targetward: &'a Rc<Cell<u64>>,
     unframable_discarded: &'a Rc<Cell<u64>>,
+    /// Identities the child emitted on that the node has no channel for (CODEC-1).
+    unconfigured: &'a Rc<CriticalCell<UnconfiguredChannels>>,
 }
 
 /// Pump one child instance. The stdin-feeding and stdout-reading loops run as
@@ -526,8 +585,7 @@ async fn pump_child(
                     // §5 counts every lost byte rather than truncating in silence
                     // (invariant 3's third clause, RV-9).
                     DataFrame::Residual(n) => {
-                        let c = routing.unframable_discarded;
-                        c.set(c.get() + n as u64);
+                        routing.unframable_discarded.add(n as u64);
                     }
                 }
             }
@@ -594,6 +652,7 @@ async fn route_event(ev: Event, routing: &Routing<'_>) {
         channel_feeds,
         stats,
         mux_discarded_targetward,
+        unconfigured,
         ..
     } = routing;
     match ev.kind {
@@ -604,6 +663,7 @@ async fn route_event(ev: Event, routing: &Routing<'_>) {
                 // `reacquire_held`-failed path used to return early, skipping the
                 // counter its sibling maintained).
                 let n = bytes.len() as u64;
+                let lost: &Cell<u64> = mux_discarded_targetward;
                 // Targetward remux output → the device, backpressured (§5). Gated on
                 // the exec codec holding the serial lock (§6).
                 // Re-read the live edge per event (§15.35), and — unlike the codec
@@ -612,64 +672,61 @@ async fn route_event(ev: Event, routing: &Routing<'_>) {
                 // stalls every *hostward* channel event queued behind it: one
                 // detached device edge would stop delivery to local consumers that
                 // have nothing to do with it. A shared pump counts; only a
-                // per-endpoint pump can afford to backpressure.
-                if let Some((tx, lock, id)) = mux_edge.origin() {
-                    // The serial endpoint went away under us (its node was removed at
-                    // runtime, or the graph was replaced): these device-bound bytes
-                    // have nowhere left to go, exactly like the no-path case below.
-                    if !reacquire_held(&lock, id).await {
-                        mux_discarded_targetward.set(mux_discarded_targetward.get() + n);
-                        return;
+                // per-endpoint pump can afford to backpressure. That policy is why
+                // only the send-and-charge *tail* below is shared with the codec and
+                // the map, never the whole pump (SIMP-2, invariant 14).
+                match mux_edge.origin() {
+                    // Both of the tail's exits — the serial endpoint went away under
+                    // us (its node was removed at runtime, or the graph was replaced)
+                    // and the targetward channel closed between the grant and the send
+                    // — are the same loss on the same counter, charged inside the
+                    // helper. CODEXEC-2 was the first of those two returning early
+                    // without charging anything.
+                    Some(origin) => {
+                        forward_targetward(&origin, n, || Some(bytes))
+                            .await
+                            .charge(lost);
                     }
-                    if tx.send(bytes).await.is_err() {
-                        // The targetward channel closed between the grant and the
-                        // send — same loss, same counter.
-                        mux_discarded_targetward.set(mux_discarded_targetward.get() + n);
-                    }
-                } else {
                     // No targetward serial path (a read-only / hostward-only mux edge):
                     // the child's device-bound bytes have nowhere to go. Count the loss
                     // so it stays located and attributable, never silently dropped (§5).
-                    mux_discarded_targetward.set(mux_discarded_targetward.get() + n);
+                    None => lost.add(n),
                 }
             } else {
                 let n = bytes.len() as u64;
-                let stat = stats.get(ev.channel.as_str());
-                if let Some(s) = stat {
-                    s.active.set(true);
-                }
-                // Mirror to this channel's tap hub for taps and the replay ring
-                // (§17), independent of whether a graph consumer is bound — and
-                // *outside* the fan-out below, so a spy never masks a real
-                // consumer's absence (§5).
-                if let Some(feed) = channel_feeds.get(ev.channel.as_str()) {
-                    feed.mirror(&bytes);
-                }
-                // The one shared hostward fan-out (§5, F1): it charges a slow
-                // consumer's full-buffer drop to that consumer, and an
-                // all-`Closed`/empty sink set to this channel's unattached counter.
-                if let Some(sinks) = channel_sinks.get(ev.channel.as_str()) {
-                    // `channel_sinks` and `stats` are both keyed by the configured
-                    // channel list, so a bound sink always has a stat; `scratch` is
-                    // the defensive arm — its count is thrown away, but the bytes
-                    // are still delivered.
-                    let scratch = Cell::new(0u64);
-                    let unattached = stat.map_or(&scratch, |s| &s.discarded_unattached);
-                    if sinks.broadcast(&bytes, unattached).live
-                        && let Some(s) = stat
-                    {
-                        s.delivered_hostward.set(s.delivered_hostward.get() + n);
-                    }
-                } else if let Some(s) = stat {
-                    s.discarded_unattached.set(s.discarded_unattached.get() + n);
-                }
+                // CODEC-1: the child emitted on an identity this node has no channel
+                // for. §8 still governs the bytes — an announcement never grows the
+                // graph, and `docs/codec-authors.md` tells authors so — but §5
+                // governs the accounting, so they are counted and the identity is
+                // named. Without the name nothing in the daemon could distinguish a
+                // mis-spelled configured channel from a device multiplexing a stream
+                // the operator never enumerated; both look like a `waiting` channel.
+                let Some(s) = stats.get(ev.channel.as_str()) else {
+                    unconfigured.with_mut(|u| u.record(ev.channel.as_str(), n));
+                    return;
+                };
+                // The one shared per-channel hostward routing block (SIMP-1), the same
+                // call the in-process codec makes: latch active, mirror to this
+                // channel's tap hub for taps and the replay ring (§17) *outside* the
+                // fan-out's accounting so a spy never masks a real consumer's absence
+                // (§5, invariant 9), then fan out to the graph sinks. A slow consumer's
+                // full-buffer drop is charged to that consumer; an all-`Closed`/empty
+                // sink set, or a channel with no fan-out at all, to this channel's
+                // unattached counter.
+                route_channel_data(
+                    &bytes,
+                    channel_feeds.get(ev.channel.as_str()),
+                    channel_sinks.get(ev.channel.as_str()),
+                    Some(&**s),
+                );
             }
         }
-        EventKind::Open => {
-            if let Some(s) = stats.get(ev.channel.as_str()) {
-                s.active.set(true);
-            }
-        }
+        EventKind::Open => match stats.get(ev.channel.as_str()) {
+            Some(s) => s.active.set(true),
+            // An announcement on an identity the operator never enumerated: no bytes
+            // to charge, but the name is the diagnosis (CODEC-1).
+            None => unconfigured.with_mut(|u| u.record(ev.channel.as_str(), 0)),
+        },
         EventKind::Close => {
             if let Some(s) = stats.get(ev.channel.as_str()) {
                 s.active.set(false);
@@ -694,6 +751,7 @@ mod tests {
         stats: Rc<HashMap<String, Rc<ChannelStat>>>,
         mux_discarded: Rc<Cell<u64>>,
         unframable: Rc<Cell<u64>>,
+        unconfigured: Rc<CriticalCell<UnconfiguredChannels>>,
     }
 
     impl Fixture {
@@ -707,6 +765,7 @@ mod tests {
                 stats: Rc::new(HashMap::new()),
                 mux_discarded: Rc::new(Cell::new(0)),
                 unframable: Rc::new(Cell::new(0)),
+                unconfigured: Rc::new(CriticalCell::new(UnconfiguredChannels::default())),
             }
         }
 
@@ -718,6 +777,7 @@ mod tests {
                 stats: &self.stats,
                 mux_discarded_targetward: &self.mux_discarded,
                 unframable_discarded: &self.unframable,
+                unconfigured: &self.unconfigured,
             }
         }
     }
@@ -820,5 +880,119 @@ mod tests {
         assert_eq!(stat.discarded_unattached.get(), 0);
         let got = rx.try_recv().expect("the live sink received the chunk");
         assert_eq!(got.len() as u64, n);
+    }
+
+    /// LEGD-2 (exec half): `fan_out` reports `live = true` for a sink whose bounded
+    /// buffer was **full** — deliberately, it is still a live consumer — so
+    /// crediting the whole chunk on `live` counted bytes as delivered that no
+    /// consumer ever received. Only what a sink actually took is credited, which
+    /// `fan_out` now reports as [`crate::runtime::FanOut::delivered`] rather than
+    /// leaving the caller to derive it. The *mixed* fan-out (one sink Ok, one Full),
+    /// where the first correction under-counted instead, is pinned once for all three
+    /// producers in `runtime::tests`, since the arithmetic is one function.
+    #[tokio::test]
+    async fn delivered_hostward_credits_only_what_a_full_sink_took() {
+        let mut f = Fixture::new();
+        let stat = Rc::new(ChannelStat::default());
+        f.stats = Rc::new(HashMap::from([("console".to_owned(), stat.clone())]));
+        // Depth 1, never drained: the first chunk is taken, the second finds it full.
+        let (tx, _rx) = mpsc::channel::<Chunk>(1);
+        let counters = Arc::new(DropCounters::default());
+        let fanout = crate::runtime::FanOutList::new();
+        fanout.attach(crate::runtime::AttachedSink {
+            target: "consumer".parse().expect("address parses"),
+            tx,
+            counters: counters.clone(),
+        });
+        f.sinks.insert("console".to_owned(), fanout);
+
+        route_event(
+            Event::data("console", Chunk::from_static(b"hello")),
+            &f.routing(),
+        )
+        .await;
+        route_event(
+            Event::data("console", Chunk::from_static(b"world")),
+            &f.routing(),
+        )
+        .await;
+
+        assert_eq!(counters.dropped_full(), 5, "the full sink was charged");
+        assert_eq!(
+            stat.delivered_hostward.get(),
+            5,
+            "only the chunk a consumer actually took is delivered"
+        );
+        assert_eq!(
+            stat.discarded_unattached.get(),
+            0,
+            "a full sink is live, so this is not an unattached loss"
+        );
+    }
+
+    /// CODEC-1 (exec half): a child emitting on an identity the node has no channel
+    /// for still has its bytes dropped (§8: an announcement never grows the graph),
+    /// but they are counted and the identity is **named** — the diagnosis that used
+    /// to exist nowhere, not even as a log line.
+    #[tokio::test]
+    async fn hostward_data_on_an_unconfigured_channel_is_counted_and_named() {
+        // `Fixture` configures no channels at all, so any identity is unconfigured.
+        let f = Fixture::new();
+        route_event(
+            Event::data("gps", Chunk::from_static(b"$GPGGA")),
+            &f.routing(),
+        )
+        .await;
+        route_event(Event::open("gps"), &f.routing()).await;
+        route_event(
+            Event::data("gps", Chunk::from_static(b"$GPRMC")),
+            &f.routing(),
+        )
+        .await;
+
+        f.unconfigured.with(|u| {
+            let mut obj = serde_json::Map::new();
+            u.report_into(&mut obj);
+            assert_eq!(obj["discarded_unconfigured_channel"], json!(12));
+            assert_eq!(
+                obj["unconfigured_channels"],
+                json!(["gps"]),
+                "the identity is named once, however often it appears"
+            );
+            assert_eq!(obj["unconfigured_overflow"], json!(0));
+        });
+        assert_eq!(
+            f.mux_discarded.get(),
+            0,
+            "an unconfigured hostward identity is not a targetward loss"
+        );
+    }
+
+    /// CORE-3: `restart_backoff_ms` is range-checked *structurally*, in the pure
+    /// `parse_attributes` both `load` and `add-node` run before anything is created
+    /// — so the §11 atomicity guarantee holds for free and a `--replace` cannot tear
+    /// a good graph down for a config that will be refused. Before this it was the
+    /// one millisecond timer in the schema with no cap: `86400000` ("a day", three
+    /// slipped digits) loaded clean and then never respawned a crashed child again,
+    /// with the node reporting `faulted … retrying` for the life of the daemon.
+    #[test]
+    fn restart_backoff_ms_is_range_checked_structurally() {
+        let attrs = |src: &str| -> toml::Table { src.parse().expect("test attributes parse") };
+
+        // Both ends of the range are legal (0 = respawn immediately).
+        assert!(parse_attributes(&attrs("argv = [\"/bin/true\"]\nrestart_backoff_ms = 0")).is_ok());
+        let at_max = format!("argv = [\"/bin/true\"]\nrestart_backoff_ms = {MAX_TIMER_MS}");
+        assert!(parse_attributes(&attrs(&at_max)).is_ok());
+
+        let err = parse_attributes(&attrs(
+            "argv = [\"/bin/true\"]\nrestart_backoff_ms = 86400000",
+        ))
+        .expect_err("a backoff longer than the cap is refused");
+        assert!(err.contains("restart_backoff_ms"), "names the field: {err}");
+        assert!(err.contains("86400000"), "names the value: {err}");
+        assert!(
+            err.contains(&MAX_TIMER_MS.to_string()),
+            "names the maximum, the same one the other timers use: {err}"
+        );
     }
 }

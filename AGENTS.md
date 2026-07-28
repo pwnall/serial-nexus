@@ -53,6 +53,7 @@ endpoint, raw edge defaults to `held` with steal-to-bypass). `existing-terminal`
   -D warnings` (+ the minimal-daemon clippy); `cargo deny check`. **The whole suite runs on
   macOS too** (serial-*device* tests self-skip there — §7 — and the real crossover-hardware
   test runs when a rig is attached).
+  Current figure: **630 passed / 0 failed / 4 ignored**.
 - **All planned phases 0–8 are done**, plus five post-1.0 tracks: the simplification
   track (design §16 / plan §9), the out-of-tree-codec extension track (design §15.26 /
   plan §10), the web console track (design §17 / plan §11.1–§11.6), the **v10 track**
@@ -106,22 +107,120 @@ endpoint, raw edge defaults to `held` with steal-to-bypass). `existing-terminal`
   open issue. (2) `load --replace` opened a serial node's replacement device *before*
   releasing the outgoing fd, so the daemon EBUSY'd against itself: on real hardware a
   one-second `faulted` flap during which an accepted `send` was purged rather than
-  written. `SerialNode::teardown` now releases `TIOCEXCL`; guard
+  written. `SerialNode::teardown` released `TIOCEXCL` — which was one of several paths that let a
+  port go, so review 32 moved the release into the port itself (invariant 15); guard
   `p11_replace_atomicity.rs`, fail-first proved. (3) The same collision is *permanent* on
   any pty-backed serial device (see §8). Suite is 485 passed / 0 failed / 4 ignored.
-- **Review remediation:** two full-workspace Opus reviews exist.
+  **Review 32's browser-history cluster is remediated on top of that:** the client now *marks* a
+  replay ring that rotated past its stored scrollback (it used to splice across the hole while
+  counting it into a `history.dropped` nothing read), sweeps the OPFS records of prior daemon boots
+  rather than orphaning up to 16 MiB per console per restart, keeps the offset-space epoch **inside**
+  the history object so the key/buffer/epoch triple cannot be adopted apart, escapes storage keys
+  injectively (two legally-named consoles used to share one file and overwrite each other), and
+  cancels the debounced save before a `clear` so a snapshot taken pre-confirmation cannot re-create
+  the record. The rendered scrollback is also capped at 256 KiB of characters while the retained
+  buffer stays at `history.cap` — an unbounded `<pre>` does not merely grow, its render throughput
+  decays with the size of the pane (measured 34.9 → 14.4 KiB/s over the first 2.9 MB, against a flat
+  121–144 KiB/s bounded), so the screen is a window onto what `export` hands back, not a copy of it.
+- **Review remediation:** three full-workspace Opus reviews exist.
   `docs/historical/19-claude-opus-code-review.md` was remediated in `b9d8a50` and folded into v9.
   `docs/historical/26-claude-opus-code-review.md` (2026-07-25, 93 surviving findings, 20 refuted) was
-  **remediated this session** — the review file itself is a frozen historical record and still
-  reads "nothing is fixed yet", so **read `docs/implementation-notes.md`, not the review, for
-  what is true now**. Its §6 lists the 20 refutations, which need no action and should not be
+  remediated before the v13 track, with its ledger at
+  `docs/historical/27-review-26-remediation-ledger.md`. **Every review file in this repository is a
+  frozen record of the review as delivered** — each still reads "nothing is fixed yet", because each was
+  written before the remediation that answered it — so **read the ledger and
+  `docs/implementation-notes.md`, never the review, for what is true now**. Its §6 lists the 20 refutations, which need no action and should not be
   re-filed. Two dispositions the remediation deliberately kept rather than changed:
   `nexus_core::data` stays the executable *specification* of §5 rather than being rebased onto
   the shipped boundaries (notes §3.18 — its module doc now says so outright, so do not read a
   green property test there as coverage of the data plane), and `arbitration` stays a per-node
   attribute applied to each host-facing endpoint (notes §3.16). Notes **§3.15 was withdrawn**:
   the `flow_control` spelling was a real defect, not a justified deviation, and `xonxoff` /
-  `rtscts` are now accepted as serde aliases beside the canonical kebab-case.
+  `rtscts` are now accepted as serde aliases beside the canonical kebab-case. The third,
+  `docs/32-claude-opus-code-review.md`, gets its own bullet below.
+- **Review 32 remediation (2026-07-27):** `docs/32-claude-opus-code-review.md` — 87 of 99 candidate
+  findings survived independent verification (**80 unique**, once the pairs two finders filed
+  independently are merged), 10 were refuted — is remediated, and the per-finding record is
+  `docs/33-review-32-remediation-ledger.md`. As with review 26 the review file is a **frozen**
+  historical record that still reads as though nothing is fixed, so read the ledger for what is true
+  now; the review's §6 tabulates the refutations, which need no action and should not be re-filed.
+  The suite went **485 → 630 passed / 0 failed / 4 ignored**, and the guards are the `p12_*` family
+  (fifteen files under `nexus-itest/tests/`, one per defect area — the `p9_*` convention, §5). Four
+  clusters, stated as what a future session must not undo. (1) **The resolver's two §12 directions
+  read one source:** `Resolver::sysfs_usb_devices` lists `<sys_root>/class/tty` and *both* capture
+  and resolution go through it, with `/dev/serial/by-id` kept as a fast path **over** it rather than
+  as the only source — a `usb:` identity minted where `/sys` exists and udev's serial links do not (a
+  container handed `--device=/dev/ttyUSB0`, an image without `60-serial.rules`) resolved back to
+  nothing while `add-node` reported success and the node waited forever for a device that was right
+  there. Ambiguity is counted over **devices**, never over by-id entries — udev derives the link name
+  from the very fields that make an identity ambiguous, so two clones sharing a serial number collide
+  on one link and a link count could never exceed 1 — and `capture_from_path` canonicalizes a
+  symlinked `/dev` path before deriving the device name, so the most canonical input an operator has
+  stops degrading to `raw:<link name>` under a "not stable across reboots" warning that is precisely
+  backwards for a by-id path. (2) **`TIOCEXCL` is owned by the port, not by one exit path** —
+  invariant 15, which is where the reasoning lives. (3) **A parked waiting verb no longer starves its
+  own connection (`CTRLW-1`):** `serve_connection`'s `select!` carries the in-flight verb as a lane
+  instead of awaiting it inline, so that connection's `tap.data` and `subscribe` keep being delivered
+  for the whole wait — `subscribe` traffic was merely late, but tap bytes were really *lost* — and
+  `send`'s `timeout_ms` now bounds the **whole** operation, the acquire *and* the targetward write,
+  so a backpressured endpoint cannot hold the write lock past the deadline the operator asked for.
+  (4) **The §5 accounting holes are closed at four boundaries:** a log node whose writer has stopped
+  (a fatal write under `overflow = "fault"`, a failed rotation) counts every byte handed to it
+  afterwards in `dropped_bytes` instead of parking it in a `queued_bytes` nothing will ever drain; a
+  `Codec::demux` refusal **faults** the node and shows up as `demux_errors` / `last_demux_error` /
+  `multiplexed.discarded_hostward` rather than only in the log, so §7.5's sanctioned never-resync
+  policy is visible in `state`; data decoded onto a channel identity the node is not configured for
+  is still dropped (§8 — an announcement never grows the graph) but is counted as
+  `discarded_unconfigured_channel`, with the identities named in a bounded `unconfigured_channels`
+  list and the occurrences past its 256-entry cap in `unconfigured_overflow`; and a `leg` counts what
+  an upstream producer shed at a `faces = "target"` channel's intake (`dropped_slow_consumer`) and
+  the untransmitted tail its write half had already taken off the bounded receiver when the peer went
+  away (`discarded_peer_gone`), with `delivered_hostward` no longer inflated by the bytes a full sink
+  refused. Beside the four: the **browser-history cluster** (see the v13 bullet above); **three gates
+  that could not fail** now can — the `TIOCEXCL` guard whose only assertion (`pass == false`) was
+  equally satisfied by the daemon's own reader eating the echo, the licence gate that took *any*
+  non-zero `cargo deny` exit (including a `cargo metadata` fetch failure on an offline runner) as
+  proof the ban list fired, and the browser suite's spec-count floor, which sat at the *device-free*
+  spec count and so let every device-bearing spec above it vanish in silence — each now asserting the
+  **reason** rather than the outcome; and **`serialnexusweb --tls` treats its cert and key as one
+  atomic pair**: both present is a load, *neither* present generates the lab self-signed pair, and a
+  **half-present pair is refused at startup**, naming the file that exists and the one that does not.
+  Do not "simplify" that back to `cert.exists() && key.exists()`: generating writes both paths, so a
+  half-present pair used to truncate the operator's private key — unrecoverable, and the ordinary CA
+  workflow of installing a key first walks straight into it — while the server came up green and the
+  single log line named only the cert. Presence is decided with `symlink_metadata`, not `exists()` (a
+  dangling planted symlink is *present*), and both files go through `create_new(true)`, with the key
+  additionally narrowed to 0600 by an explicit `set_permissions` because `OpenOptions::mode()`
+  applies only at creation. Guards: `serialnexusweb/src/tls.rs`'s unit tests and
+  `nexus-itest/tests/p12_web_tls.rs`. Two apparatus contracts tightened alongside: a `nexus-sim
+  client --recv/--drain` verdict now carries `timed_out`, and a run the wall clock ended never
+  reports `pass: true` (a `--drain` that expired mid-stream used to exit 0 with the checksum of a
+  truncated stream — verdict JSON byte-identical to a peer that genuinely lost bytes); and every
+  write `exec-conformance` makes to the child is bounded by a five-second *idle* deadline, so a codec
+  that stops reading its stdin fails that one check with `child did not drain stdin within 5000 ms`
+  instead of parking the whole battery in `anon_pipe_write` forever with no verdict line and no exit.
+- **The remediation was then audited, and the audit found regressions the remediation itself had
+  introduced (2026-07-27).** Six agents got the review and a *frozen* tree, never the implementers'
+  reports (§9), and were asked to refute "this is fixed". The per-finding verdicts, the five
+  regressions, and the one suite failure that turned out not to be ours are in
+  `docs/33-review-32-remediation-ledger.md` — read them there rather than re-deriving them. Three of
+  its outcomes are settled rules now rather than history: **break** joined `TIOCEXCL` as a claim the
+  *port* owns (invariant 15); the pty reader's **held payload** got the three rules that keep it from
+  becoming a hiding place (invariant 16); and `serialnexusweb`'s pre-auth cap is enforced by
+  **eviction**, never by refusing an accept (invariant 11). Two further outcomes change what `state`
+  shows, so an operator meeting them recognises them. A pty now reports
+  **`discarded_at_last_close`** — device bytes the kernel still held for a client
+  that never read them, discarded when that client detaches so the next session starts on an empty
+  pair. §7.2's last-close reset had only ever settled how the *next* session's bytes are framed,
+  never *which* bytes it sees, so a fresh `picocom` opened onto the previous operator's scrollback,
+  and nothing counted the discard when the pair was finally reused — `state` read
+  `discarded_no_client: 0` on a boundary shedding kilobytes (guard
+  `p12_pty_setup::a_fresh_console_session_does_not_inherit_the_previous_sessions_bytes`). And a
+  console's *un-delivered* backlog, drained when its client detaches, is charged to §6's per-origin
+  **`purged`** rather than to `discarded_targetward`: the latter stays reserved for bytes an endpoint
+  that went away could never take, which is loss, while these were discarded on purpose at the moment
+  the write floor settled. A reader watching a pty's `discarded_targetward` for detach-time backlog
+  will now always see 0.
 - **Configurations that used to load and now do not** (all refused *structurally*, before
   anything is created and before a `--replace` teardown): an unknown key anywhere outside a
   codec's opaque `attributes` table (`deny_unknown_fields`); a numeric field out of range
@@ -133,6 +232,41 @@ endpoint, raw edge defaults to `held` with steal-to-bypass). `existing-terminal`
   **Since v12 these are not load-only:** `connect` validates the candidate graph with the
   same `GraphConfig::validate` call, so an illegal edge added to a *running* graph is
   refused by the same rule with the same message and nothing changed.
+  **Review 32 added two numbers to the list** (invariant 13 applied where it had not been): a pty
+  `mode` outside `0o600 ..= 0o777` — the ceiling because a permission mode is nine bits, which is
+  what rejects every three-digit *decimal* spelling of an octal one (`mode = 666` is 0o1232, owner
+  `-w-`, and used to load and then fault the node with an EACCES that never mentioned the mode), and
+  the floor because a pty's setup chmods the slave and then opens it `O_RDWR` itself to prime the
+  session; and an exec codec's `restart_backoff_ms` above `MAX_TIMER_MS` (3600000), checked in
+  `exec::parse_attributes`, which both `load`'s codec precheck and `add-node` run before anything is
+  created — it was the one millisecond timer in the schema with no cap, so three slipped digits
+  loaded clean and then never respawned the crashed child again for the life of the daemon. Two
+  siblings outside the graph refuse on the same principle: `send-break`/`pulse-dtr` reject an `ms`
+  above `Daemon::MAX_SIGNAL_MS` (60000) before the port is resolved and before any line is asserted,
+  and `serialnexusweb --tls` refuses a half-present cert/key pair at startup. **One thing that used
+  to be refused and now loads:** a codec/exec multiplexed edge whose origin endpoint is
+  `arbitration = "free-for-all"` may be `on-demand`. The rule exists because an `on-demand` origin
+  into a held-origin pump parks on its first chunk forever, and that hazard presumes a lock upstream;
+  a `free-for-all` endpoint has none, so `held` and `on-demand` are behaviourally identical there and
+  the refusal was rejecting a graph that runs. Both edge rules now consult the one
+  `endpoint_arbitrates` predicate, so the exemption cannot be applied to one and forgotten on the
+  other again (§6, review 32 `CORE-2`).
+- **Configurations that used to *bind* and now *wait*** — the sibling list, and the one behaviour
+  change here that no `load` error announces. A `device = "usb:vid:pid:SERIAL:iface"` identity that
+  **two present devices answer to** now binds nothing: `Resolver::find_usb` declines rather than
+  returning the first match, so the node stays `waiting`. It used to bind whichever clone sorted
+  first, which meant two nodes carrying that identity both drove one adapter while the other was
+  unreachable by any node (review 32 `RES-1`). §15.10's ambiguity rule binds **resolution** as well
+  as capture now, and `resolve_current_path` hands back a bare `Option<PathBuf>` — declining is the
+  only way that signature can say "this identity pins no device", and "bind and warn" would be
+  indistinguishable, at every open and every 1 Hz recheck, from binding the right one. The identity
+  is still *accepted* (§12's asymmetry: identity-form input never requires the device present, which
+  is why `dump` emits identities and cold starts work), and `add-node` echoes a `warning` naming
+  every device that answers plus the by-path fix. This reaches an **upgrader with no action on their
+  part**: a pre-remediation daemon captured and `dump`ed the ambiguous identity, so restarting the
+  fixed daemon on an existing state file is enough to reproduce it — with no `warning` anywhere,
+  because startup takes the resolution path, not the `add-node` one. The recovery is the by-path
+  identity `ports` lists for each adapter, which does pin them one each.
 - **One behaviour change to existing working configs:** `spchex` now maps picocom's
   control-byte class (DEL plus `0x00..=0x1f` except TAB/LF/CR) instead of SPACE, so a graph
   that enabled it emits different bytes — see the v11 track entry in
@@ -154,9 +288,11 @@ Cargo workspace; `fuzz/` and `examples/external-codec/` are deliberately **exclu
 | `nexus-daemon` | lib | The daemon as an **embeddable library**: `run`/`RunOptions`/`Registry` entry surface. Wires boundary nodes, the single-thread tokio data-plane runtime, the JSON-RPC control plane, the persisted state file, and the compiled-in codec registry. Largest crate; see §4 for its modules. |
 | `serialnexusd` | bin | Deliberately thin binary: parse flags, install tracing, call `nexus_daemon::run` with `Registry::with_builtins()`. All logic lives in `nexus-daemon`. |
 | `serialnexusctl` | bin | Thin JSON-RPC client CLI. Subcommands → requests over the Unix socket; renders structured replies; `--json` is a raw pass-through of the daemon `result`. |
-| `serialnexusweb` | bin | Standalone loopback HTTP+WebSocket console that is a **pure RPC client** of the daemon (the daemon gains no HTTP). Filtering JSON-RPC proxy; enforces per-session token + Host validation; **refuses graph/lifecycle verbs** (§17). Hand-rolled HTTP on tokio; `tokio-tungstenite` WS; TLS via `rustls`+`rcgen` pinned to the **ring** backend. |
+| `serialnexusweb` | bin | Standalone loopback HTTP+WebSocket console that is a **pure RPC client** of the daemon (the daemon gains no HTTP). Filtering JSON-RPC proxy; enforces per-session token + Host validation; **allowlisted verb bridge — observation + arbitration + graph editing; `load`/`teardown`/`shutdown` stay off the browser wire** (§17/§15.35, invariant 11). Hand-rolled HTTP on tokio; `tokio-tungstenite` WS; TLS via `rustls`+`rcgen` pinned to the **ring** backend (cert and key are one atomic pair — §2). Frontend assets are hand-written ES modules with **no bundler**, each served by `assets.rs` and unit-tested under `node --test` where it is pure: `history.mjs`/`saver.mjs`/`opfs.mjs` (the browser-side offset splice, the debounced writer, OPFS storage), `graph.mjs`/`editor.mjs` (the two §15.35 pages) and **`ansi.mjs`** (§17's minimal-ANSI-subset arm — a resumable state machine, because an escape sequence split across two `tap.data` notifications is the ordinary case at serial rates). |
 | `nexus-sim` | bin | Deterministic **test double** (plan §3): PTY doubles, client drivers, in-process null-modem, TCP link-outage proxy, wire/envelope/exec conformance batteries. Emits one machine-readable JSON verdict line per run. Uses the daemon's own permissive PTY/socket calls. `publish = false`. |
-| `nexus-doctor` | bin | Shipping **capability checker** (§15.17). Passive kernel probes P1 (EXTPROC/TIOCPKT), P2 (PTY POLLHUP presence), P4 (by-id resolver), **P6** (pty-master readiness after last-slave close), **P7** (evidence a collapsed session leaves), **P8** (epoll-vs-`read` on a pty master — invariant 1's premise, probed with raw epoll, *never* `AsyncFd`), **P9** (poll timeout granularity), **P10** (pty buffer depth) + opt-in real-port P3 (serial fit), P5 (rig cert) and **P11** (TIOCGICOUNT/TIOCMGET). Markdown or `--json`. **Attach its output to any bug report.** P6–P11 exist to be **diffed between kernels** — every one emits raw numbers in `--json`, and a differing kernel is `degraded` with the observation named, never `unsupported` (which `linux.jq` and `meta_gates` both gate on). |
+| `nexus-doctor` | bin | Shipping **capability checker** (§15.17). Passive kernel probes P1 (EXTPROC/TIOCPKT), P2 (PTY POLLHUP presence), P4 (device identity resolution — the
+`<sys>/class/tty` listing the resolver reads, with `/dev/serial/by-id` as a fast path *over* it, so
+the probe answers for the environments §12 handles and not only for udev's), **P6** (pty-master readiness after last-slave close), **P7** (evidence a collapsed session leaves), **P8** (epoll-vs-`read` on a pty master — invariant 1's premise, probed with raw epoll, *never* `AsyncFd`), **P9** (poll timeout granularity), **P10** (pty buffer depth) + opt-in real-port P3 (serial fit), P5 (rig cert) and **P11** (TIOCGICOUNT/TIOCMGET). Markdown or `--json`. **Attach its output to any bug report.** P6–P11 exist to be **diffed between kernels** — every one emits raw numbers in `--json`, and a differing kernel is `degraded` with the observation named, never `unsupported` (which `linux.jq` and `meta_gates` both gate on). |
 | `nexus-itest` | lib+tests | The **cross-platform integration harness** (§5), which replaced the bash `scripts/validate/**`. `src/lib.rs`: boots `serialnexusd` on a temp socket, an in-Rust JSON-RPC client (`Rpc`), a streaming `Subscription` (`subscribe`/`tap`), `nexus-sim` subprocess doubles, `serial_pair`/`serial_echo` (Linux sim) / `crossover_ports` (real HW) providers with self-skip, and `sha256_hex`. `tests/*.rs`: one file per former phase script. `publish = false`. |
 | `serialnexusweb/ui-tests` | npm | **Not a crate.** The pinned Playwright suite (design §15.37): `@playwright/test` 1.62.0 + lockfile, Chromium only, dev-time only, nothing ships. Run *only* through `cargo test -p nexus-itest --test p8_web_ui`, which boots the fixture and passes the bootstrap URL; running `npx playwright test` by hand fails loudly by design. |
 
@@ -167,7 +303,7 @@ Dependency direction: `nexus-daemon` → {`nexus-core`, `nexus-rpc`, `nexus-sys`
 ### Key files inside `nexus-daemon/src/`
 - `lib.rs` — public API (`run`/`RunOptions`/`Registry`); socket + state-file path policy; startup load.
 - `daemon.rs` — graph state + all RPC verb impls; the two-lane control plane (§15.20). Largest file.
-- `control.rs` — JSON-RPC 2.0 over NDJSON on the Unix socket; one task per connection; cancel-safe waiting.
+- `control.rs` — JSON-RPC 2.0 over NDJSON on the Unix socket; one task per connection; cancel-safe waiting. Its `select!` has four **`biased`** lanes — the in-flight verb, the request half, the `subscribe` broadcast, the tap channel — and the order is load-bearing: a waiting verb is an *arm*, never an inline `.await`, so it cannot black out its own connection's notification lanes (§2, CTRLW-1).
 - `runtime.rs` — data-plane runtime: endpoint-keyed mpsc wiring, `poll(2)` readiness, the shared **`frame_ranges`/`frame_payload_cap`/`data_frames`** targetward-fragmentation helpers (§5/§15.19/§15.27, invariant 3) and the shared hostward **`fan_out`** (invariant 9).
 - `boundary.rs` — shared boundary-supervisor primitives (park / race3 / `BlockingReader` / `Backoff`), property-tested (§16.1).
 - `cell.rs` — `CriticalCell`, the `RefCell` wrapper that makes "a borrow never crosses `.await`" a compile-shape fact (§16.2).
@@ -203,9 +339,15 @@ cargo clippy -p serialnexusd -p nexus-daemon --no-default-features --locked -- -
 # the real macOS gate is `cargo test --workspace` on a Mac runner:
 cargo check --target x86_64-apple-darwin --workspace --exclude serialnexusweb
 # Licensing gate (permissive-only), proven not assumed. The second command is the folded
-# gate that plants a banned crate and asserts cargo-deny rejects it (self-skips without it):
+# gate that plants a banned crate and asserts cargo-deny rejects it *by name*
+# (`error[banned]`). It has TWO preconditions and self-skips on either: cargo-deny absent,
+# and a runner that cannot resolve the banned crate from the index (an air-gapped or
+# throttled box — probed with `cargo metadata`, not by reading cargo-deny's prose).
+# `SNX_LICENSE_GATE=required` turns either skip into a failure, the `SNX_WEB_UI` shape
+# below — set it wherever the runner is expected to provide both.
 cargo deny check licenses bans sources
 cargo test -p nexus-itest --test p0_license_gate --locked
+SNX_LICENSE_GATE=required cargo test -p nexus-itest --test p0_license_gate --locked
 # The browser suite (design §15.37). Self-skips without node or the pinned Chromium;
 # the CI job sets SNX_WEB_UI=required so a skip there is a failure. First-time setup:
 #   (cd serialnexusweb/ui-tests && npm ci && npx playwright install --with-deps chromium)
@@ -239,10 +381,23 @@ module doc naming the finding IDs it pins and the reviewer's live reproduction i
 **Put a new review-driven guard there** rather than in a `p0`–`p8` file. A *feature* track
 gets its own family instead, so the two never blur: the v12 graph-editing track is `p10_*`
 (`p10_ports.rs`, `p10_edge_surgery.rs`) and the v13 browser-UI track is `p11_*`
-(`p11_replace_atomicity.rs`) plus the gate `p8_web_ui.rs`. The web console is the one deliberate exception —
+(`p11_replace_atomicity.rs`) plus the gate `p8_web_ui.rs`. **`p12_*` is review 32's family** —
+fifteen files on the same one-file-per-defect-area rule, each module doc naming the finding IDs it
+pins. One of them is not a regression guard for a defect at all: `p12_sim_idle_cpu.rs` asserts a
+`nexus-sim` double's **idle CPU**, which design §15.36's Decision and plan §3 rule 2 both required in
+so many words ("pause rather than spin, and get their idle CPU asserted") and nothing implemented —
+so the `NO_SLAVE_PAUSE` fix for a measured 74.4%-of-a-core busy spin could have been deleted in
+silence, its only symptom renewed flakiness in unrelated tests. It primes each double's pts first (a
+*never*-opened master does not HUP, so a test that skips that step measures nothing) and it must keep
+its probe-relay assertion: a double that *exited* on the hangup burns zero CPU and would pass a
+budget alone. The web console is the one deliberate exception —
 its §15.35 graph/editor tests went into `p8_web.rs`, because that file already carries
 several hundred lines of web-server harness (`WebServer`, a raw RFC 6455 client,
 `wsclient_rpc`) and a fourth copy of it would cost more than a slightly over-full file.
+Review 32 added a second exception for the opposite reason: `WIRER-3`'s guard is
+`p6_fragmentation.rs`, in the *leg* family, because §15.24 has promised a leg guard by number since
+v6 ("a 100 001-byte `send` round-trip as its regression guard") and never had one — the file
+completes the family §15.24 names rather than parking a leg round-trip inside `p12_*`.
 
 **A test must not assert byte-exactness at a boundary the design makes lossy.** A `pty` node's
 hostward path is a bounded bridge whose overflow is **dropped and counted** (`pty.rs`'s
@@ -257,6 +412,19 @@ backpressures upstream and the pty's own depth is the only buffer in the path. T
 must not be "fixed": a node whose **loss is the subject** (a deliberately slow tap) keeps its
 default — deepening it silently guts the test.
 
+**A test that measures recovery after a leg outage must start from a known-quiet console.** A
+reconnect releases *two* backlogs and purges only one. Purge-on-reconnect is §6's one sanctioned
+**targetward** drain and `leg.rs` gates it on `faces == Facing::Host`; the outage-era **hostward**
+backlog is untouched, crosses the restored link, and is written into whatever console is attached —
+specified behaviour (§5/§7.4), not a defect, and not something to "fix" in the product. `p6_outage`
+step 7 used to attach its round-trip client inside that ~20–30 ms window and read the flood as its
+own echo (~1 failure in 10 unloaded runs). Gate on observables, never a sleep, and use two of them:
+drain the console to quiet — only a reader can clear bytes already sitting in the pts buffer, no RPC
+counter can see those — *and* require the receiving daemon's hostward accounting to stop moving,
+which catches the converse case of a drain that finished before the flood ever started arriving.
+**The generalisable half is in §8: when a flake is *suppressed* by CPU load rather than caused by it,
+a green loaded re-run is evidence of nothing.**
+
 **Iron conventions — follow them when adding tests:**
 - **Assert on structured RPC results / byte-exact SHA-256, never CLI text.** Drive the
   daemon via the in-Rust `Rpc` client (`d.rpc().call(method, json!({…}))` and helpers
@@ -270,6 +438,23 @@ default — deepening it silently guts the test.
   dedicated `serial_hardware.rs` test via `crossover_ports()` — it reads through the
   daemon's own fast, lossless reader (a flow-control-less UART drops bytes under a raw
   high-volume read, so *that* is where hardware byte-exactness is asserted).
+- **A guard must be able to fail on the device it runs on.** A pts has no `break_ctl` —
+  `TIOCSBRK`/`TIOCCBRK` succeed on it and change nothing observable — and `nexus-sim`'s null modem is
+  a byte-copy loop that models no line condition at all, so *any* line-state assertion over
+  `serial_echo()`/`serial_pair()` is vacuous — and reads to the next session as proof. That is how
+  review 32's `SERX-2` remediation shipped a **permanently** stuck break past a green suite: its unit
+  guard installed the successor on a second, different pts, which removes the shared-tty condition
+  that is the entire mechanism, and measured fds where the defect was a line state. Line-state claims
+  belong in a `crossover_ports()`-gated test that self-skips without a rig
+  (`p12_serial_exclusivity::a_break_straddled_by_a_replace_leaves_the_line_transmitting`), and say in
+  the doc which device the claim needs rather than implying a proof.
+- **A sim verdict distinguishes a *short* stream from a *long* one; say which you mean.**
+  `nexus-sim`'s `client` and `pty --sink` verdicts carry `timed_out` — the wall clock ended the run,
+  which a `--drain` that expired mid-stream used to render as `pass: true` over the checksum of a
+  truncated stream, byte-identical to a peer that genuinely lost bytes — and `overshoot`, bytes that
+  arrived *beyond* the budget, i.e. contamination. `pass` now requires `overshoot == 0` beside the
+  checksum. A test pinning "nothing foreign reached this console" asserts `overshoot == 0`; one
+  pinning "nothing was lost" checks `timed_out` before believing a short count.
 - **Meta-gates are proven, not assumed.** `tests/meta_gates.rs` scans the tree and asserts
   `unsafe` is confined to `nexus-sys/`, that the `RefCell` ban covers every crate holding
   daemon state (invariant 5), and that no `AsyncFd` appears in code anywhere (invariant 1); it
@@ -279,9 +464,25 @@ default — deepening it silently guts the test.
   gate whose detector silently stopped detecting is precisely the failure invariant 5 suffered.
   The licensing gate is
   `tests/p0_license_gate.rs` (folded from bash in v10 §16.11): it plants a banned crate and
-  asserts cargo-deny rejects it, self-skipping where cargo-deny is absent. `p8_external_codec.rs`
+  asserts cargo-deny rejects it, under the three-outcome discipline the next bullet
+  describes. `p8_external_codec.rs`
   builds the out-of-tree template from a consumer's position, and `p8_web_history.rs` runs
   the browser history module's `node --test` (self-skip without node). **No bash remains.**
+- **A gate whose precondition can fail needs three outcomes, not two** — pass, fail, and *could not
+  evaluate* — and it must answer the third with its own mechanism rather than by matching a tool's
+  prose. `p0_license_gate` is the worked example on both counts: it asserts cargo-deny's
+  `error[banned]` diagnostic, because taking *any* non-zero exit as proof of a ban made a
+  `cargo metadata` fetch failure pass the gate; and it decides evaluability with its own
+  `cargo metadata` probe on the scratch crate, so an air-gapped or index-throttled runner **skips**
+  rather than reporting that this tree has grown a banned dependency. Both skips honour
+  `SNX_LICENSE_GATE=required` (§4) — the `SNX_WEB_UI` shape, optional on a laptop and mandatory
+  wherever the runner is provisioned to answer.
+- **`nexus-doctor` is a test *precondition* source, not only a CI check.** `p12_sim_idle_cpu` reads
+  P2's `hup_after_close` out of `--json` and skips loudly when the kernel premise its measurement
+  rests on is gone — without it the test measures a quiet fd and passes whether or not the fix it
+  guards is present. Any test whose premise a probe already answers can do the same; the probe is
+  this tree's authority on that question (§7, `expectations/linux.jq`), and re-deriving it in the
+  harness only creates a second answer to keep in sync.
 - **The browser half runs in a real browser** (§15.37). `p8_web_ui.rs` boots a daemon, sim
   doubles and `serialnexusweb`, then hands a pinned Playwright suite the bootstrap URL. Its
   three environmental prerequisites self-skip *with the command that fixes them*, and
@@ -290,7 +491,17 @@ default — deepening it silently guts the test.
   skip silently is a gate CI passes over a hole. It also asserts a **floor on the spec
   count**, so a filter typo cannot shrink the suite quietly. Specs that cost real browser
   time are tagged `@slow` and excluded per push (`--grep-invert @slow`) — Playwright's
-  spelling of `#[ignore]` + the nightly sweep.
+  spelling of `#[ignore]` + the nightly sweep. The suite is **22 specs**, two of them `@slow`
+  (the forced tap shed and the tap grace interval, both of which are a minute of real time by
+  construction — the interval *is* the subject, so shortening it would assert a timer the product
+  does not ship). **The floor is a function of the fixture the gate built** (`SPECS_WITH_DEVICE`
+  = 20 per push, `SPECS_DEVICE_FREE` = 10) and, with a device present, the gate additionally
+  requires that **nothing skipped**. One constant used to do both jobs, sitting at the device-free
+  count — so on `ubuntu-latest`, the only platform the `web-ui` job runs on and where the echo device
+  is unconditional, any six specs could vanish under a rename or a `--grep` mistake and the gate
+  stayed green while its own message promised it would trip. A floor sees arithmetic, never coverage:
+  pair it with the skip assertion, and re-measure both numbers when you add a spec.
+  **A spec that mutates the shared graph restores it in a `finally`** — see §8.
 - **No bare sleeps.** Use `wait_until(Duration, || cond)` / `rpc.wait_status(…)` /
   `Subscription::wait_for(…)`. `Daemon`/`Sim`/`TempRun` clean up on `Drop` (kill children,
   remove the temp dir), so a panicking test never leaks a daemon or a socket.
@@ -406,7 +617,19 @@ These are settled by real bugs and benchmarks. Each cites where it lives.
    counted consumer absence (F1/DM-3). Mirror to the tap/ring **before** calling `fan_out` and
    pass it the graph sinks only: `discarded_unattached`/`discarded_no_client` accounting stays
    independent of the mirror (the ring is a spy *outside* the graph, §5) — guard
-   `active_tap_feed_does_not_hide_unattached_loss`.
+   `active_tap_feed_does_not_hide_unattached_loss`. **Delivery is reported by the helper, never
+   inferred by its caller.** `fan_out` returns `FanOut::delivered` — the bytes at least one sink
+   actually took — beside `FanOut::live`, which answers only "is anything still attached here?".
+   Crediting delivery from `live` counted bytes a full sink never received; deriving it as
+   `n - dropped_full` then under-counted, because `dropped_full` accumulates *per sink*, so a
+   `[Ok, Full]` fan-out reported `dropped_full == n` and credited **zero** delivered for a chunk a
+   live consumer had received in full (review 32 `LEGD-2`, whose first fix was the subtraction and
+   whose second is this field). With several consumers a chunk is legitimately **both** delivered and
+   discarded — the two counters measure different consumers — so "delivered + discarded partitions
+   the stream" is a single-sink property, and only the chunk *no* sink accepted is unambiguously
+   undelivered. Per-channel hostward routing credits in exactly one place,
+   `runtime::route_channel_data`; guard
+   `route_channel_data_credits_a_mixed_fan_out_to_the_consumer_that_took_it`.
 10. **`tap.data` offsets are the *delivered-bytes* space, and loss beside it is signalled, not
    folded in.** Every `ingest` both pushes to the ring and advances `ingested`, so the ring
    holds `≤ ingested` bytes by construction and `from_offset = ingested − ring.len()` cannot
@@ -419,10 +642,38 @@ These are settled by real bugs and benchmarks. Each cites where it lives.
    invisible gap. The hole is instead reported as **`gap_before`** on the first chunk drained
    after it (from the shared `feed_dropped` atomic, against the hub's `feed_dropped_seen`
    watermark), with `tap.open`'s `feed_dropped` as the client's baseline; ring-replay pieces
-   carry `gap_before: 0` because the ring is contiguous by construction. `info.instance` is a
-   per-boot nonce so a client detects the offset reset across a restart — but note it does
-   **not** rotate on a hub rebuild (`load --replace`), which is the known open issue in
-   `docs/implementation-notes.md`.
+   carry `gap_before: 0` because the ring is contiguous by construction. Review 32 sharpened three
+   clauses of that, and all three are the difference between a number an operator can add up and one
+   that double-counts or hides. The **baseline is the hub's already-charged `feed_dropped_seen`
+   watermark, not the raw atomic** (TAP-4): loss recorded since the hub's last chunk is delivered to
+   this tap as its first `gap_before`, so reporting the running counter at open counted the same
+   bytes twice and `feed_dropped + Σgap_before` overshot the endpoint's true loss. The **same counter
+   also carries the bytes an *inactive* feed never mirrored** (TAP-2) — no ring and no tap, which on
+   a `replay_ring = 0` endpoint is the whole window between one `tap.close` and the next `tap.open` —
+   because those were a third category invariant 10 has no room for: neither delivered nor signalled,
+   so a client spliced across an arbitrary hole with no `gap_before`, no counter and no epoch change.
+   Their position is *exact*, unlike an overflow's, the feed being empty by definition while nothing
+   is listening. And a **replay too large for the connection's bounded tap channel is trimmed at its
+   head, never its tail** (TAP-1), with the shortfall reported as `replay_truncated`: the newest
+   bytes are the ones delivered, so `from_offset + replay_bytes` still lands exactly on the live edge
+   and the splice stays exact. And a producer that takes `TapFeed::wanted()`'s permission to skip
+   building the `Chunk` at all must charge those bytes to **`TapFeed::skipped`**: `wanted()` and
+   `skipped()` are a pair. The one producer that takes the shortcut is `serial.rs`'s read-and-discard
+   arm (`hostward.is_empty() && !tap_wanted`), and because it never reaches `mirror`, a ring-less dark
+   window on a serial endpoint with no graph consumer landed on `discarded_unattached` and nowhere
+   else — not delivered, so correctly absent from the offset space, but not on `feed_dropped` either,
+   so absent from `gap_before` too, and a returning client spliced across the whole window with no
+   marker, no counter and no epoch change (the half of TAP-2 the first fix documented and did not
+   write). Both counters are right at once: the bytes are unattached *and* they are a gap in the
+   feed. Guard `p12_tap_replay.rs`. `info.instance` is a
+   per-boot nonce so a client detects the offset reset across a restart; it does **not** rotate
+   on a hub rebuild (`load --replace`), and it is not supposed to — **`tap.open` reports a
+   per-endpoint-hub `epoch`** for that (§15.38), unique within a process and never reused. A
+   client persists the epoch beside its stored offset and re-anchors exactly when it changes.
+   **It must not infer a reset from `from_offset < frontier`**: that is *also* what an ordinary
+   reload with a replay ring looks like, and the heuristic duplicated stored scrollback once per
+   reload until the browser suite caught it. The epoch closed the old "`instance` does not
+   rotate" open issue — do not rebuild the heuristic.
 11. **The web bridge is an allowlist, and it screens a *parsed* value and forwards that value
    re-serialized.** Both halves are settled by a reproduced bypass (review 26 WEB-1/SEC-1).
    The daemon's control socket is NDJSON, so one WebSocket frame carrying
@@ -440,6 +691,20 @@ These are settled by real bugs and benchmarks. Each cites where it lives.
    inverted list would have given away. **`load`, `teardown` and `shutdown` stay off the
    browser wire**, pinned by `bridge::the_allowlist_admits_graph_editing_and_no_lifecycle_verb`
    and end to end by `p8_web::the_editor_verbs_pass_the_bridge_and_lifecycle_verbs_still_do_not`.
+   **The console's other boundary — admission — is bounded by *eviction*, never by refusing an
+   accept.** `MAX_CONNECTIONS` (128) is taken at the **token gate**, so over the cap an
+   *authenticated* request gets a 503; the population that has not shown a cookie yet is capped
+   separately (`MAX_PRE_AUTH_CONNECTIONS`, 32) by evicting its oldest member, and registration never
+   fails. Taking that permit at `accept` instead is what the audit reproduced against the shipped
+   binary: the cookie cannot be read before the head is, so a gate closed on unauthenticated peers is
+   closed on the operator too — 32 silent sockets denied every new connection, valid session cookie
+   included, on `/app.js` and `/ws` alike, which made the lockout four times cheaper than the
+   128-socket flood it replaced. **A reserve you cannot classify into at admission time is not a
+   reserve**; the eviction form bounds how *long* an unauthenticated peer may sit rather than
+   *whether* it may connect, which leaves the newest arrival — always the operator's browser, and the
+   one with no reconnect path but a reload — the last candidate for eviction instead of the
+   structural victim. Guards: `server::the_pre_auth_population_is_a_fraction_of_the_connection_pool`
+   and `p12_web_session::a_pre_authentication_flood_cannot_deny_an_authenticated_client_a_new_connection`.
 12. **Write-mode promotion has exactly one implementation.** `GraphConfig::effective_write_mode`
    (`nexus-core/src/config.rs`) is the single source of truth for the two
    configuration-to-runtime promotions — a log target forced to `never`, and a map's `raw`
@@ -485,6 +750,90 @@ These are settled by real bugs and benchmarks. Each cites where it lives.
    forbids dropping on — a detached edge must stall its writers exactly as a steal does.
    Guards: `p10_edge_surgery.rs`, and `p9_unwired_interior.rs` still pins the read-only arm.
 
+15. **Every tty-level assertion is owned by the port, and given back at most once.** Exclusivity was
+   only the first of them. Each is a claim a serial node made on a *tty* it shares with whoever
+   opens the device next, so the node gives it back when it stops — but "when it stops" is several
+   places, and writing the release at one of them is how this was wrong twice. `ExclusivePort`
+   (`nexus-daemon/src/nodes/serial.rs`) wraps the fd with a `Cell<bool>` claim flag; `release_port`
+   is the **one ordered discard** every path takes (`teardown`, `set_waiting`, `fault`), going
+   through `SerialShared::set_port`, the single point a node's port changes; and `Drop` is the
+   backstop for the paths no successor can reach (an error inside `open_port`, a port never stored).
+   The flag is what makes the two agree: an ordered release must **not** be undone by the late `Drop`
+   of a lingering `Rc` clone, because `TIOCEXCL` is *tty* state and stripping it then strips it off
+   the **successor's** port. The failure that settled all of this is not a flap but a brick: the flag
+   clears only at the tty's last close, which a pts whose master is held open (`nexus-sim pty`, socat
+   `PTY,link=`, QEMU `-serial pty`) never reaches — so an ordinary `[node.modem] dtr = true`, which
+   is `ENOTTY` on such a device and dropped the port through `open_port`'s error arm, left every
+   unprivileged process on the machine locked out of it permanently, surviving `teardown` and daemon
+   exit, while the node's reported reason flipped from the true cause to a self-inflicted `Device or
+   resource busy` that sends the operator hunting a squatter that does not exist. The same ownership
+   settles the signal verbs: `send-break`/`pulse-dtr` hold a `SignalHandle` carrying **no** strong
+   port reference and re-check a generation through the one `with_scoped_port` predicate the verb and
+   its `RestoreGuard` share, so a signal acts on the port it was issued against and declines with
+   `node was removed while signalling` rather than following the node — reproduced on real hardware
+   as `pulse-dtr --ms 12000` flipping DTR on a `load --replace` successor's line twelve seconds
+   later, with a break half that needs no race at all because break is tty state.
+   **And that is exactly why the claim, not only the restore, has to be given back.** Scoping the
+   `RestoreGuard` alone was the regression the audit caught on the bench rig: it made the guard
+   decline once the generation moved, which removed the only `TIOCCBRK` in the tree and converted an
+   `ms`-bounded break into an unbounded one — a `send-break` straddled by `load --replace` left the
+   successor reporting `active`/`open: true`, `send` reporting bytes accepted and `driver_counters.tx`
+   climbing, with nothing on the wire, indefinitely, recoverable only by a `teardown` that destroys
+   the tty or by another `send-break`. So `ExclusivePort::release_claims` — the method the whole type
+   exists for — issues `TIOCCBRK` and *then* drops `TIOCEXCL`, in that order, so the line is
+   transmitting normally before anyone else can open it, and under the same at-most-once flag because
+   clearing a break the *successor* just asserted is the same bug in the other direction. DTR and RTS
+   are deliberately **not** released: driving them on the way out is a reset pulse on every
+   auto-reset board (§7.1), the unrequested edge this whole area exists to prevent, and unlike break
+   they self-heal — the successor's own `open(2)` re-raises DTR and `open_port` reapplies the
+   configured `[node.modem]` levels.
+   **The same ownership has a second site, and its rule is "publish before you await" (§15.38 D2).**
+   `serial.rs::reopen` adopts the reopened port into `SerialShared` *before* `purge_on_reconnect`, so
+   `release_port` can see it; the reconnect's single generation bump moved from `set_active` to
+   `adopt_port` with it, and the function re-checks the generation after the purge rather than
+   arming a reader on a port it no longer owns. The order the code does not use — open, purge, arm,
+   publish — leaves the node holding `TIOCEXCL` on a device the ordered discard cannot reach for as
+   long as the purge yields, and a `load --replace` landing there releases nothing while the aborted
+   supervisor's future holds the only `Rc<ExclusivePort>` until the `LocalSet` regains the thread: the
+   successor's `open(2)` EBUSYs against the daemon's own claim. Two consequences are accepted rather
+   than worked around, and both are more honest than the alternative: the node reports `waiting` with
+   `open: true` for the width of the purge — the daemon really does hold the device, and a third
+   party's `open(2)` already says so — and a signal verb is accepted in that window, where the
+   generation bump keeps it valid into `active` instead of orphaning it there.
+   Guards: `p12_serial_exclusivity.rs` — including
+   `a_break_straddled_by_a_replace_leaves_the_line_transmitting`, which needs a `crossover_ports()`
+   rig and self-skips without one, because a pts cannot observe a break at all (§5) — and
+   `p11_replace_atomicity.rs`.
+
+16. **A pty reader that cannot hand its chunk on *holds* it — registered on the endpoint, and never
+   across a session boundary.** The reader task's lifecycle half — the presence swap,
+   `handle_last_close` (§7.2's baseline reset, §6's detach-release and purge-on-detach) and the
+   `RECONCILE_INTERVAL` backstop — must run within a bounded time whatever the targetward channel is
+   doing, which is why it no longer sits *after* an unbounded `tx.send().await`: a console wired to a
+   serial node `waiting` for an absent device reported `client_present: true` forever after its client
+   exited and kept an on-demand write lock held by an origin that was gone (review 32 `CONC-1`). A
+   payload the endpoint cannot take is parked in `pending` instead and the master goes unread, so the
+   client backpressures through the kernel buffer — §5 forbids *dropping* targetward, not delaying it.
+   **Three rules keep that hold from becoming a hiding place, and each is a defect the first version
+   of the fix shipped** (`nexus-daemon/src/nodes/pty.rs::read_and_poll`). (1) *The hold is registered
+   on the endpoint, not on a timer.* While a payload is held the loop's one await is
+   `timeout(wait, tx.reserve())`, so the task is a producer "suspended mid-send" in the precise sense
+   §6's purge uses and `boundary::drain_to_quiescence` still reaches it. Parked on a bare `sleep` the
+   payload sat *outside* the pipeline, and the operator's pre-outage console input fired into the
+   device's boot prompt the moment it came back while `purged_on_reconnect` reported success —
+   measured at 5634 bytes on the audit's rig. (2) *A held payload never crosses a session boundary.*
+   The close block offers it once more and then purges it as §6's detach instance. The retry at the
+   top of a pass deliberately does not consult the lock, so a carried chunk would be written by an
+   origin that no longer holds the floor — after detach-release, after the next holder's
+   purge-on-acquire, into the middle of the line that holder had just queued. (3) *Lifecycle
+   observation does not depend on the data slot being empty.* The close trigger is
+   `!present_now && (was || saw_session)`; re-adding the `closed` conjunct re-opens the
+   collapsed-session leak, because it silently required the drain to *reach* EOF/EIO and the drain
+   ends early whenever the endpoint refuses a payload — a session that opened and closed inside one
+   poll gap against a saturated endpoint then leaked its lock for as long as the saturation lasted
+   (the audit measured five of five, with another origin's `send` failing on the locked endpoint
+   afterwards). Guard: `p12_pty_setup.rs`, five tests.
+
 For the deeper code-level invariants (purge-on-acquire runs synchronously at grant time;
 the exec pump polls stdin/stdout/stderr concurrently to avoid deadlock; serial
 faulted-and-wait parks receivers unread rather than draining; etc.) see
@@ -495,8 +844,13 @@ running engineering log and the authoritative "why the code looks like this" rec
 
 - **Linux is required** and is the kernel of record. **Production target is Linux 6.18;
   the dev box runs 7.0.** You can run code on 6.18 (the user can; an agent here cannot).
-  `nexus-doctor` has been confirmed **all-probes-supported on 6.18** (Debian rodete,
-  zero deltas from 7.0). **Pause and check with the user before any one-way
+  `nexus-doctor` was confirmed on 6.18 (Debian rodete, 2026-07-19) for **P1–P4 only, with zero
+  deltas from 7.0** — the probe set has since grown to eleven, and **P5–P11 have never been run
+  there.** P5 (rig discovery and certification) did not exist at that run and landed two days
+  later; P6–P11 came a week later, added precisely so that diff could be taken. So the 6.18
+  confirmation covers four of eleven probes, and in particular does *not* cover the ones whose own
+  output says "diff this block before simplifying anything" — P6 (last-close readiness) and P7
+  (collapsed-session evidence) most of all — nor the rig certification P5 performs. **Pause and check with the user before any one-way
   (hard-to-reverse) decision that depends on a kernel ability confirmed only on 7.0**, and
   keep the design's fallbacks live (the §7.2 termios reconciliation-poll backstop; P2
   slave-priming for presence). Re-gate on 6.18 with
@@ -525,7 +879,9 @@ running engineering log and the authoritative "why the code looks like this" rec
   and clears only at the tty's *last* close — which a pts whose master is held open (every
   `nexus-sim pty` double, socat `PTY,link=`, QEMU `-serial pty`) never reaches. So a
   reopen of the same pts by anyone, daemon included, is `EBUSY` forever. The daemon now
-  releases exclusivity in `SerialNode::teardown`, which repairs it; if you see a
+  releases exclusivity in `ExclusivePort`, which every discard path goes through — the ordered
+  half is `release_port` (`teardown`, `set_waiting`, `fault`), `Drop` is the backstop, and the
+  claim is given back at most once (invariant 15). That repairs it; if you see a
   permanently `faulted` serial node with `Device or resource busy` over a sim device,
   check that release before blaming the sim.
 - **serial2, not serialport.** The MPL `serialport`/`mio-serial`/`tokio-serial` stack and
@@ -554,6 +910,30 @@ running engineering log and the authoritative "why the code looks like this" rec
   "did we regress?" investigation. Killed, `p3_firehose` ran in **2.53 s** — the healthy figure
   invariant 9 records — and the suite went green. **Clean up every hog you start**, and prefer
   bounding them with `timeout`. This is a shared machine the user is working on.
+- **…but load does not only *reveal* races; it also hides them, and when it does, the advice above is
+  exactly wrong.** `p6_outage`'s step-7 flake (§5) is the counter-example that cost a round of
+  investigation: the failure needs the round-trip client to attach inside a ~20–30 ms flood window,
+  and CPU load widens client-spawn latency *past* it — so every loaded re-run came back green and not
+  one of them was evidence of anything. What settled "not ours" was a throwaway `git worktree` at the
+  pre-remediation commit reproducing the same mechanism, with hit rates on the sensitive probe
+  statistically indistinguishable (1 in 22 there, 1 in 20 here). If a hypothesis predicts that load
+  makes a failure *more* likely and the loaded runs are green, consider that you have suppressed it:
+  reproduce the window deterministically rather than turning the dial harder.
+- **A pts hands out at most 4095 bytes per read** (`N_TTY_BUF_SIZE - 1` — a property of the line
+  discipline, not a daemon or sim constant, and you will meet it again). So "exactly 2×" in a
+  pty-backed verdict is much more likely read geometry than duplication: `received: 8190` against
+  `sent: 4096` read as a doubled stream for a while and was 4095 + 4095 — a *contaminated* stream,
+  counted by an accumulator that appended whole reads past its own budget. Suspect the oracle's
+  counting rule before the data plane, and read `overshoot` (§5).
+- **A Playwright spec that mutates the shared graph must restore it in a `finally`.** The browser
+  suite's fixture is one daemon and one graph for the whole run, so a spec that leaves an edge behind
+  changes what a *later* spec measures — and the symptom is a test that fails in the suite and passes
+  in isolation, which reads as flakiness and gets chased as one. `graph-editor.spec.mjs` built a log
+  node onto the echo console and left it attached; a subsequent spec used that node's
+  `discarded_unattached` as its "did the device emit?" oracle and the counter could never move again,
+  because the bytes now had somewhere to go. The restore is one `ctl("remove-node", name,
+  "--cascade")` in a `finally` — cascade so the edge goes with the node — and it belongs there
+  whether or not the assertions above it passed.
 - **`git stash` is as destructive as `git checkout --` when the tree holds a large uncommitted
   change set**, which is the normal state mid-track here. To answer "is this failure ours?", add a
   throwaway `git worktree` at the last commit, build there, and compare — it touches nothing.
@@ -561,9 +941,17 @@ running engineering log and the authoritative "why the code looks like this" rec
 ## 9. How work has been done here (the working rhythm)
 
 - **Design/plan pairs are version-suffixed and monotonic.** The newest pair lives in
-  `docs/` (currently v12: `28-design-…-v12.md` + `29-implementation-plan-…-v12.md`);
-  superseded generations move to `docs/historical/`. `§N` always means the *current*
-  normative design. ADRs are numbered subsections under design **§15.x** (plus §16
+  `docs/` (currently **v13**: `30-design-claude-fable-v13.md` +
+  `31-implementation-plan-claude-fable-v13.md`); superseded generations move to
+  `docs/historical/`. `§N` always means the *current* normative design. **This parenthetical
+  and `README.md`'s documentation index are the two places that name the pair by filename, so
+  both must be bumped in the commit that lands a generation** — they have gone stale on three
+  consecutive generations now (review 19 DOC-5, review 26 DOC-5, review 32 DOCR-1/DOCR-5), and
+  `meta_gates` now covers both halves of that: `entry_point_doc_links_resolve` asserts every relative
+  doc *link* in `README.md` and `AGENTS.md` resolves, and `entry_point_design_and_plan_names_resolve`
+  asserts every **backticked** design/plan filename in those two files names a file that exists —
+  which is what this parenthetical is, prose rather than a link, and exactly the shape a link checker
+  could not see. ADRs are numbered subsections under design **§15.x** (plus §16
   post-completion review, §17 web console). The RPC method-by-method reference is
   `docs/rpc/` (README + one page per verb group); design §10 is its normative source.
 - **Every phase/track has ended with a multi-agent adversarial audit** (per-area finders +

@@ -38,11 +38,14 @@ struct ServeArgs {
     /// lab use; supply `--tls-cert`/`--tls-key` for a real one.
     #[arg(long)]
     tls: bool,
-    /// TLS certificate chain (PEM). Loaded if it and `--tls-key` exist; otherwise a
-    /// self-signed cert is generated and written here. Defaults to a runtime-dir path.
+    /// TLS certificate chain (PEM). The cert and key are one pair: both paths present
+    /// are loaded, NEITHER present generates a self-signed pair into them (lab use),
+    /// and a half-present pair is refused — never completed by overwriting the half
+    /// that is there. Defaults to a runtime-dir path.
     #[arg(long)]
     tls_cert: Option<PathBuf>,
-    /// TLS private key (PEM). See `--tls-cert`.
+    /// TLS private key (PEM), written 0600 when generated. See `--tls-cert` for how
+    /// the pair is treated.
     #[arg(long)]
     tls_key: Option<PathBuf>,
     /// Bind beyond loopback WITHOUT TLS — a named footgun for a network the operator

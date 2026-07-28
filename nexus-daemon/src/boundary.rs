@@ -23,6 +23,9 @@
 //!   on device loss and is joined before the supervisor transitions (fd-reuse-safe).
 //! * **back off, retry** → [`Backoff`]: the reconnect/restart backoff, reset on a
 //!   good connection.
+//! * **a node's tasks die with the node** → [`TaskSet`]: the spawned-task half of
+//!   every node's teardown, which §16.1 left per node and six modules then wrote
+//!   eleven times (SIMPB-10).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -212,6 +215,57 @@ impl BlockingReader {
     }
 }
 
+/// A node's set of spawned data-plane tasks, which **die with the node** (§16.1).
+///
+/// Every node kind kept a bare `Vec<JoinHandle<()>>` and wrote
+/// `for t in self.tasks.drain(..) { t.abort(); }` in both `signal_stop` and `Drop` —
+/// eleven copies across six modules, with four different relationships between
+/// `Drop`, `signal_stop` and `teardown` (SIMPB-10). Nothing in the type system,
+/// clippy or the suite said a node *must* have a `Drop`; it was a convention held by
+/// six copies of a loop, and the same class already bit this project once as
+/// `signal_stop`/`teardown`/`Drop` drift (BND-1). Owning the abort here makes it a
+/// type property instead: a node that forgets its `Drop` — or a *new* node kind, which
+/// is the reachable case — cannot leave `LocalSet` tasks running against `Rc` state
+/// after the node value is gone, holding an endpoint's `Rc<EdgeSlot>`/`SharedLock`
+/// alive and draining channels a torn-down node should have released.
+///
+/// This covers only the *task* half of teardown. A node with a blocking thread or a
+/// filesystem artifact still needs its own `Drop`, because the ordering there is
+/// load-bearing: the serial reader and the pty writer must be **joined after their
+/// tasks abort and before their fd drops** (§7.1 fd-reuse), and field-drop order alone
+/// would not give that.
+#[derive(Default)]
+pub struct TaskSet(Vec<tokio::task::JoinHandle<()>>);
+
+impl TaskSet {
+    /// Take ownership of one spawned task.
+    pub fn push(&mut self, handle: tokio::task::JoinHandle<()>) {
+        self.0.push(handle);
+    }
+
+    /// Abort every task and forget it — the cheap, non-blocking half of teardown
+    /// (BND-1): nothing is joined, so a caller may signal every node before paying any
+    /// node's join cost. Idempotent, because the handles are drained.
+    pub fn abort_all(&mut self) {
+        for t in self.0.drain(..) {
+            t.abort();
+        }
+    }
+
+    /// Whether any task is still held (i.e. whether this node was ever started and
+    /// has not been signalled). Used by a node whose `Drop` must decide between a
+    /// no-op and a full teardown.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Drop for TaskSet {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
+}
+
 /// Drain `rx` to quiescence, returning the bytes purged (§6 purge invariant).
 ///
 /// The bounded-rounds drain the serial node's purge-on-reconnect (§7.1) and the
@@ -395,6 +449,76 @@ mod tests {
         r.join();
         assert!(exited.load(Ordering::Relaxed), "join must wait for it");
         r.join(); // idempotent: the handle was already taken
+    }
+
+    // --- a node's tasks die with the node ---------------------------------------
+
+    /// SIMPB-10: the property that replaced six copies of an abort loop and four
+    /// relationships between `Drop` and `signal_stop`. A node value that dies without
+    /// anyone calling `signal_stop`/`teardown` — a `load --replace` rollback, a panic
+    /// unwind, a unit test that just drops its node — must not leave `LocalSet` tasks
+    /// running against the `Rc` state it held.
+    #[test]
+    fn dropping_a_task_set_aborts_the_tasks_it_holds() {
+        // A current-thread runtime + LocalSet mirrors the daemon (§5).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            // The guard's `Drop` fires when the task's *future* is dropped, which is
+            // what abort causes — so the flag is direct evidence the task was cancelled
+            // rather than merely detached.
+            struct Guard(Arc<AtomicBool>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Relaxed);
+                }
+            }
+            let alive = Arc::new(AtomicBool::new(true));
+            let guard = Guard(alive.clone());
+            let mut tasks = TaskSet::default();
+            tasks.push(tokio::task::spawn_local(async move {
+                let _guard = guard;
+                park::<()>().await;
+            }));
+            tokio::task::yield_now().await; // let it reach the park
+            assert!(alive.load(Ordering::Relaxed), "the task must be running");
+            assert!(!tasks.is_empty());
+
+            drop(tasks); // no explicit `abort_all`: the `Drop` impl must do it
+
+            for _ in 0..16 {
+                if !alive.load(Ordering::Relaxed) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !alive.load(Ordering::Relaxed),
+                "dropping the set must abort its tasks"
+            );
+        });
+    }
+
+    #[test]
+    fn abort_all_empties_the_set_and_is_idempotent() {
+        // `signal_stop` may run before `teardown` and before `Drop`, on every node, so
+        // the second and third calls must be no-ops (BND-1's two-phase teardown).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let mut tasks = TaskSet::default();
+            assert!(tasks.is_empty(), "a fresh set holds nothing");
+            tasks.push(tokio::task::spawn_local(park::<()>()));
+            assert!(!tasks.is_empty());
+            tasks.abort_all();
+            assert!(tasks.is_empty(), "abort_all drains the handles");
+            tasks.abort_all(); // idempotent
+            assert!(tasks.is_empty());
+        });
     }
 
     // --- purge drain-to-quiescence ----------------------------------------------

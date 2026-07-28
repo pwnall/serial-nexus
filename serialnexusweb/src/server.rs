@@ -15,16 +15,32 @@
 //! sanctioned non-loopback tiers (§15.29), so the pre-auth path is bounded in three
 //! dimensions too: a deadline on the head (and the TLS handshake), a cap on the head
 //! size, and a cap on in-flight connections.
+//!
+//! **The credential the browser holds is split in two** (review WEBS-1). A cookie's jar
+//! key is (name, domain, path) and never the port, so a value stored under `Path=/` is
+//! replayed to every path of every service on this host that the operator's browser
+//! contacts — and the session token is shell-equivalent, because whoever opens `/ws`
+//! can add an exec codec (`docs/security.md`). So the token cookie is scoped
+//! `Path=/ws`, the one path a browser needs it on, and a second, freshly minted
+//! *asset credential* (`nexus_assets_<port>`, `Path=/`) carries the static assets.
+//! What a sibling-port service harvests from an ordinary navigation now authorizes
+//! reading this console's own JavaScript and nothing else. The residual is stated
+//! rather than implied: a page *served from* a sibling port is same-*site*, so it can
+//! still fetch its own `/ws` with credentials and log what the browser attaches. Path
+//! scoping narrows the auto-replay from every request to one path; ending it entirely
+//! would mean taking the token out of cookies altogether, which no browser can do for
+//! the navigations and subresource loads that must also be gated.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, oneshot};
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
@@ -51,14 +67,155 @@ pub const MAX_HEAD: usize = 16 * 1024;
 /// the handshake. Without it, a peer that connects and sends nothing pins a task and
 /// an fd forever — reachable by unauthenticated peers in the sanctioned `--tls` and
 /// `--insecure-bind` tiers (§15.29), since both bounds are pre-authentication.
-const HEAD_TIMEOUT: Duration = Duration::from_secs(15);
+///
+/// Five seconds, not the fifteen it was (review WEB-5): a complete request head is one
+/// round trip on a link the operator already reached, so the only thing the extra ten
+/// seconds bought was a longer hold time for a peer that sends one byte and waits. It is
+/// how long a peer that is *not* evicted may sit in the pre-auth population, so it is
+/// also the ceiling on how long a stalled peer keeps a slot the operator might want. The
+/// slack that remains is for the TLS handshake, which shares this deadline and costs a
+/// couple of round trips.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// In-flight connections served at once. A browser tab costs a handful (HTTP/1.1
-/// `Connection: close` assets plus one long-lived WebSocket), so this leaves ample
-/// headroom for a lab's tabs while bounding the fds and tasks an unauthenticated peer
-/// can pin. Over the cap the newest connection is dropped, not queued: a queue would
-/// just move the exhaustion.
+/// Connections **past the token gate** served at once. A browser tab costs a handful
+/// (HTTP/1.1 `Connection: close` assets plus one long-lived WebSocket), so this leaves
+/// ample headroom for a lab's tabs while bounding the fds and tasks one credential can
+/// pin. Over the cap a request is answered `503`, not queued: a queue would just move
+/// the exhaustion.
+///
+/// The permit is taken **at the token gate and not at accept** (review WEB-5): a peer
+/// that has shown no credential must not be able to occupy a slot the operator needs,
+/// and the only moment we can tell the two apart is after the head is read. What bounds
+/// the population *before* that moment is [`MAX_PRE_AUTH_CONNECTIONS`], and it bounds it
+/// by eviction rather than by refusal.
 const MAX_CONNECTIONS: usize = 128;
+
+/// How many connections may sit *before* the token gate at once (review WEB-5).
+///
+/// **This cap is enforced by eviction, never by refusing an accept**, and that
+/// distinction is the whole finding. The first attempt at the reserve was a second
+/// semaphore acquired in the accept loop, which made the denial four times cheaper
+/// instead of closing it: the cookie cannot be known before the head is read, so a full
+/// pre-auth pool refused *every* new connection — including the operator's, carrying a
+/// valid session cookie. Measured against the shipped binary, 32 silent sockets reset
+/// every subsequent connection on `/app.js` and `/ws` alike, where the single pool had
+/// cost 128.
+///
+/// So: every accepted connection joins the pre-auth population immediately and
+/// unconditionally; when that pushes the population over this cap, the **oldest** member
+/// is evicted — its task cancelled, its socket closed — and the newcomer takes its place.
+/// A silent peer can therefore no longer deny anyone; it can only be the thing that gets
+/// evicted. The operator's browser is always the newest arrival, which is the last
+/// candidate for eviction, and it leaves the population entirely the moment its cookie is
+/// read a round trip later. To make the console so much as retry, a flood would have to
+/// turn this whole pool over inside that round trip — tens of thousands of connections
+/// per second on loopback, against 6.4/s for the semaphore it replaces.
+///
+/// The residual, stated: an evicted connection's socket closes when its task is next
+/// polled, so a burst can leave evicted-but-unreaped tasks briefly alive. tokio's
+/// cooperative budget forces the accept loop to yield, which bounds that backlog at the
+/// same order as the old total cap, and every one of those tasks is on its way out rather
+/// than holding a slot for [`HEAD_TIMEOUT`].
+///
+/// A per-peer-IP cap was considered and deliberately not added: on the loopback
+/// default every local user — the adversary §15.28 names — shares 127.0.0.1 with the
+/// operator, so a per-IP bound would ration the operator's own browser without
+/// separating it from the attacker.
+const MAX_PRE_AUTH_CONNECTIONS: usize = 32;
+
+/// The connections that have not yet shown a credential.
+///
+/// Registration never fails — see [`MAX_PRE_AUTH_CONNECTIONS`]. `live` is in arrival
+/// order, so its front is the connection that has had the longest to deliver a request
+/// head and has therefore earned its eviction; a ticket deregisters by id, never by
+/// position, because the pool is reordered under it by every eviction.
+struct PreAuthPool {
+    inner: Mutex<PreAuthInner>,
+}
+
+#[derive(Default)]
+struct PreAuthInner {
+    next_id: u64,
+    live: VecDeque<(u64, oneshot::Sender<()>)>,
+}
+
+impl PreAuthPool {
+    fn new() -> Arc<PreAuthPool> {
+        Arc::new(PreAuthPool {
+            inner: Mutex::new(PreAuthInner::default()),
+        })
+    }
+
+    /// Register a freshly accepted connection, evicting the oldest members until the
+    /// population fits. Returns the connection's membership ticket and the signal that
+    /// fires if *this* connection is later the one evicted.
+    ///
+    /// Called synchronously from the accept loop, so the population is back within its
+    /// cap before the next `accept()` — no burst can register more than the cap at once.
+    fn admit(self: &Arc<Self>) -> (PreAuthTicket, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let id = inner.next_id;
+        inner.next_id = inner.next_id.wrapping_add(1);
+        inner.live.push_back((id, tx));
+        while inner.live.len() > MAX_PRE_AUTH_CONNECTIONS {
+            if let Some((_, victim)) = inner.live.pop_front() {
+                // `Err` only means the victim's task already ended — nothing to cancel.
+                let _ = victim.send(());
+            }
+        }
+        drop(inner);
+        (
+            PreAuthTicket {
+                pool: self.clone(),
+                id,
+            },
+            rx,
+        )
+    }
+
+    /// Remove `id` from the population, if it is still in it (an evicted connection was
+    /// removed at eviction time and this is then a no-op).
+    fn leave(&self, id: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.live.retain(|(other, _)| *other != id);
+    }
+
+    #[cfg(test)]
+    fn live(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .live
+            .len()
+    }
+}
+
+/// A connection's membership in the pre-authentication population. Dropping it — at the
+/// token gate, or when the connection ends for any other reason — leaves the pool, which
+/// both frees the slot and makes the connection un-evictable.
+struct PreAuthTicket {
+    pool: Arc<PreAuthPool>,
+    id: u64,
+}
+
+impl Drop for PreAuthTicket {
+    fn drop(&mut self) {
+        self.pool.leave(self.id);
+    }
+}
+
+/// Resolves when this connection is **evicted**, and never otherwise.
+///
+/// A dropped sender — the ticket leaving the pool at the token gate, or the connection
+/// simply ending — parks forever instead of resolving. That asymmetry is load-bearing:
+/// the caller races this future against the connection itself, so one that fired on
+/// ticket drop would cancel the session one instruction after it authenticated.
+async fn evicted(signal: oneshot::Receiver<()>) {
+    if signal.await.is_err() {
+        std::future::pending::<()>().await
+    }
+}
 
 /// Post-handshake WebSocket frame limits. The browser→server direction carries
 /// JSON-RPC requests only — `send` lines and tap control — so a cap far below
@@ -100,11 +257,24 @@ pub async fn run(
     // Whether *we* terminate TLS, which decides the cookie's `Secure` attribute and
     // the default port an Origin is compared against (§15.29 tier 2).
     let secure = tls.is_some();
+    // The cookie name is the listener's, not a fixed one (review WEB-3): cookies are
+    // keyed by (name, domain, path) and never by port, so a fixed name makes two
+    // consoles on one host evict each other's session.
+    let port = bound.port();
+    // The asset-only credential the browser carries under `Path=/` (review WEBS-1).
+    // Minted fresh per run from the OS CSPRNG and unrelated to the token by
+    // construction — *not* derived from it, so nothing about a hash has to be trusted
+    // to keep the token unrecoverable from the value that does get replayed everywhere.
+    let assets: Arc<str> = Arc::from(new_asset_credential());
     let config = Arc::new(config);
     let acceptor = tls.map(TlsAcceptor::from);
-    // Bound in-flight connections; the permit is held for the whole connection, WS
-    // bridge included, and released on drop however the task ends.
+    // Bound the connections that have shown a credential; the permit is taken at the
+    // token gate, held for the rest of the connection (WS bridge included), and released
+    // on drop however the task ends.
     let conns = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    // …and, separately, the population that has *not* shown one yet, bounded by evicting
+    // its oldest member rather than by refusing the newest arrival (review WEB-5).
+    let pre_auth = PreAuthPool::new();
     tracing::info!("web console listening on {scheme}://{bound}");
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -114,36 +284,52 @@ pub async fn run(
                 continue;
             }
         };
-        let permit = match conns.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                tracing::warn!(
-                    "refusing connection from {peer}: {MAX_CONNECTIONS} connections already in flight"
-                );
-                drop(stream); // closes immediately; the peer sees a reset, not a hang
-                continue;
-            }
-        };
+        // Join the pre-auth population here, synchronously, before the next accept:
+        // registration cannot fail — which is exactly how an authenticated client stops
+        // being deniable by silent peers — and the eviction it may trigger is what keeps
+        // the population bounded.
+        let (ticket, evict) = pre_auth.admit();
         let config = config.clone();
+        let assets = assets.clone();
         let acceptor = acceptor.clone();
+        let conns = conns.clone();
         tokio::task::spawn_local(async move {
-            let _permit = permit;
             // TLS-terminate first if configured (§15.29 tier 2), then the plaintext
             // and encrypted paths are identical from here on. The handshake carries
-            // the same deadline as the request head: it is equally pre-authentication.
-            let result = match acceptor {
-                Some(acc) => match timeout(HEAD_TIMEOUT, acc.accept(stream)).await {
-                    Ok(Ok(tls_stream)) => handle_conn(tls_stream, config, secure).await,
-                    Ok(Err(e)) => {
-                        tracing::debug!("TLS handshake from {peer} failed: {e}");
-                        Ok(())
-                    }
-                    Err(_) => {
-                        tracing::debug!("TLS handshake from {peer} timed out");
-                        Ok(())
-                    }
-                },
-                None => handle_conn(stream, config, secure).await,
+            // the same deadline as the request head: it is equally pre-authentication,
+            // and it runs under the pre-auth ticket for the same reason.
+            let served = async move {
+                match acceptor {
+                    Some(acc) => match timeout(HEAD_TIMEOUT, acc.accept(stream)).await {
+                        Ok(Ok(tls_stream)) => {
+                            handle_conn(tls_stream, config, assets, secure, port, ticket, conns)
+                                .await
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!("TLS handshake from {peer} failed: {e}");
+                            Ok(())
+                        }
+                        Err(_) => {
+                            tracing::debug!("TLS handshake from {peer} timed out");
+                            Ok(())
+                        }
+                    },
+                    None => handle_conn(stream, config, assets, secure, port, ticket, conns).await,
+                }
+            };
+            // Cancelling `served` drops the stream, which is the eviction. Past the token
+            // gate `evicted` parks forever (the ticket is gone), so an authenticated
+            // session — a WebSocket bridge above all — can never be taken down this way.
+            let result = tokio::select! {
+                biased;
+                () = evicted(evict) => {
+                    tracing::debug!(
+                        "evicting {peer}: more than {MAX_PRE_AUTH_CONNECTIONS} connections \
+                         are waiting at the token gate"
+                    );
+                    Ok(())
+                }
+                r = served => r,
             };
             if let Err(e) = result {
                 tracing::debug!("connection from {peer} ended: {e}");
@@ -172,18 +358,25 @@ impl Request {
             .map(|(_, v)| v.as_str())
     }
 
-    /// The value of `cookie_name` from the `Cookie` header, if present.
-    pub fn cookie(&self, cookie_name: &str) -> Option<&str> {
-        let cookies = self.header("cookie")?;
-        for pair in cookies.split(';') {
-            let pair = pair.trim();
-            if let Some((k, v)) = pair.split_once('=')
-                && k == cookie_name
-            {
-                return Some(v);
-            }
-        }
-        None
+    /// **Every** value carried under `cookie_name` in the `Cookie` header, in the
+    /// order the header lists them.
+    ///
+    /// Returning all of them rather than the first is the point (review WEB-3). A
+    /// `Cookie` header is a flat list with no path or domain attached, so a page on
+    /// another port of this same host — same *site*, which is why `SameSite=Strict`
+    /// never fires — can plant `nexus_session…=x; path=/ws`, and RFC 6265 §5.4 orders
+    /// the longer path first. A first-value-wins reader then sees only the plant: the
+    /// assets (path `/`) still load, so the console renders normally and simply never
+    /// connects, and a reload does not clear it. Offering every value turns that from
+    /// a denial into a no-op — the real cookie is still in the header, and the caller
+    /// accepts the request if *any* value matches.
+    pub fn cookies<'a>(&'a self, cookie_name: &'a str) -> impl Iterator<Item = &'a str> {
+        self.header("cookie")
+            .into_iter()
+            .flat_map(|cookies| cookies.split(';'))
+            .filter_map(|pair| pair.trim().split_once('='))
+            .filter(move |(k, _)| *k == cookie_name)
+            .map(|(_, v)| v)
     }
 
     /// The value of `key` from the query string, if present (no percent-decoding
@@ -218,7 +411,11 @@ impl Request {
 async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     mut stream: S,
     config: Arc<ServerConfig>,
+    assets: Arc<str>,
     secure: bool,
+    port: u16,
+    pre_auth: PreAuthTicket,
+    conns: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     // A complete head, or the connection is dropped: an unauthenticated peer must not
     // be able to hold a task and an fd by staying silent.
@@ -282,41 +479,86 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + 'static>(
         .await;
     }
 
-    // The bootstrap URL: `GET /?token=TOKEN`. If it matches, set the session cookie
-    // and redirect to `/` so the token leaves the address bar (§15.29). This is the
-    // one route the query param (not the cookie) authorizes.
+    // The bootstrap URL: `GET /?token=TOKEN`. If it matches, set the two session
+    // cookies and redirect to `/` so the token leaves the address bar (§15.29). This
+    // is the one route the query param (not a cookie) authorizes.
+    //
+    // The token cookie is written first, because it is *the* session cookie: a client
+    // reading one `Set-Cookie` is reading the one that authorizes everything.
     if req.method == "GET"
-        && path_is(&req.path, "/")
+        && req.path == "/"
         && let Some(tok) = req.query_param("token")
         && ct_eq(tok, &config.token)
     {
-        let cookie = session_cookie(&config.token, secure);
+        let session = session_cookie(&config.token, secure, port);
+        let asset = asset_cookie(&assets, secure, port);
         let resp = format!(
-            "HTTP/1.1 302 Found\r\nLocation: /\r\nSet-Cookie: {cookie}\r\n\
-             Content-Length: 0\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 302 Found\r\nLocation: /\r\nSet-Cookie: {session}\r\n\
+             Set-Cookie: {asset}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
         stream.write_all(resp.as_bytes()).await?;
         return Ok(());
     }
 
-    // Every other request carries the token as the session cookie (§15.29). The
-    // cookie doubles as CSRF protection via SameSite=Strict.
-    let authorized = req
-        .cookie("nexus_session")
-        .map(|c| ct_eq(c, &config.token))
-        .unwrap_or(false);
-    if !authorized {
-        return write_simple(
-            &mut stream,
-            401,
-            "Unauthorized",
-            "missing or invalid session token — open the bootstrap URL (§15.29)",
-        )
-        .await;
+    // Every other request carries a credential as a cookie (§15.29), and *which*
+    // credential suffices depends on the route (review WEBS-1). Both cookies keep
+    // `SameSite=Strict`, which is what the CSRF story rests on; the split is about how
+    // far each value travels, not about how a request is judged once it arrives.
+    //
+    // Two names are accepted for the token, and every value under each is checked
+    // (review WEB-3). The listener-scoped name is the one *we* set, so it is the one a
+    // browser replays; the unscoped base name is for a headless client (`serialnexusweb
+    // wsclient`, curl, websocat), which is handed a token rather than a cookie jar and
+    // has no way to know the bound port — under the SSH forwarding §17 sanctions it is
+    // not even the port in the client's own URL. Reading a name we never set costs
+    // nothing: the value still has to equal the token, and no one can plant a cookie
+    // that authorizes them. Neither name is path-scoped when a client sets it by hand,
+    // which is why `Path=/ws` on our own `Set-Cookie` costs the headless client nothing.
+    let cookie_name = session_cookie_name(port);
+    let token_ok = req
+        .cookies(&cookie_name)
+        .chain(req.cookies(SESSION_COOKIE))
+        .any(|c| ct_eq(c, &config.token));
+    // The asset credential opens the static assets and nothing else. `/ws` is the whole
+    // capability — the bridge behind it commands every console and can add an exec
+    // codec — so a credential that survives being replayed to a sibling port must not
+    // reach it.
+    let asset_ok = req
+        .cookies(&asset_cookie_name(port))
+        .any(|c| ct_eq(c, &assets));
+    let ws_route = req.path == WS_PATH;
+    if !token_ok && !(asset_ok && !ws_route) {
+        let why = if asset_ok {
+            "the console cookie does not authorize the WebSocket — open the bootstrap URL (§15.29)"
+        } else {
+            "missing or invalid session token — open the bootstrap URL (§15.29)"
+        };
+        return write_simple(&mut stream, 401, "Unauthorized", why).await;
     }
+    // Past the token gate, so this connection changes populations (review WEB-5): it
+    // leaves the pre-auth pool — freeing that slot and, just as importantly, becoming
+    // un-evictable — and only now takes a permit from the pool that nothing without a
+    // credential can reach. In that order, so an authenticated client never competes
+    // with the noise below it for either resource.
+    drop(pre_auth);
+    let _served = match conns.try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!(
+                "refusing an authenticated request: {MAX_CONNECTIONS} connections already in flight"
+            );
+            return write_simple(
+                &mut stream,
+                503,
+                "Service Unavailable",
+                "too many connections in flight — close a console tab and retry",
+            )
+            .await;
+        }
+    };
 
     // Authorized. Route.
-    if req.method == "GET" && path_is(&req.path, "/ws") {
+    if req.method == "GET" && ws_route {
         return upgrade_ws(stream, req, config).await;
     }
     if req.method == "GET"
@@ -406,21 +648,30 @@ async fn upgrade_ws<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     crate::bridge::bridge(ws, config.socket.clone()).await
 }
 
+/// A restrictive CSP, sent with `nosniff` on every asset (§17, §15.35). The console
+/// renders daemon-supplied strings — node names, refusal messages, port descriptions —
+/// and since the token holder can now edit the graph, a future DOM-injection slip
+/// would be code execution *as the operator's session* rather than a defaced page.
+/// Everything the page needs is same-origin and inline-free: scripts and styles are
+/// served from here, the WebSocket is same-origin, and the history export is a `blob:`
+/// URL. `frame-ancestors 'none'` keeps the console out of a frame, which
+/// `SameSite=Strict` alone does not guarantee.
+///
+/// `connect-src` is `'self'` alone (review WEBS-2). It used to read `'self' ws: wss:`,
+/// and the bare scheme sources let a script open a WebSocket to *any* host — the exact
+/// silent, bidirectional, page-preserving exfiltration channel the paragraph above
+/// claims is closed. CSP3 makes `'self'` match a same-origin `ws:`/`wss:` connection,
+/// verified against this project's own pinned Chromium on both deployment tiers
+/// (`ws://` from an `http://` page, `wss://` from an `https://` page), so dropping the
+/// schemes costs the console nothing.
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+                   connect-src 'self'; img-src 'self' data:; \
+                   base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
 async fn write_asset<S: AsyncWrite + Unpin>(
     stream: &mut S,
     asset: crate::assets::Asset,
 ) -> anyhow::Result<()> {
-    // A restrictive CSP and `nosniff` on every asset (§17, §15.35). The console
-    // renders daemon-supplied strings — node names, refusal messages, port
-    // descriptions — and since the token holder can now edit the graph, a future
-    // DOM-injection slip would be code execution *as the operator's session* rather
-    // than a defaced page. Everything the page needs is same-origin and inline-free:
-    // scripts and styles are served from here, the WebSocket is same-origin, and the
-    // history export is a `blob:` URL. `frame-ancestors 'none'` keeps the console out
-    // of a frame, which `SameSite=Strict` alone does not guarantee.
-    const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
-                       connect-src 'self' ws: wss:; img-src 'self' data:; \
-                       base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
          Content-Security-Policy: {CSP}\r\nX-Content-Type-Options: nosniff\r\n\
@@ -449,6 +700,39 @@ async fn write_simple<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// The base name of the session cookie: the name a *headless* client presents, and the
+/// stem [`session_cookie_name`] scopes to a listener.
+const SESSION_COOKIE: &str = "nexus_session";
+
+/// The base name of the asset cookie — the credential that opens the static assets and
+/// nothing else (review WEBS-1), scoped to a listener by [`asset_cookie_name`].
+const ASSET_COOKIE: &str = "nexus_assets";
+
+/// The one path the session token is needed on, and therefore the only path its cookie
+/// is scoped to (review WEBS-1). Also the route match, so the two cannot drift: a
+/// cookie scoped to a path the upgrade does not live at is a console that never
+/// connects, and a route the cookie's scope does not cover is the same bug.
+const WS_PATH: &str = "/ws";
+
+/// The session cookie's name for a listener bound to `port` (review WEB-3).
+///
+/// A cookie's jar key is (name, domain, path) — never the port (RFC 6265 §8.5). With
+/// one fixed name, the two-console arrangement §17 explicitly prescribes ("it is
+/// single-daemon per instance in v1 — run two for two daemons") collided on one jar
+/// entry: opening the second bootstrap URL replaced the first console's cookie, and
+/// the first console's only recovery path is a reload, which 401s. Naming the cookie
+/// after the listener gives each console its own entry, so both survive.
+///
+/// The *bound* port is used rather than the browser's view of it, because the name has
+/// to match between the response that sets the cookie and every request that reads it,
+/// and only the bound port is a constant of this server. The residual that leaves: two
+/// consoles reached through SSH forwarding (§17) from different machines that happen to
+/// share a bound port still collide, and forwarding to distinct local ports cannot be
+/// seen from here.
+fn session_cookie_name(port: u16) -> String {
+    format!("{SESSION_COOKIE}_{port}")
+}
+
 /// The `Set-Cookie` value carrying the session token (§15.29).
 ///
 /// `Secure` is added exactly when this listener terminates TLS. The cookie exists so
@@ -457,12 +741,65 @@ async fn write_simple<S: AsyncWrite + Unpin>(
 /// cookie was introduced to close (review WEB-2). It is *omitted* on the plaintext
 /// tiers because browsers refuse to store a `Secure` cookie from a non-trustworthy
 /// `http://` origin — setting it unconditionally would break the loopback default.
-fn session_cookie(token: &str, secure: bool) -> String {
-    let mut cookie = format!("nexus_session={token}; Path=/; HttpOnly; SameSite=Strict");
+///
+/// `Path` is [`WS_PATH`], not `/` (review WEBS-1). A cookie is never port-scoped, so a
+/// `Path=/` token is attached to *every* request the operator's browser makes to any
+/// service on this host — the finding's demonstration was a rogue sibling-port server
+/// reading the token out of one ordinary navigation's access log. The browser needs the
+/// token on exactly one path, the WebSocket upgrade, so that is the only path it is
+/// offered on, and a sibling port sees it only if the operator visits a page there that
+/// deliberately requests its own `/ws`. The assets keep their own credential
+/// ([`asset_cookie`]) rather than sharing this one, which is what makes the narrow
+/// scope survivable.
+fn session_cookie(token: &str, secure: bool, port: u16) -> String {
+    let name = session_cookie_name(port);
+    let mut cookie = format!("{name}={token}; Path={WS_PATH}; HttpOnly; SameSite=Strict");
     if secure {
         cookie.push_str("; Secure");
     }
     cookie
+}
+
+/// The asset cookie's name for a listener bound to `port`, scoped for the same reason
+/// [`session_cookie_name`] is: two consoles on one host must not collide on one jar
+/// entry.
+fn asset_cookie_name(port: u16) -> String {
+    format!("{ASSET_COOKIE}_{port}")
+}
+
+/// The `Set-Cookie` value carrying the asset credential (review WEBS-1).
+///
+/// This is the value that *is* replayed to every path of every same-host service the
+/// browser contacts, because a navigation and a `<script src>` can present nothing
+/// else. It is therefore deliberately worth nothing: it opens the console's own
+/// static assets — HTML, CSS and JavaScript that ship in the public source tree — and
+/// is refused on `/ws`, which is where every capability lives. It carries the same
+/// `HttpOnly`, `SameSite=Strict` and TLS-conditional `Secure` flags as the session
+/// cookie: nothing about the gate is relaxed, only what leaks when it is replayed.
+fn asset_cookie(credential: &str, secure: bool, port: u16) -> String {
+    let name = asset_cookie_name(port);
+    let mut cookie = format!("{name}={credential}; Path=/; HttpOnly; SameSite=Strict");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+/// A fresh 128-bit asset credential, hex-encoded, from the OS CSPRNG.
+///
+/// Independent of the token by construction rather than derived from it: a derivation
+/// would make the token's secrecy depend on a hash's preimage resistance for no gain,
+/// when the value can simply be unrelated. 128 bits is ample for a credential whose
+/// only capability is reading files that ship in the repository.
+fn new_asset_credential() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("OS RNG");
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 /// Split an authority (`host`, `host:port`, `[::1]`, `[::1]:8080`) into its host and
@@ -532,11 +869,6 @@ pub fn origin_matches_host(origin: &str, host_header: &str, secure: bool) -> boo
         && o_host.eq_ignore_ascii_case(h_host)
 }
 
-/// Path comparison ignoring a trailing slash difference on `/`.
-fn path_is(path: &str, want: &str) -> bool {
-    path == want
-}
-
 /// Match a bracketed IPv6 host form (`[::1]`) against a bare one (`::1`) either way.
 fn bracketed_eq(a: &str, b: &str) -> bool {
     let strip = |s: &str| s.trim_start_matches('[').trim_end_matches(']').to_string();
@@ -568,20 +900,225 @@ mod tests {
     fn the_session_cookie_is_secure_only_under_tls() {
         // Plaintext tiers: a `Secure` cookie would not be stored by the browser at all
         // from an untrustworthy http origin, so it must stay off (§15.29 tier 1/3).
-        let plain = session_cookie("abc", false);
+        let plain = session_cookie("abc", false, 8080);
         assert_eq!(
             plain,
-            "nexus_session=abc; Path=/; HttpOnly; SameSite=Strict"
+            "nexus_session_8080=abc; Path=/ws; HttpOnly; SameSite=Strict"
         );
         // TLS tier: `Secure` keeps the token off any plaintext same-host request
         // (review WEB-2).
-        let tls = session_cookie("abc", true);
-        assert!(tls.starts_with("nexus_session=abc; Path=/; HttpOnly; SameSite=Strict"));
+        let tls = session_cookie("abc", true, 8080);
+        assert!(tls.starts_with("nexus_session_8080=abc; Path=/ws; HttpOnly; SameSite=Strict"));
         assert!(tls.ends_with("; Secure"), "{tls}");
-        // The flags the cookie has always carried survive either way.
-        for c in [&plain, &tls] {
+        // The flags the cookie has always carried survive either way — and the asset
+        // cookie carries every one of them too (review WEBS-1): the split narrows what
+        // leaks, it does not relax the gate.
+        let plain_asset = asset_cookie("cred", false, 8080);
+        let tls_asset = asset_cookie("cred", true, 8080);
+        assert_eq!(
+            plain_asset,
+            "nexus_assets_8080=cred; Path=/; HttpOnly; SameSite=Strict"
+        );
+        assert!(tls_asset.ends_with("; Secure"), "{tls_asset}");
+        for c in [&plain, &tls, &plain_asset, &tls_asset] {
             assert!(c.contains("HttpOnly") && c.contains("SameSite=Strict"));
         }
+    }
+
+    /// Review **WEBS-1**: the shell-equivalent token must not sit in a cookie the
+    /// browser replays to every path of every same-host service it contacts.
+    #[test]
+    fn only_the_asset_credential_is_scoped_to_every_path() {
+        let session = session_cookie("shell-equivalent", false, 8080);
+        let asset = asset_cookie("worthless", false, 8080);
+        // The token's cookie reaches one path — the upgrade — and that path is the
+        // route constant, so the two cannot drift apart.
+        assert!(session.contains("Path=/ws;"), "{session}");
+        assert_eq!(WS_PATH, "/ws");
+        // The everywhere-replayed cookie carries a value that is not the token.
+        assert!(asset.contains("Path=/;"), "{asset}");
+        assert!(!asset.contains("shell-equivalent"), "{asset}");
+        // Two consoles on one host stay separate here too (review WEB-3's rule,
+        // applied to the second cookie rather than rediscovered later).
+        assert_ne!(asset_cookie_name(8080), asset_cookie_name(8081));
+        assert_ne!(asset_cookie_name(8080), session_cookie_name(8080));
+        // A fresh credential per run, from the OS CSPRNG, unrelated to any token.
+        let (a, b) = (new_asset_credential(), new_asset_credential());
+        assert_ne!(a, b, "the credential must not be a constant");
+        assert_eq!(a.len(), 32, "128 bits, hex-encoded: {a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+    }
+
+    /// Review WEB-3: the cookie's jar key is (name, domain, path) and never the port,
+    /// so two consoles on one host must not write the same name.
+    #[test]
+    fn the_session_cookie_is_named_for_its_listener() {
+        let a = session_cookie("tok-a", false, 8080);
+        let b = session_cookie("tok-b", false, 8081);
+        assert!(a.starts_with("nexus_session_8080="), "{a}");
+        assert!(b.starts_with("nexus_session_8081="), "{b}");
+        // Same domain, same path — so the *name* is the only thing keeping the two
+        // entries apart, and it does.
+        assert!(a.contains("Path=/ws") && b.contains("Path=/ws"));
+        assert_ne!(
+            session_cookie_name(8080),
+            session_cookie_name(8081),
+            "two consoles must not collide on one jar entry (§17: run two for two daemons)"
+        );
+        // The unscoped base name is never *set* by anyone; it exists only as the name a
+        // headless client may present.
+        assert!(!a.starts_with("nexus_session="));
+    }
+
+    /// Review WEB-3, the shadowing half: a sibling-port page can plant a cookie of the
+    /// same name under a longer path, and RFC 6265 §5.4 puts it first in the header.
+    /// A first-value-wins reader saw only the plant.
+    #[tokio::test]
+    async fn every_cookie_value_for_a_name_is_offered_not_just_the_first() {
+        let raw = b"GET /ws HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\
+                    Cookie: nexus_session_8080=planted; a=1; nexus_session_8080=real; \
+                    nexus_session=headless\r\n\r\n";
+        let req = read_request(&mut &raw[..])
+            .await
+            .expect("parse")
+            .expect("a head");
+        let scoped: Vec<&str> = req.cookies("nexus_session_8080").collect();
+        assert_eq!(
+            scoped,
+            vec!["planted", "real"],
+            "both values must reach the caller, in header order"
+        );
+        // Which is what makes the gate survive the plant: the real token is accepted
+        // even though a bogus value sorts ahead of it.
+        assert!(
+            req.cookies("nexus_session_8080").any(|c| ct_eq(c, "real")),
+            "a planted cookie must not shadow the session"
+        );
+        // And the unscoped headless name is read independently of the scoped one.
+        assert_eq!(
+            req.cookies(SESSION_COOKIE).collect::<Vec<_>>(),
+            vec!["headless"]
+        );
+        // A name that is a prefix of ours is not ours.
+        assert_eq!(req.cookies("nexus_session_808").count(), 0);
+    }
+
+    /// Review WEBS-2: the bare `ws:`/`wss:` sources let a script open a WebSocket to
+    /// any host, contradicting this file's own same-origin claim. `'self'` matches a
+    /// same-origin WebSocket on both tiers in the pinned Chromium the UI suite uses.
+    #[test]
+    fn the_csp_confines_connections_to_this_origin() {
+        assert!(CSP.contains("connect-src 'self';"), "{CSP}");
+        for scheme in [" ws:", " wss:"] {
+            assert!(
+                !CSP.contains(scheme),
+                "a bare scheme source reaches every host:{CSP}"
+            );
+        }
+        // The rest of the policy is unchanged.
+        assert!(CSP.starts_with("default-src 'none';"));
+        assert!(CSP.contains("frame-ancestors 'none'"));
+    }
+
+    /// Review WEB-5: the unauthenticated population stays a small fraction of what
+    /// credentialed work gets, and the head deadline stays short.
+    #[test]
+    fn the_pre_auth_population_is_a_fraction_of_the_connection_pool() {
+        // Const-asserted, so widening the pre-auth pool fails to *compile* rather than
+        // failing a test someone can skip. All the operands are compile-time constants;
+        // there is nothing here a run-time check could see that the compiler cannot.
+        const _: () = {
+            assert!(
+                MAX_PRE_AUTH_CONNECTIONS < MAX_CONNECTIONS,
+                "peers that have shown nothing must not outnumber the ones that have"
+            );
+            assert!(
+                MAX_CONNECTIONS >= 64,
+                "the pool credentialed connections draw on must fit a lab's tabs"
+            );
+            // Comfortably more than a browser's parallel subresource loads, so a single
+            // tab opening the console never evicts its own connections.
+            assert!(
+                MAX_PRE_AUTH_CONNECTIONS >= 16,
+                "a browser's own parallel loads must not evict each other"
+            );
+            // A complete request head is one round trip; the deadline is only what a
+            // peer that escapes eviction gets to hold a slot for.
+            assert!(
+                HEAD_TIMEOUT.as_secs() <= 5,
+                "a shorter pre-auth deadline is what caps a stalled peer's hold time"
+            );
+        };
+    }
+
+    /// Review WEB-5, the regression the first remediation shipped: the cap must be
+    /// enforced by evicting the **oldest** member, never by refusing the newcomer.
+    ///
+    /// Fail-first is direct here — the shipped behaviour was `try_acquire_owned()` on a
+    /// 32-permit semaphore, whose observable is "the 33rd arrival gets nothing". This
+    /// asserts the opposite: the 33rd arrival is admitted and the 1st pays for it. A
+    /// pool that refused the newcomer could not produce an eviction signal on `[0]` at
+    /// all.
+    #[tokio::test]
+    async fn the_pre_auth_pool_evicts_its_oldest_member_and_never_refuses_a_newcomer() {
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        let pool = PreAuthPool::new();
+        let mut members: Vec<(PreAuthTicket, oneshot::Receiver<()>)> = (0
+            ..MAX_PRE_AUTH_CONNECTIONS)
+            .map(|_| pool.admit())
+            .collect();
+        assert_eq!(pool.live(), MAX_PRE_AUTH_CONNECTIONS);
+        for (i, (_, signal)) in members.iter_mut().enumerate() {
+            assert!(
+                matches!(signal.try_recv(), Err(TryRecvError::Empty)),
+                "a full pool evicts nobody until someone new arrives (member {i})"
+            );
+        }
+
+        // The newcomer — the operator's browser, in the scenario the finding names.
+        let (newest, mut newest_signal) = pool.admit();
+        assert!(
+            matches!(newest_signal.try_recv(), Err(TryRecvError::Empty)),
+            "the newest arrival must be admitted, not refused: refusing it is the \
+             lockout, because the connection carrying the session cookie is always the \
+             newest one"
+        );
+        assert!(
+            matches!(members[0].1.try_recv(), Ok(())),
+            "the oldest member is the one evicted — it has had the longest to send a head"
+        );
+        for (i, (_, signal)) in members.iter_mut().enumerate().skip(1) {
+            assert!(
+                matches!(signal.try_recv(), Err(TryRecvError::Empty)),
+                "only as many members are evicted as the newcomer displaces (member {i})"
+            );
+        }
+        // The population is back at the cap, not above it.
+        assert_eq!(pool.live(), MAX_PRE_AUTH_CONNECTIONS);
+
+        // Passing the token gate leaves the pool, so the slot comes back and the
+        // connection stops being evictable.
+        drop(newest);
+        assert_eq!(pool.live(), MAX_PRE_AUTH_CONNECTIONS - 1);
+    }
+
+    /// Review WEB-5: leaving the pool must never *look* like an eviction.
+    ///
+    /// `evicted` races the connection itself, so if a dropped sender resolved it — the
+    /// shape a plain `let _ = signal.await;` would have — every connection would be
+    /// cancelled the instant it authenticated, killing each WebSocket bridge at birth.
+    #[tokio::test]
+    async fn leaving_the_pre_auth_pool_never_looks_like_an_eviction() {
+        let pool = PreAuthPool::new();
+        let (ticket, signal) = pool.admit();
+        drop(ticket); // what the token gate does
+        assert!(
+            timeout(Duration::from_millis(50), evicted(signal))
+                .await
+                .is_err(),
+            "a ticket that left the pool must never resolve its eviction signal"
+        );
     }
 
     #[test]
@@ -699,7 +1236,10 @@ mod tests {
         assert_eq!(req.method, "GET");
         assert_eq!(req.path, "/app.js");
         assert_eq!(req.query_param("token"), Some("ab"));
-        assert_eq!(req.cookie("nexus_session"), Some("tok"));
+        assert_eq!(
+            req.cookies("nexus_session").collect::<Vec<_>>(),
+            vec!["tok"]
+        );
         assert_eq!(req.header("origin"), Some("http://127.0.0.1:8080"));
         assert_eq!(req.host(), Some("127.0.0.1"), "the port is stripped");
 

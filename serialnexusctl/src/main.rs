@@ -95,8 +95,10 @@ enum Cmd {
     /// Watch a host-facing endpoint's hostward stream over a connection-scoped tap
     /// (§17): the raw decoded bytes are written to stdout as they arrive. With
     /// `--replay` the endpoint's replay ring (§5) is delivered first (ring-then-live,
-    /// exact splice). Exits after `--bytes` decoded bytes, or when the connection
-    /// closes. Read-only: a tap never writes to the device and never touches config.
+    /// exact splice). Exits after `--bytes` decoded bytes, when the graph drops the
+    /// endpoint (`teardown`, `load --replace`, `remove-node`), or when the connection
+    /// closes; a lost byte is reported on stderr, never folded into stdout silently.
+    /// Read-only: a tap never writes to the device and never touches config.
     Tap {
         /// The host-facing endpoint to observe (e.g. `usb0` or `mux/ch2`).
         endpoint: String,
@@ -358,7 +360,13 @@ fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
 /// Read and parse a `GraphConfig` from a TOML file, mapping a parse error to a
 /// message that names the file (shared by `load` and `add-node`).
 fn read_config(file: &Path) -> anyhow::Result<GraphConfig> {
-    let text = std::fs::read_to_string(file)?;
+    // Name the file on the *read* too, not only on the parse below (review 32, CTL-3).
+    // Every other client-side I/O failure in this file names its subject — the parse
+    // arm, the empty-graph bail, all three `UnixStream::connect` sites — and a bare
+    // `No such file or directory (os error 2)` is unusable with several configurations
+    // in play, in the human arm and in `--json` alike.
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?;
     let config: GraphConfig =
         toml::from_str(&text).map_err(|e| anyhow::anyhow!("parsing {}: {e}", file.display()))?;
     // A file with content that parses to *nothing* is the one input that turns
@@ -666,12 +674,110 @@ fn subscribe_stream(socket: &Path, count: Option<usize>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The offset-continuity tracker for one tap stream (review 32, CTL-2).
+///
+/// A `tap.data` carries two *independent* discontinuity signals, and this CLI — the
+/// one first-party consumer that writes a capture file — used to read neither, so
+/// `serialnexusctl tap console > incident.bin` produced a holed stream with nothing
+/// said on stdout or stderr:
+///
+/// * `gap_before` — bytes lost at the endpoint's producer→hub feed, the one hop §5
+///   sanctions losing on. The offset space deliberately cannot express it (folding it
+///   in would leave `from_offset` naming an offset the live stream never uses — see
+///   "the offset contract" in `docs/rpc/observation.md`), so offsets stay contiguous
+///   *across* the hole and this field is its only signal.
+/// * an `offset` above the expected `previous offset + previous length` — how a
+///   per-tap queue drop surfaces instead: "a gap it can see, never a silent shift".
+///
+/// Both notices go to **stderr**, beside the `tap opened:` line: stdout is the capture
+/// and stays a clean byte stream (§15.16 lets the rendering move, not the bytes).
+struct TapContinuity {
+    /// The offset the next chunk should carry — seeded from `tap.open`'s `from_offset`
+    /// and advanced by each chunk's length. `None` only if the daemon reported no
+    /// offsets at all, which disables the offset check alone; `gap_before` still reports.
+    expected: Option<u64>,
+}
+
+impl TapContinuity {
+    fn new(from_offset: Option<u64>) -> Self {
+        TapContinuity {
+            expected: from_offset,
+        }
+    }
+
+    /// Observe one `tap.data` and return the notices it warrants (empty = contiguous).
+    fn observe(&mut self, offset: Option<u64>, gap_before: u64, len: usize) -> Vec<String> {
+        // `Vec::new` does not allocate, so a clean stream — the overwhelming case —
+        // costs nothing on this per-chunk path.
+        let mut notices = Vec::new();
+        if gap_before > 0 {
+            notices.push(match offset {
+                Some(o) => {
+                    format!("tap gap: {gap_before} bytes lost before offset {o} (daemon feed)")
+                }
+                None => format!("tap gap: {gap_before} bytes lost (daemon feed)"),
+            });
+        }
+        if let (Some(o), Some(e)) = (offset, self.expected) {
+            if o > e {
+                notices.push(format!(
+                    "tap gap: {} bytes dropped before offset {o} (this tap's queue)",
+                    o - e
+                ));
+            } else if o < e {
+                notices.push(format!(
+                    "tap warning: offset went backwards to {o}, expected {e}"
+                ));
+            }
+        }
+        self.expected = Some(offset.unwrap_or(self.expected.unwrap_or(0)) + len as u64);
+        notices
+    }
+}
+
+/// Handle the terminal `tap.closed` notification (§17) — the exit path `tap_stream`
+/// used to lack (review 32, CTL-1).
+///
+/// The daemon sends this when the graph drops the tapped endpoint (`teardown`,
+/// `load --replace`, `remove-node --cascade`) and then deliberately *keeps the
+/// connection alive* for the connection's other taps and its subscription. A client
+/// that ignores it therefore blocks in `read_line` forever on a connection that will
+/// never carry another byte — the exact hang this notification was introduced to end,
+/// and a permanent one: the hub is gone and a re-`load` does not revive that tap id.
+///
+/// **Exit status** is the deliberate part. The bytes already written are intact and
+/// flushed, so with no `--bytes` budget outstanding this is an orderly end of stream
+/// and the CLI exits **0**, naming the endpoint and the `reason` on stderr beside the
+/// `tap opened:` line. With `--bytes N` still outstanding it is a short read — the
+/// operator asked for N bytes and the stream ended at fewer — so it exits **1** through
+/// the ordinary error path, which `--json` renders as a client-origin error envelope
+/// like every other client-side failure (review 26, CLI-4).
+fn tap_closed(params: Option<&Value>, written: u64, stop_bytes: Option<u64>) -> anyhow::Result<()> {
+    let field = |key: &str| {
+        params
+            .and_then(|p| p.get(key))
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_owned()
+    };
+    let (endpoint, reason) = (field("endpoint"), field("reason"));
+    if let Some(limit) = stop_bytes {
+        anyhow::bail!(
+            "tap closed: {endpoint} ({reason}) — {written} of {limit} requested byte(s) received"
+        );
+    }
+    eprintln!("tap closed: {endpoint} ({reason}) — {written} byte(s) received");
+    Ok(())
+}
+
 /// Open the socket, `tap.open` the endpoint, and write each `tap.data`
 /// notification's decoded bytes to stdout as they arrive (§17). The connection's
 /// write half stays open for the tap's lifetime (so the daemon does not treat it
-/// as a dropped waiter, §15.20). Exits after `stop_bytes` decoded bytes or when the
+/// as a dropped waiter, §15.20). Exits after `stop_bytes` decoded bytes, on the
+/// terminal `tap.closed` ([`tap_closed`], which owns the exit status), or when the
 /// daemon closes the connection. The `tap.open` acknowledgement (carrying the tap
-/// id and `replay_bytes`) is reported on stderr, keeping stdout a clean byte stream.
+/// id and `replay_bytes`) is reported on stderr, keeping stdout a clean byte stream —
+/// as are the discontinuity notices [`TapContinuity`] raises.
 fn tap_stream(
     socket: &Path,
     endpoint: &str,
@@ -699,7 +805,7 @@ fn tap_stream(
     // clean confirmed no-op rather than a silent success (audit finding). The daemon
     // replies to tap.open before it streams any tap.data, so the ack is the first
     // line; tolerate a stray notification ahead of it defensively.
-    loop {
+    let mut continuity = loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
             anyhow::bail!("connection closed before the tap.open acknowledgement");
@@ -708,10 +814,14 @@ fn tap_stream(
             if let Some(err) = resp.error {
                 anyhow::bail!("tap.open failed: {} ({})", err.message, err.code);
             }
-            eprintln!("tap opened: {}", resp.result.unwrap_or(Value::Null));
-            break;
+            let ack = resp.result.unwrap_or(Value::Null);
+            eprintln!("tap opened: {ack}");
+            // `from_offset` is where this tap's stream begins (§11.8) — the anchor the
+            // offset-continuity check below counts from, so a drop before the very
+            // first chunk is visible too (review 32, CTL-2).
+            break TapContinuity::new(ack.get("from_offset").and_then(Value::as_u64));
         }
-    }
+    };
 
     // A paused tab (§17): hold the tap open without reading for the stall window so
     // the daemon's bounded queue fills and drops with a counter, then exit.
@@ -731,17 +841,33 @@ fn tap_stream(
             continue;
         }
         if let Ok(Incoming::Notification(note)) = serde_json::from_str::<Incoming>(trimmed) {
+            // The terminal event for this tap — and the connection stays open after it,
+            // so ignoring it is an unbounded hang, not a wait (review 32, CTL-1). A CLI
+            // tap owns exactly one tap on its own connection, so any `tap.closed` here
+            // is ours; `tap_closed` owns the exit status.
+            if note.method == "tap.closed" {
+                return tap_closed(note.params.as_ref(), written, stop_bytes);
+            }
             if note.method != "tap.data" {
                 continue; // ignore other id-less notifications
             }
-            let data = note
-                .params
-                .as_ref()
+            let params = note.params.as_ref();
+            let data = params
                 .and_then(|p| p.get("data"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("tap.data missing 'data' field"))?;
             let bytes = nexus_rpc::base64_decode(data)
                 .ok_or_else(|| anyhow::anyhow!("tap.data 'data' is not valid base64"))?;
+            // Announce a hole before writing the bytes that follow it, so the stderr
+            // notice orders correctly against a stdout capture (review 32, CTL-2).
+            let offset = params.and_then(|p| p.get("offset")).and_then(Value::as_u64);
+            let gap_before = params
+                .and_then(|p| p.get("gap_before"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            for notice in continuity.observe(offset, gap_before, bytes.len()) {
+                eprintln!("{notice}");
+            }
             let take = ((limit - written) as usize).min(bytes.len());
             stdout.write_all(&bytes[..take])?;
             stdout.flush()?;
@@ -859,6 +985,84 @@ mod tests {
         let cli = Cli::try_parse_from(["serialnexusctl", "pulse-dtr", "usb0", "--assert"]).unwrap();
         let (_, params) = build_request(&cli.cmd).unwrap();
         assert_eq!(params.unwrap()["assert"], json!(true), "bare --assert");
+    }
+
+    /// `tap.data` carries two independent discontinuity signals and the CLI reported
+    /// neither, so a `serialnexusctl tap … > incident.bin` capture was holed with
+    /// nothing on stdout or stderr (review 32, CTL-2). Each must raise exactly one
+    /// stderr notice naming its size and the offset it precedes, and a contiguous
+    /// stream must stay silent — a notice on every chunk would be as useless as none.
+    ///
+    /// End to end this is not reproducible on demand: `gap_before` needs the
+    /// producer→hub feed to overflow and the offset jump needs *this* tap's queue to,
+    /// neither of which a promptly-draining CLI can be made to cause deterministically.
+    /// So the rule lives in one small type and is pinned here rather than in a timing
+    /// race — see `nexus-itest/tests/p12_ctl_tap.rs` for the CTL-1 end-to-end guard.
+    #[test]
+    fn tap_continuity_reports_feed_gaps_and_queue_drops_and_stays_silent_otherwise() {
+        let mut c = TapContinuity::new(Some(100));
+        assert!(
+            c.observe(Some(100), 0, 10).is_empty(),
+            "the first chunk at from_offset is contiguous"
+        );
+        assert!(c.observe(Some(110), 0, 10).is_empty(), "a contiguous chunk");
+
+        // A feed-hop hole: offsets stay contiguous *across* it by design, so
+        // `gap_before` is its only signal (docs/rpc/observation.md, offset contract).
+        let notes = c.observe(Some(120), 4096, 10);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("4096"), "size not named: {}", notes[0]);
+        assert!(
+            notes[0].contains("offset 120"),
+            "offset not named: {}",
+            notes[0]
+        );
+
+        // A per-tap queue drop instead: 30 bytes of offset space vanish (130 expected).
+        let notes = c.observe(Some(160), 0, 10);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("30 bytes"),
+            "size not named: {}",
+            notes[0]
+        );
+        assert!(notes[0].contains("queue"), "hop not named: {}", notes[0]);
+
+        // The two are independent: both at once are two notices, not one.
+        let mut both = TapContinuity::new(Some(0));
+        assert_eq!(both.observe(Some(64), 8, 4).len(), 2);
+
+        // A backwards offset is a daemon bug, not loss — say so rather than swallow it.
+        let mut back = TapContinuity::new(Some(100));
+        let notes = back.observe(Some(40), 0, 4);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("backwards"), "{}", notes[0]);
+
+        // Offsets absent disables the offset check alone; `gap_before` still reports.
+        let mut bare = TapContinuity::new(None);
+        assert!(bare.observe(None, 0, 4).is_empty());
+        assert_eq!(bare.observe(None, 7, 4).len(), 1);
+    }
+
+    /// `tap.closed` is terminal for the tap while the connection stays open, so the CLI
+    /// must return rather than block in `read_line` (review 32, CTL-1). The documented
+    /// exit status: an orderly end of stream is `0` and names the endpoint and reason
+    /// on stderr; an outstanding `--bytes` budget is a short read and errors, so a
+    /// script cannot mistake a partial capture for the one it asked for.
+    #[test]
+    fn tap_closed_exits_zero_unbounded_and_errors_on_an_outstanding_byte_budget() {
+        let params = json!({ "tap": 0, "endpoint": "console", "reason": "graph replaced" });
+        assert!(tap_closed(Some(&params), 4096, None).is_ok());
+
+        let err = tap_closed(Some(&params), 4096, Some(65536))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("console"), "endpoint not named: {err}");
+        assert!(err.contains("graph replaced"), "reason not named: {err}");
+        assert!(err.contains("4096 of 65536"), "counts not named: {err}");
+
+        // A notification with no params at all must still terminate the stream.
+        assert!(tap_closed(None, 0, None).is_ok());
     }
 
     /// The sibling signal verb takes `Option<bool>` values, which clap already

@@ -53,8 +53,10 @@ mutations are serialized daemon-side, so many clients may connect at once.
 * **One in-flight *waiting* verb per connection.** `lock --wait` and `send` may
   suspend; while one is parked, a second request pipelined onto the same
   connection is answered `-32006` — with its own `id` — and the parked verb is
-  left intact and still answers later. Use a second connection for concurrent
-  work. Reaching end-of-file on the read half is different: that *cancels* the
+  left intact and still answers later. The wait is one *arm* of the connection's
+  select rather than a pause on it, so `subscribe` and `tap.data` notifications
+  keep flowing on that connection for the whole wait. Use a second connection for
+  concurrent work. Reaching end-of-file on the read half is different: that *cancels* the
   waiting verb and closes the connection (§15.20), which is why a half-close is
   not a way to say "I am done sending" (see below).
 
@@ -186,8 +188,23 @@ object with structured detail.
 | `-32602` | invalid params | missing or malformed params for a known method |
 | `-32603` | internal error | an unexpected daemon-side failure |
 | `-32001` | load on non-empty graph | `load` without `replace` while a graph is already loaded |
-| `-32002` | structural error | configuration failed validation; `data.errors` is the list of messages |
+| `-32002` | structural error | configuration failed validation; `data.errors` is the list of messages, and `message` is always `structural error: <first>` |
 | `-32003` | locked | a contended `lock`/`send` was refused; `data.held_by` names the holder when known |
 | `-32004` | has edges | `remove-node` refused because edges are still attached and `--cascade` was not given |
 | `-32005` | device absent | `add-node` by raw path or serial number, but the device is not present so its identity cannot be captured (§12) |
-| `-32006` | waiting verb in flight | a request was pipelined behind an in-flight waiting verb on the same connection; §15.20 runs one at a time, and the wait is left intact |
+| `-32006` | waiting verb in flight | a request was pipelined behind an in-flight waiting verb on the same connection; §15.20 runs one at a time, and the wait, its taps and its subscription are all left intact |
+
+The `-32002` row's "always" is worth reading twice, because it was not always true:
+every path that refuses a configuration — `load`, `add-node`, `connect`, and the
+codec-attribute precheck — now builds that message through one constructor, so the code
+carries exactly one message shape. Anything rendering `error.message` verbatim (the web
+console's editor page does) therefore shows one sentence for every refusal that carries
+this code, the unknown-codec precheck included. The prefix lives on `message` only,
+never inside `data.errors`, so a client that wants the raw validator text reads the
+array rather than stripping a string.
+
+Every row above is generated from the same registry the daemon emits from
+(`nexus_rpc::error_code_registry`), and `nexus-rpc`'s own
+`docs_rpc_table_matches_the_registry` test asserts each row appears here **verbatim**
+(§16.8). Editing a description in either place without matching the other is a test
+failure, not a documentation drift — which is the point.

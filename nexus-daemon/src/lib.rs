@@ -109,8 +109,10 @@ pub struct RunOptions {
     /// Root prefix for device-identity resolution (§12) — a fixture seam in tests
     /// (`sys_root` is `<dev-root>/sys`), `/` in production.
     pub dev_root: PathBuf,
-    /// Configuration snapshot path (§11). `None` derives it from the socket path
-    /// (`<socket>.state.toml`); an explicit path buys reboot durability.
+    /// Configuration snapshot path (§11). `None` derives it from the socket path's
+    /// **stem** (`<socket-stem>.state.toml`, so `/run/serialnexusd.sock` yields
+    /// `/run/serialnexusd.state.toml` — see [`resolve_state_file`]); an explicit path
+    /// buys reboot durability.
     pub state_file: Option<PathBuf>,
 }
 
@@ -297,6 +299,18 @@ fn resolve_socket(override_path: Option<PathBuf>) -> PathBuf {
 /// `--config` at startup, so a restart recovers incremental surgery. A deployment
 /// that wants the snapshot to survive a *reboot* (the runtime dir is cleared then)
 /// passes `--state-file` pointing at a persistent path (e.g. /var/lib).
+///
+/// **The derived name is `<socket-stem>.state.toml`, not `<socket>.state.toml`**
+/// (RV-6): `/run/serialnexusd.sock` yields `/run/serialnexusd.state.toml`, not
+/// `/run/serialnexusd.sock.state.toml`. Say *stem* wherever this is documented —
+/// an operator deriving the path from the wrong spelling looks for a file that has
+/// never existed. The known cost of the stem is that two sockets differing only in
+/// extension (`a.sock`, `a.socket`) derive one state file; the tempting one-line
+/// repair — [`Path::file_name`] instead of [`Path::file_stem`] — is **not** taken
+/// here, because it would silently orphan every deployed daemon's existing
+/// `serialnexusd.state.toml` and come up with an empty graph after an upgrade. A
+/// deployment that really runs two daemons out of one directory gives one of them
+/// an explicit `--state-file`.
 fn resolve_state_file(override_path: Option<PathBuf>, socket_path: &Path) -> PathBuf {
     if let Some(p) = override_path {
         return p;
@@ -329,7 +343,8 @@ async fn prepare_socket(path: &Path) -> anyhow::Result<()> {
 enum StartupSource {
     /// The operator's `--config` file.
     Config,
-    /// The daemon-owned `<socket>.state.toml` snapshot (§11/§15.9).
+    /// The daemon-owned `<socket-stem>.state.toml` snapshot (§11/§15.9) — the
+    /// socket's *stem*, not the whole socket path ([`resolve_state_file`]).
     StateFile,
 }
 

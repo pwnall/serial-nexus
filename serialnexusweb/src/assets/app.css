@@ -38,6 +38,10 @@ body {
 .cname { flex: 1; font-weight: 600; }
 .lockbadge { font-size: 11px; color: #ffb454; white-space: nowrap; }
 .waiters { font-size: 11px; color: #888; }
+/* §17's rail carries node status beside the address (review DEVR-2). The glyph and its
+   colours are the graph page's `.gstatus` vocabulary, shared rather than re-invented so
+   the two views cannot drift apart. */
+.console .gstatus { font-size: 11px; width: 10px; flex: 0 0 10px; }
 #conn { padding: 6px 4px; font-size: 12px; }
 #conn.connected { color: #7ec699; }
 #conn.disconnected { color: #e06c75; }
@@ -77,6 +81,46 @@ body {
   background: #14161a;
 }
 .marker { color: #6b7280; font-style: italic; }
+
+/* The minimal ANSI subset's palette (ansi.mjs, design §17 / review UIR-1). The parser
+   emits nothing but these class names — it never builds markup, and never sees the DOM —
+   so this file is the whole of the console's colour policy. Sixteen colours, because
+   that is the range `CSI 30-37/90-97 m` addresses; anything richer falls back to the
+   default rather than being approximated. */
+.a-b { font-weight: 700; }
+.a-dim { opacity: 0.62; }
+.a-fg0 { color: #3b4048; }
+.a-fg1 { color: #e06c75; }
+.a-fg2 { color: #7ec699; }
+.a-fg3 { color: #ffb454; }
+.a-fg4 { color: #61afef; }
+.a-fg5 { color: #c678dd; }
+.a-fg6 { color: #56b6c2; }
+.a-fg7 { color: #cbd0d8; }
+.a-fg8 { color: #5c6370; }
+.a-fg9 { color: #ff7b86; }
+.a-fg10 { color: #98e0b0; }
+.a-fg11 { color: #ffd18a; }
+.a-fg12 { color: #8ac6ff; }
+.a-fg13 { color: #dda0ea; }
+.a-fg14 { color: #7fd4de; }
+.a-fg15 { color: #ffffff; }
+.a-bg0 { background: #3b4048; }
+.a-bg1 { background: #e06c75; }
+.a-bg2 { background: #7ec699; }
+.a-bg3 { background: #ffb454; }
+.a-bg4 { background: #61afef; }
+.a-bg5 { background: #c678dd; }
+.a-bg6 { background: #56b6c2; }
+.a-bg7 { background: #cbd0d8; }
+.a-bg8 { background: #5c6370; }
+.a-bg9 { background: #ff7b86; }
+.a-bg10 { background: #98e0b0; }
+.a-bg11 { background: #ffd18a; }
+.a-bg12 { background: #8ac6ff; }
+.a-bg13 { background: #dda0ea; }
+.a-bg14 { background: #7fd4de; }
+.a-bg15 { background: #ffffff; }
 
 #sendform { display: flex; padding: 8px; gap: 8px; border-top: 1px solid #34383f; }
 #sendline {

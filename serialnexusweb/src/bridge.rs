@@ -43,12 +43,15 @@
 use std::path::PathBuf;
 
 use futures_util::{SinkExt, StreamExt};
+use nexus_rpc::error_codes::{INVALID_REQUEST, METHOD_NOT_FOUND};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 /// The complete set of verbs the browser may invoke (§17, §15.35): §10's
 /// observation, tap, arbitration, rotation, serial-signal **and graph-editing**
@@ -119,7 +122,14 @@ pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
         let _ = ws_sink.close().await;
     });
 
-    // Daemon → browser: forward each JSON line verbatim as a text frame.
+    // Daemon → browser: forward each JSON line verbatim as a text frame. On the way
+    // out it fires `daemon_eof`, which is how the loop below learns the daemon
+    // connection ended (review WEB-4).
+    //
+    // A oneshot rather than the task's own `JoinHandle`: the handle is awaited once at
+    // the end of this function, and a handle that had already been polled to completion
+    // inside the `select!` would panic there.
+    let (daemon_eof_tx, mut daemon_eof) = tokio::sync::oneshot::channel::<()>();
     let daemon_to_browser = {
         let to_browser = to_browser.clone();
         tokio::task::spawn_local(async move {
@@ -132,15 +142,34 @@ pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
                     break;
                 }
             }
+            let _ = daemon_eof_tx.send(());
         })
     };
 
     // Browser → daemon: filter, then forward. A denied or malformed request is
     // rejected locally with a JSON-RPC error, never reaching the daemon.
-    while let Some(msg) = ws_stream.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(_) => break,
+    //
+    // Selected against the daemon reader, because the two directions have to be
+    // symmetric (review WEB-4). Waiting only on `ws_stream.next()` handled "the browser
+    // went away" and nothing else: when the *daemon* went away, the reader task exited
+    // and dropped only its clone of `to_browser` while this loop kept the original, so
+    // the writer never saw the channel close, `ws_sink.close()` was never called, and
+    // the socket stayed open with no Close frame for as long as the tab was idle.
+    // There is no keepalive and no watchdog anywhere in this binary, so nothing else
+    // would have noticed: the page kept rendering "connected" over a dead daemon and
+    // its own "disconnected — reload to reconnect" signal never fired.
+    let daemon_gone = loop {
+        let msg = tokio::select! {
+            // `biased` so a daemon that has already ended is observed before another
+            // browser frame is taken off the wire — there is nowhere left to send it.
+            biased;
+            // Ready exactly once, and this arm breaks, so it is never polled again.
+            _ = &mut daemon_eof => break true,
+            next = ws_stream.next() => match next {
+                Some(Ok(m)) => m,
+                // `None` (browser closed) or a frame error: the browser is gone.
+                _ => break false,
+            },
         };
         match msg {
             Message::Text(text) => {
@@ -154,22 +183,39 @@ pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
                         continue;
                     }
                 };
+                // The daemon socket is AF_UNIX, so the first write after the peer
+                // closes fails with EPIPE. That is the *other* way the daemon's
+                // departure surfaces, and it is a departure, not a browser error.
                 if d_write.write_all(line.as_bytes()).await.is_err() {
-                    break;
+                    break true;
                 }
             }
             Message::Binary(_) => {} // the protocol is JSON text only
             Message::Ping(p) => {
                 let _ = to_browser.send(Message::Pong(p)).await;
             }
-            Message::Close(_) => break,
+            Message::Close(_) => break false,
             _ => {}
         }
+    };
+
+    // Say *why* the console is losing its connection (WEB-4). A Close frame carrying a
+    // reason is what lets the page tell "the daemon went away" — restart it and reload
+    // — from a network drop, and §17's own principle is that a dead pane must never
+    // look live. `Away` (1001) is the RFC 6455 code for an endpoint going away.
+    if daemon_gone {
+        let _ = to_browser
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Away,
+                reason: "daemon connection closed".into(),
+            })))
+            .await;
     }
 
-    // Browser gone (or errored): dropping d_write closes the daemon connection, which
-    // ends the daemon reader, which drops the last `to_browser`, which ends the
-    // writer. Await them so nothing leaks.
+    // Either side gone: dropping d_write closes the daemon connection, which ends the
+    // daemon reader (if it has not ended already), which drops the last `to_browser`,
+    // which ends the writer — after it has drained the Close frame above. Await them
+    // so nothing leaks.
     drop(d_write);
     drop(to_browser);
     let _ = daemon_to_browser.await;
@@ -195,7 +241,7 @@ fn screen(text: &str) -> Result<Value, String> {
         Err(_) => {
             return Err(rpc_error(
                 Value::Null,
-                -32600,
+                INVALID_REQUEST,
                 "invalid request: a frame must be exactly one JSON-RPC request object",
             ));
         }
@@ -203,19 +249,19 @@ fn screen(text: &str) -> Result<Value, String> {
     if !v.is_object() {
         return Err(rpc_error(
             Value::Null,
-            -32600,
+            INVALID_REQUEST,
             "invalid request: a frame must be exactly one JSON-RPC request object",
         ));
     }
     let id = v.get("id").cloned().unwrap_or(Value::Null);
     match v.get("method").and_then(Value::as_str) {
-        None => Err(rpc_error(id, -32600, "invalid request: no method")),
+        None => Err(rpc_error(id, INVALID_REQUEST, "invalid request: no method")),
         // Fail safe: anything not named in ALLOWED is refused, including verbs §10
         // grows later (§17/§15.35: the console edits the graph, but daemon lifecycle
         // stays off the browser wire).
         Some(m) if !ALLOWED.contains(&m) => Err(rpc_error(
             id,
-            -32601,
+            METHOD_NOT_FOUND,
             &format!(
                 "method {m:?} is not available from the web console (§17: lifecycle verbs stay off the browser wire)"
             ),
@@ -238,6 +284,14 @@ fn forward_line(v: &Value) -> String {
     line
 }
 
+/// One JSON-RPC error object, rendered as the single line the browser gets back.
+///
+/// `code` comes from `nexus_rpc::error_codes`, never a literal (review SIMPB-8): this
+/// is the only JSON-RPC-error-emitting surface in the workspace, and it is the one a
+/// compromised page hits, so `grep METHOD_NOT_FOUND` — the way a security reader
+/// enumerates where a refusal can come from — has to find the browser boundary too.
+/// The numbers are unchanged; the tests below still assert the literals on purpose,
+/// because the wire contract is what they are pinning.
 fn rpc_error(id: Value, code: i64, message: &str) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -364,6 +418,21 @@ mod tests {
         for text in ["7", "\"state\"", "null", "true", ""] {
             assert!(screen(text).is_err(), "{text:?} must be refused");
         }
+    }
+
+    /// Review SIMPB-8: the bridge's refusal codes come from `nexus_rpc::error_codes`,
+    /// the names the rest of the workspace uses, not from literals only this file
+    /// knows. Asserted from both ends — the constant *and* the number it renders as —
+    /// because the substitution had to leave the wire contract byte-identical.
+    #[test]
+    fn the_refusal_codes_are_the_registrys_and_the_wire_is_unchanged() {
+        assert_eq!(INVALID_REQUEST, -32600);
+        assert_eq!(METHOD_NOT_FOUND, -32601);
+        assert_eq!(rejection("not json")["error"]["code"], INVALID_REQUEST);
+        assert_eq!(
+            rejection("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"teardown\"}")["error"]["code"],
+            METHOD_NOT_FOUND
+        );
     }
 
     #[test]

@@ -32,6 +32,27 @@
 //! being guarded against, so each proves it catches a synthetic offender (and, since
 //! these two must read past legitimate prose, that it does *not* trip on a comment)
 //! before it trusts its own clean verdict.
+//!
+//! ## The entry-point doc links (review 32)
+//!
+//! [`entry_point_doc_links_resolve`] is the newest member and the one with the longest
+//! rap sheet: README's documentation index has pointed at a *deleted* design/plan pair
+//! in three consecutive review generations (review 19 DOC-5, review 26 DOC-5, review 32
+//! DOCR-1/DOCR-5). Each was patched by hand and each broke again the next time the pair
+//! was version-bumped, because "the newest pair lives in `docs/`, superseded ones move
+//! to `docs/historical/`" (§9) is a *rename* every generation and nothing checked the
+//! two files that are a newcomer's first stop. That is a gate's job, not a reviewer's.
+//!
+//! Its first version checked markdown *links* only, which covered README's index and
+//! missed the other half: AGENTS §9's parenthetical names the current pair in
+//! **backticks**, and a backtick is not a link. So the shape with the longest rap sheet
+//! was the shape still unguarded (review-32 audit).
+//! [`entry_point_design_and_plan_names_resolve`] closes it — any backticked
+//! `NN-design-…md` / `NN-implementation-plan-…md` in either entry point must name a file
+//! that exists, and one written without a directory must exist directly under `docs/`,
+//! which is precisely what stops being true the moment a generation is superseded. An
+//! explicitly-pathed `docs/historical/…` reference still resolves, because naming a
+//! superseded pair *as* historical is legitimate.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -195,7 +216,27 @@ const REFCELL_BAN_CRATES: &[&str] = &["nexus-daemon", "serialnexusd"];
 
 /// The one sanctioned `RefCell` in the daemon: `CriticalCell`'s own internals, which
 /// carry a localized `#[allow(clippy::disallowed_types)]` (§16.2).
-const REFCELL_EXEMPT: &[&str] = &["cell.rs"];
+///
+/// **A repo-relative path, not a bare file name** (review 32 TESTR-7). The exemption
+/// used to be matched against `path.file_name()`, which is depth-independent: any
+/// future `cell.rs` anywhere under a ban crate's `src` — `nexus-daemon/src/nodes/
+/// cell.rs` is the obvious one — inherited an exemption nobody had stated. That does
+/// not lose the *clippy* half of invariant 5 (a plain raw `RefCell` in such a file is
+/// still a lint error), but it loses this gate's independent half, which is precisely
+/// its coverage of the one case clippy cannot see: a raw `RefCell` carrying a local
+/// `#[allow(clippy::disallowed_types)]`. Two such allows exist today, both in the file
+/// named below, and nothing bounds where a third might appear.
+const REFCELL_EXEMPT: &[&str] = &["nexus-daemon/src/cell.rs"];
+
+/// Is `path` the one file [`REFCELL_EXEMPT`] names, matched on its **whole** path
+/// below `root`? Separators are normalised so the comparison holds off Unix.
+fn is_refcell_exempt(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    REFCELL_EXEMPT.contains(&rel.as_str())
+}
 
 #[test]
 fn unsafe_is_confined_to_nexus_sys() {
@@ -280,15 +321,40 @@ fn refcell_ban_covers_every_crate_that_holds_daemon_state() {
 
     let root = repo_root();
 
+    // 0b. …and prove the *exemption* is a path, not a name (review 32 TESTR-7). The
+    //     sanctioned file is exempt; a same-named file at another path is not. Both
+    //     probes are synthetic paths — nothing is written to the tree — because the
+    //     property under test is the matcher, and a matcher that silently widened is
+    //     this file's whole reason to exist.
+    assert!(
+        is_refcell_exempt(&root, &root.join("nexus-daemon/src/cell.rs")),
+        "the sanctioned {critical_hint} file is no longer exempt — the ban list would \
+         be red forever",
+        critical_hint = REFCELL_EXEMPT[0]
+    );
+    for impostor in [
+        "nexus-daemon/src/nodes/cell.rs",
+        "serialnexusd/src/cell.rs",
+        "nexus-daemon/src/state/cell.rs",
+    ] {
+        assert!(
+            !is_refcell_exempt(&root, &root.join(impostor)),
+            "{impostor} is exempt from the {cell} scan by nothing but its base name. \
+             The exemption covers exactly {:?}: a second `#[allow]`ed {cell} anywhere \
+             else is invisible to clippy by construction and would be invisible here \
+             too (§16.2, invariant 5)",
+            REFCELL_EXEMPT
+        );
+    }
+
     for krate in REFCELL_BAN_CRATES {
         let dir = root.join(krate);
         assert!(dir.is_dir(), "ban-list crate {krate} does not exist");
 
-        // 1. No raw RefCell in the crate's sources, `cell.rs` excepted.
+        // 1. No raw RefCell in the crate's sources, the one exempt path excepted.
         let mut offenders = Vec::new();
         for (path, src) in sources_under(&dir.join("src")) {
-            let file = path.file_name().unwrap_or_default().to_string_lossy();
-            if REFCELL_EXEMPT.contains(&file.as_ref()) {
+            if is_refcell_exempt(&root, &path) {
                 continue;
             }
             if has_code_token(&src, &cell) {
@@ -302,9 +368,8 @@ fn refcell_ban_covers_every_crate_that_holds_daemon_state() {
         }
         assert!(
             offenders.is_empty(),
-            "raw `{cell}` outside {}: {offenders:?} — daemon state belongs in \
-             `CriticalCell` (§16.2)",
-            REFCELL_EXEMPT.join("/"),
+            "raw `{cell}` outside {REFCELL_EXEMPT:?}: {offenders:?} — daemon state \
+             belongs in `CriticalCell` (§16.2)",
         );
 
         // 2. The lint file exists beside the manifest and carries the ban. This is
@@ -711,4 +776,299 @@ fn port_enumeration_cannot_open_a_device() {
             );
         }
     }
+}
+
+/// Every markdown link target in `text`, as (line number, raw target). Inline links
+/// and images alike — the syntax is `](target)` for both.
+///
+/// Deliberately a small hand-rolled extractor rather than a markdown crate: the whole
+/// point of this gate is that it has no dependency that could go stale, and the shapes
+/// it must handle are few and fixed — a bare path, a path with a `#fragment`, an
+/// `<angle-bracketed>` path, and a `path "title"` pair. Anything it cannot parse it
+/// reports as a link, so the failure mode is a loud false positive rather than a quiet
+/// miss (the same bias `has_unsafe_usage` takes).
+fn markdown_links(text: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let mut rest = line;
+        while let Some(i) = rest.find("](") {
+            let after = &rest[i + 2..];
+            let Some(close) = after.find(')') else {
+                break;
+            };
+            let target = after[..close].trim();
+            // `path "title"` → `path`; `<path>` → `path`.
+            let target = target.split_whitespace().next().unwrap_or("");
+            let target = target.trim_start_matches('<').trim_end_matches('>');
+            if !target.is_empty() {
+                out.push((n + 1, target.to_owned()));
+            }
+            rest = &after[close + 1..];
+        }
+    }
+    out
+}
+
+/// Does `target` point at something inside the repository (as opposed to the web, an
+/// in-page anchor, or a mail address)?
+fn is_relative_link(target: &str) -> bool {
+    !(target.starts_with('#')
+        || target.starts_with('/')
+        || target.contains("://")
+        || target.starts_with("mailto:"))
+}
+
+/// The path part of a link target, with any `#fragment` and `?query` removed. `None`
+/// when nothing but a fragment is left.
+fn link_path(target: &str) -> Option<&str> {
+    let path = target.split(['#', '?']).next().unwrap_or("");
+    (!path.is_empty()).then_some(path)
+}
+
+/// **Every relative doc link in the two files a newcomer opens first must resolve.**
+///
+/// `README.md` and `AGENTS.md` are the tree's entry points — the first is what a
+/// consumer reads, the second is what an agent (or a human picking this repo up cold)
+/// is told to read first. A dead link in either sends the reader to a file that was
+/// renamed a generation ago, which is exactly the failure §9's monotonic
+/// design/plan versioning manufactures: the newest pair lives in `docs/`, the previous
+/// one moves to `docs/historical/`, and the index in README has to be edited by hand
+/// each time. It was not, three reviews running.
+///
+/// Fragments are not checked — only the file or directory a link points at. That is
+/// the part that rots on a rename, and checking anchors would need a markdown parser
+/// and a slug algorithm, which is a dependency this gate is better off without.
+#[test]
+fn entry_point_doc_links_resolve() {
+    let root = repo_root();
+
+    // 1. Prove the extractor and the resolver both fire on a planted dead link, and
+    //    that neither trips on the shapes that are legitimately not repository paths.
+    //    Built by concatenation so this file carries no literal markdown link of its
+    //    own for the gate to find later.
+    let planted = format!(
+        "see [the design]{}\nand [the plan]{}\n",
+        "(docs/00-a-design-that-was-deleted.md)", "(docs/rpc/)"
+    );
+    let found = markdown_links(&planted);
+    assert_eq!(
+        found.len(),
+        2,
+        "the link extractor missed a planted link: {found:?}"
+    );
+    assert!(
+        !root.join(link_path(&found[0].1).unwrap()).exists(),
+        "the planted dead link unexpectedly exists — pick another name"
+    );
+    assert!(
+        root.join(link_path(&found[1].1).unwrap()).exists(),
+        "the resolver cannot see a directory target that really is there"
+    );
+    for skipped in [
+        "https://example.invalid/x",
+        "#an-in-page-anchor",
+        "mailto:nobody@example.invalid",
+    ] {
+        assert!(
+            !is_relative_link(skipped),
+            "{skipped} must not be treated as a repository path"
+        );
+    }
+    // A `path "title"` pair and an `<angled>` path both reduce to the path.
+    for (raw, want) in [
+        ("[x](docs/macos.md \"macOS\")", "docs/macos.md"),
+        ("[x](<docs/macos.md>)", "docs/macos.md"),
+        ("[x](docs/macos.md#gotchas)", "docs/macos.md"),
+    ] {
+        let got = markdown_links(raw);
+        assert_eq!(got.len(), 1, "extractor failed on {raw:?}: {got:?}");
+        assert_eq!(link_path(&got[0].1), Some(want), "on {raw:?}");
+    }
+
+    // 2. The real scan.
+    let mut checked = 0usize;
+    let mut dead: Vec<String> = Vec::new();
+    for file in ["README.md", "AGENTS.md"] {
+        let path = root.join(file);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        for (line, target) in markdown_links(&text) {
+            if !is_relative_link(&target) {
+                continue;
+            }
+            let Some(rel) = link_path(&target) else {
+                continue;
+            };
+            checked += 1;
+            // Relative to the linking file's own directory, which for these two is the
+            // repo root — written the general way so a moved entry point still works.
+            let base = path.parent().unwrap_or(&root);
+            if !base.join(rel).exists() {
+                dead.push(format!("{file}:{line} -> {target}"));
+            }
+        }
+    }
+    assert!(
+        dead.is_empty(),
+        "dead relative links in the tree's entry-point docs: {dead:?}\n\
+         These are the first files a newcomer opens. README's documentation index has \
+         pointed at a deleted design/plan pair in three consecutive reviews (19 DOC-5, \
+         26 DOC-5, 32 DOCR-1/DOCR-5) because §9's monotonic versioning renames that \
+         pair every generation; this gate is what replaces patching it by hand."
+    );
+    // 3. And the scan was not vacuous: an extractor that silently stopped extracting
+    //    is the failure invariant 5 suffered, so a floor rather than a bare `> 0`.
+    assert!(
+        checked >= 10,
+        "only {checked} relative links found across README.md and AGENTS.md — the \
+         extractor has stopped seeing them, and a gate that checks nothing passes \
+         forever"
+    );
+}
+
+/// The content of every single-backtick code span in `text`, as (line number, span).
+///
+/// Line-local and deliberately naive — split each line on the backtick and keep the odd
+/// pieces. A fenced code block yields nothing interesting (its lines carry no backticks,
+/// and the ``` fences themselves reduce to empty strings or a language tag), and none of
+/// those can look like the filenames below.
+fn backtick_spans(text: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        for (i, piece) in line.split('`').enumerate() {
+            if i % 2 == 1 && !piece.is_empty() {
+                out.push((n + 1, piece.to_owned()));
+            }
+        }
+    }
+    out
+}
+
+/// Is `token` a §9 generation-numbered design or implementation-plan filename —
+/// `30-design-claude-fable-v13.md`, `docs/31-implementation-plan-claude-fable-v13.md`?
+///
+/// The leading number is required, because that is what §9 bumps; the middle is left
+/// open, because the author name in it has already changed twice.
+fn is_generation_doc(token: &str) -> bool {
+    let base = token.rsplit('/').next().unwrap_or(token);
+    base.ends_with(".md")
+        && base
+            .split('-')
+            .next()
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        && (base.contains("-design-") || base.contains("-implementation-plan-"))
+}
+
+/// Where a [`is_generation_doc`] token must be found, relative to the repository root:
+/// as written when it carries a directory, else directly under `docs/`.
+fn generation_doc_path(token: &str) -> PathBuf {
+    if token.contains('/') {
+        PathBuf::from(token)
+    } else {
+        Path::new("docs").join(token)
+    }
+}
+
+/// **Every backticked design/plan filename in the entry-point docs must exist — and the
+/// un-pathed ones must be the *current* pair.**
+///
+/// The sibling of [`entry_point_doc_links_resolve`], for the half a link checker cannot
+/// see. `AGENTS.md` §9 names the current pair in prose, in backticks
+/// (`NN-design-…` + `NN-implementation-plan-…`), and that parenthetical is the exact site
+/// that went stale in three consecutive review generations. A stale one is not cosmetic:
+/// §9 says `§N` always means the *current* normative design, so a newcomer sent to a
+/// superseded file reads rules the code no longer implements — which AGENTS' own opening
+/// paragraph records as having cost this project two rounds of deleted working code.
+///
+/// The resolution rule is what gives the gate its teeth. A bare filename must exist
+/// directly under `docs/`, where §9 puts only the newest pair; the moment a generation is
+/// superseded the file moves to `docs/historical/` and this fails. A token written *with*
+/// a directory resolves as written, so prose that deliberately cites a historical
+/// generation (`docs/historical/28-design-…`) stays legal.
+///
+/// Proved fail-first end to end, not only through the planted-violation block below: with
+/// a stale name spliced into the scanned text the gate fails naming it, and the pathed
+/// historical name spliced beside it is accepted in the same run.
+#[test]
+fn entry_point_design_and_plan_names_resolve() {
+    let root = repo_root();
+
+    // 1. Planted-violation self-proof, in both directions. Assembled from pieces so this
+    //    file contains no literal offender of its own.
+    let stale = format!("{}{}{}", "29-", "implementation-plan-", "gone-v12.md");
+    let live = format!("{}{}{}", "30-", "design-", "claude-fable-v13.md");
+    let planted = format!("§9 (currently `{live}` + `{stale}`), superseded ones move\n");
+    let spans = backtick_spans(&planted);
+    assert_eq!(
+        spans.len(),
+        2,
+        "the backtick extractor missed a planted span: {spans:?}"
+    );
+    assert!(
+        spans.iter().all(|(_, s)| is_generation_doc(s)),
+        "the filename matcher no longer recognises a §9 generation doc: {spans:?}"
+    );
+    assert!(
+        !root.join(generation_doc_path(&stale)).exists(),
+        "the planted stale name unexpectedly exists — pick another"
+    );
+    assert!(
+        root.join(generation_doc_path(&live)).exists(),
+        "the resolver cannot see the current design, which is right there in docs/"
+    );
+    // …and the shapes that must NOT be treated as generation docs: ordinary prose, an
+    // un-numbered doc, and a review file that happens to be numbered.
+    for benign in [
+        "cargo test --workspace",
+        "docs/macos.md",
+        "docs/historical/26-claude-opus-code-review.md",
+        "§15.37",
+    ] {
+        assert!(
+            !is_generation_doc(benign),
+            "{benign:?} must not be read as a design/plan filename"
+        );
+    }
+    // A historical citation written *with* its directory stays legal.
+    let historical = "docs/historical/28-design-claude-fable-v12.md";
+    assert!(is_generation_doc(historical));
+    assert_eq!(generation_doc_path(historical), PathBuf::from(historical));
+
+    // 2. The real scan.
+    let mut checked = 0usize;
+    let mut stale_names: Vec<String> = Vec::new();
+    for file in ["README.md", "AGENTS.md"] {
+        let path = root.join(file);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        for (line, span) in backtick_spans(&text) {
+            for token in span.split_whitespace() {
+                let token = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '/');
+                if !is_generation_doc(token) {
+                    continue;
+                }
+                checked += 1;
+                if !root.join(generation_doc_path(token)).exists() {
+                    stale_names.push(format!("{file}:{line} -> {token}"));
+                }
+            }
+        }
+    }
+    assert!(
+        stale_names.is_empty(),
+        "backticked design/plan filenames in the entry-point docs that do not exist \
+         under docs/: {stale_names:?}\n\
+         §9 bumps this pair every generation and moves the old one to docs/historical/. \
+         A bare filename here must be the *current* pair; cite a superseded one with its \
+         directory (docs/historical/…) if that is what you meant."
+    );
+    // 3. Not vacuous: the two entry points must still be naming the pair somewhere. If
+    //    this floor ever wants lowering, the pair stopped being named by filename at all
+    //    — which is also a change worth noticing.
+    assert!(
+        checked >= 3,
+        "only {checked} backticked design/plan filenames found across README.md and \
+         AGENTS.md — the extractor has stopped seeing them, and a gate that checks \
+         nothing passes forever"
+    );
 }

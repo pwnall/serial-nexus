@@ -1,6 +1,8 @@
 // Thin Origin Private File System persistence for console scrollback (design §11.9 /
-// §15.32). Storage only — the splice/retention math is history.mjs, and this holds no
-// logic worth unit-testing; it is exercised by the browser/manual checklist per §16.7.
+// §15.32). Storage only — the splice/retention math is history.mjs. The I/O itself is
+// exercised in a real browser by `ui-tests/tests/history.spec.mjs`; the one piece of
+// pure logic here, the key→filename mapping, is exported and unit-tested, because a
+// non-injective mapping silently merged two consoles' records (review HIST-5).
 //
 // One flat file per console-history key holds an 8-byte little-endian hostward end-offset
 // header followed by the (already 16-MiB-capped) bytes, so a reload restores both the
@@ -35,8 +37,26 @@ export async function requestPersistence() {
   return "unavailable";
 }
 
-function fileName(key) {
-  return "hist_" + key.replace(/[^A-Za-z0-9._-]/g, "_") + ".bin";
+/// The storage name for one console-history key. **The mapping has to be injective**,
+/// and the obvious sanitiser is not: replacing every unsafe character with `_` maps the
+/// endpoint separator `/` onto a character that is itself legal inside a node name (§3
+/// bans only `/`), so the consoles `mux/console` and `mux_console` shared one record and
+/// `save()`'s `createWritable()` truncated one console's scrollback into the other's
+/// (review HIST-5). Percent-escaping is injective because `%` is itself escaped.
+///
+/// The escape body is a *fixed* four hex digits, which is the half that is easy to get
+/// wrong: a variable-width body is not injective either — `!` (`%21`) followed by the
+/// literal digits `92` and the single code unit `→` (`%2192`) would produce the same
+/// name. Exported so `history.test.mjs` can assert the injectivity directly.
+export function fileName(key) {
+  return "hist_" + encodeKey(key) + ".bin";
+}
+
+function encodeKey(key) {
+  return key.replace(
+    /[^A-Za-z0-9.-]/g,
+    (c) => "%" + c.charCodeAt(0).toString(16).padStart(4, "0"),
+  );
 }
 
 async function root() {
@@ -100,5 +120,49 @@ export async function clear(key) {
     await (await root()).removeEntry(fileName(key));
   } catch {
     /* already gone */
+  }
+}
+
+/// Reclaim every stored history record that does not belong to this origin and this
+/// daemon boot, returning how many were removed. Never throws: an enumeration this
+/// browser does not support, or a record another tab is holding, degrades to "reclaimed
+/// fewer than we hoped", which is the correct failure for a best-effort cache.
+///
+/// Records are keyed by `host::endpoint::instance`, and `instance` is the daemon's
+/// *per-boot* nonce (§11.8) — so every restart mints a whole new set of filenames and,
+/// with only `clear(key)` for deletion, the old set was immortal. §15.32's retention
+/// model is "a per-console cap (default 16 MiB, trim-oldest)", i.e. bounded by
+/// consoles; the nonce silently multiplied that bound by the number of restarts, until
+/// the origin hit its quota and persistence died for good with no in-product way to
+/// reclaim the space (review HIST-3). One sweep per connection restores the stated
+/// bound. It also reclaims records written by earlier versions of this client, whose
+/// filenames used a different (non-injective — HIST-5) escaping and therefore match
+/// neither the kept prefix nor the kept suffix.
+export async function pruneForeign(prefix, keepInstance) {
+  try {
+    const dir = await root();
+    if (typeof dir.entries !== "function") return 0;
+    const head = "hist_" + encodeKey(prefix);
+    const tail = encodeKey("::" + keepInstance) + ".bin";
+    // Collect first, delete second: removing entries from a directory while iterating
+    // it is exactly the kind of thing that skips half the list.
+    const doomed = [];
+    for await (const [name] of dir.entries()) {
+      if (!name.startsWith("hist_") || !name.endsWith(".bin")) continue;
+      if (name.startsWith(head) && name.endsWith(tail)) continue;
+      doomed.push(name);
+    }
+    let removed = 0;
+    for (const name of doomed) {
+      try {
+        await dir.removeEntry(name);
+        removed += 1;
+      } catch {
+        /* raced with another tab; it is a cache */
+      }
+    }
+    return removed;
+  } catch {
+    return 0;
   }
 }

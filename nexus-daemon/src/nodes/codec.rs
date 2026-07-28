@@ -25,8 +25,9 @@
 //! lock (FIFO) once the stealer releases — the §6 stall, with commands delayed,
 //! never dropped.
 
+use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -37,12 +38,12 @@ use nexus_core::graph::{EndpointAddr, Facing};
 use nexus_core::state::{NodeState, NodeStatus};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
+use crate::boundary::TaskSet;
 use crate::cell::CriticalCell;
 use crate::runtime::{
-    DropCounters, EdgeInbox, SharedFanOut, SharedTargetEdge, Wiring, await_origin, frame_ranges,
-    reacquire_held,
+    DropCounters, EdgeInbox, HostwardChannelStat, LossCounter, SharedFanOut, SharedTargetEdge,
+    Wiring, await_origin, forward_targetward, frame_ranges, route_channel_data,
 };
 use crate::tap::TapFeed;
 
@@ -72,6 +73,181 @@ struct ChannelStat {
     active: Cell<bool>,
 }
 
+/// The §5 hostward accounting rule, shared with the exec codec and the leg through
+/// the one [`route_channel_data`] implementation (SIMP-1). The struct stays this
+/// node's own — the counters' *names* are part of `state`'s contract — and only the
+/// arithmetic is shared. [`HostwardChannelStat::add_dropped_full`] is left at its
+/// no-op default deliberately: a slow consumer's full-buffer loss is charged to that
+/// consumer's own [`DropCounters`] at the boundary that dropped it (§5), and the
+/// codec's narrower `discarded_unattached` means "reached no live consumer at all".
+impl HostwardChannelStat for ChannelStat {
+    fn set_active(&self) {
+        self.active.set(true);
+    }
+
+    fn add_delivered(&self, n: u64) {
+        self.delivered_hostward
+            .set(self.delivered_hostward.get() + n);
+    }
+
+    fn unattached(&self) -> &dyn LossCounter {
+        &self.discarded_unattached
+    }
+}
+
+/// The largest number of *distinct* unconfigured channel identities a codec node
+/// remembers (CODEC-1). Same cap, same reasoning as the leg's `unbound` list
+/// (LEG-2): the identities come from outside the operator's configuration — a
+/// transform's decode, or an exec child's stdout — so an unbounded list is an
+/// unbounded allocation driven by the wire.
+pub(crate) const MAX_UNCONFIGURED: usize = 256;
+
+/// The largest stored length of one such identity, in bytes.
+pub(crate) const MAX_UNCONFIGURED_ID_LEN: usize = 64;
+
+/// Appended to a truncated identity, so `state` never shows a shortened name as
+/// though it were the real one.
+const TRUNCATION_MARKER: &str = "…(truncated)";
+
+/// Channel identities the transform decoded that this node is **not** configured
+/// for, and the bytes they carried (CODEC-1, design §5 "loss is always visible and
+/// attributable").
+///
+/// The bytes are still dropped — §8's rule that an announcement never grows the
+/// graph governs a codec's channels exactly as it does a leg's, and
+/// `docs/codec-authors.md` states it outright. What was missing is the *diagnosis*.
+/// A mis-spelled configured channel is already visible (it sits at `waiting` /
+/// `delivered_hostward: 0`, §8's configured-but-unannounced signal); nothing
+/// anywhere named the identity actually on the wire, which is the only thing that
+/// distinguishes a typo from a device multiplexing a stream the operator never
+/// enumerated.
+///
+/// This is `leg::UnboundSet`'s design reused rather than re-derived: a capped,
+/// insertion-ordered `Vec`, a `HashSet` for dedup, per-identity truncation with an
+/// explicit marker, and an overflow *occurrence* count for what the cap refused.
+/// It lives in this module because the codec node is its first user and the exec
+/// codec shares this one copy (`nodes/exec.rs`), so the two cannot drift.
+#[derive(Default)]
+pub(crate) struct UnconfiguredChannels {
+    order: Vec<String>,
+    seen: HashSet<String>,
+    /// Occurrences the cap refused to record — *not* distinct identities, which
+    /// cannot be counted without remembering them, which is the thing being bounded.
+    /// A repeat of an already-recorded identity is not an overflow.
+    overflow: u64,
+    /// Bytes discarded on an unconfigured identity, whether or not the identity
+    /// itself was recordable.
+    bytes: u64,
+}
+
+impl UnconfiguredChannels {
+    /// Record `n` bytes discarded on unconfigured identity `id`. `n == 0` records
+    /// the identity alone, which is what an `open` on it amounts to.
+    ///
+    /// The first sighting also logs once at WARN — the dedup *is* the rate limit, so
+    /// an unconfigured channel screaming at 1 MB/s costs exactly one line.
+    pub(crate) fn record(&mut self, id: &str, n: u64) {
+        self.bytes += n;
+        let id = truncate_identity(id);
+        if self.seen.contains(id.as_ref()) {
+            return;
+        }
+        if self.order.len() >= MAX_UNCONFIGURED {
+            self.overflow += 1;
+            return;
+        }
+        tracing::warn!(
+            target: "codec",
+            channel = %id,
+            "decoded data on a channel identity this node is not configured for; \
+             dropped and counted as discarded_unconfigured_channel (§5)"
+        );
+        let id = id.into_owned();
+        self.seen.insert(id.clone());
+        self.order.push(id);
+    }
+
+    /// Write the three §5 fields into a node's `state_extra` object. One writer for
+    /// both node kinds, so the codec and the exec codec cannot come to report the
+    /// same loss under two different names.
+    pub(crate) fn report_into(&self, obj: &mut serde_json::Map<String, Value>) {
+        obj.insert(
+            "discarded_unconfigured_channel".to_owned(),
+            json!(self.bytes),
+        );
+        obj.insert("unconfigured_channels".to_owned(), json!(self.order));
+        obj.insert("unconfigured_overflow".to_owned(), json!(self.overflow));
+    }
+}
+
+/// Bound the stored length of a decoded identity, marking a truncation explicitly.
+/// Truncation lands on a `char` boundary: the identity is transform-supplied UTF-8
+/// and a split code point would not survive JSON.
+fn truncate_identity(id: &str) -> Cow<'_, str> {
+    if id.len() <= MAX_UNCONFIGURED_ID_LEN {
+        return Cow::Borrowed(id);
+    }
+    let mut end = MAX_UNCONFIGURED_ID_LEN;
+    while end > 0 && !id.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!("{}{TRUNCATION_MARKER}", &id[..end]))
+}
+
+/// The prefix every demux-failure fault reason carries, so the demux task can tell
+/// *its own* fault from a status set elsewhere (an edge detach) and clear only the
+/// former.
+const DEMUX_FAULT_PREFIX: &str = "codec demux error: ";
+
+/// The node's demux-side protocol health (WIRE-1, design §7.5 / §5).
+///
+/// `Codec::demux` returning `Err` is the only way the trait can express §7.5's
+/// sanctioned "treats any framing violation as a protocol error and never resyncs"
+/// policy — and a codec that never resyncs is, after its first violation,
+/// permanently unable to deliver anything. The daemon used to answer that with one
+/// `tracing::warn!` and nothing else: no counter, no `state` field, and a node that
+/// went on reporting `active` with `framing_errors: 0` (that is `resync_count()`,
+/// whose trait default is 0 for exactly the codecs that never resync) while 100% of
+/// the device's output vanished. Unreachable through the shipped registry — the
+/// reference codec resyncs by length guidance and always returns `Ok` — and fully
+/// reachable through the first-class out-of-tree codec surface (§15.26).
+///
+/// So a refusal now **faults the node** instead of only logging it: `active` is a
+/// claim about delivery, and a transform refusing the stream is not delivering. The
+/// fault is deliberately *not* latched — a transform that decodes the next chunk
+/// clears it — because an `Err`-then-`Ok` codec is legal too and latching would
+/// misreport a transient violation as a dead node for the rest of the session.
+#[derive(Default)]
+struct DemuxHealth {
+    /// `Codec::demux` refusals since the node started.
+    errors: Cell<u64>,
+    /// Multiplexed *input* bytes a refusing `demux` did **not** turn into hostward
+    /// payload: the chunk as it arrived, less the `data` bytes the same call emitted
+    /// before it failed.
+    ///
+    /// The subtraction is not a refinement, it is a correction. Nothing in the
+    /// `codec-api` contract says a transform must emit nothing before returning
+    /// `Err`, and the realistic shape does the opposite: a non-resyncing framer
+    /// decodes the good frames out of a 64 KiB chunk and refuses on the corrupt tail.
+    /// Every one of those events is still routed and credited to its channel's
+    /// `delivered_hostward` below, so charging the whole chunk here reported the same
+    /// payload as delivered *and* as lost — §5 wants loss attributable, and a counter
+    /// that double-counts is worse than a coarse one, because it makes the two
+    /// numbers irreconcilable. Framing overhead of the salvaged frames is still
+    /// charged (the trait cannot report consumption), which errs toward reporting
+    /// loss rather than hiding it; and a call that emits *more* than it was handed —
+    /// legal, a transform flushing frames buffered from earlier chunks — saturates at
+    /// zero rather than wrapping.
+    discarded_hostward: Cell<u64>,
+    /// Whether the node currently carries *this* task's fault, so the success path
+    /// costs one non-atomic load per chunk rather than a status read.
+    faulted: Cell<bool>,
+    /// The most recent refusal's message, surfaced in `state` so the diagnosis does
+    /// not live only in the daemon log. Also the rate limiter: an unchanged message
+    /// neither re-logs nor re-stamps the node's status (§7's transition stamp).
+    last: CriticalCell<Option<String>>,
+}
+
 pub struct CodecNode {
     pub name: String,
     codec_name: String,
@@ -95,9 +271,17 @@ pub struct CodecNode {
     /// They are drained rather than dropped (see `drain_unwired_channels`) so a
     /// writer's task survives, and counted here so the loss stays attributable (§5).
     mux_discarded_targetward: Rc<Cell<u64>>,
-    tasks: Vec<JoinHandle<()>>,
-    /// The node's observed status *and the moment it entered it* (§7).
-    status: NodeState,
+    /// Identities the transform decoded that this node has no channel for, bounded
+    /// and named (CODEC-1). Shared with the demux task.
+    unconfigured: Rc<CriticalCell<UnconfiguredChannels>>,
+    /// The demux-side protocol health (WIRE-1). Shared with the demux task, which
+    /// is what faults the node on a `Codec::demux` refusal.
+    demux: Rc<DemuxHealth>,
+    tasks: TaskSet,
+    /// The node's observed status *and the moment it entered it* (§7). Shared with
+    /// the demux task (WIRE-1) the way the exec codec shares its own, so a framing
+    /// refusal can be reported as a fault rather than only logged.
+    status: Rc<CriticalCell<NodeState>>,
 }
 
 impl CodecNode {
@@ -128,47 +312,52 @@ impl CodecNode {
             mux_counters: None,
             mux_edge: None,
             mux_discarded_targetward: Rc::new(Cell::new(0)),
-            tasks: Vec::new(),
-            status: NodeState::new(NodeStatus::Active),
+            unconfigured: Rc::new(CriticalCell::new(UnconfiguredChannels::default())),
+            demux: Rc::new(DemuxHealth::default()),
+            tasks: TaskSet::default(),
+            status: Rc::new(CriticalCell::new(NodeState::new(NodeStatus::Active))),
         }
     }
 
-    /// Claim every channel's targetward receiver and park it in a draining task,
-    /// for the `start` paths that return before the data plane is built (§15.8).
+    /// Claim every host-facing endpoint's targetward receiver and park it in a
+    /// draining task, for the `start` paths that return before the data plane is
+    /// built (§15.8).
     ///
     /// A node that comes up `waiting` still owns its endpoints, and those endpoints
     /// still have live senders. Leaving the receivers in the wiring plan drops them
     /// when `load` finishes, which is indistinguishable to a writer from the graph
     /// being torn down — see the MAP-1 chain in `start`. Draining keeps every writer
-    /// healthy and every lost byte counted.
+    /// healthy and every lost byte counted (§5).
+    ///
+    /// **Reachability, stated honestly (SIMPB-5).** The one caller is `start`'s
+    /// `faces = "host"` exit, and for a re-multiplexer it is the *multiplexed*
+    /// endpoint that faces host while every channel faces target — so
+    /// `Wiring::build` never puts a channel receiver in `host_targetward_rx` and
+    /// this sweep finds exactly one. It still sweeps both, as cheap insurance
+    /// against a future early return in `start` (v12's edge surgery removed the
+    /// second one, which is what made the channel arm dead), and charges everything
+    /// it finds to the one node-level counter — the shape the exec codec already
+    /// had. Note what this is *not*: the read-only demux (`write_mode = "never"` on
+    /// a `faces = "target"` codec's multiplexed edge) never comes through here at
+    /// all. That case is handled by `channel_targetward`'s `await_origin` → `None`
+    /// arm, and that arm is load-bearing — `p9_unwired_interior.rs` pins it.
     fn drain_unwired_channels(&mut self, wiring: &mut Wiring) {
-        // Whichever side faces host owns the arbitrated targetward channel: the
-        // channels for a demultiplexer, the multiplexed endpoint for a re-multiplexer.
-        // Sweep both rather than assuming an orientation, so neither `start` exit can
-        // leak a receiver.
-        let addrs = std::iter::once((None, EndpointAddr::node(&self.name))).chain(
-            self.channels
-                .iter()
-                .map(|ch| (Some(ch.clone()), EndpointAddr::channel(&self.name, ch))),
-        );
-        for (channel, addr) in addrs.collect::<Vec<_>>() {
+        let addrs: Vec<EndpointAddr> = std::iter::once(EndpointAddr::node(&self.name))
+            .chain(
+                self.channels
+                    .iter()
+                    .map(|ch| EndpointAddr::channel(&self.name, ch)),
+            )
+            .collect();
+        for addr in addrs {
             let Some(rx) = wiring.host_targetward_rx.remove(&addr) else {
                 continue;
             };
-            // A per-channel stat exists for a channel endpoint; the multiplexed
-            // endpoint has none, so its discards are counted against the node's
-            // mux-side counter instead of being lost.
-            match channel.and_then(|ch| self.stats.get(&ch).cloned()) {
-                Some(stat) => self
-                    .tasks
-                    .push(tokio::task::spawn_local(channel_targetward_drain(rx, stat))),
-                None => self
-                    .tasks
-                    .push(tokio::task::spawn_local(mux_targetward_drain(
-                        rx,
-                        self.mux_discarded_targetward.clone(),
-                    ))),
-            }
+            self.tasks
+                .push(tokio::task::spawn_local(unwired_targetward_drain(
+                    rx,
+                    self.mux_discarded_targetward.clone(),
+                )));
         }
     }
 
@@ -183,11 +372,13 @@ impl CodecNode {
             // waiting/faulted state family's `waiting` arm (§15.8): the environment
             // it needs is simply not there yet, and no environmental failure has
             // occurred. Faulting here misreported deferred work as a malfunction.
-            self.status.set(NodeStatus::Waiting {
-                reason: "standalone re-multiplexer orientation (faces=host) has no driver; \
-                         deferred work (§14) — a leg node re-multiplexes through its own \
-                         link codec"
-                    .to_owned(),
+            self.status.with_mut(|s| {
+                s.set(NodeStatus::Waiting {
+                    reason: "standalone re-multiplexer orientation (faces=host) has no driver; \
+                             deferred work (§14) — a leg node re-multiplexes through its own \
+                             link codec"
+                        .to_owned(),
+                })
             });
             // Same rule as the no-upstream exit below: a waiting node must be inert,
             // not destructive. A re-multiplexer's *multiplexed* side faces host, so it
@@ -212,8 +403,10 @@ impl CodecNode {
         self.mux_edge = wiring.target_edges.remove(&mux);
         self.mux_counters = wiring.target_counters.remove(&mux);
         if !self.mux_attached() {
-            self.status.set(NodeStatus::Waiting {
-                reason: "multiplexed side has no attached upstream".to_owned(),
+            self.status.with_mut(|s| {
+                s.set(NodeStatus::Waiting {
+                    reason: "multiplexed side has no attached upstream".to_owned(),
+                })
             });
         }
 
@@ -240,9 +433,14 @@ impl CodecNode {
             self.tasks.push(tokio::task::spawn_local(hostward_demux(
                 self.codec.clone(),
                 inbox,
-                channel_sinks,
-                channel_feeds,
-                self.stats.clone(),
+                DemuxSinks {
+                    channel_sinks,
+                    channel_feeds,
+                    stats: self.stats.clone(),
+                    unconfigured: self.unconfigured.clone(),
+                    demux: self.demux.clone(),
+                    status: self.status.clone(),
+                },
             )));
         }
 
@@ -293,17 +491,23 @@ impl CodecNode {
         if !endpoint.is_default() || endpoint.node != self.name {
             return;
         }
-        self.status.set(if attached {
-            NodeStatus::Active
-        } else {
-            NodeStatus::Waiting {
-                reason: "multiplexed side has no attached upstream".to_owned(),
-            }
+        // An edge attach/detach is the operator's own act, so it wins over a demux
+        // fault the transform may be sitting in (WIRE-1): the fault flag is cleared
+        // with it, and the next refusal re-reports one.
+        self.demux.faulted.set(false);
+        self.status.with_mut(|s| {
+            s.set(if attached {
+                NodeStatus::Active
+            } else {
+                NodeStatus::Waiting {
+                    reason: "multiplexed side has no attached upstream".to_owned(),
+                }
+            })
         });
     }
 
     pub fn status(&self) -> NodeState {
-        self.status.clone()
+        self.status.with(|s| s.clone())
     }
 
     pub fn state_extra(&self) -> Value {
@@ -334,10 +538,19 @@ impl CodecNode {
                 (ch.clone(), obj)
             })
             .collect();
-        json!({
+        let mut obj = json!({
             "codec": self.codec_name,
             "faces": self.faces.to_string(),
+            // The transform's *own* framing accounting (`resync_count`), which is 0
+            // by trait default for exactly the codecs that never resync — which is
+            // why `demux_errors` beside it is the daemon's own count and not a
+            // duplicate of this one (WIRE-1).
             "framing_errors": framing_errors,
+            // WIRE-1: `Codec::demux` refusals, the multiplexed input bytes they cost,
+            // and the last message — the §7.5 never-resync policy's only signal, which
+            // used to be a log line and nothing else.
+            "demux_errors": self.demux.errors.get(),
+            "last_demux_error": self.demux.last.with(|l| l.clone()),
             // The multiplexed side's own hostward drops (the codec falling behind
             // the serial), so the loss stays located and attributable (§5).
             "multiplexed": {
@@ -346,19 +559,29 @@ impl CodecNode {
                 // re-multiplexer orientation, §14) — inert rather than destructive,
                 // and counted rather than silent (§5).
                 "discarded_targetward": mux_discarded_targetward,
+                // Multiplexed bytes a refusing `demux` never turned into events.
+                "discarded_hostward": self.demux.discarded_hostward.get(),
             },
             "channels": channels,
-        })
+        });
+        // CODEC-1's three fields, written by the one shared reporter so the codec and
+        // the exec codec name the same loss the same way.
+        if let Value::Object(map) = &mut obj {
+            self.unconfigured.with(|u| u.report_into(map));
+        }
+        obj
     }
 
     /// Ask this node's tasks to stop, without waiting (§16.1, BND-1). An interior
     /// codec owns no blocking thread and no environment to release, so signalling
     /// *is* its whole teardown; the method exists so the daemon can signal every
     /// node uniformly before it pays any node's join cost.
+    ///
+    /// It needs no `impl Drop`: [`TaskSet`] aborts what it holds when the node value
+    /// dies, so "a node's tasks die with the node" holds by type rather than by a
+    /// hand-written copy of this body (SIMPB-10).
     pub fn signal_stop(&mut self) {
-        for t in self.tasks.drain(..) {
-            t.abort();
-        }
+        self.tasks.abort_all();
     }
 
     pub fn teardown(&mut self) {
@@ -366,11 +589,65 @@ impl CodecNode {
     }
 }
 
-impl Drop for CodecNode {
-    fn drop(&mut self) {
-        for t in self.tasks.drain(..) {
-            t.abort();
+/// Everything the hostward demux task writes into: the per-channel fan-outs, tap
+/// feeds and stats, plus the three node-level signals a decode can raise — an
+/// unconfigured identity (CODEC-1), a `Codec::demux` refusal (WIRE-1), and the node
+/// status the latter faults. Bundled because the task took five parameters before
+/// and the honest count is eight.
+struct DemuxSinks {
+    channel_sinks: HashMap<String, SharedFanOut>,
+    channel_feeds: HashMap<String, TapFeed>,
+    stats: Rc<HashMap<String, Rc<ChannelStat>>>,
+    unconfigured: Rc<CriticalCell<UnconfiguredChannels>>,
+    demux: Rc<DemuxHealth>,
+    status: Rc<CriticalCell<NodeState>>,
+}
+
+impl DemuxSinks {
+    /// Record a `Codec::demux` refusal (WIRE-1): count it, charge what the refusal
+    /// actually cost, remember the message and fault the node. Only a *changed*
+    /// message re-logs and re-stamps the status, so a transform failing on every
+    /// chunk of a firehose costs one WARN line and one status transition, not one per
+    /// chunk.
+    ///
+    /// `salvaged` is the `data` payload this same `demux` call emitted before
+    /// failing, which the caller sums off the event list; it is subtracted because
+    /// those bytes are routed and credited to their channels, so charging them here
+    /// too reports one payload twice (see [`DemuxHealth::discarded_hostward`]).
+    fn note_demux_error(&self, chunk_len: u64, salvaged: u64, reason: String) {
+        let d = &self.demux;
+        d.errors.set(d.errors.get() + 1);
+        d.discarded_hostward.add(chunk_len.saturating_sub(salvaged));
+        let changed = d.last.with_mut(|last| {
+            if last.as_deref() == Some(reason.as_str()) {
+                return false;
+            }
+            *last = Some(reason.clone());
+            true
+        });
+        if !changed && d.faulted.get() {
+            return;
         }
+        tracing::warn!(target: "codec", "{DEMUX_FAULT_PREFIX}{reason}");
+        self.status.with_mut(|s| {
+            s.set(NodeStatus::Faulted {
+                reason: format!("{DEMUX_FAULT_PREFIX}{reason}"),
+            })
+        });
+        d.faulted.set(true);
+    }
+
+    /// The transform decoded a chunk after a refusal, so the violation was transient
+    /// and the node is delivering again. Only *this* task's fault is cleared — a
+    /// `waiting` set by an edge detach, or a fault set elsewhere, is left alone.
+    fn clear_demux_fault(&self) {
+        self.demux.faulted.set(false);
+        self.status.with_mut(|s| {
+            if matches!(s.status(), NodeStatus::Faulted { reason } if reason.starts_with(DEMUX_FAULT_PREFIX))
+            {
+                s.set(NodeStatus::Active);
+            }
+        });
     }
 }
 
@@ -381,9 +658,7 @@ impl Drop for CodecNode {
 async fn hostward_demux(
     codec: Rc<CriticalCell<Box<dyn Codec>>>,
     mut inbox: EdgeInbox,
-    channel_sinks: HashMap<String, SharedFanOut>,
-    channel_feeds: HashMap<String, TapFeed>,
-    stats: Rc<HashMap<String, Rc<ChannelStat>>>,
+    out: DemuxSinks,
 ) {
     // One task across every upstream edge this node is given over its life (§15.35):
     // it parks on the inbox while unattached, drains an edge until `disconnect`
@@ -392,52 +667,70 @@ async fn hostward_demux(
     while let Some(mut mux_rx) = inbox.recv().await {
         while let Some(chunk) = mux_rx.recv().await {
             let mut events = Vec::new();
-            codec.with_mut(|c| {
-                if let Err(e) = c.demux(&chunk, &mut |ev| events.push(ev)) {
-                    tracing::warn!("codec demux error: {e}");
-                }
+            let refused = codec.with_mut(|c| {
+                c.demux(&chunk, &mut |ev| events.push(ev))
+                    .err()
+                    .map(|e| e.to_string())
             });
+            match refused {
+                // WIRE-1: a refusal is the §7.5 never-resync policy speaking, and it
+                // is now visible in `state` (counter, byte cost, message, faulted
+                // node) rather than only in the log. The cost is the chunk *less*
+                // whatever the same call already emitted — those events are routed
+                // and credited below, and a partial decode is the normal shape of a
+                // non-resyncing framer, not an exotic one.
+                Some(reason) => {
+                    let salvaged: u64 = events
+                        .iter()
+                        .map(|ev| match &ev.kind {
+                            EventKind::Data(bytes) => bytes.len() as u64,
+                            _ => 0,
+                        })
+                        .sum();
+                    out.note_demux_error(chunk.len() as u64, salvaged, reason)
+                }
+                None if out.demux.faulted.get() => out.clear_demux_fault(),
+                None => {}
+            }
             for ev in events {
-                let stat = stats.get(ev.channel.as_str());
+                let stat = out.stats.get(ev.channel.as_str());
                 match ev.kind {
                     EventKind::Data(bytes) => {
                         let n = bytes.len() as u64;
-                        if let Some(s) = stat {
-                            s.active.set(true);
-                        }
-                        // Mirror to this channel's tap hub for taps and the replay ring
-                        // (§17), independent of whether a graph consumer is bound — a
-                        // tapped-but-unconsumed channel still reaches its observer.
-                        if let Some(feed) = channel_feeds.get(ev.channel.as_str()) {
-                            feed.mirror(&bytes);
-                        }
-                        // Fan out to this channel's consumers through the one shared
-                        // helper (§5, F1). A channel that reached no live consumer —
-                        // none bound, or every sink permanently `Closed` after a cascade
-                        // removal — discards-with-count; data on an unconfigured channel
-                        // (no stat) is noise from the mux and simply dropped —
-                        // announced-but-unbound is a leg concern (§7.4).
-                        if let Some(sinks) = channel_sinks.get(ev.channel.as_str()) {
-                            // `channel_sinks` and `stats` are both keyed by the
-                            // configured channel list, so a bound sink always has a
-                            // stat; `scratch` is the defensive arm — its count is
-                            // thrown away, but the bytes are still delivered.
-                            let scratch = Cell::new(0u64);
-                            let unattached = stat.map_or(&scratch, |s| &s.discarded_unattached);
-                            if sinks.broadcast(&bytes, unattached).live
-                                && let Some(s) = stat
-                            {
-                                s.delivered_hostward.set(s.delivered_hostward.get() + n);
-                            }
-                        } else if let Some(s) = stat {
-                            s.discarded_unattached.set(s.discarded_unattached.get() + n);
-                        }
+                        // CODEC-1: an identity this node has no channel for. §8 still
+                        // governs the bytes — an announcement never grows the graph,
+                        // so they are dropped — but §5 governs the *accounting*, so
+                        // they are counted and the identity is named. Nothing else in
+                        // the daemon could answer "what is actually on the wire?",
+                        // which is the whole question a channel typo raises.
+                        let Some(s) = stat else {
+                            out.unconfigured
+                                .with_mut(|u| u.record(ev.channel.as_str(), n));
+                            continue;
+                        };
+                        // The one shared per-channel hostward routing block (SIMP-1):
+                        // latch active, mirror to this channel's tap hub for taps and
+                        // the replay ring (§17) independent of whether a graph consumer
+                        // is bound, then fan out to the graph sinks alone (§5, F1). A
+                        // channel that reached no live consumer — none bound, or every
+                        // sink permanently `Closed` after a cascade removal —
+                        // discards-with-count inside the helper.
+                        route_channel_data(
+                            &bytes,
+                            out.channel_feeds.get(ev.channel.as_str()),
+                            out.channel_sinks.get(ev.channel.as_str()),
+                            Some(&**s),
+                        );
                     }
-                    EventKind::Open => {
-                        if let Some(s) = stat {
-                            s.active.set(true);
-                        }
-                    }
+                    EventKind::Open => match stat {
+                        Some(s) => s.active.set(true),
+                        // An announcement on an identity the operator never
+                        // enumerated: no bytes to charge, but the name is the
+                        // diagnosis (CODEC-1).
+                        None => out
+                            .unconfigured
+                            .with_mut(|u| u.record(ev.channel.as_str(), 0)),
+                    },
                     EventKind::Close => {
                         if let Some(s) = stat {
                             s.active.set(false);
@@ -452,31 +745,18 @@ async fn hostward_demux(
     }
 }
 
-/// Keep a read-only demux's channel receiver alive, discarding and counting what
-/// arrives (§5) — the codec's instance of the MAP-1 shape.
+/// Keep an unwired host-facing endpoint's targetward receiver alive, discarding and
+/// counting what arrives (§5) — the drain [`CodecNode::drain_unwired_channels`]
+/// parks on whatever that defensive sweep finds.
 ///
-/// A codec whose multiplexed edge is `write_mode = "never"` (validation's documented
-/// read-only demux) or unattached has no path to the device, but its channel
-/// endpoints still carry live senders: the `send` verb's clone and every writer
-/// origin attached to a channel. Dropping the receiver would close the channel under
-/// those senders, and for a pty origin the failed write ends its reader task along
-/// with presence latching, last-close handling and detach-release. Draining keeps the
-/// writers healthy and makes the loss visible in `state` instead of silent.
-async fn channel_targetward_drain(mut rx: mpsc::Receiver<Chunk>, stat: Rc<ChannelStat>) {
+/// The receiver's *senders* stay live — in `GraphState::endpoint_targetward` and in
+/// every attached writer origin — so dropping it would close the channel underneath
+/// them, and for a pty origin the failed write ends `read_and_poll` along with
+/// presence latching, last-close handling and detach-release (MAP-1). Draining makes
+/// the node inert instead of destructive, with the loss attributable in `state`.
+async fn unwired_targetward_drain(mut rx: mpsc::Receiver<Chunk>, discarded: Rc<Cell<u64>>) {
     while let Some(bytes) = rx.recv().await {
-        // The arriving bytes are what is lost; nothing is framed, so this is charged
-        // as a targetward discard rather than a framing refusal.
-        stat.discarded_targetward
-            .set(stat.discarded_targetward.get() + bytes.len() as u64);
-    }
-}
-
-/// Keep an unwired *multiplexed* endpoint's targetward receiver alive, discarding
-/// and counting what arrives (§5) — the re-multiplexer's half of the same rule
-/// `channel_targetward_drain` serves for channels.
-async fn mux_targetward_drain(mut rx: mpsc::Receiver<Chunk>, discarded: Rc<Cell<u64>>) {
-    while let Some(bytes) = rx.recv().await {
-        discarded.set(discarded.get() + bytes.len() as u64);
+        discarded.add(bytes.len() as u64);
     }
 }
 
@@ -508,9 +788,8 @@ async fn channel_targetward(
         // destructive, and never wedging a writer forever (MAP-1: closing the
         // receiver under a pty origin ends that origin's reader task and takes
         // presence latching and detach-release with it).
-        let Some((mux_tx, serial_lock, mux_id)) = await_origin(&mux_edge).await else {
-            stat.discarded_targetward
-                .set(stat.discarded_targetward.get() + total as u64);
+        let Some(origin) = await_origin(&mux_edge).await else {
+            stat.discarded_targetward.add(total as u64);
             continue;
         };
         // Fragment on the shared boundary helper (§5/§15.27): identical piece
@@ -532,30 +811,394 @@ async fn channel_targetward(
                 // envelope codec, so this is unreachable there; a custom transform
                 // that still refuses a piece must not drop silently — count the
                 // undelivered residual (§5 all-loss-is-counted).
-                stat.discarded_targetward
-                    .set(stat.discarded_targetward.get() + (total - off) as u64);
+                stat.discarded_targetward.add((total - off) as u64);
                 break;
             }
-            // Gate on holding the serial's write lock (the codec's held origin). A
-            // `send --steal` transiently ousts it; re-acquire FIFO once the stealer
-            // releases. The framed piece is parked in `framed` meanwhile.
-            if !reacquire_held(&serial_lock, mux_id).await {
-                // The upstream endpoint was torn down. Count the undelivered tail
-                // and stop framing *this* chunk, but keep the task: a `connect` may
-                // give this codec a new upstream, and the receiver's senders are
-                // still live either way (§5, §15.35).
-                stat.discarded_targetward
-                    .set(stat.discarded_targetward.get() + (total - off) as u64);
-                break;
-            }
-            if mux_tx.send(Chunk::from(framed)).await.is_err() {
-                stat.discarded_targetward
-                    .set(stat.discarded_targetward.get() + (total - off) as u64);
+            // The shared send-and-charge step (SIMP-2): gate on holding the serial's
+            // write lock (the codec's held origin) — a `send --steal` transiently
+            // ousts it and the framed piece parks in `framed` until it re-acquires,
+            // FIFO — then hand the frame to the device. Either exit costs the same
+            // undelivered tail: the upstream endpoint was torn down, or its channel
+            // closed between the grant and the send. Stop framing *this* chunk but
+            // keep the task — a `connect` may give this codec a new upstream, and the
+            // receiver's senders stay live either way (§5, §15.35).
+            let delivered =
+                forward_targetward(&origin, (total - off) as u64, || Some(Chunk::from(framed)))
+                    .await
+                    .charge(&stat.discarded_targetward);
+            if !delivered {
                 break;
             }
             stat.accepted_targetward
                 .set(stat.accepted_targetward.get() + piece_len);
         }
+    }
+}
+
+/// Hostward-signal guards for `docs/32-claude-opus-code-review.md` — WIRE-1 (a
+/// `Codec::demux` refusal had no counter, no state field and no status change),
+/// CODEC-1 (data on an unconfigured identity vanished with nothing naming it) and
+/// the codec half of LEGD-2 (`delivered_hostward` credited bytes a full sink never
+/// took). None of these need the reference codec: the whole point of WIRE-1 is that
+/// the *shipped* transform never returns `Err`, so the subject here is a stub — the
+/// out-of-tree codec §15.26 makes first-class.
+#[cfg(test)]
+mod signal_tests {
+    use super::*;
+    use codec_api::CodecError;
+
+    /// One scripted `demux` call: decode the chunk onto a channel, refuse it, or —
+    /// the shape a real non-resyncing framer actually produces — decode the leading
+    /// `n` bytes onto a channel and *then* refuse the rest.
+    ///
+    /// The third variant exists because its absence hid a defect: with `Refuse`
+    /// emitting nothing, no guard here could see that the refusal charge and the
+    /// per-channel delivery credit were counting the same bytes.
+    #[derive(Clone, Copy)]
+    enum Step {
+        Emit(&'static str),
+        Refuse(&'static str),
+        /// `(channel, payload bytes emitted, refusal reason)`. The payload is the
+        /// head of the input; asking for more than the chunk holds pads it, which
+        /// models the other legal shape — a transform flushing a frame it assembled
+        /// partly out of an *earlier* chunk and then refusing.
+        EmitThenRefuse(&'static str, usize, &'static str),
+    }
+
+    /// A transform that follows a script — the codec §7.5 sanctions and the shipped
+    /// registry does not contain: one that "treats any framing violation as a
+    /// protocol error and never resyncs", which the trait can only express as `Err`.
+    struct StubCodec {
+        script: Vec<Step>,
+        calls: usize,
+    }
+
+    impl Codec for StubCodec {
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        fn demux(&mut self, input: &[u8], emit: &mut dyn FnMut(Event)) -> Result<(), CodecError> {
+            let step = self
+                .script
+                .get(self.calls)
+                .copied()
+                .unwrap_or(Step::Refuse("past the script"));
+            self.calls += 1;
+            match step {
+                Step::Emit(channel) => {
+                    emit(Event::data(channel, input.to_vec()));
+                    Ok(())
+                }
+                Step::Refuse(why) => Err(CodecError::Framing(why.to_owned())),
+                Step::EmitThenRefuse(channel, take, why) => {
+                    let mut payload = input[..take.min(input.len())].to_vec();
+                    payload.resize(take, b'x'); // bytes buffered from an earlier chunk
+                    emit(Event::data(channel, payload));
+                    Err(CodecError::Framing(why.to_owned()))
+                }
+            }
+        }
+
+        fn mux(&mut self, _event: &Event, _out: &mut Vec<u8>) -> Result<(), CodecError> {
+            Ok(())
+        }
+    }
+
+    /// The node-level signals `hostward_demux` writes into, held together so a test
+    /// asserts on the same values `state_extra` renders.
+    struct Signals {
+        demux: Rc<DemuxHealth>,
+        unconfigured: Rc<CriticalCell<UnconfiguredChannels>>,
+        status: Rc<CriticalCell<NodeState>>,
+        stats: Rc<HashMap<String, Rc<ChannelStat>>>,
+    }
+
+    /// Run `hostward_demux` to completion over one edge carrying `chunks`, with the
+    /// node configured for `channels` and each channel wired to `sinks`.
+    async fn run_demux(
+        script: Vec<Step>,
+        channels: &[&str],
+        chunks: &[&[u8]],
+        sinks: HashMap<String, SharedFanOut>,
+    ) -> Signals {
+        let stats: Rc<HashMap<String, Rc<ChannelStat>>> = Rc::new(
+            channels
+                .iter()
+                .map(|c| ((*c).to_owned(), Rc::new(ChannelStat::default())))
+                .collect(),
+        );
+        let signals = Signals {
+            demux: Rc::new(DemuxHealth::default()),
+            unconfigured: Rc::new(CriticalCell::new(UnconfiguredChannels::default())),
+            status: Rc::new(CriticalCell::new(NodeState::new(NodeStatus::Active))),
+            stats: stats.clone(),
+        };
+        let codec: Rc<CriticalCell<Box<dyn Codec>>> =
+            Rc::new(CriticalCell::new(Box::new(StubCodec { script, calls: 0 })));
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(1);
+        let (edge_tx, edge_rx) = mpsc::channel(chunks.len().max(1));
+        for c in chunks {
+            edge_tx
+                .send(Chunk::copy_from_slice(c))
+                .await
+                .expect("the demux task has not started yet, so the buffer takes it");
+        }
+        drop(edge_tx); // the edge closes once drained
+        inbox_tx.send(edge_rx).await.expect("inbox takes the edge");
+        drop(inbox_tx); // ...and so does the inbox, so the task returns
+
+        hostward_demux(
+            codec,
+            inbox_rx,
+            DemuxSinks {
+                channel_sinks: sinks,
+                channel_feeds: HashMap::new(),
+                stats,
+                unconfigured: signals.unconfigured.clone(),
+                demux: signals.demux.clone(),
+                status: signals.status.clone(),
+            },
+        )
+        .await;
+        signals
+    }
+
+    /// One consumer sink of depth `cap`, plus its receiver and drop counters.
+    fn sink(cap: usize) -> (SharedFanOut, mpsc::Receiver<Chunk>, Arc<DropCounters>) {
+        let (tx, rx) = mpsc::channel(cap);
+        let counters = Arc::new(DropCounters::default());
+        let fanout = crate::runtime::FanOutList::new();
+        fanout.attach(crate::runtime::AttachedSink {
+            target: "consumer".parse().expect("address parses"),
+            tx,
+            counters: counters.clone(),
+        });
+        (fanout, rx, counters)
+    }
+
+    /// WIRE-1: a `Codec::demux` refusal is counted, charged the multiplexed bytes it
+    /// cost, kept as a message in `state`, and — because a codec that never resyncs
+    /// is permanently unable to deliver — **faults the node**. Before this the whole
+    /// response was one `tracing::warn!`: the node went on reporting `active` with
+    /// `framing_errors: 0` and every counter frozen while 100% of the device's
+    /// output disappeared.
+    #[tokio::test]
+    async fn a_demux_refusal_is_counted_charged_and_faults_the_node() {
+        let s = run_demux(
+            vec![Step::Refuse("bad CRC"), Step::Refuse("bad CRC")],
+            &["c0"],
+            &[b"aaaaaaaa", b"bbbb"],
+            HashMap::new(),
+        )
+        .await;
+
+        assert_eq!(s.demux.errors.get(), 2, "both refusals are counted");
+        assert_eq!(
+            s.demux.discarded_hostward.get(),
+            12,
+            "the multiplexed bytes a refusing demux never decoded are charged (§5)"
+        );
+        assert_eq!(
+            s.demux.last.with(|l| l.clone()).as_deref(),
+            Some("framing error: bad CRC"),
+            "the diagnosis reaches state, not only the log"
+        );
+        let status = s.status.with(|st| st.status().clone());
+        assert!(
+            matches!(&status, NodeStatus::Faulted { reason } if reason.contains("bad CRC")),
+            "a refusing transform is not delivering, so the node is not active: {status:?}"
+        );
+    }
+
+    /// WIRE-1: the fault is *not* latched. A transform that decodes the next chunk
+    /// was suffering a transient violation, and reporting it as a dead node for the
+    /// rest of the session would be its own misdiagnosis.
+    #[tokio::test]
+    async fn a_recovered_demux_clears_its_own_fault() {
+        let s = run_demux(
+            vec![Step::Refuse("bad CRC"), Step::Emit("c0")],
+            &["c0"],
+            &[b"junk", b"good"],
+            HashMap::new(),
+        )
+        .await;
+
+        assert_eq!(s.demux.errors.get(), 1);
+        assert!(!s.demux.faulted.get());
+        assert!(
+            matches!(s.status.with(|st| st.status().clone()), NodeStatus::Active),
+            "the node delivers again, so it says so"
+        );
+    }
+
+    /// CODEC-1: data decoded onto an identity the node has no channel for is still
+    /// dropped (§8: an announcement never grows the graph), but it is now counted
+    /// and the identity is *named*. The name is the whole finding: a mis-spelled
+    /// configured channel was already visible sitting at `waiting`, while nothing
+    /// anywhere said what was actually on the wire.
+    #[tokio::test]
+    async fn data_on_an_unconfigured_channel_is_counted_and_named() {
+        let s = run_demux(
+            vec![Step::Emit("gps"), Step::Emit("gps"), Step::Emit("c0")],
+            &["c0"],
+            &[b"1234", b"567", b"ok"],
+            HashMap::new(),
+        )
+        .await;
+
+        s.unconfigured.with(|u| {
+            let mut obj = serde_json::Map::new();
+            u.report_into(&mut obj);
+            assert_eq!(obj["discarded_unconfigured_channel"], json!(7));
+            assert_eq!(obj["unconfigured_channels"], json!(["gps"]));
+            assert_eq!(obj["unconfigured_overflow"], json!(0));
+        });
+        // The configured channel is untouched by its neighbour's noise.
+        assert_eq!(s.stats["c0"].discarded_unattached.get(), 2);
+    }
+
+    /// CODEC-1's bound: the identity list is capped, deduplicated, truncated with an
+    /// explicit marker on a `char` boundary, and the occurrences the cap refused are
+    /// counted — the leg's `UnboundSet` terms (LEG-2), reused rather than re-derived,
+    /// because these identities come from the wire and not from configuration.
+    #[test]
+    fn unconfigured_identities_are_capped_deduplicated_and_truncated() {
+        let mut set = UnconfiguredChannels::default();
+        for i in 0..MAX_UNCONFIGURED + 50 {
+            set.record(&format!("ch-{i}"), 1);
+        }
+        assert_eq!(set.order.len(), MAX_UNCONFIGURED, "the list is bounded");
+        assert_eq!(set.overflow, 50, "what the cap refused is counted");
+        assert_eq!(set.bytes, (MAX_UNCONFIGURED + 50) as u64, "no byte is lost");
+
+        // A repeat is neither duplicated nor counted as overflow, but its bytes count.
+        let before = set.overflow;
+        set.record("ch-0", 4);
+        assert_eq!(set.order.len(), MAX_UNCONFIGURED);
+        assert_eq!(set.overflow, before);
+
+        // A multi-byte identity truncates on a char boundary, marked.
+        let mut set = UnconfiguredChannels::default();
+        set.record(&"€".repeat(MAX_UNCONFIGURED_ID_LEN), 0);
+        let stored = &set.order[0];
+        assert!(stored.ends_with(TRUNCATION_MARKER), "{stored}");
+        assert!(
+            stored.len() <= MAX_UNCONFIGURED_ID_LEN + TRUNCATION_MARKER.len(),
+            "{stored}"
+        );
+    }
+
+    /// LEGD-2 (codec half): `fan_out` reports `live = true` for a sink whose bounded
+    /// buffer was **full** — deliberately, it is still a live consumer — so crediting
+    /// the whole chunk on `live` counted bytes as delivered that nobody received.
+    /// Only what a sink actually took is credited now, reported as
+    /// [`crate::runtime::FanOut::delivered`] rather than derived by the caller. The
+    /// *mixed* fan-out (one sink Ok, one Full), where the first correction
+    /// under-counted instead, is pinned once for all three producers in
+    /// `runtime::tests`, since the arithmetic is one function.
+    #[tokio::test]
+    async fn delivered_hostward_credits_only_what_a_sink_took() {
+        let (fanout, _rx, counters) = sink(1);
+        let sinks = HashMap::from([("c0".to_owned(), fanout)]);
+        // Two 5-byte chunks, one consumer of depth 1 that never drains: the first
+        // chunk is taken, the second finds the buffer full.
+        let s = run_demux(
+            vec![Step::Emit("c0"), Step::Emit("c0")],
+            &["c0"],
+            &[b"hello", b"world"],
+            sinks,
+        )
+        .await;
+
+        assert_eq!(counters.dropped_full(), 5, "the full sink was charged");
+        assert_eq!(
+            s.stats["c0"].delivered_hostward.get(),
+            5,
+            "only the chunk a consumer actually took is delivered"
+        );
+        assert_eq!(
+            s.stats["c0"].discarded_unattached.get(),
+            0,
+            "a full sink is live, so this is not an unattached loss"
+        );
+    }
+
+    /// A refusal charges the bytes it lost, **not** the ones it delivered on the way.
+    /// A non-resyncing framer's realistic failure is a partial one — decode the good
+    /// frames out of the chunk, refuse on the corrupt tail — and every event it
+    /// emitted first is still routed and credited to its channel below. Charging the
+    /// whole chunk reported that payload as delivered *and* as discarded at the same
+    /// time, on a node the same refusal faults.
+    ///
+    /// Fail-first: against `note_demux_error(chunk.len(), …)` this run charged 12
+    /// instead of 4 while `delivered_hostward` was 8 — 20 bytes accounted for a
+    /// 12-byte chunk.
+    #[tokio::test]
+    async fn a_partial_decode_charges_only_the_bytes_the_refusal_lost() {
+        let (fanout, mut rx, _counters) = sink(4);
+        let s = run_demux(
+            // 12 bytes in, 8 decoded onto c0, then the tail is refused.
+            vec![Step::EmitThenRefuse("c0", 8, "bad CRC on the tail frame")],
+            &["c0"],
+            &[b"aaaaaaaabbbb"],
+            HashMap::from([("c0".to_owned(), fanout)]),
+        )
+        .await;
+
+        assert_eq!(
+            &rx.try_recv().expect("the decoded prefix was routed")[..],
+            b"aaaaaaaa",
+            "the premise: events emitted before the error are still delivered"
+        );
+        assert_eq!(s.stats["c0"].delivered_hostward.get(), 8);
+        assert_eq!(
+            s.demux.discarded_hostward.get(),
+            4,
+            "only the tail the transform refused is loss"
+        );
+        assert_eq!(
+            s.stats["c0"].delivered_hostward.get() + s.demux.discarded_hostward.get(),
+            12,
+            "delivered + discarded must reconcile against the chunk, not exceed it"
+        );
+        assert_eq!(s.demux.errors.get(), 1, "the refusal is still a refusal");
+        assert!(
+            matches!(
+                s.status.with(|st| st.status().clone()),
+                NodeStatus::Faulted { .. }
+            ),
+            "a partial decode is still a refusal, so the node still faults (WIRE-1)"
+        );
+    }
+
+    /// The saturating half of the same arithmetic: a transform may flush frames it
+    /// buffered from *earlier* chunks and then refuse, emitting more payload than the
+    /// chunk it was handed. That is not negative loss — it is none — and it must not
+    /// wrap a `u64` counter into `state`.
+    #[tokio::test]
+    async fn a_refusal_that_emits_more_than_it_was_handed_charges_nothing() {
+        let (fanout, _rx, _counters) = sink(4);
+        let s = run_demux(
+            // 64 bytes of payload out of a 4-byte chunk: the surplus is frame data
+            // the transform had buffered from the previous chunk.
+            vec![
+                Step::Emit("c0"),
+                Step::EmitThenRefuse("c0", 64, "short frame"),
+            ],
+            &["c0"],
+            &[b"aaaa", b"bbbb"],
+            HashMap::from([("c0".to_owned(), fanout)]),
+        )
+        .await;
+
+        assert_eq!(
+            s.demux.discarded_hostward.get(),
+            0,
+            "the refusing call emitted its whole input; nothing was lost"
+        );
+        assert_eq!(s.demux.errors.get(), 1);
     }
 }
 

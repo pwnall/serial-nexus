@@ -1,11 +1,16 @@
-// The `tap.closed` re-anchor, in a real browser (design §15.37, plan §15.2).
+// The epoch re-anchor, in a real browser (design §15.37/§15.38, plan §15.2).
 //
 // This is the one behaviour on §16.7's list that had no automated coverage at any
 // layer: a `load --replace` under an open console rebuilds the endpoint's hub, which
-// retires the tap and restarts the endpoint's offset space *without* rotating the
-// daemon's per-boot `instance` nonce (AGENTS.md invariant 10 records that as the known
-// open issue). The client's answer is `offsetSpaceReset`, and until now nothing
-// exercised it against a real stored history.
+// retires the tap and restarts the endpoint's offset space. The daemon's per-boot
+// `instance` nonce does *not* rotate for that — it tracks the process, not the
+// graph — so what the client keys on is the per-hub **`epoch`** `tap.open` reports
+// (§15.38, AGENTS.md invariant 10): `history.mjs`'s `offsetSpaceChanged(storedEpoch,
+// epoch)` decides that the space restarted and `reanchor(h, from_offset)` moves the
+// frontier onto the new one, marking the seam instead of splicing across it.
+// `tap.closed` is what tells the console its *stream* ended — a detached pane rather
+// than a quiet one — and it is asserted below for that, not as the re-anchor trigger.
+// Until this spec, nothing exercised any of it against a real stored history.
 
 import { test, expect } from "@playwright/test";
 import {

@@ -29,9 +29,12 @@
 //!    underflows and never lies: with a full ring `from_offset + replay_bytes` lands
 //!    exactly on the live edge, so replay and live meet with no gap and no overlap.
 //!    Also, the offset space resets to 0 when the *graph* is replaced while
-//!    `info.instance` does **not** change — the daemon-side half of the known OPFS
-//!    console freeze, and the reason `tap.closed` (TAP-1) is the signal a client must
-//!    key on rather than the nonce.
+//!    `info.instance` does **not** change — the daemon-side half of the OPFS console
+//!    freeze, and the reason the nonce is not what a client can key on. What it keys on
+//!    instead is the per-hub **`epoch`** `tap.open` reports (§15.38): a rebuilt hub gets
+//!    a fresh one, the browser's `offsetSpaceChanged`/`reanchor` move its stored history
+//!    onto the new space, and `tap.closed` (TAP-1) tells it the *stream* ended rather
+//!    than triggering the re-anchor.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -547,12 +550,15 @@ b = "logx"
     );
 }
 
-/// The daemon-side half of the known OPFS console freeze (T6/§11.8): `load --replace`
-/// resets an endpoint's offset space to 0 while `info.instance` — the client's
-/// restart detector — deliberately does **not** change. A client keyed only on the
-/// nonce would splice new bytes at stale offsets; what it must key on instead is the
-/// terminal `tap.closed` the daemon now sends (TAP-1). Uses an echo device so the
-/// pre-replace offset is an exact, known value; skips off Linux (§5).
+/// The daemon-side half of the OPFS console freeze (T6/§11.8): `load --replace` resets
+/// an endpoint's offset space to 0 while `info.instance` — the per-boot nonce — is
+/// deliberately unchanged, because it tracks the daemon *process* and the process did
+/// not restart. A client keyed only on the nonce would splice new bytes at stale
+/// offsets. What it keys on instead is the per-hub **`epoch`** on `tap.open` (§15.38):
+/// a rebuilt hub reports a new one, and the browser's `offsetSpaceChanged`/`reanchor`
+/// carry the stored history onto the new space. The terminal `tap.closed` (TAP-1),
+/// asserted below, is the separate signal that the *stream* ended. Uses an echo device
+/// so the pre-replace offset is an exact, known value; skips off Linux (§5).
 #[test]
 fn tap_offsets_reset_on_load_replace_while_the_instance_nonce_does_not() {
     let Some(echo) = serial_echo() else {
@@ -617,7 +623,8 @@ device = "{dev}"
         "info.instance changed on a graph replace"
     );
     // … while the offset space restarted at 0. A client that spliced by offset across
-    // this would corrupt its history; `tap.closed` is what tells it not to.
+    // this would corrupt its history; the rebuilt hub's fresh `epoch` is what tells it
+    // not to (§15.38), and `tap.closed` above is what told it the stream had ended.
     let (ack2, _tap2) = OffsetTap::open(&d.socket(), "usb0", false);
     assert_eq!(
         ack2["result"]["from_offset"],

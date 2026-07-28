@@ -83,12 +83,18 @@ const TOKEN: &str = "testtoken0123456789abcdef";
 const N: u64 = 262144;
 /// Seed for the byte-stream source (the bash's `SEED`).
 const SEED: u64 = 31;
-/// Mirrors `serialnexusweb/src/server.rs`'s `MAX_CONNECTIONS`: in-flight connections
-/// served at once, above which the newest is dropped rather than queued.
+/// Mirrors `serialnexusweb/src/server.rs`'s `MAX_CONNECTIONS`: connections *past the
+/// token gate* served at once, above which a request is answered 503 rather than queued.
+/// Used below only as a flood size comfortably past the pre-auth cap.
 const MAX_CONNECTIONS: usize = 128;
+/// Mirrors `serialnexusweb/src/server.rs`'s `MAX_PRE_AUTH_CONNECTIONS`: how many
+/// connections may sit *before* the token gate at once. Enforced by evicting the oldest
+/// member, never by refusing a newcomer — see `p12_web_session.rs` for why that
+/// distinction is the whole of review WEB-5.
+const MAX_PRE_AUTH_CONNECTIONS: usize = 32;
 /// Mirrors `serialnexusweb/src/server.rs`'s `HEAD_TIMEOUT`: how long a peer has to
 /// deliver a complete request head before the connection is released.
-const HEAD_TIMEOUT: Duration = Duration::from_secs(15);
+const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A child killed and reaped on drop, so a panicking test never leaks a process.
 struct Kill(Child);
@@ -1372,12 +1378,20 @@ fn web_pre_auth_connections_are_capped_and_time_out() {
     // nothing pinned a task and an fd forever — reachable by unauthenticated peers in
     // the sanctioned `--tls`/`--insecure-bind` tiers, both of which are pre-auth.
     //
-    // Both bounds are proven in one pass, because they interlock: fill the cap with
-    // silent peers (the newest connection is then dropped immediately), then show the
-    // head deadline releases them (a 408, and the server serving again). The test costs
-    // one HEAD_TIMEOUT of wall clock — deliberately not `#[ignore]`d, since an
-    // unbounded pre-auth path is exactly the kind of regression that must not wait for
-    // the nightly sweep.
+    // Both bounds are proven in one pass, because they interlock: flood well past the
+    // pre-auth cap (the excess is closed at once), then show the head deadline releases
+    // the survivors too (a 408, and the server serving again). The test costs one
+    // HEAD_TIMEOUT of wall clock — deliberately not `#[ignore]`d, since an unbounded
+    // pre-auth path is exactly the kind of regression that must not wait for the nightly
+    // sweep.
+    //
+    // The *shape* of the connection bound changed with review WEB-5's second
+    // remediation: the cap is now enforced by evicting the **oldest** unauthenticated
+    // connection rather than by refusing the newest. Refusing the newest was itself the
+    // defect — the connection carrying the operator's session cookie is always the newest
+    // one — so this test can no longer assert "the next connection is dropped" and
+    // asserts the population bound directly instead. `p12_web_session.rs` pins the
+    // property that replaced it.
     let run = TempRun::new();
     // No daemon: nothing here reaches `/ws`, and the gates run before the socket is
     // ever touched.
@@ -1386,38 +1400,39 @@ fn web_pre_auth_connections_are_capped_and_time_out() {
         .port("http", Duration::from_secs(10))
         .expect("web server never printed its bound http URL");
 
-    // Fill the cap with peers that connect and send nothing.
+    // Flood well past the cap with peers that connect and send nothing.
     let mut silent: Vec<TcpStream> = Vec::with_capacity(MAX_CONNECTIONS);
     for i in 0..MAX_CONNECTIONS {
         let s = TcpStream::connect(("127.0.0.1", port))
             .unwrap_or_else(|e| panic!("connect silent peer {i}: {e}"));
-        s.set_read_timeout(Some(Duration::from_millis(300))).ok();
+        // Short, because the only question ever asked of these sockets is "did the
+        // server close you", which a closed socket answers instantly.
+        s.set_read_timeout(Some(Duration::from_millis(20))).ok();
         silent.push(s);
     }
 
-    // The next connection is dropped rather than queued: it EOFs at once with no
-    // response. `wait_until` absorbs the accept lag; each probe socket is closed as it
-    // goes out of scope, so probing never accumulates connections of its own.
-    let capped = wait_until(Duration::from_secs(10), || {
-        let Ok(mut probe) = TcpStream::connect(("127.0.0.1", port)) else {
-            return true; // the listener itself pushed back — also a bound
-        };
-        probe
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .ok();
+    // Bounded in connections: the excess over the pre-auth cap is closed, not served.
+    // The newest peer — the last one we opened — is the one guaranteed to survive, so it
+    // is the one held back for the deadline half below.
+    let mut held = silent.pop().expect("the flood is not empty");
+    let mut closed = 0usize;
+    for s in silent.iter_mut() {
         let mut byte = [0u8; 1];
-        matches!(probe.read(&mut byte), Ok(0))
-    });
+        if matches!(s.read(&mut byte), Ok(0)) {
+            closed += 1;
+        }
+    }
+    let started = Instant::now();
     assert!(
-        capped,
-        "with {MAX_CONNECTIONS} connections in flight the next one must be dropped, \
-         not accepted and held (an unbounded pre-auth path)"
+        closed >= MAX_CONNECTIONS - MAX_PRE_AUTH_CONNECTIONS,
+        "of {MAX_CONNECTIONS} silent peers at most {MAX_PRE_AUTH_CONNECTIONS} may sit at \
+         the token gate, so at least {} had to be closed — only {closed} were. Serving \
+         every peer that connects is the unbounded pre-auth path the review found",
+        MAX_CONNECTIONS - MAX_PRE_AUTH_CONNECTIONS
     );
 
-    // The head deadline releases a silent peer with a 408 — the mechanism itself,
-    // observed on one of the peers we are holding open.
-    let started = Instant::now();
-    let mut held = silent.remove(0);
+    // Bounded in time: the head deadline releases even a peer that escaped eviction,
+    // with a 408 — the mechanism itself, observed on the peer we held back.
     held.set_read_timeout(Some(HEAD_TIMEOUT + Duration::from_secs(20)))
         .ok();
     let mut status_line = String::new();

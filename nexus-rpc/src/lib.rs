@@ -351,7 +351,7 @@ impl AppError {
         match self {
             AppError::LoadNonEmpty => "`load` without `replace` while a graph is already loaded",
             AppError::Structural => {
-                "configuration failed validation; `data.errors` is the list of messages"
+                "configuration failed validation; `data.errors` is the list of messages, and `message` is always `structural error: <first>`"
             }
             AppError::Locked => {
                 "a contended `lock`/`send` was refused; `data.held_by` names the holder when known"
@@ -363,7 +363,7 @@ impl AppError {
                 "`add-node` by raw path or serial number, but the device is not present so its identity cannot be captured (§12)"
             }
             AppError::WaitInFlight => {
-                "a request was pipelined behind an in-flight waiting verb on the same connection; §15.20 runs one at a time, and the wait is left intact"
+                "a request was pipelined behind an in-flight waiting verb on the same connection; §15.20 runs one at a time, and the wait, its taps and its subscription are all left intact"
             }
         }
     }

@@ -265,12 +265,20 @@ cargo test -p nexus-itest --test serial_hardware -- --nocapture   # runs when a 
 ```
 
 **CI gate.** The Linux lane runs `nexus-doctor --json | jq -e -f
-expectations/linux.jq`. The macOS lane gates on an `expectations/macos.jq`
-counterpart — the *looser* profile this page describes: nothing may report
-`unsupported`, but P1 may be `supported` **or** `degraded` (poll-only is fine),
-P3/P4/P5 may be `skipped`, and the `dialout`/`plugdev` checks may be `skipped`.
-That gate and the CI lane are standing up as part of Phase 8; the `linux.jq` gate
-is the template it is modeled on.
+expectations/linux.jq`. The macOS lane runs, and gates on, the
+`expectations/macos.jq` counterpart — the *looser* profile this page describes, and
+looser clause by clause rather than wholesale, because "nothing may report
+`unsupported`" stopped being the right shape once the probe set grew past P5. What
+it requires today: a well-formed report carrying all eleven probes, each with a
+status; P2, P6 and P7 — the POSIX pty mechanisms — not `unsupported` (either verdict
+word is fine, and `degraded` is the *expected* macOS answer for P2, §7.2's BSD arm);
+P8 `supported` **or** `skipped`, because `epoll(7)` does not exist here, so it is
+unmeasurable rather than broken, and the data plane is forbidden from using epoll
+anywhere anyway (§15.18); P9 and P10 the same, being informational numbers read
+against a tuning target macOS is not; and P1, P3, P4, P5 and P11 *any* status,
+EXTPROC being unverified and the by-id and driver-counter mechanisms Linux-only. The
+`linux.jq` gate is the template it is modeled on, and the deltas this one tolerates
+are the ones this page enumerates.
 
 ## Roadmap to "verified"
 

@@ -6,6 +6,11 @@
 //! reconnects, purge-on-reconnect discards the outage-era targetward backlog with a
 //! counter (§7.4), and a fresh round-trip is byte-clean.
 //!
+//! Reconnect *also* releases the outage-era **hostward** backlog, which the purge
+//! deliberately does not touch (§6's purge is targetward-only) — so the final
+//! round-trip is gated on the console going quiet first. See step 6a: the barrier is
+//! load-bearing, and the failure it removes is one CPU load hides rather than causes.
+//!
 //! Topology (two daemons, one leg each, a serial echo device behind daemon A):
 //!
 //! ```text
@@ -26,7 +31,7 @@
 
 use std::net::TcpListener;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nexus_itest::{Daemon, Rpc, Sim, serial_echo, wait_until};
 use serde_json::Value;
@@ -78,6 +83,50 @@ fn purged_on_reconnect(rpc: &Rpc, name: &str, ch: &str) -> u64 {
                 .and_then(Value::as_u64)
         })
         .unwrap_or(0)
+}
+
+/// Every counter on the receiving daemon that moves while a hostward byte is still
+/// travelling toward the console: what the receiving leg forwarded to local
+/// consumers, what it shed at its own hostward boundary, and what the `p0` console
+/// then did with what it got (discarded for want of a client, or dropped because the
+/// client was too slow). A byte in flight hostward has to land in one of these, so a
+/// tuple that stops changing is the observable form of "the console is quiet".
+///
+/// Taken from a **single** `state` snapshot, so the four numbers describe one instant
+/// rather than four (a byte can move between two `state` calls and be missed by both).
+///
+/// A missing pointer **panics** rather than reading as `0`. The tuple is only ever
+/// compared with its predecessor, so an `unwrap_or(0)` here would turn a renamed or
+/// relocated counter into a constant — and a constant tuple is "quiet" forever, which
+/// would silently degrade step 6a's second gate into a fixed 500 ms wait with nobody
+/// the wiser. Same reasoning as the meta-gates' planted-violation self-proofs (§5): a
+/// gate that stops gating has to say so.
+fn hostward_progress(rpc: &Rpc) -> (u64, u64, u64, u64) {
+    let state = rpc.state();
+    let node = |name: &str| -> Value {
+        state
+            .get("nodes")
+            .and_then(Value::as_array)
+            .and_then(|ns| {
+                ns.iter()
+                    .find(|n| n.get("name").and_then(Value::as_str) == Some(name))
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("node `{name}` absent from `state`: {state}"))
+    };
+    let num = |v: &Value, ptr: &str| {
+        v.pointer(ptr)
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("`state` has no numeric `{ptr}`: {v}"))
+    };
+    let leg = node("downlink");
+    let pty = node("p0");
+    (
+        num(&leg, "/channels/c0/delivered_hostward"),
+        num(&leg, "/channels/c0/discarded_hostward"),
+        num(&pty, "/discarded_no_client"),
+        num(&pty, "/dropped_slow_consumer"),
+    )
 }
 
 /// Drive one seeded echo round-trip through daemon B's pty `p0` and return the sim
@@ -303,7 +352,95 @@ write_mode = "on-demand"
         rpc_b.node("downlink")
     );
 
+    // 6a. The reconnect releases a SECOND thing, and step 7 has to let it land first.
+    //
+    //     Reconnect purges the outage-era *targetward* backlog (step 6) — and flushes
+    //     the outage-era **hostward** one. Step 2's abandoned 64 KiB burst (seed 22)
+    //     was echoed by the device while the link was down, so it sat in daemon A's
+    //     `uplink/c0` per-channel hostward queue for the whole outage. Purge-on-
+    //     reconnect does not touch it and MUST NOT: §6 calls the purge "the one
+    //     sanctioned *targetward* drain", and `leg.rs` gates it on
+    //     `faces == Facing::Host`. So on reconnect that backlog crosses the restored
+    //     link and is written to this very console — specified behaviour (§5, §7.4),
+    //     not a defect, and not something to "fix" in the product.
+    //
+    //     It made step 7 ambiguous. Its client used to attach immediately after the
+    //     `wait_until` above, i.e. inside the ~20-30 ms window in which the flood is
+    //     landing, and then read the flood as though it were its own echo. Measured at
+    //     ~1 failure in 10 unloaded runs. It reported `received: 8190, sent: 4096` and
+    //     read as a *doubling*, which it never was: a pts hands out at most 4095 bytes
+    //     per read (`N_TTY_BUF_SIZE - 1`) and `nexus-sim`'s `read_until` had no cap at
+    //     `n`, so any contaminated stream rendered as 4095 + 4095. With that cap now in
+    //     place the same contamination reports `received: 4096` with a non-zero
+    //     `overshoot` and a checksum mismatch — a clearer verdict of the same failure,
+    //     which this barrier is what actually prevents.
+    //
+    //     **Counter-intuitively, CPU load SUPPRESSES this**: load widens client-spawn
+    //     latency past the flood. So a green loaded re-run is not evidence of anything,
+    //     and this barrier must not be removed on the strength of one. Nor should it be
+    //     "simplified" into a sleep — AGENTS §5 forbids bare sleeps, and both gates
+    //     below end on an observable.
+    //
+    //     Step 7's property is "the data plane recovered", which can only be measured
+    //     from a known-quiet console. Two independent gates, because each covers the
+    //     other's hole:
+    //       (a) drain the console to quiet. Only a reader can clear bytes the flood
+    //           already deposited in the pts buffer; no RPC counter can see those.
+    //       (b) then require the receiving daemon's hostward accounting to stop moving.
+    //           This catches the converse — a drain that reached its quiet window
+    //           before the flood ever started arriving, and so drained nothing.
+    //
+    //     Do not delete (a) on the grounds that it usually reads zero. It does: in the
+    //     common case the flood is already discarded to `p0.discarded_no_client` before
+    //     the drain subprocess finishes spawning (measured: ~40-55 KiB charged there by
+    //     the time step 6 returns, drain `received: 0`). Its job is the *uncommon* case —
+    //     the same ~1-in-10 window in which step 7's client used to attach mid-flood —
+    //     where it attaches first and absorbs the flood, including whatever already sits
+    //     in the pts buffer, which no counter can observe and no counter can clear.
+    let flood = Sim::client(&[
+        "--path",
+        &p0_str,
+        "--drain",
+        // Quiet window an order of magnitude past the measured 20-30 ms flood latency.
+        "--quiet-ms",
+        "750",
+        "--timeout-ms",
+        "20000",
+    ]);
+    // `pass` is deliberately not asserted: a `--drain` that reads zero bytes reports
+    // `pass: false` by design (`nexus-sim`'s `recv_pass`), and an empty flood is a
+    // legal outcome here — it is in fact the common one. What must hold is that the
+    // console reached *quiet* rather than the wall clock, and `timed_out` is true for
+    // exactly one break, the deadline.
+    assert_ne!(
+        flood["timed_out"].as_bool(),
+        Some(true),
+        "the console never went quiet after reconnect (the outage-era hostward backlog \
+         is still arriving), so step 7 cannot tell its echo from the flood: {flood}"
+    );
+    // (b) Hostward accounting stable for half a second, on top of the drain's 750 ms of
+    //     real silence. `wait_until` polls every 20 ms, so this is ~25 samples.
+    const QUIET: Duration = Duration::from_millis(500);
+    let mut last = hostward_progress(rpc_b);
+    let mut since = Instant::now();
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            let now = hostward_progress(rpc_b);
+            if now != last {
+                last = now;
+                since = Instant::now();
+            }
+            since.elapsed() >= QUIET
+        }),
+        "the receiving daemon's hostward accounting never went quiet after reconnect \
+         (leg {:?}, console {:?})",
+        rpc_b.node("downlink"),
+        rpc_b.node("p0")
+    );
+
     // 7. Post-restore: a fresh round-trip is byte-clean (the data plane recovered).
+    //    The console is now known-quiet (6a), so what this client reads can only be its
+    //    own echo.
     let post = echo_roundtrip(&p0, "seeded:4KiB", 33, 8000);
     assert_eq!(
         post["pass"].as_bool(),

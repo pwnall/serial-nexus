@@ -353,8 +353,14 @@ enum WaitOutcome {
     Fresh,
     /// The caller already held the lock; no purge.
     AlreadyHeld,
-    /// The origin is `write = never` and cannot hold the lock.
+    /// The origin's edge is `write = never` and cannot hold the lock — a statement
+    /// about configuration ([`Acquire::ReadOnly`]).
     ReadOnly,
+    /// The origin left the endpoint while contending: its edge was `disconnect`ed or
+    /// its node removed ([`Acquire::Unregistered`], §15.35). Reported apart from
+    /// [`WaitOutcome::ReadOnly`] because they are different facts and only one of
+    /// them is about the operator's configuration (CTRL-2).
+    Detached,
     /// The deadline elapsed before a grant (only reachable with a finite deadline).
     TimedOut,
     /// The endpoint was torn down or removed while waiting (§6/§15.20): the waiter
@@ -474,11 +480,7 @@ impl Daemon {
         let result = match method {
             "load" => {
                 // `replace` (§11) is read before the params move into the config parse.
-                let replace = params
-                    .as_ref()
-                    .and_then(|p| p.get("replace"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                let replace = bool_param(&params, "replace").unwrap_or(false);
                 self.load(parse_config_param(params)?, replace)
             }
             "add-node" => self.add_node(params),
@@ -547,7 +549,12 @@ impl Daemon {
                 continue;
             }
             if !self.registry.contains(codec) {
-                let available = self.registry.codec_names();
+                // The *usable* names, not the registered ones (RV-10): `exec` is a
+                // legal `codec = …` value handled above, and a list that omitted it
+                // answered a `codec = "exe"` typo without the name the operator
+                // wanted — while `docs/rpc/configuration.md` promises this list
+                // "names the codecs that would have worked".
+                let available = self.registry.usable_codec_names();
                 let message =
                     format!("node {name:?}: unknown codec {codec:?}; available: {available:?}");
                 return Err(structural_error(&message, Some(json!(available))));
@@ -570,14 +577,8 @@ impl Daemon {
     fn load(&self, config: GraphConfig, replace: bool) -> Result<Value, RpcError> {
         // Full structural validation before anything is created or torn down (§4,
         // §11): duplicate node names plus the three graph rules and name checks.
-        let errors = config.validate();
-        if !errors.is_empty() {
-            let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
-            return Err(RpcError::new(
-                app_errors::STRUCTURAL,
-                format!("structural error: {}", messages[0]),
-            )
-            .with_data(json!({ "errors": messages })));
+        if let Some(err) = structural_errors(&config.validate()) {
+            return Err(err);
         }
 
         // Codec names and attribute schemas are structural too (§8/§11/§15.26) but
@@ -730,14 +731,8 @@ impl Daemon {
             // leg/codec config. Nothing is created on a structural error.
             let mut candidate = st.config.clone();
             candidate.nodes.push(node_cfg.clone());
-            let errors = candidate.validate();
-            if !errors.is_empty() {
-                let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
-                return Err(RpcError::new(
-                    app_errors::STRUCTURAL,
-                    format!("structural error: {}", messages[0]),
-                )
-                .with_data(json!({ "errors": messages })));
+            if let Some(err) = structural_errors(&candidate.validate()) {
+                return Err(err);
             }
 
             // Instantiate the node (environmental failure faults it, §15.8; only a bad
@@ -775,17 +770,8 @@ impl Daemon {
     /// error (§6/§15.20), and prunes it from the wiring maps. Surviving neighbors
     /// self-heal: a dropped channel simply stops delivering (a closed `try_send`).
     fn remove_node(&self, params: Option<Value>) -> Result<Value, RpcError> {
-        let name = params
-            .as_ref()
-            .and_then(|p| p.get("node"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| RpcError::invalid_params("missing 'node' in params"))?
-            .to_owned();
-        let cascade = params
-            .as_ref()
-            .and_then(|p| p.get("cascade"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let name = node_param(&params)?.to_owned();
+        let cascade = bool_param(&params, "cascade").unwrap_or(false);
 
         self.state.with_mut(|st| {
             let idx = st.node_index(&name)?;
@@ -925,14 +911,8 @@ impl Daemon {
             // Validate the candidate graph before touching anything (§11 atomicity).
             let mut candidate = st.config.clone();
             candidate.edges.push(edge.clone());
-            let errors = candidate.validate();
-            if !errors.is_empty() {
-                let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
-                return Err(RpcError::new(
-                    app_errors::STRUCTURAL,
-                    format!("structural error: {}", messages[0]),
-                )
-                .with_data(json!({ "errors": messages })));
+            if let Some(err) = structural_errors(&candidate.validate()) {
+                return Err(err);
             }
             // A duplicate needs no check of its own: re-adding an existing edge gives
             // its target endpoint two, which §4 rule 2 refuses above by name. One
@@ -969,43 +949,62 @@ impl Daemon {
             })?;
             let counters = st.target_counters.get(&target).cloned().unwrap_or_default();
 
-            // Register the origin on the host endpoint's lock before any byte can
-            // flow, so arbitration is decided from the first chunk (§6).
+            // Allocate above every id the initial wiring assigned (and above every
+            // earlier live `connect`), so a new edge can never alias a registered
+            // origin — aliased ids would unregister each other.
             let origin_id = OriginId(st.next_edge_origin.get());
             st.next_edge_origin.set(origin_id.0 + 1);
-            if let Some(lock) = st.endpoint_locks.get(&host) {
-                lock.with_mut(|l| l.register(origin_id, target.clone(), mode));
-                // Record the registration for *every* mode, so `disconnect` can undo
-                // it; only a writable one also gets a targetward path and a
-                // `lock`/`unlock` address (§6).
-                let writer = (mode != WriteMode::Never)
-                    .then(|| st.endpoint_targetward.get(&host).cloned())
-                    .flatten();
-                if writer.is_some() {
-                    st.origin_locks
-                        .insert(target.clone(), (lock.clone(), origin_id));
+
+            // Attach through the **one** implementation of it, shared with
+            // `Wiring::build` (§16 one-rule-one-place, SIMPB-1): register the origin
+            // on the host endpoint's lock before any byte can flow, fill the
+            // consumer's live edge slot, make this edge's hostward channel at the
+            // producing node's configured depth, and hand the receiver to the
+            // consumer's already-running pump. Its mirror,
+            // `GraphState::detach_edge_runtime`, was consolidated first for the same
+            // reason. Nothing is spawned or restarted (invariant 14).
+            let attached = crate::runtime::attach_edge(
+                crate::runtime::EdgeParts {
+                    target: target_addr.clone(),
+                    origin: origin_id,
+                    lock: st.endpoint_locks.get(&host).cloned(),
+                    host_targetward: st.endpoint_targetward.get(&host).cloned(),
+                    fanout,
+                    inbox,
+                    slot,
+                    counters,
+                },
+                mode,
+                crate::runtime::hostward_depth(&candidate, &host_addr.node),
+            );
+
+            // What is left is the display-keyed bookkeeping (`Wiring::build` files the
+            // same registration under an `EndpointAddr`) plus the two steps that are
+            // genuinely `connect`-only, both about a *running* endpoint's lock — at
+            // load neither has anything to do, because nothing has written yet and
+            // nobody is parked.
+            if let Some((lock, id)) = &attached.registered {
+                // Record the registration for `lock`/`unlock` to address by origin
+                // name. Writable modes only — a read-only origin is still registered
+                // on the lock, and `disconnect` undoes it through the target
+                // endpoint's `TargetEdge::registered` rather than through this map.
+                if attached.addressable {
+                    st.origin_locks.insert(target.clone(), (lock.clone(), *id));
                 }
-                slot.with_mut(|e| {
-                    e.attached = true;
-                    e.registered = Some((lock.clone(), origin_id));
-                    e.writer = writer;
-                });
                 // A `held` origin is granted the lock inside `register` when the
                 // endpoint is free — a *fresh exclusive grant*, which §6 says runs
-                // purge-on-acquire before the origin's bytes flow. At load that was
-                // vacuous (nothing had written yet); on a running graph the new
-                // origin may have a backlog from an earlier attachment, and firing it
-                // is the stale-command hazard §6 exists to prevent. Synchronously,
-                // at grant time, exactly as the `lock`/`send` verbs do.
-                let granted = lock.with(|g| g.holder() == Some(origin_id));
-                if granted {
+                // purge-on-acquire before the origin's bytes flow. On a running graph
+                // the new origin may have a backlog from an earlier attachment, and
+                // firing it is the stale-command hazard §6 exists to prevent.
+                // Synchronously, at grant time, exactly as the `lock`/`send` verbs do.
+                if attached.granted {
                     let purged = st
                         .nodes
                         .iter()
                         .find(|n| n.name() == target_addr.node)
                         .map_or(0, |n| n.purge_origin());
                     if purged > 0 {
-                        lock.with_mut(|g| g.record_purge(origin_id, purged));
+                        lock.with_mut(|g| g.record_purge(*id, purged));
                     }
                 }
                 // Wake the endpoint's waiters. A `held` origin registered while
@@ -1014,29 +1013,15 @@ impl Daemon {
                 // sits there until an unrelated transition happens to nudge the lock.
                 lock.wake_waiters();
                 lock.emit_change();
-            } else {
-                slot.with_mut(|e| e.attached = true);
             }
 
-            // Hostward: the same channel `Wiring::build` would have made, at the same
-            // depth (the producing node's consumer drop policy, §5/§7.1).
-            let (htx, hrx) =
-                mpsc::channel(crate::runtime::hostward_depth(&candidate, &host_addr.node));
-            fanout.attach(crate::runtime::AttachedSink {
-                target: target_addr.clone(),
-                tx: htx,
-                counters,
-            });
-            // Hand the consumer its receiver. A *full* inbox would mean the endpoint
-            // already has an unconsumed edge, which validation just ruled out. A
-            // *closed* one means the consuming endpoint has no pump at all — a pty
-            // whose setup faulted, or a `faces = "host"` codec/exec channel, whose
-            // driver is deferred (§14). That is the same dead edge `load` would have
+            // A consumer with no pump at all — a pty whose setup faulted, a deferred
+            // `faces = "host"` channel (§14) — is the same dead edge `load` would have
             // produced for the same graph, so it is not a refusal (§15.8:
-            // environmental failure never fails a configuration operation) — but it
-            // is not silent either, because "connected" and "no bytes will ever flow"
+            // environmental failure never fails a configuration operation) — but it is
+            // not silent either, because "connected" and "no bytes will ever flow"
             // must not look alike.
-            let live = inbox.try_send(hrx).is_ok();
+            let live = attached.consumer_live;
             if !live {
                 tracing::warn!(
                     host = %host,
@@ -1211,16 +1196,8 @@ impl Daemon {
         params: Option<Value>,
         out: mpsc::Sender<crate::tap::TapMsg>,
     ) -> Result<(Value, crate::tap::OpenTap), RpcError> {
-        let endpoint = params
-            .as_ref()
-            .and_then(|p| p.get("endpoint"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| RpcError::invalid_params("missing 'endpoint' in params"))?;
-        let replay = params
-            .as_ref()
-            .and_then(|p| p.get("replay"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let endpoint = str_param(&params, "endpoint")?;
+        let replay = bool_param(&params, "replay").unwrap_or(false);
         self.state.with_mut(|st| {
             let hub = st.tap_hubs.get(endpoint).cloned().ok_or_else(|| {
                 RpcError::invalid_params(format!("no host-facing endpoint {endpoint:?} to tap"))
@@ -1258,17 +1235,22 @@ impl Daemon {
     }
 
     /// `info` (§10/§15.26): the daemon's capability surface — its version, the wire
-    /// and envelope protocol versions, and the registered codec names — so tools
-    /// (and a version-skewed CLI) discover what this possibly-custom daemon supports
-    /// rather than assume it. An unknown codec in configuration fails structurally
-    /// with this same list in its `data.available` (§8). Pure observation; touches
-    /// no graph state.
+    /// and envelope protocol versions, and every codec name a configuration may use
+    /// — so tools (and a version-skewed CLI) discover what this possibly-custom
+    /// daemon supports rather than assume it. An unknown codec in configuration
+    /// fails structurally with this same list in its `data.available` (§8). Pure
+    /// observation; touches no graph state.
+    ///
+    /// `codecs` is the *usable* set, so it includes the reserved `exec` (RV-10):
+    /// discovery is answered by what a config may name, not by which names happen to
+    /// have a registry factory. A tool reading this list previously concluded the
+    /// §7.6 escape hatch was unavailable on every daemon in existence.
     fn info(&self) -> Value {
         json!({
             "daemon_version": crate::VERSION,
             "wire_version": crate::WIRE_VERSION,
             "envelope_version": crate::ENVELOPE_VERSION,
-            "codecs": self.registry.codec_names(),
+            "codecs": self.registry.usable_codec_names(),
             // Per-boot nonce (§11.8): tap byte offsets are only comparable within one
             // instance, so a client keys its stored history on this and starts fresh
             // when it changes across a restart.
@@ -1347,11 +1329,7 @@ impl Daemon {
     /// `rotate` (§7.3): rotate a log node's file on demand. Names the node in
     /// `params.node`; errors if it is unknown or not a log node.
     fn rotate(&self, params: Option<Value>) -> Result<Value, RpcError> {
-        let node = params
-            .as_ref()
-            .and_then(|p| p.get("node"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| RpcError::invalid_params("missing 'node' in params"))?;
+        let node = node_param(&params)?;
         self.state.with(|st| {
             let target = st.node(node)?;
             match target.rotate() {
@@ -1361,16 +1339,53 @@ impl Daemon {
         })
     }
 
-    /// Resolve a named serial node to its open port for a signal verb (§7.1),
+    /// The largest `ms` a serial-signal verb accepts (§7.1, invariant 13).
+    ///
+    /// Deliberately far tighter than the schema's one-hour
+    /// [`nexus_core::config::MAX_TIMER_MS`], which bounds a *retry* interval. `ms`
+    /// here holds a **physical line** asserted — a break that garbles every byte the
+    /// device transmits, or DTR parked at a reset level — and it is the one input
+    /// that makes the window in which an in-flight signal verb outlives its node
+    /// arbitrarily wide (review 32 CTRL-1/SERX-2, reproduced on real hardware at
+    /// `--ms 12000`). Sixty seconds is two orders of magnitude past the longest
+    /// documented break or auto-reset pulse; past it the verb is indistinguishable
+    /// from a stuck line, and the operator who typed three extra digits learns it at
+    /// the call rather than by watching a console that never comes back.
+    const MAX_SIGNAL_MS: u64 = 60_000;
+
+    /// Parse and range-check a signal verb's `ms` — **before** the port is resolved
+    /// and before any line is asserted, so an out-of-range value costs nothing
+    /// (invariant 13's structural-refusal shape, applied at the verb because `ms` is
+    /// an RPC param rather than a configuration field). The wording deliberately
+    /// mirrors `ValidationError::NumericOutOfRange`, as `exec::parse_attributes`
+    /// does, so an operator meets one sentence about out-of-range numbers.
+    fn signal_ms(params: &Option<Value>, verb: &str, default: u64) -> Result<u64, RpcError> {
+        let ms = u64_param(params, "ms").unwrap_or(default);
+        if ms > Self::MAX_SIGNAL_MS {
+            return Err(RpcError::invalid_params(format!(
+                "{verb}: ms = {ms}, above the maximum {} (a numeric field is range-checked \
+                 before anything is asserted, §11)",
+                Self::MAX_SIGNAL_MS
+            )));
+        }
+        Ok(ms)
+    }
+
+    /// Resolve a named serial node to a signal handle for a signal verb (§7.1),
     /// dropping the state borrow before the caller awaits (§15.20). Errors if the
     /// node is missing, not a serial node, or its device is not currently open.
-    fn serial_port(&self, node: &str) -> Result<std::rc::Rc<serial2::SerialPort>, RpcError> {
+    ///
+    /// The handle deliberately does **not** carry an `Rc<SerialPort>` clone: holding
+    /// one across a verb's sleep is what kept a torn-down node's fd — and its asserted
+    /// line — alive into a successor node's ownership (CTRL-1/SERX-2). It carries the
+    /// node's port *generation* instead, and every use re-resolves.
+    fn signal_handle(&self, node: &str) -> Result<crate::nodes::serial::SignalHandle, RpcError> {
         self.state.with(|st| {
             let target = st.node(node)?;
             let serial = target.as_serial().ok_or_else(|| {
                 RpcError::invalid_params(format!("node {node:?} is not a serial node"))
             })?;
-            serial.port().ok_or_else(|| {
+            serial.signal_handle().ok_or_else(|| {
                 RpcError::invalid_params(format!(
                     "serial node {node:?} has no open port (device absent/faulted)"
                 ))
@@ -1381,9 +1396,9 @@ impl Daemon {
     /// `send-break` (§7.1): assert a serial break on the named node for a duration.
     async fn send_break(&self, params: Option<Value>) -> Result<Value, RpcError> {
         let node = node_param(&params)?.to_owned();
-        let ms = u64_param(&params, "ms").unwrap_or(250);
-        let port = self.serial_port(&node)?;
-        crate::nodes::serial::send_break(&port, ms)
+        let ms = Self::signal_ms(&params, "send-break", 250)?;
+        let handle = self.signal_handle(&node)?;
+        crate::nodes::serial::send_break(&handle, ms)
             .await
             .map_err(|e| RpcError::invalid_params(format!("send-break on {node:?}: {e}")))?;
         Ok(json!({ "node": node, "break_ms": ms }))
@@ -1395,8 +1410,8 @@ impl Daemon {
         let node = node_param(&params)?.to_owned();
         let dtr = bool_param(&params, "dtr");
         let rts = bool_param(&params, "rts");
-        let port = self.serial_port(&node)?;
-        crate::nodes::serial::set_modem(&port, dtr, rts)
+        let handle = self.signal_handle(&node)?;
+        crate::nodes::serial::set_modem(&handle, dtr, rts)
             .map_err(|e| RpcError::invalid_params(format!("set-modem on {node:?}: {e}")))?;
         Ok(json!({ "node": node, "dtr": dtr, "rts": rts }))
     }
@@ -1405,10 +1420,10 @@ impl Daemon {
     /// — the classic auto-reset toggle.
     async fn pulse_dtr(&self, params: Option<Value>) -> Result<Value, RpcError> {
         let node = node_param(&params)?.to_owned();
-        let ms = u64_param(&params, "ms").unwrap_or(100);
+        let ms = Self::signal_ms(&params, "pulse-dtr", 100)?;
         let assert = bool_param(&params, "assert").unwrap_or(true);
-        let port = self.serial_port(&node)?;
-        crate::nodes::serial::pulse_dtr(&port, ms, assert)
+        let handle = self.signal_handle(&node)?;
+        crate::nodes::serial::pulse_dtr(&handle, ms, assert)
             .await
             .map_err(|e| RpcError::invalid_params(format!("pulse-dtr on {node:?}: {e}")))?;
         Ok(json!({ "node": node, "pulse_ms": ms, "assert": assert }))
@@ -1436,6 +1451,7 @@ impl Daemon {
                 Acquire::Granted => WaitOutcome::Fresh,
                 Acquire::AlreadyHeld => WaitOutcome::AlreadyHeld,
                 Acquire::ReadOnly => WaitOutcome::ReadOnly,
+                Acquire::Unregistered => WaitOutcome::Detached,
                 Acquire::Denied { held_by } => return Err(self.locked_error(&cell, held_by)),
             }
         };
@@ -1462,6 +1478,17 @@ impl Daemon {
             }
             WaitOutcome::ReadOnly => Err(RpcError::invalid_params(format!(
                 "origin {:?} is write=never and cannot hold the lock",
+                p.origin
+            ))),
+            // The edge went away underneath the waiter (`disconnect`, or a
+            // `remove-node --cascade` on the origin's node). Say that, rather than
+            // the `write=never` sentence this used to borrow: the origin's declared
+            // mode is untouched, and an operator sent looking for a configuration
+            // value that has never existed loses the actual cause (CTRL-2). Still
+            // `-32602`, the code `docs/rpc/arbitration.md` already documents for "an
+            // origin that is not a writable origin on any endpoint".
+            WaitOutcome::Detached => Err(RpcError::invalid_params(format!(
+                "origin {:?} was detached from its endpoint while waiting",
                 p.origin
             ))),
             WaitOutcome::Closed => Err(RpcError::new(
@@ -1495,6 +1522,11 @@ impl Daemon {
     /// unregisters — one atomic daemon-side operation. A contended send fails with
     /// [`app_errors::LOCKED`] at its deadline; the transient origin is always
     /// cleaned up, even on cancellation.
+    ///
+    /// **`timeout_ms` bounds the whole operation, not just the acquire** (CONC-2):
+    /// the write is a backpressure point too, and a `send` that blocks there is a
+    /// `send` holding the endpoint's exclusive lock. Both halves run against one
+    /// deadline built at the top of this function.
     async fn send(&self, params: Option<Value>) -> Result<Value, RpcError> {
         let p = SendParams::parse(&params)?;
         let (cell, sender) = self.state.with(|st| {
@@ -1539,6 +1571,26 @@ impl Daemon {
             disarm: Cell::new(false),
         };
 
+        // **One deadline for the whole verb** (§6, CONC-2). `send` is specified as
+        // "acquire-with-timeout, write, and release as one atomic daemon-side
+        // operation … failing with the locked error at its deadline", so the
+        // acquire and the write share the operator's `timeout_ms` rather than the
+        // acquire bounding itself and the write running unbounded behind it. Built
+        // once, here, so the two halves cannot drift apart again — and so the
+        // `--steal` path, which skips the acquire entirely and is just as capable of
+        // parking forever on a full channel, is bounded by the same number.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(p.timeout_ms))
+            // `timeout_ms` is an unvalidated RPC `u64`; `u64::MAX` ms is ~584 million
+            // years and overflows the monotonic clock, which panics the control task
+            // on the plain `+`. Clamp at `MAX_TIMER_MS` (one hour), the ceiling §11
+            // already puts on a daemon-side timer, instead of failing the request:
+            // anything beyond it means "effectively never" to the caller either way.
+            .unwrap_or_else(|| {
+                tokio::time::Instant::now()
+                    + Duration::from_millis(nexus_core::config::MAX_TIMER_MS)
+            });
+
         // Acquire the floor (steal, or join the queue with a deadline).
         if p.steal {
             let _ = cell.with_mut(|g| g.steal(id));
@@ -1548,7 +1600,6 @@ impl Daemon {
             cell.wake_waiters();
             cell.emit_change();
         } else {
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(p.timeout_ms);
             match self.wait_for_grant(cell.clone(), id, Some(deadline)).await {
                 WaitOutcome::Fresh | WaitOutcome::AlreadyHeld => cell.emit_change(),
                 WaitOutcome::TimedOut => {
@@ -1560,7 +1611,14 @@ impl Daemon {
                 WaitOutcome::ReadOnly => {
                     return Err(RpcError::internal("send origin registered write=never"));
                 }
-                WaitOutcome::Closed => {
+                // `Detached`: the transient origin left the endpoint under us — its
+                // arbitration was rebuilt beneath a live `send`. Not reachable through
+                // a verb today (only teardown clears an endpoint's origins, and it
+                // closes the cell first, which the `Closed` half of this arm catches),
+                // but it is a real state now that `acquire` distinguishes it, and the
+                // operator-visible situation is the same one, so it gets the same
+                // defined error rather than an opaque -32603 (RUNTIME-1's rule).
+                WaitOutcome::Detached | WaitOutcome::Closed => {
                     return Err(RpcError::new(
                         app_errors::LOCKED,
                         format!("endpoint {:?} was torn down while sending", p.endpoint),
@@ -1569,12 +1627,45 @@ impl Daemon {
             }
         }
 
-        // Deliver the line targetward — a real backpressure point, but no state
-        // borrow is held across this await (structurally, via `CriticalCell`; §16.2).
+        // Deliver the line targetward under the **same deadline** the acquire ran
+        // under (CONC-2). This is a real backpressure point: the endpoint's targetward
+        // channel is 256 chunks deep (`runtime::CHANNEL_CAP`) and fills whenever the
+        // target stops draining — an absent device, or, worse because nothing in
+        // `state` flags it, a present `active`/`open` node whose peer merely stopped
+        // reading (a flow-control stall). An unbounded await there parked the verb
+        // forever while the `TransientOrigin` below still held the endpoint's
+        // exclusive write lock, so one stalled `send` locked every other origin out
+        // of a live console — `state` showing a phantom `holder: "send"` and every
+        // `lock` answering `-32003 held_by: "send"` — with nothing daemon-side to end
+        // it. Bounding it is not merely politeness to the caller: it is what keeps
+        // §6's "transient" origin transient.
+        //
+        // `mpsc::Sender::send` is **cancel-safe**: a future dropped before it resolves
+        // has enqueued nothing. So a timed-out delivery sends zero bytes and the
+        // reported `sent` stays exact — this can never report a partial line. No state
+        // borrow is held across the await (structurally, via `CriticalCell`; §16.2).
         let mut bytes = p.line.into_bytes();
         bytes.push(b'\n');
         let sent = bytes.len();
-        let delivered = sender.send(Chunk::from(bytes)).await.is_ok();
+        let delivery = tokio::time::timeout_at(deadline, sender.send(Chunk::from(bytes)));
+        let delivered = match delivery.await {
+            Ok(result) => result.is_ok(),
+            Err(_elapsed) => {
+                // Leave by the error path with the guard still armed: dropping it
+                // unregisters the transient origin — which releases the lock, since
+                // `unregister` clears a holder — and wakes the next waiter. The
+                // endpoint is therefore never held past the deadline the operator
+                // asked for, which is the whole contract §6 states for this verb.
+                return Err(RpcError::new(
+                    app_errors::LOCKED,
+                    format!(
+                        "endpoint {:?} did not accept the write within {}ms \
+                         (targetward backpressure); nothing was sent",
+                        p.endpoint, p.timeout_ms
+                    ),
+                ));
+            }
+        };
 
         // Release + unregister the transient origin, then wake the next waiter.
         cell.with_mut(|g| g.unregister(id));
@@ -1738,6 +1829,15 @@ impl Daemon {
     /// the lock's `Notify` (with an optional deadline) holding **nothing**, then
     /// re-attempt when woken. Cancel-safe: the [`WaiterGuard`] dequeues on any
     /// early drop (deadline, dropped connection, teardown) and wakes the next head.
+    ///
+    /// The park-and-retry shell is [`crate::runtime::await_grant`], shared with the
+    /// two interior write gates (SIMPB-2), so the lost-wakeup discipline — enable the
+    /// wake future *before* the attempt — is upheld by one function rather than by
+    /// three comments. The two things this caller does *not* fold into it, on purpose:
+    /// the [`WaiterGuard`], whose whole job is to outlive the wait and dequeue on an
+    /// early drop; and the deadline, which races the entire retry loop against **one**
+    /// `sleep_until` rather than re-arming a timer per iteration. Both leave the guard
+    /// armed on the timeout path, which is what dequeues the abandoned waiter.
     async fn wait_for_grant(
         &self,
         cell: SharedLock,
@@ -1749,44 +1849,36 @@ impl Daemon {
             id,
             disarm: Cell::new(false),
         };
-        loop {
-            // The endpoint may have been torn down while we waited (teardown /
-            // removal); leave the queue with a defined error rather than re-parking
-            // forever (§6/§15.20). Checked each iteration, including right after a
-            // wake — teardown calls `close()` (which wakes) before the maps clear.
-            if cell.is_closed() {
-                return WaitOutcome::Closed;
+        let attempt = |g: &mut nexus_core::lock::EndpointLock| match g.acquire(id) {
+            Acquire::Granted => Some(WaitOutcome::Fresh),
+            Acquire::AlreadyHeld => Some(WaitOutcome::AlreadyHeld),
+            Acquire::ReadOnly => Some(WaitOutcome::ReadOnly),
+            // The re-attempt after a wake is the *only* place this is reachable:
+            // `disconnect`/`remove-node` unregister the origin and wake the queue, so
+            // the waiter leaves here rather than re-parking (CTRL-2).
+            Acquire::Unregistered => Some(WaitOutcome::Detached),
+            Acquire::Denied { .. } => {
+                g.enqueue(id);
+                None
             }
-
-            // Register interest BEFORE the check so a wake landing between the
-            // check and the await is not lost (`Notify` lost-wakeup discipline).
-            let notified = cell.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            let settled = cell.with_mut(|g| match g.acquire(id) {
-                Acquire::Granted => Some(WaitOutcome::Fresh),
-                Acquire::AlreadyHeld => Some(WaitOutcome::AlreadyHeld),
-                Acquire::ReadOnly => Some(WaitOutcome::ReadOnly),
-                Acquire::Denied { .. } => {
-                    g.enqueue(id);
-                    None
-                }
-            });
-            if let Some(outcome) = settled {
+        };
+        let settled = match deadline {
+            None => crate::runtime::await_grant(&cell, attempt).await,
+            Some(dl) => tokio::select! {
+                s = crate::runtime::await_grant(&cell, attempt) => s,
+                // Leave the guard armed: dropping it dequeues this abandoned waiter
+                // and wakes the next head (§15.20 cancel-safety).
+                _ = tokio::time::sleep_until(dl) => return WaitOutcome::TimedOut,
+            },
+        };
+        match settled {
+            Some(outcome) => {
                 guard.disarm.set(true);
-                return outcome;
+                outcome
             }
-
-            match deadline {
-                None => notified.await,
-                Some(dl) => {
-                    tokio::select! {
-                        _ = &mut notified => {}
-                        _ = tokio::time::sleep_until(dl) => return WaitOutcome::TimedOut,
-                    }
-                }
-            }
+            // The endpoint was torn down or removed while we waited: leave the queue
+            // with a defined error rather than re-parking forever (§6/§15.20).
+            None => WaitOutcome::Closed,
         }
     }
 
@@ -2047,13 +2139,51 @@ fn spawn_tap_hubs(st: &mut GraphState, wiring: &mut crate::runtime::Wiring) {
 
 /// Build a structural error (`app_errors::STRUCTURAL`) with `data.errors = [msg]`,
 /// plus `data.available = [...]` when the failure is an unknown codec (§8/§15.26).
+///
+/// **The `"structural error: "` prefix is deliberately shared with
+/// [`structural_errors`]** (SIMP-6). One code, one message shape: `-32002` used to
+/// arrive prefixed from `GraphConfig::validate` and bare from the codec precheck, so
+/// anything rendering `error.message` — the web editor page does, verbatim — showed
+/// two different sentences for the same refusal. The docs' contract ("`data.errors`
+/// lists every message, and the `message` repeats the first") is unchanged: the
+/// prefix is on the message only, never inside `data.errors`.
 fn structural_error(message: &str, available: Option<Value>) -> RpcError {
     let mut data = serde_json::Map::new();
     data.insert("errors".into(), json!([message]));
     if let Some(available) = available {
         data.insert("available".into(), available);
     }
-    RpcError::new(app_errors::STRUCTURAL, message.to_owned()).with_data(Value::Object(data))
+    RpcError::new(
+        app_errors::STRUCTURAL,
+        format!("{STRUCTURAL_PREFIX}{message}"),
+    )
+    .with_data(Value::Object(data))
+}
+
+/// The one sentence opener every `app_errors::STRUCTURAL` message carries (SIMP-6).
+const STRUCTURAL_PREFIX: &str = "structural error: ";
+
+/// Turn a non-empty [`GraphConfig::validate`] result into the structural `RpcError`
+/// §11 specifies: code `app_errors::STRUCTURAL`, `data.errors` carrying **every**
+/// message so an operator fixes the file in one pass, and `message` repeating the
+/// first.
+///
+/// This exists because the eight lines it replaces were written out verbatim three
+/// times — in `load`, `add_node` and `connect` — differing only in which candidate
+/// graph they validated (SIMP-6). Three copies of a wire format is how the `data`
+/// contract comes to grow a field in two of the three places that emit it; the point
+/// of the helper is that there is now one. Returns `None` when `errors` is empty, so
+/// a call site reads as `if let Some(e) = structural_errors(&…) { return Err(e) }`.
+fn structural_errors(errors: &[nexus_core::graph::ValidationError]) -> Option<RpcError> {
+    let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+    let first = messages.first()?;
+    Some(
+        RpcError::new(
+            app_errors::STRUCTURAL,
+            format!("{STRUCTURAL_PREFIX}{first}"),
+        )
+        .with_data(json!({ "errors": messages })),
+    )
 }
 
 /// Whether a verb changes configuration and so warrants a state-file snapshot
@@ -2156,13 +2286,21 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Extract the required `node` string from a node-targeted verb's params.
-fn node_param(params: &Option<Value>) -> Result<&str, RpcError> {
+/// Extract a required string params field, naming it in the refusal. The one
+/// implementation behind [`node_param`]/[`origin_param`] and the direct callers for
+/// `endpoint`/`tap` (SIMP-6): every verb's "missing 'x' in params" then reads the
+/// same, and a new string param costs a call rather than a fresh `and_then` chain.
+fn str_param<'a>(params: &'a Option<Value>, key: &str) -> Result<&'a str, RpcError> {
     params
         .as_ref()
-        .and_then(|p| p.get("node"))
+        .and_then(|p| p.get(key))
         .and_then(Value::as_str)
-        .ok_or_else(|| RpcError::invalid_params("missing 'node' in params"))
+        .ok_or_else(|| RpcError::invalid_params(format!("missing '{key}' in params")))
+}
+
+/// Extract the required `node` string from a node-targeted verb's params.
+fn node_param(params: &Option<Value>) -> Result<&str, RpcError> {
+    str_param(params, "node")
 }
 
 /// An optional `u64` params field.
@@ -2183,11 +2321,7 @@ fn bool_param(params: &Option<Value>, key: &str) -> Option<bool> {
 
 /// Extract the required `origin` string from an `unlock` request's params.
 fn origin_param(params: &Option<Value>) -> Result<&str, RpcError> {
-    params
-        .as_ref()
-        .and_then(|p| p.get("origin"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| RpcError::invalid_params("missing 'origin' in params"))
+    str_param(params, "origin")
 }
 
 fn parse_config_param(params: Option<Value>) -> Result<GraphConfig, RpcError> {

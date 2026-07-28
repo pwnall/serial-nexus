@@ -39,8 +39,8 @@ use nexus_core::Chunk;
 use nexus_core::config::{NodeConfig, OverflowPolicy};
 use nexus_core::{NodeState, NodeStatus};
 use serde_json::json;
-use tokio::task::JoinHandle;
 
+use crate::boundary::TaskSet;
 use crate::runtime::{DropCounters, EdgeInbox};
 
 /// Upper bound on in-memory queued log bytes before the overflow policy fires
@@ -113,6 +113,15 @@ struct Queue {
     /// rotation. Recovered by directory scan at start, never persisted.
     rotation: Option<u64>,
     closed: bool,
+    /// Set once nothing will ever drain this queue again: the writer never
+    /// started (the file would not open, or the thread would not spawn), or
+    /// [`writer_loop`] has returned. [`enqueue`] then drops-and-counts rather
+    /// than piling bytes into a queue with no consumer — which reported up to
+    /// `QUEUE_CAP_BYTES` of provably-unwritable console data as *pending*
+    /// instead of *lost*, and held all 16 MiB of it resident (LOGQ-1). The
+    /// writer's own `return // the pump drops-and-counts` comment always
+    /// claimed this; the flag is what makes the claim true.
+    writer_gone: bool,
     status: NodeState,
     overflow: OverflowPolicy,
 }
@@ -125,7 +134,11 @@ pub struct LogNode {
     /// Shared with the serial reader: counts hostward bytes dropped because the
     /// node's ingest channel was full (§5). Folded into reported `dropped_bytes`.
     ingest_counters: Arc<DropCounters>,
-    pump: Option<JoinHandle<()>>,
+    /// The ingest pump. A [`TaskSet`] rather than a bare handle so "this node's
+    /// tasks die with the node" is the type's property, not this module's convention
+    /// (§16.1, SIMPB-10) — a log's `Drop` is a genuine teardown (it must flush and
+    /// join a blocking writer thread), so the two halves are deliberately distinct.
+    tasks: TaskSet,
     writer: Option<ThreadHandle<()>>,
     /// Signalled by the writer when it exits, so teardown can bound its flush
     /// wait without an unbounded `join()`.
@@ -136,8 +149,33 @@ pub struct LogNode {
     stop_signalled_at: Option<Instant>,
 }
 
+/// How [`LogNode::create`] starts its blocking writer thread.
+///
+/// A **seam, not a second code path**: production passes [`spawn_writer`] and the
+/// CONC-3 guard passes a refusing stand-in, so both run the whole of
+/// [`LogNode::create_with_spawner`] — the file open, the pessimistic queue, the
+/// `apply_spawn` verdict, and everything after. That distinction is the finding:
+/// CONC-3's defect was a `.spawn(…).expect(…)` written *inline in `create`*, which
+/// panicked out of `startup_load`, and a guard that can only call the handler the
+/// fix introduced cannot fail against it (review-32 audit).
+type WriterSpawn = fn(String, WriterBody) -> std::io::Result<ThreadHandle<()>>;
+
+/// The writer thread's body, boxed so [`WriterSpawn`] can be a plain function
+/// pointer. One allocation per log node, at creation.
+type WriterBody = Box<dyn FnOnce() + Send + 'static>;
+
+/// The production [`WriterSpawn`]: a named OS thread, exactly as before.
+fn spawn_writer(name: String, body: WriterBody) -> std::io::Result<ThreadHandle<()>> {
+    std::thread::Builder::new().name(name).spawn(body)
+}
+
 impl LogNode {
     pub fn create(config: &NodeConfig) -> LogNode {
+        Self::create_with_spawner(config, spawn_writer)
+    }
+
+    /// [`LogNode::create`], with the thread-spawn injected (see [`WriterSpawn`]).
+    fn create_with_spawner(config: &NodeConfig, spawn: WriterSpawn) -> LogNode {
         let NodeConfig::Log {
             name,
             directory,
@@ -176,6 +214,12 @@ impl LogNode {
                 rotate_pending: 0,
                 rotation,
                 closed: false,
+                // Pessimistic until a writer thread is actually running, so the
+                // two ways a node comes up without one — an unopenable file and
+                // a refused `spawn` — both drop-and-count from the first byte.
+                // Race-free: nothing can enqueue before `start`, which the
+                // caller runs after `create` returns.
+                writer_gone: true,
                 // A freshly built node has no history, so the stamp is now
                 // (§7 "status … with reason and timestamp", §15.8).
                 status: NodeState::new(status),
@@ -190,7 +234,7 @@ impl LogNode {
             filename: filename.clone(),
             shared: shared.clone(),
             ingest_counters: Arc::new(DropCounters::default()),
-            pump: None,
+            tasks: TaskSet::default(),
             writer: None,
             writer_done: None,
             stop_signalled_at: None,
@@ -200,21 +244,17 @@ impl LogNode {
         // node keeps no writer, and the pump (started later) drops-and-counts.
         if let Some(file) = file {
             let (done_tx, done_rx) = sync_channel::<()>(1);
-            let w = std::thread::Builder::new()
-                .name(format!("log-{name}"))
-                .spawn({
-                    let shared = shared.clone();
-                    let dir = directory.clone();
-                    let fname = filename.clone();
-                    let padding = rotation_padding(config);
-                    move || {
-                        writer_loop(&shared, dir, fname, padding, file);
-                        let _ = done_tx.send(());
-                    }
+            let spawned = spawn(format!("log-{name}"), {
+                let shared = shared.clone();
+                let dir = directory.clone();
+                let fname = filename.clone();
+                let padding = rotation_padding(config);
+                Box::new(move || {
+                    writer_loop(&shared, dir, fname, padding, file);
+                    let _ = done_tx.send(());
                 })
-                .expect("spawn log writer thread");
-            node.writer = Some(w);
-            node.writer_done = Some(done_rx);
+            });
+            apply_spawn(&mut node, done_rx, spawned);
         }
         node
     }
@@ -233,7 +273,8 @@ impl LogNode {
             self.ingest_counters = counters;
         }
         if let Some(inbox) = inbox {
-            self.pump = Some(tokio::task::spawn_local(pump(self.shared.clone(), inbox)));
+            self.tasks
+                .push(tokio::task::spawn_local(pump(self.shared.clone(), inbox)));
         }
     }
 
@@ -291,9 +332,7 @@ impl LogNode {
     /// the flush deadline.
     pub fn signal_stop(&mut self) {
         // Stop new bytes first so the writer drains a fixed backlog.
-        if let Some(p) = self.pump.take() {
-            p.abort();
-        }
+        self.tasks.abort_all();
         if self.stop_signalled_at.is_some() {
             return;
         }
@@ -340,9 +379,48 @@ impl LogNode {
     }
 }
 
+/// Apply the writer thread's spawn result to a node under construction.
+///
+/// A thread that will not start is an **environmental** failure — EAGAIN under
+/// `RLIMIT_NPROC`, a thread cgroup limit, memory pressure — and §15.8 says
+/// environmental failure changes a node's *state*, never the graph, and never
+/// fails the operation that created it. Panicking here unwound out of
+/// `startup_load` → `serve` → `run`, straight through the `if let Err(e)` arm
+/// that exists so a bad state file cannot cost the daemon its life; and because
+/// the graph is persisted, one transient thread limit turned a log node that had
+/// loaded fine into a crash loop across restarts (CONC-3). So fault the node
+/// exactly as an unopenable file already does above, and leave `writer_gone`
+/// set so the pump drops-and-counts instead of filling a queue nobody drains.
+///
+/// Factored out of [`LogNode::create`] for readability; the `spawn` that reaches
+/// it is injectable ([`WriterSpawn`]), so the guard drives the real `create`
+/// rather than this handler.
+fn apply_spawn(
+    node: &mut LogNode,
+    done_rx: StdReceiver<()>,
+    spawned: std::io::Result<ThreadHandle<()>>,
+) {
+    match spawned {
+        Ok(w) => {
+            node.writer = Some(w);
+            node.writer_done = Some(done_rx);
+            // The queue has a consumer now; enqueue may queue rather than shed.
+            node.shared.q.lock().unwrap().writer_gone = false;
+        }
+        Err(e) => {
+            // `done_rx` drops here: teardown then has nothing to wait on, which
+            // is right — there is no writer to flush.
+            let mut q = node.shared.q.lock().unwrap();
+            q.status.set(NodeStatus::Faulted {
+                reason: format!("spawn log writer thread: {e}"),
+            });
+        }
+    }
+}
+
 impl Drop for LogNode {
     fn drop(&mut self) {
-        if self.pump.is_some() || self.writer.is_some() {
+        if !self.tasks.is_empty() || self.writer.is_some() {
             self.teardown();
         }
     }
@@ -369,6 +447,16 @@ async fn pump(shared: Arc<Shared>, mut inbox: EdgeInbox) {
 /// Factored out of [`pump`] so the policy is exercisable without a runtime.
 fn enqueue(q: &mut Queue, chunk: Chunk) -> bool {
     let len = chunk.len();
+    // Nobody will ever drain this queue again (LOGQ-1), so these bytes are loss,
+    // not backlog: count them now. Queueing them instead reported a whole
+    // `QUEUE_CAP_BYTES` of provably-unwritable console data as `queued_bytes`
+    // while `dropped_bytes` stayed flat — an operator sizing the outage from the
+    // loss counter saw nothing for the first 16 MiB — and held it in RAM until
+    // the node was removed. §5: loss is always visible and attributable.
+    if q.writer_gone {
+        q.dropped_bytes += len as u64;
+        return false;
+    }
     if q.queued_bytes + len > QUEUE_CAP_BYTES {
         match q.overflow {
             OverflowPolicy::DropOldest => {
@@ -407,9 +495,26 @@ fn enqueue(q: &mut Queue, chunk: Chunk) -> bool {
     true
 }
 
-/// The blocking writer thread: drain the queue, `write(2)` each chunk, perform
-/// each rotation *at its place in the stream*, and flush on close (§7.3).
-fn writer_loop(shared: &Shared, dir: PathBuf, filename: String, padding: usize, mut file: File) {
+/// The blocking writer thread. Drains via [`writer_drain`] and then — on **every**
+/// exit path — marks the queue dead and accounts for whatever is left in it.
+///
+/// The wrapper exists because the drain has three exits (a fatal `write(2)` under
+/// `overflow = "fault"`, any rotation failure under either policy, and the clean
+/// close) and only the clean one leaves an empty queue. Handling "no writer any
+/// more" at each `return` is how the first two came to say *the pump
+/// drops-and-counts* in a comment while the pump did no such thing for the next
+/// 16 MiB (LOGQ-1); saying it once, here, is the version that cannot drift.
+fn writer_loop(shared: &Shared, dir: PathBuf, filename: String, padding: usize, file: File) {
+    writer_drain(shared, dir, filename, padding, file);
+    let mut q = shared.q.lock().unwrap();
+    abandon_queue(&mut q);
+    // Wake anything parked on the condvar (teardown's collector, a `rotate`).
+    shared.cv.notify_all();
+}
+
+/// The blocking writer drain: pull the queue, `write(2)` each chunk, perform each
+/// rotation *at its place in the stream*, and flush on close (§7.3).
+fn writer_drain(shared: &Shared, dir: PathBuf, filename: String, padding: usize, mut file: File) {
     let current = dir.join(&filename);
     loop {
         let (batch, closing) = {
@@ -508,6 +613,17 @@ fn count_abandoned(q: &mut Queue, rest: &[QueueItem]) {
         q.dropped_bytes += item.len() as u64;
     }
     q.draining_bytes = 0;
+}
+
+/// Mark the queue dead and account for everything still resident in it: the
+/// writer has returned, so those bytes are loss (§5 "all loss is counted") and
+/// nothing may hold them. Rotation markers count zero bytes but go with the rest
+/// — an unperformed rotation cannot be performed by a writer that is gone.
+fn abandon_queue(q: &mut Queue) {
+    q.writer_gone = true;
+    let mut orphaned = std::mem::take(&mut q.items);
+    q.queued_bytes = 0;
+    count_abandoned(q, orphaned.make_contiguous());
 }
 
 /// Perform one queued rotation exactly here in the stream (§7.3): flush, rename
@@ -633,6 +749,8 @@ mod tests {
             rotate_pending: 0,
             rotation: None,
             closed: true,
+            // A writer is about to run over this queue, so it is not dead yet.
+            writer_gone: false,
             status: NodeState::new(NodeStatus::Active),
             overflow,
         }
@@ -669,7 +787,7 @@ mod tests {
         // and returns.
         writer_loop(&shared, tmp.clone(), "ro.log".to_owned(), 3, ro);
 
-        let q = shared.q.lock().unwrap();
+        let mut q = shared.q.lock().unwrap();
         assert_eq!(
             q.dropped_bytes, total,
             "the abandoned batch must be fully counted"
@@ -680,7 +798,196 @@ mod tests {
         );
         // LOG-4: the batch is gone, so nothing is in flight any more.
         assert_eq!(q.draining_bytes, 0);
+
+        // LOGQ-1: the writer has returned, so its `the pump drops-and-counts`
+        // comment must be true from the very next chunk — not 16 MiB later. A
+        // post-return enqueue is loss (`dropped_bytes` moves) and must not be
+        // reported as backlog (`queued_bytes` stays put) or held in RAM.
+        assert!(q.writer_gone, "a returned writer must mark the queue dead");
+        assert!(
+            !enqueue(&mut q, Chunk::from_static(b"dddddddd")),
+            "a chunk offered to a dead queue must not be queued"
+        );
+        assert_eq!(
+            q.dropped_bytes,
+            total + 8,
+            "the post-return chunk must be counted as loss"
+        );
+        assert_eq!(q.queued_bytes, 0, "it must not be reported as pending");
+        assert!(q.items.is_empty(), "and it must not be retained in memory");
         drop(q);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // LOGQ-1, the other return path: *any* rotation failure ends the writer under
+    // *either* policy, so the drop-and-count must start there too. A read-only
+    // directory makes the rename fail (skipped when the process can write it
+    // anyway — running as root, or a filesystem that ignores modes).
+    #[test]
+    fn a_failed_rotation_ends_the_writer_and_the_queue_starts_shedding() {
+        let tmp = unique_dir("logq1-rotate");
+        let current = tmp.join("app.log");
+        let file = open_append(&current).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::write(tmp.join("probe"), b"x").is_ok() {
+            eprintln!(
+                "SKIP a_failed_rotation_ends_the_writer_and_the_queue_starts_shedding: \
+                 a read-only directory is still writable here"
+            );
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+
+        let mut queue = test_queue(OverflowPolicy::DropOldest);
+        push_bytes(&mut queue, b"kept");
+        queue.rotate_pending = 1;
+        queue.items.push_back(QueueItem::Rotate);
+        push_bytes(&mut queue, b"abandoned");
+
+        let shared = Shared {
+            q: Mutex::new(queue),
+            cv: Condvar::new(),
+        };
+        writer_loop(&shared, tmp.clone(), "app.log".to_owned(), 3, file);
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut q = shared.q.lock().unwrap();
+        assert!(
+            matches!(q.status.status(), NodeStatus::Faulted { .. }),
+            "a failed rename must fault the node"
+        );
+        assert!(q.writer_gone, "the writer returned; the queue is dead");
+        assert_eq!(q.dropped_bytes, 9, "the abandoned tail is counted");
+        assert!(!enqueue(&mut q, Chunk::from_static(b"more")));
+        assert_eq!(q.dropped_bytes, 13, "post-return bytes are loss too");
+        assert_eq!(q.queued_bytes, 0);
+        drop(q);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // LOGQ-1: `abandon_queue` must release what the queue still holds rather than
+    // leave it resident — the 16 MiB an operator could not get back short of
+    // removing the node. Exercised directly because reaching a *full* queue
+    // through the writer would mean actually buffering 16 MiB.
+    #[test]
+    fn abandoning_the_queue_releases_and_counts_what_it_still_holds() {
+        let mut q = test_queue(OverflowPolicy::DropOldest);
+        push_bytes(&mut q, b"aaaa");
+        q.items.push_back(QueueItem::Rotate);
+        push_bytes(&mut q, b"bb");
+        q.draining_bytes = 7;
+
+        abandon_queue(&mut q);
+
+        assert!(q.writer_gone);
+        assert!(q.items.is_empty(), "nothing may stay resident");
+        assert_eq!(q.queued_bytes, 0);
+        assert_eq!(q.draining_bytes, 0);
+        assert_eq!(q.dropped_bytes, 6, "every orphaned byte is counted once");
+    }
+
+    /// A [`WriterSpawn`] that refuses with the `EAGAIN` `pthread_create` returns
+    /// under `RLIMIT_NPROC`, dropping the body unrun.
+    fn refuse_spawn(_name: String, _body: WriterBody) -> std::io::Result<ThreadHandle<()>> {
+        Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+    }
+
+    // CONC-3: a writer thread that will not start is an environmental failure
+    // (§15.8) — it faults the node, it does not panic the daemon out of
+    // `startup_load`.
+    //
+    // Driven through the real `LogNode::create` (via its [`WriterSpawn`] seam), not
+    // through `apply_spawn`. That is the whole point: the defect was a
+    // `.spawn(…).expect(…)` *inside* `create`, so a guard aimed at the handler the
+    // fix introduced could not have failed against the shipped code — the gap the
+    // review-32 audit found. With the seam, this test compiles and runs against
+    // either version of `create`. **Proved fail-first**: restoring the `.expect(…)`
+    // shape in `create_with_spawner` makes this test fail by panicking out of the
+    // `create` call below, which is exactly how the daemon died.
+    //
+    // The end-to-end half lives in `nexus-itest/tests/p12_log_queue.rs`
+    // (`a_daemon_that_cannot_spawn_the_log_writer_starts_and_faults_the_node`), which
+    // boots `serialnexusd` under `ulimit -u 1` and provokes the real EAGAIN.
+    #[test]
+    fn a_refused_writer_thread_faults_the_node_instead_of_panicking() {
+        let tmp = unique_dir("conc3");
+        // A directory that exists and a file that opens: everything but the thread
+        // works, so the only thing under test is the refused spawn.
+        let node = LogNode::create_with_spawner(
+            &log_config(&tmp, "app.log", OverflowPolicy::DropOldest),
+            refuse_spawn,
+        );
+
+        assert!(node.writer.is_none(), "no writer may be recorded");
+        assert!(
+            node.writer_done.is_none(),
+            "teardown must have nothing to wait on"
+        );
+        let mut q = node.shared.q.lock().unwrap();
+        assert!(
+            q.status
+                .reason()
+                .is_some_and(|r| r.starts_with("spawn log writer thread:")),
+            "the fault must name the refused spawn: {:?}",
+            q.status.reason()
+        );
+        // …and the node behaves like any other writer-less log: it sheds and
+        // counts from the first byte (LOGQ-1), rather than filling 16 MiB.
+        assert!(q.writer_gone);
+        assert!(!enqueue(&mut q, Chunk::from_static(b"hello")));
+        assert_eq!(q.dropped_bytes, 5);
+        assert_eq!(q.queued_bytes, 0);
+        drop(q);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // CONC-3, the success arm: the real `create` over the real spawner starts a
+    // writer and clears the pessimistic `writer_gone`, so the queue accepts bytes
+    // normally. Same entry point as the failure arm, so the two are comparable.
+    #[test]
+    fn a_spawned_writer_thread_opens_the_queue_for_business() {
+        let tmp = unique_dir("conc3-ok");
+        let mut node = LogNode::create(&log_config(&tmp, "app.log", OverflowPolicy::DropOldest));
+
+        assert!(node.writer.is_some(), "the writer thread is recorded");
+        assert!(node.writer_done.is_some());
+        assert!(!node.shared.q.lock().unwrap().writer_gone);
+        // The queue really is open for business, and the writer really is draining
+        // it: the byte lands on disk within the flush bound.
+        {
+            let mut q = node.shared.q.lock().unwrap();
+            assert!(enqueue(&mut q, Chunk::from_static(b"hello")));
+        }
+        node.shared.cv.notify_all();
+        node.teardown();
+        assert_eq!(
+            std::fs::read(tmp.join("app.log")).expect("the log file exists"),
+            b"hello",
+            "the spawned writer must actually drain the queue"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // CONC-3: the writer-less node an unopenable file produces sheds from the
+    // first byte too — the behaviour `create`'s comment has always claimed.
+    #[test]
+    fn a_log_whose_file_will_not_open_drops_and_counts_from_the_first_byte() {
+        let tmp = unique_dir("conc3-noopen");
+        let node = LogNode::create(&log_config(
+            &tmp.join("no-such-dir"),
+            "app.log",
+            OverflowPolicy::DropOldest,
+        ));
+        assert!(node.writer.is_none(), "a faulted open starts no writer");
+        let mut q = node.shared.q.lock().unwrap();
+        assert!(q.writer_gone);
+        assert!(!enqueue(&mut q, Chunk::from_static(b"hello")));
+        assert_eq!(q.dropped_bytes, 5);
+        assert_eq!(q.queued_bytes, 0);
+        drop(q);
+        assert_eq!(node.state_extra()["dropped_bytes"], json!(5));
+        assert_eq!(node.state_extra()["queued_bytes"], json!(0));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

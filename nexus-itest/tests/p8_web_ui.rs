@@ -60,10 +60,25 @@ const HOSE_CONSOLE: &str = "hose";
 /// why 16 MiB shed on one run and not on the next.
 const HOSE_BYTES: &str = "64MiB";
 
-/// The floor the browser suite must clear (see the assertion for why a floor, not an
-/// exact count). It runs 13 specs per push plus the `@slow` one nightly; several
-/// self-skip where no serial device exists, which is why the floor sits below that.
-const MIN_SPECS: usize = 8;
+/// The floor the browser suite must clear, **as a function of the fixture this gate
+/// built** (review 32 ITEST-4).
+///
+/// `serialnexusweb/ui-tests/tests/` declares 22 specs. Two are tagged `@slow` and
+/// excluded per push (`--grep-invert @slow` below), leaving **20**; ten of those 20
+/// `test.skip` themselves when the fixture has no serial device (`!ECHO` / `!HOSE`),
+/// leaving **10** that run on any platform. (Eleven specs carry a device skip in all,
+/// but one of them is `@slow` and is not in the per-push run; both counts below are
+/// per-push counts, and were re-measured against the suite on 2026-07-27.)
+///
+/// One constant used to do both jobs: `MIN_SPECS = 8` sat at the device-free count, which
+/// is tight on macOS and carried six specs of slack on `ubuntu-latest` — the only platform
+/// the `web-ui` job runs on, where `serial_echo()` is unconditionally `Some`. Any six
+/// specs could vanish (a deleted file, a rename off `*.spec.mjs`, a `testDir` typo, a
+/// `--grep` mistake) and the gate stayed green, while its own assertion message promised
+/// that "a *removed* spec … trips it". The gate already knows which fixture it built, so
+/// it can hold the suite to the right number instead of to the smaller of the two.
+const SPECS_WITH_DEVICE: usize = 20;
+const SPECS_DEVICE_FREE: usize = 10;
 
 #[test]
 fn the_web_console_passes_its_headless_chromium_suite() {
@@ -321,32 +336,88 @@ device = "{dev}"
     // hard way (§15.36 rule 7, where a stale hand-kept list meant five parsers were
     // compiled every night and fuzzed never). A floor rather than an exact count, so
     // adding a spec does not have to edit this line; a *removed* spec, a filter typo, or
-    // a suite that silently self-skipped its way to nothing all trip it.
+    // a suite that silently self-skipped its way to nothing all trip it — which is only
+    // true now that the floor is the count for *this* fixture rather than the smaller of
+    // the two (ITEST-4).
+    //
+    // `SNX_UI_GREP` narrows the run deliberately, so the floor does not apply to it; CI
+    // never sets it, and `SNX_WEB_UI=required` does not relax anything else.
     let passed = passed_count(&stdout);
-    assert!(
-        passed >= MIN_SPECS,
-        "the Playwright suite reported {passed} passing specs, fewer than the {MIN_SPECS} \
-         this gate exists to run — a filter, a skip, or a deleted file has shrunk it\n\
-         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-    );
+    if grep.is_empty() {
+        let floor = if echo.is_some() {
+            SPECS_WITH_DEVICE
+        } else {
+            SPECS_DEVICE_FREE
+        };
+        assert!(
+            passed >= floor,
+            "the Playwright suite reported {passed} passing specs, fewer than the {floor} \
+             this fixture ({device}) exists to run — a filter, a skip, or a deleted file \
+             has shrunk it\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            device = if echo.is_some() {
+                "with a serial device"
+            } else {
+                "device-free"
+            },
+        );
+
+        // The direction a floor cannot see: a `test.skip` firing when it should not.
+        // With a device present *nothing* may skip — every `test.skip(!ECHO, …)` and
+        // `test.skip(!HOSE, …)` guard is satisfied — so a non-zero skip count means the
+        // fixture handed the browser an empty `SNX_ECHO_CONSOLE`/`SNX_HOSE_CONSOLE`, or
+        // a spec skipped itself for a reason nobody asked for. Both look identical to a
+        // count of passing specs and both silently retire real coverage.
+        if echo.is_some() {
+            let skipped = skipped_count(&stdout);
+            assert_eq!(
+                skipped, 0,
+                "{skipped} browser specs skipped themselves on a fixture that has a \
+                 serial device — the device-gated specs (the reload splice, the \
+                 `load --replace` re-anchor, the editor round-trip) are the ones that \
+                 guard §15.38's defects, and a floor cannot see them go\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+        }
+    }
 }
 
-/// The passing-spec count from Playwright's list-reporter totals line ("13 passed
+/// The passing-spec count from Playwright's list-reporter totals line ("19 passed
 /// (8.6s)"), or 0 when it printed no such line.
 fn passed_count(stdout: &str) -> usize {
-    stdout
-        .split(" passed (")
-        .next()
-        .filter(|_| stdout.contains(" passed ("))
-        .and_then(|before| {
-            let digits: String = before
-                .chars()
-                .rev()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            digits.chars().rev().collect::<String>().parse().ok()
-        })
-        .unwrap_or(0)
+    count_before(stdout, " passed (")
+}
+
+/// The skipped-spec count from Playwright's totals block ("9 skipped"), or 0 when it
+/// printed none — which is what a run where every `test.skip` guard was satisfied looks
+/// like, and what the device-bearing fixture must produce (ITEST-4).
+fn skipped_count(stdout: &str) -> usize {
+    count_before(stdout, " skipped")
+}
+
+/// The number immediately preceding the **last** occurrence of `marker` that has digits
+/// in front of it, or 0 when there is none.
+///
+/// Last rather than first, and digit-guarded, because the list reporter echoes every
+/// spec *title* before it prints the totals block: a spec one day named "…is skipped
+/// when…" would otherwise capture the reader and, with no digits before it, silently
+/// return 0 — which for the skip assertion is the *passing* answer. A counter that
+/// quietly reads zero is the failure this whole gate is about.
+fn count_before(stdout: &str, marker: &str) -> usize {
+    let mut found = None;
+    let mut at = 0usize;
+    while let Some(i) = stdout[at..].find(marker) {
+        let end = at + i;
+        let digits: String = stdout[..end]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(n) = digits.chars().rev().collect::<String>().parse::<usize>() {
+            found = Some(n);
+        }
+        at = end + marker.len();
+    }
+    found.unwrap_or(0)
 }
 
 /// Whether `<tool> --version` runs and exits 0.

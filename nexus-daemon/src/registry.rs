@@ -126,10 +126,39 @@ impl Registry {
         Ok(self)
     }
 
-    /// The registered codec names, sorted — for the `info` verb (§10/§15.26) and
-    /// for the available-list an unknown-codec error carries.
+    /// The **registered** codec names, sorted — the factories in this registry and
+    /// nothing else. This is the registration-level answer ([`Debug`], embedder
+    /// diagnostics); the operator-facing question "which codec names may a
+    /// configuration use" is [`usable_codec_names`](Registry::usable_codec_names),
+    /// which is a strictly larger set.
     pub fn codec_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.factories.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Every codec name a configuration may legally name, sorted: the registered
+    /// factories **plus** [`RESERVED_NAMES`] (RV-10).
+    ///
+    /// `exec` is a usable codec (§7.6 packages it "as an ordinary compiled-in
+    /// codec") that is deliberately not a registry entry, because it is a child
+    /// *process* rather than an in-process [`Codec`] and is routed before the
+    /// registry is consulted. That implementation fact had leaked into two operator
+    /// surfaces: `info.codecs`, the discovery surface §15.26 makes normative, and —
+    /// sharper, because `docs/rpc/configuration.md` promises the list "names the
+    /// codecs that would have worked" — the `data.available` of an unknown-codec
+    /// structural error, which answered a `codec = "exe"` typo with a list omitting
+    /// the very name the operator wanted. Both now ask this method instead. The
+    /// reserved names are unioned rather than inserted into `factories` so
+    /// [`register`](Registry::register) still rejects `exec` as reserved and
+    /// [`build`](Registry::build) still cannot be handed it.
+    pub fn usable_codec_names(&self) -> Vec<String> {
+        let mut names = self.codec_names();
+        for reserved in RESERVED_NAMES {
+            if !names.iter().any(|n| n == reserved) {
+                names.push((*reserved).to_owned());
+            }
+        }
         names.sort();
         names
     }
@@ -137,7 +166,9 @@ impl Registry {
     /// Whether `name` names a registered in-process codec (used by the daemon's
     /// structural pre-check so an unknown codec aborts the load with the available
     /// list, §8/§11). The reserved `exec` name is *not* in the registry but is a
-    /// valid codec at load time, so callers check it separately.
+    /// valid codec at load time, so callers check it separately — and report the
+    /// refusal against [`usable_codec_names`](Registry::usable_codec_names), which
+    /// includes it.
     pub fn contains(&self, name: &str) -> bool {
         self.factories.contains_key(name)
     }
@@ -146,6 +177,10 @@ impl Registry {
     /// the daemon's structural pre-check; the factory validates the attribute
     /// schema. An unknown name still errors here (a defensive fallback for direct
     /// callers) with the available list, so no path can silently do nothing.
+    ///
+    /// The list here is [`codec_names`](Registry::codec_names), deliberately *not*
+    /// the usable set: this message answers "which codec could this method have
+    /// built", and `exec` is precisely the one it never can.
     pub(crate) fn build(
         &self,
         name: &str,
@@ -194,6 +229,29 @@ mod tests {
             .register("reference", dummy())
             .expect_err("reference is already a built-in");
         assert_eq!(err, RegistryError::Duplicate("reference".to_owned()));
+    }
+
+    /// RV-10: `exec` is a usable codec name, so the operator-facing list names it —
+    /// while the registration-level list keeps meaning "registered factories", which
+    /// is what `register` and `build` are judged against.
+    #[test]
+    fn the_usable_names_include_the_reserved_exec_codec() {
+        let registry = Registry::with_builtins();
+        assert_eq!(
+            registry.usable_codec_names(),
+            vec!["exec".to_owned(), "reference".to_owned()],
+            "the usable list must name every codec a configuration may use, sorted"
+        );
+        assert!(
+            !registry.codec_names().contains(&"exec".to_owned()),
+            "exec must stay out of the registration-level list: it has no factory"
+        );
+        // An empty registry (a minimal daemon with no built-in codecs, §8) still has
+        // `exec` — that is the whole point of the escape hatch.
+        assert_eq!(
+            Registry::new().usable_codec_names(),
+            vec!["exec".to_owned()]
+        );
     }
 
     #[test]

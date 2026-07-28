@@ -1,7 +1,12 @@
 # Lifecycle verbs
 
 Whole-graph and whole-daemon lifecycle (§11). `teardown` empties the graph but
-leaves the daemon running; `shutdown` stops the daemon itself.
+leaves the daemon running; `shutdown` stops the daemon itself. Both close every
+endpoint lock outright, so a parked waiter always leaves by the torn-down arm
+(`-32003`, `endpoint behind origin "p1" was torn down while waiting`, or
+`endpoint "usb0" was torn down while sending`) — never by the detached arm that
+[`disconnect`/`remove-node`](configuration.md#remove-node) can produce, which is
+a statement about one writer and not about the endpoint.
 
 Methods on this page: [`teardown`](#teardown), [`shutdown`](#shutdown).
 

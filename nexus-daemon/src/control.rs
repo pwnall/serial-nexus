@@ -4,21 +4,41 @@
 //! errors are refused cleanly with the spec-mandated null id.
 //!
 //! Dispatch is async because the arbitration verbs may *wait* (`lock --wait`,
-//! `send`'s acquire-with-timeout, §15.20). A waiting verb is raced against a
-//! disconnect on the same connection: if the client drops mid-wait, the dispatch
-//! future is cancelled (dropped), which runs the waiter's cleanup guard and
-//! removes it from the FIFO queue (§6 cancel-safe waiting). The race uses a
-//! `biased` select so an immediately-ready fast verb is never pre-empted by a
-//! spuriously-read next line. The second lane **discriminates** what it read
-//! (CTRL-1): only an EOF or a read error cancels, because only those are the
-//! disconnect §15.20 sanctions; a *pipelined* request is answered with an error
-//! carrying its own id and the wait continues.
+//! `send`'s acquire-with-timeout, §15.20), so a connection is **one** `select!` with
+//! four lanes — the in-flight verb, the request half, the `subscribe` broadcast, and
+//! this connection's tap deliveries — rather than a request/response loop with a
+//! nested wait inside it. That shape is the CTRLW-1 fix, and it is structural: the
+//! wait used to be an inner two-arm loop polling only the verb and the next line, so
+//! for the whole duration of a wait the connection stopped draining its notification
+//! lanes — `subscribe` traffic merely late, but `tap.data` bytes really *lost* past
+//! the 128-slot tap queue (11.2 MB measured in one 6 s `lock --wait`, and a two-second
+//! terminal blackout on every contended `send` for the §17 console, which drives
+//! `subscribe`, every tap and every `send` down one daemon connection). With the verb
+//! as an arm there is exactly one place that drains the notification lanes, and no
+//! control path can bypass it.
+//!
+//! The lanes are `biased`, and the order is load-bearing twice. The verb comes first
+//! so a fast dispatch — one ready on its first poll — is answered without ever reading
+//! (and then having to refuse) a request pipelined behind it. The request half comes
+//! before the two notification lanes so an operator's keystroke is never starved by a
+//! firehose tap: the request lane is ready only while a client is actually sending and
+//! is bounded by that client, whereas a tapped high-rate endpoint (invariant 2's
+//! ~185 MiB/s reader) can keep its queue non-empty indefinitely.
+//!
+//! Only one verb may be in flight per connection. A *pipelined* request is not a
+//! disconnect (CTRL-1): it is answered with [`WAIT_IN_FLIGHT_MESSAGE`] carrying its
+//! own id, and both the wait and the connection survive. EOF or a read error *is* one:
+//! it breaks the loop, and dropping the in-flight future runs the waiter's cleanup
+//! guard and removes it from the FIFO queue (§6 cancel-safe waiting).
 
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::rc::Rc;
 
 use nexus_rpc::{
-    AppError, Notification, Response, RpcError, base64_encode, error_codes, parse_incoming_request,
+    AppError, Id, Notification, Response, RpcError, base64_encode, error_codes,
+    parse_incoming_request,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -138,10 +158,45 @@ impl<R: tokio::io::AsyncRead + Unpin> RequestLines<R> {
     }
 }
 
+/// A dispatch in progress, boxed so the connection can hold it across `select!`
+/// iterations instead of awaiting it inside a nested loop.
+type DispatchFuture = Pin<Box<dyn Future<Output = Result<Value, RpcError>>>>;
+
+/// The one verb a connection may have in flight at a time (§15.20), plus what its
+/// reply needs when it settles.
+///
+/// Boxing costs one allocation per request and buys the structural half of the
+/// CTRLW-1 fix: a *value* the loop can carry, so a waiting verb is one **arm** of the
+/// single `select!` rather than an inner loop that stops polling the notification
+/// lanes. Being pinned and owned here, it is dropped exactly when the connection ends
+/// — which is what runs the waiter's cleanup guard on a disconnect (§6).
+struct InFlight {
+    /// The request id its result is correlated with.
+    id: Id,
+    /// Whether this verb is the `subscribe` that opens the notification lane.
+    is_subscribe: bool,
+    fut: DispatchFuture,
+}
+
+/// The dispatch lane of [`serve_connection`]'s `select!`: polls the in-flight verb
+/// when there is one and parks forever when there is not, so the lane can sit in the
+/// select unconditionally instead of under a guard that could be forgotten.
+///
+/// Cancel-safe by construction: dropping this future drops the borrow, never the
+/// boxed verb, which stays in `slot` and resumes exactly where it left off — the
+/// property the pipelined-request refusal depends on (CTRL-1).
+async fn poll_inflight(slot: &mut Option<InFlight>) -> Result<Value, RpcError> {
+    match slot {
+        Some(inflight) => inflight.fut.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Serve one client connection until it closes: read newline-delimited requests,
 /// dispatch each, and write back one response line. Once the client issues
 /// `subscribe`, this also forwards the daemon's id-less notifications to it (§10)
-/// while still handling further requests on the same connection.
+/// while still handling further requests on the same connection — including while a
+/// waiting verb is parked (CTRLW-1; see the module doc for the lane order).
 pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = RequestLines::new(read_half);
@@ -165,12 +220,51 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
     let (tap_tx, mut tap_rx) = mpsc::channel::<TapMsg>(TAP_QUEUE_CAP);
     let mut open_taps: Vec<OpenTap> = Vec::new();
 
+    // The connection's single in-flight verb (§15.20). `None` for the whole life of a
+    // connection that only issues fast verbs; `Some` from the moment a `lock --wait`
+    // or a contended `send` is read until it settles, is refused a write, or the
+    // connection ends beneath it.
+    let mut inflight: Option<InFlight> = None;
+
     loop {
         tokio::select! {
+            biased;
+
+            // The in-flight verb. First, so a dispatch that is ready on its first poll
+            // is answered without reading — and then having to refuse — a request
+            // pipelined behind it.
+            result = poll_inflight(&mut inflight) => {
+                // `poll_inflight` parks forever on an empty slot, so this arm firing
+                // means there is a verb to settle; `continue` rather than panic keeps
+                // an impossible state from costing a §17 browser its session.
+                let Some(settled) = inflight.take() else { continue };
+                let response = match result {
+                    Ok(value) => Response::success(settled.id, value),
+                    Err(err) => Response::error(settled.id, err),
+                };
+                if write_half
+                    .write_all(nexus_rpc::to_line(&response).as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if settled.is_subscribe {
+                    subscribed.subscribe();
+                }
+            }
+
             line = lines.next_line() => {
                 let line = match line {
                     Ok(LineRead::Line(line)) => line,
-                    Ok(LineRead::Eof) | Err(_) => break, // client closed or read error
+                    // Client closed or read error. §15.20's cancel-on-disconnect is
+                    // normative and a bare write-half half-close is indistinguishable
+                    // from a killed client at read time, so both end the connection —
+                    // and dropping `inflight` on the way out runs the waiter's cleanup
+                    // guard, dequeuing a parked `lock --wait` promptly. (`serialnexusctl`
+                    // keeps both halves open across the read; a raw `socat` waiting-verb
+                    // user must too — CTRL-3, declined on purpose and still declined.)
+                    Ok(LineRead::Eof) | Err(_) => break,
                     Ok(LineRead::TooLong) => {
                         // One connection streaming a line with no newline would
                         // otherwise grow the shared daemon's read buffer without
@@ -193,6 +287,31 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                     continue;
                 }
 
+                // One waiting verb per connection (§15.20). A request read while one
+                // is in flight is *refused* — with its own id, so the client can
+                // correlate — and the wait, this connection's taps and its
+                // subscription all keep running (CTRL-1). Killing the connection here
+                // instead would silently cost a §17 browser its whole session.
+                if inflight.is_some() {
+                    let refusal = match parse_incoming_request(&line) {
+                        Ok(req) => Response::error(
+                            req.id,
+                            RpcError::new(AppError::WaitInFlight.code(), WAIT_IN_FLIGHT_MESSAGE),
+                        ),
+                        // An unparseable line has no id to echo; the spec's null id
+                        // applies, and it is still a refusal rather than a disconnect.
+                        Err(err) => Response::error_without_id(err),
+                    };
+                    if write_half
+                        .write_all(nexus_rpc::to_line(&refusal).as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+
                 // Parse synchronously; a parse / invalid-request error replies with
                 // the spec-mandated null id (§10, JSON-RPC 2.0 §5) and never reaches
                 // dispatch.
@@ -211,15 +330,16 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                     }
                 };
 
-                let id = req.id.clone();
+                let id = req.id;
                 let method = req.method;
                 let params = req.params;
-                let is_subscribe = method == "subscribe";
 
                 // Taps are connection-scoped (§17): handle `tap.open`/`tap.close`
                 // here, where the connection's outbound tap channel and open-tap
                 // list live, rather than in the shared dispatch. Both complete
-                // synchronously, with no waiting lane.
+                // synchronously, with no waiting lane — and their reply is written
+                // before the loop can drain a single queued `tap.data`, which is what
+                // makes `tap.open`'s `from_offset` an exact splice point (§11.8).
                 let response = if method == "tap.open" {
                     match daemon.tap_open(params, tap_tx.clone()) {
                         Ok((value, handle)) => {
@@ -269,96 +389,24 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                         ),
                     }
                 } else {
-                    // Dispatch may wait (`lock --wait`, `send`). Race it against a
-                    // disconnect so a dropped connection cancels the wait — dropping the
-                    // future runs the waiter's cleanup guard (§15.20). `biased` polls the
-                    // dispatch first, so a fast verb (ready on first poll) is taken
-                    // without ever reading — and possibly losing — a following request.
-                    //
-                    // The second lane discriminates what it read (CTRL-1):
-                    //
-                    // * **EOF or a read error** abandons the in-flight verb and closes.
-                    //   §15.20's cancel-on-disconnect is normative (a killed
-                    //   `lock --wait` client must dequeue promptly) and a bare write-half
-                    //   half-close is indistinguishable from a killed client at read
-                    //   time, so it is treated as a disconnect. `serialnexusctl` keeps
-                    //   both halves open across the read; a raw `socat` waiting-verb user
-                    //   must too (CTRL-3: declined on purpose, and still declined).
-                    // * **A pipelined request** is *not* a disconnect. It is answered
-                    //   with [`WAIT_IN_FLIGHT_MESSAGE`] carrying its own id, and the wait
-                    //   stays intact — a §17 browser drives `subscribe`, every tap and
-                    //   `send` down one connection, so killing it here silently costs the
-                    //   operator the whole session.
-                    // * **An over-cap line** keeps the read-path bound (CTRL-1): refuse
-                    //   with the null id and close, exactly as the first lane does.
-                    //
-                    // `next_line` keeps its partial line in `self.buf`, so a request that
-                    // straddles a cancelled read is never truncated.
-                    let dispatch = daemon.dispatch(&method, params);
-                    tokio::pin!(dispatch);
-                    let mut settled = None;
-                    loop {
-                        tokio::select! {
-                            biased;
-                            result = &mut dispatch => {
-                                settled = Some(match result {
-                                    Ok(value) => Response::success(id.clone(), value),
-                                    Err(err) => Response::error(id.clone(), err),
-                                });
-                                break;
-                            }
-                            second = lines.next_line() => {
-                                // `close_after` separates "refuse and keep waiting"
-                                // (a pipelined or unparseable line) from "refuse and
-                                // close" (the read-path bound).
-                                let (refusal, close_after) = match second {
-                                    Ok(LineRead::Eof) | Err(_) => break, // cancel-on-disconnect
-                                    Ok(LineRead::TooLong) => (
-                                        Response::error_without_id(RpcError::new(
-                                            error_codes::INVALID_REQUEST,
-                                            format!(
-                                                "request line exceeds the {MAX_REQUEST_LINE}-byte limit"
-                                            ),
-                                        )),
-                                        true,
-                                    ),
-                                    Ok(LineRead::Line(pipelined)) => {
-                                        if pipelined.trim().is_empty() {
-                                            continue;
-                                        }
-                                        // Echo the pipelined request's own id so the
-                                        // client correlates the refusal with the request
-                                        // it refuses; an unparseable line keeps the
-                                        // spec's null id.
-                                        let resp = match parse_incoming_request(&pipelined) {
-                                            Ok(req) => Response::error(
-                                                req.id,
-                                                RpcError::new(
-                                                    AppError::WaitInFlight.code(),
-                                                    WAIT_IN_FLIGHT_MESSAGE,
-                                                ),
-                                            ),
-                                            Err(err) => Response::error_without_id(err),
-                                        };
-                                        (resp, false)
-                                    }
-                                };
-                                let wrote = write_half
-                                    .write_all(nexus_rpc::to_line(&refusal).as_bytes())
-                                    .await
-                                    .is_ok();
-                                if close_after || !wrote {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    match settled {
-                        Some(response) => response,
-                        // The second lane ended the connection; dropping `dispatch`
-                        // here runs the waiter's cleanup guard (§15.20).
-                        None => break,
-                    }
+                    // Everything else may wait (`lock --wait`, a contended `send`), so
+                    // it does not run here: it becomes *the* in-flight verb and settles
+                    // in the dispatch lane at the top of the loop. Handing it to that
+                    // lane instead of awaiting it inside this arm is the CTRLW-1 fix —
+                    // the notification lanes keep being polled for the whole wait, so a
+                    // parked verb no longer blacks out this connection's `tap.data` and
+                    // `subscribe` streams. `biased` puts the lane first, so a verb ready
+                    // on its first poll still answers before another line is read.
+                    let dispatcher = daemon.clone();
+                    let is_subscribe = method == "subscribe";
+                    inflight = Some(InFlight {
+                        id,
+                        is_subscribe,
+                        // The future owns its method and params, so it is self-contained
+                        // and outlives this loop iteration without borrowing from it.
+                        fut: Box::pin(async move { dispatcher.dispatch(&method, params).await }),
+                    });
+                    continue;
                 };
 
                 if write_half
@@ -367,9 +415,6 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                     .is_err()
                 {
                     break;
-                }
-                if is_subscribe {
-                    subscribed.subscribe();
                 }
             }
             // Only drain notifications once subscribed; before that the receiver
@@ -594,6 +639,112 @@ mod tests {
                 assert_eq!(resp.id, Id::Number(1), "the waiting verb still answers");
                 assert!(resp.is_success(), "the send should have been granted");
                 assert!(targetward_rx.try_recv().is_ok(), "the line was delivered");
+            })
+            .await;
+    }
+
+    // CTRLW-1: a parked verb must not freeze the connection's notification lanes.
+    // The old shape left the outer `select!` for an inner two-arm loop over the verb
+    // and the next request line, so a connection with a verb in flight stopped writing
+    // *every* notification it was subscribed to — `subscribe` traffic merely late, but
+    // `tap.data` bytes really lost past the 128-slot tap queue (§17: one daemon
+    // connection carries the subscription, every tap and every `send`). Here the
+    // subscription lane stands in for both, because it needs no device: with the fix
+    // the arms are siblings and the snapshot arrives; without it, nothing is polling
+    // `notes.recv()`. Fail-first observed, not assumed — grafted onto `5a92ca5`'s
+    // `serve_connection` in a throwaway worktree it panics on the 5 s timeout.
+    // `nexus-itest/tests/p12_control_streams.rs` pins the same property end to end on
+    // the lane that actually loses bytes.
+    #[tokio::test]
+    async fn a_parked_verb_does_not_freeze_the_connections_notification_lane() {
+        use crate::daemon::Daemon;
+        use crate::runtime::LockCell;
+        use nexus_core::Chunk;
+        use nexus_core::graph::WriteMode;
+        use nexus_core::lock::{Arbitration, EndpointLock, OriginId};
+        use nexus_rpc::{Id, Incoming};
+        use std::time::Duration;
+        use tokio::io::AsyncBufReadExt;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let daemon = Rc::new(Daemon::default());
+
+                // Same fixture as the pipelining test: a host endpoint whose lock is
+                // already held, so a `send` against it parks in the FIFO queue.
+                let (notifier, _keep) = tokio::sync::broadcast::channel(8);
+                let lock = Rc::new(LockCell::new(
+                    "usb0",
+                    EndpointLock::new(Arbitration::Exclusive),
+                    notifier,
+                ));
+                let holder = OriginId(1);
+                lock.with_mut(|g| {
+                    g.register(holder, "console-a", WriteMode::OnDemand);
+                    let _ = g.acquire(holder);
+                });
+                let (tx, _targetward_rx) = mpsc::channel::<Chunk>(4);
+                daemon.advertise_endpoint_for_test("usb0", lock.clone(), tx);
+
+                let (client, server) = UnixStream::pair().unwrap();
+                tokio::task::spawn_local(serve_connection(daemon.clone(), server));
+
+                let (client_read, mut client_write) = client.into_split();
+                let mut replies = BufReader::new(client_read).lines();
+
+                client_write
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"subscribe\"}\n")
+                    .await
+                    .unwrap();
+                let ack = replies.next_line().await.unwrap().expect("the subscribe ack");
+                assert!(ack.contains("\"subscribed\":true"), "{ack}");
+
+                // Park a contended `send` — a §17 console's Enter on a locked endpoint.
+                client_write
+                    .write_all(
+                        b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"send\",\
+                          \"params\":{\"endpoint\":\"usb0\",\"line\":\"go\",\"timeout_ms\":30000}}\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut parked = false;
+                for _ in 0..500 {
+                    if lock.with(|g| g.waiters().count()) == 1 {
+                        parked = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                assert!(parked, "the contended send never reached the FIFO queue");
+
+                // The verb is parked *now*, so this snapshot can only be written by a
+                // connection that is still draining its notification lane.
+                daemon.emit_state_snapshot();
+                let note = tokio::time::timeout(Duration::from_secs(5), replies.next_line())
+                    .await
+                    .expect(
+                        "no notification arrived while a verb was parked: the connection's \
+                         subscribe lane was frozen for the whole wait (CTRLW-1)",
+                    )
+                    .unwrap()
+                    .expect("a notification line");
+                let Ok(Incoming::Notification(note)) = serde_json::from_str::<Incoming>(&note)
+                else {
+                    panic!("expected an id-less notification, got {note}");
+                };
+                assert_eq!(note.method, "state");
+
+                // And the parked verb is unharmed by the traffic: it still answers.
+                let _ = lock.with_mut(|g| g.release(holder));
+                lock.wake_waiters();
+                let settled = replies.next_line().await.unwrap().expect("the send reply");
+                let Ok(Incoming::Response(resp)) = serde_json::from_str::<Incoming>(&settled)
+                else {
+                    panic!("expected a response, got {settled}");
+                };
+                assert_eq!(resp.id, Id::Number(2), "the parked verb still answers");
+                assert!(resp.is_success(), "the send should have been granted");
             })
             .await;
     }

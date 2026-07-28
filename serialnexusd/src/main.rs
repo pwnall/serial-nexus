@@ -36,10 +36,13 @@ struct Cli {
     dev_root: PathBuf,
     /// Configuration snapshot path (§11): the daemon writes the current config here
     /// after each successful config mutation and prefers it at startup, so
-    /// incremental surgery survives a restart. Defaults to a file next to the
-    /// control socket (`<socket>.state.toml`), which shares the socket's lifecycle
-    /// — under /run or $XDG_RUNTIME_DIR it is cleared on reboot, so pass an explicit
-    /// path (e.g. /var/lib/serialnexusd/state.toml) for reboot-durable persistence.
+    /// incremental surgery survives a restart. Defaults to a file beside the control
+    /// socket, named from the socket's *stem* — `/run/serialnexusd.sock` yields
+    /// `/run/serialnexusd.state.toml`, not `serialnexusd.sock.state.toml`. It shares
+    /// the socket's lifecycle, so under /run or $XDG_RUNTIME_DIR it is cleared on
+    /// reboot: pass an explicit path (e.g. /var/lib/serialnexusd/state.toml) for
+    /// reboot-durable persistence, and pass one to each daemon if two sockets differ
+    /// only in extension (`a.sock` and `a.socket` derive the same state file).
     #[arg(long)]
     state_file: Option<PathBuf>,
 }

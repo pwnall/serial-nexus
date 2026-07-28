@@ -16,7 +16,7 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -525,6 +525,23 @@ fn wait_readable<F: AsFd>(fd: &F, ms: u16) -> anyhow::Result<PollFlags> {
     }
 }
 
+/// Poll a fd for writability up to `ms`. Returns the revents.
+///
+/// The sibling of [`wait_readable`], for the one place the harness must wait to
+/// *write*: a non-blocking pipe to a child that is not draining it. As there,
+/// `POLLERR`/`POLLHUP` arrive whether or not they are requested; the caller learns
+/// what they mean from the `write` that follows (`EPIPE`), so nothing is masked.
+fn wait_writable<F: AsFd>(fd: &F, ms: u16) -> anyhow::Result<PollFlags> {
+    let borrowed = fd.as_fd();
+    let mut fds = [PollFd::new(borrowed, PollFlags::POLLOUT)];
+    let n = poll(&mut fds, PollTimeout::from(ms))?;
+    if n == 0 {
+        Ok(PollFlags::empty())
+    } else {
+        Ok(fds[0].revents().unwrap_or_else(PollFlags::empty))
+    }
+}
+
 /// How long a "device" loop waits after a `poll` wake that no read consumed.
 ///
 /// On a pty master `POLLHUP` is level-triggered and set the whole time no slave is
@@ -810,11 +827,15 @@ fn pty_source(
 }
 
 fn pty_sink(master: &mut PtyMaster, n: usize, timeout_ms: u64) -> anyhow::Result<Value> {
-    let (got, timed_out) = read_until(master, n, timeout_ms)?;
+    let got = read_until(master, n, timeout_ms)?;
+    // `received` is capped at `--bytes`, so `overshoot` is the only place a stream
+    // carrying more than the sink asked for can show up. A device stand-in that
+    // saw foreign bytes has not passed, however exactly the first N matched.
     Ok(json!({
         "tool": "nexus-sim", "mode": "pty", "behavior": "sink",
-        "received": got.len(), "sha256": sha256_hex(&got),
-        "timed_out": timed_out, "pass": got.len() == n
+        "received": got.bytes.len(), "sha256": sha256_hex(&got.bytes),
+        "overshoot": got.overshoot,
+        "timed_out": got.timed_out, "pass": got.budget_met(n)
     }))
 }
 
@@ -884,7 +905,7 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
             Some(s) => Some(parse_size(s)?),
             None => None,
         };
-        let (received, sha) = recv_loop(
+        let (received, sha, timed_out) = recv_loop(
             &file,
             target,
             a.read_rate,
@@ -897,20 +918,11 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
             a.skip,
             a.ready_file.as_deref(),
         )?;
-        // `--recv N` passes when exactly N bytes arrived. A `--drain` has no target,
-        // and used to pass unconditionally — so a reader that observed *nothing*
-        // still printed `"pass": true`, which is how the README's echo snippet could
-        // report `received: 0, pass: true` and read as a success (review 26, RV-5).
-        // A verdict line is the harness's ground truth (AGENTS.md §5); one that
-        // cannot fail is not a verdict. A drain that read no bytes fails.
-        let pass = match target {
-            Some(t) => received as usize == t,
-            None => received > 0,
-        };
         return Ok(json!({
             "tool": "nexus-sim", "mode": "client",
             "behavior": if a.drain { "drain" } else { "recv" },
-            "received": received, "sha256": sha, "pass": pass
+            "received": received, "sha256": sha,
+            "timed_out": timed_out, "pass": recv_pass(target, received, timed_out)
         }));
     }
 
@@ -939,9 +951,10 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
         w.flush()?;
     }
 
-    let (received, timed_out) = read_handle
+    let got = read_handle
         .join()
         .map_err(|_| anyhow::anyhow!("reader thread panicked"))??;
+    let received = &got.bytes;
 
     // Keep the slave open so a subscriber can observe our presence/termios.
     if let Some(ms) = a.hold_ms {
@@ -949,9 +962,13 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
     }
 
     let sent_hash = sha256_hex(&payload);
-    let recv_hash = sha256_hex(&received);
+    let recv_hash = sha256_hex(received);
+    // `budget_met` carries the overshoot clause: an echo read is clean only when the
+    // stream held exactly what was sent. Without it the cap would *hide* a
+    // contaminated echo — `received` would land on `n` and the checksum would cover
+    // only the first `n` bytes, so a foreign tail would render as a perfect run.
     let pass = if expect_echo {
-        received.len() == n && sent_hash == recv_hash
+        got.budget_met(n) && sent_hash == recv_hash
     } else {
         true
     };
@@ -960,43 +977,134 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
     // deadline expired (the echo may still have been in flight) versus the peer
     // genuinely losing bytes. Without it both render as `pass:false` with a short
     // count, and a reader of the verdict cannot tell a slow rig from a broken one.
+    // `overshoot` is the other direction — a *long* stream, which is contamination
+    // rather than loss, and which read as a doubling until the budget was capped.
     Ok(json!({
         "tool": "nexus-sim", "mode": "client",
-        "sent": n, "received": received.len(),
+        "sent": n, "received": received.len(), "overshoot": got.overshoot,
         "sha256_sent": sent_hash, "sha256_received": recv_hash,
-        "expect": a.expect, "timed_out": timed_out, "pass": pass
+        "expect": a.expect, "timed_out": got.timed_out, "pass": pass
     }))
 }
 
-/// Read from a fd until `n` bytes are collected or the timeout elapses. `n == 0`
-/// returns immediately with nothing (used when no echo is expected).
+/// Whether a `--recv`/`--drain` run passes, from the three facts that decide it.
 ///
-/// Returns `(bytes, timed_out)`. The flag exists because a short buffer alone
-/// cannot say *why* it is short: a deadline that expired mid-stream and a peer that
-/// really dropped bytes produce the identical value, and the caller's verdict then
-/// reports a byte loss that may never have happened (that ambiguity cost a full
-/// investigation). Whoever renders a verdict must surface the flag.
-fn read_until<F: AsFd + Read>(
-    mut fd: F,
-    n: usize,
-    timeout_ms: u64,
-) -> anyhow::Result<(Vec<u8>, bool)> {
+/// One function so the rule cannot be re-derived differently at another call site.
+/// `--recv N` passes when exactly N bytes arrived. A `--drain` has no target, and
+/// used to pass unconditionally — so a reader that observed *nothing* still printed
+/// `"pass": true`, which is how the README's echo snippet could report
+/// `received: 0, pass: true` and read as a success (review 26, RV-5). A verdict line
+/// is the harness's ground truth (AGENTS.md §5); one that cannot fail is not a
+/// verdict. A drain that read no bytes fails.
+///
+/// A run the **deadline** ended never passes either, in either mode (review 32,
+/// SIM-2). `--drain` means "read until the stream goes quiet", and draining to quiet
+/// is precisely what makes the drop accounting exact; when the wall clock ends the
+/// read instead, nothing was drained to quiet — the count is truncated at an
+/// arbitrary instant and the checksum covers a truncated stream. Reporting that as
+/// `pass: true` with exit 0 handed `p5_resync` a wall-clock timeout dressed as a
+/// checksum mismatch (a resync-correctness accusation against `codecs/reference`)
+/// and left `p3_exact_loss`'s `pass` gate unable to notice at all. For `--recv` the
+/// clause is belt-and-braces: the loop breaks on the byte target before it checks
+/// the deadline, so a complete receive is never flagged.
+fn recv_pass(target: Option<usize>, received: u64, timed_out: bool) -> bool {
+    if timed_out {
+        return false;
+    }
+    match target {
+        Some(t) => received as usize == t,
+        None => received > 0,
+    }
+}
+
+/// What a [`read_until`] budget read came back with: the bytes it was *asked* for,
+/// why it stopped, and how much more the peer had already handed over.
+struct BudgetRead {
+    /// **At most `n` bytes.** The budget is a cap, not a suggestion.
+    bytes: Vec<u8>,
+    /// True for exactly one exit, the deadline; EOF, `EIO` and `POLLHUP` leave it
+    /// false. See [`read_until`] for why the distinction has to exist.
+    timed_out: bool,
+    /// Bytes that arrived past the budget and were discarded — the contamination
+    /// signal. Discarding them silently would be the same dishonesty one level
+    /// down from the uncapped accumulator this field replaced: a stream carrying
+    /// *more* than was asked for is not a clean stream, and a verdict that renders
+    /// it as an exact hit lies about the run.
+    ///
+    /// It is a **lower bound**: it counts only what came in the reads needed to
+    /// fill the budget, never what the peer sends afterwards. Zero therefore means
+    /// "no surplus was seen", not "no surplus exists" — but non-zero is proof.
+    overshoot: u64,
+}
+
+impl BudgetRead {
+    /// Whether the read got exactly the `n` bytes asked for and nothing besides.
+    /// One function so the rule cannot be re-derived differently at the two call
+    /// sites (the same reason [`recv_pass`] exists). The overshoot clause is the
+    /// load-bearing half: with the cap in place, `bytes.len() == n` alone would
+    /// turn a contaminated stream into a clean pass.
+    fn budget_met(&self, n: usize) -> bool {
+        self.bytes.len() == n && self.overshoot == 0
+    }
+}
+
+/// Read from a fd until `n` bytes are collected or the timeout elapses. `n == 0`
+/// returns immediately with nothing (used when no echo is expected), and makes no
+/// claim about the stream — nothing was asked for, so nothing is surplus.
+///
+/// The flag exists because a short buffer alone cannot say *why* it is short: a
+/// deadline that expired mid-stream and a peer that really dropped bytes produce
+/// the identical value, and the caller's verdict then reports a byte loss that may
+/// never have happened (that ambiguity cost a full investigation). Whoever renders
+/// a verdict must surface the flag.
+///
+/// The **cap** exists for the mirror-image reason, and cost a full investigation of
+/// its own. This loop used to append the whole of every read — the sibling
+/// [`recv_loop`] caps, this one did not — so `received` was not "how many of the
+/// bytes I asked for arrived" but "how many bytes happened to be in the reads I
+/// did". A `--expect echo` client asked for 4096 came back reporting 8190 and read
+/// as a *doubling* of the stream. It was neither doubled nor 8190: a pts hands out
+/// at most **4095** bytes per read (`N_TTY_BUF_SIZE - 1`, a kernel property of the
+/// line discipline — not a daemon or sim constant, and you will meet it again), so
+/// *any* contaminated read of this shape reports 4095 + 4095. The real fault was a
+/// contaminated stream, which `overshoot` now names directly (§15.36: the sim's
+/// verdict is the oracle every loss-accounting test reads).
+fn read_until<F: AsFd + Read>(mut fd: F, n: usize, timeout_ms: u64) -> anyhow::Result<BudgetRead> {
     let mut out = Vec::with_capacity(n);
+    let mut overshoot: u64 = 0;
     if n == 0 {
-        return Ok((out, false));
+        return Ok(BudgetRead {
+            bytes: out,
+            timed_out: false,
+            overshoot,
+        });
     }
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut buf = [0u8; 8192];
     while out.len() < n {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Ok((out, true)); // deadline, not a loss — say so
+            // deadline, not a loss — say so
+            return Ok(BudgetRead {
+                bytes: out,
+                timed_out: true,
+                overshoot,
+            });
         };
         let ms = remaining.as_millis().min(1000) as u16;
         let re = wait_readable(&fd, ms)?;
         if re.contains(PollFlags::POLLIN) {
+            // Read a full buffer, then keep only what fits the budget. Capping the
+            // *read* (as `recv_loop` does) would be cheaper but blind: the surplus
+            // would stay in the kernel and no one would ever learn it was there.
+            // Reading it is also the status quo — this loop always consumed it; it
+            // just used to count it as if it had been asked for.
             match fd.read(&mut buf) {
                 Ok(0) => break,
-                Ok(k) => out.extend_from_slice(&buf[..k]),
+                Ok(k) => {
+                    let take = k.min(n - out.len());
+                    out.extend_from_slice(&buf[..take]);
+                    overshoot += (k - take) as u64;
+                }
                 Err(e) if is_eio(&e) => break,
                 Err(e) => return Err(e.into()),
             }
@@ -1007,7 +1115,11 @@ fn read_until<F: AsFd + Read>(
             }
         }
     }
-    Ok((out, false))
+    Ok(BudgetRead {
+        bytes: out,
+        timed_out: false,
+        overshoot,
+    })
 }
 
 /// Receive hostward bytes, counting and checksumming them incrementally (so a
@@ -1016,6 +1128,14 @@ fn read_until<F: AsFd + Read>(
 /// with no new bytes (the fully-draining reader — draining to quiet guarantees
 /// no daemon-delivered byte is left unread, which is what makes drop accounting
 /// exact). `read_rate` paces overall throughput to model a slow consumer.
+///
+/// Returns `(received, sha256, timed_out)`. The third element carries the same
+/// contract [`read_until`] documents, for the same reason: a short count alone
+/// cannot say *why* it is short. Until review 32 (SIM-2) this loop — the one the
+/// loss-accounting tests actually use — dropped the distinction, and a `--recv`
+/// that ran out of wall clock emitted verdict JSON **byte-identical** to a peer
+/// that genuinely lost bytes. `timed_out` is true for exactly one break, the
+/// deadline; quiet, EOF, `EIO` and `POLLHUP` all leave it false.
 fn recv_loop<F: AsFd + Read>(
     mut fd: F,
     target: Option<usize>,
@@ -1024,7 +1144,7 @@ fn recv_loop<F: AsFd + Read>(
     timeout_ms: u64,
     skip: usize,
     ready_file: Option<&Path>,
-) -> anyhow::Result<(u64, String)> {
+) -> anyhow::Result<(u64, String, bool)> {
     let start = Instant::now();
     let deadline = start + Duration::from_millis(timeout_ms);
     // `received`/`hasher` cover the PAYLOAD only; the leading `to_skip` primer bytes
@@ -1038,11 +1158,13 @@ fn recv_loop<F: AsFd + Read>(
     // scheduling-bound, so grabbing up to 64 KiB per read keeps a demux burst moving.
     let mut buf = vec![0u8; 64 * 1024];
     let mut last_data = Instant::now();
+    let mut timed_out = false;
     loop {
         if target.is_some_and(|t| received as usize >= t) {
             break;
         }
         if Instant::now() >= deadline {
+            timed_out = true; // the wall clock ended this read, not the peer
             break;
         }
         if quiet_ms.is_some_and(|q| last_data.elapsed() >= Duration::from_millis(q)) {
@@ -1102,6 +1224,7 @@ fn recv_loop<F: AsFd + Read>(
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect(),
+        timed_out,
     ))
 }
 
@@ -1427,7 +1550,23 @@ struct ExecChild {
     child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
     frames: std_mpsc::Receiver<FrameMsg>,
+    /// How long [`ExecChild::write_raw`] tolerates a child accepting *no* further
+    /// stdin bytes before abandoning it. A field, not a constant, so a test can
+    /// shorten it; [`STDIN_DRAIN_TIMEOUT`] is the value every real run uses.
+    stdin_drain: Duration,
 }
+
+/// How long the harness waits for a child to accept more stdin before declaring it
+/// wedged — an *idle* bound, reset by every byte the child takes, so a slow child is
+/// never failed for being slow, only for stopping.
+///
+/// A 64 KiB pipe accepts ~65 184 bytes of `check_fragmentation`'s near-
+/// `MAX_FRAME_SIZE` frame, so a child that never reads stdin used to park the
+/// harness in `anon_pipe_write` forever: no verdict line, no exit, a CI job wedged
+/// with no diagnostic against a module doc that promises "a single JSON verdict line
+/// on exit" (review 32, SIM-1). Five seconds of a child taking nothing at all is a
+/// wedge on any runner.
+const STDIN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One decoded item from the child's stdout stream (or a terminal condition).
 enum FrameMsg {
@@ -1455,6 +1594,11 @@ impl ExecChild {
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn {exec:?}: {e}"))?;
         let stdin = child.stdin.take().expect("piped stdin");
+        // Non-blocking, so `write_raw` bounds its own wait instead of parking in
+        // `anon_pipe_write` against a child that never reads (SIM-1). Only our end
+        // of the pipe is affected: the child's fd 0 is a separate open file
+        // description and stays blocking, as it must for the codec under test.
+        nexus_sys::set_nonblocking(stdin.as_raw_fd())?;
         let mut stdout = child.stdout.take().expect("piped stdout");
         let (tx, rx) = std_mpsc::channel();
         thread::spawn(move || {
@@ -1494,25 +1638,67 @@ impl ExecChild {
             child,
             stdin: Some(stdin),
             frames: rx,
+            stdin_drain: STDIN_DRAIN_TIMEOUT,
         })
     }
 
-    /// Encode and write one event frame to the child's stdin, flushed immediately.
-    fn send(&mut self, event: &Event) -> anyhow::Result<()> {
+    /// Encode and write one event frame straight to the child's stdin (a pipe takes
+    /// the bytes unbuffered, so there is nothing left to flush). `Ok(false)` means
+    /// the child stopped draining stdin — see [`Self::write_raw`].
+    fn send(&mut self, event: &Event) -> anyhow::Result<bool> {
         let mut buf = Vec::new();
         encode(event, &mut buf).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
         self.write_raw(&buf)
     }
 
-    /// Write raw bytes to the child's stdin (used to deliver a frame in pieces).
-    fn write_raw(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+    /// Write raw bytes to the child's stdin (used to deliver a frame in pieces),
+    /// bounded by [`Self::stdin_drain`]. `Ok(true)` means every byte was accepted;
+    /// `Ok(false)` means the child stopped reading and the caller's check fails.
+    ///
+    /// The bound is the whole point. Every other terminal condition in this battery
+    /// is dead-lined — `recv` per frame, and the sibling `envelope` mode's
+    /// abandonable stdin feeder ("child did not complete within N ms") — but this
+    /// path was an unbounded blocking `write_all`, so a codec that never reads its
+    /// stdin filled the 64 KiB pipe and hung the harness with no verdict at all
+    /// (review 32, SIM-1). Deadline expiry is reported here rather than raised as an
+    /// error because "the child does not drain stdin" is a conformance failure of
+    /// the child, not a fault of the harness: the run must still print its verdict.
+    fn write_raw(&mut self, bytes: &[u8]) -> anyhow::Result<bool> {
         let stdin = self
             .stdin
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("stdin already closed"))?;
-        stdin.write_all(bytes)?;
-        stdin.flush()?;
-        Ok(())
+        let fd = stdin.as_raw_fd();
+        let mut written = 0usize;
+        let mut idle_deadline = Instant::now() + self.stdin_drain;
+        while written < bytes.len() {
+            match nexus_sys::write_fd(fd, &bytes[written..]) {
+                Ok(k) if k > 0 => {
+                    written += k;
+                    idle_deadline = Instant::now() + self.stdin_drain;
+                    continue;
+                }
+                // A zero-length `write` of a non-empty buffer is not a documented
+                // pipe outcome; wait like an `EAGAIN` rather than spinning on it.
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // Anything else (`EPIPE` from a child that died) is a real error.
+                Err(e) => return Err(e.into()),
+            }
+            let Some(remaining) = idle_deadline.checked_duration_since(Instant::now()) else {
+                eprintln!(
+                    "exec-conformance: child did not drain stdin within {} ms \
+                     ({written} of {} bytes accepted)",
+                    self.stdin_drain.as_millis(),
+                    bytes.len()
+                );
+                return Ok(false);
+            };
+            // Re-check the deadline at least every 200 ms.
+            wait_writable(stdin, remaining.as_millis().min(200) as u16)?;
+        }
+        Ok(true)
     }
 
     /// Close the child's stdin (EOF), so a child that batches until end-of-input
@@ -1577,7 +1763,10 @@ fn check_golden(exec: &str, timeout: Duration) -> anyhow::Result<bool> {
     let battery = golden_battery();
     let mut child = ExecChild::spawn(exec)?;
     for ev in &battery {
-        child.send(ev)?;
+        // A child that stops draining stdin fails the check; it never hangs the run.
+        if !child.send(ev)? {
+            return Ok(false);
+        }
     }
     child.close_stdin();
     let mut got = Vec::new();
@@ -1606,7 +1795,11 @@ fn check_liveness(exec: &str, per_frame: Duration, frames: usize) -> anyhow::Res
         .map(|i| Event::data("live", Bytes::from(seeded_bytes(1000 + i as u64, 512))))
         .collect();
     for ev in &sent {
-        child.send(ev)?;
+        // Past ~124 frames the pipeline exceeds one pipe-full, so this loop reaches
+        // the same unbounded write `check_fragmentation` did (SIM-1).
+        if !child.send(ev)? {
+            return Ok(false);
+        }
     }
 
     // Phase 1 — interleaving proof: with stdin still open, collect whatever the
@@ -1649,7 +1842,11 @@ fn check_fragmentation(exec: &str, timeout: Duration) -> anyhow::Result<bool> {
 
     let mut child = ExecChild::spawn(exec)?;
     for piece in wire.chunks(97) {
-        child.write_raw(piece)?;
+        // The frame is larger than a pipe, so a child that does not read stdin
+        // cannot be written to — that is a failed check, not a hung harness (SIM-1).
+        if !child.write_raw(piece)? {
+            return Ok(false);
+        }
     }
     child.close_stdin();
     // Generous total bound for a big frame; scale off the per-frame timeout.
@@ -1672,7 +1869,9 @@ fn check_restart(exec: &str, timeout: Duration) -> anyhow::Result<bool> {
     // kills and reaps).
     {
         let mut first = ExecChild::spawn(exec)?;
-        first.send(&probe)?;
+        if !first.send(&probe)? {
+            return Ok(false);
+        }
         first.close_stdin();
         if !matches!(first.recv(timeout), Recv::Event(ref got) if *got == probe) {
             return Ok(false);
@@ -1681,7 +1880,9 @@ fn check_restart(exec: &str, timeout: Duration) -> anyhow::Result<bool> {
 
     // A freshly spawned child must echo cleanly with no shared state.
     let mut second = ExecChild::spawn(exec)?;
-    second.send(&probe)?;
+    if !second.send(&probe)? {
+        return Ok(false);
+    }
     second.close_stdin();
     Ok(matches!(second.recv(timeout), Recv::Event(got) if got == probe))
 }
@@ -2137,5 +2338,141 @@ fn pump_dir(
             Err(ref e) if is_timeout(e) => {} // poll again (checks deadline/severed)
             Err(_) => return,
         }
+    }
+}
+
+// --- unit guards -----------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `read_until` used to append the whole of each read with no cap at `n`, so an
+    /// `--expect echo` client asked for 4096 bytes reported `received: 8190` — which
+    /// reads as a doubled stream and is actually a *contaminated* one plus pts read
+    /// geometry (4095 = `N_TTY_BUF_SIZE - 1` per read, twice). The verdict is the
+    /// oracle every loss-accounting test reads (§15.36), so it must report what was
+    /// asked for, and must not bury the surplus that capping now discards.
+    #[test]
+    fn a_read_budget_is_a_cap_and_the_surplus_is_reported_not_swallowed() {
+        // (a) The peer has 30 bytes; we ask for 10. Ten come back, twenty are named.
+        let (rx, tx) = UnixStream::pair().expect("socket pair");
+        (&tx).write_all(&[0x5au8; 30]).expect("seed the pair");
+        let over = read_until(rx, 10, 1_000).expect("read_until");
+        assert_eq!(
+            over.bytes.len(),
+            10,
+            "a budget of 10 returned {} bytes — the cap is not a cap",
+            over.bytes.len()
+        );
+        assert_eq!(
+            over.overshoot, 20,
+            "the peer had 20 bytes more to give and the verdict says nothing"
+        );
+        assert!(!over.timed_out, "the budget was met, not the deadline");
+        assert!(
+            !over.budget_met(10),
+            "a contaminated stream must not pass just because the first 10 matched"
+        );
+        drop(tx);
+
+        // (b) The clean case is unchanged: exactly the budget, no surplus, a pass.
+        let (rx2, tx2) = UnixStream::pair().expect("socket pair");
+        (&tx2).write_all(&[0x5au8; 10]).expect("seed the pair");
+        let exact = read_until(rx2, 10, 1_000).expect("read_until");
+        assert_eq!(exact.bytes.len(), 10);
+        assert_eq!(exact.overshoot, 0, "a clean stream must report no surplus");
+        assert!(exact.budget_met(10));
+        drop(tx2);
+
+        // (c) A zero budget asks for nothing, so nothing it does not read is surplus
+        // (`--expect` anything but `echo`): no read, no claim.
+        let (rx3, tx3) = UnixStream::pair().expect("socket pair");
+        (&tx3).write_all(&[0x5au8; 30]).expect("seed the pair");
+        let none = read_until(rx3, 0, 1_000).expect("read_until");
+        assert!(none.bytes.is_empty());
+        assert_eq!(none.overshoot, 0);
+        drop(tx3);
+    }
+
+    /// SIM-2 (review 32): a `--recv` that ran out of wall clock and a peer that
+    /// genuinely stopped short used to be indistinguishable — same `received`, same
+    /// `sha256`, same `pass: false`, byte-identical verdict JSON. Both halves are
+    /// produced here from one socket pair, and the only thing that may differ is the
+    /// flag. `read_until` has carried this distinction since §15.36; `recv_loop`,
+    /// the mode the loss-accounting tests actually use, did not.
+    #[test]
+    fn recv_loop_flags_a_deadline_but_not_a_peer_that_stopped_short() {
+        // (a) The deadline: the peer stays open and sends only 10 of the 100 bytes
+        // asked for, so nothing but the clock can end the read.
+        let (rx, tx) = UnixStream::pair().expect("socket pair");
+        (&tx).write_all(b"0123456789").expect("seed the pair");
+        let (n_deadline, sha_deadline, timed_out) =
+            recv_loop(rx, Some(100), None, None, 300, 0, None).expect("recv_loop");
+        drop(tx);
+        assert!(
+            timed_out,
+            "a deadline expiry must say so (received {n_deadline})"
+        );
+
+        // (b) A genuinely short peer: the same 10 bytes, then EOF, with wall clock
+        // to spare.
+        let (rx2, tx2) = UnixStream::pair().expect("socket pair");
+        (&tx2).write_all(b"0123456789").expect("seed the pair");
+        drop(tx2); // EOF — the peer, not the clock, ends the read
+        let (n_short, sha_short, short_timed_out) =
+            recv_loop(rx2, Some(100), None, None, 10_000, 0, None).expect("recv_loop");
+        assert!(
+            !short_timed_out,
+            "an EOF is a short peer, not a timeout (received {n_short})"
+        );
+
+        // The two verdicts agree on every other field, which is exactly why the flag
+        // has to exist.
+        assert_eq!(n_deadline, 10);
+        assert_eq!(n_short, 10);
+        assert_eq!(sha_deadline, sha_short);
+    }
+
+    /// SIM-2 (review 32): the `--drain` half. A drain that expired mid-stream used
+    /// to report `"pass": true` and exit 0 with a truncated count and a checksum of
+    /// a truncated stream — invisible to `p3_exact_loss`'s `pass` gate and, in
+    /// `p5_resync`, indistinguishable from a resync-correctness defect.
+    #[test]
+    fn a_timed_out_recv_or_drain_never_passes() {
+        // Complete receives and quiet drains still pass.
+        assert!(recv_pass(Some(100), 100, false));
+        assert!(recv_pass(None, 1, false));
+        // A deadline never does, in either mode, whatever arrived.
+        assert!(!recv_pass(None, 1_000_000, true));
+        assert!(!recv_pass(Some(100), 100, true));
+        // And the pre-existing rules are unchanged (review 26, RV-5).
+        assert!(!recv_pass(Some(100), 99, false));
+        assert!(!recv_pass(None, 0, false));
+    }
+
+    /// SIM-1 (review 32): `check_fragmentation` pushes a near-`MAX_FRAME_SIZE` frame
+    /// into a 64 KiB pipe, so a child that never reads stdin used to park the whole
+    /// harness in `anon_pipe_write` — no verdict line, no exit, a wedged CI job. The
+    /// write is now bounded and reports the child's failure instead of inheriting it.
+    #[test]
+    fn write_raw_gives_up_on_a_child_that_never_drains_its_stdin() {
+        // `sleep` holds its stdin open and never reads a byte of it.
+        let mut child = ExecChild::spawn("sleep 30").expect("spawn the child");
+        child.stdin_drain = Duration::from_millis(200);
+        let oversize = vec![0x5au8; 512 * 1024]; // several pipe-fulls
+        let started = Instant::now();
+        let accepted = child
+            .write_raw(&oversize)
+            .expect("a wedged child is a verdict, not a harness error");
+        assert!(
+            !accepted,
+            "write_raw must report the child that stopped draining stdin"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "write_raw took {:?} — it is still blocking on the pipe",
+            started.elapsed()
+        );
     }
 }

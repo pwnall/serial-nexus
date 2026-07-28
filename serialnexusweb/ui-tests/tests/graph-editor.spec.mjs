@@ -123,34 +123,49 @@ test("adding a console through the editor makes bytes flow end to end", async ({
   await open(page);
   await selectView(page, "editor");
 
-  // The palette is data (editor.mjs's PALETTE), so the form follows the type.
-  await page.locator("#editorview select").first().selectOption("log");
-  const fields = page.locator("#editorview .eform .efield");
-  await fields.nth(0).locator("input").fill(name);
-  await fields.nth(1).locator("input").fill(RUN);
-  await fields.nth(2).locator("input").fill(file);
-  await page.getByRole("button", { name: "add node" }).click();
-  await expect(page.locator("#editorview .estatus.ok")).toContainText(name);
+  try {
+    // The palette is data (editor.mjs's PALETTE), so the form follows the type.
+    await page.locator("#editorview select").first().selectOption("log");
+    const fields = page.locator("#editorview .eform .efield");
+    await fields.nth(0).locator("input").fill(name);
+    await fields.nth(1).locator("input").fill(RUN);
+    await fields.nth(2).locator("input").fill(file);
+    await page.getByRole("button", { name: "add node" }).click();
+    await expect(page.locator("#editorview .estatus.ok")).toContainText(name);
 
-  await page.locator('#editorview input[placeholder^="endpoint a"]').fill(ECHO);
-  await page.locator('#editorview input[placeholder^="endpoint b"]').fill(name);
-  await page.getByRole("button", { name: "connect", exact: true }).click();
-  await expect(page.locator("#editorview .estatus.ok")).toContainText("connect");
+    await page
+      .locator('#editorview input[placeholder^="endpoint a"]')
+      .fill(ECHO);
+    await page.locator('#editorview input[placeholder^="endpoint b"]').fill(name);
+    await page.getByRole("button", { name: "connect", exact: true }).click();
+    await expect(page.locator("#editorview .estatus.ok")).toContainText(
+      "connect",
+    );
 
-  // Built entirely from the browser; now drive bytes through what the browser built.
-  await selectView(page, "console");
-  await selectConsole(page, ECHO);
-  const t = token("editor-built");
-  await send(page, t);
-  await expect(page.locator("#term")).toContainText(t);
+    // Built entirely from the browser; now drive bytes through what the browser built.
+    await selectView(page, "console");
+    await selectConsole(page, ECHO);
+    const t = token("editor-built");
+    await send(page, t);
+    await expect(page.locator("#term")).toContainText(t);
 
-  // The log is a lossless sink (§7.3), so it is the byte-exact oracle here — the
-  // terminal is the lossy end of the same stream (§5).
-  await expect
-    .poll(() => (existsSync(path) ? readFileSync(path, "utf8") : ""), {
-      timeout: 15_000,
-    })
-    .toContain(t);
+    // The log is a lossless sink (§7.3), so it is the byte-exact oracle here — the
+    // terminal is the lossy end of the same stream (§5).
+    await expect
+      .poll(() => (existsSync(path) ? readFileSync(path, "utf8") : ""), {
+        timeout: 15_000,
+      })
+      .toContain(t);
+  } finally {
+    // Restore the shared fixture. This spec is the only one that permanently attaches
+    // a consumer to the echo console, and leaving it there is not free: a later spec
+    // reading that node's `discarded_unattached` as its "did the device emit?" oracle
+    // measures zero forever, because the bytes now have somewhere to go. That failed
+    // `history.spec.mjs`'s ring-rotation guard in the full run while it passed in
+    // isolation — the classic shared-fixture ordering bug. A spec that mutates the
+    // graph restores it (`--cascade` takes the edge with the node).
+    ctl("remove-node", name, "--cascade");
+  }
 });
 
 test("lifecycle verbs are still refused over the page's own transport", async ({

@@ -22,6 +22,10 @@ const OPFS_MJS: &str = include_str!("assets/opfs.mjs");
 // app.js rather than reaching for the network themselves.
 const GRAPH_MJS: &str = include_str!("assets/graph.mjs");
 const EDITOR_MJS: &str = include_str!("assets/editor.mjs");
+// The minimal ANSI subset §17's implementation stance calls for (review 32 UIR-1):
+// a resumable parser that turns console escape sequences into render ops. Pure —
+// it never touches the DOM — and unit-tested under `node --test`.
+const ANSI_MJS: &str = include_str!("assets/ansi.mjs");
 
 /// Resolve a request path to a static asset, or `None` for a 404. The token/Host
 /// gate has already run in the server (§15.29); this only maps paths to bytes.
@@ -58,6 +62,10 @@ pub fn lookup(path: &str) -> Option<Asset> {
         "/editor.mjs" => Some(Asset {
             content_type: "text/javascript; charset=utf-8",
             body: EDITOR_MJS.as_bytes(),
+        }),
+        "/ansi.mjs" => Some(Asset {
+            content_type: "text/javascript; charset=utf-8",
+            body: ANSI_MJS.as_bytes(),
         }),
         _ => None,
     }

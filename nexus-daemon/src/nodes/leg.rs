@@ -60,6 +60,7 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -75,13 +76,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
-use crate::boundary;
+use crate::boundary::{self, TaskSet};
 use crate::cell::CriticalCell;
 use crate::runtime::{
-    CHANNEL_CAP, DataFrame, LossCounter, READ_BUF, SharedFanOut, SharedLock, SharedTargetEdge,
-    Wiring, data_frames,
+    CHANNEL_CAP, DataFrame, DropCounters, Grant, HostwardChannelStat, LossCounter, READ_BUF,
+    SharedFanOut, SharedLock, SharedTargetEdge, Wiring, await_write_grant, data_frames,
+    route_channel_data,
 };
 use crate::tap::TapFeed;
 
@@ -168,6 +169,13 @@ struct ChannelStat {
     /// codec counts the same case as `discarded_targetward`; the leg's send half
     /// serves whichever direction the facing implies, so it gets its own name.
     discarded_unframable: Cell<u64>,
+    /// Bytes of a chunk the socket write half had already taken from its bounded
+    /// receiver when the peer went away, and never put on the wire (LEG-2). Its own
+    /// name rather than a fold into `discarded_unframable`: that counter means "this
+    /// channel identity is pathological", a defensively-unreachable case, and firing
+    /// it on every ordinary disconnect would destroy the one signal it carries. §5
+    /// wants loss attributable, which means one cause per counter.
+    discarded_peer_gone: Cell<u64>,
     /// Targetward bytes discarded on reconnect because they were outage-era stale
     /// (§7.4 purge-on-reconnect). Counted on both sides of the wire: the sending
     /// side's local backlog, and — since LEG-3 — the receiving side's too.
@@ -176,6 +184,35 @@ struct ChannelStat {
     bound: Cell<bool>,
     /// Whether any data has crossed the channel since connect.
     active: Cell<bool>,
+}
+
+/// The §5 hostward accounting rule, shared with both codecs through the one
+/// [`route_channel_data`] implementation (SIMP-1).
+///
+/// The leg is the *differently specified* instance of that rule, not a drifted copy
+/// of the codecs', and this impl is where the difference now lives in one visible
+/// place rather than being inferable only by diffing three routing blocks:
+/// `discarded_hostward` is documented above as covering **both** the full-buffer drop
+/// and the no-consumer-bound case, so [`Self::add_dropped_full`] folds the sinks'
+/// full-buffer loss in where the codecs' narrower `discarded_unattached` leaves it to
+/// the consuming boundary's own `DropCounters`.
+impl HostwardChannelStat for ChannelStat {
+    fn set_active(&self) {
+        self.active.set(true);
+    }
+
+    fn add_delivered(&self, n: u64) {
+        self.delivered_hostward
+            .set(self.delivered_hostward.get() + n);
+    }
+
+    fn unattached(&self) -> &dyn LossCounter {
+        &self.discarded_hostward
+    }
+
+    fn add_dropped_full(&self, n: u64) {
+        self.discarded_hostward.add(n);
+    }
 }
 
 /// Peer-announced identities this configuration does not declare — visible state
@@ -295,8 +332,16 @@ pub struct LegNode {
     idle_release_ms: u64,
     channels: Vec<String>,
     stats: Rc<HashMap<String, Rc<ChannelStat>>>,
+    /// Each `faces = target` channel's target-facing endpoint [`DropCounters`] — the
+    /// handle the producing node's `AttachedSink` charges a full-buffer drop to
+    /// (`runtime::fan_out`), and the *only* record of what this leg sheds at its own
+    /// intake. `start` used to drop it on the floor (`let _ = …remove(&addr)`), which
+    /// made the leg the one consuming node kind that never reported it: a peerless
+    /// leg could shed tens of megabytes with every counter in `state` reading zero
+    /// (LEG-1). Kept exactly as `map.rs`, `codec.rs` and `exec.rs` keep theirs.
+    channel_counters: HashMap<String, Arc<DropCounters>>,
     shared: Rc<LegShared>,
-    tasks: Vec<JoinHandle<()>>,
+    tasks: TaskSet,
 }
 
 impl LegNode {
@@ -334,8 +379,9 @@ impl LegNode {
             idle_release_ms: *idle_release_ms,
             channels: channels.clone(),
             stats: Rc::new(stats),
+            channel_counters: HashMap::new(),
             shared: Rc::new(LegShared::new(*purge_on_reconnect)),
-            tasks: Vec::new(),
+            tasks: TaskSet::default(),
         }
     }
 
@@ -391,7 +437,15 @@ impl LegNode {
                             }
                         }));
                     }
-                    let _ = wiring.target_counters.remove(&addr);
+                    // Keep this endpoint's drop counters rather than discarding them
+                    // (LEG-1): they are what the upstream producer charges when this
+                    // leg's intake is full — the *only* record of a peerless or
+                    // slower-than-the-device leg shedding hostward bytes — and
+                    // `state_extra` reports them per channel, as every other
+                    // consuming node kind does.
+                    if let Some(counters) = wiring.target_counters.remove(&addr) {
+                        self.channel_counters.insert(ch.clone(), counters);
+                    }
                     // Targetward into the local graph, gated on this leg's on-demand
                     // origin lock. One task per channel does the acquire, the
                     // idle-release, and the (backpressured) write; the pump feeds it
@@ -456,7 +510,16 @@ impl LegNode {
                     "discarded_hostward": stat.discarded_hostward.get(),
                     "discarded_targetward": stat.discarded_targetward.get(),
                     "discarded_unframable": stat.discarded_unframable.get(),
+                    "discarded_peer_gone": stat.discarded_peer_gone.get(),
                     "purged_on_reconnect": stat.purged_on_reconnect.get(),
+                    // What the *upstream* producer shed because this channel's
+                    // intake was full — a `faces = target` leg's own consuming
+                    // boundary (§5). Structurally zero for `faces = host`, whose
+                    // channel endpoints are host-facing and have no such boundary.
+                    "dropped_slow_consumer": self
+                        .channel_counters
+                        .get(ch)
+                        .map_or(0, |c| c.dropped_full()),
                 });
                 (ch.clone(), obj)
             })
@@ -515,9 +578,7 @@ impl LegNode {
     /// The leg has nothing to join, so [`Self::teardown`] is exactly this; the split
     /// exists so the two-phase shape is uniform across node kinds. Idempotent.
     pub fn signal_stop(&mut self) {
-        for t in self.tasks.drain(..) {
-            t.abort();
-        }
+        self.tasks.abort_all();
         self.unlink_listen_socket();
     }
 
@@ -528,6 +589,9 @@ impl LegNode {
 
 impl Drop for LegNode {
     fn drop(&mut self) {
+        // Kept after SIMPB-10 moved the task half into [`TaskSet`]: a leg's teardown is
+        // more than aborting tasks — it must also unlink the listening socket it
+        // created, which is filesystem state no field drop releases.
         self.signal_stop();
     }
 }
@@ -712,8 +776,7 @@ async fn supervise(mut a: SuperviseArgs) {
             for (_ch, rx, stat) in &mut a.send_receivers {
                 let purged = boundary::drain_to_quiescence(rx).await;
                 if purged > 0 {
-                    stat.purged_on_reconnect
-                        .set(stat.purged_on_reconnect.get() + purged);
+                    stat.purged_on_reconnect.add(purged);
                 }
             }
         }
@@ -799,6 +862,14 @@ async fn pump(
     listener: Option<&Listener>,
 ) -> PumpEnd {
     let mut send_start = 0usize;
+    // The chunk the write half has taken out of its bounded receiver but not yet put
+    // on the wire in full. It lives in *this* frame rather than the write future's
+    // because the peer can take it away by either of two routes (LEG-2): `write_all`
+    // fails, or the read half returns `PeerGone` first and `select!` drops the write
+    // future while it is suspended inside `write_all`, taking its stack frame — and
+    // the popped chunk — with it. A residual charged only on the error arm would miss
+    // the second exit entirely, so ownership moves out to whoever survives the race.
+    let in_flight: Cell<Option<InFlight>> = Cell::new(None);
     // Write half: multiplex the send source onto the wire. A chunk larger than a
     // single frame is fragmented into consecutive Data frames on the same channel
     // (the peer reassembles transparently) — never dropped, since READ_BUF ==
@@ -811,6 +882,14 @@ async fn pump(
                     if let Some(stat) = stats.get(&ch) {
                         stat.active.set(true);
                     }
+                    // Take custody of the whole chunk before the first `.await` that
+                    // could lose it. There is no suspension point between `next_send`
+                    // returning and this line, so a chunk is never off both the
+                    // receiver and this slot at once (LEG-2).
+                    in_flight.set(Some(InFlight {
+                        channel: ch.clone(),
+                        remaining: bytes.len() as u64,
+                    }));
                     // Fragment an over-large chunk into consecutive Data frames
                     // rather than drop it (§15.24); the peer reassembles per channel.
                     for item in data_frames(ch.as_str(), &bytes) {
@@ -819,8 +898,12 @@ async fn pump(
                                 if write_half.write_all(&frame).await.is_err() {
                                     return PumpEnd::PeerGone;
                                 }
+                                // On the wire and out of danger: shrink the custody
+                                // slot *before* crediting throughput, so the two can
+                                // never both claim the same bytes.
+                                let n = piece_len as u64;
+                                discharge(&in_flight, n);
                                 if let Some(stat) = stats.get(&ch) {
-                                    let n = piece_len as u64;
                                     if send_is_hostward {
                                         stat.delivered_hostward
                                             .set(stat.delivered_hostward.get() + n);
@@ -836,13 +919,18 @@ async fn pump(
                             // residual" — the old `map_while` shape truncated the
                             // chunk in silence (RV-9).
                             DataFrame::Residual(residual) => {
+                                discharge(&in_flight, residual as u64);
                                 if let Some(stat) = stats.get(&ch) {
-                                    stat.discarded_unframable
-                                        .set(stat.discarded_unframable.get() + residual as u64);
+                                    stat.discarded_unframable.add(residual as u64);
                                 }
                             }
                         }
                     }
+                    // Fully accounted — framed onto the wire, or charged as an
+                    // unframable residual. Release custody before parking on the next
+                    // `next_send`, so a peer that dies while this half waits charges
+                    // nothing (LEG-2).
+                    in_flight.set(None);
                 }
                 // Every send source has closed (a faces=target leg whose local
                 // producers are all gone). Park the write half so the independent
@@ -876,17 +964,82 @@ async fn pump(
     // connect role has no listener, so it parks (§16.1 park-don't-teardown).
     let reject_extra = async {
         match listener {
-            Some(l) => loop {
-                if let Ok((extra, _)) = l.accept().await {
-                    drop(extra); // close it immediately
-                }
-            },
+            Some(l) => reject_extra_peers(move || l.accept()).await,
             None => boundary::park().await,
         }
     };
     // Concurrently-polled halves (§15.22): a backpressured write never starves the
     // read half.
-    boundary::race3(write, read, reject_extra).await
+    let end = boundary::race3(write, read, reject_extra).await;
+    // Whatever the write half still had custody of is gone with the connection —
+    // via the `write_all` error arm or via `select!` dropping the suspended write
+    // future, indistinguishable from here and deliberately so (LEG-2). The pieces
+    // already on the wire were discharged as they went, so `remaining` is the exact
+    // untransmitted tail: §5's "loss is always visible and attributable", and
+    // invariant 3's third clause, applied to the sending side of the wire.
+    if let Some(f) = in_flight.take()
+        && f.remaining > 0
+        && let Some(stat) = stats.get(&f.channel)
+    {
+        stat.discarded_peer_gone.add(f.remaining);
+    }
+    end
+}
+
+/// A chunk the socket write half has taken out of its bounded receiver but not yet
+/// put on the wire in full — [`pump`]'s custody slot (LEG-2).
+struct InFlight {
+    /// The channel whose `ChannelStat` the untransmitted tail is charged to.
+    channel: String,
+    /// Source bytes of the chunk that have not reached the wire.
+    remaining: u64,
+}
+
+/// Account `n` source bytes of the in-flight chunk as no longer at risk (framed onto
+/// the wire, or charged as an unframable residual).
+fn discharge(slot: &Cell<Option<InFlight>>, n: u64) {
+    if let Some(mut f) = slot.take() {
+        f.remaining = f.remaining.saturating_sub(n);
+        slot.set(Some(f));
+    }
+}
+
+/// How long the reject-a-second-peer loop waits after its first failing `accept`,
+/// and the cap it doubles toward (LEG-3). The same exponential shape the supervisor's
+/// own accept uses, with a smaller floor because the common case here — a real second
+/// peer knocking — must still be refused promptly.
+const REJECT_BACKOFF_INITIAL_MS: u64 = 5;
+const REJECT_BACKOFF_MAX_MS: u64 = 1_000;
+
+/// The `listen` role's reject-a-second-peer arm (§7.4), parameterized over the accept
+/// so a test can hand it one that always fails.
+///
+/// An `Err` from `accept(2)` is **not** a readiness event: under EMFILE/ENFILE it
+/// returns immediately, so the former `if let Ok(…)` shape re-called it at once and
+/// spun the daemon's single runtime thread at ~54,000 accepts per second — silently,
+/// because this arm alone logged nothing (LEG-3, the §15.36 "busy-spun core" class).
+/// Errors now warn and back off toward a one-second cap; a good accept resets the
+/// schedule, so a burst of legitimate second peers is still refused at full speed.
+/// Never returns: the pump ends only through its two data halves (§16.1).
+async fn reject_extra_peers<S, F, Fut>(mut accept: F) -> PumpEnd
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<S>>,
+{
+    let mut backoff =
+        boundary::Backoff::exponential(REJECT_BACKOFF_INITIAL_MS, REJECT_BACKOFF_MAX_MS);
+    loop {
+        match accept().await {
+            Ok(extra) => {
+                drop(extra); // close it immediately
+                backoff.reset();
+            }
+            Err(e) => {
+                tracing::warn!(target: "leg", "refusing a concurrent second peer failed: {e}");
+                backoff.sleep().await;
+            }
+        }
+    }
 }
 
 /// Route one decoded wire event into the local graph. Hostward fan-out is lossy at
@@ -907,41 +1060,41 @@ async fn route_recv(
                 s.active.set(true);
             }
             match route {
-                RecvRoute::Host { sinks, feeds } => {
-                    // Mirror to this channel's tap hub for taps and the replay ring
-                    // (§17), independent of whether a local consumer is bound.
-                    if let Some(feed) = feeds.get(ch) {
-                        feed.mirror(&bytes);
-                    }
-                    match sinks.get(ch) {
-                        Some(chsinks) => {
-                            // The one shared hostward fan-out (§5, F1): it charges the
-                            // all-sinks-closed case to `unattached` itself, which is
-                            // exactly the case this loop used to swallow — an announced
-                            // channel whose local consumer was cascade-removed while the
-                            // leg lived on. An unconfigured identity has no `ChannelStat`
-                            // to charge, so its bytes go to a scratch counter and are
-                            // reported as `unbound` state instead (§8: announcements
-                            // never grow the graph).
-                            let scratch = Cell::new(0u64);
-                            let unattached: &dyn LossCounter = match stat {
-                                Some(s) => &s.discarded_hostward,
-                                None => &scratch,
-                            };
-                            let out = chsinks.broadcast(&bytes, unattached);
-                            if let Some(s) = stat {
-                                if out.live {
-                                    s.delivered_hostward.set(s.delivered_hostward.get() + n);
-                                }
-                                // Per-channel mirror of the full-buffer loss the sinks'
-                                // own `DropCounters` already carry (§5).
-                                s.discarded_hostward
-                                    .set(s.discarded_hostward.get() + out.dropped_full);
-                            }
+                RecvRoute::Host { sinks, feeds } => match sinks.get(ch) {
+                    // The one shared per-channel hostward routing block (SIMP-1). It
+                    // mirrors to this channel's tap hub for taps and the replay ring
+                    // (§17) independent of whether a local consumer is bound, and
+                    // *outside* the fan-out's accounting; it charges the
+                    // all-sinks-closed case to `unattached` itself, which is exactly
+                    // the case this loop used to swallow — an announced channel whose
+                    // local consumer was cascade-removed while the leg lived on; it
+                    // credits `FanOut::delivered` — what a sink actually took — never
+                    // `live` (a *full* sink is live) and never `n - dropped_full`
+                    // (which credited zero for a chunk one consumer received in full
+                    // while another's buffer was full), LEGD-2 in both directions; and
+                    // it mirrors the full-buffer loss into `discarded_hostward`
+                    // through this node's
+                    // own `add_dropped_full`, which is the one place the leg's rule
+                    // differs from the codecs'. An unconfigured identity has no
+                    // `ChannelStat` to charge, so the helper absorbs its bytes and the
+                    // identity is reported as `unbound` state instead (§8:
+                    // announcements never grow the graph).
+                    Some(chsinks) => route_channel_data(
+                        &bytes,
+                        feeds.get(ch),
+                        Some(chsinks),
+                        stat.map(|s| &**s as &dyn HostwardChannelStat),
+                    ),
+                    None => {
+                        // Not routed through the helper: an unconfigured identity here
+                        // is `unbound` *state*, not a scratch discard, and the leg
+                        // mirrors even an unbound channel to its tap feed.
+                        if let Some(feed) = feeds.get(ch) {
+                            feed.mirror(&bytes);
                         }
-                        None => note_undeliverable(ch, stat, n, shared, Undeliverable::Hostward),
+                        note_undeliverable(ch, stat, n, shared, Undeliverable::Hostward);
                     }
-                }
+                },
                 RecvRoute::Target(txs) => match txs.get(ch) {
                     // The per-channel task counts accepted_targetward once the local
                     // device-write handoff accepts; here we just backpressure.
@@ -952,7 +1105,7 @@ async fn route_recv(
                         if tx.send(bytes).await.is_err()
                             && let Some(s) = stat
                         {
-                            s.discarded_targetward.set(s.discarded_targetward.get() + n);
+                            s.discarded_targetward.add(n);
                         }
                     }
                     None => note_undeliverable(ch, stat, n, shared, Undeliverable::Targetward),
@@ -1004,7 +1157,7 @@ fn note_undeliverable(
             Undeliverable::Hostward => &s.discarded_hostward,
             Undeliverable::Targetward => &s.discarded_targetward,
         };
-        counter.set(counter.get() + n);
+        counter.add(n);
         return;
     }
     shared.unbound.with_mut(|unbound| unbound.insert(ch));
@@ -1070,8 +1223,7 @@ async fn channel_targetward(
             let Some(bytes) = rx.recv().await else {
                 break; // source closed (torn down)
             };
-            stat.discarded_targetward
-                .set(stat.discarded_targetward.get() + bytes.len() as u64);
+            stat.discarded_targetward.add(bytes.len() as u64);
             continue;
         };
         let msg = if holding.is_some() {
@@ -1112,8 +1264,7 @@ async fn channel_targetward(
             // Endpoint torn down (or this origin cannot write). Same reasoning as the
             // send-error arm below: count and keep the task, because a later `connect`
             // can hand this channel a live local endpoint (§15.35).
-            stat.discarded_targetward
-                .set(stat.discarded_targetward.get() + n);
+            stat.discarded_targetward.add(n);
             holding = None;
             continue;
         }
@@ -1151,8 +1302,7 @@ async fn channel_targetward(
                 // task: with edge surgery (§15.35) a `connect` may give this channel a
                 // new local endpoint, and returning here would leave a leg channel
                 // permanently dead with no way back short of a reload.
-                stat.discarded_targetward
-                    .set(stat.discarded_targetward.get() + n);
+                stat.discarded_targetward.add(n);
                 release(&lock, id);
                 holding = None;
                 continue;
@@ -1198,45 +1348,35 @@ async fn purge_inbound(
     }
     let purged = in_flight + boundary::drain_to_quiescence(rx).await;
     if purged > 0 {
-        stat.purged_on_reconnect
-            .set(stat.purged_on_reconnect.get() + purged);
+        stat.purged_on_reconnect.add(purged);
     }
 }
 
 /// Acquire `id`'s on-demand write lock, joining the FIFO queue and suspending if
 /// contended (§6, §15.20 two-lane). Returns false if the endpoint was torn down or
 /// the origin cannot write. Holds no borrow across the await.
+///
+/// The fast path is a single synchronous borrow; the slow path is the shared
+/// [`await_write_grant`] park, which owns the five-clause lost-wakeup discipline this
+/// function used to hand-write (§15.20, SIMPB-2) — so all that is left here is the one
+/// line inside the critical section.
 async fn ensure_acquired(lock: &SharedLock, id: OriginId) -> bool {
     if lock.with(|g| g.may_write(id)) {
         return true;
     }
-    loop {
-        if lock.is_closed() {
-            return false;
+    await_write_grant(lock, |g| match g.acquire(id) {
+        Acquire::Granted => Some(Grant::Fresh),
+        Acquire::AlreadyHeld => Some(Grant::AlreadyHeld),
+        // `write = never` (a claim about configuration) and an edge that went away
+        // under this pump (`disconnect`/`remove-node`, §15.35) are distinct states
+        // since CTRL-2 split them, and both are unwaitable: this channel cannot write.
+        Acquire::ReadOnly | Acquire::Unregistered => Some(Grant::Refused),
+        Acquire::Denied { .. } => {
+            g.enqueue(id);
+            None
         }
-        let notified = lock.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        let outcome = lock.with_mut(|g| match g.acquire(id) {
-            Acquire::Granted => Some(Some(true)), // freshly granted (emit)
-            Acquire::AlreadyHeld => Some(Some(false)),
-            Acquire::ReadOnly => Some(None), // cannot write
-            Acquire::Denied { .. } => {
-                g.enqueue(id);
-                None
-            }
-        });
-        match outcome {
-            Some(Some(fresh)) => {
-                if fresh {
-                    lock.emit_change();
-                }
-                return true;
-            }
-            Some(None) => return false,
-            None => notified.await,
-        }
-    }
+    })
+    .await
 }
 
 /// Release `id`'s lock if held, waking the next queue head (§6).
@@ -1518,6 +1658,23 @@ mod tests {
         .unwrap()
     }
 
+    /// The same leg the other way round: a `faces = target` leg's channel endpoints
+    /// are target-facing, so they are the ones that carry a [`DropCounters`] handle.
+    fn target_leg_config(name: &str, address: &str) -> NodeConfig {
+        toml::from_str(&format!(
+            r#"
+            type = "leg"
+            name = "{name}"
+            faces = "target"
+            transport = "unix"
+            role = "listen"
+            address = "{address}"
+            channels = ["console"]
+            "#
+        ))
+        .unwrap()
+    }
+
     // LEG-2: an uncapped `Vec` let a peer streaming frames with fresh channel ids
     // grow the leg's memory without limit. The cap holds, the earliest identities
     // (the ones an operator is most likely acting on) are the ones kept, and the
@@ -1737,6 +1894,184 @@ mod tests {
         assert_eq!(ch["discarded_unframable"], json!(5));
         // A leg with no peer reports no handshake (LEG-5's steady state).
         assert_eq!(state["protocol_version"], Value::Null);
+    }
+
+    // LEG-1: a `faces = target` leg's `start` did `let _ = wiring.target_counters
+    // .remove(&addr)`, so the one handle recording what the upstream producer sheds
+    // at this leg's intake was never reported. Measured: ~50 MB shed with every
+    // counter in `state` reading zero, beside a `log` on the same producer that
+    // accounted for its stream to the byte.
+    #[test]
+    fn a_target_facing_channel_reports_what_it_sheds_at_its_intake() {
+        let mut node = LegNode::create(&target_leg_config("up", "/tmp/never-bound.sock"));
+        // A leg that never claimed a counter reports zero rather than nothing — the
+        // shape `faces = host` legs keep, whose channel endpoints are host-facing.
+        assert_eq!(
+            node.state_extra()["channels"]["console"]["dropped_slow_consumer"],
+            json!(0)
+        );
+
+        // The handle `Wiring::build` hands every target-facing endpoint, and the
+        // producing node's `AttachedSink` charges through `runtime::fan_out`.
+        let counters = Arc::new(DropCounters::default());
+        node.channel_counters
+            .insert("console".to_owned(), counters.clone());
+        counters.add_full(4096);
+
+        let state = node.state_extra();
+        assert_eq!(
+            state["channels"]["console"]["dropped_slow_consumer"],
+            json!(4096),
+            "the intake drop must be visible in state: {state}"
+        );
+    }
+
+    // LEG-2: the write half pops a chunk off its bounded receiver before framing it,
+    // and the peer can take it away by either of two exits — `write_all` failing, or
+    // `select!` dropping the suspended write future when the read half returns first.
+    // The custody slot is what makes the untransmitted tail charge-able after the
+    // race resolves, so it has to survive an over-discharge and an empty slot
+    // without inventing bytes.
+    #[test]
+    fn the_in_flight_slot_holds_the_exact_untransmitted_tail() {
+        let slot: Cell<Option<InFlight>> = Cell::new(None);
+        // Nothing in custody: a no-op, never a phantom charge.
+        discharge(&slot, 10);
+        assert!(slot.take().is_none());
+
+        slot.set(Some(InFlight {
+            channel: "c0".to_owned(),
+            remaining: 100,
+        }));
+        discharge(&slot, 30);
+        discharge(&slot, 30);
+        let f = slot.take().expect("still in custody");
+        assert_eq!(f.remaining, 40, "the tail is what never reached the wire");
+        assert_eq!(f.channel, "c0");
+
+        // Saturating, so a miscount can never become a 2^64-byte loss report.
+        slot.set(Some(InFlight {
+            channel: "c0".to_owned(),
+            remaining: 5,
+        }));
+        discharge(&slot, 9);
+        assert_eq!(slot.take().expect("in custody").remaining, 0);
+    }
+
+    // LEG-2's counter is its own, not a fold into `discarded_unframable` — that one
+    // means "this channel identity is pathological" and must stay readable as such.
+    #[test]
+    fn state_extra_reports_the_peer_gone_residual_separately() {
+        let node = LegNode::create(&leg_config("up", "/tmp/never-bound.sock"));
+        node.stats["console"].discarded_peer_gone.set(60_001);
+        let ch = &node.state_extra()["channels"]["console"];
+        assert_eq!(ch["discarded_peer_gone"], json!(60_001));
+        assert_eq!(ch["discarded_unframable"], json!(0));
+    }
+
+    /// The number of attempts past which the injected accept stops answering, and the
+    /// ceiling the paced loop must stay under. One constant for both jobs on purpose —
+    /// see [`a_persistently_failing_accept_backs_off_instead_of_spinning`].
+    const ACCEPT_CAP: u64 = 40;
+
+    // LEG-3: an `Err` from `accept(2)` is not a readiness event — under EMFILE it
+    // returns immediately — so the former `if let Ok(…)` shape re-called it at once,
+    // pinning the single runtime thread at ~54,000 accepts per second and logging
+    // nothing at all. The loop must be paced by a timer, not by the CPU.
+    //
+    // **Why the injected accept parks after `ACCEPT_CAP`, and why the clock is paused.**
+    // The first version of this guard returned a bare `ready(Err(…))` and leaned on
+    // `timeout` alone, and against the unfixed loop it did not *report* the defect: an
+    // immediately-ready future is not a yield point and consumes no tokio coop budget,
+    // so the spinning task never returned to the scheduler, the timeout future was never
+    // polled, and the test hung instead of failing its ceiling. A guard that wedges CI
+    // stops a regression but diagnoses nothing (review-32 audit).
+    //
+    // Parking the accept at the ceiling is what closes that: the unpaced loop reaches
+    // attempt 41 in microseconds and then has to yield, the timeout fires, and the
+    // assertion below prints the count it actually reached. Proved fail-first — against
+    // the `if let Ok(…)` shape this test now reports "41 accepts in 300ms" in a fifth of
+    // a second, where the old one hung.
+    //
+    // The clock is real rather than `start_paused`, which would need tokio's `test-util`
+    // feature; nothing here depends on virtual time, because the assertion that matters
+    // is an *upper* bound — a loaded runner completes fewer sleeps, never more.
+    #[tokio::test]
+    async fn a_persistently_failing_accept_backs_off_instead_of_spinning() {
+        let calls = Rc::new(Cell::new(0u64));
+        let counter = calls.clone();
+        let arm = reject_extra_peers(move || {
+            let counter = counter.clone();
+            async move {
+                let n = counter.get() + 1;
+                counter.set(n);
+                if n > ACCEPT_CAP {
+                    // Nothing above this line ever awaits, so a paced caller sees the
+                    // same immediately-failing accept a real EMFILE gives it.
+                    std::future::pending::<()>().await;
+                }
+                Err::<(), std::io::Error>(std::io::Error::other("EMFILE"))
+            }
+        });
+        // The arm never returns by design (§16.1 park-don't-teardown), so bound it.
+        let _ = tokio::time::timeout(Duration::from_millis(300), arm).await;
+        let n = calls.get();
+        assert!(n >= 2, "the loop stopped retrying after {n} attempts");
+        assert!(
+            n <= ACCEPT_CAP,
+            "the reject arm is spinning rather than backing off: {n} accepts in 300ms \
+             (the injected accept stops answering past {ACCEPT_CAP}, so this is a floor \
+             on the real count, not the whole of it)"
+        );
+    }
+
+    // LEGD-2: `fan_out` reports `live = true` for a sink whose bounded buffer is
+    // *full* (deliberately — it is still live), so crediting the whole chunk on
+    // `live` counted bytes no consumer ever received. With one slow consumer the leg
+    // reported the same stream as both delivered and discarded at once.
+    //
+    // Single-sink deliberately: that is the shape in which the two counters must
+    // partition the stream exactly, and the shape an operator reconciles. The mixed
+    // fan-out (one sink Ok, one Full) — where the first correction, `n -
+    // dropped_full`, then credited zero — is pinned in `runtime::tests`, because the
+    // arithmetic is one function shared by all three producers.
+    #[tokio::test]
+    async fn a_chunk_no_sink_accepted_is_not_credited_as_delivered() {
+        let shared = shared();
+        let stats = stats_for(&["c0"]);
+        let fanout = crate::runtime::FanOutList::new();
+        // Depth 1: the first chunk is taken, every one after it finds the sink full.
+        let (tx, _rx) = mpsc::channel::<Chunk>(1);
+        fanout.attach(crate::runtime::AttachedSink {
+            target: EndpointAddr::node("consumer"),
+            tx,
+            counters: Arc::new(DropCounters::default()),
+        });
+        let route = RecvRoute::Host {
+            sinks: HashMap::from([("c0".to_owned(), fanout)]),
+            feeds: HashMap::new(),
+        };
+
+        for _ in 0..3 {
+            route_recv(
+                Event::data("c0", Chunk::from_static(&[7u8; 8])),
+                &route,
+                &stats,
+                &shared,
+            )
+            .await;
+        }
+
+        let s = &stats["c0"];
+        assert_eq!(
+            s.delivered_hostward.get(),
+            8,
+            "only the chunk a sink actually took is a delivery"
+        );
+        assert_eq!(s.discarded_hostward.get(), 16);
+        // §5, stated as arithmetic: with one sink the two counters partition the
+        // stream exactly, so an operator can reconcile them against the consumer.
+        assert_eq!(s.delivered_hostward.get() + s.discarded_hostward.get(), 24);
     }
 
     // SEC-2: the v1 wire has no authentication (§9), so the path is the whole gate —

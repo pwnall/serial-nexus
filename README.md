@@ -177,8 +177,8 @@ hardening guidance.
 
 ## Documentation
 
-- [`docs/28-design-claude-fable-v12.md`](docs/28-design-claude-fable-v12.md) — the normative design document (concepts, node types, RPC contract, and the reasoning behind each decision). A `§N` reference anywhere in this repository means this document.
-- [`docs/29-implementation-plan-claude-fable-v12.md`](docs/29-implementation-plan-claude-fable-v12.md) — the normative implementation plan (phases and post-1.0 tracks).
+- [`docs/30-design-claude-fable-v13.md`](docs/30-design-claude-fable-v13.md) — the normative design document (concepts, node types, RPC contract, and the reasoning behind each decision). A `§N` reference anywhere in this repository means this document. Superseded generations live in [`docs/historical/`](docs/historical/) and are **not** normative; this bullet and `AGENTS.md` §9 are the two places that name the current pair by filename, so both must be bumped whenever a generation lands.
+- [`docs/31-implementation-plan-claude-fable-v13.md`](docs/31-implementation-plan-claude-fable-v13.md) — the normative implementation plan (phases and post-1.0 tracks).
 - [`docs/rpc/`](docs/rpc/) — the JSON-RPC method reference (the stable contract of §10).
 - [`docs/codec-authors.md`](docs/codec-authors.md) — writing a codec: the trait, the event vocabulary, and the envelope protocol for external (any-language) codecs.
 - [`docs/security.md`](docs/security.md) — threat model and hardening.

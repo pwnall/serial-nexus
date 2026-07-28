@@ -1413,34 +1413,61 @@ fn p10_fill_pass(write_to: RawFd, already: u64) -> (u64, u64, String, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// P4 — by-id resolution ground truth (§12)
+// P4 — device identity resolution ground truth (§12)
 // ---------------------------------------------------------------------------
 
-// The by-id + sysfs walk that produces `usb:vid:pid:serial:iface` lives in
-// `nexus_core::resolver` (the daemon and the doctor share one implementation,
-// §12); the doctor observes what that resolver reports.
+// The `<sys>/class/tty` listing + sysfs walk that produces
+// `usb:vid:pid:serial:iface`, with `/dev/serial/by-id` as a fast path over it,
+// lives in `nexus_core::resolver` (the daemon and the doctor share one
+// implementation, §12); the doctor observes what that resolver reports — and
+// therefore has to ask it about *devices*, not about the by-id directory, or it
+// contradicts the daemon in the one environment §12 grew a fallback for (RES-2).
 
 pub fn p4_resolver(dev_root: &Path, sys_root: &Path) -> Probe {
     let p = Probe::new(
         "P4",
-        "by-id resolution ground truth",
-        "Does /dev/serial/by-id plus a dependency-free sysfs walk yield the canonical usb:vid:pid:serial:iface identity (§12)?",
+        "device identity resolution",
+        "Does the resolver's one source — the <sys>/class/tty listing plus a dependency-free sysfs walk, with /dev/serial/by-id as a fast path over it — yield the canonical usb:vid:pid:serial:iface identity (§12)?",
     );
-    let by_id = dev_root.join("dev/serial/by-id");
-    if !by_id.is_dir() {
+    // **Gate on devices, not on the by-id directory.** Gating on `by_id.is_dir()`
+    // made this probe skip with "no USB-serial adapter present" in exactly the
+    // environment §12 now handles — `/sys` mounted, no udev `60-serial.rules`, the
+    // adapter sitting at `/dev/ttyUSB0` — so the report AGENTS §3 tells operators to
+    // attach to every bug report contradicted the daemon that was working beside it
+    // (review 32 RES-2). `enumerate_ports` is the resolver's own enumeration face and
+    // reads the same source capture does, so what P4 reports is what `add-node`
+    // would store; it is passive by construction (readlinks, listings, sysfs reads —
+    // never `open(2)`, §15.35), which is what lets a *diagnostic* run it unattended.
+    let resolver = nexus_core::Resolver::with_roots(dev_root, sys_root);
+    let by_id_present = dev_root.join("dev/serial/by-id").is_dir();
+    let adapters = resolver.discover_adapters();
+    let candidates = resolver.enumerate_ports();
+    // Devices sysfs can identify that udev never named — the RES-2 population.
+    let unnamed: Vec<_> = candidates
+        .iter()
+        .filter(|c| c.by_id.is_none() && c.kind == nexus_core::DeviceKind::Usb)
+        .collect();
+    // Everything else with no by-id entry: a by-path-only adapter, or a BSD `cu.*`
+    // node. Counted, never judged — neither is a failure of identity resolution.
+    let other = candidates.iter().filter(|c| c.by_id.is_none()).count() - unnamed.len();
+
+    let p = p
+        .observe(
+            "by_id_tree",
+            if by_id_present { "present" } else { "absent" },
+        )
+        .observe("count", adapters.len() as u64)
+        .observe("sysfs_only", unnamed.len() as u64)
+        .observe("other_candidates", other as u64);
+
+    if adapters.is_empty() && candidates.is_empty() {
         return p.verdict(
-            Status::skipped("no /dev/serial/by-id tree"),
-            "No USB-serial adapter present; identity resolution untested here (run on an adapter-equipped box).",
+            Status::skipped("no serial device visible"),
+            "No serial device visible through /dev/serial/by-id, the sysfs tty listing, /dev/serial/by-path or cu.*; identity resolution untested here (run on an adapter-equipped box).",
         );
     }
-    let adapters = nexus_core::Resolver::with_roots(dev_root, sys_root).discover_adapters();
-    if adapters.is_empty() {
-        return p.verdict(
-            Status::skipped("by-id tree present but empty"),
-            "No adapters to resolve.",
-        );
-    }
-    let mut p = p.observe("count", adapters.len() as u64);
+
+    let mut p = p;
     let mut all_resolved = true;
     for a in &adapters {
         let val = a.identity.clone().unwrap_or_else(|| "by-path only".into());
@@ -1449,15 +1476,35 @@ pub fn p4_resolver(dev_root: &Path, sys_root: &Path) -> Probe {
             all_resolved = false;
         }
     }
+    for c in &unnamed {
+        p = p.observe(&c.path.display().to_string(), c.identity.clone());
+    }
+
+    // The by-id tree's *absence* is reported on the environment check as `degraded`
+    // with the observation named (§13), not here: this probe answers "does identity
+    // resolution work", and in that environment it does — through the sysfs listing,
+    // which is the same source capture reads. Naming it in the consequence keeps the
+    // operator informed without reddening a box the daemon is fine on; a `degraded`
+    // verdict here would also fail `expectations/linux.jq`, which admits only
+    // `supported` or `skipped` for P4.
+    let where_from = if by_id_present {
+        ""
+    } else {
+        " No /dev/serial/by-id tree here (no udev 60-serial.rules — a container's bare --device=…, a busybox-mdev image): identities came from the <sys>/class/tty listing, the same source capture reads (§12)."
+    };
     if all_resolved {
         p.verdict(
             Status::Supported,
-            "Resolver produces canonical identities; configs survive replug and cold start (§12).",
+            &format!(
+                "Resolver produces canonical identities; configs survive replug and cold start (§12).{where_from}"
+            ),
         )
     } else {
         p.verdict(
             Status::Degraded,
-            "Some adapters resolve only by topology (no serial number) → by-path fallback with a documented instability warning (§12).",
+            &format!(
+                "Some adapters resolve only by topology (no serial number) → by-path fallback with a documented instability warning (§12).{where_from}"
+            ),
         )
     }
 }
@@ -2461,19 +2508,41 @@ pub fn environment(dev_root: &Path, sys_root: &Path, named_ports: &[PathBuf]) ->
         )),
     }
 
-    // by-id tree.
+    // by-id tree. **The tree's absence is not the adapter's absence**, and reporting
+    // it as one is how this check came to contradict a daemon working beside it: with
+    // `/sys` mounted and no udev `60-serial.rules` (a container handed a bare
+    // `--device=/dev/ttyUSB0`, a busybox-mdev image) it said "absent (no USB-serial
+    // adapter)" and skipped, about a tree where the adapter is present in sysfs and
+    // at `/dev/ttyUSB0` (review 32 RES-2). The resolver learned to resolve there; the
+    // diagnostic has to learn to *say* so, because AGENTS §3 makes this report the
+    // first attachment on every bug report.
+    //
+    // A differing environment is `degraded` with the observation named, never
+    // `unsupported` (§13): the daemon's fallback applies and it works — what the
+    // operator loses is udev's stable naming, which is worth a line in the report.
     let by_id = dev_root.join("dev/serial/by-id");
-    let adapters = nexus_core::Resolver::with_roots(dev_root, sys_root).discover_adapters();
+    let resolver = nexus_core::Resolver::with_roots(dev_root, sys_root);
+    let adapters = resolver.discover_adapters();
+    let candidates = resolver.enumerate_ports();
     if by_id.is_dir() {
         checks.push(EnvCheck::new(
             "/dev/serial/by-id",
             format!("present ({} adapter(s))", adapters.len()),
             Status::Supported,
         ));
+    } else if !candidates.is_empty() {
+        checks.push(EnvCheck::new(
+            "/dev/serial/by-id",
+            format!(
+                "absent — {} serial device(s) visible another way (sysfs / by-path / cu.*); identities come from those instead of udev's stable names (§12). No 60-serial.rules here — a container's bare --device=…, a busybox-mdev image; macOS has no by-id tree at all (§13)",
+                candidates.len()
+            ),
+            Status::Degraded,
+        ));
     } else {
         checks.push(EnvCheck::new(
             "/dev/serial/by-id",
-            "absent (no USB-serial adapter)",
+            "absent, and no serial device visible through sysfs, by-path or cu.* either",
             Status::skipped("no adapter"),
         ));
     }
@@ -2489,8 +2558,16 @@ pub fn environment(dev_root: &Path, sys_root: &Path, named_ports: &[PathBuf]) ->
         checks.push(group_membership_check(grp));
     }
 
-    // Access to each discovered or named serial device node.
+    // Access to each discovered or named serial device node. Enumerated candidates
+    // are in the set too, not just by-id adapters: in the no-udev environment above
+    // the by-id list is empty, and reporting no access line at all for a device the
+    // operator is staring at is the same misdirection in a quieter form (RES-2).
     let mut ports: Vec<PathBuf> = adapters.iter().map(|a| a.dev_path.clone()).collect();
+    for c in &candidates {
+        if !ports.contains(&c.path) {
+            ports.push(c.path.clone());
+        }
+    }
     for p in named_ports {
         if !ports.contains(p) {
             ports.push(p.clone());
@@ -2568,6 +2645,189 @@ mod tests {
             item: item.to_owned(),
             integrity,
         }
+    }
+
+    // -- P4 / environment: the diagnostic must not contradict the daemon (RES-2) ---
+
+    /// A self-cleaning fixture tree under the system temp dir. No `tempfile`
+    /// dependency — the doctor's dependency list is part of the licensing gate
+    /// (§13), and the resolver's own tests do the same.
+    struct TmpTree(PathBuf);
+
+    impl TmpTree {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("snx-doctor-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TmpTree(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_file(p: &Path, contents: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, contents).unwrap();
+    }
+
+    /// One USB tty device in sysfs with a `/dev` node and **no udev symlinks at
+    /// all** — the RES-2 environment: a container handed `--device=/dev/ttyUSB0`, a
+    /// busybox-mdev image. Mirrors `nexus-core`'s `add_usb_device_unlinked`.
+    fn unlinked_usb_device(root: &Path, dev_name: &str) {
+        write_file(&root.join("dev").join(dev_name), "");
+        let usbdev = root.join("sys/bus/usb/devices/1-1");
+        write_file(&usbdev.join("idVendor"), "0403");
+        write_file(&usbdev.join("idProduct"), "6001");
+        write_file(&usbdev.join("serial"), "UNIQ01");
+        write_file(&usbdev.join("manufacturer"), "FTDI");
+        write_file(&usbdev.join("product"), "FT232R USB UART");
+        write_file(&usbdev.join("1-1:1.0/bInterfaceNumber"), "00");
+        let class = root.join("sys/class/tty").join(dev_name);
+        std::fs::create_dir_all(&class).unwrap();
+        std::os::unix::fs::symlink("../../../bus/usb/devices/1-1/1-1:1.0", class.join("device"))
+            .unwrap();
+    }
+
+    fn env_check<'a>(checks: &'a [EnvCheck], name: &str) -> &'a EnvCheck {
+        checks
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no {name} check in {checks:#?}"))
+    }
+
+    fn observed(p: &Probe, key: &str) -> Option<serde_json::Value> {
+        p.observations
+            .iter()
+            .find(|o| o.key == key)
+            .map(|o| o.value.clone())
+    }
+
+    /// RES-2, the doctor's half. AGENTS §3 makes this report the first attachment on
+    /// every bug report, and in the one environment the finding is about it said the
+    /// opposite of the truth: gated on `dev/serial/by-id.is_dir()`, P4 skipped with
+    /// "No USB-serial adapter present" and the environment check said "absent (no
+    /// USB-serial adapter)" — about a tree where the adapter is in sysfs and at
+    /// `/dev/ttyUSB0`, and where the daemon now binds it.
+    ///
+    /// Fail-first, run against the pre-fix code: P4 `skipped (no /dev/serial/by-id
+    /// tree)` with zero observations, and the by-id check `skipped (no adapter)`.
+    #[test]
+    fn p4_and_the_environment_see_an_adapter_udev_never_named() {
+        let t = TmpTree::new("res2");
+        unlinked_usb_device(t.path(), "ttyUSB0");
+        let sys_root = t.path().join("sys");
+        assert!(
+            !t.path().join("dev/serial").exists(),
+            "the fixture must model a tree with no udev serial links at all"
+        );
+
+        let p = p4_resolver(t.path(), &sys_root);
+        assert_eq!(
+            p.status.label(),
+            "supported",
+            "P4 skipped a resolvable adapter: {:?}",
+            p.status
+        );
+        assert_eq!(observed(&p, "by_id_tree"), Some("absent".into()));
+        assert_eq!(observed(&p, "sysfs_only"), Some(1.into()));
+        assert_eq!(
+            observed(&p, &t.path().join("dev/ttyUSB0").display().to_string()),
+            Some("usb:0403:6001:UNIQ01:00".into()),
+            "the identity the daemon would store must be in the report: {p:#?}"
+        );
+        assert!(
+            p.consequence.contains("no udev 60-serial.rules"),
+            "the environment difference must be named, not implied: {}",
+            p.consequence
+        );
+
+        let checks = environment(t.path(), &sys_root, &[]);
+        let by_id = env_check(&checks, "/dev/serial/by-id");
+        assert_eq!(
+            by_id.status.label(),
+            "degraded",
+            "a differing environment is degraded with the observation named, never \
+             skipped-as-absent (§13): {by_id:#?}"
+        );
+        assert!(
+            by_id.value.contains("1 serial device"),
+            "the check must count the devices that ARE visible: {}",
+            by_id.value
+        );
+        // …and the device gets an access line, which it had none of before: an
+        // operator debugging a permissions problem here saw no row at all.
+        let access = format!("access:{}", t.path().join("dev/ttyUSB0").display());
+        env_check(&checks, &access);
+    }
+
+    /// The other side of the same coin, and the reason the fix cannot simply stop
+    /// skipping: a box with **no** serial device must still read `skipped`, because
+    /// that is what CI runs and `expectations/linux.jq` admits only `supported` or
+    /// `skipped` for P4. A verdict that reddened an adapter-less runner would be a
+    /// bug, not a finding (probes.rs module doc).
+    #[test]
+    fn an_adapterless_tree_still_skips_rather_than_reddening() {
+        let t = TmpTree::new("empty");
+        std::fs::create_dir_all(t.path().join("dev")).unwrap();
+        let sys_root = t.path().join("sys");
+
+        let p = p4_resolver(t.path(), &sys_root);
+        assert_eq!(p.status.label(), "skipped", "{:?}", p.status);
+        let checks = environment(t.path(), &sys_root, &[]);
+        assert_eq!(
+            env_check(&checks, "/dev/serial/by-id").status.label(),
+            "skipped"
+        );
+    }
+
+    /// The udev-equipped box — this project's dev box and the 6.18 production target
+    /// — must read exactly as it did: `supported`, one observation per by-id entry,
+    /// and no by-id-absence sentence in the consequence. The RES-2 fix widened where
+    /// P4 looks; it must not have moved the verdict anywhere it already worked.
+    #[test]
+    fn a_by_id_equipped_tree_reads_exactly_as_before() {
+        let t = TmpTree::new("byid");
+        unlinked_usb_device(t.path(), "ttyUSB0");
+        let by_id = t.path().join("dev/serial/by-id");
+        std::fs::create_dir_all(&by_id).unwrap();
+        std::os::unix::fs::symlink(
+            "../../ttyUSB0",
+            by_id.join("usb-FTDI_FT232R_USB_UART_UNIQ01-if00-port0"),
+        )
+        .unwrap();
+        let sys_root = t.path().join("sys");
+
+        let p = p4_resolver(t.path(), &sys_root);
+        assert_eq!(p.status.label(), "supported");
+        assert_eq!(observed(&p, "by_id_tree"), Some("present".into()));
+        assert_eq!(observed(&p, "count"), Some(1.into()));
+        assert_eq!(
+            observed(&p, "sysfs_only"),
+            Some(0.into()),
+            "a device udev named is not a sysfs-only device: {p:#?}"
+        );
+        assert_eq!(
+            observed(&p, "usb-FTDI_FT232R_USB_UART_UNIQ01-if00-port0"),
+            Some("usb:0403:6001:UNIQ01:00".into())
+        );
+        assert!(
+            !p.consequence.contains("No /dev/serial/by-id tree"),
+            "{}",
+            p.consequence
+        );
+        assert_eq!(
+            env_check(&environment(t.path(), &sys_root, &[]), "/dev/serial/by-id")
+                .status
+                .label(),
+            "supported"
+        );
     }
 
     /// The sim path (§15.21: "characterization reporting skipped on non-UARTs, so

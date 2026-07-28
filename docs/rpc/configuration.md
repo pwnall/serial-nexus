@@ -59,7 +59,11 @@ The CLI reads the TOML file, parses it into a `GraphConfig`, and sends it as the
   codec name is structural too** (§8/§15.26): the error additionally carries
   `data.available`, the list of codecs this daemon *does* have — the same list the
   [`info`](observation.md#info) verb reports — so a misconfiguration names the
-  codecs that would have worked.
+  codecs that would have worked. That list includes the built-in
+  `exec` (§7.6), which has no registry entry but is a legal `codec = …` value: it
+  is a child *process* rather than an in-process codec and is routed before the
+  registry is consulted, an implementation fact that has no business leaking into
+  the answer a `codec = "exe"` typo gets.
 * `-32602` — the params were missing, `config` was absent, or the config did not
   deserialize (**including an unknown key or an unknown table**, see below); also
   an unimplementable node kind.
@@ -93,8 +97,10 @@ validated rather than trusted:
 | `replay_ring` | `0 ..= 16777216` (16 MiB) | the ring allocates lazily on the first hostward byte, so an unbounded value loads cleanly and then aborts the process — on a configuration `load` has already persisted, so the daemon crash-loops |
 | `hostward_buffer` | `1 ..= 65536` chunks | `0` is a rendezvous channel that drops nearly all hostward output; the depth is handed straight to a bounded tokio channel, which panics above its permit ceiling |
 | `baud` | `1 ..= 4294967295` | no upper bound by design (§7.1/§13 buy nonstandard rates deliberately), but `B0` means *hang up the line* |
+| `mode` (pty) | `0o600 ..= 0o777` (384 ..= 511) | a permission mode is nine bits, so the ceiling names the whole family of three-digit *decimal* typos of an octal one: `mode = 666` is 0o1232 — owner `-w-` — which used to load and then fault the node with an `EACCES` that never mentioned the mode. The floor is the daemon's own access: a pty's setup chmods the slave and then *opens* it to prime the session, so a mode denying the owner read+write faults by construction, and it catches what the ceiling misses by arithmetic accident (`mode = 154` is 0o232, no owner read, and sits inside 0o777) |
 | `rotation_padding` | `0 ..= 20` | the rotation counter is a `u64`, so beyond twenty digits the padding is pure filename noise |
 | `reconnect_initial_ms`, `reconnect_max_ms`, `idle_release_ms` | `0 ..= 3600000` (1 h) | a leg that waits longer than an hour to retry, or to release an idle implicit lock, is indistinguishable from a dead one |
+| `restart_backoff_ms` (exec codec) | `0 ..= 3600000` (1 h) | the same bound as the leg timers, and the same reasoning, applied to the one timer that lives inside a codec's opaque `attributes` table rather than in the node schema — `restart_backoff_ms = 86400000` used to load clean and then never respawn a crashed child for the rest of the daemon's life, with the node reporting that it was retrying. Checked in the codec's own `parse_attributes`, which both `load` and `add-node` call before anything is created, so the §11 atomicity guarantee is unchanged |
 
 The message names the node, the field, the value and the bound: `node "p"
 declares hostward_buffer = 70000, above the maximum 65536 (a numeric field is
@@ -108,7 +114,12 @@ range-checked before anything is created, §11)`.
   *held* origin, so any other mode — including the generic `on-demand` default an
   omitted `write_mode` produces — parks on its first chunk forever while `send`
   reports success. Bytes accepted, acknowledged and lost is what §5 forbids
-  outright, so the operator is told instead of left to hunt a stall.
+  outright, so the operator is told instead of left to hunt a stall. The whole
+  hazard presumes a lock upstream, so — exactly as in the sibling rule below — an
+  endpoint whose node is `arbitration = "free-for-all"` is exempt: with no lock
+  there, `held` and `on-demand` are behaviourally identical, no writer can park,
+  and the refusal would reject a graph that runs while citing a stall that cannot
+  happen on it.
 * At most **one effectively-`held` edge per host-facing endpoint**. `held` means
   acquire-on-attach and held indefinitely (§6), which two origins cannot both
   have: one wins arbitrarily, the loser can never write, never joins the waiter
@@ -164,6 +175,19 @@ input in configuration, so `dump` round-trips it and the config survives a cold
 start. Adding by raw path or serial number requires the device present *now*;
 adding by an already-canonical `usb:`/`by-path:` identity never does.
 
+A `/dev` path that is itself a **symlink** — `/dev/serial/by-id/usb-FTDI_…-if00-port0`,
+`/dev/serial/by-path/…` — is followed to its device node before the identity is
+derived, so the most canonical spelling an operator has captures the same `usb:`
+identity the device node would. A link name is not a sysfs device name, and
+deriving from the literal input degraded that input all the way to `raw:`,
+carrying the "not stable across reboots" warning — which is precisely backwards
+for a by-id path. A device with genuinely no identity, reached through a link,
+stores the canonical device-node path in its `raw:` form rather than the link
+name: the link may be gone next boot, the node will not. Two cases deliberately
+keep the operator's own spelling instead — a link that cannot be resolved at all
+(a race with an unplug) and one whose target escapes the daemon's `--dev-root`,
+since the resolver never binds a device outside the tree it was pointed at.
+
 ### Params
 
 | Field | Type | Required | Description |
@@ -178,7 +202,7 @@ adding by an already-canonical `usb:`/`by-path:` identity never does.
 | `identity` | string | *(serial only)* the captured canonical identity |
 | `description` | string | *(serial only)* human description, e.g. `FTDI FT232R, serial A6008isP, interface 0` |
 | `kind` | string | *(serial only)* resolution kind label (`usb`, `by-path`, `raw`, …) |
-| `resolved_path` | string \| null | *(serial only)* the current `/dev/tty*` path, or null if resolved while absent |
+| `resolved_path` | string \| null | *(serial only)* the current `/dev/tty*` path, or null if resolved while absent — the canonical device node, so a symlinked input is echoed back as what it points at |
 | `warning` | string | *(serial only, optional)* an instability warning (e.g. a raw-path add) |
 
 The identity echo fields are present only when the added node is a serial node;
@@ -227,9 +251,21 @@ drop.)
 
 Remove one node (§11). **Refused while any edge is attached** unless `cascade`
 is set, which also removes those edges. Removal tears down the node's
-environment (flushing a log queue within the bounded wait, §7.3), closes its
-endpoint locks so parked `lock --wait`/`send` waiters leave with the defined
-error (§6/§15.20), and prunes it from the wiring. Surviving neighbors self-heal.
+environment (flushing a log queue within the bounded wait, §7.3), leaves every
+lock it touched cleanly so no parked `lock --wait`/`send` waiter is stranded
+(§6/§15.20), and prunes it from the wiring. Surviving neighbors self-heal.
+
+Which *defined* error a waiter gets depends on which side of the removal it was
+on, and the two are worth telling apart. A waiter parked on a lock belonging to
+the **removed node's own** endpoint gets `-32003` (`endpoint behind origin "p1"
+was torn down while waiting`, or `endpoint "usb0" was torn down while sending`) —
+the endpoint it wanted no longer exists. A waiter whose *origin* was on the
+removed node but whose endpoint **survives** is unregistered from that surviving
+lock and gets `-32602` (`origin "p1" was detached from its endpoint while
+waiting`): the endpoint is still there and still writable, this writer simply is
+not attached to it any more. That second one used to borrow the `write=never`
+sentence, which is a claim about configuration and was never true here — the
+origin's declared mode is untouched by a removal.
 
 ### Params
 
@@ -363,7 +399,10 @@ wedged as locked by an origin that no longer exists, with no recovery. So
 `disconnect` unregisters the origin (whether it was the holder or a queued
 waiter), wakes the FIFO head so a parked `lock --wait` is granted, and purges the
 departing origin's un-flushed targetward backlog so bytes typed under the old lock
-cannot surface later under whoever takes the endpoint next (§6).
+cannot surface later under whoever takes the endpoint next (§6). If the departing
+origin was itself parked in that queue, its `lock --wait` leaves with `-32602
+origin "p1" was detached from its endpoint while waiting` — the endpoint it was
+queued for is alive and writable; this writer just stopped being attached to it.
 
 Nothing buffered hostward is lost to the detach itself: removing the producer's
 sink closes that edge's channel, and the consumer drains what it already holds

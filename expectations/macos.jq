@@ -37,9 +37,12 @@
 #     design, because TIOCGICOUNT is Linux-only and the serial node omits the
 #     counters rather than faulting (§5, §13).
 #
-# The macOS CI lane runs this as an INFORMATIONAL check: the gating macOS deliverable
-# is that the workspace builds and the portable unit/property tests pass; the doctor
-# report and the phase-2 e2e are observational until a hands-on macOS pass (§13).
+# The macOS CI lane runs this with `jq -e`, unguarded, so a failing clause FAILS the
+# job — the check has been gating since the §15.30 hands-on macOS pass, not
+# informational as this comment said while it was still awaiting one. What keeps that
+# honest rather than brittle is the leniency above: the clauses assert structure and
+# the portable mechanisms, and every Linux-only probe is free to skip, degrade or
+# report unsupported. Widen a clause here rather than un-gating the step (§13).
 #
 # Evaluates to `true` (exit 0) only when every clause below holds.
 

@@ -14,12 +14,480 @@ design.
 
 ---
 
+## REVIEW-32 REMEDIATION — all 80 unique findings dispositioned (2026-07-27 session)
+
+**The finding-by-finding ledger is `docs/33-review-32-remediation-ledger.md`** — read that before
+re-filing anything from review 32, and read the review's own §6a/§6b (10 refuted, 2 already-known)
+before filing anything new. One finding is deliberately narrowed rather than closed (`WEBS-1`, the
+web token's outbound cookie exposure: reduced in code to `Path=/ws` plus a separate asset credential,
+with the residual stated in `docs/security.md` and design §15.29/§17); the other 79 are fixed and, where
+behavioural, guarded.
+
+**Scale and gates.** Suite **485 → 630 passing / 0 failing / 4 ignored** (+145). `cargo fmt`,
+`cargo clippy` (workspace **and** minimal-daemon), `cargo deny check licenses bans sources`, the macOS
+cross-check, `nexus-doctor --json | jq -e -f expectations/linux.jq` and the headless-Chromium suite
+(19 specs per push, 2 `@slow` nightly) are all green. This review's guards are the **`p12_*`** family in
+`nexus-itest/tests/`, plus `p6_fragmentation.rs` (§15.24 named a leg guard by number and the leg family
+is `p6_*`) and new cases inside the modules that changed.
+
+**The shape of the fixes, which matters more than the list.** Each cluster's remedy is a *relocation* —
+the review's three-for-three thesis is that defects cluster where a rule lives in prose instead of in a
+type, a cap, a parser or a helper:
+
+- **One source for the resolver's two directions.** Capture walked sysfs while resolution, the
+  duplicate-serial guard and `enumerate_ports` read only `/dev/serial/by-id`. Both directions now read
+  `<sys_root>/class/tty` with by-id as a *fast path*, ambiguity is counted over **devices** (two clones
+  sharing a serial collide on one udev-generated link name, so counting links could never fire for the
+  hazard §12/§15.25 name), and a symlinked `/dev` path is canonicalized before capture. The unit fixture
+  that made the old guard look tested — it invented two by-id names udev cannot produce for identical
+  devices — was replaced with the single-link shape udev really emits.
+- **Exclusivity belongs to the port.** `ExclusivePort` returns the `TIOCEXCL` claim on `Drop` and
+  `release_port` is the one ordered discard, so the four exit paths stop being four things to remember.
+  Reachable before this from §7.1's *documented* modem-line assertions on a pty-backed device: `set_dtr`
+  ENOTTYs, the port is dropped still exclusive, and the flag clears only at the tty's last close — which
+  a held master never reaches — so the device was un-openable by every unprivileged process on the
+  machine, permanently, surviving teardown and daemon exit.
+- **One place drains a connection's notifications.** `serve_connection` is now a single four-lane
+  `select!` with dispatch as an optional arm, instead of an inner two-arm loop that left the `notes` and
+  `tap_rx` arms unpolled for the whole of a parked wait (measured: 11.2 MB dropped in one 6 s
+  `lock --wait`; a 2.001 s terminal blackout with 3.3 MB dropped per contended browser keystroke, since
+  §17 mandates one daemon connection per browser). `send`'s deadline now bounds the delivery too — it
+  used to hang forever *holding the exclusive lock* — and a pty reader parked on a full targetward
+  channel no longer freezes its own presence, last-close, termios reset and detach-release.
+- **Charge every non-delivery exit, through one verb.** The four §5 accounting holes are closed, and
+  `SIMP-2` — their structural form — with them: every targetward charge site goes through
+  `LossCounter`, with a `#[must_use]` residual so an uncharged exit is a compiler warning rather than an
+  audit item. `runtime::route_channel_data` does the same for the hostward per-channel block that was a
+  verbatim clone between `codec.rs` and `exec.rs`.
+- **Gates that can fail.** `p0_license_gate` asserts cargo-deny's `error[banned]` diagnostic rather than
+  its exit code (it passed vacuously on any `cargo metadata` failure — *proven* by deleting the ban
+  entry); `p11_replace_atomicity`'s exclusivity guard asserts the EBUSY *reason* rather than bare
+  `pass == false` (~40% detection on an idle box before, deterministic now); the `RefCell` meta-gate's
+  exemption is a repo-relative path with a planted-impostor self-proof; and `entry_point_doc_links_resolve`
+  replaces the third manual patch of README's stale design-pair links with a gate.
+
+**Two process notes.** (1) **Fail-first proof was obtained where the shim was affordable** and the
+guard's doc comment says so where it was reasoned instead — `ITEST-1` via an `LD_PRELOAD` shim
+swallowing `TIOCEXCL` (6/6 fail, 4 at the exact verdict the old assertion called green), `TESTR-2`
+end-to-end under the offline-runner shape the finding names, `TESTR-7` twice. Do not read an unproved
+guard as an equal one. (2) **A shared-fixture Playwright spec cost a full investigation.** The new
+`HIST-1` spec failed in the suite and passed in isolation, because `graph-editor.spec.mjs` attaches a
+log node to the shared echo console and never removed it — so the later spec's `discarded_unattached`
+oracle could never move and read exactly like "the device never spoke". The editor spec now restores the
+graph in a `finally`, *and* the history spec asserts its own precondition, which is the durable half.
+
+---
+
+## THE AUDIT OF THE REMEDIATION — six skeptics on a frozen tree (2026-07-27 session)
+
+The remediation above was put through §15.34's own treatment one level up: six independent agents got
+review 32 and a **frozen** worktree, never the implementers' reports, and were told to refute the claim
+that each finding was fixed. Verdicts, per-finding outcomes and the narrative are in
+`docs/33-review-32-remediation-ledger.md` ("The audit round"); **this entry is the engineering half** —
+the mechanisms, the measurements, and why the code that answers each one looks the way it does. Read it
+before "simplifying" anything named here: several of these are shapes a remediation already got wrong
+once, in the obvious direction, with a green suite behind it.
+
+### The lesson: a guard that drives the fix cannot fail against the code that lacked it
+
+The audit's highest-yield finding was not a defect at all — it judged **nineteen** of the remediation's
+new guards *unable to fail*, which for a project whose method is "every phase ends with an adversarial
+audit" is worse than a missing test, because it is counted as coverage. One pattern produced most of
+them, and it is a pattern a remediation is structurally prone to: the fix extracts a function
+(`apply_spawn`, `attach_edge`, `with_scoped_port`, `route_channel_data`), and the guard drives *that
+function*. Against the tree without the fix there is no such function — so the test does not fail, it
+fails to *compile*, which is a state no fail-first run ever reaches and no reviewer ever sees.
+
+Two more variants worth recognizing, because neither looks like the first: a guard whose bound is
+generous enough to admit the unfixed behaviour (`HIST-2`'s trimmer spec streamed ~320 kB and asserted
+`100_000 < chars < 1_000_000`, and an unfixed client renders ~320 008 — inside the window), and a guard
+that removes the very condition the defect needs (SERX-2's unit test installed the successor on a
+*second* pts, which is not the shared tty the whole mechanism turns on — and a pts has no `break_ctl`
+anyway, so nothing it asserted could ever have been observable).
+
+**The rule, applied throughout the fixes below: a regression guard names the entry point an operator
+reaches, and its bound is a function of the constant the fix introduced, not of the volume the test
+happens to produce.** The extracted helper still gets a unit test for its own arithmetic — as well,
+never instead. Where a defect is only observable on hardware or under a resource limit, that is where
+the guard goes, even at the cost of a self-skip (§5's skip-is-a-valid-verdict discipline): a rig-gated
+test that really fails is worth more than a portable one that cannot.
+
+### Accounting: two counters answering one question, and a hole answering none
+
+**(a) `LEGD-2`'s over-correction, and why `FanOut` now has two fields.** The filed defect was
+`delivered_hostward` crediting bytes no sink accepted, and the fix subtracted the drops:
+`add_delivered(n.saturating_sub(fan.dropped_full))`. That is wrong in the other direction, and the
+review's own verifier had said so in advance. `dropped_full` accumulates **per sink**, so a `[Ok, Full]`
+fan-out reports `dropped_full == n` and the subtraction credits **zero** delivered for a chunk a live
+consumer received in full — the exact inverse of the complaint. With *k* full sinks it saturates at zero
+for several chunks' worth. `runtime::FanOut` therefore carries `live` (is anything still attached? — the
+question the unattached charge turns on, and a consumer whose buffer is full is very much attached) and
+`delivered` (bytes at least one sink actually took), decided inside `fan_out` from the sends themselves.
+`route_channel_data` credits `fan.delivered` unmodified and never subtracts one counter from another.
+The consequence an operator has to know, now stated in the field's doc: **with several consumers a chunk
+is legitimately both delivered and discarded** — the two counters measure different consumers — so
+`delivered + discarded == streamed` is a *single-sink* property, which is what `p12_leg_accounting` wires
+and says it wires.
+
+**(b) The demux emit-then-error over-count** (found by the audit; not in review 32). `WIRE-1`'s new
+`note_demux_error(chunk.len(), …)` charged the whole input chunk to `multiplexed.discarded_hostward`
+whenever `Codec::demux` returned `Err` — but `hostward_demux` drains its `events` vec unconditionally
+*after* the match, so every event the same call emitted before failing is still routed and credited to
+its channel's `delivered_hostward`. The realistic shape does exactly that: a non-resyncing framer decodes
+the good frames out of a 64 KiB chunk and refuses on the corrupt tail, and nothing in `codec-api` says a
+transform must emit nothing before erroring — `demux` invokes `emit` once per decoded event *and*
+separately returns a `Result`. So `state` reported ~64 KiB of hostward loss on a chunk that was ~100%
+delivered, with the same payload counted as delivered *and* as lost — irreconcilable numbers, which §5
+treats as worse than coarse ones (a counter that double-counts cannot be reconciled at all). The charge is
+now `chunk_len.saturating_sub(salvaged)`, `salvaged` being the `data` payload of the events that call
+emitted, summed by the caller. **The residual is stated rather than hidden:** framing overhead of the
+salvaged frames is still charged as loss, because the trait cannot report consumption — erring toward
+reporting loss, not toward hiding it — and a call that emits more than it was handed (legal: a transform
+flushing frames buffered from earlier chunks) saturates at zero rather than wrapping. Guard
+`codec::tests::a_partial_decode_charges_only_the_bytes_the_refusal_lost`, fail-first: the old charge
+reported 12 lost against 8 delivered on a 12-byte chunk.
+
+**(c) `Handoff` is `#[must_use]` too.** `SIMP-2` made the *blocking* helper's residual a compiler
+concern (`TargetwardLoss`, with `charge` as its only consuming method), and left the non-blocking twin
+without one: `try_forward_targetward(origin, chunk, &lost);` in statement position compiled clean and
+silently dropped a targetward chunk with no counter — SIMP-2's own failure scenario, on the one path
+whose helper could not warn. `runtime::Handoff` now carries the attribute, and `Handoff::Full(Chunk)`
+hands the undelivered chunk back so the caller has something it must do with it. Both pty call sites
+already matched, so nothing was broken at the time; the point is that a future third site cannot forget,
+because with CI's `-D warnings` an ignored handoff is a hard error rather than an audit item.
+
+**(d) `TapFeed::skipped`, and why the first TAP-2 guard could not see the gap.** The mirror-hop half of
+TAP-2 shipped and the skip-site half did not, though the doc comment and a test comment both pointed at
+"`serial.rs`'s `TapFeed::skipped` call" — a method that did not exist. The reachable shape is the one an
+operator actually uses: a lone serial node watched only through `ctl tap`, `replay_ring = 0`, no graph
+consumer at all. `reader_thread` takes the `hostward.is_empty() && !tap_wanted` read-and-discard arm,
+never builds a `Chunk`, and so never reaches `TapFeed::mirror`; the audit measured `discarded_unattached`
+growing by 196 608 across a 3 s dark window while the next `tap.open` returned the previous frontier, the
+same `epoch`, `feed_dropped: 0` and a first chunk with `gap_before: 0`. The guard could not see it and
+said so without noticing: it *deliberately* attaches a `log` sink, precisely to force the chunk to be
+built. **A guard that steers around the one shape that still reproduces reads exactly like coverage.**
+`TapFeed::skipped(n)` now charges the same `feed_dropped` atomic from the skip site, and the two guards
+run one body with a `with_sink` switch so everything a client observes is asserted identical on both
+paths (`p12_tap_replay::the_ringless_window_is_announced_with_no_graph_consumer_at_all`, fail-first
+against a tree with the method present and the call site removed). The two charges stay independent and
+both are right: the bytes are unattached (no graph consumer took them) **and** a hole in the feed (no hub
+saw them) — the ring is a spy outside the graph, so its accounting never substitutes for the graph's
+(invariant 9/10). `wanted()` and `skipped()` are a pair; a producer that takes the allocation-skipping
+answer owes the charge.
+
+### The serial line: break is tty state, and the reopen window is a second D2
+
+**`SERX-2` — the fix converted a bounded outage into an unbounded one.** Making the deferred restore
+generation-scoped is right and stays: a node that has been torn down, replaced or reconnected must not
+drive a *successor's* line, so `RestoreGuard::drop` asks `with_scoped_port` and declines when the
+generation moved. But declining removed the only `TIOCCBRK` in the tree. A `send-break` straddled by
+`load --replace` therefore left the **tty** asserted with nobody left to clear it. Reproduced on the
+bench crossover rig, control against treatment: control `send-break usb0 --ms 2000` with no replace →
+the peer sees `\x00` at t=0.50 and `CTRL-OK\n` at t=2.51, the break clearing on schedule; treatment
+`--ms 5000` with a `load --replace` at t≈1.0 → the verb returns `-32602 node was removed while
+signalling`, the successor reports `status: active, open: true`, two `send`s report `sent 14 byte(s)` /
+`sent 6 byte(s)`, `driver_counters.tx` climbs to 79 — and the peer receives nothing for the next 19 s.
+An earlier run was still silent 30 s later. Recovery needed a full `teardown` (which destroys the tty)
+or another `send-break`; `load --replace` does not clear it.
+
+What the first fix missed is one sentence: **break is tty state exactly as `TIOCEXCL` is.** It outlives
+the fd that asserted it whenever the tty outlives that fd, and under `--replace` the tty never reaches
+last close. So the remedy is invariant 15 extended rather than a timer restored — `ExclusivePort` owns
+*every* tty-level assertion this node made, and `release_claims` (plural, and renamed for it) gives them
+all back in order: `TIOCCBRK` first so the line is transmitting normally, then `TIOCEXCL` so anyone else
+may open. **Why there and not in the successor's `open_port`:** the departing node cleans up after
+itself, which keeps the rule one place and keeps ownership honest — a successor-side clear would have to
+run on every open, would fire on ports nobody asserted anything on, and would depend on the next arrival
+noticing. DTR and RTS are deliberately *not* released: driving them on the way out is a reset pulse on
+every auto-reset board (§7.1), the unrequested edge this whole area exists to prevent, and unlike break
+they self-heal (the successor's own `open(2)` re-raises DTR on a real adapter, and `open_port` reapplies
+the configured `[node.modem]` levels — measured). Guard
+`p12_serial_exclusivity::a_break_straddled_by_a_replace_leaves_the_line_transmitting`, rig-gated on
+purpose: a pts has no `break_ctl` and the sim null modem is a byte-copy loop that models no line
+condition, so a `serial_pair()` version would be green against the stuck-break binary.
+
+**The reconnect window is D2 surviving in a second place.** The audit read `supervise`'s reconnect arm
+and found the same ordering defect §15.38's D2 fixed in `teardown`: `open_port` takes `TIOCEXCL`, then
+`purge_on_reconnect` awaits (up to `DRAIN_ROUNDS` yields whenever there *is* an outage backlog), and only
+then is the port stored — so for the width of the purge the daemon holds a device `release_port` cannot
+see, because `sh.port` is still `None`. A `load --replace` landing there releases nothing, the aborted
+supervisor future holds the only `Rc<ExclusivePort>` and is not dropped until the `LocalSet` regains the
+thread, and the *successor's* `open(2)` EBUSYs against the daemon's own claim — a `faulted` flap during
+which an accepted `send` is purged rather than written, which is what `p11_replace_atomicity` exists to
+prevent. The window is sub-millisecond and the audit did not land it live; the mechanism is certain from
+the code path, so it was fixed rather than left.
+
+The arm is now the extracted `serial::reopen`, whose rule is **publish the port on the node before the
+first `.await`** — the general form of D2, and the second site to need it. `adopt_port` stores it and
+carries the reconnect's single generation bump (moved off `set_active` for this), then the purge awaits,
+then a generation re-check declines to arm a reader on a port the node let go. Two state-reporting
+consequences were checked rather than assumed and are accepted:
+
+* The node reports `waiting` with `open: true` for the width of the purge. That is *more* truthful than
+  the alternative — the daemon really does hold the device exclusively, and a third party's `open(2)`
+  already says so.
+* A signal verb is accepted in that window, because `signal_handle` keys off `sh.port`. The port is real
+  and this node owns it, and because the bump happens at `adopt_port` rather than at the transition to
+  Active, a signal issued in the window stays valid into Active instead of being orphaned there.
+
+The generation re-check is insurance, not necessity: an aborted `spawn_local` future is never polled
+again today, so a teardown inside the window means `reopen` simply never resumes. It is written so that
+stays an asserted property rather than a fact about tokio's scheduler.
+
+### The resolver's second door, and the diagnostic that pointed away from it
+
+**`RES-1` ran on one of two paths.** The ambiguity guard was fixed to count *devices* rather than by-id
+link names, and guarded end to end — on the **capture** path only. The other direction,
+`Resolver::resolve_usb_identity`, is the path `load`, daemon startup from the state file, and `add-node
+device = "usb:…"` all take, and it never called the guard at all. Reproduced against the fixed daemon on
+a two-clone fixture tree: two nodes carrying
+`usb:0403:6001:DUP:00` both accepted with `kind: usb` and no warning, both reporting
+`resolved_path: …/dev/ttyUSB0`, the second adapter unreachable by any node. This is not hypothetical for
+an upgrader — `dump` wrote the ambiguous `usb:` string, so restarting the fixed daemon on an existing
+state file reproduces it with no operator action. Three doors reach that function carrying an ambiguous
+identity and only one of them is history: a persisted config, a hand-typed identity, and the door no
+amount of history fixes — an identity captured while only one clone was plugged in, whose twin appears
+later.
+
+**The disposition is decline, not guess**, and it costs a fast path. `find_usb` runs the device listing
+*before* the by-id readlinks and returns `None` when two present devices answer, so a node whose identity
+is ambiguous stays `waiting` rather than driving a coin-flip board; `resolve_usb_identity` returns the
+identity with a `warning` naming every device that answers plus the by-path fix, which is what `add-node`
+echoes. The reason the ordering had to invert is `RES-1` itself: a by-id *hit* says nothing about
+uniqueness, because udev publishes exactly one link per colliding name. Measured cost on this dev box
+(real `/sys`, ~110 tty entries): **0.93 ms per resolution against 0.041 ms** for the readlink alone, paid
+once per open and once per 1 Hz faulted-and-wait recheck per waiting node — under a tenth of a percent of
+a core, and `stat`s rather than DTR, since nothing here opens a device (§15.35). Declining is also the
+only arm available at the lower level: `resolve_current_path` returns a bare `Option<PathBuf>`, so
+"bind and warn" has nowhere to put the warning and would be indistinguishable, at every open, from
+binding the right device.
+
+**`RES-2`'s third surface was `nexus-doctor`, and it is the one AGENTS §3 tells operators to attach to
+every bug report.** The daemon learned to resolve identities in a tree with `/sys` and no by-id links;
+the diagnostic still gated on `dev/serial/by-id.is_dir()` at both the environment check and P4, so in
+exactly that environment it reported `/dev/serial/by-id: "absent (no USB-serial adapter)"` and
+`P4 skipped: "no /dev/serial/by-id tree"` — the daemon works and the diagnostic points away from it. P4
+is now "device identity resolution", asks about the `<sys>/class/tty` listing with by-id as a fast path
+over it, gates on **devices**, and emits `by_id_tree` (present/absent), `sysfs_only` and
+`other_candidates` beside `count`. It stays `supported` in a no-udev environment **by design** —
+`linux.jq` admits only `supported|skipped` for P4, and a probe that reddens a box the daemon is fine on
+is a false negative carried to 6.18. The environmental difference is carried by the by-id *environment
+check* instead, which gained a third arm: `degraded`, naming how many devices are visible another way,
+never `unsupported` (§13's diff-between-kernels rule).
+
+### The web console's pre-auth pool: a reserve you cannot classify into is not a reserve
+
+`WEB-5`'s first remediation split the 128-slot connection pool and took a 32-permit pre-auth semaphore
+**in the accept loop**, before a byte is read. The cookie cannot be known there, so a full pre-auth pool
+refused every new connection *including one carrying a valid session cookie* — the denial got four times
+cheaper, not closed. Measured against the shipped binary with a bootstrap cookie in hand: 16 silent peers
+→ `200 OK`, 31 → `200 OK`, **32 → connection reset**, 40 → reset, on `/app.js` and `/ws` alike; releasing
+the peers restored service. Shortening `HEAD_TIMEOUT` from 15 s to 5 s made the other axis worse too —
+the sustain rate an attacker needs fell from 128/15 s ≈ 8.5 conn/s to 32/5 s ≈ 6.4 conn/s. And because
+the newest connection is the one dropped, the operator — always the newest, with no reconnect in
+`app.js`, so a reload is the only recovery — is the structural victim.
+
+The shipped shape inverts both halves. `MAX_CONNECTIONS = 128` bounds connections that have **passed**
+the token gate; the permit is taken at the gate and the overflow is answered `503`, not queued.
+`MAX_PRE_AUTH_CONNECTIONS = 32` bounds the population before it, **by eviction**: every accepted
+connection joins unconditionally, and going over the cap cancels the *oldest* member's task and closes
+its socket. A silent peer can no longer deny anyone; it can only be the thing that gets evicted. After
+the change, 300 held peers and a sustained ~18 000 conn/s reconnect flood both leave authenticated
+requests served.
+
+**The generalizable half, worth more than the constants:** *a reserve you cannot classify into at
+admission time is not a reserve.* Any bound taken before the credential is readable is taken against the
+operator as well as the attacker, so the only question a pre-auth cap may answer is **how long** an
+unauthenticated peer may sit, never **whether** it may connect — and eviction is the form that answers
+it. Making the operator the newest arrival then makes them the last candidate rather than the first
+victim. A per-peer-IP cap was considered and declined for the same reason: on the loopback default every
+local user shares 127.0.0.1 with the operator. Guards
+`p12_web_session::a_pre_authentication_flood_cannot_deny_an_authenticated_client_a_new_connection`
+(a *new* authenticated connection while the pool is saturated — the property the first guard never
+tested; it asserted the 33rd pre-auth connection was dropped, i.e. it asserted the lockout) and
+`server::tests::the_pre_auth_population_is_a_fraction_of_the_connection_pool`.
+
+### The browser saver's coalescing rule is asymmetric, and had to be said out loud
+
+`HISTC-2`'s fix routed the clear's OPFS delete through `saver.mjs` so it could not be overtaken by a
+snapshot already inside `createWritable()`. The queue it went into had a single `pending` slot assigned
+unconditionally, so the *other* order silently reversed it: proved against the real module, `save(k)` in
+flight → `remove(k)` → `save(k)` produces a write log of `[write, write]` and the delete **never runs**.
+The reachable sequence is narrow but is `HISTC-2`'s own scenario through a smaller window — the debounced
+snapshot of a large buffer is still writing when the operator clicks clear, the delete is queued, and a
+`flushSave` landing before that write finishes (pagehide, visibilitychange, a console switch, the next
+`scheduleSave`) replaces it; if the page then dies before the replacing snapshot drains — and the review
+measured that pagehide's OPFS write does not land — the last committed record is the pre-clear
+scrollback. Clear, walk away, next viewer sees the secret.
+
+The queue now has **two slots, `del` and `pending`, because they are different intents**, and the rule is
+written down where it can be read: a snapshot enqueued *before* a delete is superseded by it — the
+operator asked for the record to be gone — while a snapshot enqueued *after* one does **not** cancel it;
+the delete runs first and the snapshot follows as a new record. Only the first direction had a test; both
+do now. This is the kind of rule that reads like an oversight when found and like an arbitrary asymmetry
+when documented, which is exactly why it belongs in prose beside the code rather than only in a test
+name.
+
+### Two gates that could not report their own defect
+
+**`CONC-3`.** The remediation factored the refused writer-thread spawn into `apply_spawn` and justified
+the absence of an end-to-end guard with "provoking `EAGAIN` from `pthread_create` needs an
+`RLIMIT_NPROC` the harness cannot impose on a daemon it shares a process tree with". That was wrong
+twice over: `RLIMIT_NPROC` is per *process*, `bash -c 'ulimit -u 1; exec serialnexusd …'` applies it to
+the daemon alone and the harness never notices — and the unit guard drove `apply_spawn`, a function the
+fix introduced, so it could not fail against the old inline `.expect`. Both halves are now real:
+`LogNode::create` takes an injected `WriterSpawn` (one production code path, a test-only argument) so the
+unit guard drives the real constructor, and `nexus-itest/tests/p12_log_queue.rs` boots `serialnexusd`
+under `ulimit -u 1` and asks it about the node — old tree: exit 101; new tree: daemon up, node
+`faulted (spawn log writer thread: … os error 11)`. **The retracted justification is retracted in the
+module doc**, not silently deleted, because "this cannot be tested" is a claim a future session will
+otherwise inherit.
+
+**`LEG-3`.** The backoff guard injected an accept returning `std::future::ready(Err(..))` and bounded the
+arm with `tokio::time::timeout(300ms, …)`. Against the unfixed `loop { if let Ok(..) = accept().await {} }`
+there is no yield point and a ready future consumes no tokio coop budget, so the timeout future was never
+polled: the test **hung** instead of failing its ceiling. It stops a green CI and diagnoses nothing. The
+reusable rule: **when bounding a never-returning loop with `timeout`, the injected stub must itself park
+after a cap, or the bound is unreachable.** The stub now stops answering at `ACCEPT_CAP = 40` — one
+constant serving as both the park point and the ceiling the paced loop must stay under — so the unpaced
+loop reaches attempt 41 in microseconds, has to yield, and the assertion prints the count it reached.
+
+### The pty's detach purge is a *purge*, not loss
+
+A counter-semantics change a reader watching `state` will notice: a pty's backlog settled at detach —
+the master's remaining kernel-buffer input **and** the payload the reader was holding in `pending` — is
+charged to §6's per-origin `purged`, not to the node's `discarded_targetward`. The two mean different
+things and only one is a defect: `discarded_targetward` is loss, bytes the endpoint could never take
+because it went away, while these were discarded on purpose at the moment the floor question settled,
+exactly as `handle_last_close`'s purge-on-detach branch already counts a non-holder's backlog. Reporting
+them as `discarded_targetward` would announce a §5 violation that did not happen. **So a reader watching
+a pty's `discarded_targetward` for detach-time backlog will now always see 0**; the number is in the
+origin's `purged`. With no origin to attribute to (a read-only spy edge, or one `disconnect` cleared)
+there is no per-origin counter and the node's own loss counter is the only honest home — §5 forbids the
+silent version either way.
+
+### A fresh console session inherited the previous one's bytes (§7.2 — and it predates all of this)
+
+Found while chasing the `p6_outage` failure below, and the more valuable half of that investigation: a
+**standing product defect**, reproduced on the pre-remediation commit as well, so it is not a regression.
+
+§7.2 promises that on last close the daemon resets the pair "so every client session starts
+deterministic". That sentence has to carry two meanings — how the next session's bytes are *framed*, and
+*which bytes it sees at all* — and only the first shipped. `handle_last_close` re-applied the baseline
+termios with `TCSANOW` and did nothing else; there was no `tcflush` and no drain anywhere in the tree.
+The kernel accepts ~13.8 KiB of master writes for a client that never reads — that is the pts input
+queue's depth here — and **keeps them across that client's last close**, so the next opener receives the
+previous operator's output. The control measurement offers an 8192-byte burst to a session that never
+reads and finds all 8192 waiting for the next opener, delivered in reads of `[4095, 4095, 2]` — the
+`N_TTY_BUF_SIZE - 1` geometry again. A fresh `picocom` opens onto someone else's
+scrollback. The §5 half is the worse half — nothing counted those bytes when they were eventually
+destroyed, so `state` reported `discarded_no_client: 0` on a boundary that had silently shed kilobytes.
+
+**Three `tcflush` variants were tried and rejected before the shipped one**, measured on 7.0 against an
+8 KiB backlog, and the reasons are the durable part:
+
+* **master `TCOFLUSH`** — clears the flip buffers and leaves the line discipline's own read buffer
+  behind. The next opener still read 4095 bytes. Wrong queue.
+* **master `TCIFLUSH`** — the other direction entirely; changed nothing.
+* **slave `TCIFLUSH`** — does clear it, and fails on two counts. It reports *how much* it discarded to
+  nobody, and §5 wants the number; and it leaves a `TIOCPKT_FLUSHREAD` packet readable on the master,
+  which at the next poll is **indistinguishable from a client's own session evidence** — so it would
+  re-arm the §15.36 presence latch it had just cleared, and the last-close handler would re-fire every
+  pass (the 99%-CPU shape `b8d8ed8` records).
+
+What shipped is **reading the slave dry** (`flush_hostward_queue`): it clears the same queue, yields the
+exact count, and leaves the master with nothing readable — the last property asserted directly in the
+unit test, on the master's own `poll_ready`. The open is the momentary-slave-open mechanism §15.30
+already uses off Linux for the baseline termios, used a second time rather than a second mechanism; it
+has to be the slave on both platforms because the master cannot name the whole queue on either. Only the
+*readability* of that fd is a platform arm (`make_drainable`): on Linux the baseline applied through the
+master survives the client's close so the fd is already raw, and a `tcsetattr` there would merely re-arm
+the very `TIOCPKT_IOCTL` packet the flush is careful not to create; on BSD the pair has reset to cooked
+by then and a canonical-mode read returns only complete lines, so a half-written line would survive the
+flush into the next session. `MAX_FLUSH_ROUNDS = 16` bounds the one case that could keep feeding the
+loop — the hostward writer thread finishing the chunk it was mid-write on when presence flipped — so a
+session boundary can never become an unbounded loop on the single runtime thread; each round already
+moves a kernel queue's worth (the whole 8 KiB backlog in round one, 24 µs), so reaching the cap costs
+only the accuracy of the count.
+
+**Why `discarded_at_last_close` is its own field** rather than folded into either neighbour: it is
+neither of the losses they name. `discarded_no_client` is output the daemon had while *nobody held the
+slave* — the presence gate — and these bytes were written for a client that was attached;
+`dropped_slow_consumer` is output the daemon never handed to the kernel at all, shed at its own bounded
+bridge while the session was live and the client could still catch up. These reached the kernel and were
+destroyed by the session *ending*. Folding them into either number would send an operator watching it
+move to the wrong mechanism, and §5 asks for loss that is attributable, not merely non-zero. Guards
+`p12_pty_setup::a_fresh_console_session_does_not_inherit_the_previous_sessions_bytes` (fresh client reads
+the post-attach marker and **no** stale byte; the conservation law
+`discarded_no_client + dropped_slow_consumer + discarded_at_last_close == fanned-out total` doubles as
+its quiescence signal) and the unit control/treatment pair
+`pty::tests::a_sessions_undelivered_output_survives_last_close_and_the_flush_removes_it`, which measures
+the control first so the test is a proof rather than a tautology — and prints a NOTE instead of failing
+on a kernel that already discards the queue itself, since this is precisely the kind of claim that
+differs between 6.18 and 7.0 (§13).
+
+**The residual this work measured and did not fix.** The kernel queue is now emptied at last close; the
+*daemon's* own in-flight hostward queue is not. Chunks already handed to the pty's blocking writer
+(`sync_channel(hostward_buffer)`, default 32 chunks) are discarded-and-counted by `writer_thread` only
+once it observes `present == false`, so a client attaching inside that window can still be handed a
+departed session's bytes. It is bounded by `hostward_buffer` rather than unbounded, and — unlike the
+kernel queue, which was the whole defect — it is **counted** (`discarded_no_client`) as soon as presence
+is observed. Closing it entirely means gating the bridge on a presence epoch rather than on a boolean,
+which is a larger change than the defect that remains justifies today.
+
+### The oracle counted what it was handed, not what it asked for (4095, and `overshoot`)
+
+One full-suite run failed `p6_outage::outage_faults_then_purges_then_recovers_byte_clean` with
+`received: 8190, sent: 4096` — an apparent **doubling**, which is a far narrower clue than "flaky" and
+was chased rather than re-run (§15.36). It was never a doubling. **A pts hands out at most 4095 bytes
+per read** (`N_TTY_BUF_SIZE - 1` — a property of the line discipline, not of anything in this tree, and
+you will meet it again), and `nexus-sim`'s `read_until` looped `while out.len() < n` while appending the
+*whole* of every read, unlike its sibling `recv_loop`, which caps. So `received` was not "how many of the
+bytes I asked for arrived" but "how many bytes happened to be in the reads I did", and **any**
+contaminated stream of this shape renders as 4095 + 4095 = 8190. The clue that looked like duplication
+was an artefact of the oracle's counting rule — §15.36's harness-honesty class arriving a second time, in
+the one component every loss-accounting test reads as ground truth.
+
+`read_until` now caps the append at the budget and returns the surplus as `BudgetRead::overshoot`; the
+`client` and `pty --sink` verdict lines carry `"overshoot"`, and `budget_met` — the one function both
+call sites share, so the rule cannot be re-derived differently — is `bytes.len() == n && overshoot == 0`.
+The surplus is still *read* rather than left in the kernel: capping the read would be cheaper and blind.
+`overshoot` is a **lower bound** by construction — it counts only what arrived in the reads needed to
+fill the budget, never what the peer sends afterwards — so zero means "no surplus was seen", not "no
+surplus exists"; non-zero is proof. With the cap in place the same contamination now reports
+`received: 4096`, a non-zero `overshoot` and a checksum mismatch: a *short* stream (`timed_out`, low
+`received`) and a *long* one (contamination) are finally different verdicts instead of the same number.
+
+### Reconnect releases two backlogs and purges one — by design
+
+The contamination above was not a defect either, and the note exists so a future reader does not "fix"
+it. A leg reconnect releases **two** outage-era backlogs and §6 sanctions only one drain: the
+*targetward* backlog is purged-and-counted (`purged_on_reconnect`), and the *hostward* one — in
+`p6_outage`, step 2's abandoned 64 KiB burst, echoed by the device while the link was down and parked in
+daemon A's `uplink/c0` per-channel queue — crosses the restored link and lands in the console. That is
+specified behaviour (§5, §7.4): purge-on-reconnect is "the one sanctioned *targetward* drain" and
+`leg.rs` gates it on `faces == Facing::Host`. **Do not remove that gate.**
+
+What was wrong was the test, which attached its round-trip client inside the ~20–30 ms window in which
+that flood lands and read the flood as its own echo — ~1 failure in 10 unloaded runs. Step 6a now starts
+step 7 from a known-quiet console, with two independent gates because each covers the other's hole:
+drain the console to quiet (only a *reader* can clear bytes the flood already deposited in the pts
+buffer — no RPC counter can see or clear those), then require the receiving daemon's hostward accounting
+to stop moving (which catches a drain that finished before the flood began arriving). Two things about
+this are worth carrying: it is not a bare sleep and both gates end on an observable (§5), and
+**CPU load *suppressed* the failure** — load widens client-spawn latency past the flood — so a green
+loaded re-run was evidence of nothing. When a flake is suppressed by load rather than caused by it, the
+usual "reproduce it under hogs" instinct is exactly backwards; reproduce it deterministically instead.
+
+---
+
 ## OPUS COMPREHENSIVE CODE REVIEW #3 — `docs/32-claude-opus-code-review.md` (2026-07-27)
 
-**Read the review, not this paragraph, for the findings.** Recorded here so a fresh session knows it
-exists and knows its status: **nothing in it is fixed yet.** The review was taken at `cfb2187` against
-a tree whose full suite is green (485 passed / 0 failed / 4 ignored, re-measured during the review),
-which is its main point — the defects sit exactly where the suite does not look.
+**Read the review for the findings, and the remediation entry above for what is true now.** The review
+file is a frozen record of the review *as delivered* — it still reads "nothing is fixed yet", because it
+was written before the remediation. It was taken at `cfb2187` against a tree whose full suite was green
+(485 passed / 0 failed / 4 ignored, re-measured during the review), which is its main point — the
+defects sat exactly where the suite did not look.
 
 99 candidate findings from 16 lenses (25 finder runs), each handed to an independent verifier that had
 **not** seen the report and was told to refute it, on a tree frozen for the whole pass (§15.34's second
@@ -48,7 +516,8 @@ meta-gate's file-name exemption), and a documentation cluster in the files a new
 Its **§6 lists the 10 refutations and 2 already-knowns** — consult it before re-filing anything from
 this review, exactly as review 26's §6 serves that role. The refutations that exist because the *code*
 is right are additionally written up as **§3.20** below, in the deviations family, so they are findable
-from the same place as §3.1–§3.19.
+from the same place as §3.1–§3.19. Everything *confirmed* is answered id-by-id in
+**`docs/33-review-32-remediation-ledger.md`**.
 
 ---
 
@@ -2307,6 +2776,24 @@ from §14's deferred list, §17's console rail promising node status, and §17's
 grace interval). Those are listed in the review's §2 with an (a)/(b)/(c) classification each; they
 belong in the design, not here.
 
+### 3.21 The pty's blocking writer thread still bypasses `boundary::BlockingReader` (review 32 SIMP-3, partial)
+
+SIMP-3 had two halves and only one was taken. The half that landed is the uncontroversial one the
+finding's own verifier preferred over the finder's suggestion: `PtyNode::drop` now calls
+`self.teardown()` — idempotent, and covering the join and the symlink unlink — instead of re-deriving
+`signal_stop`'s two statements, matching `LogNode::drop`. The half deliberately **not** taken is
+rebasing `PtyNode`'s writer thread onto `boundary::BlockingReader`, which would have meant renaming
+that type (its `lost` counter and its reader-shaped doc are not writer-shaped) and touching `serial.rs`
+mid-remediation for a nit-severity cleanup. So the state of affairs is: `BlockingReader` is used by
+`serial.rs` alone, and `PtyNode` (stop flag + join handle + spawn-with-EAGAIN-fault + join-before-fd-drop)
+and `LogNode` are a second and third hand-rolled variant of the same pattern.
+
+The cost is stated rather than hidden, because it is the cost §16.1 exists to remove: a hardening added
+to `BlockingReader` — its re-arm `debug_assert`, say — reaches one of the three. **This is recorded as a
+deviation rather than as a to-do**, which means a future session may close it, but should close it as
+the §16.1 item it is (rename to something direction-neutral, make the loss counter optional, rebase all
+three, keep `SerialNode::drop`'s join-after-abort ordering) rather than as a local tidy of `pty.rs`.
+
 ---
 
 ## 4. Findings carried forward (from nexus-doctor)
@@ -2693,7 +3180,9 @@ deferred `connect`/`disconnect`/`set-attribute`).
 - **State file (`daemon.rs`/`main.rs`, §11/§15.9).** `Daemon::snapshot_config` writes
   config (TOML, atomic tmp+rename) after every config-mutating verb (dispatch-gated by
   `is_config_mutation`, NOT on read/arbitration traffic). Startup **prefers the state
-  file** over `--config`. Default path is **socket-adjacent** (`<socket>.state.toml`)
+  file** over `--config`. Default path is **socket-adjacent** (`<socket-stem>.state.toml` —
+  the socket's *stem*, so `/run/serialnexusd.sock` yields `/run/serialnexusd.state.toml`,
+  never `serialnexusd.sock.state.toml`; review 32 `RV-6`)
   — session-durable + restart-recovering, and per-daemon-unique so it never leaks
   across test daemons or into `$HOME`; `--state-file` gives reboot durability. Clean
   shutdown (`teardown_all`) does NOT persist an empty graph (preserves it for restart);
