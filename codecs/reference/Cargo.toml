@@ -1,6 +1,6 @@
 [package]
-name = "codec-reference"
-version = "0.2.0"
+name = "serial-nexus-codec-reference"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,12 +11,12 @@ description = "The reference framing codec: the v1 envelope format as a demux/re
 workspace = true
 
 [dependencies]
-codec-api.workspace = true
+serial-nexus-codec-api.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 # The conformance kit (§15.26 / plan §10.4): the reference codec runs the generic
-# suites in its own tests. Also unifies `test-support` into codec-api for the whole
+# suites in its own tests. Also unifies `test-support` into serial-nexus-codec-api for the whole
 # `cargo test --workspace`, so the kit's own self-tests run there too.
-codec-api = { workspace = true, features = ["test-support"] }
+serial-nexus-codec-api = { workspace = true, features = ["test-support"] }

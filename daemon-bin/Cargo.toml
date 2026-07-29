@@ -1,0 +1,29 @@
+[package]
+name = "serial-nexus-daemon-bin"
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The serial_nexus daemon: a thin binary over the serial-nexus-daemon library (§15.26)."
+
+[[bin]]
+name = "serial-nexus-daemon"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+# The built-in codec set is chosen by forwarding features to the library (§8).
+# `codec-reference` is on by default; a minimal build drops it.
+[features]
+default = ["codec-reference"]
+codec-reference = ["serial-nexus-daemon/codec-reference"]
+
+[dependencies]
+# Everything that makes the daemon a daemon lives in the library; the binary only
+# parses flags, installs a tracing subscriber, and calls `run` (§15.26).
+serial-nexus-daemon = { workspace = true }
+clap.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

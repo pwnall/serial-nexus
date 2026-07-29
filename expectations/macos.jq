@@ -1,5 +1,5 @@
 # Per-platform expectation for a best-effort macOS system (design §13, plan §Phase 8):
-#   nexus-doctor --json | jq -e -f expectations/macos.jq
+#   serial-nexus-doctor --json | jq -e -f expectations/macos.jq
 #
 # macOS is explicitly best-effort: PTYs and the poll(2) data plane are plain POSIX
 # and portable, but several Linux-only mechanisms have no macOS equivalent yet (no
@@ -25,7 +25,7 @@
 #     arm applies the baseline termios through the slave, which is exactly the
 #     mechanism P7 measures). Their numbers are the point on this platform too.
 #   - P8 (epoll vs read(2)) is **Linux-only and must be allowed to skip**:
-#     `epoll(7)` does not exist here, `nexus-sys`'s stub answers ENOTSUP, and the
+#     `epoll(7)` does not exist here, `serial-nexus-sys`'s stub answers ENOTSUP, and the
 #     data plane is forbidden from using epoll anyway (invariant 1), so nothing is
 #     untested — only unmeasurable. `unsupported` would be flatly wrong.
 #   - P9 (poll timeout granularity) and P10 (pty buffer depth) are POSIX and

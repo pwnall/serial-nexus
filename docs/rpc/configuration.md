@@ -12,7 +12,7 @@ Methods on this page: [`load`](#load), [`add-node`](#add-node),
 `GraphConfig` and `NodeConfig` are the configuration types shared with `dump`;
 they are exactly the load format. `connect`/`disconnect` take an `EdgeConfig` —
 the same `[[edge]]` table `load` accepts — for the same reason. `dump` round-trips
-them, and `serialnexusctl` renders them as TOML.
+them, and `serial-nexus-ctl` renders them as TOML.
 
 ---
 
@@ -41,8 +41,8 @@ up faulted/waiting and heals on its own (§15.8).
 ### CLI
 
 ```console
-$ serialnexusctl load config.toml            # load onto an empty graph
-$ serialnexusctl load config.toml --replace  # teardown-then-load
+$ serial-nexus-ctl load config.toml            # load onto an empty graph
+$ serial-nexus-ctl load config.toml --replace  # teardown-then-load
 ```
 
 The CLI reads the TOML file, parses it into a `GraphConfig`, and sends it as the
@@ -83,7 +83,7 @@ success. The one deliberately open table is a codec node's `attributes`, which �
 requires to stay opaque. Over the CLI these surface as a TOML parse error naming
 the offending field before anything is sent; over the wire they are `-32602`,
 with the message *invalid config: unknown field `nodez`, expected `node` or
-`edge`*. `serialnexusctl` additionally refuses a file whose text is non-empty but
+`edge`*. `serial-nexus-ctl` additionally refuses a file whose text is non-empty but
 which parses to *no* nodes and no edges — an empty graph is legal over RPC
 (`teardown` persists one), but a file the operator wrote and that yielded nothing
 is a mistake worth naming, not an instruction to empty the graph.
@@ -211,7 +211,7 @@ for other node kinds the result is just `{ "added": <name> }`.
 ### CLI
 
 ```console
-$ serialnexusctl add-node one-node.toml
+$ serial-nexus-ctl add-node one-node.toml
 ```
 
 The file is a TOML configuration containing **exactly one `[[node]]` and no
@@ -222,9 +222,9 @@ to stderr.
 A file carrying more is an **error** — nothing is sent — naming what it found:
 
 ```console
-$ serialnexusctl add-node two-nodes.toml
+$ serial-nexus-ctl add-node two-nodes.toml
 Error: two-nodes.toml: add-node takes a single [[node]] and no [[edge]], but this
-file has 2 node(s) and 1 edge(s) — nothing was added. Use `serialnexusctl load`
+file has 2 node(s) and 1 edge(s) — nothing was added. Use `serial-nexus-ctl load`
 (or `load --replace` over a running graph) for a multi-node configuration, or add
 the nodes one at a time and wire them with `connect`.
 ```
@@ -284,8 +284,8 @@ origin's declared mode is untouched by a removal.
 ### CLI
 
 ```console
-$ serialnexusctl remove-node usb0
-$ serialnexusctl remove-node usb0 --cascade
+$ serial-nexus-ctl remove-node usb0
+$ serial-nexus-ctl remove-node usb0 --cascade
 ```
 
 ### Errors
@@ -357,8 +357,8 @@ promotions, and both the validator and the data plane consult it.
 ### CLI
 
 ```console
-$ serialnexusctl connect usb0 console
-$ serialnexusctl connect usb0 mux --write-mode held
+$ serial-nexus-ctl connect usb0 console
+$ serial-nexus-ctl connect usb0 mux --write-mode held
 ```
 
 ### Errors
@@ -427,7 +427,7 @@ before parking.
 ### CLI
 
 ```console
-$ serialnexusctl disconnect usb0 console
+$ serial-nexus-ctl disconnect usb0 console
 ```
 
 ### Errors
@@ -473,11 +473,11 @@ TOML table names, and an empty one is **omitted**, so an empty graph dumps as
 ### CLI
 
 ```console
-$ serialnexusctl dump              # renders TOML
-$ serialnexusctl --json dump       # raw GraphConfig JSON
+$ serial-nexus-ctl dump              # renders TOML
+$ serial-nexus-ctl --json dump       # raw GraphConfig JSON
 ```
 
-The daemon returns structured JSON; `serialnexusctl dump` renders it as TOML
+The daemon returns structured JSON; `serial-nexus-ctl dump` renders it as TOML
 (the load format), while `--json` passes the JSON through unchanged. Defaults are
 materialized on the way out — a node dumps with every attribute the daemon
 actually applied, not just the ones the operator typed — so the dump is a

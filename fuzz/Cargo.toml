@@ -13,24 +13,24 @@
 # -----------------------------------------------------------------------------
 # Coverage map (review 26, SEC-7: "fuzzing covers only leg-reachable decoders")
 # -----------------------------------------------------------------------------
-# The first four targets all sit on the codec-api layer, i.e. they are reachable
+# The first four targets all sit on the serial-nexus-codec-api layer, i.e. they are reachable
 # only through a configured `leg` or `exec` codec. Everything an ordinary client
 # can reach over the 0600 control socket — with no leg, no peer, no child process
 # — was unfuzzed. SEC-7 named four such parsers; here is where each stands.
 #
-#   1. `nexus-rpc`'s request parser  -> rpc_request_line   ADDED
+#   1. `serial-nexus-rpc`'s request parser  -> rpc_request_line   ADDED
 #      Every byte written to the control socket. The daemon's front door.
-#   2. `nexus-rpc`'s base64          -> rpc_base64         ADDED
+#   2. `serial-nexus-rpc`'s base64          -> rpc_base64         ADDED
 #      Hand-rolled (§13 permissive-only), and `tap.data`'s byte-exactness rests
 #      on it in both directions.
 #   3. the control-socket LINE READER (`RequestLines`) -> control_request_lines  ADDED
 #      The framer every byte hits before any JSON is parsed, and the one place a
 #      hostile client controls both content *and* chunking. Reached through
-#      `nexus_daemon::unstable_fuzz_api` — a module that exists only for this and
+#      `serial_nexus_daemon::unstable_fuzz_api` — a module that exists only for this and
 #      carries no stability promise (§15.26's embeddable surface is unchanged;
 #      implementation-notes §3.19 records the terms).
 #   4. the web server's HTTP head parser -> web_http_head                      ADDED
-#      `serialnexusweb` gained a library beside its binary so the parser is
+#      `serial-nexus-web` gained a library beside its binary so the parser is
 #      reachable; same `unstable_fuzz_api` treatment. This one is the most exposed
 #      parser in the project: §15.29 sanctions binding beyond loopback, and it runs
 #      *before* the token gate. The Origin/Host gate (SEC-3/WEB-7) rides along.
@@ -52,22 +52,22 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-codec-api = { path = "../codec-api" }
-codec-reference = { path = "../codecs/reference" }
-# The leg-free surfaces (SEC-7). `nexus-rpc` is the control socket's stable framing
-# and its dependency-free base64; `nexus-core` owns `GraphConfig` and its structural
+serial-nexus-codec-api = { path = "../codec-api" }
+serial-nexus-codec-reference = { path = "../codecs/reference" }
+# The leg-free surfaces (SEC-7). `serial-nexus-rpc` is the control socket's stable framing
+# and its dependency-free base64; `serial-nexus-core` owns `GraphConfig` and its structural
 # validation. Both are already workspace members, so this adds no third-party
 # dependency and nothing new for `cargo deny` to weigh (§13).
-nexus-rpc = { path = "../nexus-rpc" }
-nexus-core = { path = "../nexus-core" }
+serial-nexus-rpc = { path = "../rpc" }
+serial-nexus-core = { path = "../core" }
 # `load` carries JSON, so the config target parses what the RPC actually delivers.
 serde_json = "1"
 # The two crates whose parsers are only reachable through a deliberately unstable
 # `unstable_fuzz_api` module (SEC-7 items 3 and 4). Both are workspace members, so
 # again nothing new for `cargo deny` (§13). Depending on them here is the reason
 # those modules exist; nothing else may.
-nexus-daemon = { path = "../nexus-daemon" }
-serialnexusweb = { path = "../serialnexusweb" }
+serial-nexus-daemon = { path = "../daemon" }
+serial-nexus-web = { path = "../web" }
 # Both targets drive an `AsyncRead` parser, so they need a runtime to block on.
 tokio = { version = "1", features = ["rt", "io-util", "macros"] }
 

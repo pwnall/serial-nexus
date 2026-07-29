@@ -6,7 +6,7 @@ version = 4
 name = "acme-codec"
 version = "0.1.0"
 dependencies = [
- "codec-api",
+ "serial-nexus-codec-api",
 ]
 
 [[package]]
@@ -16,8 +16,8 @@ dependencies = [
  "acme-codec",
  "anyhow",
  "clap",
- "codec-api",
- "nexus-daemon",
+ "serial-nexus-codec-api",
+ "serial-nexus-daemon",
  "tracing-subscriber",
 ]
 
@@ -149,23 +149,6 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
-
-[[package]]
-name = "codec-api"
-version = "0.2.0"
-dependencies = [
- "bytes",
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "codec-reference"
-version = "0.2.0"
-dependencies = [
- "bytes",
- "codec-api",
-]
 
 [[package]]
 name = "colorchoice"
@@ -356,55 +339,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nexus-core"
-version = "0.2.0"
-dependencies = [
- "bytes",
- "serde",
- "thiserror",
- "toml",
-]
-
-[[package]]
-name = "nexus-daemon"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "bytes",
- "codec-api",
- "codec-reference",
- "futures",
- "libc",
- "nexus-core",
- "nexus-rpc",
- "nexus-sys",
- "nix",
- "serde",
- "serde_json",
- "serial2",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "nexus-rpc"
-version = "0.2.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexus-sys"
-version = "0.2.0"
-dependencies = [
- "libc",
- "nix",
-]
-
-[[package]]
 name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -528,6 +462,72 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "serial-nexus-codec-api"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "serial-nexus-codec-reference"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "serial-nexus-codec-api",
+]
+
+[[package]]
+name = "serial-nexus-core"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "serde",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "serial-nexus-daemon"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "libc",
+ "nix",
+ "serde",
+ "serde_json",
+ "serial-nexus-codec-api",
+ "serial-nexus-codec-reference",
+ "serial-nexus-core",
+ "serial-nexus-rpc",
+ "serial-nexus-sys",
+ "serial2",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "serial-nexus-rpc"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "serial-nexus-sys"
+version = "0.3.0"
+dependencies = [
+ "libc",
+ "nix",
 ]
 
 [[package]]

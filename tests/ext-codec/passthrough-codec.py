@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A 1-channel passthrough exec codec for the crash-containment test (§7.6).
 
-Speaks the shared envelope on stdin/stdout (see codec-api). The multiplexed side
+Speaks the shared envelope on stdin/stdout (see serial-nexus-codec-api). The multiplexed side
 is the reserved empty channel identity; this codec swaps it with one real channel
 (argv[1], default "c0") in both directions, so a device byte stream appears on the
 channel and vice versa — a trivial demux/remux whose correctness is a checksum.

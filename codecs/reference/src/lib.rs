@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 //! The **reference framing codec** (design §7.5, §9): the v1 envelope format
-//! ([`codec_api::encode`] / [`codec_api::try_decode`]) exposed as a
+//! ([`serial_nexus_codec_api::encode`] / [`serial_nexus_codec_api::try_decode`]) exposed as a
 //! [`Codec`]. It does double duty — the first real demux/remux codec *and* the
 //! core of the link codec (§8) — so its on-wire framing is exactly the shared
 //! envelope, with no per-frame magic.
@@ -36,7 +36,7 @@
 //! transport (phase 6) simply never hits the resync path, since TCP does not
 //! corrupt.
 
-use codec_api::{Codec, CodecError, Event, MAX_FRAME_SIZE, encode, try_decode};
+use serial_nexus_codec_api::{Codec, CodecError, Event, MAX_FRAME_SIZE, encode, try_decode};
 
 /// This codec's registry name (§8 match-on-name).
 pub const NAME: &str = "reference";
@@ -145,8 +145,8 @@ impl Codec for ReferenceCodec {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use codec_api::EventKind;
     use proptest::prelude::*;
+    use serial_nexus_codec_api::EventKind;
 
     /// Collect every event `demux` emits for `input`.
     fn demux_all(codec: &mut ReferenceCodec, input: &[u8]) -> Vec<Event> {
@@ -360,14 +360,14 @@ mod tests {
         assert_eq!(codec.buffered(), 0);
     }
 
-    /// The reference codec satisfies the generic `codec-api` conformance kit
+    /// The reference codec satisfies the generic `serial-nexus-codec-api` conformance kit
     /// (§15.26 / plan §10.4) — the same suites an out-of-tree codec runs from the
     /// consumer position. This is the reference implementation exercising the kit
     /// it must be honest against; the bespoke resync/streaming tests above cover
     /// what the generic kit deliberately cannot (exact resync accounting).
     #[test]
     fn satisfies_the_conformance_kit() {
-        use codec_api::test_support as kit;
+        use serial_nexus_codec_api::test_support as kit;
         let channels = ["console", "trace", "ctrl"];
         kit::round_trip_identity(ReferenceCodec::new, &channels);
         kit::fragmentation_tolerance(ReferenceCodec::new, "console");

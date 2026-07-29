@@ -1,11 +1,11 @@
 #![no_main]
-//! Fuzz the wire handshake decoder (`codec_api::try_decode_hello`, §9). Arbitrary
+//! Fuzz the wire handshake decoder (`serial_nexus_codec_api::try_decode_hello`, §9). Arbitrary
 //! bytes must refuse cleanly (bad magic, unsupported version, oversize, truncated,
 //! bad channel id) and never panic. Byte-identity does NOT hold (the decoder ignores
 //! trailing bytes within `body_len` beyond the announced count), so we assert
 //! decode -> encode -> decode STABILITY instead.
 
-use codec_api::{WIRE_VERSION, encode_hello, try_decode_hello};
+use serial_nexus_codec_api::{WIRE_VERSION, encode_hello, try_decode_hello};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

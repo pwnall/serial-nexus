@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>serial_nexus console</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="rail">
+      <h1>serial_nexus</h1>
+      <nav id="views">
+        <button type="button" data-view="console" class="viewbtn active">consoles</button>
+        <button type="button" data-view="graph" class="viewbtn">graph</button>
+        <button type="button" data-view="editor" class="viewbtn">editor</button>
+      </nav>
+      <ul id="consoles"></ul>
+      <div id="conn" class="disconnected">connecting…</div>
+      <!-- Provenance (plan §17.3). A console pane on a screen says nothing about what
+           is serving it; this names the client and the daemon it is actually attached
+           to, filled from `info` on connect so the version is the daemon's own answer
+           rather than a build-time guess baked into the page. -->
+      <div id="provenance">serial-nexus-web</div>
+    </aside>
+    <main id="pane">
+      <header id="pane-head">
+        <span id="pane-title">select a console</span>
+        <span id="pane-lock"></span>
+        <span id="pane-drops"></span>
+        <span id="pane-storage" class="storage"></span>
+        <span id="pane-tools">
+          <button id="exportbtn" type="button" disabled>export</button>
+          <button id="clearbtn" type="button" disabled>clear</button>
+        </span>
+      </header>
+      <pre id="term" tabindex="0"></pre>
+      <form id="sendform">
+        <input id="sendline" type="text" placeholder="send a line…" autocomplete="off" disabled>
+        <button id="sendbtn" type="submit" disabled>send</button>
+      </form>
+      <!-- The graph and editor views (§17, §15.35). One shell, three views: the
+           layout is the contract, and hash routing keeps each bookmarkable
+           without the server growing a router. -->
+      <section id="graphview" hidden></section>
+      <section id="editorview" hidden></section>
+    </main>
+  </div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

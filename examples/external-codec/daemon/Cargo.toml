@@ -9,13 +9,13 @@ publish = false
 name = "acme-daemon"
 path = "src/main.rs"
 
-# A custom daemon links the two open contracts (§15.26): `nexus-daemon` (the entry
-# API — run options, registry, version constants) and `codec-api` (to name the
+# A custom daemon links the two open contracts (§15.26): `serial-nexus-daemon` (the entry
+# API — run options, registry, version constants) and `serial-nexus-codec-api` (to name the
 # `Codec` trait its factory returns), plus its own codec crate. The paths stand in
 # for version pins against a released open core.
 [dependencies]
-nexus-daemon = { path = "../../../nexus-daemon" }
-codec-api = { path = "../../../codec-api" }
+serial-nexus-daemon = { path = "../../../daemon" }
+serial-nexus-codec-api = { path = "../../../codec-api" }
 acme-codec = { path = "../codec" }
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

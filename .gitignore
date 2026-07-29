@@ -6,9 +6,9 @@
 
 # Playwright dev-time dependency tree for the web console UI suite (design §15.37):
 # installed by `npm ci`, never shipped, never vendored into the binary.
-/serialnexusweb/ui-tests/node_modules
-/serialnexusweb/ui-tests/test-results
-/serialnexusweb/ui-tests/playwright-report
+/web/ui-tests/node_modules
+/web/ui-tests/test-results
+/web/ui-tests/playwright-report
 
 # Claude Code. `/.claude/settings.json` IS tracked — it is shared project
 # configuration (the permission allowlist, the enabled plugins). What is excluded

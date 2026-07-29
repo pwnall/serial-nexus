@@ -1,7 +1,7 @@
 # serial_nexus
 
 **serial_nexus** is a permissively-licensed (`MIT OR Apache-2.0`) daemon
-(`serialnexusd`) and control CLI (`serialnexusctl`) that manages serial ports as
+(`serial-nexus-daemon`) and control CLI (`serial-nexus-ctl`) that manages serial ports as
 an explicit, inspectable **graph** of data-routing nodes under a single,
 operator-owned configuration. Embedded serial work looks trivial — open
 `/dev/ttyUSB0`, run a terminal — until the realities collide: one UART carries
@@ -23,10 +23,10 @@ ad-hoc pipelines, shared console access and logging — and all three are
 copyleft. None of them compose demultiplexing, PTY fan-out, per-stream logging,
 re-multiplexing, and cross-machine forwarding under one configuration. The
 stable contract is a JSON-RPC method set over a Unix socket (design §10):
-operators and AI agents drive `serialnexusctl` or speak JSON-RPC directly, and
+operators and AI agents drive `serial-nexus-ctl` or speak JSON-RPC directly, and
 the whole surface is debuggable with `socat` and `jq`.
 
-> **Maturity:** 0.2.0, pre-1.0. Lab-usable on Linux. macOS is best-effort;
+> **Maturity:** 0.3.0, pre-1.0. Lab-usable on Linux. macOS is best-effort;
 > Windows is out of scope. Interfaces may still shift before 1.0.
 
 ## Architecture
@@ -45,7 +45,7 @@ attached edge, and one exclusive write lock arbitrates who may write back.
 | **exec-codec** | The escape hatch: a `codec` node with `codec = "exec"` that runs an external child process speaking a documented envelope protocol on stdin/stdout, so protocol tools under any license can be wrapped without linking (§7.6). |
 | **leg** | Cross-daemon transport: carries every channel multiplexed over one TCP or Unix socket to a peer daemon, loopback-only unless explicitly opted out (§7.4). |
 | **map** | Per-console character map: picocom's `--imap`/`--omap` byte mappings (bare-LF fix, CR-expecting input, hex display) applied once in configuration so every consumer sees the corrected stream; a stateless interior transform, not a codec ([§7.8](docs/rpc/configuration.md#the-map-node--character-mapping-78)). |
-| **existing-terminal** | *(design-specified, §7.7; not yet implemented in 0.2.0)* connects to a pre-existing PTY or tty by path — a QEMU console, a simulator, a mock device. |
+| **existing-terminal** | *(design-specified, §7.7; not yet implemented in 0.3.0)* connects to a pre-existing PTY or tty by path — a QEMU console, a simulator, a mock device. |
 
 ## Five-minute quickstart
 
@@ -54,7 +54,7 @@ required. The daemon's control socket is a Unix socket, whose path is bounded to
 roughly 108 bytes (`SUN_LEN`), so keep `XDG_RUNTIME_DIR` short.
 
 ```sh
-# 1. Build the workspace (daemon, CLI, the nexus-sim test double, nexus-doctor).
+# 1. Build the workspace (daemon, CLI, the serial-nexus-sim test double, serial-nexus-doctor).
 cargo build
 
 # 2. A short runtime dir: the control socket and the state file live here.
@@ -64,11 +64,11 @@ BIN=$PWD/target/debug
 # 3. Stand a fake device where /dev/ttyUSB0 would be — an echoing PTY behind a
 #    stable symlink. --timeout-ms is the sim's *idle* timeout: it exits after that
 #    long with no traffic, and the 5 s default expires long before step 7.
-"$BIN/nexus-sim" pty --echo --link "$XDG_RUNTIME_DIR/device" --timeout-ms 60000 &
+"$BIN/serial-nexus-sim" pty --echo --link "$XDG_RUNTIME_DIR/device" --timeout-ms 60000 &
 
-# 4. Start the daemon. It creates $XDG_RUNTIME_DIR/serialnexusd.sock (mode 0600 —
+# 4. Start the daemon. It creates $XDG_RUNTIME_DIR/serial-nexus-daemon.sock (mode 0600 —
 #    whoever can open the socket owns every console).
-"$BIN/serialnexusd" &
+"$BIN/serial-nexus-daemon" &
 
 # 5. Describe the graph: a serial node on the fake device, a pty node for an
 #    operator console, and one edge wiring them together.
@@ -90,20 +90,20 @@ b = "console"
 EOF
 
 # 6. Load it.
-"$BIN/serialnexusctl" load "$XDG_RUNTIME_DIR/demo.toml"
+"$BIN/serial-nexus-ctl" load "$XDG_RUNTIME_DIR/demo.toml"
 #   -> loaded 2 node(s)
 
-"$BIN/serialnexusctl" state
+"$BIN/serial-nexus-ctl" state
 #   -> usb0             active
 #   -> console          active
 
 # 7. Send a line targetward through the endpoint; the fake device echoes it back,
 #    the serial node reads it hostward, and it fans out to the console PTY.
-"$BIN/serialnexusctl" send usb0 --line "hello"
+"$BIN/serial-nexus-ctl" send usb0 --line "hello"
 #   -> usb0: sent 6 byte(s)
 
 # 8. Tear it all down.
-"$BIN/serialnexusctl" shutdown
+"$BIN/serial-nexus-ctl" shutdown
 ```
 
 To watch the echo arrive on the console instead of trusting the send count,
@@ -111,9 +111,9 @@ attach any terminal to the pty — for example `screen "$XDG_RUNTIME_DIR/console
 — or, without a terminal, let the test double drive the whole round trip itself:
 
 ```sh
-"$BIN/nexus-sim" client --path "$XDG_RUNTIME_DIR/console" --send seeded:64 --expect echo
+"$BIN/serial-nexus-sim" client --path "$XDG_RUNTIME_DIR/console" --send seeded:64 --expect echo
 #   -> {"expect":"echo","mode":"client","pass":true,"received":64,"sent":64,
-#       "sha256_received":"6b612dc8…","sha256_sent":"6b612dc8…","tool":"nexus-sim"}
+#       "sha256_received":"6b612dc8…","sha256_sent":"6b612dc8…","tool":"serial-nexus-sim"}
 ```
 
 The client writes 64 seeded bytes into the console PTY; they travel targetward
@@ -122,7 +122,7 @@ node reads them back hostward and fans them out to the same PTY. `pass` is the
 byte-exact verdict — it is `received == sent && sha256_received == sha256_sent`,
 not a count — and the sim's exit status is 0 only when `pass` is true, so the one
 line is scriptable as-is. Let the client both send and verify: a bare `--drain`
-reader started alongside `serialnexusctl send` races the send and reports only
+reader started alongside `serial-nexus-ctl send` races the send and reports only
 whatever it managed to read before its one-second quiet timer fires — which is
 routinely nothing. A drain that read nothing now *fails* (`pass: false`, exit 1),
 so the race is at least visible; it is still the wrong tool for confirming a
@@ -130,8 +130,8 @@ round trip, because a drain has no expectation to check against.
 
 **Why `arbitration = "free-for-all"`?** Writing is arbitrated per endpoint, and
 the default is `exclusive`: a terminal attached to `console` would have to grab
-the write lock (`serialnexusctl lock console`) before its keystrokes reach the
-device, and release it (`serialnexusctl unlock console`) when done. `free-for-all`
+the write lock (`serial-nexus-ctl lock console`) before its keystrokes reach the
+device, and release it (`serial-nexus-ctl unlock console`) when done. `free-for-all`
 opts that endpoint out of the lock entirely, which is what you want for a single
 console with no contention. (The `send` verb self-acquires the lock either way,
 which is why step 7 works under both policies.)
@@ -140,26 +140,26 @@ which is why step 7 works under both policies.)
 
 ```sh
 cargo build --workspace          # all workspace crates
-cargo test  --workspace          # unit/property tests + the nexus-itest integration harness
+cargo test  --workspace          # unit/property tests + the serial-nexus-itest integration harness
 ```
 
 `cargo test --workspace` is the whole suite: the pure-logic unit/property tests **and**
-the `nexus-itest` end-to-end harness (it boots `serialnexusd`/`nexus-sim`/`serialnexusweb`
+the `serial-nexus-itest` end-to-end harness (it boots `serial-nexus-daemon`/`serial-nexus-sim`/`serial-nexus-web`
 and drives them over the control socket). It runs on Linux and macOS; serial-*device*
 tests self-skip where a pty cannot stand in for a serial port (macOS), and a real
 crossover-rig test runs when two USB-serial adapters are attached.
 
-`nexus-doctor` is the shipping capability report: it probes every kernel
+`serial-nexus-doctor` is the shipping capability report: it probes every kernel
 behavior the design depends on (PTY packet mode, serial ioctls, `by-id`
 resolution) and emits a Markdown report — **attach its output to any bug
 report.** It never touches a real serial port unless you name one with `--port`.
 
 ```sh
-./target/debug/nexus-doctor            # Markdown report on stdout
-./target/debug/nexus-doctor --json     # JSON twin for CI
+./target/debug/serial-nexus-doctor            # Markdown report on stdout
+./target/debug/serial-nexus-doctor --json     # JSON twin for CI
 ```
 
-See [`docs/nexus-doctor.md`](docs/nexus-doctor.md) for the probe reference.
+See [`docs/serial-nexus-doctor.md`](docs/serial-nexus-doctor.md) for the probe reference.
 
 ## Platform support
 
@@ -177,14 +177,14 @@ hardening guidance.
 
 ## Documentation
 
-- [`docs/30-design-claude-fable-v13.md`](docs/30-design-claude-fable-v13.md) — the normative design document (concepts, node types, RPC contract, and the reasoning behind each decision). A `§N` reference anywhere in this repository means this document. Superseded generations live in [`docs/historical/`](docs/historical/) and are **not** normative; this bullet and `AGENTS.md` §9 are the two places that name the current pair by filename, so both must be bumped whenever a generation lands.
-- [`docs/31-implementation-plan-claude-fable-v13.md`](docs/31-implementation-plan-claude-fable-v13.md) — the normative implementation plan (phases and post-1.0 tracks).
+- [`docs/35-design-claude-fable-v14.md`](docs/35-design-claude-fable-v14.md) — the normative design document (concepts, node types, RPC contract, and the reasoning behind each decision). A `§N` reference anywhere in this repository means this document. Superseded generations live in [`docs/historical/`](docs/historical/) and are **not** normative; this bullet and `AGENTS.md` §2 are the two places that name the current pair by filename, so both must be bumped whenever a generation lands.
+- [`docs/36-implementation-plan-claude-fable-v14.md`](docs/36-implementation-plan-claude-fable-v14.md) — the normative implementation plan (phases and post-1.0 tracks).
 - [`docs/rpc/`](docs/rpc/) — the JSON-RPC method reference (the stable contract of §10).
 - [`docs/codec-authors.md`](docs/codec-authors.md) — writing a codec: the trait, the event vocabulary, and the envelope protocol for external (any-language) codecs.
 - [`docs/security.md`](docs/security.md) — threat model and hardening.
 - [`docs/macos.md`](docs/macos.md) — macOS best-effort notes.
-- [`docs/nexus-doctor.md`](docs/nexus-doctor.md) — the capability checker.
-- [`docs/doctor/`](docs/doctor/) — captured `nexus-doctor` reports, one per kernel and rig, and the artifacts behind every cross-kernel claim in the page above.
+- [`docs/serial-nexus-doctor.md`](docs/serial-nexus-doctor.md) — the capability checker.
+- [`docs/doctor/`](docs/doctor/) — captured `serial-nexus-doctor` reports, one per kernel and rig, and the artifacts behind every cross-kernel claim in the page above.
 - [`packaging/`](packaging/) — distribution packaging.
 
 ## License

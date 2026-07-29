@@ -1,0 +1,23 @@
+[package]
+name = "serial-nexus-core"
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Graph model, data-plane contracts, and config/state types for serial_nexus (§3–§5)."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+# The codec node's opaque attribute table (§8) is a `toml::Table` — a config
+# type, so toml is a regular dependency, not test-only.
+toml.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+proptest.workspace = true

@@ -1,15 +1,15 @@
 # serial_nexus control-plane RPC reference
 
-The daemon `serialnexusd` is driven entirely over a Unix domain socket speaking
+The daemon `serial-nexus-daemon` is driven entirely over a Unix domain socket speaking
 hand-rolled **JSON-RPC 2.0 over newline-delimited JSON** (design §10). This
 directory documents that surface method by method.
 
 > **This is the stable contract (§15.16).** The RPC method set and its JSON
-> schemas are what `serialnexusd` guarantees. `serialnexusctl` is a thin
+> schemas are what `serial-nexus-daemon` guarantees. `serial-nexus-ctl` is a thin
 > presentation layer over these methods — its subcommand names, argument
 > spellings, and rendered output may be renamed, regrouped, or composed from
 > several RPCs without any daemon change. Each page below documents the RPC
-> method first and notes the current `serialnexusctl` spelling second.
+> method first and notes the current `serial-nexus-ctl` spelling second.
 
 ## Pages
 
@@ -81,16 +81,16 @@ The socket path is chosen by privilege, and is overridable on both binaries with
 
 | Condition | Default socket path |
 | --- | --- |
-| running as root (euid 0) | `/run/serialnexusd.sock` |
-| `$XDG_RUNTIME_DIR` set and non-empty | `$XDG_RUNTIME_DIR/serialnexusd.sock` |
-| otherwise | `/tmp/serialnexusd-<uid>.sock` |
+| running as root (euid 0) | `/run/serial-nexus-daemon.sock` |
+| `$XDG_RUNTIME_DIR` set and non-empty | `$XDG_RUNTIME_DIR/serial-nexus-daemon.sock` |
+| otherwise | `/tmp/serial-nexus-daemon-<uid>.sock` |
 
-`serialnexusctl` mirrors this policy exactly, so the CLI and a raw client find
+`serial-nexus-ctl` mirrors this policy exactly, so the CLI and a raw client find
 the same socket without configuration.
 
 **Socket permissions are the authorization model** — whoever can open the socket
 owns every console. The daemon creates it mode `0600` (owner only) by default;
-`serialnexusd --socket-group <GROUP>` chgrps it to that group and relaxes the
+`serial-nexus-daemon --socket-group <GROUP>` chgrps it to that group and relaxes the
 mode to `0660`. The stale-socket unlink dance runs at startup, and the socket is
 removed on clean shutdown.
 
@@ -100,7 +100,7 @@ Any newline-delimited client works. With `nc -N -U` (Unix-socket mode, half-clos
 on stdin EOF) and `jq`:
 
 ```console
-$ SOCK="${XDG_RUNTIME_DIR:-/tmp}/serialnexusd.sock"
+$ SOCK="${XDG_RUNTIME_DIR:-/tmp}/serial-nexus-daemon.sock"
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"state"}' | nc -N -U "$SOCK" | jq
 {
   "jsonrpc": "2.0",
@@ -125,14 +125,14 @@ notification lines (feed them to `jq -c` line by line), and `-N` ends it right
 after the acknowledgement. For those, keep the write half open: plain `nc -U`, or
 `socat -,ignoreeof UNIX-CONNECT:$SOCK`.
 
-## `serialnexusctl --json` is a pass-through
+## `serial-nexus-ctl --json` is a pass-through
 
-`serialnexusctl` renders results for humans by default (a table for `state`,
+`serial-nexus-ctl` renders results for humans by default (a table for `state`,
 TOML for `dump`, one-line acknowledgements elsewhere). The global `--json` flag
 prints the daemon's raw `result` value instead, unmodified:
 
 ```console
-$ serialnexusctl --json state
+$ serial-nexus-ctl --json state
 {
   "endpoints": [],
   "nodes": [],
@@ -149,7 +149,7 @@ pass-through of the daemon `result` and is never printed alongside it. Without
 `data` pretty-printed beneath it.
 
 ```console
-$ serialnexusctl --json load bad.toml; echo "exit=$?"
+$ serial-nexus-ctl --json load bad.toml; echo "exit=$?"
 {
   "error": {
     "code": -32002,
@@ -204,7 +204,7 @@ never inside `data.errors`, so a client that wants the raw validator text reads 
 array rather than stripping a string.
 
 Every row above is generated from the same registry the daemon emits from
-(`nexus_rpc::error_code_registry`), and `nexus-rpc`'s own
+(`serial_nexus_rpc::error_code_registry`), and `serial-nexus-rpc`'s own
 `docs_rpc_table_matches_the_registry` test asserts each row appears here **verbatim**
 (§16.8). Editing a description in either place without matching the other is a test
 failure, not a documentation drift — which is the point.

@@ -1,11 +1,11 @@
 #![no_main]
-//! Fuzz the streaming envelope decoder (`codec_api::FrameDecoder`) — the
+//! Fuzz the streaming envelope decoder (`serial_nexus_codec_api::FrameDecoder`) — the
 //! partial-frame reassembly path a single `try_decode` call does not exercise.
 //! Feeding arbitrary bytes in arbitrary chunks must never panic and the drain loop
 //! must always terminate. `FrameDecoder` is the link codec: it never resyncs, so an
 //! `Err` is terminal (a real leg drops the connection); we end the run there.
 
-use codec_api::{FrameDecoder, MAX_FRAME_SIZE};
+use serial_nexus_codec_api::{FrameDecoder, MAX_FRAME_SIZE};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

@@ -1,17 +1,17 @@
 #![forbid(unsafe_code)]
 
-//! `acme-codec` — a trivial out-of-tree codec, standing in for a closed-source
+//! `acme-codec` — a trivial out-of-tree codec, standing in for one maintained
 //! protocol crate (§8/§15.26).
 //!
-//! It depends only on `codec-api` — never on the daemon — so it could live in a
+//! It depends only on `serial-nexus-codec-api` — never on the daemon — so it could live in a
 //! separate repository under a different license and pin the open core by version
 //! tag. This one is a single-channel passthrough: every multiplexed byte is data
 //! on the [`CHANNEL`] channel, and channel data is written straight through. That
 //! is enough to demonstrate the embedding pattern (a real codec would frame N
 //! channels with a device-specific protocol); correctness of a real protocol is
-//! the codec author's job, tested with the `codec-api` conformance kit (§15.26).
+//! the codec author's job, tested with the `serial-nexus-codec-api` conformance kit (§15.26).
 
-use codec_api::{Codec, CodecError, Event, EventKind};
+use serial_nexus_codec_api::{Codec, CodecError, Event, EventKind};
 
 /// The one channel this demo codec exposes. A real mux codec would expose several.
 pub const CHANNEL: &str = "console";
@@ -73,13 +73,13 @@ mod tests {
     }
 }
 
-// A closed-source codec proves conformance from its own tests using the shared
+// An out-of-tree codec proves conformance from its own tests using the shared
 // kit (§15.26 / plan §10.4): `cargo test --features conformance`. The passthrough
 // serves exactly one channel, so the kit is instantiated with just that channel.
 #[cfg(all(test, feature = "conformance"))]
 mod conformance {
     use super::*;
-    use codec_api::test_support as kit;
+    use serial_nexus_codec_api::test_support as kit;
 
     #[test]
     fn acme_conforms_for_its_channel() {

@@ -7,7 +7,7 @@ proves the child actually implements the shared frame format in another language
 which is the point of the any-language envelope contract. Python stdlib only —
 no dependencies, no copyleft.
 
-Envelope layout (all integers big-endian), per codec-api:
+Envelope layout (all integers big-endian), per serial-nexus-codec-api:
     u32 body_len            length of everything after this field
     u8  type                0=data, 1=open, 2=close, 3=error
     u16 channel_id_len

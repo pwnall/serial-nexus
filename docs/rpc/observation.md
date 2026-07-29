@@ -163,8 +163,8 @@ where it happens") makes one family of them meaningful everywhere. Per kind:
 ### CLI
 
 ```console
-$ serialnexusctl state          # one line per node: "<name>  <status> (reason)"
-$ serialnexusctl --json state   # the raw {"endpoints":…,"nodes":…,"taps":…} object
+$ serial-nexus-ctl state          # one line per node: "<name>  <status> (reason)"
+$ serial-nexus-ctl --json state   # the raw {"endpoints":…,"nodes":…,"taps":…} object
 ```
 
 The rendered form prints nodes only; `--json` is the way to reach the timestamp,
@@ -232,7 +232,7 @@ endpoint's write lock appears in the top-level `lock` field, like any single
 host-facing-endpoint node.
 
 ```console
-$ serialnexusctl --json state | jq '.nodes[] | select(.name=="console")'
+$ serial-nexus-ctl --json state | jq '.nodes[] | select(.name=="console")'
 {
   "name": "console",
   "status": "active",
@@ -274,11 +274,11 @@ None.
 ### CLI
 
 ```console
-$ serialnexusctl subscribe             # one JSON notification per line, forever
-$ serialnexusctl subscribe --count 3   # exit after 3 notifications
+$ serial-nexus-ctl subscribe             # one JSON notification per line, forever
+$ serial-nexus-ctl subscribe --count 3   # exit after 3 notifications
 ```
 
-`serialnexusctl subscribe` swallows the acknowledgement and prints one JSON
+`serial-nexus-ctl subscribe` swallows the acknowledgement and prints one JSON
 notification object per line (a clean stream for `jq`), exiting after `--count`
 of them or when the daemon closes the connection.
 
@@ -309,10 +309,10 @@ Report the daemon's **capability surface** (§10, §15.26): its version, the wir
 and envelope protocol versions, and every codec name a configuration may use,
 including the built-in `exec`.
 Tools — and a version-skewed CLI — use it to *discover* what a daemon supports
-rather than assume it, which matters because the daemon is embeddable: a
-closed-source binary built on the `nexus-daemon` library registers its own codecs
-(§15.26), and `info` is how the unchanged `serialnexusctl`, `nexus-sim`, and
-`nexus-doctor` learn that daemon's codec set. The same list appears in an
+rather than assume it, which matters because the daemon is embeddable: an
+out-of-tree binary built on the `serial-nexus-daemon` library registers its own codecs
+(§15.26), and `info` is how the unchanged `serial-nexus-ctl`, `serial-nexus-sim`, and
+`serial-nexus-doctor` learn that daemon's codec set. The same list appears in an
 unknown-codec load error's `data.available` (see
 [configuration.md](configuration.md)), so a misconfiguration names the codecs
 that *would* have worked.
@@ -327,7 +327,7 @@ None.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `daemon_version` | string | the `nexus-daemon` library (engine) version — what determines wire and behavior compatibility |
+| `daemon_version` | string | the `serial-nexus-daemon` library (engine) version — what determines wire and behavior compatibility |
 | `wire_version` | integer | the daemon-to-daemon wire protocol version (§9) |
 | `envelope_version` | integer | the exec-codec envelope version (§8/§15.15) — a codec author pins against this |
 | `codecs` | array of string | every codec name a configuration may legally name, sorted: the registered in-process codecs **plus** the reserved `exec` child-process codec (§7.6), which is always available. `exec` is deliberately not a registry entry — it is a child *process*, routed before the registry is consulted — but that is an implementation fact, and leaving it out of this list made the discovery surface disagree with what a `codec = …` field accepts |
@@ -336,8 +336,8 @@ None.
 ### CLI
 
 ```console
-$ serialnexusctl info          # rendered: version, wire/envelope, codec list
-$ serialnexusctl --json info   # the raw object
+$ serial-nexus-ctl info          # rendered: version, wire/envelope, codec list
+$ serial-nexus-ctl --json info   # the raw object
 ```
 
 ### Errors
@@ -349,7 +349,7 @@ None beyond the transport-level codes.
 ```console
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"info"}' | nc -N -U "$SOCK" | jq .result
 {
-  "daemon_version": "0.2.0",
+  "daemon_version": "0.3.0",
   "wire_version": 1,
   "envelope_version": 1,
   "codecs": ["exec", "reference"],
@@ -428,8 +428,8 @@ loads, and leaves the second faulted on `TIOCEXCL`), `bound_to` names the first.
 ### CLI
 
 ```console
-$ serialnexusctl ports          # rendered: path, free/bound, identity, description
-$ serialnexusctl --json ports   # the raw object
+$ serial-nexus-ctl ports          # rendered: path, free/bound, identity, description
+$ serial-nexus-ctl --json ports   # the raw object
 ```
 
 ### Errors
@@ -631,12 +631,12 @@ that was not there.
 ### CLI
 
 ```console
-$ serialnexusctl tap console            # decoded bytes to stdout until the tap or the connection ends
-$ serialnexusctl tap console --replay   # ring first, then live (exact splice)
-$ serialnexusctl tap console --bytes 4096
+$ serial-nexus-ctl tap console            # decoded bytes to stdout until the tap or the connection ends
+$ serial-nexus-ctl tap console --replay   # ring first, then live (exact splice)
+$ serial-nexus-ctl tap console --bytes 4096
 ```
 
-`serialnexusctl tap` opens the tap, prints the acknowledgement to stderr, and
+`serial-nexus-ctl tap` opens the tap, prints the acknowledgement to stderr, and
 writes the base64-decoded `tap.data` bytes to stdout, exiting after `--bytes` of
 them, on the terminal [`tap.closed`](#tapclosed-notification), or when the
 connection closes. A failed open exits non-zero. A `tap.closed` is reported on

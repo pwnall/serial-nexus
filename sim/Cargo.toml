@@ -1,0 +1,26 @@
+[package]
+name = "serial-nexus-sim"
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Purpose-built test double: PTY/socket doubles that emit machine-readable verdicts (§3)."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+nix = { workspace = true, features = ["term", "fs", "poll", "ioctl"] }
+serial-nexus-sys.workspace = true
+libc.workspace = true
+anyhow.workspace = true
+sha2.workspace = true
+# The `mux`/`envelope` modes (phase 5) produce and verify reference-framed
+# streams and drive external codec children through the golden-vector battery —
+# both speak the shared envelope, so the double links serial-nexus-codec-api directly (§8).
+serial-nexus-codec-api.workspace = true
+bytes.workspace = true

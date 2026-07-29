@@ -1,12 +1,12 @@
 //! The codec conformance kit (§15.26 / plan §10.4).
 //!
 //! Generic suites any [`Codec`] implementation can run in its own crate's tests —
-//! including a *closed-source* one, which is the point: the codec author proves
+//! including an out-of-tree one, which is the point: the codec author proves
 //! conformance from the consumer position without forking serial_nexus. Enable the
 //! `test-support` feature (a dev-dependency) and call these from `#[cfg(test)]`:
 //!
 //! ```ignore
-//! use codec_api::test_support as kit;
+//! use serial_nexus_codec_api::test_support as kit;
 //! #[test]
 //! fn conforms() {
 //!     kit::round_trip_identity(MyCodec::new, &["console", "trace"]);
@@ -288,9 +288,9 @@ pub fn assert_buffer_bounded<C: Codec>(make: impl Fn() -> C, buffered: impl Fn(&
 mod tests {
     use super::*;
 
-    // A genuinely-conformant codec built on codec-api's own envelope — the same
+    // A genuinely-conformant codec built on serial-nexus-codec-api's own envelope — the same
     // framing the reference codec exposes — so the suites are proven to *pass* for
-    // a correct codec, independent of codec-reference (which cannot be a dependency
+    // a correct codec, independent of serial-nexus-codec-reference (which cannot be a dependency
     // here without a cycle).
     #[derive(Default)]
     struct GoodFraming {

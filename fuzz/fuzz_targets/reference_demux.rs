@@ -1,12 +1,12 @@
 #![no_main]
-//! Fuzz the reference codec's demultiplexer (`codec_reference::ReferenceCodec`,
+//! Fuzz the reference codec's demultiplexer (`serial_nexus_codec_reference::ReferenceCodec`,
 //! §7.5) — the length-guided resync path. Arbitrary bytes, fed in arbitrary chunks,
 //! must always RETURN (resync terminates — no infinite loop), never panic, keep the
 //! parser state bounded to one frame (§5), and only ever *increase* the framing-error
 //! counter. `demux` resyncs rather than erroring, so it never hard-fails on garbage.
 
-use codec_api::{Codec, MAX_FRAME_SIZE};
-use codec_reference::ReferenceCodec;
+use serial_nexus_codec_api::{Codec, MAX_FRAME_SIZE};
+use serial_nexus_codec_reference::ReferenceCodec;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

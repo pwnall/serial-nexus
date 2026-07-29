@@ -9,7 +9,7 @@
 //! (§15.13's ethos, matching the daemon's hand-rolled JSON-RPC) rather than a
 //! battle-tested HTTP crate, so it earns its own target.
 //!
-//! Reached through `serialnexusweb::unstable_fuzz_api`, which exists for exactly this
+//! Reached through `serial_nexus_web::unstable_fuzz_api`, which exists for exactly this
 //! and promises nothing (see that module's docs and implementation-notes §3.19).
 //!
 //! Also fuzzed here: `split_authority` and `origin_matches_host`, the pure functions
@@ -18,7 +18,7 @@
 //! reachable with attacker-chosen header values on every request.
 
 use libfuzzer_sys::fuzz_target;
-use serialnexusweb::unstable_fuzz_api::{
+use serial_nexus_web::unstable_fuzz_api::{
     MAX_HEAD, Request, origin_matches_host, read_request, split_authority,
 };
 
@@ -33,7 +33,7 @@ fuzz_target!(|data: &[u8]| {
         // that a network peer can always produce.
         let mut src = data;
         // The `Request` annotation is deliberate rather than inferred: the meta-gate in
-        // `nexus-itest/tests/meta_gates.rs` holds every `unstable_fuzz_api` re-export to
+        // `itest/tests/meta_gates.rs` holds every `unstable_fuzz_api` re-export to
         // having a target that names it, so the API widening stays exactly as large as
         // the fuzzing it was granted for.
         let parsed: Result<Option<Request>, _> = read_request(&mut src).await;

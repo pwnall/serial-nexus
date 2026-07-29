@@ -55,7 +55,7 @@ a flat loss counter.
 ### CLI
 
 ```console
-$ serialnexusctl rotate applog
+$ serial-nexus-ctl rotate applog
 ```
 
 ### Errors

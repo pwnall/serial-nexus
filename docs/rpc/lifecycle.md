@@ -38,7 +38,7 @@ None.
 ### CLI
 
 ```console
-$ serialnexusctl teardown
+$ serial-nexus-ctl teardown
 ```
 
 ### Errors
@@ -89,7 +89,7 @@ None.
 ### CLI
 
 ```console
-$ serialnexusctl shutdown
+$ serial-nexus-ctl shutdown
 ```
 
 ### Errors

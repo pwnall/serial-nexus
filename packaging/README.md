@@ -1,14 +1,14 @@
 # Packaging & deployment
 
-Files for running `serialnexusd` as a system service on Linux. serial_nexus is
-lab-usable on Linux at `0.2.0`, pre-1.0; see [`../docs/macos.md`](../docs/macos.md)
+Files for running `serial-nexus-daemon` as a system service on Linux. serial_nexus is
+lab-usable on Linux at `0.3.0`, pre-1.0; see [`../docs/macos.md`](../docs/macos.md)
 for the best-effort macOS status and [`../docs/security.md`](../docs/security.md)
 for the threat model you accept by exposing the control socket.
 
 | File | Purpose |
 |------|---------|
-| `serialnexusd.service` | systemd unit (dedicated identity, state/runtime dirs, sandboxing) |
-| `serialnexusd.example.toml` | first-boot configuration seed |
+| `serial-nexus-daemon.service` | systemd unit (dedicated identity, state/runtime dirs, sandboxing) |
+| `serial-nexus-daemon.example.toml` | first-boot configuration seed |
 | `99-serial-nexus.rules` | optional udev rules for narrower device access |
 
 ## Install
@@ -16,14 +16,14 @@ for the threat model you accept by exposing the control socket.
 ```sh
 # 1. Build and install the binaries (release build recommended).
 cargo build --release
-sudo install -m0755 target/release/serialnexusd  /usr/local/bin/
-sudo install -m0755 target/release/serialnexusctl /usr/local/bin/
+sudo install -m0755 target/release/serial-nexus-daemon  /usr/local/bin/
+sudo install -m0755 target/release/serial-nexus-ctl /usr/local/bin/
 
 # 2. Seed configuration (edit for your device — capture its identity first, below).
-sudo install -d -m0755 /etc/serialnexusd
-sudo install -m0644 packaging/serialnexusd.example.toml /etc/serialnexusd/config.toml
+sudo install -d -m0755 /etc/serial-nexus-daemon
+sudo install -m0644 packaging/serial-nexus-daemon.example.toml /etc/serial-nexus-daemon/config.toml
 
-# 3. (The default log directory /var/log/serialnexusd is created and chowned to the
+# 3. (The default log directory /var/log/serial-nexus-daemon is created and chowned to the
 #    service automatically by the unit's LogsDirectory= — no manual step needed.)
 
 # 4. (Optional) narrower device access than the whole `dialout` group.
@@ -31,13 +31,13 @@ sudo install -m0644 packaging/99-serial-nexus.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
 
 # 5. Install and start the service.
-sudo install -m0644 packaging/serialnexusd.service /etc/systemd/system/
+sudo install -m0644 packaging/serial-nexus-daemon.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now serialnexusd
+sudo systemctl enable --now serial-nexus-daemon
 ```
 
-`RuntimeDirectory=`/`StateDirectory=` in the unit create `/run/serialnexusd` and
-`/var/lib/serialnexusd` automatically under the service's transient identity — no
+`RuntimeDirectory=`/`StateDirectory=` in the unit create `/run/serial-nexus-daemon` and
+`/var/lib/serial-nexus-daemon` automatically under the service's transient identity — no
 manual `useradd` needed.
 
 ## Capture your device's identity
@@ -48,7 +48,7 @@ identity that would bind each one — it opens nothing, so listing a port never 
 DTR and never resets the board behind it:
 
 ```sh
-serialnexusctl ports
+serial-nexus-ctl ports
 # /dev/ttyUSB0   free   usb:0403:6001:A6008isP:00
 #                       FTDI FT232R USB UART, serial A6008isP, interface 00
 ```
@@ -58,25 +58,25 @@ which echoes back what it resolved so a wrong device answering is noticed:
 
 ```sh
 printf '[[node]]\ntype="serial"\nname="usb0"\ndevice="usb:0403:6001:A6008isP:00"\n' > /tmp/n.toml
-serialnexusctl add-node /tmp/n.toml
+serial-nexus-ctl add-node /tmp/n.toml
 # -> added usb0 — bound: FTDI FT232R, serial A6008isP, interface 0
-serialnexusctl ports                   # the port now reads: bound usb0
+serial-nexus-ctl ports                   # the port now reads: bound usb0
 ```
 
 ## Operating it
 
 ```sh
-serialnexusctl state                 # observed status of every node
-serialnexusctl --json state | jq .   # machine-readable (or speak JSON-RPC directly)
-serialnexusctl ports                 # what is plugged in, and what already binds it
-serialnexusctl send usb0 --line "…"  # atomic acquire-write-release to the device
-serialnexusctl rotate cap            # rotate a log node on demand
-serialnexusctl connect usb0 console  # wire an edge onto the running graph
-serialnexusctl disconnect usb0 cap   # …and take one out, with no outage
-sudo systemctl reload-or-restart serialnexusd   # note: no live reload; restart re-reads state
+serial-nexus-ctl state                 # observed status of every node
+serial-nexus-ctl --json state | jq .   # machine-readable (or speak JSON-RPC directly)
+serial-nexus-ctl ports                 # what is plugged in, and what already binds it
+serial-nexus-ctl send usb0 --line "…"  # atomic acquire-write-release to the device
+serial-nexus-ctl rotate cap            # rotate a log node on demand
+serial-nexus-ctl connect usb0 console  # wire an edge onto the running graph
+serial-nexus-ctl disconnect usb0 cap   # …and take one out, with no outage
+sudo systemctl reload-or-restart serial-nexus-daemon   # note: no live reload; restart re-reads state
 ```
 
-The control socket is `/run/serialnexusd/serialnexusd.sock`, mode `0600` — **whoever
+The control socket is `/run/serial-nexus-daemon/serial-nexus-daemon.sock`, mode `0600` — **whoever
 can open it owns every console** (§10). To let a group of operators drive the daemon,
 create a group, add it to the unit's `SupplementaryGroups=`, and pass
 `--socket-group <group>` (widens the socket to `0660`). Read
@@ -92,12 +92,12 @@ things you will likely edit:
   subsystem. If your adapters enumerate elsewhere (a platform UART `/dev/ttyS*`,
   `/dev/ttyAMA*`, or a different major), add the matching `DeviceAllow=` line, or the
   daemon's serial node will come up `faulted` with a permission error in `state`.
-- **Log directories** — the default `/var/log/serialnexusd` is provisioned by
+- **Log directories** — the default `/var/log/serial-nexus-daemon` is provisioned by
   `LogsDirectory=` (created and chowned to the service each start). For a log node
   pointed *outside* that tree, add its `directory` to `ReadWritePaths=` **and**, under
   `DynamicUser`, pre-`chown` it to the service — `ReadWritePaths` only flips the mount
   to read-write, it does not chown, so a root-owned directory stays unwritable.
-  Simplest is to keep extra logs under a subdirectory of `/var/log/serialnexusd`.
+  Simplest is to keep extra logs under a subdirectory of `/var/log/serial-nexus-daemon`.
 
 - **`RestrictAddressFamilies=`** — drop `AF_INET AF_INET6` if you configure no leg
   nodes (legs are loopback-only, carried over SSH; §7.4/§9).
@@ -121,14 +121,42 @@ greppable footgun — prefer SSH forwarding.
 There is no separate changelog, so the list lives here, where someone installing the
 unit will read it.
 
+**This is `0.3.0`, and the minor bump is the rename.** A patch would have understated it:
+design §15.40 changes the crate names an out-of-tree consumer builds against, which is a
+breaking change to the §15.26 extension surface — taken deliberately at 0.x, where the cost
+is one `Cargo.toml` edit plus an import rename, rather than after that surface has pins on it.
+
+**Everything user-visible was renamed (design §15.40).** Every binary now carries the
+family prefix: the daemon `serialnexusd` is `serial-nexus-daemon`, the CLI
+`serialnexusctl` is `serial-nexus-ctl`, and the web console, capability checker and
+test double follow the same scheme. Reinstall the unit file and re-create the
+configuration directory under the new names shown in the install steps above — the old
+`/etc`, `/run` and `/var/lib` directories are not read.
+
+**Two defaults are still accepted on read, for this release only.** Both are
+daemon-owned paths nobody looks at, which is exactly why a rename is dangerous there:
+
+- a state snapshot at the pre-rename default (`serialnexusd.state.toml`, beside the
+  control socket) is **adopted** at startup, and the next configuration mutation
+  rewrites it under the current name. The old file is left exactly as it was — remove
+  it once the new one appears. Without this, an upgraded daemon would have found no
+  snapshot at the new path and come up with an **empty graph**, silently dropping every
+  node added by `add-node`/`connect` since the last `load`.
+- `serial-nexus-ctl` and `serial-nexus-web`, given no `--socket`, fall back to a
+  `serialnexusd.sock` left by a still-running pre-upgrade daemon — but only when no
+  current-name socket exists, so a live daemon is never passed over for a stale inode.
+
+Nothing writes the old spelling again, and both fallbacks are deleted in the next
+release: finish the migration now rather than relying on them.
+
 **New in this build (design §15.35).** Three additions, none of which breaks an
 existing configuration:
 
-- **`serialnexusctl ports`** lists the serial devices on the machine, the identity
+- **`serial-nexus-ctl ports`** lists the serial devices on the machine, the identity
   that would bind each one, and which node already holds it. It is strictly passive —
   by-id/by-path readlinks and sysfs, never `open(2)` — so listing a port cannot reset
   the board behind it.
-- **`serialnexusctl connect` / `disconnect`** reshape a running graph one edge at a
+- **`serial-nexus-ctl connect` / `disconnect`** reshape a running graph one edge at a
   time, under the same structural validation `load` performs. Rewiring no longer needs
   a `load --replace` outage; disconnecting a writer that holds the write lock releases
   it and purges its un-flushed bytes rather than leaving the endpoint wedged.
@@ -145,7 +173,7 @@ configuration validation and changed a few operator-visible behaviours.
 **Configurations that used to load and now do not.** Each is refused *structurally*,
 before anything is created — so under `load --replace` a bad file can no longer
 destroy the running graph, which is the point of the change (§11). Run
-`serialnexusctl load <file>` against a scratch daemon before rolling one out.
+`serial-nexus-ctl load <file>` against a scratch daemon before rolling one out.
 
 - **Unknown keys and unknown tables are rejected.** `advertized_baud = 9600` used to
   be accepted and silently ignored; a misspelled `[[nodez]]` table used to parse to an
@@ -172,7 +200,7 @@ destroy the running graph, which is the point of the change (§11). Run
   every control byte below 0x20 except TAB/LF/CR — where it previously matched SPACE.
   A configuration using `spchex` produces different output; the old behaviour is
   approximately `nrmhex` restricted to SPACE, and was never what the design specified.
-- **`serialnexusctl add-node` errors** on a file carrying more than one `[[node]]` or
+- **`serial-nexus-ctl add-node` errors** on a file carrying more than one `[[node]]` or
   any `[[edge]]`, instead of silently adding the first node and discarding the rest.
 - **`--json` prints errors as JSON** (`{"error": {...}}` on stdout, non-zero exit)
   rather than only as human text on stderr.

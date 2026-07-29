@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! `codec-api` — the codec trait, per-channel event vocabulary, and the
+//! `serial-nexus-codec-api` — the codec trait, per-channel event vocabulary, and the
 //! envelope frame types (design §8, §9, §15.11, §15.15).
 //!
 //! A **codec** is a multi-channel framing transform: it converts between one
@@ -145,7 +145,7 @@ pub enum CodecError {
 /// may hold a partial frame (bounded by its frame size) and nothing else.
 ///
 /// The reference framing codec and the exec codec implement this in phase 5;
-/// codec-api defines only the contract.
+/// serial-nexus-codec-api defines only the contract.
 pub trait Codec {
     /// The codec's registry name (the compiled-in match-on-name of §8).
     fn name(&self) -> &str;

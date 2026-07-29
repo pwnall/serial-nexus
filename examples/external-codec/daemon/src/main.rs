@@ -1,21 +1,21 @@
 #![forbid(unsafe_code)]
 
-//! `acme-daemon` — a custom serial_nexus daemon, standing in for a closed-source
+//! `acme-daemon` — a custom serial_nexus daemon, standing in for one maintained
 //! deployment (§15.26).
 //!
-//! It is the in-tree `serialnexusd` plus **one line**: registering the `acme`
-//! codec before calling [`nexus_daemon::run`]. Everything else in the ecosystem —
-//! `serialnexusctl`, `nexus-sim`, `nexus-doctor`, the validation scripts — works
+//! It is the in-tree `serial-nexus-daemon` plus **one line**: registering the `acme`
+//! codec before calling [`serial_nexus_daemon::run`]. Everything else in the ecosystem —
+//! `serial-nexus-ctl`, `serial-nexus-sim`, `serial-nexus-doctor`, the validation scripts — works
 //! against this binary unchanged, because they speak the RPC surface and the
 //! envelope, never the codec list (§15.16). The daemon's internals stay private;
-//! this consumer only touches the two semver'd contracts (`nexus-daemon` and
-//! `codec-api`), so it keeps compiling across daemon refactors.
+//! this consumer only touches the two semver'd contracts (`serial-nexus-daemon` and
+//! `serial-nexus-codec-api`), so it keeps compiling across daemon refactors.
 
 use std::path::PathBuf;
 
 use clap::Parser;
-use codec_api::Codec;
-use nexus_daemon::{Registry, RunOptions};
+use serial_nexus_codec_api::Codec;
+use serial_nexus_daemon::{Registry, RunOptions};
 
 #[derive(Parser)]
 #[command(name = "acme-daemon", about = "a custom serial_nexus daemon (§15.26)")]
@@ -38,7 +38,7 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // The one line a closed-source daemon adds: its own codec, registered by name.
+    // The one line an out-of-tree daemon adds: its own codec, registered by name.
     // A name collision with a built-in (or a reserved name) is a startup error, so
     // this `?` refuses before the daemon ever serves traffic (§8/§15.26).
     let registry = Registry::with_builtins().register("acme", |_attributes| {
@@ -52,5 +52,5 @@ fn main() -> anyhow::Result<()> {
         dev_root: cli.dev_root,
         ..Default::default()
     };
-    nexus_daemon::run(options, registry)
+    serial_nexus_daemon::run(options, registry)
 }

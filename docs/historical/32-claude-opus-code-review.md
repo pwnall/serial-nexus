@@ -1258,7 +1258,7 @@ Invariant 13 and 11 require every numeric attribute to carry a stated maximum an
 
 ### `SIM-1` — `nexus-sim exec-conformance` deadlocks with no verdict against a codec that does not drain its stdin
 
-**🔵 low** · reliability · `nexus-sim/src/main.rs:1651` · design nexus-sim module doc ("prints a single JSON verdict line on exit"); §15.26 / plan §10.5 — "the closed-repo CI entry point for an exec codec"; §15.36 doubles doctrine · verdict **CONFIRMED** (high confidence)
+**🔵 low** · reliability · `nexus-sim/src/main.rs:1651` · design nexus-sim module doc ("prints a single JSON verdict line on exit"); §15.26 / plan §10.5 — "the CI entry point for an out-of-tree exec codec"; §15.36 doubles doctrine · verdict **CONFIRMED** (high confidence)
 
 `check_fragmentation` pushes a near-`MAX_FRAME_SIZE` frame (~65 419 bytes) into the child's stdin with unbounded blocking `write_all` (`ExecChild::write_raw`, line 1508-1516). A 64 KiB pipe accepts only ~65 184 bytes when written in 97-byte pieces, so a child that does not read stdin blocks the harness in `anon_pipe_write` permanently. No timeout guards the write, so `nexus-sim` never prints a verdict line and never exits.
 

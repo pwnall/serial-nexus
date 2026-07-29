@@ -43,9 +43,9 @@ one.
 
 **Socket path.** Chosen by privilege, overridable with `--socket`:
 
-- running as root: `/run/serialnexusd.sock`
-- otherwise: `$XDG_RUNTIME_DIR/serialnexusd.sock`
-  (and, with no `XDG_RUNTIME_DIR`, `/tmp/serialnexusd-<uid>.sock`)
+- running as root: `/run/serial-nexus-daemon.sock`
+- otherwise: `$XDG_RUNTIME_DIR/serial-nexus-daemon.sock`
+  (and, with no `XDG_RUNTIME_DIR`, `/tmp/serial-nexus-daemon-<uid>.sock`)
 
 **Socket mode.** Owner-only by default; group-widened on request:
 
@@ -55,11 +55,11 @@ one.
   group is offered.
 
 ```sh
-# Owner-only (default): only the user running serialnexusd can drive it.
-serialnexusd
+# Owner-only (default): only the user running serial-nexus-daemon can drive it.
+serial-nexus-daemon
 
 # Let a trusted operator group in, and nobody else.
-serialnexusd --socket-group consoleops
+serial-nexus-daemon --socket-group consoleops
 ```
 
 Because a serial console is so often a root shell or a bootloader prompt, opening
@@ -102,7 +102,7 @@ daemon is holding, in memory, the last 64 KiB each console emitted, whether or
 not anyone was watching.
 
 The access-control consequence is one sentence: **anyone who can open the control
-socket can replay it.** `tap.open` with `replay: true` (`serialnexusctl tap
+socket can replay it.** `tap.open` with `replay: true` (`serial-nexus-ctl tap
 <endpoint> --replay`) hands back the endpoint's ring snapshot and then the live
 stream, and a tap needs nothing but a connection — so the bytes a root shell
 printed *before* an operator connected are as reachable as the bytes it prints
@@ -126,7 +126,7 @@ Three things bound it, and they are worth knowing before deciding it is fine:
   relying on nobody thinking to ask for a replay.
 
 The browser's own history is a separate, larger exposure with a separate answer:
-`serialnexusweb` persists per-console scrollback in the browser's Origin Private
+`serial-nexus-web` persists per-console scrollback in the browser's Origin Private
 File System (default cap 16 MiB per console), **unencrypted in the browser
 profile**. On a shared machine — and doubly under the insecure bind tier —
 clearing site data is part of walking away (§15.32).
@@ -198,7 +198,7 @@ channels = ["console"]
 ```
 
 Without `insecure_bind = true`, a non-loopback TCP address fails validation with a
-`NonLoopbackBind` error (`nexus-core/src/config.rs`), and the load creates nothing
+`NonLoopbackBind` error (`core/src/config.rs`), and the load creates nothing
 (§11). The flag is named to be greppable and impossible to set by accident: **a
 named footgun beats the patched binary someone would otherwise ship.** The point
 is not to make remote exposure impossible — it is to make it a recorded, auditable
@@ -207,7 +207,7 @@ configs, rather than a silent default someone quietly forked the code to obtain.
 
 ## The web console: three request gates, a bounded pre-auth path, three bind tiers
 
-`serialnexusweb` (§17) is a **separate process** — a pure client of the daemon's
+`serial-nexus-web` (§17) is a **separate process** — a pure client of the daemon's
 control socket on one side, and an HTTP + WebSocket server for a browser on the
 other. The daemon does not link it, serve it, or know it exists; the web server is
 "simply a client that holds the socket, and whoever holds the token holds exactly
@@ -240,7 +240,7 @@ answer three *different* questions — none substitutes for another (§15.29):
   the same name — RFC 6265 §5.4 orders the longer path first, and a
   first-value-wins reader saw only the plant: the assets (path `/`) still returned
   `200` while `/ws` got `401`, a console that renders normally and never connects.
-  A headless client (`serialnexusweb wsclient`, `curl`) may instead present the
+  A headless client (`serial-nexus-web wsclient`, `curl`) may instead present the
   unscoped name `nexus_session`: it is handed a token rather than a cookie jar and
   cannot know the bound port, which under the SSH forwarding §17 sanctions is not
   even the port in its own URL.
@@ -255,7 +255,7 @@ answer three *different* questions — none substitutes for another (§15.29):
   request's own already-validated Host, so SSH-forwarded ports still agree) or the
   request gets `403`; an *absent* one is accepted, because Host is mandatory in
   HTTP/1.1 and `Origin` is not — browsers always send it on a WS handshake and on
-  cross-origin fetches, while non-browser clients (`serialnexusweb wsclient`,
+  cross-origin fetches, while non-browser clients (`serial-nexus-web wsclient`,
   `curl`) never do, and refusing them would break the §17 headless client.
 
 **Residual: the session cookie is readable by any same-host service the operator's
@@ -383,7 +383,7 @@ verbs. That is a real widening and it deserves a plain statement rather than an
 implication:
 
 > A log node writes files, and an exec codec runs a command — both as the user
-> `serialnexusd` runs as. Whoever holds the web token can therefore create a node
+> `serial-nexus-daemon` runs as. Whoever holds the web token can therefore create a node
 > that writes a file anywhere that user can write, and a node that executes an
 > arbitrary command line as that user. Treat the token as equivalent to shell
 > access for that account, and run the daemon under a dedicated, unprivileged user
@@ -417,7 +417,7 @@ therefore run a command as the daemon's user, which subsumes stopping the daemon
 rewriting its configuration on disk. The lifecycle verbs stay off the wire because
 they are not what the operator asked for, not because withholding them constrains an
 attacker who already holds the token. **The token is the boundary.** Treat it as
-shell access for the account `serialnexusd` runs as; the checklist below is how you
+shell access for the account `serial-nexus-daemon` runs as; the checklist below is how you
 make that account small.
 
 Two properties make that screen binding rather than decorative, both settled by a
@@ -451,14 +451,14 @@ envelope protocol on stdin/stdout. Stated plainly, as the design states it:
 There is no sandbox around the exec child in v1. Its argv executes with the
 daemon's full privileges and file access — so a codec command line is code you are
 choosing to run as the daemon. Vet exec-codec argv and environment with the same
-care you would vet anything launched by the account `serialnexusd` runs as, and
+care you would vet anything launched by the account `serial-nexus-daemon` runs as, and
 prefer running the daemon under a dedicated, unprivileged user (see the checklist
 below) so "the daemon's user" is as small a blast radius as possible.
 
 ## What v1 deliberately does not do
 
 - **No in-daemon cryptography.** There is no TLS, no wire encryption, and no
-  in-protocol authentication inside `serialnexusd`. In-daemon TLS and non-loopback
+  in-protocol authentication inside `serial-nexus-daemon`. In-daemon TLS and non-loopback
   legs are recorded as deferred work (§14). Confidentiality and authentication
   between machines are SSH's job, per above; on a single host, the socket's file
   permissions are the boundary.
@@ -474,7 +474,7 @@ below) so "the daemon's user" is as small a blast radius as possible.
 
 The controls above are the design's guarantees; these are the deployment steps
 that make them tight in practice. The reference systemd unit lives at
-`packaging/serialnexusd.service` — install and adapt it rather than running the
+`packaging/serial-nexus-daemon.service` — install and adapt it rather than running the
 daemon by hand.
 
 1. **Run as a dedicated, unprivileged user.** Do not run the daemon as root unless
@@ -482,14 +482,14 @@ daemon by hand.
    user" — and therefore an exec-codec child (§7.6) — can touch. `DynamicUser=yes`
    gives a transient one for free.
 2. **Confine the socket's directory.** Point `--socket` at a per-service runtime
-   directory the daemon owns exclusively (`RuntimeDirectory=serialnexusd`,
+   directory the daemon owns exclusively (`RuntimeDirectory=serial-nexus-daemon`,
    `RuntimeDirectoryMode=0700`). The `0700` parent bounds the brief post-`bind`
    window before the daemon narrows the socket itself to `0600` (§10). A system
    service has no `XDG_RUNTIME_DIR`, so set `--socket` explicitly.
 3. **Give state a reboot-durable home.** The default state snapshot sits beside the
    socket under `/run`, which is cleared on reboot (§11). For persistence across
-   reboots, pass `--state-file /var/lib/serialnexusd/state.toml` and provision it
-   with `StateDirectory=serialnexusd` (`StateDirectoryMode=0700`).
+   reboots, pass `--state-file /var/lib/serial-nexus-daemon/state.toml` and provision it
+   with `StateDirectory=serial-nexus-daemon` (`StateDirectoryMode=0700`).
 4. **Widen socket access by group, never wider.** Keep the `0600` default unless a
    second operator truly needs in; then use `--socket-group <grp>` and add only the
    people who should hold console-root-equivalent to that group.
@@ -504,7 +504,7 @@ daemon by hand.
      GROUP="plugdev", MODE="0660"
    ```
 
-   `nexus-doctor`'s environment checks (probe P3) verify device permissions and
+   `serial-nexus-doctor`'s environment checks (probe P3) verify device permissions and
    group membership and tell you exactly what is missing — run it first when a
    node comes up faulted on a permission error.
 6. **Sandbox the service.** The unit applies the standard systemd confinement:
@@ -515,10 +515,10 @@ daemon by hand.
    `char-pts`) the daemon needs to allocate PTY nodes — `PrivateDevices` stays off
    precisely so those remain reachable.
 
-The complete, maintained unit is [`packaging/serialnexusd.service`](../packaging/serialnexusd.service)
+The complete, maintained unit is [`packaging/serial-nexus-daemon.service`](../packaging/serial-nexus-daemon.service)
 — install and adapt it rather than copying a snippet here. It applies exactly the
 controls above, and two details worth knowing: the default log directory is
-provisioned with `LogsDirectory=serialnexusd` (systemd creates *and* chowns it to the
+provisioned with `LogsDirectory=serial-nexus-daemon` (systemd creates *and* chowns it to the
 transient user — a bare `ReadWritePaths` would flip the mount without chowning and the
 log node would fault on `EACCES`), and the `/dev/ptmx` + `char-pts` device rules are
 required or PTY nodes cannot allocate their pairs. See

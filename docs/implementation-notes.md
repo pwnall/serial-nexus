@@ -1,16 +1,99 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-28 (**phases 0-8 + simplification + extension + web-console + v10 + v11
-console-map + review-26 remediation + v12 graph-editing tracks done**, plus the
-**v13 browser-UI automation track** — a pinned Playwright suite in real headless
-Chromium, gated from `nexus-itest`, design §15.37/§15.38, plan §15. The web console's
-browser half is now **CI-verified** rather than checklist-verified: the OPFS splice, the
-`tap.closed` re-anchor and the editor flows are asserted where they run.)
+**As of:** 2026-07-29 (**phases 0-8 + simplification + extension + web-console + v10 + v11
+console-map + review-26 remediation + v12 graph-editing + v13 browser-UI automation +
+review-32 remediation tracks done**, plus the **v14 rename track** — every binary, crate
+and default path moved to the `serial-nexus-*` / `serial_nexus_*` family, design §15.40,
+plan §17, with the consumer-context scrub of §15.41 beside it.)
 **Branch:** `implementation` (off `main`).
-**Normative docs are now v13:** `docs/30-design-claude-fable-v13.md` (design) and
-`docs/31-implementation-plan-claude-fable-v13.md` (plan). v1–v12 docs, the review and its
-remediation ledger are in `docs/historical/`. Section references (§) point at the v13
+**Normative docs are now v14:** `docs/35-design-claude-fable-v14.md` (design) and
+`docs/36-implementation-plan-claude-fable-v14.md` (plan). v1–v13 docs, the reviews and their
+remediation ledgers are in `docs/historical/`. Section references (§) point at the v14
 design.
+
+---
+
+## THE RENAME TRACK — one name for the family, and the two documents it had to correct (2026-07-29 session)
+
+Plan §17 executed in full: design §15.40's family rename and §15.41's context scrub. What is worth
+carrying forward is not the mechanics — a rename is a rename — but the four things that made it not
+one.
+
+**The tree arrived red, and the gates were right.** `HEAD` had two failing meta-gates before a line
+was touched: the design revision moved the v13 pair into `docs/historical/` and left README's index
+and AGENTS.md pointing at it. `entry_point_doc_links_resolve` and
+`entry_point_design_and_plan_names_resolve` are exactly the gates §9's monotonic versioning demands,
+and they fired on exactly the failure they were written for — the fourth generation running.
+AGENTS.md §1 additionally said the normative pair was "named in §2" while §2 named nothing, so the
+gate's non-vacuity floor had nothing to count. Both are fixed, and the second gate no longer *spells*
+the current design: it discovers a generation doc under `docs/` instead, because a literal there was
+a third hand-maintained copy of the name and went stale on the same bump the gate exists to catch.
+
+**Two find-and-replace artifacts sat in the normative design.** §15.41's earlier scrub had rewritten
+`downstream` → `out-of-tree` inside §3's terminology note — the very use §15.41 names as a legitimate
+survivor of the data-flow sense — and had mangled "all reported `Active`" into "all out-of-tree
+repositoryrted `Active`" by rewriting the bare substring `repo` wherever it appeared, including
+inside an ordinary English word. The historical generations carry the earlier stage of the same
+corruption, which is how the chain was identified: a first pass had already broken that word, and the
+v14 scrub then rewrote the breakage. Both are corrected; the lesson is the one this session then had
+to learn again for itself.
+
+**A blanket textual rename conflates registers, and the compiler will not tell you.** The same token
+is a *directory*, a *Cargo package*, a *lib crate*, a *binary*, a *Cargo feature*, or prose, and the
+right replacement differs in each. Two concrete instances. First, an ordered list of replacements is
+not a rename: the rule converting the old compound daemon name produced a string the *next* rule
+matched again, doubling every name that was already correct in the v14 documents — fixed by a
+single-pass matcher whose every rule carries a "not already converted" lookbehind. Second,
+`unsafe_is_confined_to_serial_nexus_sys` went red because the prefix it tests is a *filesystem* path
+and the directory is `sys/`, while the blanket pass had rewritten it as a crate name. Plan §17.1's
+"with directories unchanged" clause was amended for the same reason — see §3.22.
+
+**The gate found its own hole on its first run.** `retired_names_appear_only_where_history_lives`
+and `consumer_context_terms_appear_only_where_the_ban_is_stated` are both plant-the-violation gates
+per review 32 item 7. The context gate's first matcher required a word boundary *after* the token,
+which silently exempted every inflected form — the plural, the `-ory`/`-ories` endings, the
+past-participle spelling — and it knew only the spaced version of one term while a hyphenated one sat
+in `--help` output at the time. Folding hyphens to spaces and dropping the trailing boundary surfaced
+eleven further sites. A scanning gate's *matcher* needs the same adversarial treatment its walker
+gets: both this session's gates plant a violation and prove the detector fires, but only the walker
+half of that was thought about first.
+
+**One residual lead, recorded rather than closed.** On one full-suite run (of five this session)
+the browser gate's `adding a console through the editor makes bytes flow end to end` spec failed
+after 20.4 s on a box at load 0.29 — and reported the wrong thing: its `finally` ran
+`remove-node --cascade`, that threw, and JavaScript replaced the in-flight exception with the
+teardown's, so the failure named the one step that was working. The elapsed time says the real
+failure was the 15 s poll waiting for the editor-built log node to receive the token, but that is
+inference, not evidence, because the evidence was destroyed. The masking is fixed — the cleanup now
+reports and lets the body's error through — and the spec has since passed 3/3 in isolation and 1/1
+in a full run. **Not diagnosed, not called fixed:** the next occurrence will name its own cause,
+which is the only thing this session can honestly claim about it (AGENTS.md §9). The general lesson
+is worth more than the instance: a `finally` that can throw is a diagnosis destroyed, and this suite
+now has two shared-fixture ordering scars in the same file.
+
+**The version went 0.2.0 → 0.3.0.** A minor bump, not a patch: §15.40 changes the crate names
+an out-of-tree consumer builds against, and §15.26 calls that surface semver'd. Nothing here is
+published, so no real pin breaks — but the number is what a consumer reads before the changelog,
+and understating a rename of the thing they import would be the wrong first impression to give.
+The twelve workspace manifests, `README`'s maturity line, `packaging/README.md`, the `info`
+example in `docs/rpc/observation.md` and both normative documents' status lines moved together;
+the captured `docs/doctor/` artifacts kept `0.2.0`, because that is the binary that produced them.
+
+**The design shipped two sections numbered 15.39.** The session-boundary ADR landed first
+(`85699d6`), and the v14 revision then drafted the rename and the context scrub as 15.39 and
+15.40 — so every "design §15.39" citation in the tree was ambiguous, across shipped probe code,
+both `expectations/*.jq` files, `docs/macos.md` and the doctor reference. The collision was
+resolved *against* the newer pair — rename is now **§15.40**, context scrub **§15.41** — for one
+reason that admits no argument: the committed `docs/doctor/` artifacts cite `§15.39` for the
+session-boundary edge, and §16.13 forbids editing captured tool output, so renumbering that entry
+would leave immutable evidence pointing at the wrong section forever. Everything written against
+the drafts (AGENTS.md, plan §17, this file, the new gates) moved with it. Worth knowing for next
+time: a new §15 entry's number is only free if nothing already shipped with it.
+
+**And the gates then fired on the notes describing them**, twice — this entry and plan §17 both
+started out spelling the banned tokens in order to explain them. That is not a false positive: a
+document that reproduces the vocabulary is a document that reintroduces it, which is why the rule
+statements carry exact-count allowances and everything else describes the tokens instead.
 
 ---
 
@@ -22,7 +105,7 @@ commit, probe-set fingerprint and date, so committing it records provenance rath
 it." **The owner ran it — with the HEAD binary and the cross-wired pair, though not `--json`**
 (`85699d66c5a5`, generated 2026-07-29T00:15:16Z, Tier-3 rig,
 **21 supported · 0 degraded · 0 unsupported · 1 skipped**). The numbers and the gap-by-gap
-disposition live in `docs/nexus-doctor.md`; this entry records what the exercise settled, what it
+disposition live in `docs/serial-nexus-doctor.md`; this entry records what the exercise settled, what it
 cost in corrections, and the three things about it a future session will get wrong.
 
 **Verdict: no daemon change, again.** Not a shipped constant, comment, test premise or design claim
@@ -70,7 +153,7 @@ lives — and note that **attaching the rig is not sufficient**: on Linux `cross
 `SNX_CROSSOVER_A`/`_B` and has no auto-detect arm (that is `#[cfg(target_os = "macos")]`), so the
 rig-gated tests still self-skip on the upgraded box until those are exported.
 (2) **The probe-set fingerprint digests `(id, question)`, not `(id, title, question)`**, as
-`AGENTS.md` and `docs/nexus-doctor.md` both claimed. The exclusion is load-bearing and the docs had
+`AGENTS.md` and `docs/serial-nexus-doctor.md` both claimed. The exclusion is load-bearing and the docs had
 inverted its reason: P3's *title* embeds the device path and P3 is emitted once per `--port`, so
 folding it in would make a two-port 6.18 run and a zero-port 7.0 run of one binary report themselves
 incomparable — over exactly the diff the field underwrites.
@@ -117,7 +200,7 @@ rig-gated `a_break_straddled_by_a_replace_leaves_the_line_transmitting`, the inv
 guard a pts structurally cannot run.
 
 **Why this had never happened.** CI's macOS lane runs `cargo test --workspace`, and *cargo
-test fail-fasts per crate*. One `nexus-daemon` unit test had been failing there, so the lane
+test fail-fasts per crate*. One `serial-nexus-daemon` unit test had been failing there, so the lane
 stopped before the integration harness every time: red on six consecutive pushes, always
 reported as the same single failure, with **three more sitting behind it that nobody had
 seen**. `--no-fail-fast` surfaced all four at once. That is now a rule in AGENTS §2 — when
@@ -160,10 +243,10 @@ space or in time.
 
 **The fourth failure was a real macOS defect. It is now fixed — design §15.39.** After the
 test-only work above was committed and CI went green, the owner signed off on the product
-change, and it landed as `nexus_sys::SessionLatch`: a `kqueue` knote registered
+change, and it landed as `serial_nexus_sys::SessionLatch`: a `kqueue` knote registered
 `EVFILT_READ | EV_CLEAR` on the pty master (Darwin), inert elsewhere, folded into
 `read_and_poll`'s existing `saw_session` rather than added as a third disjunct. Suite
-623 → **627** (the four new `nexus-sys` tests), and `p9_pty_collapse`'s third test now runs
+623 → **627** (the four new `serial-nexus-sys` tests), and `p9_pty_collapse`'s third test now runs
 **unskipped on both platforms**. Proved fail-first on this box: **0/8** collapsed
 termios-only sessions release with the latch's one assignment commented out, **8/8** with
 it. Idle cost measured by A/B in the same binary: **1.62% → 1.75%** of a core, one
@@ -177,7 +260,7 @@ running, because `apply_baseline` and `flush_hostward_queue` open the slave them
 forge an identical edge — delete that and the handler re-fires on its own footsteps, which
 `collapsed_client_sessions_still_release_the_write_lock` catches, in a *different* test
 than the one the latch fixes; and invariant 1 is untouched, its ban being on `AsyncFd`/epoll
-as a **readiness** source while readiness stays `poll(2)` alone. `nexus-doctor` gained
+as a **readiness** source while readiness stays `poll(2)` alone. `serial-nexus-doctor` gained
 **P12** so the two mechanisms are diffable across kernels — gated tightly in `macos.jq`,
 where the edge is the only mechanism, and presence-only in `linux.jq`, where it is inert by
 design. One asymmetry is recorded rather than levelled: the bare open→close that Linux
@@ -199,10 +282,10 @@ reproducible, zero fires across idle controls and 200 daemon-shaped poll+read pa
 conclusion had followed from the shape of the probe, and a measurement outranks it. Severity
 against the shipped daemon: 20/20 real `stty -f` sessions leak, past 30 s, with another
 origin's `send` failing `-32003`. **Deliberately left open**: the fix needs new `unsafe` in
-`nexus-sys` (invariant 4), an ADR separating an *edge latch* from invariant 1's *readiness*
+`serial-nexus-sys` (invariant 4), an ADR separating an *edge latch* from invariant 1's *readiness*
 ban, a doctor probe for the mechanism, and handling the daemon's own momentary slave opens,
 which forge an identical edge — a §9 design decision, not a diagnosis-phase patch. Its guard
-**skips rather than being retired**, gated on `nexus-doctor` P7 and `cfg(not(linux))`: on the
+**skips rather than being retired**, gated on `serial-nexus-doctor` P7 and `cfg(not(linux))`: on the
 kernel of record a `false` answer means the daemon is leaking locks, and `linux.jq` admits P7
 `degraded`, so a P7-keyed skip there would retire the guard at exactly the wrong moment (§5's
 "a gate that can skip silently is a gate CI passes over a hole"). Full detail in
@@ -233,9 +316,9 @@ is what a tiered checklist run reads to decide it may start (§15.21).
 
 ## THE 6.18 KERNEL DIFF — taken at last, and it changed nothing (2026-07-28 session)
 
-P6–P11 were added on 2026-07-26/27 "so the owner can run `nexus-doctor --json` on 6.18 and diff it
+P6–P11 were added on 2026-07-26/27 "so the owner can run `serial-nexus-doctor --json` on 6.18 and diff it
 against the 7.0 baseline". **The owner ran it on 2026-07-27 and the diff is now taken.** The scope
-statement, the numbers and the residual gaps live in `docs/nexus-doctor.md`'s 6.18 section — this
+statement, the numbers and the residual gaps live in `docs/serial-nexus-doctor.md`'s 6.18 section — this
 entry records what the exercise cost, what it settled, and the three things about it a future session
 will get wrong.
 
@@ -258,7 +341,7 @@ guarded by `p12_pty_setup.rs`, not by the doctor. (3) P6's `handler_reset_readab
 rather than removable. The run's only new positive is that P7's widened-latch premise holds there —
 `latch_covers_termios_only_session: true` — retiring the risk that probe was written to name.
 
-**Three named hedges the run positively answers.** `nexus-sys`'s TIOCOUTQ-on-a-pty comment called
+**Three named hedges the run positively answers.** `serial-nexus-sys`'s TIOCOUTQ-on-a-pty comment called
 itself "exactly the quiet 6.18-vs-7.0 difference this section exists to surface": 6.18 answers
 `pending_output_bytes: 0` in both directions, same as 7.0. P7's own "if 6.18 leaves nothing there, the
 widened latch silently fails" is retired on the probe's terms. And P2's `hup_after_close: true` is the
@@ -268,11 +351,11 @@ kernel rather than self-skipping there — if the suite were ever run there, whi
 **What the diff cost, the instrumentation gap it exposed, and the fix.** Establishing that the 6.18
 report came from a **`fe1c52c`-vintage binary rather than HEAD** took forensics on a *section title*:
 its P4 block is the pre-`RES-2` "by-id resolution ground truth" shape. Nothing in the artifact said
-which build produced it — the header was a bare `nexus-doctor v0.2.0`, the JSON carried only
+which build produced it — the header was a bare `serial-nexus-doctor v0.2.0`, the JSON carried only
 `tool`/`version`/`generated_unix_ms`, and `to_markdown` dropped even that timestamp, so a *committed*
 6.18 Markdown would have dated itself only by its commit. `expectations/linux.jq` exists precisely to
 prove the artifact is "diffable field by field" and had no clause that could see it. The vintage turned
-out to be benign — `git diff fe1c52c a2d3b96 -- nexus-doctor/src/probes.rs` touches only
+out to be benign — `git diff fe1c52c a2d3b96 -- doctor/src/probes.rs` touches only
 `p4_resolver`, `environment()` and tests, so P1–P3 and P6–P11 are validly diffable — but that was luck,
 established after the fact.
 
@@ -334,7 +417,7 @@ both_renderers_carry_the_build_identity_and_the_timestamp}`, and the gate itself
 fail (`jq 'del(.build)'` and an emptied fingerprint are both rejected).
 
 **Two report-text defects the run surfaced, both Tier-1 over-claims, both now fixed.** They were in
-the operator-facing report AGENTS §3 makes the first attachment on every bug report, and a Tier-1
+the operator-facing report the README makes the first attachment on every bug report, and a Tier-1
 dangling converter is §13's *baseline* rig, so neither was exotic — both were on the page the owner
 pasted. (a) P11's consequence text said unconditionally that "a nonzero `frame` here is usually P5's
 deliberate baud-mismatch item", but `p5_certify_pair` runs only over discovered *pairs*, so on a
@@ -372,7 +455,7 @@ executed tests. One visit with a HEAD binary, both adapters cross-wired, `--json
 closes all four.
 
 **Neither artifact is in the tree.** *(Closed 2026-07-29 — `docs/doctor/` now holds the 6.18 report
-and three same-fingerprint 7.0 baselines, exactly as this paragraph proposed.)* Both reports live in a session scratchpad. `docs/nexus-doctor.md`
+and three same-fingerprint 7.0 baselines, exactly as this paragraph proposed.)* Both reports live in a session scratchpad. `docs/serial-nexus-doctor.md`
 says "the report itself is the record" and no such record exists for either kernel, which makes
 "P6/P7 read field-for-field identical" a claim in three documents with nothing in-repo to check it
 against — DOCR-3's shape one level up. Committing both under `docs/doctor/` and pointing the prose at
@@ -386,7 +469,7 @@ asserting it.
 
 ## REVIEW-32 REMEDIATION — all 80 unique findings dispositioned (2026-07-27 session)
 
-**The finding-by-finding ledger is `docs/33-review-32-remediation-ledger.md`** — read that before
+**The finding-by-finding ledger is `docs/historical/33-review-32-remediation-ledger.md`** — read that before
 re-filing anything from review 32, and read the review's own §6a/§6b (10 refuted, 2 already-known)
 before filing anything new. One finding is deliberately narrowed rather than closed (`WEBS-1`, the
 web token's outbound cookie exposure: reduced in code to `Path=/ws` plus a separate asset credential,
@@ -395,9 +478,9 @@ behavioural, guarded.
 
 **Scale and gates.** Suite **485 → 630 passing / 0 failing / 4 ignored** (+145). `cargo fmt`,
 `cargo clippy` (workspace **and** minimal-daemon), `cargo deny check licenses bans sources`, the macOS
-cross-check, `nexus-doctor --json | jq -e -f expectations/linux.jq` and the headless-Chromium suite
+cross-check, `serial-nexus-doctor --json | jq -e -f expectations/linux.jq` and the headless-Chromium suite
 (19 specs per push, 2 `@slow` nightly) are all green. This review's guards are the **`p12_*`** family in
-`nexus-itest/tests/`, plus `p6_fragmentation.rs` (§15.24 named a leg guard by number and the leg family
+`itest/tests/`, plus `p6_fragmentation.rs` (§15.24 named a leg guard by number and the leg family
 is `p6_*`) and new cases inside the modules that changed.
 
 **The shape of the fixes, which matters more than the list.** Each cluster's remedy is a *relocation* —
@@ -453,7 +536,7 @@ graph in a `finally`, *and* the history spec asserts its own precondition, which
 The remediation above was put through §15.34's own treatment one level up: six independent agents got
 review 32 and a **frozen** worktree, never the implementers' reports, and were told to refute the claim
 that each finding was fixed. Verdicts, per-finding outcomes and the narrative are in
-`docs/33-review-32-remediation-ledger.md` ("The audit round"); **this entry is the engineering half** —
+`docs/historical/33-review-32-remediation-ledger.md` ("The audit round"); **this entry is the engineering half** —
 the mechanisms, the measurements, and why the code that answers each one looks the way it does. Read it
 before "simplifying" anything named here: several of these are shapes a remediation already got wrong
 once, in the obvious direction, with a green suite behind it.
@@ -504,7 +587,7 @@ and says it wires.
 whenever `Codec::demux` returned `Err` — but `hostward_demux` drains its `events` vec unconditionally
 *after* the match, so every event the same call emitted before failing is still routed and credited to
 its channel's `delivered_hostward`. The realistic shape does exactly that: a non-resyncing framer decodes
-the good frames out of a 64 KiB chunk and refuses on the corrupt tail, and nothing in `codec-api` says a
+the good frames out of a 64 KiB chunk and refuses on the corrupt tail, and nothing in `serial-nexus-codec-api` says a
 transform must emit nothing before erroring — `demux` invokes `emit` once per decoded event *and*
 separately returns a `Result`. So `state` reported ~64 KiB of hostward loss on a chunk that was ~100%
 delivered, with the same payload counted as delivered *and* as lost — irreconcilable numbers, which §5
@@ -632,7 +715,7 @@ only arm available at the lower level: `resolve_current_path` returns a bare `Op
 "bind and warn" has nowhere to put the warning and would be indistinguishable, at every open, from
 binding the right device.
 
-**`RES-2`'s third surface was `nexus-doctor`, and it is the one AGENTS §3 tells operators to attach to
+**`RES-2`'s third surface was `serial-nexus-doctor`, and it is the one AGENTS §3 tells operators to attach to
 every bug report.** The daemon learned to resolve identities in a tree with `/sys` and no by-id links;
 the diagnostic still gated on `dev/serial/by-id.is_dir()` at both the environment check and P4, so in
 exactly that environment it reported `/dev/serial/by-id: "absent (no USB-serial adapter)"` and
@@ -703,11 +786,11 @@ name.
 **`CONC-3`.** The remediation factored the refused writer-thread spawn into `apply_spawn` and justified
 the absence of an end-to-end guard with "provoking `EAGAIN` from `pthread_create` needs an
 `RLIMIT_NPROC` the harness cannot impose on a daemon it shares a process tree with". That was wrong
-twice over: `RLIMIT_NPROC` is per *process*, `bash -c 'ulimit -u 1; exec serialnexusd …'` applies it to
+twice over: `RLIMIT_NPROC` is per *process*, `bash -c 'ulimit -u 1; exec serial-nexus-daemon …'` applies it to
 the daemon alone and the harness never notices — and the unit guard drove `apply_spawn`, a function the
 fix introduced, so it could not fail against the old inline `.expect`. Both halves are now real:
 `LogNode::create` takes an injected `WriterSpawn` (one production code path, a test-only argument) so the
-unit guard drives the real constructor, and `nexus-itest/tests/p12_log_queue.rs` boots `serialnexusd`
+unit guard drives the real constructor, and `itest/tests/p12_log_queue.rs` boots `serial-nexus-daemon`
 under `ulimit -u 1` and asks it about the node — old tree: exit 101; new tree: daemon up, node
 `faulted (spawn log writer thread: … os error 11)`. **The retracted justification is retracted in the
 module doc**, not silently deleted, because "this cannot be tested" is a claim a future session will
@@ -811,7 +894,7 @@ One full-suite run failed `p6_outage::outage_faults_then_purges_then_recovers_by
 `received: 8190, sent: 4096` — an apparent **doubling**, which is a far narrower clue than "flaky" and
 was chased rather than re-run (§15.36). It was never a doubling. **A pts hands out at most 4095 bytes
 per read** (`N_TTY_BUF_SIZE - 1` — a property of the line discipline, not of anything in this tree, and
-you will meet it again), and `nexus-sim`'s `read_until` looped `while out.len() < n` while appending the
+you will meet it again), and `serial-nexus-sim`'s `read_until` looped `while out.len() < n` while appending the
 *whole* of every read, unlike its sibling `recv_loop`, which caps. So `received` was not "how many of the
 bytes I asked for arrived" but "how many bytes happened to be in the reads I did", and **any**
 contaminated stream of this shape renders as 4095 + 4095 = 8190. The clue that looked like duplication
@@ -851,7 +934,7 @@ usual "reproduce it under hogs" instinct is exactly backwards; reproduce it dete
 
 ---
 
-## OPUS COMPREHENSIVE CODE REVIEW #3 — `docs/32-claude-opus-code-review.md` (2026-07-27)
+## OPUS COMPREHENSIVE CODE REVIEW #3 — `docs/historical/32-claude-opus-code-review.md` (2026-07-27)
 
 **Read the review for the findings, and the remediation entry above for what is true now.** The review
 file is a frozen record of the review *as delivered* — it still reads "nothing is fixed yet", because it
@@ -887,7 +970,7 @@ Its **§6 lists the 10 refutations and 2 already-knowns** — consult it before 
 this review, exactly as review 26's §6 serves that role. The refutations that exist because the *code*
 is right are additionally written up as **§3.20** below, in the deviations family, so they are findable
 from the same place as §3.1–§3.19. Everything *confirmed* is answered id-by-id in
-**`docs/33-review-32-remediation-ledger.md`**.
+**`docs/historical/33-review-32-remediation-ledger.md`**.
 
 ---
 
@@ -906,7 +989,7 @@ at 0.
 
 ### The document alignment pass (do this first on any new design generation)
 
-`docs/30-design-claude-fable-v13.md` and its plan were rebased from a pre-v12 text and
+`docs/historical/30-design-claude-fable-v13.md` and its plan were rebased from a pre-v12 text and
 silently dropped rules the code still enforces — the *same* failure the v12 track records
 above, and the second time in a row, so it is now a standing first step rather than an
 anecdote. **Nothing was a code deviation; the fix was to restore the text.** Restored into
@@ -932,14 +1015,14 @@ intended new v13 content, which is the check to repeat.
 
 ### §15.1 — the Playwright scaffold
 
-`serialnexusweb/ui-tests/`: pinned `@playwright/test` 1.62.0 (Apache-2.0) plus its
+`web/ui-tests/`: pinned `@playwright/test` 1.62.0 (Apache-2.0) plus its
 lockfile, `playwright.config.mjs` (Chromium only, `workers: 1`, `fullyParallel: false`,
 **`retries: 0` on purpose** — §15.36's whole point is that a retry converts a mechanism
 into a mystery), traces and screenshots retained on failure. `node_modules`,
 `test-results` and `playwright-report` are gitignored; nothing here ships, and the
 console's own assets stay vendored and unbundled.
 
-`nexus-itest/tests/p8_web_ui.rs` is the gate. It builds the fixture in Rust — where every
+`itest/tests/p8_web_ui.rs` is the gate. It builds the fixture in Rust — where every
 other test's fixture lives — and hands the browser a bootstrap URL plus a description of
 what it is looking at through the environment (`SNX_WEB_URL`, `SNX_ECHO_CONSOLE`,
 `SNX_FAULT_*`, `SNX_REPLACE_CFG`, `SNX_CTL`/`SNX_SOCKET`, …). Three points worth keeping:
@@ -1006,7 +1089,7 @@ is acknowledged and then purged**: "sent 20 byte(s)" followed by `purged_on_reco
 `remove-node --cascade` + `add-node` too.
 
 **Fix: one ioctl.** `SerialNode::teardown` calls `sys::set_exclusive(fd, false)` before
-releasing the port. `TIOCNXCL` existed in `nexus-sys` and had no caller. Exclusivity is a
+releasing the port. `TIOCNXCL` existed in `serial-nexus-sys` and had no caller. Exclusivity is a
 claim the node made, so the node gives it back when it stops; the unclaimed window is
 bounded by the same critical section and `open_port` re-takes it. Guard:
 `p11_replace_atomicity.rs`, **proved fail-first** (3 of its 4 tests fail against the
@@ -1015,7 +1098,7 @@ exclusive while a live node holds it — passes before and after, and exists so 
 simply stopped taking `TIOCEXCL` cannot pass). Verified on the FTDI bench afterwards.
 
 **D3 — and why a pts made D2 findable.** `TIOCEXCL` lives on the tty and is cleared only
-at its *last* close. A pts whose master `nexus-sim` holds open never reaches that close, so
+at its *last* close. A pts whose master `serial-nexus-sim` holds open never reaches that close, so
 the flag outlives the daemon's fd and **every** later `open(2)` is EBUSY — for the daemon
 and for anyone else (verified with an unrelated `python3` open). A one-second hardware flap
 is a permanent fault on a pts, which is the only reason it was visible at all. The same
@@ -1070,7 +1153,7 @@ and the doctor's report language are untouched by the reduction.
 Started as "investigate the GitHub CI failures" and ended up covering three unrelated things: a
 CI-infrastructure bug that was already fixed, a family of **load-sensitive test-harness races** that
 had been red on four of the last six pushes, and one **real product defect** found beside them. Six
-new `nexus-doctor` probes were added on top, to settle on the production kernel the questions this
+new `serial-nexus-doctor` probes were added on top, to settle on the production kernel the questions this
 work could only answer on 7.0.
 
 **Gates:** 480 passed / 0 failed / 4 ignored (was 459 at `548823e`) on **four consecutive**
@@ -1090,7 +1173,7 @@ something new**, and capture the name before re-running. The whole point of this
 ### The two stories in the CI history
 
 **Story 1 — already fixed.** Every red run from 2026-07-24 through 07-25 08:03 failed with
-`binary serialnexusd not found at target/debug/serialnexusd` (`nexus-itest/src/lib.rs:60`).
+`binary serial-nexus-daemon not found at target/debug/serial-nexus-daemon` (`itest/src/lib.rs:60`).
 `cargo test` builds test-instrumented binaries under `deps/`, not the plain artifacts the harness
 boots. `b81bb093` added `cargo build --workspace` to the four jobs that boot binaries and is an
 ancestor of both `main` and HEAD. `main`'s scheduled nightly still hit it at 08:18 on 07-26 only
@@ -1114,7 +1197,7 @@ sharing one deadline, so a `None` from a later call threw away the header it had
 handed. The bytes were gone from the socket and from the caller.
 
 The stream is never idle: the daemon publishes a full `state` snapshot at 5 Hz
-(`nexus-daemon/src/lib.rs` `SNAPSHOT_INTERVAL`) and the bridge subscribes on construction, so
+(`daemon/src/lib.rs` `SNAPSHOT_INTERVAL`) and the bridge subscribes on construction, so
 `collect_replies`' tail deadline always expires *into* a live frame stream. This test is the only
 one in the file that reuses one `Ws` across two `collect_replies` calls, so call 1's desync
 corrupted call 2 and a payload byte parsed as a header with the mask bit set.
@@ -1140,11 +1223,11 @@ into a silently mis-parsed WEB-1/SEC-1 security test. Do not lengthen the tail d
 `collect_replies` after the first reply either: that deletes the "exactly one reply" property that is
 the whole point of the invariant-11 guard.
 
-### F2 — `nexus-sim`'s echo double died on a slave close (`p7_p5` loopback → dangling)
+### F2 — `serial-nexus-sim`'s echo double died on a slave close (`p7_p5` loopback → dangling)
 
 `pty_echo` treated a bare pty-master `POLLHUP` as terminal and exited its echo loop **forever**. On a
 pty master `POLLHUP` is level-triggered and set whenever no slave is open, so it fired on a mere
-*close*, not an unplug. `nexus-doctor` runs P3 (which opens and closes every port) before P5, and the
+*close*, not an unplug. `serial-nexus-doctor` runs P3 (which opens and closes every port) before P5, and the
 close→reopen gap is ~22 µs — a wake-to-run race the doctor usually but not always wins. Measured
 survival against the unfixed double: 0% fatal at ≤16 µs, 36% at 20 µs, 92% at 30 µs. Lose it, and P5
 wrote into a dead peer for 4 s and reported `dangling (nothing wired to it)`.
@@ -1178,7 +1261,7 @@ the merged classification test and the new dedicated guard fail **deterministica
 
 `log_captures_hostward_stream_without_loss` failed with `received 238078, sent 262144`. This looked
 like an invariant-3 data-loss bug and is not. A `pty` node's hostward path is a **bounded bridge whose
-overflow is dropped and counted** (`nexus-daemon/src/nodes/pty.rs:301`, `:306-310`), default depth 32
+overflow is dropped and counted** (`daemon/src/nodes/pty.rs:301`, `:306-310`), default depth 32
 chunks, and design §5/§15.19 sanction that loss outright: "a slow spy costs itself data, never its
 neighbors." Under CPU contention the bridge fills and the pump sheds — legally.
 
@@ -1209,7 +1292,7 @@ beside it. **Run the whole suite on a quiet box and then again under parallelism
 always shows as `received + dropped_slow_consumer == sent`, which is the fingerprint to grep the
 failure message for.
 
-Secondary, and the change that would have made the original failure self-diagnosing: `nexus-sim`'s
+Secondary, and the change that would have made the original failure self-diagnosing: `serial-nexus-sim`'s
 `client` verdict could not distinguish a read deadline from real byte loss — `read_until` broke on its
 wall-clock deadline and returned the short buffer with no marker, so a timeout and a drop produced
 identical verdicts. It now emits `"timed_out": true` (additive; existing field names unchanged).
@@ -1252,8 +1335,8 @@ a client sent no command to purge — and it self-heals on the next observed ses
 measures exactly this and confirms it: shape (a) leaves 0 bytes.
 
 Guard: `p9_pty_collapse::a_collapsed_termios_only_session_still_releases_the_write_lock`, which drives
-a real `stty` (the actual `openat` → `TCGETS2` → `TCSETSW2` → `close` sequence — `nexus-itest` has no
-`nix` dependency and `libc`'s termios calls are `unsafe`, which invariant 4 confines to `nexus-sys`).
+a real `stty` (the actual `openat` → `TCGETS2` → `TCSETSW2` → `close` sequence — `serial-nexus-itest` has no
+`nix` dependency and `libc`'s termios calls are `unsafe`, which invariant 4 confines to `serial-nexus-sys`).
 Verified to fail without the latch fix and pass with it, with the two pre-existing properties still
 green in both states.
 
@@ -1278,11 +1361,11 @@ pinned in every job that compiles repo code rather than only `check`; `actions/c
 instead of being silently regenerated. **No `rust-toolchain.toml`** — pinning contributors' local
 toolchains is a repo-owner decision, not a CI fix.
 
-### The six new `nexus-doctor` probes (P6–P11)
+### The six new `serial-nexus-doctor` probes (P6–P11)
 
-Added so the owner can run `nexus-doctor --json` on **6.18** and diff it against the 7.0 baseline
+Added so the owner can run `serial-nexus-doctor --json` on **6.18** and diff it against the 7.0 baseline
 below. **That diff was taken on 2026-07-27** — see the 2026-07-28 entry at the top of this file and
-`docs/nexus-doctor.md`'s 6.18 section; the 7.0 readings recorded here are confirmed on the production
+`docs/serial-nexus-doctor.md`'s 6.18 section; the 7.0 readings recorded here are confirmed on the production
 kernel, and none of them changed a line of code. Every probe emits its raw measurements as structured JSON, not just a status word — a human
 diffing two runs must see the numbers. A probe reports what it *observed*: "this kernel differs" is
 `degraded` with the observation named, **never** `unsupported`, because `linux.jq` gates
@@ -1300,7 +1383,7 @@ Both expectation files were extended and both still pass.
   ioctl bit set; shape (c) open→write→close leaves 2 bytes with a data packet. So the widened latch
   covers the realistic collapsed session here, and the known limitation is confirmed as (a).
 - **P8 — does epoll report a pty master readable while `read` returns EAGAIN?** The behaviour behind
-  invariant 1. Probed with **raw epoll through `nexus-sys`** — not `AsyncFd`, which invariant 1's
+  invariant 1. Probed with **raw epoll through `serial-nexus-sys`** — not `AsyncFd`, which invariant 1's
   meta-gate bans workspace-wide with an empty allowlist, and which would have added tokio to the
   doctor for nothing. Finding worth keeping: a bare level-triggered `EPOLLIN` registration on a pty
   master **agrees with `poll(2)` on 7.0** and does not reproduce the busy-loop. That is not a
@@ -1312,7 +1395,7 @@ Both expectation files were extended and both still pass.
 - **P11 — real-port line-state counters** (`TIOCGICOUNT`/`TIOCMGET`), **opt-in behind `--port`** like
   P3/P5, because opening a port toggles DTR on hardware that may be wired to live equipment.
 
-`nexus-sys` gained the epoll wrapper (`Epoll`, level-triggered only — an edge-triggered variant
+`serial-nexus-sys` gained the epoll wrapper (`Epoll`, level-triggered only — an edge-triggered variant
 cannot exhibit the persistent-ready loop at all and would quietly report "no problem"),
 `pending_input_bytes` (FIONREAD) and `pending_output_bytes` (TIOCOUTQ), all documented as
 *instruments, not data-plane primitives*, with 5 new unit tests. It remains the workspace's only
@@ -1380,7 +1463,7 @@ zero — so the fix was to restore the text, not to remove working code. Restore
 name-legality clause (`BlankName`/`NameTooLong`/`MAX_NAME_LEN`, whose absence left AGENTS.md
 invariant 7 with no design source); §8's and §15.26's `unstable_fuzz_api` amendment (both
 modules ship and a meta-gate enforces its one-target-per-export rule, citing a section that
-no longer said it); §16.2's `RefCell`-ban *scope* (v12 still said "in `serialnexusd`" — the
+no longer said it); §16.2's `RefCell`-ban *scope* (v12 still said "in `serial-nexus-daemon`" — the
 exact wording INV5-CLIPPY-SCOPE proved broken); §11's empty-parse refusal; §15.21's P5
 verdict folding; and, in §15.34, the two clauses that make the shared-helper rules binding
 (the hostward fan-out is *one* helper for all five producers, and `effective_write_mode` is
@@ -1389,7 +1472,7 @@ corrected to the canonical kebab-case with the unhyphenated forms named as alias
 §11/§16.10's "connect/disconnect are deferred" text was reconciled with §10/§14/§15.35.
 
 **§14.1 — THE `ports` VERB.**
-- **Enumeration** `nexus-core/src/resolver.rs::enumerate_ports` → `Vec<PortCandidate>`
+- **Enumeration** `core/src/resolver.rs::enumerate_ports` → `Vec<PortCandidate>`
   (identity, kind, path, description, `by_id`, warning). Three passive sources unioned and
   deduplicated by device node: `/dev/serial/by-id`, `/dev/serial/by-path` (which still
   covers an adapter whose serial number is absent), and a `<dev-root>/dev` scan for `cu.*`
@@ -1404,12 +1487,12 @@ corrected to the canonical kebab-case with the unhyphenated forms named as alias
   so a device held by a `by-path:` identity reports bound even though `ports` advertises it
   as `usb:`.
 - **Passivity has two proofs.** Structural: `meta_gates::port_enumeration_cannot_open_a_device`
-  asserts `nexus-core` declares no dependency that *could* open a device
-  (`serial2`/`nexus-sys`/`nix`/`libc`) and still forbids `unsafe`, with a planted-violation
+  asserts `serial-nexus-core` declares no dependency that *could* open a device
+  (`serial2`/`serial-nexus-sys`/`nix`/`libc`) and still forbids `unsafe`, with a planted-violation
   self-proof on the manifest scanner. Runtime: `p10_ports.rs`'s fixture device nodes are
   writer-less FIFOs, so a blocking `open(2)` would never return and the RPC would hit its
   timeout.
-- `Daemon::start_with_args` was added to `nexus-itest` so a test can pass `--dev-root`
+- `Daemon::start_with_args` was added to `serial-nexus-itest` so a test can pass `--dev-root`
   without a fourth hand-rolled `KillOnDrop` copy.
 
 **§14.2 — `connect` / `disconnect`.** The verbs are easy; making them *the same operation
@@ -1420,7 +1503,7 @@ corrected to the canonical kebab-case with the unhyphenated forms named as alias
   graph therefore meant restarting tasks — and aborting a task drops its *targetward*
   receiver out from under senders that stay live in `GraphState::endpoint_targetward` and in
   every writer origin. That is MAP-1's chain exactly.
-- **The shape that fixed it** (`nexus-daemon/src/runtime.rs`), resting on one observation:
+- **The shape that fixed it** (`daemon/src/runtime.rs`), resting on one observation:
   §4 rule 2 gives a target-facing endpoint **at most one edge**, so everything an edge
   contributes is derivable from the two endpoints' *permanent* resources.
   - `FanOutList` / `SharedFanOut` — a host-facing endpoint's live sink list, `Arc<Mutex<…>>`
@@ -1453,7 +1536,7 @@ corrected to the canonical kebab-case with the unhyphenated forms named as alias
   would be dead code that could only ever disagree with the validator.
 
 **§14.3/§14.4 — THE GRAPH AND EDITOR PAGES, AND THE POSTURE.**
-- `serialnexusweb/src/assets/graph.mjs` and `editor.mjs`: pure renderers, handed snapshots
+- `web/src/assets/graph.mjs` and `editor.mjs`: pure renderers, handed snapshots
   by `app.js`. One shell, three views, hash-routed (`#graph`, `#editor`) so each is
   bookmarkable without the server growing a router.
 - The graph page reads `dump` for topology and `state` for status — the §15.8 split kept in
@@ -1509,7 +1592,7 @@ load-bearing structure rather than adding one.
    `krate.workspace = true` — the only spelling this workspace uses. It would have passed
    forever while catching nothing, which is INV5-CLIPPY-SCOPE's exact shape. It now matches
    every form (dotted, table, target-specific, renamed via `package`), plants each one in its
-   self-proof, and its *claim* is narrowed: it proves nexus-core carries neither the crates
+   self-proof, and its *claim* is narrowed: it proves serial-nexus-core carries neither the crates
    that drive a port nor an explicit file-opening API — not that nothing is opened, since
    `std::fs` needs no dependency and no `unsafe`. The behavioural proof is `p10_ports`'s
    writer-less FIFOs.
@@ -1568,9 +1651,9 @@ and are delivered if it is wired again.
 `cargo test --workspace --locked` (**459 passing / 0 failing / 4 ignored**, up from 436);
 `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`
 plus the minimal-daemon pass; `cargo deny check licenses bans sources`;
-`cargo check --target x86_64-apple-darwin --workspace --exclude serialnexusweb`;
-`nexus-doctor --json | jq -e -f expectations/linux.jq`. New test files: `p10_ports.rs` (4),
-`p10_edge_surgery.rs` (6), `serialnexusweb/src/assets/graph.test.mjs` (10 under
+`cargo check --target x86_64-apple-darwin --workspace --exclude serial-nexus-web`;
+`serial-nexus-doctor --json | jq -e -f expectations/linux.jq`. New test files: `p10_ports.rs` (4),
+`p10_edge_surgery.rs` (6), `web/src/assets/graph.test.mjs` (10 under
 `node --test`), plus four new `p8_web.rs` tests and one new meta-gate.
 
 **REAL-BROWSER VALIDATED (2026-07-26, same session).** Driven through Chrome against the
@@ -1621,9 +1704,9 @@ re-fixing a cleared candidate is its own defect. Design §15.34 records the patt
 lessons; plan §13 is the track.
 
 **Scale.** 69 files, ~12k insertions. Suite **265 → 435 passing / 0 failing**; nine new
-`nexus-itest` files (`p9_*`), three new fuzz targets, two new meta-gates. `cargo fmt`,
+`serial-nexus-itest` files (`p9_*`), three new fuzz targets, two new meta-gates. `cargo fmt`,
 `cargo clippy` (full **and** minimal-daemon), `cargo deny`, the macOS cross-check and
-`nexus-doctor --json | jq -f expectations/linux.jq` are all green.
+`serial-nexus-doctor --json | jq -f expectations/linux.jq` are all green.
 
 **The shape of the fixes, which matters more than the list.** Every headline defect was an
 invariant upheld in a layer that could not enforce it, so the fixes moved each one down:
@@ -1684,7 +1767,7 @@ delivered** — it still reads "nothing is fixed yet", because it was written be
 that followed it. Read the remediation entry above it for what is true now, and read the review for
 *why*: its §1 action table, its §6 list of the 20 refuted candidates (which need no action and should
 not be re-filed), and its §7 reproduction log. Its **justified** deviations are recorded below as
-§3.16–§3.18 (per-node `arbitration`, the map's `held` raw-edge promotion, and `nexus_core::data` as
+§3.16–§3.18 (per-node `arbitration`, the map's `held` raw-edge promotion, and `serial_nexus_core::data` as
 specification-not-path — the last also corrects §3.3). A fourth, §3.15 (flow-control spelling), was
 **withdrawn**: blind re-verification showed it was a real defect, not a deviation.
 
@@ -1697,11 +1780,11 @@ codec/exec multiplexed edge with an omitted `write_mode` silently parked every t
 `send` reported success; `spchex` implemented SPACE→hex where picocom's `M_SPCHEX` is the
 control-character class, leaving no rule able to hex a control byte; and a pipelined request during a
 waiting verb tore down the whole control connection, which killed web-console sessions. Also: the
-clippy `RefCell` ban (invariant #5) had stopped covering `nexus-daemon` at the v8 library split —
+clippy `RefCell` ban (invariant #5) had stopped covering `serial-nexus-daemon` at the v8 library split —
 proven with a planted `RefCell` plus a lint canary — so AGENTS.md §6 and `cell.rs` overstated it.
 That last one is the one to remember for its shape rather than its severity: a `clippy.toml` disarms
 **silently** when the code it governs moves to a sibling crate, which is why the ban is now duplicated
-into `nexus-daemon/clippy.toml` *and* backed by a `meta_gates` test that fails when a new crate starts
+into `daemon/clippy.toml` *and* backed by a `meta_gates` test that fails when a new crate starts
 holding daemon state.
 
 The review's §7 is a reproduction log (22 live reproductions). **Verification is complete and was
@@ -1730,13 +1813,13 @@ again, so §3.16 and §3.17 stand on independent evidence.
 
 ## WEB CONSOLE REAL-BROWSER VALIDATION (design §17 / plan §11) — DONE (2026-07-25 session, uncommitted)
 
-First **actual browser** validation of `serialnexusweb`. Previously the web/OPFS round-trip rode the
+First **actual browser** validation of `serial-nexus-web`. Previously the web/OPFS round-trip rode the
 manual checklist (§16.7) "because an agent can't drive a browser" (see the v11 track note below); this
 session drove a real Chrome via the browser-automation harness. Run on the **real FTDI crossover rig**
 (`/dev/ttyUSB0` `…BH00LL8O` ↔ `/dev/ttyUSB1` `…BH00L4KU`): the daemon owns `ttyUSB0` as serial node
 `usb0` (exclusive, default 64 KiB ring); an **external raw echo+banner responder** on `ttyUSB1` returns
 typed input and emits a periodic `[responder] tick N` line, so both the send round-trip **and**
-unsolicited hostward rendering are exercised; `serialnexusweb --bind 127.0.0.1:8088 --token … --socket …`.
+unsolicited hostward rendering are exercised; `serial-nexus-web --bind 127.0.0.1:8088 --token … --socket …`.
 Every claim below is asserted on structured RPC / OPFS state / byte content, never on a screenshot.
 
 **All green:**
@@ -1757,7 +1840,7 @@ Every claim below is asserted on structured RPC / OPFS state / byte content, nev
   `disconnect`/`set-attribute` at the bridge with **-32601** and the daemon **survives a `shutdown`
   attempt**; HTTP gates: no-cookie→**401**, bad-Host→**403**, wrong-token→**401**; the ES-module chain
   (`/history.mjs`, `/opfs.mjs`) serves 200.
-- **Drop accounting (§5 / invariant #9):** a gated 256 MiB `nexus-sim pty --source` firehose added via
+- **Drop accounting (§5 / invariant #9):** a gated 256 MiB `serial-nexus-sim pty --source` firehose added via
   `add-node` (`usb0` untouched) into a slow browser tab → that tab's tap `dropped` climbed to
   **260,632,266** while `feed_dropped=0` (shared producer→hub hop) and `usb0` stayed unaffected — "a slow
   spy costs only itself".
@@ -1770,7 +1853,7 @@ browser visual (plan §12.2) still rides the checklist — this session validate
 not a map render.
 
 **⚠️ UI ISSUE FOUND — NOT YET FIXED (proposed patch below): `load --replace` freezes a live web
-console's OPFS-restored view.** After an operator runs `serialnexusctl load --replace` (or
+console's OPFS-restored view.** After an operator runs `serial-nexus-ctl load --replace` (or
 `remove-node`+`add-node`, or `teardown`+`load` — all reach the same teardown/rebuild) **beneath a live
 browser session** tapping the endpoint, the console stops rendering new bytes. Root cause, verified
 line-by-line:
@@ -1799,7 +1882,7 @@ line-by-line:
   in `app.js selectConsole`, when it fires on a restored history, re-anchor `history.frontier =
   res.from_offset` and emit a `— stream reset (endpoint reconfigured) —` marker (old bytes stay as
   scrollback, new bytes splice forward). Regression: a case in the `history.mjs` `node --test` suite run
-  by `nexus-itest/tests/p8_web_history.rs`. **Alternatives considered and rejected as heavier:** (B) a
+  by `itest/tests/p8_web_history.rs`. **Alternatives considered and rejected as heavier:** (B) a
   per-endpoint offset epoch surfaced in `tap.open`/`state` folded into the OPFS key — honors invariant
   #10 for *all* offset clients but orphans scrollback on every benign reconfigure; (C) rebump the whole
   `instance` nonce — coarse, orphans every endpoint, needs interior mutability on an immutable field;
@@ -1845,7 +1928,7 @@ on `termios_settable` not `never_opened` (`probes.rs`). The only executable work
 **§12.1 — THE MAP NODE.** picocom's `--imap`/`--omap` byte mappings as a first-class **interior
 transform** (the first *non-codec* one), slotting into the endpoint-keyed wiring (§15.23) with
 **zero `Wiring::build` structural change** — purely via `shape()`, exactly as the design promised.
-- **Pure engine** `nexus-core/src/map.rs` (`#[forbid(unsafe)]`, property-tested): `Mapping` (the 14
+- **Pure engine** `core/src/map.rs` (`#[forbid(unsafe)]`, property-tested): `Mapping` (the 14
   picocom names), `MapDirection` (a compiled 256-entry first-match table + `k×` expansion bound),
   `MapDirection::apply(input, out, on_rule)` — a stateless byte→byte-sequence substitution, first
   match per byte wins, `on_rule` decouples the pure module from the daemon's `Cell` counters.
@@ -1871,21 +1954,21 @@ transform** (the first *non-codec* one), slotting into the endpoint-keyed wiring
   configuration round-trips unaltered, and the map is stateless, so the new behavior simply takes
   effect at the next `load` with no migration. Same family as §3.14's RESOLV-1 note: a visible
   on-upgrade behavior change, safe and operator-recoverable, worth saying out loud.
-- **Config** `nexus-core/src/config.rs`: `NodeConfig::Map { name, hostward, targetward, arbitration,
+- **Config** `core/src/config.rs`: `NodeConfig::Map { name, hostward, targetward, arbitration,
   replay_ring }`; `shape()` = a **host-facing default endpoint** (the mapped side, standard
   lock/fan-out/tap/ring machinery) + a **target-facing `raw` endpoint** (`MAP_RAW_ENDPOINT = "raw"`,
   addressed `node/raw`); `name()`/`replay_ring()`/`arbitration()` arms; `GraphConfig::validate()`
   rejects an unknown mapping name → new `ValidationError::UnknownMapping` (graph.rs), **structural,
   caught before any `--replace` teardown** so a bad map never destroys a good graph. Round-trip +
   proptest cover the new variant.
-- **Node runtime** `nexus-daemon/src/nodes/map.rs` (`MapNode`, mirrors `codec.rs` but simpler — no
+- **Node runtime** `daemon/src/nodes/map.rs` (`MapNode`, mirrors `codec.rs` but simpler — no
   framing, no fragmentation): a hostward pump (raw upstream → map → mapped fan-out + tap/ring mirror,
   lossy-at-boundary §5) and a targetward pump (consumer writes → map → upstream via `reacquire_held`,
   the §6 held origin). Per-direction `bytes_in`/`bytes_out` + per-rule substitution counters in
   `state_extra` (`Cell` on the runtime thread, `Rc`-shared — no borrow crosses `.await`, no `RefCell`).
   Wired into the `Node` enum (mod.rs).
 
-**§12.2 — REFERENCE CONFIG + DOCS.** `packaging/serialnexusd.example.toml` gains an active mapped
+**§12.2 — REFERENCE CONFIG + DOCS.** `packaging/serial-nexus-daemon.example.toml` gains an active mapped
 console (`quirky`/`qcon`: `hostward=["lfcrlf"]` normalizes bare LF, `targetward=["lfcr"]` satisfies
 CR). `docs/rpc/configuration.md` documents the map node, addressing, the full picocom vocabulary
 table, first-match ordering, and steal-to-bypass; `docs/rpc/observation.md` documents the per-rule /
@@ -1910,13 +1993,13 @@ or covered; do NOT regress:**
 
 **Gates (all green on the Linux 7.0 dev box):** `cargo fmt --all --check`; `cargo clippy --workspace
 --all-targets` (+ minimal `--no-default-features`); `cargo deny check licenses bans sources`;
-`cargo check --target x86_64-apple-darwin --workspace --exclude serialnexusweb`; and `cargo test
---workspace --locked` — **265 passed / 0 failed / 4 ignored**. New tests: `nexus-itest/tests/p8_map.rs`
+`cargo check --target x86_64-apple-darwin --workspace --exclude serial-nexus-web`; and `cargo test
+--workspace --locked` — **265 passed / 0 failed / 4 ignored**. New tests: `itest/tests/p8_map.rs`
 (6 tests — 1 cross-platform config-validation + 1 unknown-mapping + 4 serial-device-gated data-plane,
-self-skipping on macOS) plus the `nexus-core` map unit/proptests.
+self-skipping on macOS) plus the `serial-nexus-core` map unit/proptests.
 
 **REAL TIER-3 HARDWARE VALIDATION (2026-07-24, two FTDI FT232R adapters cross-wired on the 7.0 box:
-`/dev/ttyUSB0` `usb:0403:6001:BH00LL8O:00` ↔ `/dev/ttyUSB1` `usb:0403:6001:BH00L4KU:00`).** `nexus-doctor
+`/dev/ttyUSB0` `usb:0403:6001:BH00LL8O:00` ↔ `/dev/ttyUSB1` `usb:0403:6001:BH00L4KU:00`).** `serial-nexus-doctor
 --port /dev/ttyUSB0 --port /dev/ttyUSB1` = **15 supported / 0 degraded / 0 unsupported** (P2 supported —
 the §15.30 fix holds; P5 certifies the pair both directions, `rate_ladder=true
 deliberate_mismatch_observed=true`); baseline passes `expectations/linux.jq`. The full suite run with
@@ -1944,7 +2027,7 @@ a genuine doctor-P2 regression on `main`, a throughput regression the new defaul
 introduced, and two over-specified/racy tests. The full suite is green after.
 
 **§11.7 — DEFAULT-ON, PER-CHANNEL REPLAY RINGS.** `replay_ring` now defaults to **64 KiB**
-(`nexus_core::config::DEFAULT_REPLAY_RING`) on *every* host-facing endpoint, opt out with
+(`serial_nexus_core::config::DEFAULT_REPLAY_RING`) on *every* host-facing endpoint, opt out with
 `0`, superseding the serial-only opt-in default and the codec/leg scoped deferral. New
 `replay_ring` field on `Codec` and `Leg` node configs (serial's default flipped); a
 `NodeConfig::replay_ring()` accessor. `runtime::Wiring::build` sizes `host_ring_cap` for
@@ -1974,9 +2057,9 @@ stable/changes test). `p5_info` asserts `instance`; `docs/rpc/observation.md` do
 new fields + a Taps section (taps were previously undocumented in `docs/rpc/`).
 
 **§11.9 — BROWSER-SIDE OPFS HISTORY.** New pure ES module
-`serialnexusweb/src/assets/history.mjs` (offset-splice frontier + 16 MiB trim-oldest
+`web/src/assets/history.mjs` (offset-splice frontier + 16 MiB trim-oldest
 retention, DOM/storage-free), unit-tested by `history.test.mjs` (`node --test`, 9 tests) and
-gated by `nexus-itest/tests/p8_web_history.rs` (self-skips without `node`). Thin OPFS adapter
+gated by `itest/tests/p8_web_history.rs` (self-skips without `node`). Thin OPFS adapter
 `opfs.mjs` (per-`(origin, endpoint, instance)` key, 8-byte end-offset header + capped bytes,
 `navigator.storage.persist()` status surfaced, memory-only fallback). `app.js` became an ES
 module wiring history + OPFS: restores stored scrollback before the ring replay, splices live
@@ -1987,7 +2070,7 @@ itself is browser-only and rides the manual/hardware checklist (§16.7) — the 
 must be correct is the node-tested pure module; a real-browser drive is still owed at the
 checklist.**
 
-**§16.11 — BASH RETIRED.** The last three shell scripts are folded into `nexus-itest` and
+**§16.11 — BASH RETIRED.** The last three shell scripts are folded into `serial-nexus-itest` and
 `scripts/` is **deleted**: `p0_license_gate.rs` (plants `serialport`, asserts cargo-deny
 rejects it; self-skips without cargo-deny), `p8_external_codec.rs` (now *builds* the excluded
 template from the consumer position + runs its conformance kit, then drives `acme-daemon` over
@@ -2029,10 +2112,10 @@ the FTDI crossover rig attached — NOT environment artifacts, real issues:**
 
 **Gates (all on the real Linux 7.0 box + FTDI FT232R crossover rig, `/dev/ttyUSB0 ↔ ttyUSB1`):**
 `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`(+minimal), `cargo deny check`,
-`cargo check --target x86_64-apple-darwin --workspace --exclude serialnexusweb` (the `ring`/rustls
+`cargo check --target x86_64-apple-darwin --workspace --exclude serial-nexus-web` (the `ring`/rustls
 dep can't cross-build from Linux — pre-existing; the real macOS gate is `cargo test` on a Mac),
 and `cargo test --workspace --locked` — **all green, confirmed across repeated runs.** On the
-physical rig: `nexus-doctor --port /dev/ttyUSB0 --port /dev/ttyUSB1` reports **15 supported / 0
+physical rig: `serial-nexus-doctor --port /dev/ttyUSB0 --port /dev/ttyUSB1` reports **15 supported / 0
 degraded / 0 unsupported** (P2 now `supported`; P5 certifies the pair both directions — custom
 baud, break, TIOCGICOUNT, bidirectional rate ladder, deliberate-mismatch observed), and the
 `serial_hardware::crossover_rig_data_plane_send_and_exclusivity` test drives the daemon through
@@ -2090,7 +2173,7 @@ driver counters gracefully absent (TIOCGICOUNT is Linux-only). `serial2` opening
    && !hup_after_reopen`) hold but the kernel needs the §7.2 platform arm. `macos.jq` now passes
    (summary: 0 unsupported); Linux stays `supported`.
 
-**nexus-sim — same master-termios ENOTTY.** `apply_raw_pair` is a **no-op on BSD/macOS**: the
+**serial-nexus-sim — same master-termios ENOTTY.** `apply_raw_pair` is a **no-op on BSD/macOS**: the
 consumer configures the slave (the daemon's serial node via serial2, or the sim `client`), and
 opening the slave to set termios would prime POLLHUP → the echo/source/sink loops read that as
 "client hung up" and exit early. `set_raw`/`termios_of_pair` cfg-gated to match.
@@ -2102,9 +2185,9 @@ therefore does not run on macOS — serial-*device* tests there need **real hard
 Real UARTs are unaffected (proven byte-exact). See `docs/macos.md`.
 
 **Rust test-harness migration (replacing the bash `scripts/validate/**`, per operator request).**
-New **`nexus-itest`** crate (`publish = false`, workspace member): a cross-platform harness that
-boots `serialnexusd`, drives it with a small in-Rust JSON-RPC client (replacing `serialnexusctl
---json | jq`), orchestrates `nexus-sim` doubles as subprocesses, and asserts on structured results
+New **`serial-nexus-itest`** crate (`publish = false`, workspace member): a cross-platform harness that
+boots `serial-nexus-daemon`, drives it with a small in-Rust JSON-RPC client (replacing `serial-nexus-ctl
+--json | jq`), orchestrates `serial-nexus-sim` doubles as subprocesses, and asserts on structured results
 + byte-exact SHA-256 — none of the `stat -c` / `nc -q` / `sha256sum` / `timeout` /
 `/dev/serial/by-id` bash portability hazards (all of which break the old scripts on macOS).
 `serial_rig()`/`crossover_ports()` yield a serial device (macOS: the real crossover rig; Linux: a
@@ -2142,8 +2225,8 @@ All three rig tests share a process-wide `RIG` mutex (poison-tolerant `into_inne
 contend the two physical ports under the default parallel harness. Shared `null_modem_cfg` /
 `inject_verify` / `boot_rig` helpers. Full suite now **248 pass / 0 fail / 4 ignored**; fmt+clippy clean.
 
-**Unplug→replug heal validated manually on the rig** (an agent can't pull a cable): a `serialnexusd`
-holding both ports via `serialnexusctl` — pull one adapter → its node → `waiting (device … lost)`
+**Unplug→replug heal validated manually on the rig** (an agent can't pull a cable): a `serial-nexus-daemon`
+holding both ports via `serial-nexus-ctl` — pull one adapter → its node → `waiting (device … lost)`
 while the other stays `active` and the graph is unchanged (config-vs-state split, invariant #7);
 replug → `active` in ~1 s at the **same stable `cu.usbserial-*` path** (termios + modem lines
 reapplied); a `send` nonce then crossed the healed wire. This is the §7/§12 "survive replug" property
@@ -2163,7 +2246,7 @@ refuses the open). The clean isolation — a second open that succeeds without T
 it — is a Linux-rig property. `docs/macos.md` and the macOS-session summary above were reworded from
 the earlier "TIOCEXCL enforced" to the accurate "a second opener is refused" + this nuance.
 
-**Migration COMPLETE.** All of phases 0–8 (58 bash scripts) are ported to 43 `nexus-itest/tests/*.rs`
+**Migration COMPLETE.** All of phases 0–8 (58 bash scripts) are ported to 43 `itest/tests/*.rs`
 files (**83 tests**, 1 `#[ignore]`d endurance soak), across three batches (0–4, 5–6, 7–8), each
 compiling + clippy/fmt-clean and **green on macOS** (serial-*device* tests self-skip; codec/exec/leg/
 tap/**web** tests run there). The 55 retired scripts are deleted; only three genuine tooling files
@@ -2174,7 +2257,7 @@ gates on `expectations/macos.jq`; `harness-lint` (shellcheck/jq-lint) and the sc
 `integration` job are gone; the nightly lanes run `cargo test … --ignored`/`--include-ignored`.
 Key foundation decisions: serial providers are Linux-sim + lossless (a raw high-volume read over a
 flow-control-less UART drops bytes — that byte-exactness lives in `serial_hardware.rs` via the
-daemon's reader); the RPC verb→params shapes come from `serialnexusctl::build_request` (`load` is
+daemon's reader); the RPC verb→params shapes come from `serial-nexus-ctl::build_request` (`load` is
 `{config, replace}`, not a path). `Cargo.lock` updated for the new member. AGENTS.md §5 rewritten.
 
 ---
@@ -2183,7 +2266,7 @@ daemon's reader); the RPC verb→params shapes come from `serialnexusctl::build_
 v9 = v8 + a new normative surface: §5 gains **the replay ring** (`replay_ring = <bytes>`
 on a host-facing endpoint, graduated from §14), §6/§10 gain **taps** (`tap.open`/
 `tap.close`, the `never` write mode in dynamic form), and new §15.28/§15.29/§17 spec the
-**web console client** (`serialnexusweb`). Everything else in v9 (§5 fragmentation
+**web console client** (`serial-nexus-web`). Everything else in v9 (§5 fragmentation
 invariant, §6 purge-to-quiescence + acquisition-time held-priority, §7.3 log write_mode,
 §10 EOF-cancel, §12 identity spelling, §15.27) is **doc-catch-up describing the
 already-committed Opus review remediation** (`b9d8a50`).
@@ -2204,7 +2287,7 @@ code, BOTH FIXED by aligning code to the design:**
    permanent `waiting`). v9 §12 says "empty or whitespace-only fields are malformed at add
    time". **Fixed:** `f.trim().is_empty()`; test extended with two whitespace cases.
 
-**§11.1 THE TAP + §11.2 THE REPLAY RING — BUILT + VALIDATED.** New `nexus-daemon/src/
+**§11.1 THE TAP + §11.2 THE REPLAY RING — BUILT + VALIDATED.** New `daemon/src/
 tap.rs`: `TapHub` (per host-facing endpoint, `Rc<CriticalCell<>>`), `Tap`, `ReplayRing`,
 `TapFeed`, `TapMsg`, `OpenTap`. **Architecture (the crux was the blocking-thread serial
 reader owning its `Vec<HostwardSink>` — no shared mutable fan-out):** each host-facing
@@ -2225,8 +2308,8 @@ doing double duty). `replay_ring` config landed on the **serial** node; codec/le
 channels get a hub (tap works) but per-channel ring config is a scoped deferral. Hub tasks
 self-terminate when the producer's feed sender drops (teardown/remove/replace); `state`
 reports open taps `{tap,endpoint,dropped}`; `dump` is untouched (taps are state, §8).
-`nexus-rpc` gained tested `base64_encode`/`base64_decode`; `serialnexusctl tap <endpoint>
-[--replay] [--bytes N] [--stall-ms N]` (holds the write half open, §15.20); `nexus-sim pty
+`serial-nexus-rpc` gained tested `base64_encode`/`base64_decode`; `serial-nexus-ctl tap <endpoint>
+[--replay] [--bytes N] [--stall-ms N]` (holds the write half open, §15.20); `serial-nexus-sim pty
 --source` gained `--wait-file` gating (presence!=readiness). Producers touched: serial,
 codec, exec, leg (all mirror; pty/log are target-facing → no tap).
 
@@ -2252,12 +2335,12 @@ FIXED; do NOT regress:**
   counted. **Fixed:** a per-endpoint `feed_dropped` atomic (shared TapFeed↔hub),
   incremented on the `try_send` Full, surfaced in `state.taps[].feed_dropped`. Still
   never backpressures (the ring must not stall the device).
-- **[LOW] `serialnexusctl tap --bytes 0` swallowed the ack** — the `while written<limit`
+- **[LOW] `serial-nexus-ctl tap --bytes 0` swallowed the ack** — the `while written<limit`
   loop never ran, so a failed open (unknown endpoint) exited 0. **Fixed:** read the
   tap.open ack *before* the byte loop; `--bytes 0` is a confirmed no-op, a failed open
   exits non-zero.
 
-**§11.3–§11.6 THE WEB CLIENT — BUILT + VALIDATED.** New crate **`serialnexusweb`** (a
+**§11.3–§11.6 THE WEB CLIENT — BUILT + VALIDATED.** New crate **`serial-nexus-web`** (a
 pure RPC client of the daemon; the daemon gains no HTTP, §17). **Deps (all §13-permissive,
 `cargo deny check licenses bans sources` green):** `tokio-tungstenite` (WS framing),
 `sha1` (WS accept), `getrandom` (token), and for the TLS tier `rustls`+`rcgen` pinned to
@@ -2274,9 +2357,9 @@ relays both ways, and **denies graph/lifecycle verbs** (`load`/`add-node`/`remov
 `teardown`/`shutdown`/`connect`/`disconnect`/`set-attribute`) so the web console can never
 mutate the graph (§17 non-goal). Frontend = embedded static `index.html`/`app.js`/`app.css`
 (functional console: left rail from state+subscribe, tap terminal with replay marker + drop
-counter, send box with holder-named LOCKED + explicit-steal). `serialnexusweb wsclient`
+counter, send box with holder-named LOCKED + explicit-steal). `serial-nexus-web wsclient`
 (headless: `--endpoint`+`--bytes` taps and checksums; `--rpc`+`--params` one-shots) is the
-validation client. `nexus-rpc` gained shared `base64_encode`/`base64_decode`. `docs/
+validation client. `serial-nexus-rpc` gained shared `base64_encode`/`base64_decode`. `docs/
 security.md` gained the web section (token/Host/three tiers, token-is-not-TLS).
 
 **Gates (final):** `cargo test --workspace` = **156**, fmt/clippy(all-targets)/cargo-deny
@@ -2298,11 +2381,11 @@ existed in the code; all five are now built + validated + adversarially audited.
 (The v8 §16 dispositions reverted to "(adopt)" phrasing vs v7's "(done)"; that is
 annotation only — plan §9 remains built, no code change there.)
 
-1. **Library/binary split + registry-as-value (§10.1).** New crate **`nexus-daemon`**
-   (library) holds every former `serialnexusd` internal (`git mv` of boundary/cell/
-   control/daemon/nodes/runtime + new `lib.rs`/`registry.rs`); `serialnexusd` is now a
+1. **Library/binary split + registry-as-value (§10.1).** New crate **`serial-nexus-daemon`**
+   (library) holds every former `serial-nexus-daemon` internal (`git mv` of boundary/cell/
+   control/daemon/nodes/runtime + new `lib.rs`/`registry.rs`); `serial-nexus-daemon` is now a
    ~dozen-line binary that parses flags, installs tracing, and calls
-   `nexus_daemon::run(RunOptions, Registry)`. The codec registry is a **value**:
+   `serial_nexus_daemon::run(RunOptions, Registry)`. The codec registry is a **value**:
    `Registry::with_builtins().register(name, factory)` — a factory is
    `Rc<dyn Fn(&toml::Table)->Result<Box<dyn Codec>,String>>`; a **duplicate or
    reserved (`exec`) name is a startup error**. Public API is exactly `{run, RunOptions,
@@ -2310,17 +2393,17 @@ annotation only — plan §9 remains built, no code change there.)
    verified with `cargo doc` (every internal module is private). `Daemon` gained an
    `Rc<Registry>`, threaded into `Node::instantiate` in `load`/`add-node`.
 2. **`info` verb (§10.2).** `{daemon_version, wire_version, envelope_version, codecs}`;
-   `serialnexusctl info`. An **unknown codec is a structural error** carrying
+   `serial-nexus-ctl info`. An **unknown codec is a structural error** carrying
    `data.available`. (Fix #1 below extended this to codec *attribute* schemas.)
 3. **External-consumer template (§10.3).** `examples/external-codec/` (workspace-
-   excluded, its own workspace): `acme-codec` (against `codec-api` only) + `acme-daemon`
-   (a custom binary against `nexus-daemon`). Built from the consumer position by
+   excluded, its own workspace): `acme-codec` (against `serial-nexus-codec-api` only) + `acme-daemon`
+   (a custom binary against `serial-nexus-daemon`). Built from the consumer position by
    `scripts/validate/phase8/external-codec.sh` + a per-push CI job.
-4. **Conformance kit (§10.4).** `codec-api` `test-support` feature →
-   `codec_api::test_support`: `round_trip_identity` / `fragmentation_tolerance` /
+4. **Conformance kit (§10.4).** `serial-nexus-codec-api` `test-support` feature →
+   `serial_nexus_codec_api::test_support`: `round_trip_identity` / `fragmentation_tolerance` /
    `handles_garbage` / `bounded_parser_state` / `assert_buffer_bounded`. Reference
    codec + acme run it; four deliberately-broken codecs prove each suite bites.
-5. **Exec-conformance harness (§10.5).** `nexus-sim exec-conformance` (an `ExecChild`
+5. **Exec-conformance harness (§10.5).** `serial-nexus-sim exec-conformance` (an `ExecChild`
    with a concurrent stdout-decoding thread): golden vectors, **full-duplex liveness**
    (the §15.22 deadlock class), fragmented reassembly, kill/restart. Fixtures
    `tests/ext-codec/{passthrough.py (pass), lag.py (bounded-lag, pass), half-duplex.py
@@ -2359,8 +2442,8 @@ NOT regress:**
 - **[LOW] `Registry::with_builtins()` `unused_mut` under `--no-default-features`** broke the
   §8 minimal build's `-D warnings`. **Fixed:** `#[cfg_attr(not(feature="codec-reference"),
   allow(unused_mut))]` + a CI minimal-build clippy step.
-- **[LOW] `codec-authors.md` linked to moved source paths** (`serialnexusd/src/nodes/…`).
-  **Fixed** to `nexus-daemon/src/{nodes/exec.rs,registry.rs}`.
+- **[LOW] `codec-authors.md` linked to moved source paths** (`daemon-bin/src/nodes/…`).
+  **Fixed** to `daemon/src/{nodes/exec.rs,registry.rs}`.
 0 findings refuted. Gates after fixes: `all.sh --through 8` = **48/48** (45 prior + info/
 exec-conformance/external-codec), fmt/clippy(+minimal)/macOS-cross-check/shellcheck clean.
 Not committed; no `main` merge.
@@ -2372,20 +2455,20 @@ executed as seven commits on `implementation`, each behavior-preserving item
 adversarially re-audited before commit. Final state: **102 unit/property tests**,
 `all.sh --through 8` = **45/45** (the original 42 + the new unsafe-gate, jq-lint, and
 harness self-test), fmt/clippy/`--target x86_64-apple-darwin`/shellcheck all clean.
-- **§9.1 boundary-supervisor library** (`214e237`, §16.1). New `serialnexusd::boundary`:
+- **§9.1 boundary-supervisor library** (`214e237`, §16.1). New `serial-nexus-daemon::boundary`:
   `park()` (park-don't-teardown), `race3` (concurrent halves — a *flat* 3-arm `select!`),
   `Backoff::{exponential,fixed}`, `BlockingReader` (loss-notify + join-then-transition).
   serial/exec/leg rebased onto it. The 3-lens audit caught a real medium bug — race3 was
   first drafted as nested `race2`, which biases the tie-break when two halves are ready in
   one poll (a spurious respawn on a teardown/crash race) — fixed to a flat select; plus a
   `fixed(0)` floor divergence. 8 boundary tests.
-- **§9.2 critical-section cell** (`362a11e`, §16.2). `serialnexusd::cell::CriticalCell`
-  (closure-only `with`/`with_mut`) replaces **every** `RefCell` in serialnexusd (daemon
-  state, `LockCell`, all node shared cells); `serialnexusd/clippy.toml` bans
+- **§9.2 critical-section cell** (`362a11e`, §16.2). `serial-nexus-daemon::cell::CriticalCell`
+  (closure-only `with`/`with_mut`) replaces **every** `RefCell` in serial-nexus-daemon (daemon
+  state, `LockCell`, all node shared cells); `daemon-bin/clippy.toml` bans
   `std::cell::RefCell` via `disallowed-types` (per-crate scoping via `CARGO_MANIFEST_DIR`,
   confirmed on clippy 0.1.97). The "borrow never crosses `.await`" tripwire is now a
   compile-shape fact. Audit clean. Gate proven (clippy fails on a planted RefCell). 3 tests.
-- **§9.3 nexus-sys crate** (`052fb8a`, §16.3). New `nexus-sys` = all unsafe (ioctls,
+- **§9.3 serial-nexus-sys crate** (`052fb8a`, §16.3). New `serial-nexus-sys` = all unsafe (ioctls,
   ptsname, poll); daemon/doctor `sys.rs` deleted, sim's local unsafe removed; every other
   crate now `#![forbid(unsafe_code)]`. `scripts/validate/phase0/unsafe-gate.sh` proves
   confinement (detector-proven). doctor `read_icounter`/`SerialIcounter` → canonical
@@ -2400,7 +2483,7 @@ harness self-test), fmt/clippy/`--target x86_64-apple-darwin`/shellcheck all cle
 - **§9.6 state-file fsync** (`f129a2f`, §16.6). `atomic_write` fsyncs temp before rename +
   dir after (strace-confirmed `fsync→rename→fsync`); comment-pinned test; crash-recovery
   script stays green.
-- **§9.7 error-code registry** (`0756022`, §16.8). `nexus_rpc::AppError` enum = single
+- **§9.7 error-code registry** (`0756022`, §16.8). `serial_nexus_rpc::AppError` enum = single
   registry; daemon `app_errors` re-exports its `.code()`; `error_code_registry()`; test
   `docs_rpc_table_matches_the_registry` asserts docs/rpc ↔ registry (catches undocumented
   or unregistered codes — the audit's `-32001` bug).
@@ -2416,13 +2499,13 @@ The remainder of this document (below) is the phase 0-8 build history, unchanged
 real silicon — two FTDI FT232R adapters (`usb:0403:6001:BH00L4KU:00` /dev/ttyUSB0 ↔
 `usb:0403:6001:BH00LL8O:00` /dev/ttyUSB1) cross-wired as a null modem. Device access
 is resolved (the dev user is in `dialout`; the old "S3 access pending" caveat no longer
-applies). `nexus-doctor` baseline was clean (12/12), and the rig cert surfaced **the
+applies). `serial-nexus-doctor` baseline was clean (12/12), and the rig cert surfaced **the
 first genuine real-hardware bug** — in the *doctor*, not the daemon: `p5_certify_pair`
 (§15.21) had never run against real UARTs (the sim skips it as "not a UART"), and it
 reopened both ports per rate and transmitted *before the FTDI applied the new baud
 divisor*, so the rate ladder garbled at 115200+ and reported `rate_ladder=false` while
 an independent pyserial test proved the physical link flawless 9600..921600. **Fixed
-(`nexus-doctor/src/probes.rs`, commit `8cf61d0`):** a 150 ms post-open baud settle
+(`doctor/src/probes.rs`, commit `8cf61d0`):** a 150 ms post-open baud settle
 before each single-shot exchange, a **both-direction** ladder (§15.21 "all must
 round-trip", closing a pre-existing one-way gap), and a bulkier mismatch pattern so the
 frame-error observation is deterministic — verified `rate_ladder=true
@@ -2479,16 +2562,16 @@ All gates green: 78 workspace tests, fmt/clippy clean, `all.sh --through 6` = 32
 
 **Phase 6 (2026-07-21).** The cross-daemon transport (§7.4/§9): a new **leg node**
 (`nodes/leg.rs`) carrying N channels multiplexed over a tcp|unix socket by the
-built-in **link codec** (the shared envelope, §8). `codec-api` grew the **v1 wire
+built-in **link codec** (the shared envelope, §8). `serial-nexus-codec-api` grew the **v1 wire
 hello** (`WIRE_MAGIC` "SNXL", `WIRE_VERSION` distinct from `ENVELOPE_VERSION`, a `u32`
 capability bitset with `CAP_LOCK_RELAY` reserved, `Hello`/`encode_hello`/
 `try_decode_hello`, `WireError`) — a distinct wire construct, not a fifth event kind,
-so the four golden vectors stay frozen. `nexus-core` gained the `NodeConfig::Leg`
+so the four golden vectors stay frozen. `serial-nexus-core` gained the `NodeConfig::Leg`
 variant (+ `Transport`/`LegRole`), the leg `shape()` (N channel endpoints, no default
 endpoint), and config-level validation (loopback-only unless `insecure_bind`, empty
 channel/list rejection → new `ValidationError::{NonLoopbackBind,EmptyLeg}`). The leg
 plugs into the §15.23 endpoint-keyed `Wiring` with **zero `Wiring::build` change** —
-purely via `shape()`. `nexus-sim` grew `wire` (hostile-or-conforming peer / §9
+purely via `shape()`. `serial-nexus-sim` grew `wire` (hostile-or-conforming peer / §9
 conformance driver) and `tcp-proxy` (outage injection) modes, plus `pty --stall`. One
 new ADR landed — **§15.24** (the leg node, the hello frame, fragmentation-not-drop,
 faulted-and-wait); §7.5/§15.23/§14 were touched for the re-multiplexer scoping. A
@@ -2507,7 +2590,7 @@ See §6d below.
 crate (the v1 envelope framing as a `Codec`, with length-guided resync); the
 interior **codec node** (`nodes/codec.rs`) and **exec codec node** (`nodes/exec.rs`)
 on a **generalized endpoint-keyed data-plane wiring** (interior nodes have N+1
-endpoints — the first non-two-layer topology); `nexus-sim` grew `mux`/`envelope`
+endpoints — the first non-two-layer topology); `serial-nexus-sim` grew `mux`/`envelope`
 modes; two new ADRs landed — **§15.22** (exec child protocol: the multiplexed side
 is a reserved empty channel; the exec codec is a child-pipe boundary, not a pure §5
 interior node) and **§15.23** (endpoint-keyed wiring, length-guided resync,
@@ -2524,7 +2607,7 @@ priority over on-demand waiters). See §6c below.
 into the design text and added two new normative requirements that phase 0-2 code
 was realigned to satisfy: (a) design §3 now makes a node name or channel identity
 containing `/` a **structural validation error** — enforced in
-`nexus_core::graph::GraphModel::validate` (`ValidationError::InvalidName`); and
+`serial_nexus_core::graph::GraphModel::validate` (`ValidationError::InvalidName`); and
 (b) plan §2 now requires **`Cargo.lock` committed** (the cargo-deny gate is only as
 strong as the committed graph) — `Cargo.lock` was un-gitignored and checked in. The
 lingering `serial2-tokio` workspace-dependency declaration was also dropped (§13,
@@ -2575,27 +2658,31 @@ the items below are refinements consistent with the design, none contradict it.
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| 0 | Doctor + scaffolding | **done** — `nexus-doctor`, CI, cargo-deny gate |
-| 1 | Contracts in the small | **done** — nexus-core, codec-api, nexus-sim |
+| 0 | Doctor + scaffolding | **done** — `serial-nexus-doctor`, CI, cargo-deny gate |
+| 1 | Contracts in the small | **done** — serial-nexus-core, serial-nexus-codec-api, serial-nexus-sim |
 | 2 | Walking skeleton | **done** — control plane + node lifecycle + data plane (serial↔PTY byte flow, presence gating, backpressure) |
 | 3 | Boundaries & logging | **done** — drop counters, log node, `rotate`/`subscribe`, client-termios, high-throughput data plane + benchmark (§3.11) |
 | 4 | Arbitration | **done** — slices A & B (exclusive write lock, `lock`/`unlock`, `may_write` gate, purge-on-acquire/-detach, detach-release, held, free-for-all) plus **slice C**: the FIFO waiter queue + two-lane async dispatch, `send`, `--steal`/`--wait`/`--lease-ms`, lease generation-guard, immediate lock notifications (§3.12, §6b, §15.20) |
-| 5 | Codecs | **done** — codec runtime + registry (§8), the `codecs/reference` framing codec (resync), the interior codec node + exec codec (§7.5/§7.6), endpoint-keyed wiring, `nexus-sim` `mux`/`envelope`; audited (§6c, §15.22, §15.23) |
-| 6 | The wire | **done** — leg node (§7.4) + v1 wire hello (§9), fragmentation, binding, faulted-and-wait/purge-on-reconnect, `nexus-sim` `wire`/`tcp-proxy`, §9 conformance scripts; audited (§6d, §15.24) |
+| 5 | Codecs | **done** — codec runtime + registry (§8), the `codecs/reference` framing codec (resync), the interior codec node + exec codec (§7.5/§7.6), endpoint-keyed wiring, `serial-nexus-sim` `mux`/`envelope`; audited (§6c, §15.22, §15.23) |
+| 6 | The wire | **done** — leg node (§7.4) + v1 wire hello (§9), fragmentation, binding, faulted-and-wait/purge-on-reconnect, `serial-nexus-sim` `wire`/`tcp-proxy`, §9 conformance scripts; audited (§6d, §15.24) |
 | — | **v6 alignment** | **done** — phase 0-4 re-audited against the revised v6 design; 5 deviations fixed (empty-node-name §11, boundary comment §5, serial/PTY `hostward_buffer` + serial `modem` §7.1/§7.2, `--socket-group` §10) (§3.13) |
-| 7 | Identity & resilience | **done** — resolver (§12) + faulted-and-wait/reopen (§7.1) + state file (§11) + `add-node`/`remove-node --cascade`/`load --replace` + serial-signal verbs (§7.1) + doctor P5 + `nexus-sim nullmodem`; audited (§6e, §15.25) |
+| 7 | Identity & resilience | **done** — resolver (§12) + faulted-and-wait/reopen (§7.1) + state file (§11) + `add-node`/`remove-node --cascade`/`load --replace` + serial-signal verbs (§7.1) + doctor P5 + `serial-nexus-sim nullmodem`; audited (§6e, §15.25) |
 | 8 | Hardening & release | **done** — macOS build+cfg-gating (cross-checked via `--target x86_64-apple-darwin`) + macOS CI lane + `docs/macos.md`; docs (README, `docs/security.md`, `docs/codec-authors.md`, `docs/rpc/`); packaging (systemd unit, udev, example config); cargo-fuzz targets (`fuzz/`, nightly); `phase8/{quickstart,agent-task,soak}.sh` + CI wiring; audited (§6f) |
 
 **Quality gates (all green):** `cargo fmt --all --check`, `cargo clippy --workspace
 --all-targets --locked -- -D warnings` (plus the minimal-daemon clippy), `cargo build
 --workspace --locked` **then** `cargo test --workspace --locked` — one suite now carrying
-the unit/property tests *and* the whole `nexus-itest` integration harness — `cargo check
---target x86_64-apple-darwin --workspace --exclude serialnexusweb` (macOS portability), and
+the unit/property tests *and* the whole `serial-nexus-itest` integration harness — `cargo check
+--target x86_64-apple-darwin --workspace --exclude serial-nexus-web` (macOS portability), and
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
-`scripts/validate/**` into the harness; AGENTS.md §4 carries the exact current command block.
+`scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
+The current whole-suite figure is **642 passing, 0 failed, 4 ignored** across 102 test
+targets on Linux (2026-07-29, after the rename track); of those, one is the doc-tested
+twelve-line embedder `main` in `daemon/src/lib.rs`, which is the §15.26 entry surface
+proving it still compiles under the family names.
 
-**Hardware integration test (Tier-3, opt-in):** `nexus-itest/tests/serial_hardware.rs` — the
+**Hardware integration test (Tier-3, opt-in):** `itest/tests/serial_hardware.rs` — the
 end-to-end test on *real* silicon (design §13/§15.17/§15.21, plan §5), which replaced the
 retired `hardware/crossover-rig.sh`. It requires two USB-serial adapters wired together with a
 crossover UART cable, auto-detected by `crossover_ports()` (`/dev/cu.usbserial-*` on macOS, or
@@ -2605,7 +2692,7 @@ by SHA-256 (§4/§5/§7.1) at 115200 and at the custom rate 250000, the `send` v
 far port, `TIOCEXCL` exclusivity against a second opener, the serial signal verbs
 (`send-break`/`set-modem`/`pulse-dtr`) — unreachable on the pts that `p7_signals` uses — and
 the v11 map node in both directions. They share a process-wide mutex, so the two ports are
-never contended. Certify the rig first with `nexus-doctor --port … --port …` (the §15.21
+never contended. Certify the rig first with `serial-nexus-doctor --port … --port …` (the §15.21
 precondition: a failure is attributable to a loose wire, not the daemon). Verified passing on
 a cross-wired FTDI FT232R pair.
 
@@ -2625,7 +2712,7 @@ the same code on three dates). So the kernel-sensitive PTY/serial mechanics are
 de-risked across the support matrix — but "zero deltas" would be the wrong
 sentence, and what the 6.18 run does *not* cover (HEAD's P4, everything a paired
 rig certifies, the `--json`/`jq` gate, and `cargo test` at all) is enumerated in
-`docs/nexus-doctor.md`. Read that section, not this line, before acting on it.
+`docs/serial-nexus-doctor.md`. Read that section, not this line, before acting on it.
 
 ---
 
@@ -2633,30 +2720,30 @@ rig certifies, the `--json`/`jq` gate, and `cargo test` at all) is enumerated in
 
 | Crate | Role | State |
 |-------|------|-------|
-| `codec-api` | codec trait (+ `resync_count`), event vocabulary, envelope frame codec + golden vectors, **v1 wire hello** (`WIRE_MAGIC`/`WIRE_VERSION`/`Hello`/`WireError`) (§8/§9) | done |
-| `codecs/reference` (`codec-reference`) | the v1 envelope framing as a `Codec`, with length-guided resync (§7.5/§9) | done (phase 5) |
-| `nexus-core` | graph model + validator (§4), data-plane deliver contracts + holdover (§5), lock state machine incl. `reclaim_held` (§6), config/state split (§15.8), **device-identity `resolver` (§12)** | done |
-| `nexus-rpc` | JSON-RPC 2.0 wire types — the stable §15.16 surface | done |
-| `nexus-sim` | test double: `pty`/`client`/`mux`/`envelope`/`wire`/`tcp-proxy`/`nullmodem` modes (§3) | done through phase 7 |
-| `nexus-doctor` | shipping capability checker: probes P1–P12 + env checks (§15.17) | done |
-| `serialnexusd` | the daemon | control plane + node lifecycle + data plane + codecs + leg/wire done |
-| `serialnexusctl` | the CLI (thin RPC client + `--json`) | `load [--replace]`/`add-node`/`remove-node [--cascade]`/`dump`/`state`/`subscribe`/`rotate`/`lock`/`unlock`/`send`/`send-break`/`set-modem`/`pulse-dtr`/`teardown`/`shutdown` |
+| `serial-nexus-codec-api` | codec trait (+ `resync_count`), event vocabulary, envelope frame codec + golden vectors, **v1 wire hello** (`WIRE_MAGIC`/`WIRE_VERSION`/`Hello`/`WireError`) (§8/§9) | done |
+| `codecs/reference` (`serial-nexus-codec-reference`) | the v1 envelope framing as a `Codec`, with length-guided resync (§7.5/§9) | done (phase 5) |
+| `serial-nexus-core` | graph model + validator (§4), data-plane deliver contracts + holdover (§5), lock state machine incl. `reclaim_held` (§6), config/state split (§15.8), **device-identity `resolver` (§12)** | done |
+| `serial-nexus-rpc` | JSON-RPC 2.0 wire types — the stable §15.16 surface | done |
+| `serial-nexus-sim` | test double: `pty`/`client`/`mux`/`envelope`/`wire`/`tcp-proxy`/`nullmodem` modes (§3) | done through phase 7 |
+| `serial-nexus-doctor` | shipping capability checker: probes P1–P12 + env checks (§15.17) | done |
+| `serial-nexus-daemon` | the daemon | control plane + node lifecycle + data plane + codecs + leg/wire done |
+| `serial-nexus-ctl` | the CLI (thin RPC client + `--json`) | `load [--replace]`/`add-node`/`remove-node [--cascade]`/`dump`/`state`/`subscribe`/`rotate`/`lock`/`unlock`/`send`/`send-break`/`set-modem`/`pulse-dtr`/`teardown`/`shutdown` |
 
-Daemon modules (the v8 library/binary split moved all of these out of `serialnexusd`
-into the `nexus-daemon` library, §15.26; `serialnexusd` is now flags + tracing + a
-`run` call): `lib.rs` (entry surface, socket and state-file policy), `control.rs`
+Daemon modules (the v8 library/binary split moved all of these out of the thin binary
+crate into the `serial-nexus-daemon` library, §15.26; the binary is now flags + tracing +
+a `run` call): `lib.rs` (entry surface, socket and state-file policy), `control.rs`
 (JSON-RPC over UDS), `daemon.rs` (graph state + method impls), `runtime.rs`
 (endpoint-keyed data-plane `Wiring` + the shared fragmentation and fan-out helpers),
 `boundary.rs`, `cell.rs`, `registry.rs`, `tap.rs`, and
 `nodes/{mod,serial,pty,log,codec,exec,leg,map}.rs`. The single unsafe-bearing module
-is the separate `nexus-sys` crate (ioctls, raw `read`/`write`/`fcntl`,
-`poll_ready`/`poll_blocking`). AGENTS.md §3 carries the current crate-by-crate table
+is the separate `serial-nexus-sys` crate (ioctls, raw `read`/`write`/`fcntl`,
+`poll_ready`/`poll_blocking`). AGENTS.md §1 carries the current crate-by-crate table
 and is the one to keep in sync.
 
-The integration harness is the canonical exit criterion (plan §3): the `nexus-itest`
+The integration harness is the canonical exit criterion (plan §3): the `serial-nexus-itest`
 crate, run by `cargo test` like any other. It replaced the bash `scripts/validate/**`
 maze in §16.11 — `scripts/` is **deleted**, `bash` appears nowhere in the gates, and each
-former phase script is a `nexus-itest/tests/*.rs`. Where a section below still names a
+former phase script is a `itest/tests/*.rs`. Where a section below still names a
 `phaseN/*.sh`, read it as a dated record of what ran at the time, and see the migration
 entry above for the script→test mapping.
 
@@ -2669,7 +2756,7 @@ kernel/library reality shaped the approach. None contradict the design.
 
 ### 3.1 Serial node uses blocking `serial2` + poll-based readiness, not `serial2-tokio`
 **Design:** §13 lists `serial2`/`serial2-tokio` for "concurrent async read/write."
-**Reality (nexus-doctor P3 research):** `serial2-tokio` 0.1.24 exposes **no
+**Reality (serial-nexus-doctor P3 research):** `serial2-tokio` 0.1.24 exposes **no
 accessor for the inner fd**, and `serial2` **does not take `TIOCEXCL`** (only
 `O_NOCTTY`). The daemon needs the raw fd for `TIOCEXCL` (§7.1) and later
 `TIOCGICOUNT` (§5).
@@ -2678,14 +2765,14 @@ break, and the raw ioctls via `as_raw_fd`), set it non-blocking, and drive async
 I/O with poll-based readiness (see §3.10) — rather than `serial2-tokio`.
 Consistent with §13's "raw termios via nix/rustix as the fallback." `TIOCEXCL` is
 issued by the daemon itself (`nodes/serial.rs`). `serial2-tokio` is now an unused
-dependency and was dropped from `serialnexusd/Cargo.toml` — and, in the v3
+dependency and was dropped from `daemon-bin/Cargo.toml` — and, in the v3
 realignment, from the root `Cargo.toml` `[workspace.dependencies]` as well, so the
 design's "dropped during implementation" (§13, §15.1) is literally true of the
 manifest.
 
 ### 3.2 PTY slave is *primed* at creation (POLLHUP never-opened refinement)
 **Design:** §7.2 detects presence via the master's HUP condition.
-**Reality (nexus-doctor P2):** a master whose slave was **never opened** does
+**Reality (serial-nexus-doctor P2):** a master whose slave was **never opened** does
 **not** report `POLLHUP`; HUP only appears after the first open→close. So HUP
 alone cannot represent the initial no-client state.
 **Decision:** at PTY node creation, open and immediately close the slave once
@@ -2698,14 +2785,14 @@ design text; it is a faithful refinement of §7.2's model, confirmed identical o
 **Design:** §5 — a transform that has emitted output when downstream refuses
 "parks it in its holdover slot."
 **Refinement:** a chunk parked on the *last* offer would be stranded if the
-runtime only retries on new origin input. `nexus-core::data::TargetwardSink` has
+runtime only retries on new origin input. `serial-nexus-core::data::TargetwardSink` has
 a `flush()` method that drains parked holdovers in order, independent of new
 input. Caught by a property test (`prop_targetward_no_loss_bounded_interior`). v4 §5
 now names this explicitly ("boundaries announce writability, and the runtime drains
 parked holdover frames on that signal, independent of any new origin input").
 **Correction (review 26, F3/LOCK-3):** this entry used to say "the runtime calls
 `flush()`". It does not, and never did — nothing outside `data.rs` calls it, because
-`nexus_core::data` is the executable *specification* of §5, not the shipped data path
+`serial_nexus_core::data` is the executable *specification* of §5, not the shipped data path
 (§3.18). The anti-stranding property is real and is carried in the daemon by the
 channel-plus-`send().await` shape: a paused origin is literally a task suspended inside
 `tx.send(chunk).await`, and resumption *is* the bounded channel waking it, so there is
@@ -2718,11 +2805,11 @@ model/path split outright; read the two together.
 (`"usb0"` or `"mux/console"`), not a nested `{node, endpoint}` table. This keeps
 edges all-scalar and TOML-clean and makes configs read the way operators write
 them. The design does not specify the on-disk encoding of an address; this is a
-presentation choice. (`nexus-core::graph::EndpointAddr`.)
+presentation choice. (`serial-nexus-core::graph::EndpointAddr`.)
 
 ### 3.5 JSON-RPC `id: null` and result-XOR-error validation
 **Design:** §10 — hand-rolled JSON-RPC 2.0.
-**Refinement (from an adversarial review):** `nexus-rpc` now has an `Id::Null`
+**Refinement (from an adversarial review):** `serial-nexus-rpc` now has an `Id::Null`
 variant and `Response::error_without_id`, so a parse-error / invalid-request
 reply carries the spec-mandated `id: null` (JSON-RPC 2.0 §5) and never desyncs a
 client's read stream; and `Response`'s deserializer enforces exactly-one-of
@@ -2731,7 +2818,7 @@ Completes §10's contract; not a deviation.
 
 ### 3.6 `load` RPC carries the config as JSON, not TOML text
 **Design:** §10 — "Configuration files are TOML; the RPC carries JSON."
-**Decision:** `serialnexusctl` reads the `.toml` file, parses it to
+**Decision:** `serial-nexus-ctl` reads the `.toml` file, parses it to
 `GraphConfig`, and sends `{"config": <GraphConfig as JSON>}` in the `load`
 params; `dump` returns the config as JSON and the CLI renders TOML. The CLI owns
 the TOML↔JSON conversion (presentation, §15.16); the daemon speaks only JSON.
@@ -2739,7 +2826,7 @@ the TOML↔JSON conversion (presentation, §15.16); the daemon speaks only JSON.
 ### 3.7 Daemon-specific error codes
 `load` on a non-empty graph → `-32001`; a structural validation failure →
 `-32002` (with all offenders in `error.data.errors`). Both in the reserved
-application range `[-32099, -32000]` (§10). `nexus-rpc::error_codes` unchanged.
+application range `[-32099, -32000]` (§10). `serial-nexus-rpc::error_codes` unchanged.
 
 ### 3.8 `advertised_baud` maps to standard rates only
 PTY `advertised_baud` is cosmetic (§7.2). nix on Linux sets termios speed via a
@@ -2811,7 +2898,7 @@ hot hostward path moved to a blocking thread). The design pass this section aske
 for is done; the code comments were repointed from §15.18 to §15.19 to match.
 
 ### 3.12 Arbitration addressing: `lock`/`unlock` name the origin, not the endpoint
-**Design:** §6 shows `serialnexusctl lock <node/channel>` and `send <node/channel>`
+**Design:** §6 shows `serial-nexus-ctl lock <node/channel>` and `send <node/channel>`
 without pinning down whether `<node/channel>` is the origin acquiring the lock or
 the host-facing endpoint being locked.
 **Decision (phase 4, slice A):** the lock lives on a **host-facing endpoint** (the
@@ -2822,9 +2909,9 @@ makes the reference workflow coherent: `lock ptya` grants *ptya* the write lock 
 its operator can type, while other origins on the same serial are locked out. The
 later `send` verb (slice C) instead names the **target** endpoint, since the CLI is
 itself the transient origin. This is a presentation/RPC-shape choice the design
-leaves open (§15.16); the state machine (`nexus_core::lock`) is addressing-agnostic
+leaves open (§15.16); the state machine (`serial_nexus_core::lock`) is addressing-agnostic
 (it keys on an opaque `OriginId`), so a future spelling change costs only the daemon
-glue. **Architecture:** the lock is a pure state machine in `nexus_core::lock`
+glue. **Architecture:** the lock is a pure state machine in `serial_nexus_core::lock`
 (property-tested); the daemon shares one `Rc<RefCell<EndpointLock>>` per endpoint
 (all tasks are on the one runtime thread) between the control-plane methods that
 mutate it and each origin's PTY read task, which consults `may_write` before
@@ -2938,12 +3025,12 @@ operator-recoverable — but it is a visible on-upgrade behavior change worth no
   client and a half-close are indistinguishable at read-EOF, so a "keep awaiting on EOF"
   policy strands the killed waiter (verified: it regressed both `waiting.sh` and, via a
   hung control connection, `resync.sh`). The design-correct behavior — any second-lane
-  resolution (EOF/pipeline/error) cancels the wait — is therefore *kept*. `serialnexusctl`
+  resolution (EOF/pipeline/error) cancels the wait — is therefore *kept*. `serial-nexus-ctl`
   holds both socket halves open across the read, so its waiting verbs are unaffected; a raw
   `socat` waiting-verb user must likewise keep the write half open. CTRL-1 (the 1 MiB
   request-line bound via the new `RequestLines` reader) is the substantive control.rs fix
   and is applied.
-- **daemon-arbitration-1 is fixed in `nexus-core::lock::acquire`.** While the lock is free
+- **daemon-arbitration-1 is fixed in `serial-nexus-core::lock::acquire`.** While the lock is free
   but a registered `held` origin (a demux) exists that is not the caller, `acquire` now
   returns `Denied { held_by }` *before* the FIFO-head check, so a woken on-demand `--wait`
   waiter re-parks and the held origin's `reclaim_held` wins deterministically rather than
@@ -3015,9 +3102,9 @@ sharing is the point: the reachable failure was two maps attached to one upstrea
 `state`. A validator re-deriving the rule would have missed the promoted shape; calling the same
 function cannot.
 
-### 3.18 `nexus_core::data` is the executable specification of §5, not the shipped data path
+### 3.18 `serial_nexus_core::data` is the executable specification of §5, not the shipped data path
 **Design:** §5 — the deliver contracts, the one-chunk holdover, boundary-only policy.
-**Reality:** nothing outside `nexus-core/src/data.rs` references `HostwardConsumer`,
+**Reality:** nothing outside `core/src/data.rs` references `HostwardConsumer`,
 `HostFanout`, `MockConsumer`, `TargetwardSink`, `Holdover`, `BusyBoundary` or `Delivery`; only
 the `Chunk` type alias escapes the module. The daemon implements the same semantics directly
 on bounded `tokio::sync::mpsc` channels in `runtime.rs` and each `nodes/*.rs`.
@@ -3037,19 +3124,19 @@ F1/DM-3). The targetward half is still per-node, so the two-places rule above st
 
 ### 3.19 Two crates expose an `unstable_fuzz_api` module the design says should not exist
 **Design:** §15.26 — "the supported extension surface is exactly two contracts, both semver'd:
-`codec-api` for in-process codecs, and the narrow `nexus-daemon` entry API (run options,
+`serial-nexus-codec-api` for in-process codecs, and the narrow `serial-nexus-daemon` entry API (run options,
 registry, version constants); **everything else stays private**."
-**Reality:** `nexus-daemon` and `serialnexusweb` each expose a `pub mod unstable_fuzz_api`
+**Reality:** `serial-nexus-daemon` and `serial-nexus-web` each expose a `pub mod unstable_fuzz_api`
 re-exporting internals — the control-socket line framer (`RequestLines`, `LineRead`,
 `MAX_REQUEST_LINE`) and the web console's HTTP head parser (`read_request`, `Request`,
-`MAX_HEAD`, `split_authority`, `origin_matches_host`). `serialnexusweb` also gained a library
+`MAX_HEAD`, `split_authority`, `origin_matches_host`). `serial-nexus-web` also gained a library
 target beside its binary so that its module can exist at all.
 **Decision: operator's call, taken deliberately, reversing the disposition this file carried
 one commit earlier.** Review 26's SEC-7 observed that all four fuzz targets sat on the
-`codec-api` layer, so every parser reachable *without* a leg was unfuzzed. Three of those were
+`serial-nexus-codec-api` layer, so every parser reachable *without* a leg was unfuzzed. Three of those were
 closed with no API change. The remaining two — the daemon's front door, and the most
 network-exposed parser in the project — were declined on §15.26 grounds, with the note that
-"the honest move is to lift the reader into a crate of its own, not to widen `nexus-daemon`."
+"the honest move is to lift the reader into a crate of its own, not to widen `serial-nexus-daemon`."
 That rule is now suspended for these two modules: the stability promise is carried by a doc
 comment on each module stating in its first line that nothing inside is supported, semver'd, or
 guaranteed to exist next release, and that an embedder must not use it. The parent modules
@@ -3072,7 +3159,7 @@ erosion this entry exists to catch. The rule is: a re-export here must have a ta
 
 ### 3.20 Justified deviations confirmed by review 32 (2026-07-27)
 
-The third comprehensive review (`docs/32-claude-opus-code-review.md`, 99 candidate findings each
+The third comprehensive review (`docs/historical/32-claude-opus-code-review.md`, 99 candidate findings each
 adversarially verified on a frozen tree) produced ten refutations and two already-known dispositions.
 Several of those exist because the **code is right and something else is wrong** — the design text, a
 doc comment, or the finder's model of the system. They are recorded here, in the same slot family as
@@ -3095,12 +3182,12 @@ for. The destructive-typo path this was feared to open is closed elsewhere and s
 "a non-empty source that parses to an *empty* graph is refused rather than obeyed", and its predicate
 is literally `config.is_empty() && !text.trim().is_empty()` — it needs the **source text**. The RPC
 verb receives a deserialized `GraphConfig`, never TOML, so the daemon cannot evaluate the rule even in
-principle; `config.rs`, `graph.rs` and `serialnexusctl/src/main.rs` all say so in comments. What
+principle; `config.rs`, `graph.rs` and `ctl/src/main.rs` all say so in comments. What
 remains reachable over raw RPC is a client *deliberately* sending `{"config":{},"replace":true}`,
 which is an operator act, not a typo. `docs/rpc/configuration.md` already documents the split. If
 anything changes here it should be design §11's wording, not the daemon.
 
-**(c) `nexus-sys::poll_ready`'s `unwrap_or_else(PollFlags::empty)` cannot silently swallow a real
+**(c) `serial-nexus-sys::poll_ready`'s `unwrap_or_else(PollFlags::empty)` cannot silently swallow a real
 readiness bit.** *(review 32 `DOC-1`, refuted.)* nix's `revents()` returns `None` — not a truncated
 set — for any bit it does not model, which reads like a latent data-loss bug. It is unreachable:
 `poll(2)` masks `revents` to `requested | POLLERR | POLLHUP` (plus `POLLNVAL`), and every call site in
@@ -3118,19 +3205,21 @@ author adding a knob is routed to the right file by the build, not by memory.
 
 **(e) `EndpointLock::register` over a live registration is unreachable from the daemon.** *(review 32
 `LOCK-1`, refuted.)* Re-registering an attached origin does corrupt the holder/`may_write` pair when
-driven through the pure `nexus-core` API, but two deliberate mechanisms prevent the daemon from ever
+driven through the pure `serial-nexus-core` API, but two deliberate mechanisms prevent the daemon from ever
 doing it — `SEND_ORIGIN_BASE` (so a transient CLI origin cannot collide with a real one) and
 `next_edge_origin`'s floor taken from `Wiring`'s own counter — and no verb mutates a registered
 origin's write mode. The remaining `register` call sites are `#[cfg(test)]`.
 
 **(f) `tap.open`'s `epoch` is covered, indirectly but genuinely.** *(review 32 `ITEST-2`, refuted;
-`TESTR-1` records the same observation.)* `grep -rni epoch nexus-itest/` really is zero hits, which
-looks like a brand-new protocol field shipping unguarded. But
+`TESTR-1` records the same observation.)* `grep -rni epoch itest/` really was zero hits **when this
+was written**, which looks like a brand-new protocol field shipping unguarded. But
 `p8_tap_offsets.rs::tap_offsets_reset_on_load_replace_while_the_instance_nonce_does_not` already
 asserts `tap.closed` with reason `"graph replaced"` — emitted **only** when the hub is dropped — *and*
 `from_offset == 0` on the reopen, which catches hub-reuse and offset-restart from opposite directions.
 A direct epoch assertion is still worth adding (it is cheap and names the contract), but this is an
-improvement, not a hole.
+improvement, not a hole. **It was added:** the remediation's own `p12_tap_replay.rs` asserts the
+epoch directly (`ack2["epoch"] == ack1["epoch"]` across a reopen), so the grep above now returns
+six hits and the paragraph stands as the record of a refuted finding rather than a live gap.
 
 **(g) The `unstable_fuzz_api` disclaimer is where an embedder would meet it.** *(review 32 `DOCR-7`,
 refuted.)* `lib.rs`'s crate doc says the entry surface is "the only public API" while
@@ -3183,12 +3272,35 @@ deviation rather than as a to-do**, which means a future session may close it, b
 the §16.1 item it is (rename to something direction-neutral, make the loss counter optional, rebase all
 three, keep `SerialNode::drop`'s join-after-abort ordering) rather than as a local tidy of `pty.rs`.
 
+### 3.22 Directories dropped the retired vocabulary; plan §17.1's "directories unchanged" gave way
+
+Plan §17.1 said the rename lands "with directories unchanged via explicit `name =` fields", and plan
+§17.2 said the meta-gate must fail "on any hit outside `docs/historical/`". Those cannot both hold: a
+directory still carrying a retired name is itself a hit, and so is every workspace `members` entry,
+path dependency, `.gitignore` line and CI `working-directory` naming one. Design §15.40 and AGENTS.md
+§11 both say only that directory names stay **short**, which a rename to short stems satisfies, so
+the design was left alone and the plan's clause was amended in place (it now records why).
+
+The layout: `core/`, `rpc/`, `sys/`, `daemon/` (the library), `daemon-bin/` (the seventy-line thin
+binary), `ctl/`, `web/`, `sim/`, `doctor/`, `itest/`, with `codec-api/` and `codecs/reference/`
+unchanged — neither carried a retired token. Package names are hyphenated throughout, so every lib
+target auto-derives to the `serial_nexus_*` spelling §15.40 names as importable; the one wart is
+`serial-nexus-daemon-bin`, the package producing the `serial-nexus-daemon` binary, because the
+consumer-facing *library* is the one that deserves the clean name and Cargo will not give it to both.
+Underscored library packages (`serial_nexus_daemon`) were rejected: two packages differing only by
+separator collide on crates.io and read as a typo everywhere else.
+
+**The corollary is the part worth remembering**, because it cost two red gates: a gate that scans the
+filesystem spells the **directory**, a manifest or a `use` spells the **crate**, and a `Command::new`
+spells the **binary**. A textual rename that does not distinguish them will convert all three to
+whichever it saw first.
+
 ---
 
-## 4. Findings carried forward (from nexus-doctor)
+## 4. Findings carried forward (from serial-nexus-doctor)
 
-Full report: `docs/nexus-doctor.md`. Re-runnable per system with
-`cargo run -p nexus-doctor` (Markdown) / `--json | jq -e -f expectations/linux.jq`.
+Full report: `docs/serial-nexus-doctor.md`. Re-runnable per system with
+`cargo run -p serial-nexus-doctor` (Markdown) / `--json | jq -e -f expectations/linux.jq`.
 
 - **P1 EXTPROC/TIOCPKT — supported (7.0 & 6.18).** Packet-mode observation is the
   primary path; the §7.2 reconciliation poll remains an unconditional backstop
@@ -3248,29 +3360,29 @@ Full report: `docs/nexus-doctor.md`. Re-runnable per system with
 ## 5. How to build, test, run
 
 ```bash
-# `cargo build` first is NOT optional: the nexus-itest harness boots the plain
-# target/debug/{serialnexusd,nexus-sim,serialnexusweb,nexus-doctor} artifacts, which only
+# `cargo build` first is NOT optional: the serial-nexus-itest harness boots the plain
+# target/debug/{serial-nexus-daemon,serial-nexus-sim,serial-nexus-web,serial-nexus-doctor} artifacts, which only
 # `cargo build` emits — `cargo test` alone on a clean tree fails every itest.
 cargo build --workspace --locked
 # The one suite: unit + property tests AND the whole integration harness. There is no
 # separate validation step any more — `scripts/` was deleted in §16.11 and every former
-# phase script is now a `nexus-itest/tests/*.rs` (§5 of AGENTS.md).
+# phase script is now a `itest/tests/*.rs` (§5 of AGENTS.md).
 cargo test --workspace --locked
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p nexus-itest --test p4_steal_lease     # one former phase script
-cargo test -p nexus-itest --test p8_soak -- --ignored   # the endurance soak
+cargo test -p serial-nexus-itest --test p4_steal_lease     # one former phase script
+cargo test -p serial-nexus-itest --test p8_soak -- --ignored   # the endurance soak
 
 # Capability report on this machine (attach to any bug report):
-cargo run -p nexus-doctor                      # Markdown
-cargo run -p nexus-doctor -- --port /dev/ttyUSB0   # include P3 on a real port
+cargo run -p serial-nexus-doctor                      # Markdown
+cargo run -p serial-nexus-doctor -- --port /dev/ttyUSB0   # include P3 on a real port
 
 # Drive the daemon by hand (use a SHORT socket dir — see §7):
 export XDG_RUNTIME_DIR=$(mktemp -d /tmp/snx.XXXXXX)
-./target/debug/serialnexusd &                  # or --config demo.toml, --socket PATH
-./target/debug/serialnexusctl load demo.toml
-./target/debug/serialnexusctl --json state
-./target/debug/serialnexusctl dump
-./target/debug/serialnexusctl shutdown
+./target/debug/serial-nexus-daemon &                  # or --config demo.toml, --socket PATH
+./target/debug/serial-nexus-ctl load demo.toml
+./target/debug/serial-nexus-ctl --json state
+./target/debug/serial-nexus-ctl dump
+./target/debug/serial-nexus-ctl shutdown
 ```
 
 A minimal `demo.toml` (serial→PTY fan of one):
@@ -3282,7 +3394,7 @@ path = "/tmp/snx/console"
 [[node]]
 type = "serial"
 name = "usb0"
-device = "/dev/ttyUSB0"     # or a `nexus-sim pty --echo --link` path
+device = "/dev/ttyUSB0"     # or a `serial-nexus-sim pty --echo --link` path
 [[edge]]
 a = "usb0"
 b = "console"
@@ -3313,7 +3425,7 @@ Real bytes flow serial↔PTY through a configured daemon over RPC. As built:
 - **Wiring:** `runtime::Wiring::build` derives the channels from the validated
   edges; `daemon::load` starts each node via `Node::start` (`spawn_local` on the
   `LocalSet`). Teardown/Drop abort the tasks and close the fds.
-- **`nexus-sim`:** `client --report-termios` opens the daemon's PTY and reports
+- **`serial-nexus-sim`:** `client --report-termios` opens the daemon's PTY and reports
   its termios *without* disturbing it (verifies the §7.2 baseline end to end).
 - **Validated by `scripts/validate/phase2/data-path.sh`:** 64 KiB seeded echo
   round-trip (checksums intact), both nodes `active`, baseline termios from the
@@ -3338,7 +3450,7 @@ the throughput (~185 MiB/s) and idle (2% for 32 fds) axes.
 Per plan §Phase 4, built in slices; test topology needs no codec (PTYs on one
 serial endpoint is a legal §4 fan-out).
 
-- **Slice A DONE: the exclusive write lock.** `nexus_core::lock::EndpointLock` —
+- **Slice A DONE: the exclusive write lock.** `serial_nexus_core::lock::EndpointLock` —
   the pure, property-tested state machine (holder, per-origin write modes, purge
   accounting; `may_write` is the gate). Serial node gains an `arbitration` config
   attribute (§6). `Wiring::build` creates one `Rc<RefCell<EndpointLock>>` per
@@ -3382,7 +3494,7 @@ serial endpoint is a legal §4 fan-out).
   `exclusivity.sh` now also asserts detach-release.
 
 - **Slice C DONE: waiting verbs + the two-lane control plane (§6, §10, §15.20).**
-  - **Pure lock (`nexus_core::lock`):** `EndpointLock` gained a FIFO `waiters`
+  - **Pure lock (`serial_nexus_core::lock`):** `EndpointLock` gained a FIFO `waiters`
     queue, a grant `generation`, `steal`, and `renew`. `acquire` is now queue-aware
     — it grants a free lock **only to the FIFO head** (barge prevention), naming an
     earlier waiter in `Denied { held_by }`. New pure API: `enqueue`/`dequeue`/`steal`
@@ -3441,16 +3553,16 @@ The interior codec node — the first node with more than one endpoint and the f
 non-two-layer topology. Built in three slices, then an adversarial audit fixed 14
 findings.
 
-- **Slice A — pure contracts + reference codec + sim modes.** `nexus-core` gained the
+- **Slice A — pure contracts + reference codec + sim modes.** `serial-nexus-core` gained the
   `NodeConfig::Codec` variant (codec name, `faces`, channel list, opaque `attributes`
   table; multiplexed side = the default/empty endpoint, channels = identities) and the
   shape/validation; `Eq` was dropped from `GraphConfig`/`NodeConfig` (a `toml::Table`
   carries floats — only `PartialEq`; nothing needed `Eq`). New crate
-  **`codecs/reference`** (`codec-reference`): the v1 envelope framing as a `Codec`,
+  **`codecs/reference`** (`serial-nexus-codec-reference`): the v1 envelope framing as a `Codec`,
   with **length-guided resync** — on a body-decode error with an intact length prefix,
   skip exactly `4 + body_len` and count one framing error; only a mangled length prefix
   is unrecoverable, and the reliable-transport link codec (phase 6) never hits it, so
-  §8's one shared frame format holds. `nexus-sim` grew **`mux`** (round-robin
+  §8's one shared frame format holds. `serial-nexus-sim` grew **`mux`** (round-robin
   seeded per-channel data → reference frames, `--corrupt-every`, a deterministic
   `--manifest` oracle, and a `--wait-file` feed gate so presence-gated channel PTYs
   don't miss the burst) and **`envelope`** (drives an external codec child through the
@@ -3512,7 +3624,7 @@ The cross-daemon transport (§7.4/§9/§15.24). Built as one coherent slice (con
 wire contracts, then the leg node, then the six validation scripts), then an
 adversarial audit fixed 17 findings.
 
-- **Wire contracts (`codec-api`).** The v1 **hello** frame: `WIRE_MAGIC` (`0x534E584C`
+- **Wire contracts (`serial-nexus-codec-api`).** The v1 **hello** frame: `WIRE_MAGIC` (`0x534E584C`
   "SNXL"), `WIRE_VERSION = 1` (versioned independently of `ENVELOPE_VERSION`), a `u32`
   capability bitset (`CAP_LOCK_RELAY = 1<<0` reserved, negotiated none in v1),
   `Hello{version,capabilities,channels}`, `encode_hello`/`try_decode_hello`,
@@ -3521,7 +3633,7 @@ adversarial audit fixed 17 findings.
   begins with the magic so it never collides with a data frame. `try_decode_hello`
   validates the version-stable magic+version prefix *before* the v1 12-byte header, so
   a version mismatch is always refused as such (audit fix).
-- **Config (`nexus-core`).** `NodeConfig::Leg` (+ `Transport`/`LegRole`); `shape()`
+- **Config (`serial-nexus-core`).** `NodeConfig::Leg` (+ `Transport`/`LegRole`); `shape()`
   emits one endpoint per channel, all facing `faces`, **no default endpoint** (the
   socket is off-graph); host-facing channels carry the leg's arbitration.
   `GraphConfig::validate` gained the loopback-only check (tcp non-loopback needs
@@ -3544,7 +3656,7 @@ adversarial audit fixed 17 findings.
   to be dropped at the peer). Outage = faulted-and-wait: reconnect backoff, listen
   reject-extras, park the receivers, purge-on-reconnect (faces=host targetward
   backlog), and park the SEND half — not tear down — when local producers close.
-- **`nexus-sim`.** `wire` (hostile-or-conforming peer: crafted `--hello-version`,
+- **`serial-nexus-sim`.** `wire` (hostile-or-conforming peer: crafted `--hello-version`,
   `--bad-magic`, `--oversize-frame`, `--unknown-type`, `--echo`, `--send`, `--stall`)
   and `tcp-proxy` (`--drop-after`/`--restore-after` outage injection) modes; `pty
   --stall`.
@@ -3582,7 +3694,7 @@ Built in seven slices (§12/§7.1/§11/§10 + doctor P5), then an adversarial au
 fixed 5 findings. New ADR **§15.25**; §11/§14 touched (state-file path policy,
 deferred `connect`/`disconnect`/`set-attribute`).
 
-- **The resolver (`nexus-core/src/resolver.rs`, §12).** A dependency-free (no
+- **The resolver (`core/src/resolver.rs`, §12).** A dependency-free (no
   libudev) module lifting the doctor's P4 sysfs walk into shared code — the doctor
   P4 probe now consumes it (`Resolver::with_roots(...).discover_adapters()`). Rooted
   by a `dev_root` whose `sys_root = dev_root/sys`, so a single `--dev-root` selects a
@@ -3605,15 +3717,15 @@ deferred `connect`/`disconnect`/`set-attribute`).
   the lock-purge's job, §6). fd-reuse-safe (reader joined before the port drops);
   `WriterClosed` keeps hostward alive when targetward senders drop (§15.24 lesson).
   New serial config field `purge_on_reconnect` (default on). **Test-fidelity:** a
-  finite `nexus-sim pty --source` now CORRECTLY faults-and-waits when it closes —
+  finite `serial-nexus-sim pty --source` now CORRECTLY faults-and-waits when it closes —
   `pty --hold-ms` was wired to keep the device "plugged in"; `subscribe.sh` uses it;
   `log.sh` Check 3 now relies on **auto-recovery** (below) instead of a manual reload.
 - **State file (`daemon.rs`/`main.rs`, §11/§15.9).** `Daemon::snapshot_config` writes
   config (TOML, atomic tmp+rename) after every config-mutating verb (dispatch-gated by
   `is_config_mutation`, NOT on read/arbitration traffic). Startup **prefers the state
   file** over `--config`. Default path is **socket-adjacent** (`<socket-stem>.state.toml` —
-  the socket's *stem*, so `/run/serialnexusd.sock` yields `/run/serialnexusd.state.toml`,
-  never `serialnexusd.sock.state.toml`; review 32 `RV-6`)
+  the socket's *stem*, so `/run/serial-nexus-daemon.sock` yields `/run/serial-nexus-daemon.state.toml`,
+  never `serial-nexus-daemon.sock.state.toml`; review 32 `RV-6`)
   — session-durable + restart-recovering, and per-daemon-unique so it never leaks
   across test daemons or into `$HOME`; `--state-file` gives reboot durability. Clean
   shutdown (`teardown_all`) does NOT persist an empty graph (preserves it for restart);
@@ -3638,13 +3750,13 @@ deferred `connect`/`disconnect`/`set-attribute`).
   lacks modem lines, so `set-modem`/`pulse-dtr` return `ENOTTY` there (the exact
   Tier-3 boundary — the verb reached the live port); `send-break` latches on a pts;
   true master-side DTR/break observation is a Tier-3 hardware checklist item.
-- **Doctor P5 + nexus-sim nullmodem (§13/§15.21).** P5 (`probes.rs`) classifies each
+- **Doctor P5 + serial-nexus-sim nullmodem (§13/§15.21).** P5 (`probes.rs`) classifies each
   named port dangling/loopback/paired (both directions, so a half-crossed rig is named
   Degraded, never Unsupported) and certifies real UARTs, reporting `skipped (not a
   UART)` for the sim pts. Passive: `--port`-gated like P3. Discovery is a **poll-driven
   continuous scan** with periodic nonce re-sends + a 5 ms yield (a busy-spin on a
   perpetually-ready port would starve a software echo peer — a real bug found while
-  hardening). `nexus-sim nullmodem --link-a/--link-b` bridges two PTY pairs as a
+  hardening). `serial-nexus-sim nullmodem --link-a/--link-b` bridges two PTY pairs as a
   crossed pair. `expectations/linux.jq` gained a P5 `{supported,skipped}` clause.
   **Test note:** `phase7/p5.sh` runs the doctor twice (pair+dangling in one, loopback
   in its own) — a software `pty --echo` peer competing for CPU with other active peers
@@ -3685,11 +3797,11 @@ ADR (nothing contradicted the design); the additions are all §13/§Phase-8 plan
   `cargo check --target x86_64-apple-darwin --workspace` (which type-checks cfg
   resolution; it found the two blockers *and* one the up-front research missed). Two
   hard-compile blockers, both `#[cfg(target_os = ...)]`-gated: (1) **`libc::TIOCGICOUNT`**
-  (Linux-only ioctl) in `serialnexusd/src/sys.rs` and `nexus-doctor/src/sys.rs` —
+  (Linux-only ioctl) in `daemon-bin/src/sys.rs` and `doctor/src/sys.rs` —
   gated with a `#[cfg(not(target_os="linux"))]` `read_icounts`/`read_icounter` stub
   returning `ENOTSUP`, which the callers already map to "omit driver counters, never
   fault" (the same path a pts takes on Linux); (2) **`nix::pty::ptsname_r`** (Linux/
-  Android-only reentrant variant) in `pty.rs`, `probes.rs`, and `nexus-sim` — a shared
+  Android-only reentrant variant) in `pty.rs`, `probes.rs`, and `serial-nexus-sim` — a shared
   `sys::ptsname` wrapper (the daemon's + doctor's `sys` modules, a localized
   `#[allow(unsafe_code)]` fn in the deny-unsafe sim) uses `ptsname_r` on Linux and the
   static-buffer `unsafe ptsname` elsewhere. Plus the high-baud `BaudRate::{B460800,
@@ -3709,10 +3821,10 @@ ADR (nothing contradicted the design); the additions are all §13/§Phase-8 plan
   `docs/rpc/` (7 man-style pages over the full §10 verb surface, error codes,
   notifications — the docs auditor caught that the daemon defines a 5th app code
   `-32001` load-on-non-empty beyond the four in the research catalog).
-- **Packaging.** `packaging/serialnexusd.service` (a hardened systemd unit —
+- **Packaging.** `packaging/serial-nexus-daemon.service` (a hardened systemd unit —
   `DynamicUser`, `RuntimeDirectory`/`StateDirectory`/`LogsDirectory`, sandboxing with
   the deliberate device-access loosenings, validated by `systemd-analyze verify`),
-  `serialnexusd.example.toml` (the §2 reference topology; load-verified), a udev rule,
+  `serial-nexus-daemon.example.toml` (the §2 reference topology; load-verified), a udev rule,
   and `packaging/README.md`.
 - **Fuzzing.** `fuzz/` — a cargo-fuzz crate (EXCLUDED from the workspace via root
   `[workspace] exclude`, needs nightly + libFuzzer) with four targets over the pure
@@ -3723,7 +3835,7 @@ ADR (nothing contradicted the design); the additions are all §13/§Phase-8 plan
   libFuzzer glue needs nightly); a nightly CI job builds and runs each briefly.
 - **Release validation.** `scripts/validate/phase8/{quickstart,agent-task,soak}.sh`.
   quickstart = the five-minute echo, wall-clocked under budget; agent-task = the full
-  operator scenario via `serialnexusctl --json` (inspect → lock + LOCKED negative
+  operator scenario via `serial-nexus-ctl --json` (inspect → lock + LOCKED negative
   control → send --steal → device-received via the echo→log oracle → rotate + byte-exact
   continuity → unlock), all deterministic with `printf|sha256sum` oracles; soak =
   parameterized (`SOAK_SECONDS`, default 8 smoke / nightly 1800+) asserting bounded
@@ -3734,10 +3846,10 @@ ADR (nothing contradicted the design); the additions are all §13/§Phase-8 plan
   macOS lane and nightly soak/fuzz jobs (`schedule` cron). *(The `phase5/demux.sh`
   flake that once justified capping the sweep is now fixed — see §7.)*
 - **⚠️ Audit fixes (5 confirmed, ALL FIXED; do NOT regress).** (1) **[HIGH] packaged
-  log node faulted out-of-the-box** — the unit granted `/var/log/serialnexusd` via
+  log node faulted out-of-the-box** — the unit granted `/var/log/serial-nexus-daemon` via
   `ReadWritePaths`, which flips the mount but does NOT chown, so the `DynamicUser`
   couldn't create files and the example config's `cap` log node faulted on `EACCES`
-  every boot. **Fixed** with `LogsDirectory=serialnexusd` (systemd creates AND chowns
+  every boot. **Fixed** with `LogsDirectory=serial-nexus-daemon` (systemd creates AND chowns
   it); removed the README's manual `install -d` step and documented the chown caveat
   for extra log dirs. (2) **[HIGH] `envelope_decode` fuzz target false-fired** — it
   asserted decode→encode byte-identity, but `try_decode` consumes `frame_end`
@@ -3755,7 +3867,7 @@ ADR (nothing contradicted the design); the additions are all §13/§Phase-8 plan
   UP to `security.md`'s tighter claims. (5) **[LOW] `security.md`↔unit drift** (device
   policy wording, a divergent inline unit copy missing the pty device rules). **Fixed**
   by rewording the device-policy prose and replacing the drift-prone inline unit with a
-  pointer to the canonical `packaging/serialnexusd.service`. 0 findings refuted. All
+  pointer to the canonical `packaging/serial-nexus-daemon.service`. 0 findings refuted. All
   gates green after fixes: 42/42 `all.sh --through 8`, 87 tests, fmt/clippy/macOS-check
   clean.
 
@@ -3770,7 +3882,7 @@ ADR (nothing contradicted the design); the additions are all §13/§Phase-8 plan
 - **Serial device access:** the daemon runs as its own user and needs r/w on the
   device node. On the dev box `/dev/ttyUSB0` was `root:dialout 660`; a udev rule
   `SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="0403", GROUP="plugdev",
-  MODE="0660"` (or dialout membership) grants it. `nexus-doctor`'s env checks
+  MODE="0660"` (or dialout membership) grants it. `serial-nexus-doctor`'s env checks
   report `group:*` membership and `access:<dev>`.
 - **`Cargo.lock` is committed** (v3 plan §2): this is a binary workspace, and the
   cargo-deny gate is only as strong as the graph it inspects — an uncommitted lock
@@ -3778,7 +3890,7 @@ ADR (nothing contradicted the design); the additions are all §13/§Phase-8 plan
   removed from `.gitignore` in the v3 realignment.
 - **Licensing gate** (`deny.toml`) is proven in CI (rejects `serialport`); keep
   all new deps permissive (MIT/Apache/BSD/ISC/Zlib/Unicode), §13.
-- **`nexus-doctor` never gates the daemon:** runtime degradation paths (e.g.
+- **`serial-nexus-doctor` never gates the daemon:** runtime degradation paths (e.g.
   §7.2's poll) are unconditional, so a wrong probe misleads a developer but never
   the data plane. Keep it that way.
 - **`phase5/demux.sh` presence-vs-readiness flake — FIXED (test-fidelity only; no
@@ -3788,7 +3900,7 @@ ADR (nothing contradicted the design); the additions are all §13/§Phase-8 plan
   load the burst outran the not-yet-reading consumer and the lossy presence-gated PTY
   shed the head, failing the byte-exact manifest check. The fix is entirely in the
   test double and the harness (plan §3's "presence is not readiness"):
-  - **First-byte handshake (the prescribed fix).** `nexus-sim mux` gained
+  - **First-byte handshake (the prescribed fix).** `serial-nexus-sim mux` gained
     `--prime-file`/`--prime-bytes` and `client` gained `--skip`/`--ready-file`. Two
     phases: once the clients are present, the mux sends a small primer per channel
     (small enough that a present-but-not-yet-draining PTY buffers rather than drops

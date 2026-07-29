@@ -1,6 +1,6 @@
 [package]
-name = "codec-api"
-version = "0.2.0"
+name = "serial-nexus-codec-api"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,7 +12,7 @@ workspace = true
 
 # The conformance kit (§15.26 / plan §10.4): generic suites any `Codec` runs in
 # its own tests. Off by default (it is test scaffolding), enabled by a consumer's
-# dev-dependency `codec-api = { features = ["test-support"] }`.
+# dev-dependency `serial-nexus-codec-api = { features = ["test-support"] }`.
 [features]
 test-support = []
 

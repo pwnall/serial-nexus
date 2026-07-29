@@ -1,14 +1,14 @@
 #![no_main]
-//! Fuzz the **daemon's front door** — `nexus_rpc::parse_incoming_request`, the parser
+//! Fuzz the **daemon's front door** — `serial_nexus_rpc::parse_incoming_request`, the parser
 //! every byte written to the 0600 control socket passes through (§10, §15.16).
 //!
-//! Added for review 26 **SEC-7**: the four original targets all sit on the `codec-api`
+//! Added for review 26 **SEC-7**: the four original targets all sit on the `serial-nexus-codec-api`
 //! layer, so everything reachable *without a leg* was unfuzzed. This is the largest of
-//! those surfaces — it is what a `serialnexusctl`, the web console's bridge, and any
+//! those surfaces — it is what a `serial-nexus-ctl`, the web console's bridge, and any
 //! `socat`-wielding operator all speak, and unlike the wire it needs no peer daemon and
 //! no configuration to reach.
 //!
-//! Scope, matching how the daemon actually calls it: `RequestLines` (in `nexus-daemon`,
+//! Scope, matching how the daemon actually calls it: `RequestLines` (in `serial-nexus-daemon`,
 //! see the note in `Cargo.toml`) does the framing — it splits on `\n`, caps the line
 //! length, strips one trailing `\r`, and refuses invalid UTF-8 with an `InvalidData`
 //! error before this parser ever sees the bytes. So a fuzz case is one UTF-8 line.
@@ -23,7 +23,7 @@
 //!   request, so the daemon and its clients cannot disagree about what was asked.
 
 use libfuzzer_sys::fuzz_target;
-use nexus_rpc::{error_codes, parse_incoming_request, to_line};
+use serial_nexus_rpc::{error_codes, parse_incoming_request, to_line};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(line) = std::str::from_utf8(data) else {

@@ -1,5 +1,5 @@
 # Per-platform expectation for a supported Linux system (plan §4.3):
-#   nexus-doctor --json | jq -e -f expectations/linux.jq
+#   serial-nexus-doctor --json | jq -e -f expectations/linux.jq
 #
 # Encodes what a supported Linux MUST report. Deliberately lenient where the
 # design has a fallback, strict where it does not:
@@ -19,7 +19,7 @@
 #     stop condition before any tiered checklist item runs.
 #
 # The kernel-diff probes (P6..P12) are gated on PRESENCE, not on a particular
-# answer. This is the 6.18 re-gate command (§7: `nexus-doctor --json | jq -e -f
+# answer. This is the 6.18 re-gate command (§7: `serial-nexus-doctor --json | jq -e -f
 # expectations/linux.jq`), and its job there is to prove the *artifact* is
 # complete — every measurement block the 7.0 baseline has, so the two runs are
 # diffable field by field. The finding lives in the numbers inside each block, and

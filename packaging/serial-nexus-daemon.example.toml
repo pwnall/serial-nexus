@@ -1,0 +1,145 @@
+# serial-nexus-daemon example configuration (serial_nexus, design §2 reference topology).
+#
+# Install as /etc/serial-nexus-daemon/config.toml. This is the FIRST-BOOT seed only: once
+# the daemon runs, its own state snapshot (/var/lib/serial-nexus-daemon/state.toml with the
+# packaged unit) is preferred at startup, and you evolve the running graph with the
+# incremental verbs (add-node/remove-node/rotate), not by editing this file (§11).
+#
+# TOML shape: each node is a [[node]] table tagged by `type`; each edge is an [[edge]]
+# joining two endpoint addresses. A bare node name addresses its default endpoint; a
+# codec/leg channel is addressed as `node/channel` (§3).
+
+# --- A physical serial console, fanned out to an operator PTY and a forensic log ---
+
+# The serial port. Prefer a resolver IDENTITY (usb:vid:pid:serial:iface) over a raw
+# /dev path: an identity survives replug, restart, and cold boot with the device
+# unplugged, and cannot be hijacked by a different adapter squatting on the old path
+# (§12). Capture it once with `serial-nexus-ctl add-node`, which echoes the resolved
+# identity back ("bound: FTDI FT232R, serial A6008isP, interface 0"); paste it here.
+# A raw path (device = "/dev/ttyUSB0") also works but carries no identity guarantee.
+[[node]]
+type = "serial"
+name = "usb0"
+device = "usb:0403:6001:A6008isP:00"
+baud = 115200
+# parity, data_bits, stop_bits, flow_control default to 8N1 / none.
+# arbitration defaults to "exclusive": a writer must grab the lock before its bytes
+# reach the device (grab-write-release, or `send`). Set "free-for-all" for a single
+# uncoordinated console.
+arbitration = "exclusive"
+
+# The interactive pseudo-terminal an operator (or a script) attaches to. Open the
+# symlink with any terminal program (picocom, screen, minicom) or drive it over RPC.
+[[node]]
+type = "pty"
+name = "console"
+path = "/run/serial-nexus-daemon/console"
+
+# The append-only forensic log. Rotate on demand with `serial-nexus-ctl rotate cap` —
+# the verb names the NODE, the rotated files are named after the FILE: the current
+# console.log is renamed to console.log.000, then console.log.001, and so on (higher
+# is newer, no shifting cascade). Three digits by default; set `rotation_padding` for
+# more. The directory must be in the unit's ReadWritePaths.
+[[node]]
+type = "log"
+name = "cap"
+directory = "/var/log/serial-nexus-daemon"
+filename = "console.log"
+# overflow defaults to drop-oldest-with-counters; set to "fault" to stop on a full
+# disk instead of dropping.
+
+# Fan-out is implicit at the serial node's host-facing endpoint: two edges, one
+# stream broadcast to both consumers (§4). The log edge is read-only (`never`); the
+# PTY edge is `on-demand` (the default) so its client can acquire the write lock.
+[[edge]]
+a = "usb0"
+b = "console"
+
+[[edge]]
+a = "usb0"
+b = "cap"
+write_mode = "never"
+
+# --- A quirky console, normalized once with a map node (§7.8) --------------------
+#
+# Some consoles emit bare LF (no CR) and expect CR on input. Instead of re-teaching
+# every terminal, log, and remote session that quirk (picocom --imap/--omap on each),
+# a `map` node fixes it in ONE place, and every consumer — PTY, log, leg, web console
+# — sees the corrected stream. The map is an interior transform, not a codec: no
+# channels, no frames, just a stateless byte substitution (§7.8).
+
+[[node]]
+type = "serial"
+name = "quirky"
+device = "usb:0403:6001:BH00LL8O:00"
+
+# hostward = device -> consumers (picocom's --imap): this console emits bare LF, so
+#   `lfcrlf` turns each LF into CR LF and terminals/logs render clean line breaks.
+# targetward = consumers -> device (picocom's --omap): the console's line editor wants
+#   CR, so `lfcr` turns the Enter key's LF into the CR the firmware expects.
+# Within a direction the FIRST matching rule per input byte wins, so list order
+# resolves conflicts deterministically (§7.8). An unknown mapping name fails the load.
+[[node]]
+type = "map"
+name = "qcon"
+hostward = ["lfcrlf"]
+targetward = ["lfcr"]
+
+[[node]]
+type = "pty"
+name = "qterm"
+path = "/run/serial-nexus-daemon/quirky"
+
+# The serial feeds the map's RAW upstream side (`qcon/raw`, a `node/raw` address),
+# `held` so the map owns the console's writes — like a demux's edge to its serial, but
+# with softer stakes: bypassing a map is merely unmapped, not corrupt, so a
+# `serial-nexus-ctl send quirky --steal` injects RAW bytes past the map (§7.8). The
+# map's MAPPED side is the bare node name `qcon`; `send qcon` speaks the mapped stream.
+[[edge]]
+a = "quirky"
+b = "qcon/raw"
+write_mode = "held"
+
+# The map's mapped side (its default endpoint, addressed as the bare node name) fans
+# out to consumers — here the operator PTY (§4). A log or a leg channel could attach
+# here too, all seeing the corrected stream.
+[[edge]]
+a = "qcon"
+b = "qterm"
+
+# --- The reference topology (§2), for reference ---------------------------------
+#
+# To split one multiplexed UART into named channels and forward them to a second
+# machine, add a demux codec and a leg. Sketch (uncomment and adapt):
+#
+# [[node]]
+# type = "codec"
+# name = "mux"
+# codec = "reference"     # a compiled-in codec; or codec = "exec" with argv in
+# channels = ["console", "trace"]   # `attributes` to wrap an external protocol tool
+# faces = "target"        # demultiplexer: multiplexed side faces the device
+#
+# [[node]]
+# type = "leg"
+# name = "uplink"
+# faces = "target"        # computer A consumes local channels for transport
+# transport = "tcp"
+# role = "listen"
+# address = "127.0.0.1:7420"   # loopback-only; carry it over SSH port-forwarding.
+# channels = ["console", "trace"]
+#
+# [[edge]]                # serial (default endpoint) -> codec multiplexed side
+# a = "usb0"
+# b = "mux"
+# write_mode = "held"     # REQUIRED on a codec's multiplexed side: the demux owns the
+#                         # UART's writes, and any other writer would corrupt the
+#                         # framing on the wire (§6/§7.5). Only "held" (the working
+#                         # mode) and "never" (a read-only demux) are accepted here;
+#                         # the load is refused otherwise rather than parking every
+#                         # targetward byte forever.
+# [[edge]]                # a channel -> the operator PTY, the log, and the uplink
+# a = "mux/console"
+# b = "console"
+# [[edge]]
+# a = "mux/console"
+# b = "uplink/console"

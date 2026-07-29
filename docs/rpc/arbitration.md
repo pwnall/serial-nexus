@@ -37,7 +37,7 @@ report is documented on the observation page.
 > therefore keep its write half open across a waiting verb — `nc -N -U` gets no
 > reply at all — which is why the one-shot `nc -N -U` idiom used elsewhere on
 > these pages does not apply to a contended `lock --wait` or `send`.
-> `serialnexusctl` keeps both halves open.
+> `serial-nexus-ctl` keeps both halves open.
 
 > **`lock`/`unlock` name the ORIGIN; `send` names the ENDPOINT.** A lock belongs
 > to an endpoint, but an origin (a target-facing writer) feeds exactly one
@@ -106,10 +106,10 @@ the next holder's line would be interleaved with a departed console's typing.
 ### CLI
 
 ```console
-$ serialnexusctl lock demux                       # fail fast if contended
-$ serialnexusctl lock demux --wait                # block until granted
-$ serialnexusctl lock demux --steal               # take it from the holder
-$ serialnexusctl lock demux --lease-ms 5000       # auto-release after 5s
+$ serial-nexus-ctl lock demux                       # fail fast if contended
+$ serial-nexus-ctl lock demux --wait                # block until granted
+$ serial-nexus-ctl lock demux --steal               # take it from the holder
+$ serial-nexus-ctl lock demux --lease-ms 5000       # auto-release after 5s
 ```
 
 Note the CLI spelling `--lease-ms` maps to the `lease_ms` param.
@@ -175,7 +175,7 @@ is reported, not an error.
 ### CLI
 
 ```console
-$ serialnexusctl unlock demux
+$ serial-nexus-ctl unlock demux
 ```
 
 ### Errors
@@ -233,9 +233,9 @@ the acquire entirely, runs under the same deadline for the same reason.
 ### CLI
 
 ```console
-$ serialnexusctl send usb0 --line "reboot"
-$ serialnexusctl send usb0 --line "reboot" --timeout-ms 500
-$ serialnexusctl send usb0 --line "reboot" --steal
+$ serial-nexus-ctl send usb0 --line "reboot"
+$ serial-nexus-ctl send usb0 --line "reboot" --timeout-ms 500
+$ serial-nexus-ctl send usb0 --line "reboot" --steal
 ```
 
 The CLI spelling `--timeout-ms` maps to `timeout_ms`.

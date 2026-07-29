@@ -3,16 +3,16 @@ resolver = "2"
 members = [
     "codec-api",
     "codecs/reference",
-    "nexus-core",
-    "nexus-rpc",
-    "nexus-sim",
-    "nexus-sys",
-    "nexus-doctor",
-    "nexus-daemon",
-    "serialnexusd",
-    "serialnexusctl",
-    "serialnexusweb",
-    "nexus-itest",
+    "core",
+    "rpc",
+    "sim",
+    "sys",
+    "doctor",
+    "daemon",
+    "daemon-bin",
+    "ctl",
+    "web",
+    "itest",
 ]
 # The cargo-fuzz harness (fuzz/) is a separate crate: it needs a nightly toolchain
 # and libFuzzer, so it is excluded from the normal workspace build/test (§Phase 8).
@@ -42,7 +42,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 
-# CLI parsing (serialnexusctl, nexus-sim, nexus-doctor).
+# CLI parsing (serial-nexus-ctl, serial-nexus-sim, serial-nexus-doctor).
 clap = { version = "4", features = ["derive"] }
 
 # Diagnostics.
@@ -61,22 +61,22 @@ serial2 = "0.2"
 nix = { version = "0.31", default-features = false }
 libc = "0.2"
 
-# Property testing (dev-dependency in nexus-core / codec-api).
+# Property testing (dev-dependency in serial-nexus-core / serial-nexus-codec-api).
 proptest = "1"
 
-# Checksums for the nexus-sim test double's verdicts (§3). Confined to the
+# Checksums for the serial-nexus-sim test double's verdicts (§3). Confined to the
 # non-shipping test binary; RustCrypto is MIT/Apache (permissive, §13).
 sha2 = "0.10"
 
 # Internal crates.
-codec-api = { path = "codec-api" }
-codec-reference = { path = "codecs/reference" }
-nexus-core = { path = "nexus-core" }
-nexus-rpc = { path = "nexus-rpc" }
-nexus-sys = { path = "nexus-sys" }
+serial-nexus-codec-api = { path = "codec-api" }
+serial-nexus-codec-reference = { path = "codecs/reference" }
+serial-nexus-core = { path = "core" }
+serial-nexus-rpc = { path = "rpc" }
+serial-nexus-sys = { path = "sys" }
 # default-features off so the thin binary chooses its built-in codec set by
-# forwarding features (§8); only serialnexusd inherits this dependency.
-nexus-daemon = { path = "nexus-daemon", default-features = false }
+# forwarding features (§8); only serial-nexus-daemon-bin inherits this dependency.
+serial-nexus-daemon = { path = "daemon", default-features = false }
 
 # Lints applied to every crate that opts in with `[lints] workspace = true`.
 # The unsafe-code policy is expressed per-crate at the source level (§2): pure

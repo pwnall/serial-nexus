@@ -9,9 +9,9 @@ program in any language becomes a codec.
 
 Everything below is grounded in the code. The envelope format is defined in
 [`codec-api/src/lib.rs`](../codec-api/src/lib.rs); the exec host is
-[`nexus-daemon/src/nodes/exec.rs`](../nexus-daemon/src/nodes/exec.rs); the
+[`daemon/src/nodes/exec.rs`](../daemon/src/nodes/exec.rs); the
 compiled-in registry is
-[`nexus-daemon/src/registry.rs`](../nexus-daemon/src/registry.rs); the
+[`daemon/src/registry.rs`](../daemon/src/registry.rs); the
 reference codec is [`codecs/reference/src/lib.rs`](../codecs/reference/src/lib.rs).
 The canonical working exec codecs live under
 [`tests/ext-codec/`](../tests/ext-codec/).
@@ -29,7 +29,7 @@ emitting and consuming per-channel events drawn from a small vocabulary:
 | `close` | the channel closed                                 |
 | `error` | a channel-scoped error, with a human-readable reason |
 
-That is the entire vocabulary — four events (`EventKind` in `codec-api`). v1 is
+That is the entire vocabulary — four events (`EventKind` in `serial-nexus-codec-api`). v1 is
 exactly these four; the protocol is evolvable to more per-channel control events
 later, but a codec today produces and consumes only these.
 
@@ -54,7 +54,7 @@ turns a write on `"console"` back into device bytes targetward.
 
 ### (a) A compiled-in Rust codec
 
-Write a small crate against the `codec-api` crate and implement the `Codec`
+Write a small crate against the `serial-nexus-codec-api` crate and implement the `Codec`
 trait:
 
 ```rust
@@ -103,29 +103,29 @@ closure `Fn(&toml::Table) -> Result<Box<dyn Codec>, String>`; a duplicate or
 reserved name (`exec`) is a **startup error**, before any configuration is read.
 Two ways to register:
 
-**In-tree** — add one line to `Registry::with_builtins()` in `nexus-daemon`,
+**In-tree** — add one line to `Registry::with_builtins()` in `serial-nexus-daemon`,
 behind a Cargo feature so a minimal build can drop it (the `reference` codec is the
 example to copy).
 
-**Out-of-tree (closed source)** — keep your codec crate in its own repository
-depending only on `codec-api`, and ship a **dozen-line custom daemon** that links
-the `nexus-daemon` library and registers your codec before calling `run`:
+**Out-of-tree** — keep your codec crate in its own repository
+depending only on `serial-nexus-codec-api`, and ship a **dozen-line custom daemon** that links
+the `serial-nexus-daemon` library and registers your codec before calling `run`:
 
 ```rust
-let registry = nexus_daemon::Registry::with_builtins()
+let registry = serial_nexus_daemon::Registry::with_builtins()
     .register("myproto", |_attrs| {
-        Ok(Box::new(MyCodec::new()) as Box<dyn codec_api::Codec>)
+        Ok(Box::new(MyCodec::new()) as Box<dyn serial_nexus_codec_api::Codec>)
     })?;                              // duplicate / reserved name → startup error
-nexus_daemon::run(options, registry)
+serial_nexus_daemon::run(options, registry)
 ```
 
-Everything else in the ecosystem — `serialnexusctl`, `nexus-sim`, `nexus-doctor`,
-the `nexus-itest` harness — works against your custom binary **unchanged**, because
+Everything else in the ecosystem — `serial-nexus-ctl`, `serial-nexus-sim`, `serial-nexus-doctor`,
+the `serial-nexus-itest` harness — works against your custom binary **unchanged**, because
 they speak the RPC surface and the envelope, never the codec list (§15.16); the
 daemon advertises your codec through the [`info`](rpc/observation.md#info) verb,
 and an unknown codec in configuration fails structurally with the available list in
 `data.available`. The supported extension surface is exactly two semver'd contracts
-— `codec-api` and the narrow `nexus-daemon` entry API — and everything else in the
+— `serial-nexus-codec-api` and the narrow `serial-nexus-daemon` entry API — and everything else in the
 daemon is private, so it can change beneath you without breaking your build. A
 complete worked example lives in
 [`examples/external-codec/`](../examples/external-codec/), built from a consumer's
@@ -164,7 +164,7 @@ All integers are **big-endian**.
  ...  payload           data: the bytes | error: UTF-8 reason | open/close: empty
 ```
 
-Constants, from `codec-api`:
+Constants, from `serial-nexus-codec-api`:
 
 - `MAX_FRAME_SIZE = 65536` (`64 * 1024`). A frame whose `body_len` exceeds this is
   **refused** — the decoder rejects it before buffering the body, and a
@@ -188,7 +188,7 @@ the daemon's targetward framer can no longer fit a single byte.
 ### The decode contract
 
 A correct reader distinguishes three outcomes on the bytes it has so far. This is
-`try_decode` in `codec-api`, and your child must implement the same discipline:
+`try_decode` in `serial-nexus-codec-api`, and your child must implement the same discipline:
 
 - **Whole frame** → `Ok(Some((event, consumed)))`. Consume `consumed` bytes and
   continue.
@@ -206,7 +206,7 @@ valid UTF-8.
 ### The frozen golden vectors
 
 These four byte strings are **frozen** (§15.15). They are asserted in
-`codec-api`'s `golden_vectors` test; a drift is a breaking envelope change and
+`serial-nexus-codec-api`'s `golden_vectors` test; a drift is a breaking envelope change and
 must be deliberate. Use them as conformance fixtures for your implementation — if
 your encoder reproduces these exactly and your decoder round-trips them, your
 framing is correct.
@@ -440,8 +440,8 @@ is `arbitration = "free-for-all"` has none, so `held` and `on-demand` are
 behaviourally identical there and no writer can park — the rule does not fire, rather
 than refusing a graph that runs (§6).
 
-Load it with the daemon's `--config` at startup, or `serialnexusctl load`. Watch
-it with `serialnexusctl state` (or `--json` for the codec's per-channel
+Load it with the daemon's `--config` at startup, or `serial-nexus-ctl load`. Watch
+it with `serial-nexus-ctl state` (or `--json` for the codec's per-channel
 `delivered_hostward` / `discarded_unattached` counters and, beside them at the node
 level, `restart_count`, `discarded_unframable`, and the
 `discarded_unconfigured_channel` / `unconfigured_channels` / `unconfigured_overflow`
@@ -453,17 +453,17 @@ refusal raises).
 
 ### In-process Rust codecs — the conformance kit
 
-`codec-api` ships a generic conformance kit behind its `test-support` feature
+`serial-nexus-codec-api` ships a generic conformance kit behind its `test-support` feature
 (§15.26). Enable it as a dev-dependency and run the suites against your codec from
-your **own** crate's tests — including a closed-source one, which is the point: you
+your **own** crate's tests — including an out-of-tree one, which is the point: you
 prove conformance from the consumer position without forking serial_nexus.
 
 ```rust
 // Cargo.toml:  [dev-dependencies]
-//              codec-api = { version = "…", features = ["test-support"] }
+//              serial-nexus-codec-api = { version = "…", features = ["test-support"] }
 #[test]
 fn conforms() {
-    use codec_api::test_support as kit;
+    use serial_nexus_codec_api::test_support as kit;
     kit::round_trip_identity(MyCodec::new, &["console", "trace"]);  // the channels you serve
     kit::fragmentation_tolerance(MyCodec::new, "console");
     kit::handles_garbage(MyCodec::new, "console");
@@ -488,26 +488,26 @@ the consumer position.
 ### Exec codecs — the pipe harness
 
 Because the child is a plain program on stdin/stdout, you can test it without the
-daemon. `nexus-sim` ships two modes:
+daemon. `serial-nexus-sim` ships two modes:
 
 - **`envelope`** — the golden-vector battery: drives the child through every event
   kind and checks it re-emits them intact.
 
   ```console
-  $ ./target/debug/nexus-sim envelope --exec "python3 tests/ext-codec/passthrough.py"
-  {"mode":"envelope","pass":true,"received_frames":10,"sent_frames":10,"tool":"nexus-sim","trailing_bytes":0}
+  $ ./target/debug/serial-nexus-sim envelope --exec "python3 tests/ext-codec/passthrough.py"
+  {"mode":"envelope","pass":true,"received_frames":10,"sent_frames":10,"tool":"serial-nexus-sim","trailing_bytes":0}
   ```
 
 - **`exec-conformance`** — the full behavioral battery, and the **recommended CI
-  entry point for a closed-repo exec codec** (§15.26): golden vectors, **full-duplex
+  entry point for an out-of-tree exec codec** (§15.26): golden vectors, **full-duplex
   liveness** (send-and-echo under one bound — the §15.22 deadlock class, so a child
   that reads all input before writing is *caught here* rather than in production),
   **fragmented-frame reassembly** (a big frame delivered to stdin in pieces must
   still be echoed whole), and **kill-and-restart cleanliness**.
 
   ```console
-  $ ./target/debug/nexus-sim exec-conformance --exec "python3 my_codec.py"
-  {"checks":{"fragmentation":true,"golden":true,"liveness":true,"restart":true},"mode":"exec-conformance","pass":true,"tool":"nexus-sim"}
+  $ ./target/debug/serial-nexus-sim exec-conformance --exec "python3 my_codec.py"
+  {"checks":{"fragmentation":true,"golden":true,"liveness":true,"restart":true},"mode":"exec-conformance","pass":true,"tool":"serial-nexus-sim"}
   ```
 
   A codec that stops reading its stdin no longer hangs the battery. Every write to
@@ -527,7 +527,7 @@ bytes.
 
 ## 7. The envelope contract versus the wire protocol
 
-You will see two versions in `codec-api`. Know which one is yours.
+You will see two versions in `serial-nexus-codec-api`. Know which one is yours.
 
 - **`ENVELOPE_VERSION` (currently 1)** — the **public** contract, versioned *for
   codec authors*. It governs the exec-codec child-process interface: the frames in

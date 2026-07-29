@@ -54,8 +54,8 @@ Assert a serial break condition on the named node for a duration (§7.1).
 ### CLI
 
 ```console
-$ serialnexusctl send-break usb0            # 250 ms default
-$ serialnexusctl send-break usb0 --ms 500
+$ serial-nexus-ctl send-break usb0            # 250 ms default
+$ serial-nexus-ctl send-break usb0 --ms 500
 ```
 
 ### Errors
@@ -110,8 +110,8 @@ values applied (null where untouched). Ephemeral, not configuration (§15.8).
 ### CLI
 
 ```console
-$ serialnexusctl set-modem usb0 --dtr true
-$ serialnexusctl set-modem usb0 --dtr false --rts true
+$ serial-nexus-ctl set-modem usb0 --dtr true
+$ serial-nexus-ctl set-modem usb0 --dtr false --rts true
 ```
 
 Omitting `--dtr`/`--rts` on the CLI sends `null` for that line, leaving it
@@ -160,9 +160,9 @@ duration, then to the opposite level.
 ### CLI
 
 ```console
-$ serialnexusctl pulse-dtr usb0                         # 100 ms, assert=true
-$ serialnexusctl pulse-dtr usb0 --ms 200 --assert false
-$ serialnexusctl pulse-dtr usb0 --ms 200 --assert=false  # equivalent
+$ serial-nexus-ctl pulse-dtr usb0                         # 100 ms, assert=true
+$ serial-nexus-ctl pulse-dtr usb0 --ms 200 --assert false
+$ serial-nexus-ctl pulse-dtr usb0 --ms 200 --assert=false  # equivalent
 ```
 
 `--assert` **takes a value** (`true` or `false`); it is not a bare flag, and both

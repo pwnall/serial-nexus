@@ -1,10 +1,10 @@
 #![no_main]
-//! Fuzz the envelope frame decoder (`codec_api::try_decode`) — the exec-codec
+//! Fuzz the envelope frame decoder (`serial_nexus_codec_api::try_decode`) — the exec-codec
 //! stdin/stdout contract and the per-event unit on the wire (§8, §15.15). Arbitrary
 //! bytes must never panic; a decoded frame must re-encode byte-identically and
 //! round-trip, because the payload consumes all remaining body bytes (no slack).
 
-use codec_api::{EventKind, encode, try_decode};
+use serial_nexus_codec_api::{EventKind, encode, try_decode};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

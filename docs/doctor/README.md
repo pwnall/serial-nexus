@@ -1,6 +1,6 @@
-# Captured `nexus-doctor` reports
+# Captured `serial-nexus-doctor` reports
 
-The artifacts behind every cross-kernel claim in `docs/nexus-doctor.md`, `AGENTS.md`
+The artifacts behind every cross-kernel claim in `docs/serial-nexus-doctor.md`, `AGENTS.md`
 §7 and `docs/implementation-notes.md`. Until 2026-07-29 there were none: both the
 7.0 baseline and the 6.18 run lived in session scratchpads, which made "P6 and P7
 read field-for-field identical" a statement asserted in three documents with
@@ -32,10 +32,18 @@ anything built before 2026-07-28 — is not comparable with these.
 Files are named for the UTC day of their own `generated` stamp, which is why the
 7.0 runs read `2026-07-29` despite being taken on the evening of the 28th local.
 
+**These four predate the §15.40 rename and still say so inside**, because they are
+captured tool output: their `tool` field carries the binary's pre-rename name, and
+nothing in this directory is hand-edited to read more tidily. That is the whole point
+of committing them — an artifact edited after the fact is an assertion again, not a
+check — so the retired-name meta-gate exempts exactly these four files by name and
+`README.md` (this file) not at all. A future report will carry the current name on its
+own, without anyone touching a byte of these.
+
 Same binary, same commit, same fingerprint on both sides of the diff: these two
-kernels are comparable field by field, and `docs/nexus-doctor.md` does the
+kernels are comparable field by field, and `docs/serial-nexus-doctor.md` does the
 comparison. The recorded pre-2026-07-28 baselines are **not** in this set and are
-not comparable to these — `nexus-doctor/src/probes.rs` moved 702 lines between
+not comparable to these — `doctor/src/probes.rs` moved 702 lines between
 `a2d3b96` and `85699d6` (P12 arrived, P4 and P5 were rewritten). Those older runs
 cannot even say so themselves: `a2d3b96` predates the Build block, so they carry no
 fingerprint at all, which is exactly why the absent field has to read as "not
@@ -48,7 +56,7 @@ first outing, not a problem to work around.
 transcription of what the operator pasted from the production box's terminal, not a
 `--json >` capture, so it is the human-facing rendering and there is no JSON twin.
 The consequence is precise and worth stating rather than glossing:
-`nexus-doctor --json | jq -e -f expectations/linux.jq` **still has not been executed
+`serial-nexus-doctor --json | jq -e -f expectations/linux.jq` **still has not been executed
 on 6.18**. Every clause of that file is decidable by eye from this Markdown and every
 one holds — including the `.build.probe_set` / `.build.commit` clauses added on
 2026-07-28, which the older `fe1c52c`-vintage 6.18 artifact could not have answered —
@@ -71,11 +79,11 @@ one run of making. Sequential runs on a quiet box (load 0.44, no other load), al
 
 ```sh
 cargo build --workspace --locked
-./target/debug/nexus-doctor --json > docs/doctor/<os>-<kver>-<yyyy-mm-dd>[-<rig>].json
-./target/debug/nexus-doctor --json | jq -e -f expectations/linux.jq   # or macos.jq
+./target/debug/serial-nexus-doctor --json > docs/doctor/<os>-<kver>-<yyyy-mm-dd>[-<rig>].json
+./target/debug/serial-nexus-doctor --json | jq -e -f expectations/linux.jq   # or macos.jq
 # With a rig, opt the ports in explicitly — this transmits, and a listed port could
 # be wired to live equipment (§15.17):
-./target/debug/nexus-doctor --port /dev/ttyUSB0 --port /dev/ttyUSB1 > docs/doctor/….md
+./target/debug/serial-nexus-doctor --port /dev/ttyUSB0 --port /dev/ttyUSB1 > docs/doctor/….md
 ```
 
 Prefer `--json` (it is what the gate consumes and what diffs cleanly); commit the

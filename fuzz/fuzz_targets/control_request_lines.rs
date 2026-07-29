@@ -7,7 +7,7 @@
 //! `rpc_request_line` fuzzes what happens to a line once it has been framed; this
 //! fuzzes the framing itself.
 //!
-//! Reached through `nexus_daemon::unstable_fuzz_api`, which exists for exactly this
+//! Reached through `serial_nexus_daemon::unstable_fuzz_api`, which exists for exactly this
 //! and promises nothing (see that module's docs and implementation-notes §3.19).
 //!
 //! Two things make the framer worth a target rather than only unit tests. It carries a
@@ -18,7 +18,7 @@
 //! patterns*, which is precisely what a fuzzer explores and a unit test enumerates.
 
 use libfuzzer_sys::fuzz_target;
-use nexus_daemon::unstable_fuzz_api::{LineRead, MAX_REQUEST_LINE, RequestLines};
+use serial_nexus_daemon::unstable_fuzz_api::{LineRead, MAX_REQUEST_LINE, RequestLines};
 
 /// A byte source that hands out at most `chunk` bytes per `poll_read`, so the fuzzer
 /// controls *how the input is split across reads*, not just its content. A framer that
@@ -88,7 +88,7 @@ fuzz_target!(|data: &[u8]| {
                     // handed without panicking, whatever the bytes were. Neither
                     // `rpc_request_line` (which starts from a whole line) nor the unit
                     // tests (which start from known-good framing) cover that seam.
-                    let _ = nexus_rpc::parse_incoming_request(&line);
+                    let _ = serial_nexus_rpc::parse_incoming_request(&line);
                     consumed += line.len();
                 }
                 // An over-cap line is refused, not truncated into a short line that

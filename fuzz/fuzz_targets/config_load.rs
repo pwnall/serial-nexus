@@ -12,7 +12,7 @@
 //! had already torn the running graph down. Both walked through this parser.
 //!
 //! JSON, not TOML, deliberately: JSON is the shape the `load` RPC actually carries
-//! (`serialnexusctl` converts TOML to it before sending), so this fuzzes the bytes a
+//! (`serial-nexus-ctl` converts TOML to it before sending), so this fuzzes the bytes a
 //! hostile client can put on the control socket rather than a CLI convenience format.
 //!
 //! Invariants:
@@ -25,12 +25,12 @@
 //!   an equal config with the same verdict. §11 makes configuration round-trippable, and
 //!   `dump` is the operator's only way to read the graph back.
 //!
-//! Worth seeding a corpus from `packaging/serialnexusd.example.toml` (converted to
-//! JSON) and from `nexus-itest`'s inline configs: `deny_unknown_fields` (the CP-2 fix)
+//! Worth seeding a corpus from `packaging/serial-nexus-daemon.example.toml` (converted to
+//! JSON) and from `serial-nexus-itest`'s inline configs: `deny_unknown_fields` (the CP-2 fix)
 //! means an unseeded fuzzer will spend most of its budget being refused at the door.
 
 use libfuzzer_sys::fuzz_target;
-use nexus_core::GraphConfig;
+use serial_nexus_core::GraphConfig;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(config) = serde_json::from_slice::<GraphConfig>(data) else {

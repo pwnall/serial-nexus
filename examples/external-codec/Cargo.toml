@@ -1,4 +1,4 @@
-# A self-contained workspace standing in for a *closed-source* codec repository
+# A self-contained workspace standing in for an out-of-tree codec repository
 # (§15.26). It is excluded from the main serial_nexus workspace (see the root
 # `[workspace] exclude`) and builds from the consumer's own position: its path
 # dependencies point back at the open crates exactly where a real consumer would

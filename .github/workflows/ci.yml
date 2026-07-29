@@ -48,12 +48,12 @@ env:
 
 jobs:
   # Unprivileged lane: builds, lints, and the WHOLE test suite — unit + property
-  # tests AND the nexus-itest integration harness (design §5), which boots
-  # serialnexusd/nexus-sim/serialnexusweb as subprocesses and drives them over the
+  # tests AND the serial-nexus-itest integration harness (design §5), which boots
+  # serial-nexus-daemon/serial-nexus-sim/serial-nexus-web as subprocesses and drives them over the
   # control socket. The harness's bin() lookups resolve `target/debug/<name>`, which
   # ONLY `cargo build` produces — `cargo test` builds the test-instrumented bins under
   # `deps/`, not the plain artifact — so an explicit `cargo build --workspace` MUST
-  # precede the test step (matching AGENTS.md §4's documented local flow). The
+  # precede the test step (matching AGENTS.md §3's documented local flow). The
   # exec/envelope codec tests shell out to python3, which the runner image provides.
   # Runs on every push (§3). MSRV is pinned to the development toolchain (the code uses
   # let-chains freely); bump the `MSRV` env above in lockstep with Cargo.toml.
@@ -75,18 +75,18 @@ jobs:
       # also be warning-clean — the registry-as-value path is easy to leave with an
       # unused binding when no codec is registered.
       - name: Clippy (minimal daemon, no built-in codecs)
-        run: cargo clippy -p serialnexusd -p nexus-daemon --no-default-features --locked -- -D warnings
-      # `cargo test` does NOT emit `target/debug/serialnexusd` (only the deps/ test
-      # bins); the nexus-itest harness boots that plain artifact, so build it first.
-      - name: Build workspace binaries (nexus-itest boots them as subprocesses)
+        run: cargo clippy -p serial-nexus-daemon-bin -p serial-nexus-daemon --no-default-features --locked -- -D warnings
+      # `cargo test` does NOT emit `target/debug/serial-nexus-daemon` (only the deps/ test
+      # bins); the serial-nexus-itest harness boots that plain artifact, so build it first.
+      - name: Build workspace binaries (serial-nexus-itest boots them as subprocesses)
         run: cargo build --workspace --locked
-      - name: Test (unit + property + nexus-itest integration harness)
+      - name: Test (unit + property + serial-nexus-itest integration harness)
         run: cargo test --workspace --locked
 
-  # The licensing gate proven, not assumed (§13). cargo-deny plus the nexus-itest test
+  # The licensing gate proven, not assumed (§13). cargo-deny plus the serial-nexus-itest test
   # that proves the gate rejects a banned crate (§16.11 folded the bash script into it;
   # it self-skips where cargo-deny is absent, so this job — which installs it — is where
-  # it runs for real). The job compiles repo code (that nexus-itest test), so it pins the
+  # it runs for real). The job compiles repo code (that serial-nexus-itest test), so it pins the
   # MSRV like every other compiling job, and it caches: without `rust-cache` it rebuilt
   # cargo-deny from source on every single push.
   license-gate:
@@ -109,12 +109,12 @@ jobs:
       - name: Prove the gate rejects a banned crate
         env:
           SNX_LICENSE_GATE: required
-        run: cargo test -p nexus-itest --test p0_license_gate --locked
+        run: cargo test -p serial-nexus-itest --test p0_license_gate --locked
 
   # Capability report (design §15.17): run every probe on the runner, assert the
   # platform expectation, and archive the Markdown so every capability claim has a
   # dated report behind it. `skipped(no adapter)` is a valid CI verdict. (The
-  # no-unsupported assertion is ALSO covered by nexus-itest tests/meta_gates.rs; this
+  # no-unsupported assertion is ALSO covered by serial-nexus-itest tests/meta_gates.rs; this
   # job additionally archives the human report.)
   doctor:
     runs-on: ubuntu-latest
@@ -128,18 +128,18 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
       - name: Capability report
         run: |
-          cargo run -q --locked -p nexus-doctor -- --markdown | tee nexus-doctor-report.md
-          cargo run -q --locked -p nexus-doctor -- --json | jq -e -f expectations/linux.jq
+          cargo run -q --locked -p serial-nexus-doctor -- --markdown | tee serial-nexus-doctor-report.md
+          cargo run -q --locked -p serial-nexus-doctor -- --json | jq -e -f expectations/linux.jq
       - uses: actions/upload-artifact@v5
         with:
-          name: nexus-doctor-report
-          path: nexus-doctor-report.md
+          name: serial-nexus-doctor-report
+          path: serial-nexus-doctor-report.md
 
-  # Out-of-tree codec template (§15.26 / plan §10.3): build the closed-repo stand-in
+  # Out-of-tree codec template (§15.26 / plan §10.3): build the out-of-tree stand-in
   # from the CONSUMER's own position (its own workspace manifest, path deps standing
   # in for version pins), run its conformance-kit test, and prove the custom daemon
   # serves its `acme` codec alongside the built-ins. §16.11 folded the bash script into
-  # nexus-itest tests/p8_external_codec.rs, which now builds the excluded template itself
+  # serial-nexus-itest tests/p8_external_codec.rs, which now builds the excluded template itself
   # (the `check` job's `cargo test --workspace` also exercises it; this job keeps an
   # isolated signal for the embedding pattern — a consumer building against the MSRV).
   external-codec:
@@ -151,7 +151,7 @@ jobs:
         run: rustup toolchain install "$MSRV" --profile minimal && rustup default "$MSRV"
       - uses: Swatinem/rust-cache@v2
       - name: Build and exercise the out-of-tree template
-        run: cargo test -p nexus-itest --test p8_external_codec --locked
+        run: cargo test -p serial-nexus-itest --test p8_external_codec --locked
 
   # macOS is best-effort (design §13). Now that the PTY node works on macOS (§7.2
   # slave-termios) and the harness is portable Rust, the macOS lane runs the SAME
@@ -169,20 +169,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install jq
         run: brew install jq
-      # As on Linux: `cargo test` never emits the plain `target/debug/serialnexusd`
-      # the nexus-itest harness boots — build the workspace bins first.
-      - name: Build workspace binaries (nexus-itest boots them as subprocesses)
+      # As on Linux: `cargo test` never emits the plain `target/debug/serial-nexus-daemon`
+      # the serial-nexus-itest harness boots — build the workspace bins first.
+      - name: Build workspace binaries (serial-nexus-itest boots them as subprocesses)
         run: cargo build --workspace --locked
       - name: Build + test (portable core + integration harness; serial tests self-skip)
         run: cargo test --workspace --locked
       - name: Capability report + macos.jq gate
         run: |
-          cargo run -q --locked -p nexus-doctor -- --markdown | tee nexus-doctor-macos.md
-          cargo run -q --locked -p nexus-doctor -- --json | jq -e -f expectations/macos.jq
+          cargo run -q --locked -p serial-nexus-doctor -- --markdown | tee serial-nexus-doctor-macos.md
+          cargo run -q --locked -p serial-nexus-doctor -- --json | jq -e -f expectations/macos.jq
       - uses: actions/upload-artifact@v5
         with:
-          name: nexus-doctor-macos-report
-          path: nexus-doctor-macos.md
+          name: serial-nexus-doctor-macos-report
+          path: serial-nexus-doctor-macos.md
 
   # The web console's browser half, in real headless Chromium (design §15.37, plan §15).
   # §16.7's doctrine only allows a behavior the sim cannot exercise to be checklist-
@@ -217,12 +217,12 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-          cache-dependency-path: serialnexusweb/ui-tests/package-lock.json
+          cache-dependency-path: web/ui-tests/package-lock.json
       # `npm ci` installs exactly the committed lockfile — the dev-time dependency tree
       # is pinned like every other tool version in this file (§15.37: "the browser and
       # package versions are pinned").
       - name: Install the pinned Playwright package
-        working-directory: serialnexusweb/ui-tests
+        working-directory: web/ui-tests
         run: npm ci
       # Keyed on the lockfile, because the browser build Playwright wants is a function
       # of the Playwright version. A miss costs the ~115 MiB download once.
@@ -230,18 +230,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('serialnexusweb/ui-tests/package-lock.json') }}
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/ui-tests/package-lock.json') }}
       - name: Install the pinned Chromium
-        working-directory: serialnexusweb/ui-tests
+        working-directory: web/ui-tests
         run: npx playwright install --with-deps chromium
-      # The gate boots the plain `target/debug/{serialnexusd,nexus-sim,serialnexusweb}`
+      # The gate boots the plain `target/debug/{serial-nexus-daemon,serial-nexus-sim,serial-nexus-web}`
       # artifacts, which only `cargo build` emits (see the `check` job).
       - name: Build workspace binaries (the gate boots them as subprocesses)
         run: cargo build --workspace --locked
       - name: Browser suite
         env:
           SNX_WEB_UI: required
-        run: cargo test -p nexus-itest --test p8_web_ui --locked
+        run: cargo test -p serial-nexus-itest --test p8_web_ui --locked
       # The browser console's *pure* modules (`history.mjs`, `saver.mjs`, `ansi.mjs`,
       # `graph.mjs`) under `node --test`. It runs in the `check` job too, but there it
       # self-skips when the image ships no node — invisibly, because libtest captures a
@@ -250,14 +250,14 @@ jobs:
       - name: Browser console modules (node --test)
         env:
           SNX_WEB_UI: required
-        run: cargo test -p nexus-itest --test p8_web_history --locked
+        run: cargo test -p serial-nexus-itest --test p8_web_history --locked
       # Traces and screenshots for a failing spec (§15.37). `if: failure()` so a green
       # run uploads nothing.
       - uses: actions/upload-artifact@v5
         if: failure()
         with:
           name: playwright-traces
-          path: serialnexusweb/ui-tests/test-results
+          path: web/ui-tests/test-results
           retention-days: 7
 
   # Nightly soak (§Phase 8 item 2): the reference-topology data plane under sustained
@@ -274,7 +274,7 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install "$MSRV" --profile minimal && rustup default "$MSRV"
       - uses: Swatinem/rust-cache@v2
-      # p8_soak boots serialnexusd + nexus-sim; `cargo test -p nexus-itest` would not
+      # p8_soak boots serial-nexus-daemon + serial-nexus-sim; `cargo test -p serial-nexus-itest` would not
       # produce those plain artifacts, so build the workspace bins first.
       - name: Build workspace binaries (soak boots them as subprocesses)
         run: cargo build --workspace --locked
@@ -282,7 +282,7 @@ jobs:
         env:
           SOAK_SECONDS: '1800'
           SOAK_INTERVAL: '30'
-        run: cargo test -p nexus-itest --locked --test p8_soak -- --ignored --nocapture
+        run: cargo test -p serial-nexus-itest --locked --test p8_soak -- --ignored --nocapture
 
   # Nightly full sweep (post-1.0 §9.5, design §16.5): the complete suite INCLUDING the
   # #[ignore]d endurance/heavy tests — "a validation suite that only runs on the
@@ -297,8 +297,8 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install "$MSRV" --profile minimal && rustup default "$MSRV"
       - uses: Swatinem/rust-cache@v2
-      # `cargo test` never emits the plain workspace bins the nexus-itest harness boots.
-      - name: Build workspace binaries (nexus-itest boots them as subprocesses)
+      # `cargo test` never emits the plain workspace bins the serial-nexus-itest harness boots.
+      - name: Build workspace binaries (serial-nexus-itest boots them as subprocesses)
         run: cargo build --workspace --locked
       - name: Full suite including ignored (endurance/heavy)
         run: cargo test --workspace --locked -- --include-ignored
@@ -320,17 +320,17 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-          cache-dependency-path: serialnexusweb/ui-tests/package-lock.json
+          cache-dependency-path: web/ui-tests/package-lock.json
       - name: Install the pinned Playwright package
-        working-directory: serialnexusweb/ui-tests
+        working-directory: web/ui-tests
         run: npm ci
       - name: Cache the pinned Chromium
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('serialnexusweb/ui-tests/package-lock.json') }}
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/ui-tests/package-lock.json') }}
       - name: Install the pinned Chromium
-        working-directory: serialnexusweb/ui-tests
+        working-directory: web/ui-tests
         run: npx playwright install --with-deps chromium
       - name: Build workspace binaries (the gate boots them as subprocesses)
         run: cargo build --workspace --locked
@@ -338,12 +338,12 @@ jobs:
         env:
           SNX_WEB_UI: required
           SNX_UI_SLOW: '1'
-        run: cargo test -p nexus-itest --test p8_web_ui --locked
+        run: cargo test -p serial-nexus-itest --test p8_web_ui --locked
       - uses: actions/upload-artifact@v5
         if: failure()
         with:
           name: playwright-traces-nightly
-          path: serialnexusweb/ui-tests/test-results
+          path: web/ui-tests/test-results
           retention-days: 7
 
   # Nightly fuzzing (§Phase 8, widened by review 26 SEC-7): every parser on an
