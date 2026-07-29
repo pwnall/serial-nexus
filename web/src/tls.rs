@@ -128,7 +128,9 @@ fn generate_self_signed(
     let certified =
         rcgen::generate_simple_self_signed(sans).context("generating a self-signed cert")?;
     let cert_pem = certified.cert.pem();
-    let key_pem = certified.key_pair.serialize_pem();
+    // rcgen 0.14 renamed `CertifiedKey::key_pair` to `signing_key` (the type is now
+    // generic over `SigningKey`); same key, same PEM.
+    let key_pem = certified.signing_key.serialize_pem();
 
     write_new(cert_path, cert_pem.as_bytes())
         .with_context(|| format!("writing TLS cert {}", cert_path.display()))?;
@@ -141,8 +143,9 @@ fn generate_self_signed(
     }
 
     let cert_der = certified.cert.der().clone();
-    let key_der =
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        certified.signing_key.serialize_der(),
+    ));
     Ok((vec![cert_der], key_der))
 }
 

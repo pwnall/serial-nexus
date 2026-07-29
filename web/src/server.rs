@@ -793,7 +793,9 @@ fn asset_cookie(credential: &str, secure: bool, port: u16) -> String {
 /// only capability is reading files that ship in the repository.
 fn new_asset_credential() -> String {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("OS RNG");
+    // getrandom 0.4 renamed the free function; the contract is unchanged — fill from
+    // the OS RNG, fail loudly rather than fall back to anything weaker.
+    getrandom::fill(&mut bytes).expect("OS RNG");
     let mut hex = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         use std::fmt::Write as _;

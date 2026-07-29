@@ -174,7 +174,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 /// A fresh 256-bit bearer token, hex-encoded (§15.29). `getrandom` reads the OS CSPRNG.
 fn new_token() -> String {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("OS RNG");
+    // getrandom 0.4 renamed the free function; same OS RNG, same failure discipline.
+    getrandom::fill(&mut bytes).expect("OS RNG");
     let mut s = String::with_capacity(64);
     for b in bytes {
         s.push_str(&format!("{b:02x}"));

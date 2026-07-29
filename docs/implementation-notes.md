@@ -13,6 +13,44 @@ design.
 
 ---
 
+## DEPENDENCY UPDATE — everything to latest stable, and the Tier-3 rig that checked it (2026-07-29 session)
+
+`cargo update` plus five deliberate **major** bumps that sit outside the manifests' semver ranges:
+`sha2` and `sha1` 0.10 → 0.11 (the RustCrypto `digest` 0.11 generation), `tokio-tungstenite`
+0.26 → 0.30, `getrandom` 0.2 → 0.4, and `rcgen` 0.13 → 0.14. Two crates were deliberately **not**
+taken: `libc` 1.0.0-alpha.4 and `rustls` 0.24.0-dev.1 are pre-releases, and a lab tool's TLS stack
+is the last place to run one. `@playwright/test` was already at its latest (1.62.0).
+
+**Three call sites needed porting, all in the web console, none behavioural.** `getrandom`'s free
+function became `fill` (two sites — the session token and the asset credential); `rcgen`'s
+`CertifiedKey` became generic over `SigningKey` and its `key_pair` field is now `signing_key`
+(two sites in the self-signed generator). The RustCrypto and tungstenite majors needed no source
+change at all, which is the whole point of using their trait surfaces rather than their internals.
+The new graph pulls a visible tail of transitive crates — `asn1-rs`, `der-parser`, `nom`,
+`num-bigint`, `rand` 0.10, `chacha20`, `hybrid-array` replacing `generic-array` — and
+`cargo deny check licenses bans sources` stays green over all of it, which is the gate that
+matters here: a major bump is exactly how a copyleft transitive dependency would arrive (§13).
+
+**The generated-cert path was exercised, not assumed.** `rcgen` is the one bump that touches
+cryptographic material, and its only in-tree consumer is the `--tls` first-run generator.
+`tls.rs`'s `generation_happens_only_when_neither_path_exists_and_the_key_is_0600` covers it
+through `build_config`, which means rustls itself accepts the pair — but the suite never completes
+a *handshake* against a generated cert, so this session did one by hand: `--tls` with no cert paths,
+then `curl --cacert` over `localhost`, giving `verify=0`, `302` with the token and `401` without.
+Worth recording because the first attempt "failed": connecting by `127.0.0.1` is refused for want of
+an IP SAN, which is **deliberate and pre-existing** — `generate_self_signed` skips IP hosts and says
+so, and rcgen 0.13 and 0.14 behave identically there. A dependency bump makes every such refusal
+look like a regression; the check is to read the code that predates it.
+
+**Validated on the Tier-3 rig, which is on this box now.** `docs/doctor/README.md` recorded that the
+7.0 side was passive-only "because the dev box has no adapter attached any more". It does again —
+the same two FT232Rs (`BH00L4KU`, `BH00LL8O`) cross-wired — so this update was checked on real
+silicon rather than on pty stand-ins: the doctor certifies **21 supported · 0 degraded · 0
+unsupported · 1 skipped** (P12 inert on Linux by design), and `serial_hardware.rs` passes 4/4 —
+byte-exact both directions at a nonstandard 250000 baud, the signal verbs, and the map node over
+the physical crossover. That closes the asymmetry the doctor README named: there is now a Tier-3
+artifact for 7.0, not only for 6.18.
+
 ## THE RENAME TRACK — one name for the family, and the two documents it had to correct (2026-07-29 session)
 
 Plan §17 executed in full: design §15.40's family rename and §15.41's context scrub. What is worth
