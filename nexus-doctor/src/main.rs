@@ -6,7 +6,8 @@
 //! depends on (P1 EXTPROC/TIOCPKT, P2 PTY presence, P3 serial fit, P4 device
 //! identity resolution, P5 rig certification, P6 post-hangup pty readiness, P7 collapsed
 //! client-session evidence, P8 epoll vs read(2) on a pty master, P9 poll(2)
-//! timeout granularity, P10 pty buffer depth, P11 real-port line-state counters)
+//! timeout granularity, P10 pty buffer depth, P11 real-port line-state counters,
+//! P12 the session-boundary edge P7's packet route substitutes for on Linux)
 //! plus environment checks, and emits a copy-pasteable Markdown report — the
 //! expected first attachment on any support request — with a `--json` twin for
 //! CI.
@@ -15,7 +16,7 @@
 //! Linux 6.18 and this tree is developed on 7.0, so §13 forbids a one-way
 //! decision resting on 7.0-only evidence. Every probe emits its raw measurements
 //! (counts, flags, bytes in hex, microseconds, byte depths) beside its verdict so
-//! two runs can be diffed numerically — P6..P11 exist for exactly that, and each
+//! two runs can be diffed numerically — P6..P12 exist for exactly that, and each
 //! one measures a premise some shipped decision currently rests on.
 //!
 //! The daemon never consumes this output: its degradation paths (e.g. §7.2's

@@ -150,8 +150,9 @@ pub struct Build {
     /// changed between two commits.
     pub commit: &'static str,
     /// A digest over the deduplicated, sorted set of every probe's
-    /// `(id, question)` — see [`probe_set_fingerprint`] for why each of those
-    /// three words is load-bearing. Answers the question a diff actually needs —
+    /// `(id, question)` — see [`probe_set_fingerprint`] for why each of
+    /// "deduplicated", "sorted" and the omission of the title is load-bearing.
+    /// Answers the question a diff actually needs —
     /// **are these two artifacts comparable?** — in one glance and with no
     /// repository access, which is what the commit alone cannot do. Equal
     /// fingerprints mean the two runs asked the same questions of their kernels;

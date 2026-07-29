@@ -14,6 +14,99 @@ design.
 
 ---
 
+## THE 6.18 RE-RUN — a HEAD binary on a Tier-3 rig, and the first diff the repo can check (2026-07-29 report)
+
+The 2026-07-28 entry below closed with a recommendation: re-run the doctor on 6.18 with a HEAD
+binary, both adapters cross-wired, and `--json`, "because any report it produces will carry its own
+commit, probe-set fingerprint and date, so committing it records provenance rather than asserting
+it." **The owner ran it — with the HEAD binary and the cross-wired pair, though not `--json`**
+(`85699d66c5a5`, generated 2026-07-29T00:15:16Z, Tier-3 rig,
+**21 supported · 0 degraded · 0 unsupported · 1 skipped**). The numbers and the gap-by-gap
+disposition live in `docs/nexus-doctor.md`; this entry records what the exercise settled, what it
+cost in corrections, and the three things about it a future session will get wrong.
+
+**Verdict: no daemon change, again.** Not a shipped constant, comment, test premise or design claim
+is falsified. P6, P7 and P8 came back byte-identical to a HEAD 7.0 baseline on every measured field
+— and P8's wall clock, 10–25 ms apart in the previous diff, now agrees within 1 ms once the same
+binary is on both sides, which confirms that spread was noise rather than kernel. (It is still not
+evidence: `elapsed_ms` is 64 passes × a fixed pause, and two 7.0 runs of one binary differ by 1 ms.)
+P1's and P2's booleans
+matched, P9's timed floor came in *tighter* on 6.18 on every row (by 9–107 µs, ≤ 1.1 % of the
+requested interval; the 2026-07-27 pair's "8–17 µs" does not describe this one), and P10's cross-kernel
+difference **dissolved**: the two kernels swapped shapes, so what the 2026-07-28 entry called "6.18
+the mid-fill, 7.0 the late flip" was a per-run artifact, exactly as the probe's own text warned.
+
+**The artifacts are in the tree now, and that is the structural change.** `docs/doctor/` holds the
+6.18 Markdown beside three passive HEAD 7.0 JSON runs. Until this session, "P6 and P7 read
+field-for-field identical" was asserted in three documents with nothing in the repository to check
+it against — DOCR-3's shape one level up, named in the 2026-07-28 entry and left open there for want
+of a report worth committing. The 7.0 side is passive because **the crossover pair physically moved
+to the 6.18 box**, which is how that box became Tier 3; that costs the kernel diff nothing (P1, P2,
+P6–P10 need no hardware) and costs the *port* diff everything (P3/P4/P5/P11 skip on 7.0, so every
+port-facing 6.18 number is a first measurement, not a comparison). It is three runs rather than one
+because P9 and P10 vary run to run on one box, and one sample of a varying quantity is
+indistinguishable from a cross-kernel difference — the precise mistake the previous P10 reading came
+within one run of making.
+
+**The fingerprint earned itself on its first outing, in both directions.** The recorded 2026-07-27
+7.0 baseline is `a2d3b96`, which predates both the Build block and P12 — so it emits no `probe_set`
+at all, and by the rule the field exists to enforce it is *not* comparable with the new 6.18 run.
+The three passive runs were captured to supply a lawful counterpart. In the other direction, the
+report-text corrections made this session (below) left the fingerprint at `01b257ece8c48470`,
+verified by rebuild — which is the design working: `(id, question)` moves when the *question* moves,
+and correcting a `Consequence` paragraph does not invalidate an archived comparison.
+
+**Three claims this session had to correct, and each was a note that had drifted from its code.**
+(1) **`brk = 0` is structural, not a Tier-1 artifact.** Three documents tied it to the dangling rig;
+the Tier-3 report reads `brk = 0` on both ports of a certified pair. `p5_certify_port` computes
+`break_ok` as `set_break(true).is_ok() && set_break(false).is_ok()` — local ioctl acceptance — and
+`p5_certify_pair` transmits a rate ladder and a bulk mismatch pattern and no break at all — and the
+two phases that do hold both ports open at once, discovery and the pair certificate, are precisely
+the two that assert none, so nothing the doctor itself does can raise `brk` at any tier. The Tier-1 verdict string
+carried the same false implicature ("and no break was received by anything" — a tier-scoped sentence
+for a binary-scoped fact) and has lost that clause. Break *reception* on 6.18 is unobserved and
+belongs to the suite gap, where `p12_serial_exclusivity::a_break_straddled_by_a_replace_leaves_the_line_transmitting`
+lives — and note that **attaching the rig is not sufficient**: on Linux `crossover_ports()` reads
+`SNX_CROSSOVER_A`/`_B` and has no auto-detect arm (that is `#[cfg(target_os = "macos")]`), so the
+rig-gated tests still self-skip on the upgraded box until those are exported.
+(2) **The probe-set fingerprint digests `(id, question)`, not `(id, title, question)`**, as
+`AGENTS.md` and `docs/nexus-doctor.md` both claimed. The exclusion is load-bearing and the docs had
+inverted its reason: P3's *title* embeds the device path and P3 is emitted once per `--port`, so
+folding it in would make a two-port 6.18 run and a zero-port 7.0 run of one binary report themselves
+incomparable — over exactly the diff the field underwrites.
+(3) **P10's operator-facing band was measured too narrow.** It printed "(7.0 measured 11776–13824
+first-pass, 13824–15360 total)" and a doc comment blamed the 13824 case on "several doctors running
+concurrently"; run 2 of three, alone on an idle box, produced 13824, and run 1 produced a hostward
+first pass of 15360 — above the stated band. Both texts now report what has been measured.
+
+**One hedge the run does *not* discharge, stated so it is not read as closed.** P4 came back
+`by_id_tree: present, count: 2, sysfs_only: 0`. `enumerate_ports` merges its sysfs pass with
+`or_insert`, so a `sysfs_usb_devices()` that returned nothing would have printed a byte-identical
+block: the `<sys>/class/tty` listing **ran but is not witnessed**. What *is* witnessed is the sysfs
+ancestor walk, since `discover_adapters` derives both printed identities through `sysfs_lookup`. The
+no-udev arm RES-2 was written for remains unexercised on either kernel — and it needs no hardware to
+close, `--dev-root` rerooting `/dev` *and* `/sys`, so a fixture tree fires it on the 6.18 box
+directly.
+
+**Housekeeping that the probe count had outgrown.** P12 landed in `85699d6` and eleven documents,
+doc comments and a guard still enumerated the set as P1–P11 or "P6..P11" — including
+`probes::tests::the_kernel_diff_probes_never_report_unsupported`, whose own doc names
+`expectations/linux.jq` and `meta_gates` as the gates it stands in for while omitting the one probe
+both of those files had just started gating. P12 is in the loop now (it is `skipped` on Linux and
+carries measurements where it runs, so both assertions apply unchanged).
+
+**What is still open on 6.18, so the next session inherits two items and not four.** (1)
+**`cargo test --workspace` has never run there** — and attaching the rig does not by itself unblock
+the `crossover_ports()`-gated tests, which need `SNX_CROSSOVER_A`/`_B` exported on Linux. That one
+gap now also carries break reception and the far-side modem-line and parity items a Tier-3 *checklist*
+covers but a Tier-3 *certificate* does not. (2) `--json` was not captured, so the `jq -e -f
+expectations/linux.jq` re-gate is satisfied clause by clause on inspection — `.build.*` included this
+time — and still never *executed* there. What Markdown cannot witness is not any clause's content but
+the JSON encoding, which the three 7.0 runs of the identical commit discharge; the honest form is
+"content proven on 6.18, encoding proven on 7.0", and one `--json` capture collapses the distinction.
+
+---
+
 ## THE FIRST WHOLE-SUITE macOS RUN — four failures, three guards, one real defect (2026-07-28 session)
 
 Run on macOS 15.7.8 / Darwin 24.6.0, x86_64, with two FTDI adapters cross-wired as a null
@@ -265,7 +358,10 @@ themselves, all three lines differ) and
 with both conditionals planted back, exactly those two tests fail and the other 21 pass — which is
 also the measurement of why the defects shipped, the existing folds being blind to the distinction.
 
-**Residual gaps, so "6.18 is confirmed" is not read wider than it is.** The binary vintage leaves
+**Residual gaps, so "6.18 is confirmed" is not read wider than it is.** *(As of 2026-07-28. Two of
+the four — the binary vintage and the rig tier — were closed by the 2026-07-29 re-run at the top of
+this file, which also relocated `brk = 0` to a structural cause. Read that entry, not this
+paragraph, for the current state.)* The binary vintage leaves
 HEAD's P4/`environment()` rewrite unmeasured there. The box is Tier 1 — one dangling adapter — so
 everything a *pair* certifies is unmeasured, no break was ever observed (`brk = 0`), and every
 `crossover_ports()`-gated test self-skips. Only Markdown was captured, so the `jq -e -f
@@ -275,7 +371,8 @@ expectations/linux.jq` re-gate is satisfied clause by clause on inspection but h
 executed tests. One visit with a HEAD binary, both adapters cross-wired, `--json`, and a suite run
 closes all four.
 
-**Neither artifact is in the tree.** Both reports live in a session scratchpad. `docs/nexus-doctor.md`
+**Neither artifact is in the tree.** *(Closed 2026-07-29 — `docs/doctor/` now holds the 6.18 report
+and three same-fingerprint 7.0 baselines, exactly as this paragraph proposed.)* Both reports live in a session scratchpad. `docs/nexus-doctor.md`
 says "the report itself is the record" and no such record exists for either kernel, which makes
 "P6/P7 read field-for-field identical" a claim in three documents with nothing in-repo to check it
 against — DOCR-3's shape one level up. Committing both under `docs/doctor/` and pointing the prose at
@@ -2512,15 +2609,19 @@ never contended. Certify the rig first with `nexus-doctor --port … --port …`
 precondition: a failure is attributable to a loose wire, not the daemon). Verified passing on
 a cross-wired FTDI FT232R pair.
 
-**Kernel matrix:** all eleven probes report `supported` on **Linux 7.0.0** (dev
-box, Ubuntu 26.04, HEAD binary, cross-wired pair — 21 · 0 · 0 · 0) and on **Linux
-6.18.14** (Debian rodete, 2026-07-27, `fe1c52c`-vintage binary, one dangling
-adapter — 19 · 0 · 0 · 0). **P6 and P7 are byte-identical across the two**, P8
-matches on every semantic field, P1/P2/P3's booleans match, P9's timer floor
-agrees within 8–17 µs and P10 lands inside the band the probe declares for 7.0
-against itself; the two zero-timeout `poll(2)` costs that differ are box
-properties, not kernel ones (the same 6.18 kernel measured 605 ns and 1162 ns for
-the same code on two dates). So the kernel-sensitive PTY/serial mechanics are
+**Kernel matrix:** every probe that runs on Linux reports `supported` on **Linux
+7.0.0** (dev box, Ubuntu 26.04, HEAD binary, cross-wired pair — 21 · 0 · 0 · 0 on
+2026-07-27; 13 · 0 · 0 · 6 passive at HEAD on 2026-07-29, the box having no adapter
+since the pair moved) and on **Linux 6.18.14** (Debian rodete — 19 · 0 · 0 · 0 on
+2026-07-27 with a `fe1c52c` binary and one dangling adapter; **21 · 0 · 0 · 1 on
+2026-07-29 with a HEAD binary and a Tier-3 cross-wired pair**, the one skip being
+P12, which is inert on Linux by design). **P6, P7 and P8 are byte-identical across
+the two** — P8 including `elapsed_ms` once both sides were the same binary —
+P1/P2/P3's booleans match, P9's timer floor is *tighter* on 6.18 on every row
+(≤ 1 %), and P10's apparent difference dissolved when the two kernels swapped
+flip-scheduling shapes. The zero-timeout `poll(2)` costs that differ are box
+properties, not kernel ones (the same 6.18 kernel measured 605, 1162 and 526 ns for
+the same code on three dates). So the kernel-sensitive PTY/serial mechanics are
 de-risked across the support matrix — but "zero deltas" would be the wrong
 sentence, and what the 6.18 run does *not* cover (HEAD's P4, everything a paired
 rig certifies, the `--json`/`jq` gate, and `cargo test` at all) is enumerated in
@@ -2537,7 +2638,7 @@ rig certifies, the `--json`/`jq` gate, and `cargo test` at all) is enumerated in
 | `nexus-core` | graph model + validator (§4), data-plane deliver contracts + holdover (§5), lock state machine incl. `reclaim_held` (§6), config/state split (§15.8), **device-identity `resolver` (§12)** | done |
 | `nexus-rpc` | JSON-RPC 2.0 wire types — the stable §15.16 surface | done |
 | `nexus-sim` | test double: `pty`/`client`/`mux`/`envelope`/`wire`/`tcp-proxy`/`nullmodem` modes (§3) | done through phase 7 |
-| `nexus-doctor` | shipping capability checker: probes P1–P11 + env checks (§15.17) | done |
+| `nexus-doctor` | shipping capability checker: probes P1–P12 + env checks (§15.17) | done |
 | `serialnexusd` | the daemon | control plane + node lifecycle + data plane + codecs + leg/wire done |
 | `serialnexusctl` | the CLI (thin RPC client + `--json`) | `load [--replace]`/`add-node`/`remove-node [--cascade]`/`dump`/`state`/`subscribe`/`rotate`/`lock`/`unlock`/`send`/`send-break`/`set-modem`/`pulse-dtr`/`teardown`/`shutdown` |
 
@@ -3102,12 +3203,20 @@ Full report: `docs/nexus-doctor.md`. Re-runnable per system with
   review 32 (`RES-2`) the probe asks about **devices**, reading the
   `<sys>/class/tty` listing with `/dev/serial/by-id` as a fast path over it, so it
   stays `supported` in a no-udev environment instead of skipping in the one place
-  §12's fallback exists for. **That rewrite has no 6.18 evidence** — the 2026-07-27
-  6.18 run predates it (the binary-vintage note in `docs/nexus-doctor.md`).
-- **P5 rig discovery/certification — supported on both kernels, at different
-  tiers.** 7.0 certifies a cross-wired *pair* (rate ladder, deliberate baud
-  mismatch); 6.18 has one dangling adapter, so it certifies per-port only. The
-  word is the same and the coverage is not.
+  §12's fallback exists for. **The rewrite ran on 6.18 on 2026-07-29** (the
+  2026-07-27 run predated it), reporting `by_id_tree: present, count: 2,
+  sysfs_only: 0` for two adapters — which witnesses the sysfs *ancestor walk*
+  there (both identities come out of `sysfs_lookup`) but **not** the `<sys>/class/tty`
+  listing, whose contribution `enumerate_ports` merges with `or_insert` and which
+  would print identically had it returned nothing. The no-udev arm is still
+  unexercised on either kernel; `--dev-root` fires it without hardware.
+- **P5 rig discovery/certification — supported on both kernels, and since
+  2026-07-29 at the same tier.** Both boxes have now certified a cross-wired
+  *pair* (rate ladder in both directions, deliberate baud mismatch); the 6.18
+  Tier-1 run of 2026-07-27 certified per-port only, and "supported" meant strictly
+  less there. What *no* tier certifies is break **reception** — the per-port
+  `break` item is local ioctl acceptance and no probe transmits a break into an
+  open peer — so `brk = 0` everywhere is structural.
 - **P6 post-hangup pty readiness, P7 collapsed-session evidence — supported, and
   byte-identical on 7.0 and 6.18.** P6's `handler_reset_readable_bytes: 1` on both
   is what makes `pty.rs`'s last-close drain load-bearing on the production kernel;
@@ -3119,9 +3228,20 @@ Full report: `docs/nexus-doctor.md`. Re-runnable per system with
   readiness guard, not `epoll_ctl`), so it refutes nothing.
 - **P9 poll timeout granularity, P10 pty buffer depth — supported, numbers within
   their declared noise on both.** No backoff step and no `hostward_buffer` default
-  moves.
+  moves. P10's apparent cross-kernel difference **dissolved on 2026-07-29**: the
+  two kernels swapped flip-scheduling shapes, and three sequential 7.0 runs on an
+  idle box produced all three first-pass values. Read a P10 delta as a scheduling
+  artifact until several runs a side say otherwise.
 - **P11 line-state counters — supported.** Both ioctls answer on every named port
-  on both kernels; absolute counts differ by construction.
+  on both kernels; absolute counts differ by construction. Since 2026-07-29 that
+  is two ports on 6.18 and **none on 7.0**, the crossover pair having moved to the
+  production box — so P11, like P3/P4/P5, currently has no same-fingerprint 7.0
+  counterpart to diff against.
+- **P12 session-boundary edge — `skipped` on Linux, by design.** P7's sibling
+  (§15.39): Darwin destroys the retained packet at last close so the *edge* is the
+  only mechanism there, while Linux keeps the packet, which is P7's subject. A
+  Linux `skipped` is the expected answer and is not a gap; `expectations/macos.jq`
+  gates it tightly, `linux.jq` presence-only.
 
 ---
 

@@ -4,13 +4,16 @@
 //! rests on — and P8..P11, the kernel-behaviour measurements the *data plane's*
 //! shape rests on: P8 epoll-vs-`read(2)` on a pty master (invariant 1), P9
 //! `poll(2)` timeout granularity (§15.19's timer floor), P10 pty buffer depth
-//! (the `hostward_buffer` defaults), P11 real-port line-state ioctls (§5/§7.1).
+//! (the `hostward_buffer` defaults), P11 real-port line-state ioctls (§5/§7.1),
+//! and P12, P7's sibling — the session-boundary *edge* (§15.39), which carries
+//! §6's detach-release on Darwin and is inert on Linux, where the retained packet
+//! P7 measures carries it instead.
 //! Each returns a self-judging [`Probe`]. The kernel probes (P1, P2, P6, P7, P8,
-//! P9, P10) and the resolver probe (P4) are passive and always safe to run; P3,
-//! P5 and P11 open a real serial port and therefore run only on an explicitly
+//! P9, P10, P12) and the resolver probe (P4) are passive and always safe to run;
+//! P3, P5 and P11 open a real serial port and therefore run only on an explicitly
 //! named `--port`.
 //!
-//! **P6..P11 exist to be diffed across kernels.** Production runs Linux 6.18;
+//! **P6..P12 exist to be diffed across kernels.** Production runs Linux 6.18;
 //! this tree was developed on 7.0, and §13 forbids a one-way decision resting on
 //! 7.0-only evidence. Each probe therefore emits its *raw measurements* — pass
 //! counts, poll flags, read outcomes, packet bytes in hex, microseconds, byte
@@ -1396,16 +1399,23 @@ struct FillResult {
     /// This is not padding, it is the measurement's honesty. A tty moves bytes
     /// from the driver buffer into the line discipline's read buffer on an
     /// **asynchronous** work item, so a single-pass fill measures "how much fits
-    /// before EAGAIN *at this instant*" and lands 11776 or 13824 bytes on the same
-    /// kernel depending on whether that work ran mid-fill (both observed on 7.0,
-    /// the second only when several doctors ran concurrently). Reporting one
+    /// before EAGAIN *at this instant*" and lands 11776, 13824 or 15360 bytes on
+    /// the same kernel depending on whether that work ran mid-fill. Reporting one
     /// number would have handed the 6.18 diff a scheduling race dressed as a
     /// cross-kernel difference. So both are reported, and the pair says which
     /// happened: a first pass short by a chunk with a matching `settled_extra`
     /// **is** the late-flip case.
     ///
+    /// That it is a race and not a kernel property is now measured rather than
+    /// argued: three *sequential* 7.0 runs on an idle box produced all three
+    /// first-pass values, and the two 6.18 runs produced two of them — the two
+    /// kernels having swapped shapes between 2026-07-27 and 2026-07-29
+    /// (`docs/doctor/`). An earlier version of this comment guessed the 13824 case
+    /// needed "several doctors running concurrently"; run 2 of three, alone on an
+    /// idle box, says otherwise.
+    ///
     /// Neither figure is exact, and no arrangement of passes would make it so —
-    /// on 7.0 the first pass measured 11776–13824 and the total 13824–15360. Read
+    /// on 7.0 the first pass measured 11776–15360 and the total 13824–15360. Read
     /// a one-chunk difference across kernels as noise and only an
     /// order-of-magnitude one as signal; the number this probe exists to give is
     /// the *scale* of the pipe under a `hostward_buffer`, not its last byte.
@@ -1484,7 +1494,7 @@ pub fn p10_pty_buffer_depth() -> Probe {
             p.verdict(
                 Status::Supported,
                 &format!(
-                    "This kernel's pty accepts {} byte(s) master→slave (targetward, what a pty node writes to its client) and {} byte(s) slave→master (hostward, what the node reads) before answering EAGAIN, reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands (7.0 measured 11776–13824 first-pass, 13824–15360 total), so across kernels a one-chunk difference is noise and only an order-of-magnitude one is signal. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}",
+                    "This kernel's pty accepts {} byte(s) master→slave (targetward, what a pty node writes to its client) and {} byte(s) slave→master (hostward, what the node reads) before answering EAGAIN, reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands (three sequential 7.0 runs on an idle box measured 11776–15360 first-pass and 13824–15360 total, and 6.18 has produced two of those shapes across two runs), so across kernels a one-chunk difference is noise and only an order-of-magnitude one is signal. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}",
                     targetward.bytes,
                     hostward.bytes,
                     targetward.total(),
@@ -2511,7 +2521,13 @@ fn p5_verdict(
                 .to_owned(),
             2 => "**Tier 2** — a TX↔RX jumper: a real driver data path, but on one clock, so the rate ladder and the deliberate baud mismatch did **not** run (both need a cross-wired pair)."
                 .to_owned(),
-            _ => "**Tier 1** — a dangling converter: per-port items only. The rate ladder and the deliberate baud mismatch did **not** run, and no break was received by anything."
+            // Deliberately does *not* say "and no break was received by anything":
+            // true of Tier 1 and equally true of Tier 3, because no probe here
+            // drives a break into an open, counting peer at any tier — so a
+            // tier-scoped sentence for a binary-scoped fact read as a promise that
+            // upgrading the rig would get you break reception. It would not; that
+            // is a job for the suite's `crossover_ports()`-gated guards.
+            _ => "**Tier 1** — a dangling converter: per-port items only. The rate ladder and the deliberate baud mismatch did **not** run."
                 .to_owned(),
         };
         // The ceiling clause is only meaningful below a complete top-tier
@@ -3483,7 +3499,7 @@ mod tests {
         );
     }
 
-    /// P6..P11 may never report `unsupported`, on any box.
+    /// P6..P12 may never report `unsupported`, on any box.
     ///
     /// Each measures *which* of several legitimate kernel behaviours applies, and
     /// the shipped daemon is correct under all of them — so none can contradict a
@@ -3504,6 +3520,12 @@ mod tests {
             p9_poll_granularity(),
             p10_pty_buffer_depth(),
             p11_line_state(&[], RigFacts::default()),
+            // P12 belongs here because `expectations/linux.jq` and
+            // `expectations/macos.jq` both gate it, and a guard that names the
+            // gate has to cover what the gate covers. It is `skipped` on Linux
+            // (the latch is inert there, §15.39) and carries measurements where
+            // it runs, so both assertions below apply to it unchanged.
+            p12_session_edge(),
         ] {
             assert!(
                 !p.status.is_unsupported(),

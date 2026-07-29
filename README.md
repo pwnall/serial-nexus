@@ -184,6 +184,7 @@ hardening guidance.
 - [`docs/security.md`](docs/security.md) — threat model and hardening.
 - [`docs/macos.md`](docs/macos.md) — macOS best-effort notes.
 - [`docs/nexus-doctor.md`](docs/nexus-doctor.md) — the capability checker.
+- [`docs/doctor/`](docs/doctor/) — captured `nexus-doctor` reports, one per kernel and rig, and the artifacts behind every cross-kernel claim in the page above.
 - [`packaging/`](packaging/) — distribution packaging.
 
 ## License

@@ -1,7 +1,7 @@
 //! Stamp the build's git identity into the binary, so a report says which tree
 //! produced it (§15.17).
 //!
-//! **Why this exists.** The doctor's whole purpose for P6–P11 is that two runs on
+//! **Why this exists.** The doctor's whole purpose for P6–P12 is that two runs on
 //! two kernels get diffed field by field (§13, `expectations/linux.jq`). When the
 //! 2026-07-27 Linux 6.18 report arrived, establishing *which build* had produced
 //! it took forensics on a section title — its P4 block was the pre-`RES-2`
