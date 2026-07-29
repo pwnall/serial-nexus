@@ -19,7 +19,7 @@ mod linux_impl {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    use serial_nexus_itest::{Daemon, Sim, sha256_hex};
+    use serial_nexus_itest::{Daemon, Sim, seeded_bytes, sha256_hex};
 
     /// 256 MiB, matching the script's `SIZE_H="256MiB"` / `SIZE_B=256*1024*1024`.
     /// Far larger than the RSS budget, so any interior accumulation of the stream
@@ -30,26 +30,6 @@ mod linux_impl {
     const RSS_BUDGET_KB: u64 = 120 * 1024;
     /// The source seed (`--seed 7`).
     const SEED: u64 = 7;
-
-    /// The `serial-nexus-sim` deterministic byte stream (splitmix64), copied verbatim from
-    /// `serial-nexus-sim`'s `seeded_bytes`. The source's own `sha256` verdict is on a
-    /// stdout that `Sim::spawn` discards, so we reconstruct the byte-exact ground
-    /// truth from the seed instead — equivalent, since the stream is deterministic
-    /// in `(seed, size)`, and hashed through the approved `sha256_hex` oracle.
-    fn seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
-        let mut s = seed;
-        let mut out = Vec::with_capacity(len);
-        while out.len() < len {
-            s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = s;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            out.extend_from_slice(&z.to_le_bytes());
-        }
-        out.truncate(len);
-        out
-    }
 
     /// Scan /proc for the `serial-nexus-daemon` process whose NUL-separated argv carries
     /// `socket` (unique per test) — the portable-Rust stand-in for the bash's

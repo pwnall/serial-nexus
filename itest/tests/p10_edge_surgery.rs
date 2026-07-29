@@ -29,7 +29,9 @@
 //! with no UART in sight. Only property 2 needs a real byte source, and it uses the
 //! Linux sim echo device with the standard self-skip.
 
-use std::time::Duration;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use serial_nexus_itest::{Daemon, serial_echo, sha256_hex, wait_until};
@@ -334,6 +336,55 @@ fn disconnecting_a_lock_holding_origin_releases_the_lock_and_purges() {
     );
 }
 
+/// **37-LIFE-1.** `remove-node --cascade` reports the same two facts `disconnect`
+/// does, for the identical edge.
+///
+/// Both verbs undo an edge through one helper, whose return exists precisely because
+/// these facts are "reported rather than done silently" — but the cascade loop dropped
+/// it, so the same removal was loud through one door and mute through the other. An
+/// operator who cascades a lock-holding writer has changed who may write (§6), and one
+/// whose client had bytes queued has lost them by design (§5 all-loss-is-visible);
+/// neither landed in a response field, a counter or a log.
+///
+/// The counts are what a cascade adds over a single `disconnect`: two edges, one of
+/// them the holder's, sum to exactly one released lock.
+#[test]
+fn a_cascade_reports_the_released_locks_and_purged_bytes_disconnect_does() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    rpc.load_toml(&bare_graph(&d), false).expect("load");
+    rpc.connect("m", "p0", None).expect("connect p0");
+    rpc.connect("m", "p1", None).expect("connect p1");
+    rpc.lock("p0", false, false, None).expect("p0 takes it");
+
+    // Remove the *map*, cascading both edges: p0's (the lock holder's) and p1's.
+    let out = rpc.remove_node("m", true).expect("remove-node m --cascade");
+    assert_eq!(
+        out.get("cascaded_edges"),
+        Some(&Value::from(2)),
+        "the cascade count is the pre-existing field, unchanged: {out}"
+    );
+    assert_eq!(
+        out.get("released_locks"),
+        Some(&Value::from(1)),
+        "the cascade must report the lock it took away — exactly the holder's, not \
+         every edge's: {out}"
+    );
+    assert_eq!(
+        out.get("purged_bytes"),
+        Some(&Value::from(0)),
+        "the byte count must be present, and `0` rather than absent: a field that \
+         appears only when nonzero is one a client learns to read as absent: {out}"
+    );
+
+    // An edgeless removal reports the same two fields at zero, so a client never has
+    // to branch on their presence.
+    let out = rpc.remove_node("p0", false).expect("remove-node p0");
+    assert_eq!(out.get("cascaded_edges"), Some(&Value::from(0)), "{out}");
+    assert_eq!(out.get("released_locks"), Some(&Value::from(0)), "{out}");
+    assert_eq!(out.get("purged_bytes"), Some(&Value::from(0)), "{out}");
+}
+
 #[test]
 fn disconnecting_an_interior_nodes_upstream_stalls_it_instead_of_shedding_bytes() {
     // Property 4. A map's raw side is an interior targetward path; disconnecting it
@@ -521,6 +572,139 @@ b = "cap"
         after,
         vec!["cap".to_string()],
         "removing the pty must not take the log's registration with it: {after:?}"
+    );
+}
+
+/// The origins `state` lists on the map's host-facing endpoint (§6).
+fn origins_of_m(rpc: &serial_nexus_itest::Rpc) -> Vec<String> {
+    rpc.node("m")
+        .and_then(|n| n.pointer("/lock/origins").cloned())
+        .and_then(|o| o.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|o| o.get("origin").and_then(Value::as_str).map(str::to_owned))
+        .collect()
+}
+
+/// Write `requests` to the control socket as one pipelined burst and read back
+/// `requests.len()` NDJSON response lines. The harness's own [`serial_nexus_itest::Rpc`]
+/// is one-request-per-connection by design, and pipelining is the point here: the
+/// daemon dispatches a burst without yielding to the data plane between requests.
+fn pipeline(socket: &std::path::Path, requests: &[String]) -> Vec<Value> {
+    let mut s = UnixStream::connect(socket).expect("connect to the control socket");
+    s.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    s.write_all(requests.join("").as_bytes())
+        .expect("write the burst");
+    s.flush().expect("flush");
+
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if out.iter().filter(|b| **b == b'\n').count() >= requests.len() {
+            break;
+        }
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) => panic!("read the burst's replies: {e}"),
+        }
+    }
+    String::from_utf8_lossy(&out)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("parse {l:?}: {e}")))
+        .collect()
+}
+
+/// `serial_nexus_rpc::AppError::EdgeInboxFull` — `APP_ERROR_BASE (-32000) - 7`.
+/// Hardcoded as a literal for the same reason every other code in this family is:
+/// `serial-nexus-itest` drives the daemon over the wire, so a constant imported from
+/// the daemon's own crate would prove only that the daemon agrees with itself.
+const EDGE_INBOX_FULL: i64 = -32007;
+
+#[test]
+fn a_pipelined_surgery_burst_leaves_no_phantom_origin_behind() {
+    // 37-DATA-1. Each `connect` hands the consuming endpoint's pump a hostward
+    // receiver through a bounded inbox (`runtime::EDGE_INBOX_CAP` = 4), and
+    // `disconnect` cannot retract one already queued — so a burst dispatched with no
+    // scheduler yield between its requests (one control connection, pipelined) fills
+    // that inbox with stale entries and the next hand-off is refused. §4 rule 2
+    // bounds *configured* edges, not undrained receivers, so it does not prevent
+    // this; five connects with four interleaved disconnects reach it deterministically.
+    //
+    // What must not happen is the half-attached edge: an origin registered on the
+    // lock, a sink in the fan-out, and a hostward receiver nobody holds — a
+    // configured edge that is dead from birth, reported as if the *consumer* had no
+    // pump. The refused attachment attaches nothing at all instead, so `state` never
+    // grows a phantom — and the verb says so as the transient it is (`-32007`), which
+    // is the control plane's half of the same finding: `consumer_live: false` names a
+    // node that cannot receive at all, so answering it here sent an operator to
+    // inspect a healthy pty while the configured edge stayed dead for good.
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    rpc.load_toml(&bare_graph(&d), false).expect("load");
+
+    let mut burst = Vec::new();
+    let mut id = 100;
+    for i in 0..5 {
+        if i > 0 {
+            burst.push(format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"disconnect","params":{{"a":"m","b":"p0"}}}}"#
+            ));
+            burst.push("\n".to_string());
+            id += 1;
+        }
+        burst.push(format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"connect","params":{{"a":"m","b":"p0"}}}}"#
+        ));
+        burst.push("\n".to_string());
+        id += 1;
+    }
+    // Two strings per request (the line and its newline); the reply count is one per
+    // request.
+    let lines: Vec<String> = burst.chunks(2).map(|c| c.concat()).collect();
+    let replies = pipeline(&d.socket(), &lines);
+    assert_eq!(
+        replies.len(),
+        lines.len(),
+        "one reply per request: {replies:?}"
+    );
+
+    // The burst's last connect is the one whose hand-off was refused. It must be
+    // refused *as a refusal*: nothing succeeded, so nothing may report success.
+    let last = replies.last().expect("a reply for the last connect");
+    assert_eq!(
+        last.pointer("/error/code").and_then(Value::as_i64),
+        Some(EDGE_INBOX_FULL),
+        "the overflowed hand-off must answer the transient by name, not report a \
+         connected edge: {last}"
+    );
+    assert!(
+        last.pointer("/result").is_none(),
+        "an error reply carries no result (§10 result-XOR-error): {last}"
+    );
+
+    // A refused hand-off must also attach *nothing*: no origin on the lock, so `state`
+    // cannot list a writer for an edge that carries no byte. (It registered one before,
+    // alongside a fan-out sink feeding a receiver nobody held.)
+    let origins = origins_of_m(rpc);
+    assert!(
+        origins.is_empty(),
+        "the burst left {origins:?} registered on `m` — a hand-off refused for a full \
+         edge inbox attached half an edge, whose hostward receiver was dropped; \
+         edges={:?}",
+        edges_of(&rpc.dump())
+    );
+
+    // And the endpoint is still usable: a plain connect after the burst behaves.
+    let _ = rpc.disconnect("m", "p0");
+    rpc.connect("m", "p0", None)
+        .expect("a connect after the burst still works");
+    assert_eq!(
+        origins_of_m(rpc),
+        vec!["p0".to_string()],
+        "exactly the live edge's origin, not a phantom beside it"
     );
 }
 

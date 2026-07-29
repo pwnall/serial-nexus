@@ -30,6 +30,15 @@
 //! resolve. The fallback is still an *exact* identity match, so squatter
 //! refusal is unchanged.
 //!
+//! The rule is over *every* arm, which took one more round to be true of the
+//! bare-serial form: it kept scanning by-id alone, so `add-node` reported an
+//! adapter absent in that same tree, and a serial two adapters carry captured
+//! whichever clone owned udev's single link (review 37 RES-1). A serial number
+//! names a string rather than a device, so an ambiguous one has nothing to degrade
+//! to and is refused naming every device that carries it — the arm §15.10 leaves
+//! open for identity-form resolution, applied where capture must answer with one
+//! identity or none.
+//!
 //! Both roots are parameterized so tests point them at fixture trees (plan §3);
 //! `sys_root` defaults to `dev_root/sys`, so a single `--dev-root` selects a
 //! self-contained fixture (and the production `dev_root = "/"` yields
@@ -165,8 +174,56 @@ impl Resolver {
     }
 
     /// Join an absolute `/dev`-style path under `dev_root` (a no-op for `"/"`).
+    /// Callers pass literal operator input through [`Self::check_literal`] first —
+    /// this trims leading slashes and nothing else, so a `..` component joins
+    /// *through* the root (RES-4).
     fn rooted(&self, abs: &str) -> PathBuf {
         self.dev_root.join(abs.trim_start_matches('/'))
+    }
+
+    /// The two well-formedness rules every literal path arm shares, applied before
+    /// the join (§11 rejects ill-formed resolver input up front, which is what the
+    /// all-slash guards below already do one component earlier).
+    ///
+    /// * A `..` component escapes `dev_root`, and that root is not a cosmetic
+    ///   prefix: it is the daemon's `--dev-root` and the fixture seam every §12 test
+    ///   runs in (plan §3), so `raw:/../x` minted an identity and bound a path
+    ///   outside the tree the resolver was pointed at (RES-4). The check is on the
+    ///   *component*, not on where the spelling happens to land — a lexically
+    ///   normalized path stops being the same path the moment a symlink is in it.
+    /// * A directory satisfies `exists()`, so `/dev` and `/dev/serial` captured as
+    ///   `raw:/dev` bound to a directory; `dump` persisted it and the node then
+    ///   faulted EISDIR carrying the nonsense identity (RES-3). Absence stays legal
+    ///   here — identity-form input never requires the device present (§12) — it is
+    ///   *presence as the wrong kind of thing* that is refused.
+    fn check_literal(&self, input: &str, path: &str) -> Result<PathBuf, ResolveError> {
+        if Path::new(path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(ResolveError::Malformed {
+                input: input.to_owned(),
+                reason: ".. components are not allowed: the path must stay inside the device root"
+                    .into(),
+            });
+        }
+        let rooted = self.rooted(path);
+        if rooted.is_dir() {
+            return Err(ResolveError::Malformed {
+                input: input.to_owned(),
+                reason: "path is a directory, not a device node".into(),
+            });
+        }
+        Ok(rooted)
+    }
+
+    /// A literal `/dev`-style path resolved for the identity→path direction, or
+    /// `None` when it escapes the root, names a directory, or is simply not there —
+    /// the same three refusals [`Self::check_literal`] makes on the input side, with
+    /// the one answer `resolve_current_path` can give (RES-3/RES-4).
+    fn literal_dev_path(&self, path: &str) -> Option<PathBuf> {
+        let rooted = self.check_literal(path, path).ok()?;
+        is_dev_node(&rooted).then_some(rooted)
     }
 
     // -- input → identity (add time) ---------------------------------------
@@ -293,10 +350,10 @@ impl Resolver {
                 reason: "empty raw path".into(),
             });
         }
-        let rooted = self.rooted(rest);
+        let rooted = self.check_literal(input, rest)?;
         Ok(Resolved {
             identity: input.to_owned(),
-            path: rooted.exists().then_some(rooted),
+            path: is_dev_node(&rooted).then_some(rooted),
             kind: DeviceKind::Raw,
             description: format!("raw path {rest}"),
             warning: Some(RAW_WARNING.into()),
@@ -315,8 +372,8 @@ impl Resolver {
                 reason: "empty path".into(),
             });
         }
-        let rooted = self.rooted(input);
-        if !rooted.exists() {
+        let rooted = self.check_literal(input, input)?;
+        if !is_dev_node(&rooted) {
             return Err(ResolveError::NotPresent {
                 input: input.to_owned(),
             });
@@ -367,27 +424,56 @@ impl Resolver {
         (self.rooted(&spelling), spelling)
     }
 
-    /// Capture an identity from a present adapter whose serial matches.
+    /// Capture an identity from the present adapter whose serial matches.
+    ///
+    /// Reads [`Self::sysfs_usb_devices`], the same device listing capture-by-path
+    /// and resolution read (§12's one-source rule). It used to scan
+    /// `/dev/serial/by-id`, which is empty in exactly the environment §12 names —
+    /// a container handed a bare `--device=/dev/ttyUSB0`, an image without
+    /// `60-serial.rules` — so a bare-serial `add-node` reported the adapter absent
+    /// while it was right there, the RES-2 diagnostic in the arm RES-2 missed
+    /// (RES-1).
     fn capture_from_serial(&self, serial: &str) -> Result<Resolved, ResolveError> {
-        for a in self.discover_adapters() {
-            let matches = a
-                .identity
-                .as_deref()
-                .and_then(usb_serial_field)
-                .is_some_and(|s| s == serial);
-            if matches {
-                let dev_name = a
-                    .dev_path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let raw = format!("/dev/{dev_name}");
-                return Ok(self.capture_for_dev(&dev_name, a.dev_path, &raw));
-            }
+        let mut matches = self.devices_with_serial(serial);
+        if matches.len() > 1 {
+            return Err(ResolveError::Malformed {
+                input: serial.to_owned(),
+                reason: ambiguous_serial_reason(&matches),
+            });
         }
-        Err(ResolveError::NotPresent {
-            input: serial.to_owned(),
-        })
+        let Some((dev_path, _)) = matches.pop() else {
+            return Err(ResolveError::NotPresent {
+                input: serial.to_owned(),
+            });
+        };
+        let dev_name = dev_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let raw = format!("/dev/{dev_name}");
+        Ok(self.capture_for_dev(&dev_name, dev_path, &raw))
+    }
+
+    /// Every device *present right now* whose sysfs identity carries this serial
+    /// number, sorted by device name — the bare-serial form's source in both §12
+    /// directions.
+    ///
+    /// Counted over devices, for the same reason [`Self::usb_identity_matches`] is:
+    /// a serial number names a *string*, not a device, and two devices carry one in
+    /// exactly the two shapes §12 cares about — two clones with the same hard-coded
+    /// serial (§15.10's hazard, for which udev publishes a single by-id link), and
+    /// one multi-port adapter whose UARTs share a serial and differ only in the
+    /// interface index. Neither is visible from `/dev/serial/by-id` (RES-1).
+    fn devices_with_serial(&self, serial: &str) -> Vec<(PathBuf, UsbInfo)> {
+        // `-` is §12's *absent* marker, not a serial number: an adapter that has none
+        // cannot be named by one, so the marker matches nothing here.
+        if serial == "-" {
+            return Vec::new();
+        }
+        self.sysfs_usb_devices()
+            .into_iter()
+            .filter(|(_, info)| usb_serial_field(&info.identity) == Some(serial))
+            .collect()
     }
 
     /// The best identity for a present device node, applying the §12 fallback
@@ -470,21 +556,21 @@ impl Resolver {
         } else if let Some(rest) = device.strip_prefix("by-path:") {
             self.bypath_lookup(rest)
         } else if let Some(rest) = device.strip_prefix("raw:") {
-            let p = self.rooted(rest);
-            p.exists().then_some(p)
+            self.literal_dev_path(rest)
         } else if device.starts_with('/') {
-            let p = self.rooted(device);
-            p.exists().then_some(p)
+            self.literal_dev_path(device)
         } else {
-            // A bare serial number left unresolved (uncaptured); best-effort.
-            self.discover_adapters().into_iter().find_map(|a| {
-                let matches = a
-                    .identity
-                    .as_deref()
-                    .and_then(usb_serial_field)
-                    .is_some_and(|s| s == device);
-                matches.then_some(a.dev_path)
-            })
+            // A bare serial number left unresolved (uncaptured) — the hand-written
+            // configuration's door into the capture form. Same device listing and
+            // same ambiguity rule capture uses, never the by-id tree alone: a serial
+            // two present devices carry pins neither, so it binds nothing rather
+            // than a coin-flip adapter (§12, §15.10, RES-1).
+            let mut matches = self.devices_with_serial(device);
+            if matches.len() == 1 {
+                matches.pop().map(|(p, _)| p)
+            } else {
+                None
+            }
         }
     }
 
@@ -514,6 +600,10 @@ impl Resolver {
                 identity,
             });
         }
+        // `read_dir` order is arbitrary; sort so two calls read the same, as
+        // [`Self::sysfs_usb_devices`] does — the doctor's P4 probe reports this list
+        // verbatim, and a report that reorders between runs diffs as a change.
+        out.sort_by(|a, b| a.by_id_name.cmp(&b.by_id_name));
         out
     }
 
@@ -597,7 +687,7 @@ impl Resolver {
                 let rooted = self.rooted(&raw);
                 // A by-id link can outlive its device node; do not offer a path
                 // that is no longer there.
-                if !rooted.exists() {
+                if !is_dev_node(&rooted) {
                     return None;
                 }
                 let resolved = self.capture_for_dev(&dev_name, rooted.clone(), &raw);
@@ -641,7 +731,7 @@ impl Resolver {
                 let dev_path = self.dev_root.join("dev").join(&name);
                 // A sysfs entry whose device node is gone is not a *present*
                 // adapter — neither bindable nor countable as ambiguity.
-                if !dev_path.exists() {
+                if !is_dev_node(&dev_path) {
                     return None;
                 }
                 self.sysfs_lookup(&name).map(|info| (dev_path, info))
@@ -711,7 +801,16 @@ impl Resolver {
             if let Some(info) = self.sysfs_lookup(&dev_name)
                 && info.identity == identity
             {
-                return Some((self.dev_root.join("dev").join(&dev_name), info));
+                let dev_path = self.dev_root.join("dev").join(&dev_name);
+                // The same presence predicate every sibling source applies. Without
+                // it this arm answered with a device the primary listing had already
+                // excluded — a stale link in a container's static `/dev`, or the
+                // window where devtmpfs has removed the node and sysfs has not caught
+                // up — which makes by-id an *alternative* source rather than the fast
+                // path over one listing §12 requires (RES-2).
+                if is_dev_node(&dev_path) {
+                    return Some((dev_path, info));
+                }
             }
         }
         None
@@ -723,7 +822,7 @@ impl Resolver {
         let target = std::fs::read_link(&link).ok()?;
         let dev_name = target.file_name()?.to_string_lossy().into_owned();
         let p = self.dev_root.join("dev").join(dev_name);
-        p.exists().then_some(p)
+        is_dev_node(&p).then_some(p)
     }
 
     /// The `by-path` port name currently covering `dev_name`, if any.
@@ -779,6 +878,19 @@ impl Resolver {
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "-".into());
                 let iface = interface.unwrap_or_else(|| "-".into());
+                // §12's usb form is `:`-separated with exactly four fields, so a
+                // field that *contains* `:` mints a string `resolve_usb_identity`
+                // parses as six and rejects as malformed: `dump` wrote it and no
+                // verb could take it back. MAC-style serials do exactly this. A
+                // field that cannot ride the format is unusable for the usb form,
+                // which is the verdict a blank `idVendor` already gets — abandon it
+                // and let §12's fallback chain degrade to by-path (CP-6, RES-5).
+                if [&vid, &pid, &serial, &iface]
+                    .iter()
+                    .any(|f| f.contains(':'))
+                {
+                    return None;
+                }
                 let identity = format!("usb:{vid}:{pid}:{serial}:{iface}");
                 let manufacturer = read_trimmed(&cur.join("manufacturer"));
                 let product = read_trimmed(&cur.join("product"));
@@ -815,6 +927,35 @@ fn ambiguous_warning(matches: &[(PathBuf, UsbInfo)]) -> String {
         devices.len(),
         devices.join(", ")
     )
+}
+
+/// The refusal a bare *serial number* gets when more than one present device carries
+/// it (§12/§15.10). A raw path pins the device, so capture can degrade a duplicated
+/// serial to the by-path identity of *that* device; a serial number pins nothing, so
+/// there is no device to degrade to and picking one binds a physical port the
+/// operator never named. Both shapes land here — two clones with one hard-coded
+/// serial, and one multi-port adapter whose UARTs differ only in the interface index
+/// — so the refusal names every device that carries it and the identity that pins
+/// each, which is the way out `ports` shows too.
+fn ambiguous_serial_reason(matches: &[(PathBuf, UsbInfo)]) -> String {
+    let devices: Vec<String> = matches
+        .iter()
+        .map(|(p, info)| format!("{} ({})", p.display(), info.identity))
+        .collect();
+    format!(
+        "{} present devices carry this serial number ({}) — a serial number that names more than one adapter pins none of them; add by one of the identities listed here, or by the device path (§12)",
+        devices.len(),
+        devices.join(", ")
+    )
+}
+
+/// Whether a path names a **present device node**: there, and not a directory.
+/// `exists()` alone is true for `/dev` and `/dev/serial`, and every source in this
+/// module has to agree about what "present" means — the by-id fast path answering
+/// with a node the device listing already excluded is by-id acting as an alternative
+/// source rather than a fast path over one (RES-2/RES-3).
+fn is_dev_node(p: &Path) -> bool {
+    std::fs::metadata(p).is_ok_and(|m| !m.is_dir())
 }
 
 fn read_trimmed(p: &Path) -> Option<String> {
@@ -1785,6 +1926,318 @@ mod tests {
             r.resolve_current_path(&got.identity),
             Some(t.path().join("dev/ttyFOO"))
         );
+    }
+
+    // -- the bare-serial input form, in both directions (RES-1/RES-6) ----------
+
+    #[test]
+    fn a_bare_serial_number_captures_and_resolves_with_no_by_id_tree() {
+        // RES-1. A bare serial number is a first-class §12 capture form, and it read
+        // `/dev/serial/by-id` alone — so in the exact environment the one-source rule
+        // exists for (a container handed `--device=/dev/ttyUSB0`, an image without
+        // `60-serial.rules`) `add-node` answered "device is not present" for an
+        // adapter that is right there: a diagnostic pointing away from the cause,
+        // which is the RES-2 pattern in the one arm the RES-2 fix did not reach.
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        add_usb_device_unlinked(
+            t.path(),
+            "1-1",
+            "ttyUSB0",
+            "0403",
+            "6001",
+            Some("UNIQ01"),
+            "00",
+            Some(("FTDI", "FT232R USB UART")),
+        );
+        assert!(
+            !t.path().join("dev/serial/by-id").exists(),
+            "the fixture must have no by-id tree at all"
+        );
+
+        let got = r.resolve_input("UNIQ01").expect("the adapter is present");
+        assert_eq!(got.identity, "usb:0403:6001:UNIQ01:00");
+        assert_eq!(got.kind, DeviceKind::Usb);
+        assert!(got.warning.is_none());
+        assert_eq!(got.path, Some(t.path().join("dev/ttyUSB0")));
+        // Capture by serial and capture by path are the same act on the same device,
+        // so they must mint the same identity and the same echo — a divergence here
+        // is the resolver holding a second opinion about what binding it stores.
+        assert_eq!(got, r.resolve_input("/dev/ttyUSB0").unwrap());
+        // Resolution reads that source too: an uncaptured bare serial in a
+        // hand-written configuration still finds its device.
+        assert_eq!(
+            r.resolve_current_path("UNIQ01"),
+            Some(t.path().join("dev/ttyUSB0"))
+        );
+    }
+
+    #[test]
+    fn a_bare_serial_number_no_present_adapter_carries_is_not_present() {
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        add_usb_device(
+            t.path(),
+            "1-1",
+            "ttyUSB0",
+            "usb-FTDI_FT232R_USB_UART_A6008isP-if00-port0",
+            "0403",
+            "6001",
+            Some("A6008isP"),
+            "00",
+            None,
+        );
+        // A serial-less adapter beside it, so the `-` case below has something to
+        // wrongly match.
+        add_usb_device_unlinked(t.path(), "2-1", "ttyUSB1", "1a86", "7523", None, "00", None);
+
+        assert_eq!(
+            r.resolve_input("NOSUCH"),
+            Err(ResolveError::NotPresent {
+                input: "NOSUCH".into()
+            })
+        );
+        assert_eq!(r.resolve_current_path("NOSUCH"), None);
+        // `-` is §12's *absent* marker, not a serial number: an adapter that has none
+        // cannot be named by one, so the marker must not capture ttyUSB1.
+        assert_eq!(
+            r.resolve_input("-"),
+            Err(ResolveError::NotPresent { input: "-".into() })
+        );
+        assert_eq!(r.resolve_current_path("-"), None);
+    }
+
+    #[test]
+    fn a_serial_number_two_adapters_carry_binds_neither() {
+        // RES-1's ambiguity half. A raw path pins the device, so capture can degrade
+        // a duplicated serial to the by-path identity of *that* device (§15.10); a
+        // bare serial number pins nothing, so there is no device to degrade to and
+        // picking one binds a physical port the operator never named. udev publishes
+        // exactly one by-id link for a colliding name, so the old by-id scan saw one
+        // entry and captured whichever clone happened to own it.
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        add_usb_device(
+            t.path(),
+            "1-1",
+            "ttyUSB0",
+            "usb-Clone_DUP-if00-port0",
+            "1a86",
+            "7523",
+            Some("DUP"),
+            "00",
+            None,
+        );
+        add_usb_device_unlinked(
+            t.path(),
+            "2-1",
+            "ttyUSB1",
+            "1a86",
+            "7523",
+            Some("DUP"),
+            "00",
+            None,
+        );
+
+        match r.resolve_input("DUP") {
+            Err(ResolveError::Malformed { input, reason }) => {
+                assert_eq!(input, "DUP");
+                assert!(
+                    reason.contains("ttyUSB0") && reason.contains("ttyUSB1"),
+                    "the refusal must name every device that carries it: {reason}"
+                );
+            }
+            other => panic!("a serial two adapters carry must bind neither, got {other:?}"),
+        }
+        assert_eq!(r.resolve_current_path("DUP"), None);
+    }
+
+    #[test]
+    fn a_multi_port_adapters_one_serial_names_no_single_uart() {
+        // The shape §12 has in mind when it says the interface index is part of the
+        // identity: one FT2232-style adapter, two UARTs, one serial number. Each
+        // interface's `usb:` identity *does* pin it, so this is not §15.10's
+        // duplicate-serial hazard — but the serial number alone still names two
+        // devices, and taking the one that sorts first is a coin flip over which UART
+        // the operator gets.
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        add_usb_device_unlinked(
+            t.path(),
+            "1-1",
+            "ttyUSB0",
+            "0403",
+            "6011",
+            Some("MP1"),
+            "00",
+            None,
+        );
+        add_usb_device_unlinked(
+            t.path(),
+            "1-2",
+            "ttyUSB1",
+            "0403",
+            "6011",
+            Some("MP1"),
+            "01",
+            None,
+        );
+
+        assert!(
+            matches!(r.resolve_input("MP1"), Err(ResolveError::Malformed { .. })),
+            "one serial over two interfaces names no single UART"
+        );
+        assert_eq!(r.resolve_current_path("MP1"), None);
+        // Each interface is still bindable by the identity that does pin it — the
+        // refusal is scoped to the ambiguous *input*, not to the adapter.
+        assert_eq!(
+            r.resolve_current_path("usb:0403:6011:MP1:01"),
+            Some(t.path().join("dev/ttyUSB1"))
+        );
+    }
+
+    // -- by-id is a fast path over the listing, not an alternative (RES-2) -----
+
+    #[test]
+    fn a_by_id_link_outliving_its_device_node_resolves_to_nothing() {
+        // RES-2. Every sibling source gates on the `/dev` node being there; the by-id
+        // arm did not, so it answered with a device the primary listing had already
+        // excluded — a stale link in a container's static `/dev`, or the window where
+        // devtmpfs has removed the node and sysfs has not caught up. The node then
+        // reported a `resolved_path` whose open(2) is ENOENT, which is by-id acting
+        // as an alternative source rather than the fast path §12 requires.
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        let dev = add_usb_device(
+            t.path(),
+            "1-1",
+            "ttyUSB0",
+            "usb-FTDI_A6008isP-if00",
+            "0403",
+            "6001",
+            Some("A6008isP"),
+            "00",
+            None,
+        );
+        let ours = "usb:0403:6001:A6008isP:00";
+        assert_eq!(r.resolve_current_path(ours), Some(dev.clone()));
+
+        std::fs::remove_file(&dev).unwrap();
+        assert!(
+            std::fs::read_link(t.path().join("dev/serial/by-id/usb-FTDI_A6008isP-if00")).is_ok(),
+            "the fixture must keep the stale by-id link the device node left behind"
+        );
+        assert_eq!(
+            r.resolve_current_path(ours),
+            None,
+            "the by-id arm answered with a device node that is gone"
+        );
+        assert_eq!(r.resolve_input(ours).unwrap().path, None);
+    }
+
+    // -- literal path arms: directories and `..` (RES-3/RES-4) -----------------
+
+    #[test]
+    fn a_directory_is_not_a_device_node() {
+        // RES-3. `exists()` is true for `/dev` and `/dev/serial`, so `add-node device
+        // = "/dev"` succeeded and `dump` persisted `raw:/dev`; the node then faulted
+        // EISDIR carrying that nonsense identity — the outcome the all-slash guard
+        // already says §11 rejects up front, reached one component later.
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        std::fs::create_dir_all(t.path().join("dev/serial/by-id")).unwrap();
+        for input in ["/dev", "/dev/serial", "raw:/dev", "raw:/dev/serial/by-id"] {
+            assert!(
+                matches!(r.resolve_input(input), Err(ResolveError::Malformed { .. })),
+                "expected {input:?} to be refused as a directory, not captured"
+            );
+        }
+        // Resolution answers the same way, so a stored one binds nothing rather than
+        // handing the reopen ritual a directory to open.
+        assert_eq!(r.resolve_current_path("raw:/dev"), None);
+        assert_eq!(r.resolve_current_path("/dev/serial"), None);
+    }
+
+    #[test]
+    fn a_parent_dir_component_cannot_escape_the_dev_root() {
+        // RES-4. `rooted` trims leading slashes and nothing else, so `raw:/../x`
+        // joined *through* the root: the identity was minted, the path bound, and the
+        // daemon opened a device outside the tree `--dev-root` pointed it at. That
+        // root is the daemon's own flag and the seam every §12 test runs in (plan §3),
+        // so containment is the property it exists for.
+        let t = TmpTree::new();
+        let root = t.path().join("root");
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        write(&t.path().join("outside"), "");
+        write(&root.join("dev/ttyX"), "");
+        let r = Resolver::new(&root);
+
+        for input in ["raw:/../outside", "/../outside"] {
+            assert!(
+                matches!(r.resolve_input(input), Err(ResolveError::Malformed { .. })),
+                "expected {input:?} to be refused before it is joined under the root"
+            );
+            assert_eq!(r.resolve_current_path(input), None, "{input} resolved");
+        }
+        // The check is on the *component*, not on whether this particular spelling
+        // happens to land back inside: a lexically normalized path is not the same
+        // path once a symlink is in it, so `..` is refused wherever it appears.
+        assert!(matches!(
+            r.resolve_input("/dev/../dev/ttyX"),
+            Err(ResolveError::Malformed { .. })
+        ));
+        assert_eq!(r.resolve_current_path("raw:/dev/../dev/ttyX"), None);
+        // …and the plain spelling of the same device is untouched.
+        assert_eq!(
+            r.resolve_input("/dev/ttyX").unwrap().identity,
+            "raw:/dev/ttyX"
+        );
+    }
+
+    // -- a serial number that cannot ride the identity format (RES-5) ----------
+
+    #[test]
+    fn a_serial_containing_a_colon_degrades_to_by_path() {
+        // RES-5. The `usb:` form is `:`-separated with exactly four fields, so a
+        // MAC-style serial minted `usb:0403:6001:00:1A:…:00` — six fields, which
+        // `resolve_usb_identity` rejects as malformed. `dump` wrote it and no verb
+        // could take it back. A field that cannot ride the format is unusable for the
+        // usb form, which is the verdict a blank `idVendor` already gets: abandon it
+        // and let §12's fallback chain degrade to by-path (CP-6).
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        add_usb_device(
+            t.path(),
+            "1-1",
+            "ttyUSB0",
+            "usb-Vendor_Board-if00-port0",
+            "0403",
+            "6001",
+            Some("00:1A:7D:DA:71:13"),
+            "00",
+            None,
+        );
+        let by_path = t.path().join("dev/serial/by-path");
+        std::fs::create_dir_all(&by_path).unwrap();
+        std::os::unix::fs::symlink("../../ttyUSB0", by_path.join("pci-0:1:1.0-port0")).unwrap();
+
+        let got = r.resolve_input("/dev/ttyUSB0").unwrap();
+        assert_eq!(got.kind, DeviceKind::ByPath);
+        assert_eq!(got.identity, "by-path:pci-0:1:1.0-port0");
+        assert!(got.warning.is_some());
+        // The invariant behind the finding: whatever capture mints must be input the
+        // resolver itself accepts, or the dumped configuration cannot be re-added.
+        assert!(
+            r.resolve_input(&got.identity).is_ok(),
+            "a captured identity must round-trip as input"
+        );
+        assert_eq!(
+            r.resolve_current_path(&got.identity),
+            Some(t.path().join("dev/ttyUSB0"))
+        );
+        // The discovery listing reports the absence rather than a half-formed
+        // identity, exactly as it does for a blank `idVendor`.
+        assert_eq!(r.discover_adapters()[0].identity, None);
     }
 
     #[test]

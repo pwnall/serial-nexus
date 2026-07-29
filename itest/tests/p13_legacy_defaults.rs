@@ -10,18 +10,20 @@
 //! built by `add-node`/`connect` since the last `load` — the exact loss the snapshot
 //! exists to prevent, delivered by a rename.
 //!
-//! Three properties, one per test:
+//! Four properties, one per test:
 //!
 //! 1. a legacy snapshot beside a default socket is adopted, and the next mutation
 //!    rewrites under the *current* name while the legacy file is left untouched;
-//! 2. a client with no `--socket` finds a pre-rename daemon's socket;
-//! 3. …but only when there is no current one — a live daemon is never passed over in
+//! 2. the same holds for an explicit `--state-file` — the shape `packaging/` ships,
+//!    where the rename moved the snapshot's *directory* rather than its name;
+//! 3. a client with no `--socket` finds a pre-rename daemon's socket;
+//! 4. …but only when there is no current one — a live daemon is never passed over in
 //!    favour of a stale socket from an older release.
 //!
-//! Fail-first (plan §3 rule 4): test 1 was proved against the unfixed tree by reverting
-//! the adoption block in `daemon/src/lib.rs` in place — it fails with an empty graph,
-//! which is precisely the defect. Tests 2 and 3 fail the same way with the fallback
-//! removed from `ctl`'s `resolve_socket`.
+//! Fail-first (plan §3 rule 4): tests 1 and 2 were proved against the unfixed tree by
+//! reverting the adoption block in `daemon/src/lib.rs` in place — each fails with an
+//! empty graph, which is precisely the defect. Tests 3 and 4 fail the same way with the
+//! fallback removed from `ctl`'s `resolve_socket`.
 //!
 //! When the window closes, this file and `serial_nexus_rpc::LEGACY_DAEMON_NAME` are
 //! deleted together, and the `meta_names` allowance that names them both goes with them.
@@ -149,6 +151,108 @@ fn a_pre_rename_state_file_is_adopted_and_rewritten_under_the_current_name() {
 
     // 4. …and the legacy file is left exactly as it was. A file this release did not
     //    create is not this release's to delete: a downgrade must still find it.
+    assert_eq!(
+        std::fs::read(&legacy_state).expect("re-read legacy state"),
+        legacy_bytes,
+        "the legacy state file was modified; adoption is read-only"
+    );
+}
+
+/// **An explicit `--state-file` is adopted too — the shape `packaging/` ships** (PKG-1).
+///
+/// The packaged unit does not use the derived default: it names its snapshot under
+/// `/var/lib` so it survives a *reboot* (§11/§15.9), and the pre-rename unit named the
+/// same file under the pre-rename directory. Adoption that only looked beside the
+/// control socket therefore skipped every systemd deployment — the one shape most
+/// likely to meet the rename, upgraded exactly as `packaging/README.md` instructs,
+/// falling through to the `--config` first-boot seed and discarding every node added by
+/// surgery since the last `load`. That is the same empty-graph loss as test 1, arriving
+/// through the door the packaging opens.
+///
+/// The fixture is the packaged shape in miniature: two `<dir>/state.toml` paths whose
+/// directories differ by exactly the rename, and both daemons given the flags their
+/// generation's unit passes.
+#[test]
+fn a_pre_rename_state_file_under_an_explicit_directory_is_adopted() {
+    let run = TempRun::new();
+    // `StateDirectory=` in the unit; `mkdir` here.
+    let legacy_state = run.join(LEGACY).join("state.toml");
+    let current_state = run.join(CURRENT).join("state.toml");
+    for dir in [&legacy_state, &current_state] {
+        std::fs::create_dir_all(dir.parent().unwrap()).expect("mkdir the state directory");
+    }
+
+    // 1. The "old release" unit: both flags spelled the old way.
+    {
+        let legacy_sock = run.join(&format!("{LEGACY}.sock"));
+        let (_d, rpc) = spawn(
+            &run,
+            &format!("{LEGACY}.sock"),
+            &[
+                "--socket",
+                legacy_sock.to_str().unwrap(),
+                "--state-file",
+                legacy_state.to_str().unwrap(),
+            ],
+        );
+        rpc.load_toml(&console_config(&run, "before"), false)
+            .expect("load");
+        assert!(
+            wait_until(Duration::from_secs(5), || legacy_state.exists()),
+            "the old-spelling daemon never wrote {}",
+            legacy_state.display()
+        );
+        rpc.shutdown();
+    }
+    let legacy_bytes = std::fs::read(&legacy_state).expect("read legacy state");
+    assert!(
+        !current_state.exists(),
+        "nothing should have written the current-name state file yet"
+    );
+
+    // 2. The upgraded unit: the same two flags, both respelled by the rename.
+    let current_sock = run.join(&format!("{CURRENT}.sock"));
+    let (_d, rpc) = spawn(
+        &run,
+        &format!("{CURRENT}.sock"),
+        &[
+            "--socket",
+            current_sock.to_str().unwrap(),
+            "--state-file",
+            current_state.to_str().unwrap(),
+        ],
+    );
+    let state = rpc.state();
+    let names: Vec<String> = state["nodes"]
+        .as_array()
+        .expect("nodes array")
+        .iter()
+        .map(|n| n["name"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "before"),
+        "the upgraded unit came up with {names:?} instead of adopting the snapshot the \
+         pre-rename unit left under its own state directory — a systemd deployment \
+         would have silently lost every node added since its last `load`"
+    );
+
+    // 3. The first mutation writes forward, at the path the current unit named…
+    rpc.add_node_toml(&console_config(&run, "after"))
+        .expect("add-node");
+    assert!(
+        wait_until(Duration::from_secs(5), || current_state.exists()),
+        "the adopted graph was never rewritten to {}",
+        current_state.display()
+    );
+    let written = std::fs::read_to_string(&current_state).expect("read current state");
+    assert!(
+        written.contains("before") && written.contains("after"),
+        "the current state file should carry the adopted graph plus the new node, \
+         got:\n{written}"
+    );
+
+    // 4. …and the pre-rename directory is left exactly as it was, for the same reason as
+    //    in test 1: a downgrade must still find it.
     assert_eq!(
         std::fs::read(&legacy_state).expect("re-read legacy state"),
         legacy_bytes,

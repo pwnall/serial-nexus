@@ -5,9 +5,10 @@
 //!
 //! Dispatch is async because the arbitration verbs may *wait* (`lock --wait`,
 //! `send`'s acquire-with-timeout, §15.20), so a connection is **one** `select!` with
-//! four lanes — the in-flight verb, the request half, the `subscribe` broadcast, and
-//! this connection's tap deliveries — rather than a request/response loop with a
-//! nested wait inside it. That shape is the CTRLW-1 fix, and it is structural: the
+//! five lanes — the in-flight verb, the request half, the `subscribe` broadcast, this
+//! connection's terminal `tap.closed` events, and its tap deliveries — rather than a
+//! request/response loop with a nested wait inside it. That shape is the CTRLW-1 fix,
+//! and it is structural: the
 //! wait used to be an inner two-arm loop polling only the verb and the next line, so
 //! for the whole duration of a wait the connection stopped draining its notification
 //! lanes — `subscribe` traffic merely late, but `tap.data` bytes really *lost* past
@@ -17,13 +18,25 @@
 //! as an arm there is exactly one place that drains the notification lanes, and no
 //! control path can bypass it.
 //!
-//! The lanes are `biased`, and the order is load-bearing twice. The verb comes first
-//! so a fast dispatch — one ready on its first poll — is answered without ever reading
-//! (and then having to refuse) a request pipelined behind it. The request half comes
-//! before the two notification lanes so an operator's keystroke is never starved by a
+//! The lanes are `biased`, and the order is load-bearing three times. The verb comes
+//! first so a fast dispatch — one ready on its first poll — is answered without ever
+//! reading (and then having to refuse) a request pipelined behind it. The request half
+//! comes before the notification lanes so an operator's keystroke is never starved by a
 //! firehose tap: the request lane is ready only while a client is actually sending and
 //! is bounded by that client, whereas a tapped high-rate endpoint (invariant 2's
-//! ~185 MiB/s reader) can keep its queue non-empty indefinitely.
+//! ~185 MiB/s reader) can keep its queue non-empty indefinitely. And the terminal
+//! `tap.closed` lane comes before the tap-data lane, because the client it exists for is
+//! the one whose data queue is saturated (37-CTRL-1): draining it behind that backlog
+//! would be draining it behind the reason it was written.
+//!
+//! **No write in this loop is ever unpolled** (37-CTRL-2). Every line goes out through
+//! [`write_line`], which races the write against the parked verb, because a client that
+//! has stopped reading blocks `write_all` for as long as it likes and the parked verb's
+//! *deadline and dequeue guard live inside its future* (§15.20). Awaiting a write
+//! straight inside a select arm therefore froze §15.20's cancel-safety enumeration for
+//! the duration: one non-reading client whose parked `send` sat at an endpoint's FIFO
+//! head denied every other connection's acquire on that endpoint — the lock reported
+//! free, `--steal` the only escape — for as long as it declined to read.
 //!
 //! Only one verb may be in flight per connection. A *pipelined* request is not a
 //! disconnect (CTRL-1): it is answered with [`WAIT_IN_FLIGHT_MESSAGE`] carrying its
@@ -178,6 +191,15 @@ struct InFlight {
     fut: DispatchFuture,
 }
 
+/// A verb that finished while the connection was blocked writing something else
+/// (37-CTRL-2): its reply, held until the write path frees up. Carrying it as a value
+/// keeps the settle path in one place — the top of the loop — whichever poll noticed it.
+struct Settled {
+    id: Id,
+    is_subscribe: bool,
+    result: Result<Value, RpcError>,
+}
+
 /// The dispatch lane of [`serve_connection`]'s `select!`: polls the in-flight verb
 /// when there is one and parks forever when there is not, so the lane can sit in the
 /// select unconditionally instead of under a guard that could be forgotten.
@@ -189,6 +211,98 @@ async fn poll_inflight(slot: &mut Option<InFlight>) -> Result<Value, RpcError> {
     match slot {
         Some(inflight) => inflight.fut.as_mut().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Write one line to the client while the connection's parked verb keeps being polled
+/// (§15.20, 37-CTRL-2). The connection loop's **only** write, so the property holds by
+/// construction rather than by being remembered at each of its eight call sites.
+///
+/// A client that stops reading blocks `write_all` for as long as it likes — a frozen
+/// §17 browser tab backpressuring the bridge's bounded funnel is the shipped way to
+/// reach it. Awaiting that write inside a select arm stopped polling *everything* on
+/// the connection, and the one thing that must not stop is the in-flight verb: its
+/// deadline and its dequeue guard live inside that future, so §15.20's cancel-safety
+/// enumeration — a deadline, a dropped connection, teardown — could not fire while the
+/// write was blocked. A parked `send` at an endpoint's FIFO queue head then stayed
+/// there indefinitely, and `EndpointLock::acquire` denies every other on-demand origin
+/// while free-but-queued (FIFO fairness, §6): one non-reading client stalled every
+/// other connection's arbitration on that endpoint, with the lock reported free.
+///
+/// The verb may therefore settle *during* a write. Its reply cannot be written here —
+/// this write is not finished, and NDJSON frames do not interleave — so it is parked in
+/// `settled` and answered at the top of the loop, before any further request is read;
+/// the one-waiting-verb-per-connection rule is preserved as seen from the client.
+/// `write_all` is not cancel-safe, which is why the future is pinned once and polled
+/// across the inner select rather than recreated: dropping it mid-line would resume a
+/// frame from its middle.
+async fn write_line<W: tokio::io::AsyncWrite + Unpin>(
+    write_half: &mut W,
+    line: &str,
+    inflight: &mut Option<InFlight>,
+    settled: &mut Option<Settled>,
+) -> io::Result<()> {
+    let write = write_half.write_all(line.as_bytes());
+    tokio::pin!(write);
+    loop {
+        tokio::select! {
+            biased;
+
+            done = &mut write => return done,
+
+            // Parks forever once the slot is empty, so this arm fires at most once per
+            // write and never spins.
+            result = poll_inflight(inflight) => {
+                let Some(done) = inflight.take() else { continue };
+                *settled = Some(Settled {
+                    id: done.id,
+                    is_subscribe: done.is_subscribe,
+                    result,
+                });
+            }
+        }
+    }
+}
+
+/// One tap delivery as the id-less notification it becomes on the wire (§10/§17).
+/// Shared by the two lanes that carry them, so a terminal event that overflowed the
+/// data queue (37-CTRL-1) is framed identically to one that did not.
+fn tap_notification(msg: TapMsg) -> Notification {
+    match msg {
+        TapMsg::Data {
+            tap_id,
+            bytes,
+            offset,
+            gap_before,
+        } => Notification::new(
+            "tap.data",
+            Some(json!({
+                "tap": tap_id,
+                // The endpoint hostward offset of this chunk's first byte
+                // (plan §11.8), so a client splices replay and live exactly.
+                "offset": offset,
+                // Bytes lost at the endpoint's producer→hub feed hop just
+                // before these (§5, TAP-1b). Normally 0; non-zero means a
+                // real hole the contiguous offsets cannot show.
+                "gap_before": gap_before,
+                "data": base64_encode(&bytes),
+            })),
+        ),
+        // The graph dropped this tap's endpoint (TAP-1). Terminal for the
+        // tap, not for the connection: its other taps and its subscription
+        // keep running.
+        TapMsg::Closed {
+            tap_id,
+            endpoint,
+            reason,
+        } => Notification::new(
+            "tap.closed",
+            Some(json!({
+                "tap": tap_id,
+                "endpoint": endpoint,
+                "reason": reason,
+            })),
+        ),
     }
 }
 
@@ -218,6 +332,12 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
     // notifications. `open_taps` tracks the taps this connection opened so they close
     // on `tap.close` and, via `OpenTap`'s drop, when the connection ends.
     let (tap_tx, mut tap_rx) = mpsc::channel::<TapMsg>(TAP_QUEUE_CAP);
+    // The terminal-event lane (§10, 37-CTRL-1): where a hub puts a tap's `tap.closed`
+    // when the bounded data queue above has no room for it. Unbounded because the
+    // terminal event is not part of the bytes' lossy bargain — §10 promises the tap does
+    // not silently die — and bounded in fact by the taps this connection has open, one
+    // event each, since a detached tap leaves its hub in the same breath.
+    let (closed_tx, mut closed_rx) = mpsc::unbounded_channel::<TapMsg>();
     let mut open_taps: Vec<OpenTap> = Vec::new();
 
     // The connection's single in-flight verb (§15.20). `None` for the whole life of a
@@ -225,8 +345,36 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
     // or a contended `send` is read until it settles, is refused a write, or the
     // connection ends beneath it.
     let mut inflight: Option<InFlight> = None;
+    // A verb that settled while a write was blocked (37-CTRL-2), waiting for its reply
+    // to be written at the top of the loop.
+    let mut settled: Option<Settled> = None;
 
     loop {
+        // Answer a settled verb before reading anything else, so the client never sees
+        // a second verb accepted while this one's reply is outstanding (§15.20). Both
+        // settle paths — the dispatch lane below and a verb that finished inside
+        // [`write_line`] — converge here.
+        if let Some(done) = settled.take() {
+            let response = match done.result {
+                Ok(value) => Response::success(done.id, value),
+                Err(err) => Response::error(done.id, err),
+            };
+            if write_line(
+                &mut write_half,
+                &serial_nexus_rpc::to_line(&response),
+                &mut inflight,
+                &mut settled,
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+            if done.is_subscribe {
+                subscribed.subscribe();
+            }
+        }
+
         tokio::select! {
             biased;
 
@@ -236,22 +384,14 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
             result = poll_inflight(&mut inflight) => {
                 // `poll_inflight` parks forever on an empty slot, so this arm firing
                 // means there is a verb to settle; `continue` rather than panic keeps
-                // an impossible state from costing a §17 browser its session.
-                let Some(settled) = inflight.take() else { continue };
-                let response = match result {
-                    Ok(value) => Response::success(settled.id, value),
-                    Err(err) => Response::error(settled.id, err),
-                };
-                if write_half
-                    .write_all(serial_nexus_rpc::to_line(&response).as_bytes())
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                if settled.is_subscribe {
-                    subscribed.subscribe();
-                }
+                // an impossible state from costing a §17 browser its session. The reply
+                // is written at the top of the loop, where the other settle path lands.
+                let Some(done) = inflight.take() else { continue };
+                settled = Some(Settled {
+                    id: done.id,
+                    is_subscribe: done.is_subscribe,
+                    result,
+                });
             }
 
             line = lines.next_line() => {
@@ -275,11 +415,13 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                             error_codes::INVALID_REQUEST,
                             format!("request line exceeds the {MAX_REQUEST_LINE}-byte limit"),
                         );
-                        let _ = write_half
-                            .write_all(
-                                serial_nexus_rpc::to_line(&Response::error_without_id(err)).as_bytes(),
-                            )
-                            .await;
+                        let _ = write_line(
+                            &mut write_half,
+                            &serial_nexus_rpc::to_line(&Response::error_without_id(err)),
+                            &mut inflight,
+                            &mut settled,
+                        )
+                        .await;
                         break;
                     }
                 };
@@ -302,10 +444,14 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                         // applies, and it is still a refusal rather than a disconnect.
                         Err(err) => Response::error_without_id(err),
                     };
-                    if write_half
-                        .write_all(serial_nexus_rpc::to_line(&refusal).as_bytes())
-                        .await
-                        .is_err()
+                    if write_line(
+                        &mut write_half,
+                        &serial_nexus_rpc::to_line(&refusal),
+                        &mut inflight,
+                        &mut settled,
+                    )
+                    .await
+                    .is_err()
                     {
                         break;
                     }
@@ -319,10 +465,14 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                     Ok(req) => req,
                     Err(err) => {
                         let resp = Response::error_without_id(err);
-                        if write_half
-                            .write_all(serial_nexus_rpc::to_line(&resp).as_bytes())
-                            .await
-                            .is_err()
+                        if write_line(
+                            &mut write_half,
+                            &serial_nexus_rpc::to_line(&resp),
+                            &mut inflight,
+                            &mut settled,
+                        )
+                        .await
+                        .is_err()
                         {
                             break;
                         }
@@ -339,10 +489,15 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                 // list live, rather than in the shared dispatch. Both complete
                 // synchronously, with no waiting lane — and their reply is written
                 // before the loop can drain a single queued `tap.data`, which is what
-                // makes `tap.open`'s `from_offset` an exact splice point (§11.8).
+                // makes `tap.open`'s `from_offset` an exact splice point (plan §11.8).
                 let response = if method == "tap.open" {
                     match daemon.tap_open(params, tap_tx.clone()) {
                         Ok((value, handle)) => {
+                            // Route this tap's terminal event onto the overflow lane
+                            // before anything can await: the hub is one synchronous
+                            // step away from here, so no `detach_all` can land in
+                            // between and find the tap without a lane (37-CTRL-1).
+                            handle.attach_terminal(closed_tx.clone());
                             open_taps.push(handle);
                             Response::success(id, value)
                         }
@@ -409,10 +564,14 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                     continue;
                 };
 
-                if write_half
-                    .write_all(serial_nexus_rpc::to_line(&response).as_bytes())
-                    .await
-                    .is_err()
+                if write_line(
+                    &mut write_half,
+                    &serial_nexus_rpc::to_line(&response),
+                    &mut inflight,
+                    &mut settled,
+                )
+                .await
+                .is_err()
                 {
                     break;
                 }
@@ -421,10 +580,14 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
             // just buffers (and drops-oldest on lag), which we never read.
             note = notes.recv(), if subscribed.counted => match note {
                 Ok(note) => {
-                    if write_half
-                        .write_all(serial_nexus_rpc::to_line(&note).as_bytes())
-                        .await
-                        .is_err()
+                    if write_line(
+                        &mut write_half,
+                        &serial_nexus_rpc::to_line(&note),
+                        &mut inflight,
+                        &mut settled,
+                    )
+                    .await
+                    .is_err()
                     {
                         break;
                     }
@@ -432,42 +595,30 @@ pub async fn serve_connection(daemon: Rc<Daemon>, stream: UnixStream) {
                 Err(RecvError::Lagged(_)) => {} // skipped snapshots; the next is current
                 Err(RecvError::Closed) => break,
             },
+            // Terminal `tap.closed` events that overflowed the data queue below
+            // (37-CTRL-1). Ahead of that queue on purpose: this lane exists for the
+            // client whose data queue is full, so draining it behind that backlog would
+            // defeat it. `recv` yields `None` only when every sender is gone; the
+            // connection holds `closed_tx` for its whole life, so this only pends.
+            closed = closed_rx.recv() => if let Some(msg) = closed {
+                let note = serial_nexus_rpc::to_line(&tap_notification(msg));
+                if write_line(&mut write_half, &note, &mut inflight, &mut settled)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            },
             // Tap deliveries for this connection (§17): base64-frame bytes into a
-            // `tap.data` notification, or relay the terminal `tap.closed`. Both ride
-            // this channel rather than the `subscribe` broadcast because §10 delivers
-            // a tap's stream *on that connection*, subscribed or not. `recv` yields
-            // `None` only when every sender is gone; the connection holds `tap_tx` for
-            // its whole life, so this only pends rather than firing spuriously.
+            // `tap.data` notification, or relay the terminal `tap.closed` that still
+            // fitted here. Both ride this channel rather than the `subscribe` broadcast
+            // because §10 delivers a tap's stream *on that connection*, subscribed or
+            // not. `recv` yields `None` only when every sender is gone; the connection
+            // holds `tap_tx` for its whole life, so this only pends rather than firing
+            // spuriously.
             tap = tap_rx.recv() => if let Some(msg) = tap {
-                let note = match msg {
-                    TapMsg::Data { tap_id, bytes, offset, gap_before } => Notification::new(
-                        "tap.data",
-                        Some(json!({
-                            "tap": tap_id,
-                            // The endpoint hostward offset of this chunk's first byte
-                            // (§11.8), so a client splices replay and live exactly.
-                            "offset": offset,
-                            // Bytes lost at the endpoint's producer→hub feed hop just
-                            // before these (§5, TAP-1b). Normally 0; non-zero means a
-                            // real hole the contiguous offsets cannot show.
-                            "gap_before": gap_before,
-                            "data": base64_encode(&bytes),
-                        })),
-                    ),
-                    // The graph dropped this tap's endpoint (TAP-1). Terminal for the
-                    // tap, not for the connection: its other taps and its subscription
-                    // keep running.
-                    TapMsg::Closed { tap_id, endpoint, reason } => Notification::new(
-                        "tap.closed",
-                        Some(json!({
-                            "tap": tap_id,
-                            "endpoint": endpoint,
-                            "reason": reason,
-                        })),
-                    ),
-                };
-                if write_half
-                    .write_all(serial_nexus_rpc::to_line(&note).as_bytes())
+                let note = serial_nexus_rpc::to_line(&tap_notification(msg));
+                if write_line(&mut write_half, &note, &mut inflight, &mut settled)
                     .await
                     .is_err()
                 {
@@ -745,6 +896,148 @@ mod tests {
                 };
                 assert_eq!(resp.id, Id::Number(2), "the parked verb still answers");
                 assert!(resp.is_success(), "the send should have been granted");
+            })
+            .await;
+    }
+
+    // 37-CTRL-2: a connection whose client has stopped reading must not take an
+    // endpoint's arbitration down with it. Every write in the loop used to be awaited
+    // straight inside its select arm, so a blocked `write_all` stopped polling the
+    // parked verb — and the verb's deadline and dequeue guard live *inside* that future
+    // (§15.20). The parked `send` therefore sat at the endpoint's FIFO head forever,
+    // and `EndpointLock::acquire` denies every other on-demand origin while
+    // free-but-queued (§6 fairness): one non-reading client — a frozen §17 tab
+    // backpressuring the bridge's funnel is the shipped way there — stalled every other
+    // connection's arbitration on that endpoint, with the lock reported free and
+    // `--steal` the only escape.
+    //
+    // The tap lane is the firehose that stalls the write, because that is the lane a
+    // console actually saturates; the assertion is about the *lock*, observed from
+    // outside the connection entirely.
+    #[tokio::test]
+    async fn a_parked_verb_expires_while_its_client_has_stopped_reading() {
+        use crate::daemon::Daemon;
+        use crate::runtime::LockCell;
+        use crate::tap::TapHub;
+        use serial_nexus_core::Chunk;
+        use serial_nexus_core::graph::WriteMode;
+        use serial_nexus_core::lock::{Acquire, Arbitration, EndpointLock, OriginId};
+        use std::time::Duration;
+        use tokio::io::AsyncBufReadExt;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let daemon = Rc::new(Daemon::default());
+
+                let (notifier, _keep) = tokio::sync::broadcast::channel(8);
+                let lock = Rc::new(LockCell::new(
+                    "usb0",
+                    EndpointLock::new(Arbitration::Exclusive),
+                    notifier,
+                ));
+                let holder = OriginId(1);
+                let rival = OriginId(2);
+                lock.with_mut(|g| {
+                    g.register(holder, "console-a", WriteMode::OnDemand);
+                    g.register(rival, "console-b", WriteMode::OnDemand);
+                    let _ = g.acquire(holder);
+                });
+                let (tx, _targetward_rx) = mpsc::channel::<Chunk>(4);
+                daemon.advertise_endpoint_for_test("usb0", lock.clone(), tx);
+                // The same endpoint's tap hub: this connection's firehose.
+                let (hub, _active, _fd) = TapHub::new("usb0", 0);
+                daemon.advertise_tap_hub_for_test("usb0", hub.clone());
+
+                let (client, server) = UnixStream::pair().unwrap();
+                tokio::task::spawn_local(serve_connection(daemon.clone(), server));
+
+                let (client_read, mut client_write) = client.into_split();
+                // Held, never read from again after the ack below — a live connection
+                // with a client that has stopped consuming, not a closed one.
+                let mut replies = BufReader::new(client_read).lines();
+
+                client_write
+                    .write_all(
+                        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tap.open\",\
+                          \"params\":{\"endpoint\":\"usb0\"}}\n",
+                    )
+                    .await
+                    .unwrap();
+                let ack = replies
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("the tap.open ack");
+                assert!(ack.contains("\"tap\":"), "{ack}");
+
+                // Park a contended `send` on a short deadline: the FIFO head.
+                client_write
+                    .write_all(
+                        b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"send\",\
+                          \"params\":{\"endpoint\":\"usb0\",\"line\":\"go\",\"timeout_ms\":500}}\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut parked = false;
+                for _ in 0..500 {
+                    if lock.with(|g| g.waiters().count()) == 1 {
+                        parked = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                assert!(parked, "the contended send never reached the FIFO queue");
+
+                // Firehose the tap until the connection is provably no longer draining
+                // it: the client is not reading, so the socket fills and the write in
+                // flight cannot return. A tap charging drops is the observable proof —
+                // the loop takes one message per iteration, so a full queue means the
+                // write of the one before it has not come back.
+                let blob = vec![b'x'; 64 * 1024];
+                let mut stalled = false;
+                for _ in 0..200 {
+                    for _ in 0..16 {
+                        hub.with_mut(|h| h.ingest(&Chunk::copy_from_slice(&blob)));
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    if hub.with(|h| h.snapshot().taps.iter().any(|&(_, dropped)| dropped > 0)) {
+                        stalled = true;
+                        break;
+                    }
+                }
+                assert!(
+                    stalled,
+                    "the fixture never saturated the connection's write path, so nothing \
+                     was actually observed under a stalled reader"
+                );
+
+                // The deadline must still fire: the waiter leaves the queue and the
+                // transient origin unregisters, all inside the future nothing else can
+                // poll.
+                let mut expired = false;
+                for _ in 0..1000 {
+                    if lock.with(|g| g.waiters().count()) == 0 {
+                        expired = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(
+                    expired,
+                    "the parked send never expired: its deadline lives inside the verb's \
+                     future, which a blocked write stopped polling (37-CTRL-2)"
+                );
+
+                // And the endpoint is arbitrable again by someone else — the symptom an
+                // operator sees, with the lock free and only `--steal` as an escape.
+                assert!(lock.with_mut(|g| g.release(holder)));
+                assert_eq!(
+                    lock.with_mut(|g| g.acquire(rival)),
+                    Acquire::Granted,
+                    "a stalled connection's parked verb still owns the FIFO head, so \
+                     every other origin is denied on a free lock (37-CTRL-2)"
+                );
             })
             .await;
     }

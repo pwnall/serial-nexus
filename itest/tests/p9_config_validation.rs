@@ -78,7 +78,7 @@ fn node_names(rpc: &Rpc) -> Vec<String> {
     names
 }
 
-/// The daemon's per-boot nonce (`info.instance`, §11.8). Unchanged across a test
+/// The daemon's per-boot nonce (`info.instance`, plan §11.8). Unchanged across a test
 /// means *this* daemon process served both calls — the liveness assertion RV-11a
 /// needs, since its defect was a SIGABRT followed by a crash loop.
 fn instance(rpc: &Rpc) -> Value {

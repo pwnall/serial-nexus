@@ -65,6 +65,12 @@ body {
 #pane-title { font-weight: 700; }
 #pane-lock { color: #ffb454; font-size: 12px; }
 #pane-drops { color: #e06c75; font-size: 12px; margin-left: auto; }
+/* The unknown-sequence tally (§17), which sits beside the drop badge and inside the run
+   its `margin-left: auto` pushes right — so an empty drop badge still leaves this one
+   where the operator looks for it. Quieter in colour on purpose: bytes the daemon could
+   not deliver are a fault, sequences this subset does not speak are a stated limit. Both
+   are losses the operator is owed; only one is alarming. */
+#pane-unknown { color: #ffb454; font-size: 12px; }
 #pane-storage { color: #6b7280; font-size: 12px; }
 #pane-tools { display: flex; gap: 6px; }
 #pane-tools button {

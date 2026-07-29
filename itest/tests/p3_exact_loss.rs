@@ -19,32 +19,12 @@
 mod linux_impl {
     use std::time::Duration;
 
-    use serial_nexus_itest::{Daemon, Sim, sha256_hex, wait_until};
+    use serial_nexus_itest::{Daemon, Sim, seeded_bytes, sha256_hex, wait_until};
 
     /// 24 MiB, matching the script's `SIZE_H="24MiB"` / `SIZE_B=24*1024*1024`.
     const SIZE: usize = 24 * 1024 * 1024;
     /// The source seed (`--seed 7`).
     const SEED: u64 = 7;
-
-    /// The `serial-nexus-sim` deterministic byte stream (splitmix64), copied verbatim from
-    /// `serial-nexus-sim`'s `seeded_bytes`. The source's own `sent`/`sha256` verdict is on a
-    /// stdout that `Sim::spawn` discards, so we reconstruct the byte-exact ground
-    /// truth from the seed instead — equivalent, since the stream is deterministic in
-    /// `(seed, size)`.
-    fn seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
-        let mut s = seed;
-        let mut out = Vec::with_capacity(len);
-        while out.len() < len {
-            s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = s;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            out.extend_from_slice(&z.to_le_bytes());
-        }
-        out.truncate(len);
-        out
-    }
 
     /// Read a node's two hostward PTY drop counters (§7.2 `state_extra`), 0 if absent.
     fn drop_counters(rpc: &serial_nexus_itest::Rpc, node: &str) -> (u64, u64) {

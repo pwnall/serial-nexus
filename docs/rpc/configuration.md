@@ -280,6 +280,13 @@ origin's declared mode is untouched by a removal.
 | --- | --- | --- |
 | `removed` | string | the removed node's name |
 | `cascaded_edges` | integer | number of attached edges removed (0 when none) |
+| `released_locks` | integer | how many of those cascaded edges held their endpoint's write lock and released it on the way out. `0` unless `cascade` removed a lock-holding writer |
+| `purged_bytes` | integer | un-flushed targetward bytes discarded with the cascaded origins, summed — the same fact [`disconnect`](#disconnect) reports for one edge, and honest for the same reason (§5: loss is always visible). Nonzero only where a **pty** origin was cascaded |
+
+The last two rows exist because the identical edge removal used to be loud through
+`disconnect` and mute through this verb: an operator cascading a lock-holding writer
+changed who may write, and one cascading a writer with bytes queued lost them by design.
+Both are reported rather than done silently (review 37 `37-LIFE-1`).
 
 ### CLI
 
@@ -301,7 +308,9 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"remove-node","params":{"node"
     | nc -N -U "$SOCK" | jq .result
 {
   "removed": "usb0",
-  "cascaded_edges": 2
+  "cascaded_edges": 2,
+  "released_locks": 1,
+  "purged_bytes": 41
 }
 ```
 
@@ -373,6 +382,14 @@ $ serial-nexus-ctl connect usb0 mux --write-mode held
 * `-32602` — the *params* are malformed, before any graph is considered: a missing
   `a`/`b`, an unknown `write_mode` value, or an unknown key (the edge schema is
   `deny_unknown_fields`, §11).
+* `-32007` — **transient**, and the only error here that is a property of the
+  moment rather than of the request: the target-facing endpoint has not yet drained
+  the hostward receivers of the edges attached before this one, so the attachment
+  did nothing and the graph is exactly as it was. Reachable only from a pipelined
+  burst of edge surgery on one endpoint faster than its pump is scheduled; retry.
+  It is deliberately *not* reported as `consumer_live: false`, which names a node
+  that cannot receive at all — a permanent property that would send an operator to
+  inspect a healthy node while the configured edge stayed dead (37-DATA-1).
 
 ### Example
 

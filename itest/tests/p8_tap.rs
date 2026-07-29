@@ -51,65 +51,20 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use serial_nexus_itest::{Daemon, Rpc, Sim, Subscription, serial_echo, sha256_hex, wait_until};
+use serial_nexus_itest::{
+    Daemon, Rpc, Sim, Subscription, file_len, seeded_bytes, serial_echo, sha256_hex, wait_until,
+};
 
 const N: usize = 262144; // 256 KiB — well under the tap queue bound, so no drops here.
 const SEED: u64 = 7;
 
-/// Current on-disk length of `p` (0 if absent) — the portable replacement for
-/// `stat -c %s … || echo 0`.
-fn file_len(p: &Path) -> u64 {
-    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-}
-
-/// The sim's deterministic payload generator (SplitMix64), reimplemented so the test
-/// owns the source's ground-truth checksum without parsing the sim's (nulled) stdout.
-/// `N` is a multiple of 8, so this is byte-identical to `serial-nexus-sim`'s output.
-fn seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
-    let mut s = seed;
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        out.extend_from_slice(&z.to_le_bytes());
-    }
-    out.truncate(len);
-    out
-}
-
-/// Standard base64 decode (alphabet `A-Za-z0-9+/`, `=` padding) — the inverse of the
-/// daemon's `serial_nexus_rpc::base64_encode` used for `tap.data`. Each `tap.data` payload is
-/// its own padded string, so decoding per-message and concatenating is exact.
+/// Standard base64 decode of a `tap.data` payload — `serial_nexus_rpc`'s tested
+/// decoder rather than a seventh hand-rolled copy (§16.5 one-rule-one-place, review
+/// 37 37-TEST-5). Panics on a malformed payload: these bytes were produced by
+/// `serial_nexus_rpc::base64_encode` on the other side of the socket, so anything
+/// else is a defect, not an input.
 fn base64_decode(s: &str) -> Vec<u8> {
-    fn val(c: u8) -> Option<u32> {
-        match c {
-            b'A'..=b'Z' => Some((c - b'A') as u32),
-            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let mut out = Vec::new();
-    let mut acc = 0u32;
-    let mut nbits = 0u32;
-    for &c in s.as_bytes() {
-        if c == b'=' {
-            break;
-        }
-        let Some(v) = val(c) else { continue }; // skip any stray whitespace/newlines
-        acc = (acc << 6) | v;
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((acc >> nbits) as u8);
-        }
-    }
-    out
+    serial_nexus_rpc::base64_decode(s).expect("a tap.data payload must be valid base64")
 }
 
 /// Number of open taps `state` currently reports.
@@ -522,7 +477,7 @@ fn tap_close_detaches_its_own_tap_and_a_stranger_connection_cannot() {
     let mut owner = TapConn::open(&d.socket());
     let ack = owner.tap_open("usb0", true);
     let id = tap_id(&ack);
-    // The `tap.open` result's full shape (§17/§11.8/TAP-1b): the id, the echoed
+    // The `tap.open` result's full shape (§17/plan §11.8/TAP-1b): the id, the echoed
     // endpoint, the empty-replay marker, the offset the stream begins at, and the
     // endpoint's feed-loss baseline that `tap.data.gap_before` deltas are measured from.
     assert_eq!(ack.pointer("/result/endpoint"), Some(&json!("usb0")));
@@ -869,4 +824,120 @@ device = "{dev}"
 
     // The bytes flowed; the closed tap saw none of them.
     conn.expect_no_note("tap.data", Duration::from_millis(500), "after tap.close");
+}
+
+/// Bytes the endpoint's taps have shed because their connection stopped draining its
+/// bounded queue (§5) — the observable proof that a queue is *full*, which is the only
+/// state in which the terminal event has nowhere ordinary to go.
+fn tap_dropped(rpc: &Rpc) -> u64 {
+    rpc.state()["taps"]
+        .as_array()
+        .map(|taps| {
+            taps.iter()
+                .filter_map(|t| t.get("dropped").and_then(Value::as_u64))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// 37-CTRL-1 — the terminal `tap.closed` must reach a client whose tap queue is
+/// **full**. Every guard above opens its tap on an idle or absent endpoint, where the
+/// bounded queue has room and `try_send` always succeeds; the event used to be sent
+/// with a `try_send` whose `Full` was discarded, and `detach_all` drops the senders one
+/// line later, so on a saturated queue the loss was permanent, uncounted and invisible
+/// from the channel. That queue is not an exotic state: it is the ordinary steady state
+/// of a slow consumer on a firehose endpoint — precisely the client §10's "the tap does
+/// not silently die" is about. When it happened, `ctl tap` re-entered the hang CTL-1
+/// was fixed for and the console pane froze with no re-anchor.
+///
+/// Needs a real byte source to saturate a socket, so it skips off Linux (§7).
+#[test]
+fn tap_closed_reaches_a_client_whose_tap_queue_is_full() {
+    if !cfg!(target_os = "linux") {
+        eprintln!(
+            "SKIP tap_closed_reaches_a_client_whose_tap_queue_is_full: a pts cannot be a serial device off Linux"
+        );
+        return;
+    }
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let dev = d.run().join("dev");
+    let dev_str = dev.to_string_lossy().into_owned();
+
+    // A paced firehose: fast enough to fill a socket buffer and a 128-slot tap queue in
+    // about a second, bounded in total so it cannot outlive the test.
+    let _source = Sim::spawn(
+        &[
+            "pty",
+            "--source",
+            "--bytes",
+            "32MiB",
+            "--rate",
+            "2097152",
+            "--link",
+            &dev_str,
+            "--hold-ms",
+            "600000",
+            "--timeout-ms",
+            "600000",
+        ],
+        Some(&dev),
+    );
+
+    // A lone serial node: no consumer attached, so the hostward bytes are discarded
+    // after the tap sees them (§5, §15.32 — the tap mirror is outside the graph).
+    let cfg = format!(
+        r#"
+[[node]]
+type = "serial"
+name = "usb0"
+device = "{dev}"
+hostward_buffer = 8192
+"#,
+        dev = dev.display(),
+    );
+    rpc.load_toml(&cfg, false)
+        .expect("load the firehose config");
+    assert!(
+        rpc.wait_status("usb0", "active", Duration::from_secs(20)),
+        "usb0 not active: {:?}",
+        rpc.node("usb0")
+    );
+
+    let mut conn = TapConn::open(&d.socket());
+    let id = tap_id(&conn.tap_open("usb0", false));
+
+    // From here the client reads nothing: the socket fills, the connection blocks
+    // mid-write, and its bounded tap queue saturates.
+    assert!(
+        wait_until(Duration::from_secs(30), || tap_dropped(rpc) > 0),
+        "the fixture never saturated the tap queue, so nothing was observed on a full \
+         queue (dropped={})",
+        tap_dropped(rpc)
+    );
+
+    // The graph goes away beneath the saturated tap.
+    rpc.teardown();
+
+    // The client starts reading again and must find the terminal event in what it is
+    // handed — behind the backlog the socket already held, ahead of whatever bytes are
+    // still queued for an endpoint that no longer exists.
+    let note = conn
+        .wait_note("tap.closed", Duration::from_secs(30))
+        .expect(
+            "no `tap.closed` reached a client whose tap queue was full: it is left on a \
+             live connection receiving nothing, with the loss uncounted (37-CTRL-1)",
+        );
+    assert_eq!(
+        closed_params(&note),
+        (id, "usb0".to_string(), "teardown".to_string()),
+        "tap.closed did not name this tap, its endpoint and the reason: {note}"
+    );
+
+    // Terminal for the tap, not for the connection — the same contract the unsaturated
+    // path keeps.
+    assert!(
+        conn.call("state", Value::Null).get("result").is_some(),
+        "the connection died with its tap"
+    );
 }

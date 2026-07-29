@@ -10,7 +10,7 @@
 //! 3. **The bootstrap URL** `?token=` sets the cookie (302); a wrong token → 401.
 //! 4. **A valid cookie serves the app** (200) for `/`, `/app.js`, and every ES module
 //!    `app.js` imports — the list read out of `app.js` itself, so a module added
-//!    tomorrow cannot be forgotten here (§11.9).
+//!    tomorrow cannot be forgotten here (plan §11.9).
 //! 5. **The bind policy** (§15.29): a non-loopback plaintext bind without
 //!    `--tls`/`--insecure-bind` exits non-zero with the documented reason; the TLS
 //!    tier binds an `https://` listener, writes a 0600 key, and *permits* a
@@ -798,7 +798,7 @@ fn web_http_security_gates() {
         "GET / with the cookie should be 200"
     );
 
-    // (5) every ES module `app.js` imports must serve too (§11.9) — a 404 here breaks
+    // (5) every ES module `app.js` imports must serve too (plan §11.9) — a 404 here breaks
     // the module import chain in the browser and the console never boots. The list is
     // *derived from app.js's own import statements* rather than restated, so the next
     // module (as `saver.mjs` was) cannot be added to the chain and forgotten here.

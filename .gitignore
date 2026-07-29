@@ -16,3 +16,4 @@
 # purpose is to not be shared.
 /.claude/scheduled_tasks.lock
 /.claude/settings.local.json
+__pycache__/

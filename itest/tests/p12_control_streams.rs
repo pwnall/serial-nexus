@@ -183,6 +183,21 @@ impl Conn {
     }
 }
 
+/// Bytes this endpoint's taps have shed because their connection stopped draining its
+/// bounded queue (§5). Non-zero is the observable proof that a connection is no longer
+/// consuming its tap lane — the loop takes one message per iteration, so a full queue
+/// means the write of the message before it has not returned.
+fn tap_dropped(rpc: &Rpc) -> u64 {
+    rpc.state()["taps"]
+        .as_array()
+        .map(|taps| {
+            taps.iter()
+                .filter_map(|t| t.get("dropped").and_then(Value::as_u64))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 /// The FIFO waiter queue of `node`'s endpoint lock, front first.
 fn waiters(rpc: &Rpc, node: &str) -> Vec<String> {
     rpc.node(node)
@@ -208,6 +223,14 @@ struct Rig {
 /// pty consoles, so the endpoint's write lock has two origins to contend over. Returns
 /// `None` off Linux, where a pts cannot be a serial device (§7) — the caller skips.
 fn rig() -> Option<Rig> {
+    rig_at(SOURCE_RATE)
+}
+
+/// [`rig`] with the source paced at `rate` bytes/second. The stalled-reader test
+/// (37-CTRL-2) needs the connection's socket buffer *and* its 128-slot tap queue full
+/// within a second or two rather than within a measurement window, so it pays for the
+/// higher rate over the few seconds it runs.
+fn rig_at(rate: &str) -> Option<Rig> {
     if !cfg!(target_os = "linux") {
         return None;
     }
@@ -221,7 +244,7 @@ fn rig() -> Option<Rig> {
             "--bytes",
             SOURCE_BYTES,
             "--rate",
-            SOURCE_RATE,
+            rate,
             "--link",
             &dev_str,
             "--hold-ms",
@@ -454,4 +477,90 @@ fn tap_data_keeps_arriving_while_a_contended_send_is_parked_on_the_same_connecti
         after.get("result").is_some(),
         "a post-wait request was not served: {after}"
     );
+}
+
+// ============================================================================
+// 37-CTRL-2 — the other direction, and the one that costs *other* connections: a
+// client that stops reading must not take the endpoint's arbitration with it.
+//
+// Every notification used to be written with a bare `write_all` inside its select arm,
+// so a blocked write stopped polling the connection's parked verb — whose deadline and
+// dequeue guard live inside that future (§15.20). The parked `send` then held the
+// endpoint's FIFO head forever, and `acquire` denies every other on-demand origin while
+// free-but-queued (§6 fairness): one frozen console stalled every other connection's
+// arbitration on that endpoint, with `state` reporting the lock free and `--steal` the
+// only escape.
+// ============================================================================
+#[test]
+fn a_stalled_reader_does_not_hold_the_endpoints_fifo_head() {
+    // Paced high enough that the connection's socket buffer and its 128-slot tap queue
+    // both fill in about a second, so the `send` below is provably still parked when
+    // the stall is confirmed.
+    let Some(rig) = rig_at("2097152") else {
+        eprintln!("SKIP: a pts cannot be a serial device off Linux (§7)");
+        return;
+    };
+    let rpc = rig.daemon.rpc();
+
+    // One connection, one tap on the firehose endpoint — the §17 console in miniature.
+    let mut conn = Conn::open(&rig.daemon.socket());
+    conn.request(1, "tap.open", json!({ "endpoint": "usb0" }));
+    let opened = conn
+        .response(1, Duration::from_secs(5))
+        .expect("tap.open was not answered");
+    assert!(opened.get("result").is_some(), "tap.open failed: {opened}");
+
+    // Another origin holds the lock, so this console's `send` parks at the FIFO head.
+    // The deadline is short enough to keep the test brisk and long enough that the
+    // stall below is established while it is still parked (asserted, not assumed).
+    rpc.lock("ptya", false, false, None).expect("lock ptya");
+    conn.request(
+        2,
+        "send",
+        json!({ "endpoint": "usb0", "line": "hello", "timeout_ms": 4000, "steal": false }),
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || waiters(rpc, "usb0")
+            == vec!["send".to_string()]),
+        "the contended send never parked (waiters={:?})",
+        waiters(rpc, "usb0")
+    );
+
+    // `conn` now reads nothing, ever again — a frozen browser tab, in one connection.
+    // The daemon fills its socket and then blocks mid-write; the tap's own drop counter
+    // climbing is the proof that the connection has stopped draining.
+    assert!(
+        wait_until(Duration::from_secs(20), || tap_dropped(rpc) > 0),
+        "the fixture never saturated the connection's tap queue, so nothing was \
+         observed under a stalled reader"
+    );
+    assert_eq!(
+        waiters(rpc, "usb0"),
+        vec!["send".to_string()],
+        "the send expired before the connection stalled: the window this test measures \
+         never opened"
+    );
+
+    // Release the lock. It is now free with one waiter nobody is polling — the shape in
+    // which every other origin is denied.
+    rpc.unlock("ptya").expect("unlock ptya");
+
+    // The stalled connection's `send` must still expire at its deadline, and ptyb must
+    // then be able to take the endpoint. The lock verb does not enqueue on refusal, so
+    // retrying it leaves the FIFO queue untouched.
+    assert!(
+        wait_until(Duration::from_secs(30), || rpc
+            .lock("ptyb", false, false, None)
+            .is_ok()),
+        "ptyb could never acquire a free lock: a stalled connection's parked send still \
+         owns the FIFO head, so one non-reading client stalled the whole endpoint's \
+         arbitration (37-CTRL-2). waiters={:?}",
+        waiters(rpc, "usb0")
+    );
+    assert!(
+        waiters(rpc, "usb0").is_empty(),
+        "the abandoned waiter never left the queue: {:?}",
+        waiters(rpc, "usb0")
+    );
+    rpc.unlock("ptyb").expect("unlock ptyb");
 }

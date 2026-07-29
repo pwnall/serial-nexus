@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use serial_nexus_itest::{
-    Daemon, Sim, Subscription, serial_echo, serial_pair, sha256_hex, wait_until,
+    Daemon, Sim, Subscription, seeded_bytes, serial_echo, serial_pair, sha256_hex, wait_until,
 };
 
 // ---- Independent oracles (reimplemented here, never serial_nexus_core::map) --------------
@@ -111,51 +111,13 @@ fn oracle_targetward(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The sim's deterministic SplitMix64 payload — reimplemented so the test owns the
-/// source's ground truth (identical to `serial-nexus-sim`; `len` a multiple of 8).
-fn seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
-    let mut s = seed;
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        out.extend_from_slice(&z.to_le_bytes());
-    }
-    out.truncate(len);
-    out
-}
-
-/// Standard base64 decode — the inverse of the daemon's `tap.data` encoding.
+/// Standard base64 decode of a `tap.data` payload — `serial_nexus_rpc`'s tested
+/// decoder rather than a seventh hand-rolled copy (§16.5 one-rule-one-place, review
+/// 37 37-TEST-5). Panics on a malformed payload: these bytes were produced by
+/// `serial_nexus_rpc::base64_encode` on the other side of the socket, so anything
+/// else is a defect, not an input.
 fn base64_decode(s: &str) -> Vec<u8> {
-    fn val(c: u8) -> Option<u32> {
-        match c {
-            b'A'..=b'Z' => Some((c - b'A') as u32),
-            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let mut out = Vec::new();
-    let mut acc = 0u32;
-    let mut nbits = 0u32;
-    for &c in s.as_bytes() {
-        if c == b'=' {
-            break;
-        }
-        let Some(v) = val(c) else { continue };
-        acc = (acc << 6) | v;
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((acc >> nbits) as u8);
-        }
-    }
-    out
+    serial_nexus_rpc::base64_decode(s).expect("a tap.data payload must be valid base64")
 }
 
 /// Drain `tap.data` notifications, concatenating decoded payloads until `want` bytes

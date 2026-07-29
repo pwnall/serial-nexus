@@ -14,7 +14,9 @@
 //! on the process deadlocked. Permanently — the hub is gone from `state.taps` and a
 //! re-`load` does not revive that tap id.
 //!
-//! Two tests, one per platform class:
+//! Three tests. The first two are `CTL-1`'s two halves, one per platform class; the
+//! third (37-TOOL-1) is the *other* way a tap's stream ends short — a bare connection
+//! EOF, which used to exit 0 over a truncated capture:
 //!
 //! 1. [`ctl_tap_exits_on_tap_closed_rather_than_blocking_forever`] — the control-plane
 //!    half, on **every** platform. Every host-facing endpoint gets a hub at load even
@@ -27,9 +29,13 @@
 //!    macOS, §5). A seeded `serial-nexus-sim` source feeds the endpoint, the CLI captures to a
 //!    file, the graph is torn down, and the capture is asserted byte-exact by SHA-256
 //!    against an independently computed source stream.
+//! 3. [`ctl_tap_exits_nonzero_when_the_connection_dies_short_of_its_bytes_budget`] — the
+//!    EOF arm, on **every** platform. Same documented rule, the route that never
+//!    obeyed it.
 //!
-//! Fail-first: with the `tap.closed` arm removed from `tap_stream`, both children are
-//! still alive at the bound and both `wait_exit` calls return `None`.
+//! Fail-first: with the `tap.closed` arm removed from `tap_stream`, both children of
+//! test 1 are still alive at the bound and both `wait_exit` calls return `None`; with
+//! the EOF arm's budget check removed, test 3's capped child exits 0.
 //!
 //! `CTL-2` (the CLI discarding `gap_before` and the `offset` jump) is only half guarded
 //! here. Producing either signal on demand needs a bounded queue to overflow — the
@@ -43,7 +49,10 @@ use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use serial_nexus_itest::{Daemon, Rpc, Sim, bin, serial_echo, sha256_hex, wait_until};
+use serial_nexus_itest::{
+    Daemon, Rpc, Sim, TempRun, bin, daemon_answers, seeded_bytes, serial_echo, sha256_hex,
+    wait_until,
+};
 
 /// How long a `tap.closed` may take to reach the child and end it. Generous: the
 /// failure this guards is *unbounded*, so a slow runner cannot make it a false pass.
@@ -57,12 +66,12 @@ fn tap_count(rpc: &Rpc) -> usize {
 /// Spawn `serial-nexus-ctl --socket <sock> tap <args…>` with stdout and stderr each
 /// redirected to a file, so the capture stays a clean byte stream and the notices can
 /// be read back. Returns the child; the caller owns waiting for (or killing) it.
-fn spawn_ctl_tap(d: &Daemon, args: &[&str], out: &Path, err: &Path) -> Child {
+fn spawn_ctl_tap(socket: &Path, args: &[&str], out: &Path, err: &Path) -> Child {
     let stdout = std::fs::File::create(out).expect("create capture file");
     let stderr = std::fs::File::create(err).expect("create notice file");
     Command::new(bin("serial-nexus-ctl"))
         .arg("--socket")
-        .arg(d.socket())
+        .arg(socket)
         .arg("tap")
         .args(args)
         .stdin(Stdio::null())
@@ -89,29 +98,10 @@ fn wait_exit(child: &mut Child, bound: Duration) -> Option<ExitStatus> {
     }
 }
 
-/// The sim's deterministic payload generator (SplitMix64), reimplemented so this test
-/// owns the source's ground-truth checksum without parsing the sim's (nulled) stdout —
-/// the same independence [`p8_tap`]'s copy buys. `N` is a multiple of 8, so this is
-/// byte-identical to `serial-nexus-sim`'s output.
-fn seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
-    let mut s = seed;
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        out.extend_from_slice(&z.to_le_bytes());
-    }
-    out.truncate(len);
-    out
-}
-
 /// A graph whose serial node's device does not exist: the node sits `waiting` (§7.1
 /// faulted-and-wait) while its host-facing endpoint still owns a tap hub (§15.8), which
 /// is all `tap.closed` needs. No serial device, so this runs everywhere.
-fn absent_cfg(d: &Daemon) -> String {
+fn absent_cfg(run: &TempRun) -> String {
     format!(
         r#"
 [[node]]
@@ -126,8 +116,8 @@ path = "{console}"
 a = "usb0"
 b = "console"
 "#,
-        dev = d.run().join("absent-usb0").display(),
-        console = d.run().join("console").display(),
+        dev = run.join("absent-usb0").display(),
+        console = run.join("console").display(),
     )
 }
 
@@ -140,12 +130,14 @@ b = "console"
 fn ctl_tap_exits_on_tap_closed_rather_than_blocking_forever() {
     let d = Daemon::start();
     let rpc = d.rpc();
-    rpc.load_toml(&absent_cfg(&d), false).expect("load graph");
+    rpc.load_toml(&absent_cfg(d.run()), false)
+        .expect("load graph");
 
     let (open_out, open_err) = (d.run().join("open.bin"), d.run().join("open.err"));
     let (cap_out, cap_err) = (d.run().join("capped.bin"), d.run().join("capped.err"));
-    let mut unbounded = spawn_ctl_tap(&d, &["usb0"], &open_out, &open_err);
-    let mut capped = spawn_ctl_tap(&d, &["usb0", "--bytes", "4096"], &cap_out, &cap_err);
+    let sock = d.socket();
+    let mut unbounded = spawn_ctl_tap(&sock, &["usb0"], &open_out, &open_err);
+    let mut capped = spawn_ctl_tap(&sock, &["usb0", "--bytes", "4096"], &cap_out, &cap_err);
 
     // Both taps must be registered before the graph moves, or the test would prove
     // nothing about `tap.closed` (a tap that never opened exits for another reason).
@@ -211,6 +203,107 @@ fn ctl_tap_exits_on_tap_closed_rather_than_blocking_forever() {
         capped_notices.contains("0 of 4096"),
         "the short read does not name what was received against what was asked: \
          {capped_notices:?}"
+    );
+}
+
+/// A daemon on `run`'s fixed socket and state file, hand-managed because this test
+/// must **kill** it mid-stream. `Daemon` reaps its child only on drop, and dropping it
+/// would take the CLI's socket away with the wrong ceremony (a graceful `shutdown`
+/// first), which is the path the sibling tests already cover.
+fn spawn_daemon(run: &TempRun) -> Child {
+    Command::new(bin("serial-nexus-daemon"))
+        .arg("--socket")
+        .arg(run.socket())
+        .arg("--state-file")
+        .arg(run.state_file())
+        .env("XDG_RUNTIME_DIR", run.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn serial-nexus-daemon")
+}
+
+/// 37-TOOL-1 — a clean connection EOF short of the `--bytes` budget is a **short read**,
+/// and must exit non-zero like the `tap.closed` route it is indistinguishable from.
+///
+/// The two ways a tap's stream can end short were treated differently for no stated
+/// reason: `tap.closed` — the graph dropping the endpoint — errored per the documented
+/// rule, while the connection simply going away broke the read loop and fell through to
+/// `Ok(())`. That is the one outcome `--bytes N` exists to prevent: a script that asked
+/// for N bytes, got fewer because the daemon died mid-capture, and was told **0**. Both
+/// sibling guards above exit through `tap.closed`, so this arm had no test at all.
+///
+/// `SIGKILL` on the daemon is the shape the review names (a crash, an abrupt close) and
+/// the only one that reaches the arm: the graph-side routes all send `tap.closed` first.
+/// A Unix-socket peer dying closes the fd, so the CLI reads a clean EOF, not an error —
+/// which is exactly why the old code could mistake it for an orderly end of stream.
+///
+/// Both statuses are pinned, because "make every EOF an error" would be the wrong fix:
+/// with no budget outstanding the bytes already written are intact and the stream ended,
+/// which is still an orderly **0**.
+#[test]
+fn ctl_tap_exits_nonzero_when_the_connection_dies_short_of_its_bytes_budget() {
+    let run = TempRun::new();
+    let mut daemon = spawn_daemon(&run);
+    let sock = run.socket();
+    assert!(
+        wait_until(Duration::from_secs(10), || sock.exists()
+            && daemon_answers(&sock)),
+        "daemon never answered `info` on {}",
+        sock.display()
+    );
+    let rpc = Rpc::new(&sock);
+    rpc.load_toml(&absent_cfg(&run), false).expect("load graph");
+
+    let (open_out, open_err) = (run.join("open.bin"), run.join("open.err"));
+    let (cap_out, cap_err) = (run.join("capped.bin"), run.join("capped.err"));
+    let mut unbounded = spawn_ctl_tap(&sock, &["usb0"], &open_out, &open_err);
+    let mut capped = spawn_ctl_tap(&sock, &["usb0", "--bytes", "4096"], &cap_out, &cap_err);
+    assert!(
+        wait_until(Duration::from_secs(10), || tap_count(&rpc) == 2),
+        "the two CLI taps did not both register (taps={:?})",
+        rpc.state()["taps"]
+    );
+
+    // The crash. Reaped here so the socket's peer is provably gone before the wait
+    // below, rather than at some later drop.
+    daemon.kill().expect("kill the daemon");
+    daemon.wait().expect("reap the daemon");
+
+    let capped_status = wait_exit(&mut capped, EXIT_BOUND);
+    let unbounded_status = wait_exit(&mut unbounded, EXIT_BOUND);
+    assert!(
+        capped_status.is_some(),
+        "`serial-nexus-ctl tap usb0 --bytes 4096` never exited after the daemon died"
+    );
+    assert!(
+        unbounded_status.is_some(),
+        "`serial-nexus-ctl tap usb0` never exited after the daemon died"
+    );
+    assert!(
+        !capped_status.expect("exited").success(),
+        "a capture truncated by the daemon's death exited 0 — a script cannot tell it \
+         from the 4096 bytes it asked for (37-TOOL-1); stderr={:?}",
+        String::from_utf8_lossy(&std::fs::read(&cap_err).expect("read notices"))
+    );
+    assert!(
+        unbounded_status.expect("exited").success(),
+        "an unbounded tap whose connection ended is still an orderly end of stream: {}",
+        String::from_utf8_lossy(&std::fs::read(&open_err).expect("read notices"))
+    );
+
+    // And it says what was short, in the same sentence the `tap.closed` route uses —
+    // an exit code alone would not tell an operator what happened.
+    let notices =
+        String::from_utf8(std::fs::read(&cap_err).expect("read notices")).expect("stderr is utf-8");
+    assert!(
+        notices.contains("0 of 4096"),
+        "the short read does not name what was received against what was asked: \
+         {notices:?}"
+    );
+    assert!(
+        notices.contains("usb0"),
+        "the short read does not name the endpoint: {notices:?}"
     );
 }
 
@@ -284,7 +377,7 @@ hostward_buffer = 8192
     );
 
     let (out, err) = (d.run().join("incident.bin"), d.run().join("incident.err"));
-    let mut child = spawn_ctl_tap(&d, &["usb0"], &out, &err);
+    let mut child = spawn_ctl_tap(&d.socket(), &["usb0"], &out, &err);
     assert!(
         wait_until(Duration::from_secs(10), || tap_count(rpc) == 1),
         "the CLI tap did not register (taps={:?})",

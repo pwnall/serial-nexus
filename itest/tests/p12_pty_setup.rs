@@ -73,6 +73,17 @@
 //!    they were eventually destroyed, so `state` reported `discarded_no_client: 0`
 //!    on a boundary that had silently shed kilobytes. The fix drains the pair at
 //!    last close and charges it to `discarded_at_last_close`.
+//!
+//! Review 37 added three more to the same file's surface, each of them a property of
+//! the pair the daemon builds rather than of the bytes crossing it:
+//!
+//! 6. [`a_client_clearing_extproc_has_it_re_asserted_so_changes_keep_surfacing`] —
+//!    37-PTY-3. §7.2's re-assert was implemented and exercised by nothing, so
+//!    deleting it passed the suite while observation silently degraded to the poll
+//!    backstop.
+//! 7. [`the_pty_master_is_close_on_exec_so_no_child_inherits_a_console`] — 37-PTY-1.
+//! 8. [`a_console_slave_lands_on_the_configured_mode_not_the_devpts_default`] —
+//!    37-PTY-2's assertable half.
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -101,6 +112,38 @@ fn attach(path: &Path, nonblocking: bool) -> std::fs::File {
 /// A node's `client_present` from `state` (§7.2), or `None` if the node is absent.
 fn client_present(rpc: &Rpc, node: &str) -> Option<bool> {
     rpc.node(node)?.get("client_present")?.as_bool()
+}
+
+/// One field of a node's observed `client_termios` (§7.2), or `None` while no client
+/// has touched the settings this session.
+fn client_termios(rpc: &Rpc, node: &str, field: &str) -> Option<Value> {
+    rpc.node(node)?.get("client_termios")?.get(field).cloned()
+}
+
+/// Run `stty -F <tty> <args>`, returning its exit status and stdout. The one
+/// terminal-settings tool available without linking termios into this crate, which
+/// is `#![forbid(unsafe_code)]` and must stay that way (invariant 4 / §16.3).
+fn stty(tty: &Path, args: &[&str]) -> (bool, String) {
+    let out = std::process::Command::new("stty")
+        .arg("-F")
+        .arg(tty)
+        .args(args)
+        .output();
+    match out {
+        Ok(o) => (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+        ),
+        Err(_) => (false, String::new()),
+    }
+}
+
+/// Whether `stty -a` output carries `token` as a whole word — `extproc` and
+/// `-extproc` are different answers, and a substring test cannot tell them apart.
+fn stty_reports(report: &str, token: &str) -> bool {
+    report
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .any(|w| w == token)
 }
 
 // ============================================================================
@@ -1046,5 +1089,312 @@ fn a_fresh_console_session_does_not_inherit_the_previous_sessions_bytes() {
          the last-close flush (`discarded_at_last_close`)",
         accounted(),
         rpc.node("console")
+    );
+}
+
+// ============================================================================
+// 37-PTY-3 — §7.2's EXTPROC re-assert, when a client clears the flag.
+// ============================================================================
+
+/// A spy console on a `map` node's host-facing endpoint: `write_mode = "never"`, so
+/// the pty is *read* (that is the spy shape — its termios and presence are what an
+/// operator wants surfaced) without any device in sight. Reading is what matters
+/// here: the packet-mode `TIOCPKT_IOCTL` notification is consumed by the reader's
+/// drain, so a node nobody reads from would fall back on the slow backstop and this
+/// test would measure the backstop instead of the mechanism.
+fn spied_console(run: &TempRun) -> String {
+    format!(
+        r#"
+[[node]]
+type = "map"
+name = "m"
+hostward = []
+targetward = []
+
+[[node]]
+type = "pty"
+name = "console"
+path = "{console}"
+
+[[edge]]
+a = "m"
+b = "console"
+write_mode = "never"
+"#,
+        console = run.join("console").display(),
+    )
+}
+
+/// §7.2: the daemon's baseline sets EXTPROC, and a client that *clears* it — any
+/// client rebuilding termios from scratch rather than modifying what it read —
+/// must have it re-asserted, "so the daemon keeps observing subsequent changes".
+///
+/// The branch existed and nothing exercised it (37-PTY-3): no test and no sim mode
+/// ever cleared the flag, so deleting the re-assert passed the suite while silently
+/// degrading observation to the [`RECONCILE_INTERVAL`] backstop. That degradation is
+/// invisible in a snapshot and obvious in *latency*, which is why the second half
+/// below times a baud change: with EXTPROC set the kernel posts a packet-mode
+/// notification on every slave `tcsetattr`; with it cleared it posts none at all
+/// (Linux `pty_set_termios` raises `TIOCPKT_IOCTL` only when EXTPROC is set in the
+/// old or the new termios), and the change surfaces only when the 3 s poll gets to it.
+#[test]
+fn a_client_clearing_extproc_has_it_re_asserted_so_changes_keep_surfacing() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let console = d.run().join("console");
+    rpc.load_toml(&spied_console(d.run()), false)
+        .expect("load the spied console");
+    assert!(
+        rpc.wait_status("console", "active", Duration::from_secs(10)),
+        "console never became active: {:?}",
+        rpc.node("console")
+    );
+
+    // A client holds the slave for the whole test: reconciliation only runs while
+    // one is present (§7.2), and `stty` alone would come and go inside a poll gap.
+    let held = attach(&console, true);
+
+    // The tool check is also the anti-tautology proof (§5): an `stty` that does not
+    // know `extproc` would "clear" it silently and leave every assertion below
+    // trivially true. `stty -a` names the flag either way, so seeing bare `extproc`
+    // proves both that this stty understands it and that the daemon's baseline set it.
+    let (ok, report) = stty(&console, &["-a"]);
+    if !ok || !(stty_reports(&report, "extproc") || stty_reports(&report, "-extproc")) {
+        eprintln!(
+            "SKIP a_client_clearing_extproc_has_it_re_asserted_so_changes_keep_surfacing: \
+             this stty does not report `extproc` (got {report:?})"
+        );
+        return;
+    }
+    assert!(
+        stty_reports(&report, "extproc"),
+        "the §7.2 baseline did not leave EXTPROC set on a fresh console, so clearing \
+         it below would prove nothing: {report:?}"
+    );
+
+    // The client rebuilds the line without EXTPROC.
+    let (cleared, _) = stty(&console, &["-extproc"]);
+    assert!(cleared, "stty -extproc failed on {}", console.display());
+
+    // §7.2's re-assert, observed through the daemon's own reconciliation: the pass
+    // that finds the flag cleared re-sets it, and its own `tcsetattr` posts the
+    // notification the next pass reconciles — so state settles back on `extproc:
+    // true`. Without the re-assert it settles on `false` and stays there.
+    assert!(
+        wait_until(Duration::from_secs(10), || client_termios(
+            rpc, "console", "extproc"
+        ) == Some(Value::Bool(true))),
+        "the daemon never re-asserted EXTPROC after a client cleared it (§7.2); \
+         console={:?}",
+        rpc.node("console")
+    );
+
+    // And the consequence that makes the re-assert worth having: a subsequent baud
+    // change surfaces *promptly* — through the packet-mode notification, not the 3 s
+    // backstop. The bound is deliberately well under `RECONCILE_INTERVAL`, so a pass
+    // that only the backstop could deliver fails here.
+    let before = client_termios(rpc, "console", "baud");
+    let (set, _) = stty(&console, &["9600"]);
+    assert!(set, "stty 9600 failed on {}", console.display());
+    let surfaced = wait_until(Duration::from_millis(1_500), || {
+        client_termios(rpc, "console", "baud")
+            .and_then(|b| b.as_str().map(str::to_owned))
+            .is_some_and(|b| b.contains("9600"))
+    });
+    assert!(
+        surfaced,
+        "a baud change did not surface within 1.5s of a console whose EXTPROC was \
+         cleared and re-asserted (before={before:?}, now={:?}) — observation has \
+         degraded to the {:?} backstop",
+        client_termios(rpc, "console", "baud"),
+        Duration::from_secs(3)
+    );
+    drop(held);
+}
+
+// ============================================================================
+// 37-PTY-1 — the master fd must not cross an exec.
+// ============================================================================
+
+/// The pid of the daemon serving `socket`, found by its command line. `Daemon` owns
+/// its child handle and does not publish the pid, and this is the one property that
+/// can only be asserted from outside the process.
+#[cfg(target_os = "linux")]
+fn daemon_pid(socket: &Path) -> Option<u32> {
+    let needle = socket.to_string_lossy().into_owned();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        // NUL-separated argv; the socket path is one whole argument.
+        if cmdline
+            .split(|b| *b == 0)
+            .any(|arg| String::from_utf8_lossy(arg) == needle)
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// The `flags:` line of `/proc/<pid>/fdinfo/<fd>`, which carries `O_CLOEXEC` when
+/// the descriptor is close-on-exec.
+#[cfg(target_os = "linux")]
+fn fd_flags(pid: u32, fd: &str) -> Option<u32> {
+    let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
+    info.lines()
+        .find_map(|l| l.strip_prefix("flags:"))
+        .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
+}
+
+/// Every pty master the daemon holds must be `FD_CLOEXEC` (37-PTY-1).
+///
+/// The daemon forks exec-codec children (§7.6) that do no fd cleanup of their own,
+/// so a master without the flag is inherited by every one of them: the child then
+/// holds the pair open past `remove-node`/`load --replace` — the slave client never
+/// sees HUP and the pts index is never reclaimed — and owns a live handle on the
+/// console's targetward bytes in both directions.
+///
+/// Asserted against the kernel's own view rather than a child's, because that is the
+/// property itself: `posix_openpt` opens `/dev/ptmx`, so every master is nameable
+/// from `/proc/<pid>/fd`, and whether it survives an exec is exactly one bit there.
+/// Linux-only (procfs); other platforms have no equivalent and self-skip.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_pty_master_is_close_on_exec_so_no_child_inherits_a_console() {
+    const O_CLOEXEC: u32 = 0o2_000_000;
+
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    rpc.load_toml(&two_consoles_that_both_come_up(d.run()), false)
+        .expect("load two pty nodes");
+    for node in ["conA", "conB"] {
+        assert!(
+            rpc.wait_status(node, "active", Duration::from_secs(10)),
+            "{node} never became active: {:?}",
+            rpc.node(node)
+        );
+    }
+
+    let pid = daemon_pid(&d.socket()).expect("find the daemon's pid by its socket arg");
+    let mut masters = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("read the daemon's fd table")
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if std::fs::read_link(entry.path()).ok().as_deref() == Some(Path::new("/dev/ptmx")) {
+            masters.push(name);
+        }
+    }
+    assert_eq!(
+        masters.len(),
+        2,
+        "expected one /dev/ptmx descriptor per live console; found {masters:?} — \
+         without them this test proves nothing"
+    );
+
+    for fd in &masters {
+        let flags = fd_flags(pid, fd).unwrap_or_else(|| panic!("fdinfo for fd {fd}"));
+        assert_ne!(
+            flags & O_CLOEXEC,
+            0,
+            "the pty master on fd {fd} is not close-on-exec (flags {flags:#o}), so \
+             every exec-codec child inherits the console's master: the pair outlives \
+             `remove-node`, the pts index is never reclaimed, and the child can read \
+             and inject the console's bytes (§7.2, §7.6)"
+        );
+    }
+}
+
+/// [`TWO_CONSOLES`] without the unresolvable group — two consoles that both come up,
+/// which is what a master-fd census needs.
+fn two_consoles_that_both_come_up(run: &TempRun) -> String {
+    two_consoles(run)
+        .lines()
+        .filter(|l| !l.starts_with("group ="))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ============================================================================
+// 37-PTY-2 — ownership settles before the mode does.
+// ============================================================================
+
+/// `apply_perms` chowns the slave to the configured owner/group **before** chmodding
+/// it to the configured mode (37-PTY-2): a fresh devpts node belongs to the group the
+/// mount was made with — `tty` on a stock Linux — so widening to the configured mode
+/// first hands every member of that group read/write on the console for the length of
+/// the chown, a window the NSS name lookups widen and an fd opened inside it outlives,
+/// because a chown does not revoke an open descriptor.
+///
+/// The window itself is a TOCTOU race and leaves no trace to assert after the fact.
+/// What *is* assertable, and what the reorder must not cost, is that the mode is still
+/// applied at all — the step that now runs last, and whose absence would leave every
+/// console on whatever the devpts mount hands out.
+///
+/// Two consoles with *different* configured modes, because one console cannot tell
+/// "the daemon applied 0600" from "this box mounts devpts with mode=600" — both are
+/// deployed defaults. A difference between the two can only come from the chmod.
+#[test]
+fn a_console_slave_lands_on_the_configured_mode_not_the_devpts_default() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let cfg = format!(
+        r#"
+[[node]]
+type = "pty"
+name = "narrow"
+path = "{narrow}"
+
+[[node]]
+type = "pty"
+name = "wide"
+path = "{wide}"
+mode = 0o640
+"#,
+        narrow = d.run().join("narrow").display(),
+        wide = d.run().join("wide").display(),
+    );
+    rpc.load_toml(&cfg, false).expect("load two pty nodes");
+
+    let mode_of_pts = |node: &str| -> u32 {
+        let pts = rpc
+            .node(node)
+            .and_then(|n| n.get("pts_path").and_then(Value::as_str).map(str::to_owned))
+            .unwrap_or_else(|| panic!("{node} reports no pts_path: {:?}", rpc.node(node)));
+        std::fs::metadata(&pts)
+            .unwrap_or_else(|e| panic!("stat {pts}: {e}"))
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    for node in ["narrow", "wide"] {
+        assert!(
+            rpc.wait_status(node, "active", Duration::from_secs(10)),
+            "{node} never became active: {:?}",
+            rpc.node(node)
+        );
+    }
+
+    assert_eq!(
+        mode_of_pts("narrow"),
+        0o600,
+        "the default console slave is not 0600 (§7.2)"
+    );
+    assert_eq!(
+        mode_of_pts("wide"),
+        0o640,
+        "a console configured `mode = 0o640` did not get it — `apply_perms` no longer \
+         applies the mode, so every console sits on the devpts mount's default"
     );
 }

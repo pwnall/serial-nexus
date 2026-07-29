@@ -59,7 +59,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
-use serial_nexus_itest::{TempRun, bin, wait_until};
+use serial_nexus_itest::{TempRun, bin, cpu_ticks, wait_until};
 
 /// The measurement window, and the ceiling on what a *paused* double may burn
 /// inside it.
@@ -93,20 +93,6 @@ impl Drop for KillOnDrop {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-/// `utime + stime` of `pid` in clock ticks, read from `/proc/<pid>/stat`. The two
-/// fields are 14 and 15 (1-based) *after* the parenthesised comm field, which may
-/// itself contain spaces — so the split starts past the last `)`.
-#[cfg(target_os = "linux")]
-fn cpu_ticks(pid: u32) -> u64 {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .unwrap_or_else(|e| panic!("read /proc/{pid}/stat: {e}"));
-    let tail = &stat[stat.rfind(')').expect("comm field is parenthesised") + 1..];
-    let fields: Vec<&str> = tail.split_whitespace().collect();
-    let utime: u64 = fields[11].parse().expect("utime");
-    let stime: u64 = fields[12].parse().expect("stime");
-    utime + stime
 }
 
 /// Spawn `serial-nexus-sim` with `args`, returning the reaped-on-drop child and its pid.

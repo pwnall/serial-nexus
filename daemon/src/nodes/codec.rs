@@ -21,9 +21,12 @@
 //! **The held lock (§6).** The demultiplexer's edge to the serial holds that
 //! endpoint's write lock permanently (any other writer would corrupt the mux
 //! framing). A `send --steal` at the serial ousts the codec transiently; each
-//! channel's targetward task then parks its one framed chunk and re-acquires the
-//! lock (FIFO) once the stealer releases — the §6 stall, with commands delayed,
-//! never dropped.
+//! channel's targetward task then parks its one framed chunk and, once the stealer
+//! releases, *reclaims* the lock ahead of the on-demand FIFO queue — held-priority
+//! reclaim (§15.23), which restated §6 as "FIFO among on-demand contenders, beneath
+//! held reclaim" precisely so a `--wait` waiter could not inherit a stolen
+//! demultiplexer's lock and corrupt the framing. The §6 stall, with commands
+//! delayed, never dropped.
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -816,10 +819,11 @@ async fn channel_targetward(
             }
             // The shared send-and-charge step (SIMP-2): gate on holding the serial's
             // write lock (the codec's held origin) — a `send --steal` transiently
-            // ousts it and the framed piece parks in `framed` until it re-acquires,
-            // FIFO — then hand the frame to the device. Either exit costs the same
-            // undelivered tail: the upstream endpoint was torn down, or its channel
-            // closed between the grant and the send. Stop framing *this* chunk but
+            // ousts it and the framed piece parks in `framed` until the origin
+            // reclaims the lock ahead of the on-demand FIFO queue (held-priority
+            // reclaim, §15.23) — then hand the frame to the device. Either exit costs
+            // the same undelivered tail: the upstream endpoint was torn down, or its
+            // channel closed between the grant and the send. Stop framing *this* chunk but
             // keep the task — a `connect` may give this codec a new upstream, and the
             // receiver's senders stay live either way (§5, §15.35).
             let delivered =
@@ -835,17 +839,21 @@ async fn channel_targetward(
     }
 }
 
-/// Hostward-signal guards for `docs/32-claude-opus-code-review.md` — WIRE-1 (a
-/// `Codec::demux` refusal had no counter, no state field and no status change),
-/// CODEC-1 (data on an unconfigured identity vanished with nothing naming it) and
-/// the codec half of LEGD-2 (`delivered_hostward` credited bytes a full sink never
-/// took). None of these need the reference codec: the whole point of WIRE-1 is that
-/// the *shipped* transform never returns `Err`, so the subject here is a stub — the
-/// out-of-tree codec §15.26 makes first-class.
+/// Guards for the signals a *custom* transform raises — WIRE-1 (a `Codec::demux`
+/// refusal had no counter, no state field and no status change), CODEC-1 (data on an
+/// unconfigured identity vanished with nothing naming it), the codec half of LEGD-2
+/// (`delivered_hostward` credited bytes a full sink never took), and 37-CODEC-3 (the
+/// targetward mirror: a `Codec::mux` refusing a fragment must charge the residual).
+/// None of these need the reference codec — that is the whole point. The *shipped*
+/// transform never returns `Err` in either direction, so every arm here is reachable
+/// only through the §15.26 out-of-tree surface and its subject is a stub.
 #[cfg(test)]
 mod signal_tests {
     use super::*;
+    use crate::runtime::{SharedLock, TargetEdge, frame_payload_cap};
     use serial_nexus_codec_api::CodecError;
+    use serial_nexus_core::lock::{Arbitration, EndpointLock, OriginId, WriteMode};
+    use tokio::sync::broadcast;
 
     /// One scripted `demux` call: decode the chunk onto a channel, refuse it, or —
     /// the shape a real non-resyncing framer actually produces — decode the leading
@@ -868,9 +876,17 @@ mod signal_tests {
     /// A transform that follows a script — the codec §7.5 sanctions and the shipped
     /// registry does not contain: one that "treats any framing violation as a
     /// protocol error and never resyncs", which the trait can only express as `Err`.
+    ///
+    /// The `mux` half is scripted by count rather than by step, because the
+    /// targetward caller is a fragmentation loop: what matters is *which fragment*
+    /// gets refused, not what the event carried.
     struct StubCodec {
         script: Vec<Step>,
         calls: usize,
+        /// How many `mux` calls to accept before refusing this one and every one
+        /// after it. `usize::MAX` for the hostward tests, which never mux.
+        mux_ok: usize,
+        mux_calls: usize,
     }
 
     impl Codec for StubCodec {
@@ -900,7 +916,15 @@ mod signal_tests {
             }
         }
 
-        fn mux(&mut self, _event: &Event, _out: &mut Vec<u8>) -> Result<(), CodecError> {
+        fn mux(&mut self, event: &Event, out: &mut Vec<u8>) -> Result<(), CodecError> {
+            let nth = self.mux_calls;
+            self.mux_calls += 1;
+            if nth >= self.mux_ok {
+                return Err(CodecError::Framing(format!("refused piece {nth}")));
+            }
+            if let EventKind::Data(bytes) = &event.kind {
+                out.extend_from_slice(bytes);
+            }
             Ok(())
         }
     }
@@ -935,7 +959,12 @@ mod signal_tests {
             stats: stats.clone(),
         };
         let codec: Rc<CriticalCell<Box<dyn Codec>>> =
-            Rc::new(CriticalCell::new(Box::new(StubCodec { script, calls: 0 })));
+            Rc::new(CriticalCell::new(Box::new(StubCodec {
+                script,
+                calls: 0,
+                mux_ok: usize::MAX, // hostward only: nothing here muxes
+                mux_calls: 0,
+            })));
 
         let (inbox_tx, inbox_rx) = mpsc::channel(1);
         let (edge_tx, edge_rx) = mpsc::channel(chunks.len().max(1));
@@ -963,6 +992,33 @@ mod signal_tests {
         )
         .await;
         signals
+    }
+
+    /// A serial lock whose held demux origin already owns the write lock, so the
+    /// codec's `reacquire_held` fast path returns immediately (no parking).
+    fn held_lock() -> (SharedLock, OriginId) {
+        let id = OriginId(1);
+        let mut lock = EndpointLock::new(Arbitration::Exclusive);
+        lock.register(id, "demux", WriteMode::Held); // acquires the lock on attach
+        let (notifier, _rx) = broadcast::channel(16);
+        (
+            Rc::new(crate::runtime::LockCell::new("mux", lock, notifier)),
+            id,
+        )
+    }
+
+    /// A multiplexed-side edge slot bound to `held_lock`'s origin, writing into
+    /// `mux_tx` — the shape `connect` leaves behind (§15.35). Shared with the
+    /// reference-codec `tests` module below, which needs the identical fixture.
+    pub(super) fn bound_edge(mux_tx: mpsc::Sender<Chunk>) -> SharedTargetEdge {
+        let (lock, id) = held_lock();
+        let slot = TargetEdge::new();
+        slot.with_mut(|e| {
+            e.attached = true;
+            e.registered = Some((lock, id));
+            e.writer = Some(mux_tx);
+        });
+        slot
     }
 
     /// One consumer sink of depth `cap`, plus its receiver and drop counters.
@@ -1173,6 +1229,83 @@ mod signal_tests {
         );
     }
 
+    /// 37-CODEC-3, the targetward mirror of WIRE-1: a transform that refuses a
+    /// *fragment* mid-chunk must charge the undelivered residual and stop framing.
+    ///
+    /// The branch is the one AGENTS.md §4 names a tripwire — "never skip-on-encode
+    /// error" — and §15.27 records that exact bug shipping three times in three
+    /// framers before review caught the last one. Here it was unreachable and
+    /// therefore unguarded: the reference codec's fragments provably fit the frame
+    /// bound ([`frame_ranges`] is sized off [`frame_payload_cap`]), so nothing in the
+    /// shipped registry can refuse a piece, and a regression that simply `break`ed
+    /// without the charge would have compiled, passed, and shipped. A `mux` that errs
+    /// after the first piece is reachable only through the §15.26 out-of-tree
+    /// surface, which is what this stub stands in for.
+    ///
+    /// The assertion is the §5 reconciliation, not the two counters separately:
+    /// `accepted + discarded == total` for the whole source chunk, so no arithmetic
+    /// that loses or double-counts a byte can pass.
+    #[tokio::test]
+    async fn a_mux_refusal_mid_chunk_charges_the_residual_and_stops_framing() {
+        let channel = "c0";
+        // Three fragments: the first is accepted, the second refused, the third never
+        // attempted. A chunk of exactly one fragment could not tell "charged the
+        // residual" from "charged the chunk".
+        let cap = frame_payload_cap(channel);
+        let total = 2 * cap + 7;
+        let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+
+        let (in_tx, in_rx) = mpsc::channel::<Chunk>(1);
+        let (mux_tx, mut mux_rx) = mpsc::channel::<Chunk>(8);
+        let codec: Rc<CriticalCell<Box<dyn Codec>>> =
+            Rc::new(CriticalCell::new(Box::new(StubCodec {
+                script: Vec::new(), // targetward only: nothing here demuxes
+                calls: 0,
+                mux_ok: 1,
+                mux_calls: 0,
+            })));
+        let stat = Rc::new(ChannelStat::default());
+
+        in_tx
+            .send(Chunk::from(payload))
+            .await
+            .expect("the task has not started, so the buffer takes it");
+        drop(in_tx); // close the source so the task drains its one chunk and returns
+        channel_targetward(
+            channel.to_owned(),
+            in_rx,
+            bound_edge(mux_tx),
+            codec,
+            stat.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            stat.accepted_targetward.get(),
+            cap as u64,
+            "the piece the transform framed is the only one delivered"
+        );
+        assert_eq!(
+            stat.discarded_targetward.get(),
+            (total - cap) as u64,
+            "the refusal costs the whole undelivered tail, not one fragment"
+        );
+        assert_eq!(
+            stat.accepted_targetward.get() + stat.discarded_targetward.get(),
+            total as u64,
+            "every source byte is either accepted targetward or charged as loss (§5)"
+        );
+
+        let mut frames = 0usize;
+        while mux_rx.try_recv().is_ok() {
+            frames += 1;
+        }
+        assert_eq!(
+            frames, 1,
+            "framing stops at the refusal; the third fragment is never attempted"
+        );
+    }
+
     /// The saturating half of the same arithmetic: a transform may flush frames it
     /// buffered from *earlier* chunks and then refuse, emitting more payload than the
     /// chunk it was handed. That is not negative loss — it is none — and it must not
@@ -1205,35 +1338,11 @@ mod signal_tests {
 #[cfg(all(test, feature = "codec-reference"))]
 mod tests {
     use super::*;
-    use crate::runtime::{SharedLock, TargetEdge};
-    use serial_nexus_core::lock::{Arbitration, EndpointLock, OriginId, WriteMode};
-    use tokio::sync::broadcast;
-
-    /// A serial lock whose held demux origin already owns the write lock, so the
-    /// codec's `reacquire_held` fast path returns immediately (no parking).
-    fn held_lock() -> (SharedLock, OriginId) {
-        let id = OriginId(1);
-        let mut lock = EndpointLock::new(Arbitration::Exclusive);
-        lock.register(id, "demux", WriteMode::Held); // acquires the lock on attach
-        let (notifier, _rx) = broadcast::channel(16);
-        (
-            Rc::new(crate::runtime::LockCell::new("mux", lock, notifier)),
-            id,
-        )
-    }
-
-    /// A multiplexed-side edge slot bound to `held_lock`'s origin, writing into
-    /// `mux_tx` — the shape `connect` leaves behind (§15.35).
-    fn bound_edge(mux_tx: mpsc::Sender<Chunk>) -> SharedTargetEdge {
-        let (lock, id) = held_lock();
-        let slot = TargetEdge::new();
-        slot.with_mut(|e| {
-            e.attached = true;
-            e.registered = Some((lock, id));
-            e.writer = Some(mux_tx);
-        });
-        slot
-    }
+    // The held-lock / bound-edge fixture lives with the stub-codec guards above,
+    // since both modules need the identical shape and only one of them is gated on
+    // the reference codec.
+    use super::signal_tests::bound_edge;
+    use crate::runtime::TargetEdge;
 
     /// A read-only demux (`write_mode = "never"` on the multiplexed edge, which
     /// validation permits) keeps its channel receivers alive and counts what it

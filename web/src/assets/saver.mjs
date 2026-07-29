@@ -1,4 +1,5 @@
-// Per-key write serialization for console scrollback (design §11.9 / §15.32).
+// Per-key write serialization for console scrollback (design §15.32, §17's
+// browser-side history; the track item is plan §11.9).
 //
 // Persisting history is a *full-buffer rewrite* of a capped snapshot, and the OPFS
 // adapter's `createWritable()` truncates the file before the first `write` lands. Two
@@ -38,9 +39,9 @@
 /// completes afterwards and re-creates the record that was just deleted (review
 /// HISTC-2).
 export function makeSaver(write, onError = () => {}, remove = null) {
-  // key -> { del: boolean, pending: {bytes, endOffset, epoch} | null, running: boolean }
+  // key -> { del, pending: {bytes, endOffset, epoch} | null, running, waiters }
   // Two slots, not one: `del` and `pending` are different intents and only one of the
-  // two coalescing directions is safe (see the header).
+  // two coalescing directions is safe (see the header). `waiters` is `settled()`'s.
   const queues = new Map();
 
   function drain(key, q) {
@@ -67,16 +68,20 @@ export function makeSaver(write, onError = () => {}, remove = null) {
         }
       }
       // Synchronous from the last slot check through here, so nothing can be queued into
-      // a slot nobody will drain.
+      // a slot nobody will drain — and so a `settled()` waiter cannot be added to a queue
+      // that has already published its last resolution.
       q.running = false;
       queues.delete(key);
+      const waiters = q.waiters;
+      q.waiters = null;
+      if (waiters) for (const w of waiters) w();
     })();
   }
 
   function queueFor(key) {
     let q = queues.get(key);
     if (!q) {
-      q = { del: false, pending: null, running: false };
+      q = { del: false, pending: null, running: false, waiters: null };
       queues.set(key, q);
     }
     return q;
@@ -107,6 +112,24 @@ export function makeSaver(write, onError = () => {}, remove = null) {
       q.del = true;
       q.pending = null;
       start(q, key);
+    },
+
+    /// Resolve once nothing is queued or in flight for `key` — the ordering a *reader*
+    /// needs.
+    ///
+    /// This queue serializes writers against each other, but the restore path reads
+    /// storage directly, and a read is not a queue member: it overtook a snapshot this
+    /// queue had not drained yet and came back with the previous record, whose frontier
+    /// lags the stream by however long the write took (review 37-WEBC-6). Awaiting this
+    /// first is what makes "select the console that is already selected" read what that
+    /// console just wrote. An idle key resolves immediately, which is the common case and
+    /// costs one map lookup.
+    settled(key) {
+      const q = queues.get(key);
+      if (!q) return Promise.resolve();
+      return new Promise((resolve) => {
+        (q.waiters ??= []).push(resolve);
+      });
     },
 
     /// Whether a write is in flight for `key` (tests and diagnostics).

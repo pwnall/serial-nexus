@@ -4,12 +4,92 @@
 console-map + review-26 remediation + v12 graph-editing + v13 browser-UI automation +
 review-32 remediation tracks done**, plus the **v14 rename track** — every binary, crate
 and default path moved to the `serial-nexus-*` / `serial_nexus_*` family, design §15.40,
-plan §17, with the consumer-context scrub of §15.41 beside it.)
+plan §17, with the consumer-context scrub of §15.41 beside it — and the **review-37
+remediation**, all 82 findings dispositioned.)
 **Branch:** `implementation` (off `main`).
 **Normative docs are now v14:** `docs/35-design-claude-fable-v14.md` (design) and
 `docs/36-implementation-plan-claude-fable-v14.md` (plan). v1–v13 docs, the reviews and their
 remediation ledgers are in `docs/historical/`. Section references (§) point at the v14
 design.
+
+---
+
+## REVIEW-37 REMEDIATION — all 82 findings dispositioned (2026-07-29 session)
+
+**The finding-by-finding ledger is `docs/38-review-37-remediation-ledger.md`** — read it
+before re-filing anything from review 37, and read the review's own §6 (cleared candidates,
+including the two hypotheses its finders killed before filing) before filing anything new.
+Eighty are fixed and, where behavioural, guarded; two are **justify** and were already
+recorded here as §3.23 and §3.24, with the design annotations they called for made this
+session. Nothing was silently declined.
+
+**Scale and gates.** Suite **642 → 723 passing / 0 failing / 4 ignored** (+81), across
+**102 → 111** test targets. `cargo build`, `cargo fmt`, `cargo clippy` (workspace **and**
+minimal-daemon), `cargo deny check licenses bans sources`, the macOS cross-check,
+`serial-nexus-doctor --json | jq -e -f expectations/linux.jq` and the headless-Chromium suite
+(forced with `SNX_WEB_UI=required`, so the green is a run and not a skip) are all green. One
+wire-surface change: a new application error **`-32007` (edge inbox full)** — additive, per
+§10, and the registry's own gate refused it until `docs/rpc/README.md` carried the row.
+
+**The shape of the fixes, which matters more than the list.** Two of the five clusters are
+the same relocation twice, one level apart, and are the ones to re-read before touching
+either area:
+
+- **Provenance travels with the data; it cannot be re-derived later.** The leg's
+  receiving-side purge identified outage-era chunks by reading the disconnect epoch *after*
+  `rx.recv()` returned. A peer whose final data frames and FIN are readable together — one
+  that sends its commands and disconnects in one breath — is enqueued, EOF'd and
+  epoch-bumped inside a single poll of the supervise task, so every stale chunk snapshotted
+  the **post**-bump epoch, both purge checks compared equal, and the dead connection's whole
+  backlog fired into the device the §6 purge exists to protect. Deterministic on the
+  current-thread runtime, not a race. The queue now carries `Inbound { epoch, bytes }`
+  stamped at enqueue, on the pump's read half, which is the only moment the provenance is
+  known. See §3.25 for what that cost: this instance of the purge no longer uses
+  `boundary::drain_to_quiescence`.
+- **The same collapse one level down.** `attach_edge` handed the consumer its hostward
+  receiver with `inbox.try_send(hrx).is_ok()`, so a *full* inbox and a *closed* one were one
+  fact. `Closed` is a property of the node (no pump — a faulted pty, a deferred
+  `faces = "host"` channel) and is correctly reported, never refused; `Full` is a property of
+  the moment, and reporting it as the former sent an operator to inspect a healthy node while
+  a **configured** edge stayed hostward-dead for good. `Full` now attaches nothing at all and
+  `connect` answers `-32007`.
+- **A promise driven from three places and not the fourth.** §6/§15.23's "a `held` origin
+  reclaims the moment it frees" had drivers in the codec, exec and map targetward pumps and
+  none for a pty, while held-priority in `acquire` denied every *other* origin on the free
+  lock — so any steal-release, unlock or lease expiry left the endpoint free-but-untakeable
+  until a manual `lock`, another steal, or edge surgery. The reclaim gained a non-parking
+  sibling for boundary origins that own their own lifecycle loop (§3.26).
+- **Terminal events and deadlines moved off the congested path.** `tap.closed` was delivered
+  with a discarded `try_send` on the very queue whose fullness is why the client needs it; a
+  parked verb's deadline lived inside a `select!` arm body that a blocked `write_all` stopped
+  polling, so one non-reading client stalled every other connection's arbitration on that
+  endpoint with the lock reported free. The terminal event now has its own per-connection
+  lane drained *ahead* of the data arm, and the connection's writes no longer block the loop
+  that owns the deadline.
+- **Gates that could not fail.** Three tree-scanning meta-gates proved their matchers and
+  never their walkers, and the self-exclusion matched a bare file name; nothing in the suite
+  ever sent the daemon a signal, so deleting its shutdown arms would have passed everything.
+  All four now assert execution — the `meta_names.rs` treatment, which existed as the correct
+  shape the whole time.
+
+**Four things the remediation found that the review did not**, recorded because a review's
+own errors are as load-bearing as its findings: `37-DOC-3`'s second location is wrong (the
+doc comment is `itest/src/lib.rs:774`, not `serial_hardware.rs`) and its third site is
+partially refuted (no such notes §3 entry exists; a *different* error at line 2231 was fixed
+instead); a fourth `37-DOC-3` site — `serial_hardware.rs`'s four skip messages — told a Linux
+operator to attach `cu.usbserial` adapters, which does nothing there; `docs/serial-nexus-doctor.md`
+carried a fifth stale claim falsified by the very artifact `37-DOC-1` is about (`brk` "stays 0
+at every tier on every kernel", against a committed `brk=2`); and `37-WEBC-8`'s dangling
+`§11.8`/`§11.9` refs were tree-wide rather than confined to three web modules — 37 further
+sites across `daemon/`, `itest/`, `ctl/` and `docs/rpc/` cited plan sections in the notation
+README reserves for the design, and now read `plan §11.8`.
+
+**One toolchain note worth more than it looks.** `cargo test -p serial-nexus-itest --test
+<name>` does **not** rebuild the daemon binary the harness spawns — it runs whatever sits in
+`target/debug/`. Every in-place revert taken for fail-first proof this session had to be
+followed by `cargo build -p serial-nexus-daemon-bin` before the itest meant anything. This is
+review 32's "a guard that drives the fix cannot fail against the code that lacked it", one
+layer down in the toolchain, and it is invisible: the proof simply passes and reports nothing.
 
 ---
 
@@ -1511,10 +1591,13 @@ corrected to the canonical kebab-case with the unhyphenated forms named as alias
 
 **§14.1 — THE `ports` VERB.**
 - **Enumeration** `core/src/resolver.rs::enumerate_ports` → `Vec<PortCandidate>`
-  (identity, kind, path, description, `by_id`, warning). Three passive sources unioned and
+  (identity, kind, path, description, `by_id`, warning). **Four** passive sources unioned and
   deduplicated by device node: `/dev/serial/by-id`, `/dev/serial/by-path` (which still
-  covers an adapter whose serial number is absent), and a `<dev-root>/dev` scan for `cu.*`
-  callout nodes — the BSD/macOS face. The `cu.*` scan is deliberately **not** `cfg`-gated:
+  covers an adapter whose serial number is absent), the `<sys-root>/class/tty` device
+  listing itself — added by review 32's `RES-2` and the source that makes `ports` work in a
+  tree with `/sys` and no udev serial rules, where the other two are empty — and a
+  `<dev-root>/dev` scan for `cu.*` callout nodes, the BSD/macOS face. (This paragraph said
+  "three" until review 37 `37-RES-7`; the fourth had been there since `RES-2` shipped.) The `cu.*` scan is deliberately **not** `cfg`-gated:
   the prefix matches nothing on Linux, and one code path keeps the macOS arm reachable from
   a Linux fixture instead of shipping untested.
 - Each candidate's identity comes from the *same* private `capture_for_dev` chain
@@ -2228,9 +2311,12 @@ boots `serial-nexus-daemon`, drives it with a small in-Rust JSON-RPC client (rep
 --json | jq`), orchestrates `serial-nexus-sim` doubles as subprocesses, and asserts on structured results
 + byte-exact SHA-256 — none of the `stat -c` / `nc -q` / `sha256sum` / `timeout` /
 `/dev/serial/by-id` bash portability hazards (all of which break the old scripts on macOS).
-`serial_rig()`/`crossover_ports()` yield a serial device (macOS: the real crossover rig; Linux: a
-sim pty double; otherwise `None` → the test self-skips, the §5 skip discipline). **Verified on
-macOS: 6/6** — `tests/control_plane.rs` and `tests/serial_hardware.rs`.
+`serial_echo()`/`serial_pair()` yield a serial device on Linux (sim pty doubles) and `None`
+elsewhere; `crossover_ports()` yields the real crossover rig — `SNX_CROSSOVER_A`/`_B` on any
+platform, plus a `cu.usbserial-*` scan on **macOS only**. Otherwise `None` → the test
+self-skips, the §5 skip discipline. (This sentence named a `serial_rig()` that no longer
+exists and read as though `crossover_ports()` detected a Linux rig on its own; it does not —
+review 37 `37-DOC-3`.) **Verified on macOS: 6/6** — `tests/control_plane.rs` and `tests/serial_hardware.rs`.
 
 **Real-hardware validation (macOS, two FTDI FT232R adapters cross-wired).** `serial_hardware.rs`
 (one `#[test]`, auto-detected via `crossover_ports()`, self-skips when absent) certifies end to
@@ -2715,8 +2801,8 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **642 passing, 0 failed, 4 ignored** across 102 test
-targets on Linux (2026-07-29, after the rename track); of those, one is the doc-tested
+The current whole-suite figure is **723 passing, 0 failed, 4 ignored** across 111 test
+targets on Linux (2026-07-29, after the review-37 remediation); of those, one is the doc-tested
 twelve-line embedder `main` in `daemon/src/lib.rs`, which is the §15.26 entry surface
 proving it still compiles under the family names.
 
@@ -2735,9 +2821,12 @@ precondition: a failure is attributable to a loose wire, not the daemon). Verifi
 a cross-wired FTDI FT232R pair.
 
 **Kernel matrix:** every probe that runs on Linux reports `supported` on **Linux
-7.0.0** (dev box, Ubuntu 26.04, HEAD binary, cross-wired pair — 21 · 0 · 0 · 0 on
-2026-07-27; 13 · 0 · 0 · 6 passive at HEAD on 2026-07-29, the box having no adapter
-since the pair moved) and on **Linux 6.18.14** (Debian rodete — 19 · 0 · 0 · 0 on
+7.0.0** (dev box, Ubuntu 26.04 — **21 · 0 · 0 · 1 on 2026-07-29 with a `da290c616631`
+binary and the Tier-3 cross-wired FT232R pair**, committed as
+`docs/doctor/linux-7.0-2026-07-29-tier3.json`; the three 13 · 0 · 0 · 6 passive runs
+committed beside it are the earlier state of that same day, taken while the pair was
+on the other box, and are superseded as the 7.0 baseline — review 37 `37-DOC-2`) and
+on **Linux 6.18.14** (Debian rodete — 19 · 0 · 0 · 0 on
 2026-07-27 with a `fe1c52c` binary and one dangling adapter; **21 · 0 · 0 · 1 on
 2026-07-29 with a HEAD binary and a Tier-3 cross-wired pair**, the one skip being
 P12, which is inert on Linux by design). **P6, P7 and P8 are byte-identical across
@@ -2762,10 +2851,11 @@ rig certifies, the `--json`/`jq` gate, and `cargo test` at all) is enumerated in
 | `codecs/reference` (`serial-nexus-codec-reference`) | the v1 envelope framing as a `Codec`, with length-guided resync (§7.5/§9) | done (phase 5) |
 | `serial-nexus-core` | graph model + validator (§4), data-plane deliver contracts + holdover (§5), lock state machine incl. `reclaim_held` (§6), config/state split (§15.8), **device-identity `resolver` (§12)** | done |
 | `serial-nexus-rpc` | JSON-RPC 2.0 wire types — the stable §15.16 surface | done |
-| `serial-nexus-sim` | test double: `pty`/`client`/`mux`/`envelope`/`wire`/`tcp-proxy`/`nullmodem` modes (§3) | done through phase 7 |
+| `serial-nexus-sim` | test double: `pty`/`client`/`mux`/`envelope`/`exec-conformance`/`wire`/`tcp-proxy`/`nullmodem` modes (§3) | done |
 | `serial-nexus-doctor` | shipping capability checker: probes P1–P12 + env checks (§15.17) | done |
 | `serial-nexus-daemon` | the daemon | control plane + node lifecycle + data plane + codecs + leg/wire done |
-| `serial-nexus-ctl` | the CLI (thin RPC client + `--json`) | `load [--replace]`/`add-node`/`remove-node [--cascade]`/`dump`/`state`/`subscribe`/`rotate`/`lock`/`unlock`/`send`/`send-break`/`set-modem`/`pulse-dtr`/`teardown`/`shutdown` |
+| `serial-nexus-ctl` | the CLI (thin RPC client + `--json`) | `load [--replace]`/`add-node`/`remove-node [--cascade]`/`connect`/`disconnect`/`dump`/`state`/`info`/`ports`/`subscribe`/`tap`/`rotate`/`lock`/`unlock`/`send`/`send-break`/`set-modem`/`pulse-dtr`/`teardown`/`shutdown` |
+| `serial-nexus-web` | the web console's server half (§17): static assets, the split credential and token gate, TLS, the bounded WebSocket bridge that forwards an allowlist of RPC methods, plus a `wsclient` headless client for driving the browser-facing protocol without a browser | done |
 
 Daemon modules (the v8 library/binary split moved all of these out of the thin binary
 crate into the `serial-nexus-daemon` library, §15.26; the binary is now flags + tracing +
@@ -2792,15 +2882,24 @@ entry above for the script→test mapping.
 These are implementation decisions the design does not spell out, or where a
 kernel/library reality shaped the approach. None contradict the design.
 
-### 3.1 Serial node uses blocking `serial2` + poll-based readiness, not `serial2-tokio`
+### 3.1 Serial node uses `serial2` + poll-based readiness, not `serial2-tokio`
 **Design:** §13 lists `serial2`/`serial2-tokio` for "concurrent async read/write."
 **Reality (serial-nexus-doctor P3 research):** `serial2-tokio` 0.1.24 exposes **no
 accessor for the inner fd**, and `serial2` **does not take `TIOCEXCL`** (only
 `O_NOCTTY`). The daemon needs the raw fd for `TIOCEXCL` (§7.1) and later
 `TIOCGICOUNT` (§5).
-**Decision:** open a blocking `serial2::SerialPort` (settings, modem lines,
+**Decision:** open a `serial2::SerialPort` (settings, modem lines,
 break, and the raw ioctls via `as_raw_fd`), set it non-blocking, and drive async
 I/O with poll-based readiness (see §3.10) — rather than `serial2-tokio`.
+**Correction (review 37 `37-SER-3`):** this entry, `sys/src/lib.rs`, the
+`nodes/serial.rs` module doc, the root `Cargo.toml` comment and design §13 all said
+the fd was *opened blocking*. It is not: the pinned serial2 0.2.37
+`SerialPort::open` passes `O_NONBLOCK | O_NOCTTY` as custom flags and never clears
+them. The daemon's own `set_nonblocking` on that fd is therefore redundant — and is
+kept deliberately, because the readiness loop's correctness must not rest on a
+dependency's open flags, which are not part of its published API. Nothing about the
+reopen-window reasoning changes; the prose was simply describing a state the fd was
+never in.
 Consistent with §13's "raw termios via nix/rustix as the fallback." `TIOCEXCL` is
 issued by the daemon itself (`nodes/serial.rs`). `serial2-tokio` is now an unused
 dependency and was dropped from `daemon-bin/Cargo.toml` — and, in the v3
@@ -3363,8 +3462,70 @@ that is what lets configurations survive cold starts with hardware unplugged (§
 resolve would break the property the identity design exists for, and the destructive-typo path is
 closed structurally by `deny_unknown_fields` before `--replace` can reach teardown. What §11's
 sentence actually describes is `add-node`'s *capture* rule (§12's "raw path requires the device
-present at that moment"). The design sentence should be qualified at the next design revision;
-recorded here so the next review reads the clause as a documentation artifact, not a validation gap.
+present at that moment"). **Landed 2026-07-29:** the design sentence is now qualified in place,
+naming this entry.
+
+### 3.25 The leg's receiving-side purge carries per-chunk provenance, not a quiescence drain (review 37 `37-LEG-1`)
+
+**Design:** §6 — "purging is one rule with three instances", one of which is purge-on-reconnect,
+which §7.1 defines as draining the parked targetward pipeline *to quiescence*.
+**Reality:** a *local* backlog has no record of which connection produced it, so time is the only
+available proxy and the drain's yield-redrain rounds are the right shape. A *wire-arriving* queue
+does have that record, and approximating it by time is what let a peer that sent and disconnected in
+one poll have its whole backlog attributed to the connection that replaced it.
+**Decision:** the `faces = "target"` inbound queue carries `Inbound { epoch, bytes }`, stamped with
+`LegShared::disconnect_epoch` at **enqueue** on the pump's read half; `channel_targetward` decides
+staleness from that tag and discards the backlog one attributed chunk per loop turn instead of
+calling `boundary::drain_to_quiescence`. This is exact where the drain was bounded (`DRAIN_ROUNDS`)
+and strictly safer in the other direction too: a chunk a *live* connection queued behind stale ones
+is now delivered rather than swept up. The sending side and the serial node are unchanged and still
+share the helper. §6's "one invariant, three instances" is intact — one of the three now decides
+provenance per chunk rather than per drain. **Do not** re-generalize the helper over the element
+type and reintroduce a blanket drain here; the blanket drain is the part that was wrong.
+
+### 3.26 Held-priority *reclaim* does not run purge-on-acquire, in two places (review 37 `37-LOCK-1`)
+
+**Design:** §6 — "Every grant, immediate or queued, runs purge-on-acquire before the origin's bytes
+flow."
+**Reality:** held-priority reclaim is not one of those grants, and now there are two implementations
+of it: the pre-existing `runtime::reacquire_held` (the codec, exec and map targetward pumps) and the
+new `runtime::may_write_reclaiming`, the non-parking sibling added for boundary origins — a `held`
+pty edge — which own their own lifecycle loop and cannot park inside a gate.
+**Decision:** neither purges, deliberately, for three reasons that all point the same way. A held
+origin's floor is *permanent* and a steal is a transient ouster of it, not a fresh acquisition;
+§6's purge paragraph scopes the rule to "explicit lock acquisition" in its own words; and a boundary
+observes the lock freeing at poll resolution rather than at the instant it happens, so purging on
+reclaim would discard console input typed *after* the endpoint was already this origin's again —
+loss §5 does not sanction. The rationale is stated at the new helper so the next reader finds it
+there rather than here.
+
+### 3.27 A log node whose directory scan cannot run faults at create (review 37 `37-LOG-2`)
+
+**Design:** §7.3 recovers the rotation counter by scanning the directory at node start.
+**Reality:** `scan_rotation` swallowed `read_dir` failure as `None`, indistinguishable from "no
+rotations yet" — and the two are reachable independently, because they are separate permissions: a
+mode-0300 directory grants create-and-traverse without list, so `read_dir` fails while `open_append`
+succeeds. The node came up Active with the counter reset, and the next `rotate` renamed the live file
+onto the newest rotation on disk, which `rename(2)` replaces without a word: the log node destroying
+the one thing it exists to keep.
+**Decision:** the scan returns `io::Result<Option<u64>>` and a scan that could not run faults the
+node — §7's environmental-failure rule, exactly as an unopenable file already does — which also makes
+`rotate` refuse for as long as the fault stands. The open is still attempted first, so a *missing*
+directory (where both fail) keeps naming the open, the more useful diagnosis. New reason spelling:
+`scan <directory> for rotations: <err>`.
+
+### 3.28 The listen role's bind retries on the reconnect backoff (review 37 `37-LEG-2`)
+
+**Design:** §7.4 says "the connect role retries with backoff; an outage is faulted-and-wait", and
+§11/§15.8 generalize environmental faults to "visible in state, healing on their own".
+**Reality:** the listen-role bind was one-shot — a transient EADDRINUSE, EMFILE or not-yet-up
+interface address faulted the node and returned the supervisor permanently. It was the daemon's one
+environmental fault that could be cleared only by remove-and-re-add.
+**Decision:** the bind moved inside the supervisor's retry loop, sharing the existing `Backoff` with
+the connect role's dial; `bind_listener` re-runs the SEC-8 stale-socket check on every attempt, which
+is what makes the common heal — a predecessor's inode outliving the peer that was still answering on
+it — work at all. A successful bind sets `waiting`, so the heal is observable rather than silent.
+§7.4's sentence names only the connect role's retry because the bind used to be one-shot.
 
 ---
 

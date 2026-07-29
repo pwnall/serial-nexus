@@ -189,19 +189,37 @@ impl LogNode {
 
         let directory = PathBuf::from(directory);
         // Recover the rotation counter by scanning for existing `<name>.NNN`
-        // (§7.3); a missing/unreadable directory leaves it None and surfaces as
-        // an open fault below.
-        let rotation = scan_rotation(&directory, filename);
+        // (§7.3). A scan that could not *run* is not "no rotations yet": adopting
+        // `None` there resets the counter, and the next `rotate` then renames the
+        // live file onto the newest rotation already on disk, which `rename(2)`
+        // replaces without a word — the log node destroying the one thing it
+        // exists to keep (LOG-2). The two are distinguishable here because they
+        // are separate permissions: a mode-0300 directory grants create-and-
+        // traverse without list, so `read_dir` fails while `open_append` succeeds.
+        // An unreadable directory is an environmental failure, so it faults the
+        // node exactly as an unopenable file does (§7), and `rotate` refuses for
+        // as long as the fault stands.
+        let scan = scan_rotation(&directory, filename);
 
-        let (status, file) = match open_append(&directory.join(filename)) {
-            Ok(f) => (NodeStatus::Active, Some(f)),
-            Err(e) => (
+        // The open is attempted either way, so a *missing* directory — where both
+        // fail — keeps naming the open, which is the more useful diagnosis.
+        let current = directory.join(filename);
+        let (status, file) = match (open_append(&current), &scan) {
+            (Err(e), _) => (
                 NodeStatus::Faulted {
-                    reason: format!("open {}: {e}", directory.join(filename).display()),
+                    reason: format!("open {}: {e}", current.display()),
                 },
                 None,
             ),
+            (Ok(_), Err(e)) => (
+                NodeStatus::Faulted {
+                    reason: format!("scan {} for rotations: {e}", directory.display()),
+                },
+                None,
+            ),
+            (Ok(f), Ok(_)) => (NodeStatus::Active, Some(f)),
         };
+        let rotation = scan.ok().flatten();
 
         let shared = Arc::new(Shared {
             q: Mutex::new(Queue {
@@ -539,15 +557,21 @@ fn writer_drain(shared: &Shared, dir: PathBuf, filename: String, padding: usize,
         for (i, item) in batch.iter().enumerate() {
             match item {
                 QueueItem::Bytes(chunk) => {
-                    if let Err(e) = file.write_all(chunk) {
+                    if let Err((unwritten, e)) = write_chunk(&mut file, chunk) {
                         let mut q = shared.q.lock().unwrap();
+                        // Only the remainder the file never took is loss. A prefix
+                        // the failing `write(2)` already stored is durably in the
+                        // file, and charging the whole chunk made
+                        // `file_len + dropped_bytes` exceed the produced total —
+                        // the exactness §5 requires of the loss accounting, and
+                        // what `p12_log_queue` pins (LOG-1).
+                        q.dropped_bytes += unwritten as u64;
                         match q.overflow {
                             OverflowPolicy::Fault => {
-                                // The failing chunk and every remaining item of
-                                // the drained batch are abandoned; count them so
-                                // reported loss stays exact (§5 "all loss is
-                                // counted").
-                                count_abandoned(&mut q, &batch[i..]);
+                                // Every remaining item of the drained batch is
+                                // abandoned as well; count them so reported loss
+                                // stays exact (§5 "all loss is counted").
+                                count_abandoned(&mut q, &batch[i + 1..]);
                                 q.status.set(NodeStatus::Faulted {
                                     reason: format!("write {}: {e}", current.display()),
                                 });
@@ -555,7 +579,6 @@ fn writer_drain(shared: &Shared, dir: PathBuf, filename: String, padding: usize,
                                 return; // stop draining; the pump drops-and-counts
                             }
                             OverflowPolicy::DropOldest => {
-                                q.dropped_bytes += chunk.len() as u64;
                                 // The node deliberately stays `active` here (§5
                                 // sanctions drop-oldest-with-counters for the
                                 // full-disk case), so record the refusal
@@ -603,6 +626,37 @@ fn writer_drain(shared: &Shared, dir: PathBuf, filename: String, padding: usize,
             return;
         }
     }
+}
+
+/// One chunk's blocking write, hand-rolled so a **partial** write stays visible.
+///
+/// `write_all` reports the error and not how much of the buffer reached the file,
+/// yet the ordinary full-disk shape is exactly a partial one: `write(2)` stores
+/// what fits and the retry gets ENOSPC. Charging the whole chunk to
+/// `dropped_bytes` there made `file_len + dropped_bytes` exceed the produced
+/// total, which is the identity §5's "loss is always visible and attributable"
+/// rests on (LOG-1 — the review-26 PTY-3 remedy applied here). Returns the
+/// unwritten remainder together with the error that stopped it.
+fn write_chunk(file: &mut File, chunk: &[u8]) -> Result<(), (usize, std::io::Error)> {
+    let mut rest = chunk;
+    while !rest.is_empty() {
+        match file.write(rest) {
+            // `write_all`'s own reading of a zero-length write on a non-empty
+            // buffer: the destination is taking nothing, so this is a refusal to
+            // count rather than a loop to spin in.
+            Ok(0) => {
+                return Err((
+                    rest.len(),
+                    std::io::Error::new(std::io::ErrorKind::WriteZero, "write returned zero bytes"),
+                ));
+            }
+            Ok(n) => rest = &rest[n..],
+            // A signal is not progress lost; retry what is left.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err((rest.len(), e)),
+        }
+    }
+    Ok(())
 }
 
 /// Count an abandoned tail of a drained batch as loss and clear the in-flight
@@ -686,11 +740,15 @@ fn open_append(path: &std::path::Path) -> std::io::Result<File> {
 }
 
 /// Scan `dir` for `<filename>.NNN` and return the highest N (§7.3 counter
-/// recovery). `None` if the directory is unreadable or has no rotations yet.
-fn scan_rotation(dir: &std::path::Path, filename: &str) -> Option<u64> {
+/// recovery). `Ok(None)` is "no rotations yet"; `Err` is "the scan could not run",
+/// and the caller must not read one as the other (LOG-2). An entry the directory
+/// listing itself refuses counts as a failed scan for the same reason: it is a
+/// rotation number that cannot be ruled out.
+fn scan_rotation(dir: &std::path::Path, filename: &str) -> std::io::Result<Option<u64>> {
     let prefix = format!("{filename}.");
     let mut max: Option<u64> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if let Some(suffix) = name.strip_prefix(&prefix)
@@ -699,7 +757,7 @@ fn scan_rotation(dir: &std::path::Path, filename: &str) -> Option<u64> {
             max = Some(max.map_or(n, |m| m.max(n)));
         }
     }
-    max
+    Ok(max)
 }
 
 fn rotation_padding(config: &NodeConfig) -> usize {
@@ -817,6 +875,189 @@ mod tests {
         assert!(q.items.is_empty(), "and it must not be retained in memory");
         drop(q);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // LOG-1: the ordinary full-disk shape is a **partial** write — `write(2)` stores
+    // what fits and the retry fails — and the prefix it stored is durably in the file,
+    // not lost. Charging the whole chunk made `written + dropped` exceed `produced`,
+    // the identity §5's loss accounting rests on and `p12_log_queue` pins end to end
+    // (its own guards fail at offset 0, so they never see partial progress).
+    //
+    // The vehicle is a non-blocking `AF_UNIX` stream standing in for the file: it is
+    // the one `write(2)` target that partial-writes on demand with no privilege, no
+    // filesystem to fill, and no `RLIMIT_FSIZE` whose SIGXFSZ would take the test
+    // process with it. `written` is then *measured* at the far end rather than
+    // assumed — the writer's `File` is the only remaining sender, so the peer reads
+    // to EOF exactly what the socket took.
+    #[test]
+    fn a_partial_write_charges_only_the_unwritten_remainder() {
+        use std::io::Read;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let tmp = unique_dir("log1-partial");
+        let (sink, mut peer) = UnixStream::pair().expect("socketpair");
+        sink.set_nonblocking(true).expect("non-blocking sink");
+
+        // Comfortably past any plausible socket buffer, so the first `write(2)` stores
+        // a prefix and the retry gets EWOULDBLOCK.
+        let produced = 4 * 1024 * 1024_u64;
+        let mut queue = test_queue(OverflowPolicy::DropOldest);
+        assert!(enqueue(
+            &mut queue,
+            Chunk::from(vec![0x5a_u8; produced as usize])
+        ));
+
+        let shared = Shared {
+            q: Mutex::new(queue),
+            cv: Condvar::new(),
+        };
+        writer_loop(
+            &shared,
+            tmp.clone(),
+            "sock".to_owned(),
+            3,
+            File::from(OwnedFd::from(sink)),
+        );
+
+        let mut drained = Vec::new();
+        peer.read_to_end(&mut drained).expect("drain the peer");
+        let written = drained.len() as u64;
+
+        let q = shared.q.lock().unwrap();
+        if written == 0 || written == produced {
+            eprintln!(
+                "SKIP a_partial_write_charges_only_the_unwritten_remainder: the socket \
+                 took {written} of {produced} bytes, so no partial write happened here"
+            );
+            drop(q);
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+        assert_eq!(
+            written + q.dropped_bytes,
+            produced,
+            "written ({written}) + dropped ({}) must equal produced ({produced}): the \
+             prefix the failing write already stored is not loss (LOG-1)",
+            q.dropped_bytes
+        );
+        assert_eq!(
+            q.write_errors, 1,
+            "one refusal, whatever the syscall count behind it"
+        );
+        assert!(
+            q.status.is_active(),
+            "drop-oldest is a sanctioned arm; a partial write must not fault the node"
+        );
+        drop(q);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // LOG-2: a directory the node can create in but not *list* (mode 0300) fails the
+    // §7.3 rotation scan while `open_append` succeeds. Reading that failure as "no
+    // rotations yet" reset the counter, and the next `rotate` renamed the live file
+    // onto `<name>.000` — `rename(2)` replaces without a word, so an already-rotated
+    // log was destroyed by the node that exists to keep it. The scan failure must
+    // fault instead, which is what `create`'s comment always claimed and what makes
+    // `rotate` refuse. Skipped where the mode does not bite (root, or a filesystem
+    // that ignores modes).
+    #[test]
+    fn an_unreadable_directory_faults_the_node_instead_of_resetting_the_counter() {
+        let tmp = unique_dir("log2-scan");
+        std::fs::write(tmp.join("app.log.000"), b"the rotated log").unwrap();
+        std::fs::write(tmp.join("app.log"), b"live").unwrap();
+        // Write + traverse, no list: create and rename work, `read_dir` does not.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::read_dir(&tmp).is_ok() {
+            eprintln!(
+                "SKIP an_unreadable_directory_faults_the_node_instead_of_resetting_the_counter: \
+                 an unlistable directory is still listable here"
+            );
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+
+        let mut node = LogNode::create(&log_config(&tmp, "app.log", OverflowPolicy::DropOldest));
+        let status = node.status();
+        assert!(
+            status.reason().is_some_and(|r| r.starts_with("scan ")),
+            "a scan that could not run must fault the node rather than pass for a \
+             fresh directory: {:?}",
+            status.reason()
+        );
+        assert!(
+            node.writer.is_none(),
+            "a scan-faulted node starts no writer"
+        );
+        // The operation that would do the damage is refused for as long as the fault
+        // stands, so no rename can reach the counter's blind spot (§7.3).
+        assert!(
+            node.rotate().is_err(),
+            "rotate must be refused while the rotation counter is unknown"
+        );
+        node.teardown();
+
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            std::fs::read(tmp.join("app.log.000")).unwrap(),
+            b"the rotated log",
+            "the newest rotation on disk must survive"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // LOG-3: the `overflow = "fault"` arm of a full queue, which had no test at any
+    // level — its reason string appeared nowhere outside the source. Three behaviors:
+    // the arriving chunk is dropped and counted rather than queued past the bound,
+    // the node faults naming the overflow, and — §15.27's recorded decline — a log
+    // faulted by overflow **keeps consuming** rather than wedging its pump.
+    #[test]
+    fn a_full_queue_under_fault_drops_counts_and_keeps_consuming() {
+        let mut q = test_queue(OverflowPolicy::Fault);
+        // Exactly at the bound: the last chunk that still fits, so anything after it
+        // takes the overflow arm whatever its size.
+        let head = QUEUE_CAP_BYTES;
+        assert!(enqueue(&mut q, Chunk::from(vec![0u8; head])));
+        assert!(
+            q.status.is_active(),
+            "a queue within the bound does not fault"
+        );
+
+        assert!(
+            !enqueue(&mut q, Chunk::from_static(b"overflowing")),
+            "a chunk past the bound must not be queued under the fault policy"
+        );
+        assert_eq!(
+            q.queued_bytes, head,
+            "the queue must not grow past the bound"
+        );
+        assert_eq!(q.dropped_bytes, 11, "the arriving chunk is counted as loss");
+        assert_eq!(
+            q.status.reason(),
+            Some("log queue overflow"),
+            "the fault must name the overflow"
+        );
+
+        // Keeps consuming: the next oversize chunk is dropped and counted too, and
+        // once the writer has drained the backlog the queue accepts bytes again. An
+        // overflow-faulted log goes on reporting its loss; it does not park the pump
+        // behind the bound.
+        assert!(!enqueue(&mut q, Chunk::from_static(b"more")));
+        assert_eq!(q.dropped_bytes, 15);
+        assert_eq!(q.queued_bytes, head, "the bound still holds");
+        q.items.clear();
+        q.queued_bytes = 0;
+        assert!(
+            enqueue(&mut q, Chunk::from_static(b"after")),
+            "a drained queue accepts bytes again; overflow faults, it does not wedge"
+        );
+        assert_eq!(q.dropped_bytes, 15, "and accepting is not loss");
+        assert_eq!(
+            q.status.reason(),
+            Some("log queue overflow"),
+            "the fault itself stands until the operator acts"
+        );
     }
 
     // LOGQ-1, the other return path: *any* rotation failure ends the writer under

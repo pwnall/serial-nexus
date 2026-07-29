@@ -8,14 +8,15 @@
 // token by hand: a credential this file can read is a credential a DOM-injection slip
 // can exfiltrate. The layout is the contract; this rendering iterates freely (§15.16).
 //
-// Scrollback beyond the daemon's replay ring lives here, in the browser (§11.9): each
-// console's hostward stream is folded by monotonic byte offset (§11.8) into a capped
-// history persisted in the Origin Private File System, keyed by the web origin, the
-// endpoint, and the daemon `instance` nonce — so a reload trims the ring overlap exactly
-// and a daemon restart starts fresh, the previous boot's records being swept once per
-// connection so "fresh" does not mean "forever" (§15.32's per-console cap is a cap on
-// what is *retained*, not on what accumulates). The splice/retention math is history.mjs
-// (unit tested); OPFS I/O is opfs.mjs; both degrade to memory-only where OPFS is absent.
+// Scrollback beyond the daemon's replay ring lives here, in the browser (§15.32): each
+// console's hostward stream is folded by the monotonic byte offset every `tap.data`
+// carries (§10) into a capped history persisted in the Origin Private File System, keyed
+// by the web origin, the endpoint, and the daemon `instance` nonce — so a reload trims
+// the ring overlap exactly and a daemon restart starts fresh, the previous boot's records
+// being swept once per connection so "fresh" does not mean "forever" (§15.32's per-console
+// cap is a cap on what is *retained*, not on what accumulates). The splice/retention math
+// is history.mjs (unit tested); OPFS I/O is opfs.mjs; both degrade to memory-only where
+// OPFS is absent.
 //
 // What reaches the *screen* is a bounded window onto that log, not the log: the rendered
 // scrollback is capped (review HIST-2 — an unbounded `<pre>` does not merely grow, it
@@ -54,6 +55,7 @@ const termEl = document.getElementById("term");
 const titleEl = document.getElementById("pane-title");
 const lockEl = document.getElementById("pane-lock");
 const dropsEl = document.getElementById("pane-drops");
+const unknownEl = document.getElementById("pane-unknown");
 const storageEl = document.getElementById("pane-storage");
 const exportBtn = document.getElementById("exportbtn");
 const clearBtn = document.getElementById("clearbtn");
@@ -70,10 +72,13 @@ const pending = new Map();          // id -> resolve
 const pendingFull = new Set();      // ids whose caller wants the whole envelope
 let selected = null;                // selected endpoint display
 let currentTap = null;              // active tap id
+/// The endpoint's producer→hub loss at the moment `currentTap` was opened — adopted with
+/// it, and meaningless without it (§10, TAP-1b). See `updateHead`.
+let feedBaseline = 0;
 let lastState = { nodes: [], taps: [] };
 let decoder = new TextDecoder("utf-8", { fatal: false });
 
-let instanceNonce = null;           // daemon per-boot nonce (§11.8); history reset key
+let instanceNonce = null;           // daemon per-boot nonce (§10 `info`); history reset key
 let opfsOk = opfsAvailable();       // false → memory-only fallback
 let persistStatus = "unavailable";  // persisted | best-effort | unavailable
 let storageError = null;            // last persistence failure, shown in the badge
@@ -394,8 +399,16 @@ function updateHead() {
   const ep = endpointsFromState(lastState).find((e) => e.display === selected);
   lockEl.textContent = ep && ep.lock && ep.lock.holder ? `locked by ${ep.lock.holder}` : "";
   const tap = (lastState.taps || []).find((t) => t.tap === currentTap);
-  const dropped = tap ? (tap.dropped || 0) + (tap.feed_dropped || 0) : 0;
+  // §17: "the tab's own tap drop counter is shown when nonzero". `state` reports the
+  // endpoint hub's *lifetime* producer→hub loss, so adding it raw charged every later tab
+  // for everything the endpoint had ever lost — including bytes that went missing before
+  // the tab existed (37-WEBC-4). `tap.open` answers with that figure precisely so a client
+  // can separate the two, and the difference is what this tap was actually told about
+  // through `gap_before`. Clamped, because a hub rebuilt beneath us restarts its counter.
+  const feedSinceOpen = tap ? Math.max(0, (tap.feed_dropped || 0) - feedBaseline) : 0;
+  const dropped = tap ? (tap.dropped || 0) + feedSinceOpen : 0;
   dropsEl.textContent = dropped > 0 ? `⚠ ${dropped} tap bytes dropped` : "";
+  renderUnknownBadge();
   // The send box follows the *tap*, not merely the selection. An endpoint whose tap the
   // daemon retired (`tap.closed`), or that the grace timer released while nobody was
   // watching, is not somewhere a line can be typed with any confidence (WEBUI-1,
@@ -434,6 +447,32 @@ function keyFor(display) {
   return `${location.host}::${display}::${instanceNonce ?? "unknown"}`;
 }
 
+// ---- the in-flight selection, named rather than inferred (review 37-WEBC-1/2/6) -----
+//
+// A selection tears the previous console's state down synchronously and adopts the new
+// console's over three awaits. Everything that could run in those gaps used to read the
+// torn-down state as "nothing is happening on this pane": the grace timer's resume saw
+// `currentTap === null` and opened a second tap in the same generation, leaking the first
+// daemon-side for the page's life (37-WEBC-2); the clear button saw `historyKey === null`
+// and deleted nothing, while the resuming selection re-rendered — and, at its next flush,
+// re-wrote — the record the operator had just confirmed destroying (37-WEBC-1). Those
+// nulls are legitimate *inside* this window and only inside it, so the window gets a name
+// instead of being inferred from them.
+//
+// A depth rather than a flag: two rapid clicks put two continuations in flight, and a
+// boolean the first one cleared would open the window under the second.
+let selectionDepth = 0;
+
+function selectionInFlight() {
+  return selectionDepth > 0;
+}
+
+/// Bumped by every confirmed clear, with the key it destroyed. A selection parked on an
+/// await compares the counter it captured on entry, which is how it learns that the
+/// record it is holding is one the operator has already thrown away (37-WEBC-1).
+let clearSeq = 0;
+let clearedKey = null;
+
 // Selecting a console spans three awaits, and clicks do not queue: a second click can
 // land in any of the gaps. A generation counter captured at entry and re-checked after
 // every await makes a superseded continuation abandon its work — otherwise the loser
@@ -447,6 +486,20 @@ function keyFor(display) {
 // console's record and the next selection declared a false restart (HIST-4).
 async function selectConsole(display) {
   const gen = ++selectGen;
+  // Captured before the first await, so a clear confirmed anywhere in this continuation —
+  // including while the dialog held the renderer — is visible to the restore below.
+  const clearAt = clearSeq;
+  selectionDepth += 1;
+  try {
+    await adoptConsole(display, gen, clearAt);
+  } finally {
+    // In `finally`, because every early return here is a *superseded* selection: leaving
+    // the window open would freeze the pane's resume path for the rest of the session.
+    selectionDepth -= 1;
+  }
+}
+
+async function adoptConsole(display, gen, clearAt) {
   flushSave();                       // persist the outgoing console under its own key
 
   // Drop everything the previous console owned, synchronously. Clearing `currentTap`
@@ -470,8 +523,23 @@ async function selectConsole(display) {
   // the ring's overlap and the terminal shows history-then-ring-then-live contiguously.
   const key = keyFor(display);
   let stored = null;
-  if (opfsOk) { try { stored = await load(key); } catch { stored = null; } }
+  if (opfsOk) {
+    // Read *through* the saver's queue rather than past it. `flushSave` above may have
+    // just enqueued a snapshot for this very key — re-selecting the console that is
+    // already selected is an ordinary click — and `load` goes straight to storage, so the
+    // restore could return the record that snapshot is about to replace and come back
+    // with a frontier lagging the stream by a debounce window, which a talkative console
+    // then reads as a ring gap that never happened (37-WEBC-6).
+    await saver.settled(key);
+    if (gen !== selectGen) return;
+    try { stored = await load(key); } catch { stored = null; }
+  }
   if (gen !== selectGen) return;
+  // The operator confirmed a clear for this console while this continuation was parked
+  // (`confirm` blocks the renderer, so the window cannot close itself): the record is
+  // deleted, and restoring the copy in hand would put it back on screen and, at the next
+  // flush, back in storage (37-WEBC-1).
+  if (clearSeq !== clearAt && clearedKey === key) stored = null;
 
   historyKey = key;
   history = stored
@@ -504,6 +572,19 @@ async function selectConsole(display) {
 // selection passes whether storage supplied one, a resume passes whether the console has
 // been streaming.
 async function openTapAndAnchor(display, gen, hadBytes) {
+  // The open is part of the in-flight-selection window: until the reply lands
+  // `currentTap` is null, and anything that reads that as "this console has no tap" —
+  // the grace timer's resume, above all — would start a second open in the same
+  // generation, whose loser then streams to nobody for the page's life (37-WEBC-2).
+  selectionDepth += 1;
+  try {
+    await openTap(display, gen, hadBytes);
+  } finally {
+    selectionDepth -= 1;
+  }
+}
+
+async function openTap(display, gen, hadBytes) {
   const res = await rpc("tap.open", { endpoint: display, replay: true });
   if (gen !== selectGen) {
     // A newer selection won while this open was in flight: close the tap we just
@@ -513,6 +594,11 @@ async function openTapAndAnchor(display, gen, hadBytes) {
   }
   if (!res) return;
   currentTap = res.tap;
+  // Adopted with the tap, in the same synchronous step: the endpoint's producer→hub loss
+  // as of this open is the baseline the badge measures this tab's own drops against
+  // (37-WEBC-4, `updateHead`). A hub that never lost anything reports zero, which is the
+  // ordinary case and costs the subtraction nothing.
+  feedBaseline = res.feed_dropped ?? 0;
   const epoch = res.epoch ?? 0;
   // `history.epoch` still holds what storage said — it was adopted with the key and
   // the buffer — so this comparison has to happen before the live epoch is written in.
@@ -559,7 +645,6 @@ async function openTapAndAnchor(display, gen, hadBytes) {
 // editor page, which hides the console pane as a unit while its tap keeps streaming with
 // no console on screen at all.
 let tapGraceTimer = null;
-let resuming = false;
 
 function consoleIsWatched() {
   return view === "console" && !document.hidden;
@@ -595,15 +680,16 @@ async function suspendTap() {
 // Re-attach through the same splice path a selection uses, so §15.38's epoch re-anchor
 // and HIST-1's loss marker both still apply to what the grace interval cost.
 async function resumeTap() {
-  if (resuming || !selected || currentTap !== null || !history) return;
-  resuming = true;
-  try {
-    const gen = selectGen;   // not a new selection: a real one supersedes this resume
-    await openTapAndAnchor(selected, gen, history.frontier !== null);
-    if (gen === selectGen) renderConsoles();
-  } finally {
-    resuming = false;
-  }
+  // `currentTap === null` plus a non-null `history` was the whole guard, and both hold
+  // *inside* a selection — which is how a view switch or a tab unhide landed a second
+  // `tap.open` in the same generation (37-WEBC-2). The in-flight window also covers this
+  // function's own re-entry, since it is the only thing that starts an open outside a
+  // selection. A flip ignored here is deferred rather than lost: `openTapAndAnchor` ends
+  // by re-reading the watch state.
+  if (selectionInFlight() || !selected || currentTap !== null || !history) return;
+  const gen = selectGen;   // not a new selection: a real one supersedes this resume
+  await openTapAndAnchor(selected, gen, history.frontier !== null);
+  if (gen === selectGen) renderConsoles();
 }
 
 function onTapData(params) {
@@ -620,7 +706,7 @@ function onTapData(params) {
   // The other hole: a chunk that starts past the frontier. `splice` counts it — and
   // until HIST-1 nothing ever read that counter, so the only hole the console did not
   // announce was the one it had measured itself. The live case is not reachable through
-  // the daemon's own paths today (§11.8 keeps the delivered-bytes space contiguous and
+  // the daemon's own paths today (§10 keeps the delivered-bytes space contiguous and
   // reports feed loss as `gap_before` instead), which is precisely why it needs saying
   // out loud if it ever happens rather than being spliced over.
   const droppedBefore = history.dropped;
@@ -714,6 +800,27 @@ function resetTerminal() {
   pendingRuns = [];
   pendingLen = 0;
   pendingCol = 0;
+  renderUnknownBadge();   // the tally belongs to the parser, and that is a fresh one
+}
+
+// §17 sanctions consuming every CSI, OSC, DCS and ESC sequence outside the subset, "the
+// counter being §5's honesty applied to the one surface where the operator cannot
+// otherwise see what was thrown away" — which it is only if the counter is *shown*. It
+// was computed at eighteen sites in ansi.mjs and read by nothing (37-WEBC-5), the same
+// shape as HIST-1's measured-but-unread hole. It sits beside the drop badge because the
+// two answer one question about different losses: bytes the daemon could not deliver, and
+// sequences this renderer does not speak.
+//
+// The last rendered value is kept so an ordinary chunk costs a comparison rather than a
+// DOM write: the writer already forces one synchronous layout per chunk (HIST-2), and a
+// second one for a counter that did not move is exactly the cost that measurement was
+// about.
+let unknownShown = -1;
+function renderUnknownBadge() {
+  const n = ansi ? ansi.unknown : 0;
+  if (n === unknownShown) return;
+  unknownShown = n;
+  unknownEl.textContent = n > 0 ? `⚑ ${n} escape sequences not rendered` : "";
 }
 
 // Insert one immutable node ahead of the pending line, then drop the oldest until the
@@ -873,6 +980,7 @@ function writeTerminal(s) {
   blockChars = 0;
   if (chars > 0) commitNode(node, chars);
   renderPending();
+  renderUnknownBadge();
   if (atBottom) termEl.scrollTop = termEl.scrollHeight;
 }
 
@@ -920,16 +1028,28 @@ clearBtn.onclick = () => {
   // to destroy (HISTC-2). Cancel the debounce and detach the buffer *first*, then ask
   // for the delete.
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  // The key comes from the *selection*, not from `historyKey`. A selection in flight has
+  // already nulled `historyKey` and re-adopts it only after its awaits — and `confirm`
+  // parks that continuation for exactly as long as the dialog is up, so the window cannot
+  // close itself while the operator is looking at it. Guarding the delete on `historyKey`
+  // therefore made a clear confirmed in that window delete nothing at all, while the
+  // resuming selection put the record back on screen (37-WEBC-1). `keyFor` is what that
+  // selection will adopt, so this is the same record either way.
+  const key = historyKey ?? keyFor(selected);
+  clearSeq += 1;
+  clearedKey = key;
   // Keep the live frontier and the offset space so the ongoing stream is not
-  // re-duplicated after a clear.
-  const frontier = history ? history.frontier : null;
-  const epoch = history ? history.epoch : null;
-  history = fromStored(new Uint8Array(0), frontier ?? 0, epoch);
+  // re-duplicated after a clear. A selection in flight owns `history` — key and buffer are
+  // adopted in one step — so leave it alone rather than handing it a buffer keyed to
+  // nothing; it reads `clearSeq` and starts empty.
+  if (history) {
+    history = fromStored(new Uint8Array(0), history.frontier ?? 0, history.epoch);
+  }
   resetTerminal();
   appendMarker("— history cleared —\n");
   // Through the saver, so the delete is ordered after a write that is already inside
   // `createWritable()` instead of racing it.
-  if (opfsOk && historyKey) saver.remove(historyKey);
+  if (opfsOk) saver.remove(key);
 };
 
 // Persist a final snapshot when the tab is hidden or closed (a reload otherwise loses the

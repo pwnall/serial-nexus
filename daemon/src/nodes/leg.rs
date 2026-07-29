@@ -296,8 +296,10 @@ struct LegShared {
     disconnect: Notify,
     /// Incremented alongside every `disconnect` pulse. Because `notify_waiters`
     /// stores no permit, a channel task blocked in a backpressured local write
-    /// misses the pulse; it snapshots this counter before the write and re-reads it
-    /// after, releasing the lock promptly when it changed (§7.1, LEG-4).
+    /// misses the pulse; it compares this counter against the one its chunk was
+    /// *enqueued* under, releasing the lock promptly when it changed (§7.1, LEG-4)
+    /// and purging the chunk when the connection that delivered it is the one that
+    /// went away (§6, 37-LEG-1 — see [`Inbound`]).
     disconnect_epoch: Cell<u64>,
 }
 
@@ -395,7 +397,16 @@ impl LegNode {
         // onto the wire. faces=host: the arbitrated targetward stream (host writers
         // → wire). faces=target: the local hostward stream (device → wire).
         let mut send_receivers: Vec<SendReceiver> = Vec::new();
-        let stat_for = |ch: &str| self.stats.get(ch).cloned().unwrap_or_default();
+        // Infallible by construction — `create` keys `stats` off the very `channels`
+        // this loop walks — and a fallback default here would be worse than a panic:
+        // the orphan stat it minted would count bytes `state_extra` never reads,
+        // turning a broken invariant into a silent accounting gap (37-LEG-5).
+        let stat_for = |ch: &str| {
+            self.stats
+                .get(ch)
+                .cloned()
+                .expect("stats is keyed by self.channels")
+        };
         // How the pump routes decoded wire events back into the local graph.
         let recv_route: RecvRoute = match self.faces {
             Facing::Host => {
@@ -416,7 +427,7 @@ impl LegNode {
                 RecvRoute::Host { sinks, feeds }
             }
             Facing::Target => {
-                let mut inbound_txs: HashMap<String, mpsc::Sender<Chunk>> = HashMap::new();
+                let mut inbound_txs: HashMap<String, mpsc::Sender<Inbound>> = HashMap::new();
                 for ch in &self.channels {
                     let addr = EndpointAddr::channel(&self.name, ch);
                     // The local hostward stream reaches the wire pump through a
@@ -457,9 +468,9 @@ impl LegNode {
                         .target_edges
                         .remove(&addr)
                         .unwrap_or_else(crate::runtime::TargetEdge::new);
-                    let (inbound_tx, inbound_rx) = mpsc::channel::<Chunk>(CHANNEL_CAP);
+                    let (inbound_tx, inbound_rx) = mpsc::channel::<Inbound>(CHANNEL_CAP);
                     inbound_txs.insert(ch.clone(), inbound_tx);
-                    let stat = self.stats.get(ch).cloned().unwrap_or_default();
+                    let stat = stat_for(ch);
                     let idle = Duration::from_millis(self.idle_release_ms);
                     self.tasks.push(tokio::task::spawn_local(channel_targetward(
                         inbound_rx,
@@ -633,7 +644,26 @@ enum RecvRoute {
         feeds: HashMap<String, TapFeed>,
     },
     /// faces=target: hand each channel's targetward data to its per-channel task.
-    Target(HashMap<String, mpsc::Sender<Chunk>>),
+    Target(HashMap<String, mpsc::Sender<Inbound>>),
+}
+
+/// One wire-arriving targetward chunk, tagged with the connection that delivered it.
+///
+/// The tag is [`LegShared::disconnect_epoch`] read at **enqueue**, on the pump's read
+/// half, because that is the only moment at which the chunk's provenance is known.
+/// Reading it after `rx.recv()` returns instead attributes the chunk to whichever
+/// connection is live when [`channel_targetward`] is next polled, and a peer whose
+/// last data frames and FIN are readable together — one that sends its commands and
+/// disconnects in one breath — is enqueued, EOF'd and epoch-bumped inside a single
+/// poll of the supervise task. Every queued chunk then snapshotted the *post*-bump
+/// epoch, both purge checks compared equal, and the dead connection's whole backlog
+/// fired into the device the §6 purge exists to protect (37-LEG-1). Provenance
+/// carried with the chunk is decidable whenever the channel task gets round to it.
+struct Inbound {
+    /// The disconnect epoch current when the pump enqueued this chunk. A tag that
+    /// differs from the live epoch means the connection that delivered it is gone.
+    epoch: u64,
+    bytes: Chunk,
 }
 
 struct SuperviseArgs {
@@ -663,37 +693,60 @@ enum PumpEnd {
 /// receivers, the recv route, and the per-channel targetward tasks persist across
 /// reconnects; only the socket and the pump are per-connection.
 async fn supervise(mut a: SuperviseArgs) {
-    // The listen role binds once and accepts successive peers; the connect role
-    // dials with backoff.
-    let listener = match a.role {
-        LegRole::Listen => match bind_listener(a.transport, &a.address).await {
-            Ok(l) => {
-                // Record the inode this node actually created, so teardown unlinks
-                // its own artifact and nothing else (SEC-8).
-                if a.transport == Transport::Unix {
-                    let path = a.address.clone();
-                    a.shared.bound_unix_path.with_mut(|p| *p = Some(path));
-                }
-                Some(l)
-            }
-            Err(e) => {
-                set_status(
-                    &a.shared,
-                    NodeStatus::Faulted {
-                        reason: format!("bind {:?}: {e}", a.address),
-                    },
-                );
-                return; // a bind failure does not self-heal
-            }
-        },
-        LegRole::Connect => None,
-    };
-
-    // Exponential reconnect backoff (§7.4), reset on a good connection.
+    // Exponential reconnect backoff (§7.4), reset on a good connection. The listen
+    // role's bind shares the schedule with the connect role's dial: both are the same
+    // environmental retry.
     let mut backoff = boundary::Backoff::exponential(a.reconnect_initial_ms, a.reconnect_max_ms);
     let mut connected_before = false;
+    // The listen role's socket, taken on the first successful bind and then kept for
+    // every peer after it. `None` for the connect role, which dials instead.
+    let mut listener: Option<Listener> = None;
 
     loop {
+        // Bind (listen role) — *inside* the retry loop, because a bind fails for the
+        // same environmental reasons a dial does: an address whose interface is not up
+        // yet, a port a departing process still holds, a descriptor table momentarily
+        // exhausted. §11 says environmental failures leave nodes "visible in state,
+        // healing on their own", generalized to every boundary type by §15.8, and a
+        // one-shot bind made this the daemon's one fault that could only be cleared by
+        // remove-and-re-add (37-LEG-2). The SEC-8 stale-socket check re-runs on every
+        // attempt with it, which is what makes the common case — a predecessor's inode
+        // outliving the peer that was still answering on it — heal at all.
+        if a.role == LegRole::Listen && listener.is_none() {
+            match bind_listener(a.transport, &a.address).await {
+                Ok(l) => {
+                    // Record the inode this node actually created, so teardown unlinks
+                    // its own artifact and nothing else (SEC-8).
+                    if a.transport == Transport::Unix {
+                        let path = a.address.clone();
+                        a.shared.bound_unix_path.with_mut(|p| *p = Some(path));
+                    }
+                    listener = Some(l);
+                    // A leg that is listening is waiting for a peer, not faulted. On
+                    // the first bind this is the status the node already carries, so
+                    // `NodeState::set` leaves the stamp alone (STATE-1); after a
+                    // refused bind it is the transition an operator watches for — a
+                    // heal nobody can observe is not one (§7).
+                    set_status(
+                        &a.shared,
+                        NodeStatus::Waiting {
+                            reason: "no peer connected yet".to_owned(),
+                        },
+                    );
+                }
+                Err(e) => {
+                    set_status(
+                        &a.shared,
+                        NodeStatus::Faulted {
+                            reason: format!("bind {:?}: {e}", a.address),
+                        },
+                    );
+                    backoff.sleep().await;
+                    continue;
+                }
+            }
+        }
+
         // Establish a connection.
         let established = match &listener {
             Some(l) => l.accept().await.map(|(s, addr)| (s, Some(addr))),
@@ -1099,10 +1152,18 @@ async fn route_recv(
                     // The per-channel task counts accepted_targetward once the local
                     // device-write handoff accepts; here we just backpressure.
                     Some(tx) => {
+                        // Tag the chunk with the connection delivering it (37-LEG-1):
+                        // this is the last moment that fact is knowable, and the read
+                        // half of a connection that is about to end is still *this*
+                        // connection.
+                        let inbound = Inbound {
+                            epoch: shared.disconnect_epoch.get(),
+                            bytes,
+                        };
                         // A closed queue means this channel's writer task is gone
                         // (torn down). The bytes are lost either way; §5 wants the
                         // loss counted where it happens rather than swallowed.
-                        if tx.send(bytes).await.is_err()
+                        if tx.send(inbound).await.is_err()
                             && let Some(s) = stat
                         {
                             s.discarded_targetward.add(n);
@@ -1179,8 +1240,19 @@ fn note_undeliverable(
 /// stale ones, and the memory is freed for the duration of the outage. Every drop
 /// here is counted into `purged_on_reconnect`, the same counter the sending side
 /// reports.
+///
+/// **Per chunk, not per moment (37-LEG-1).** Which chunks are outage-era is decided
+/// from the tag each one carries out of [`Inbound`], never from when this task
+/// happened to dequeue it — the sending side's `drain_to_quiescence` approximates
+/// provenance by time because a local backlog has no other record of it, and this
+/// queue does. Two consequences worth stating: the whole backlog is discarded one
+/// attributed chunk per loop turn rather than in one drain, and a chunk a *live*
+/// connection put in the queue behind stale ones is delivered rather than swept up
+/// with them. A chunk the pump is suspended mid-`send` on — §6's named case — carries
+/// the tag it was stamped with before the suspension, so it is attributed correctly
+/// whichever side of the disconnect it lands on.
 async fn channel_targetward(
-    mut rx: mpsc::Receiver<Chunk>,
+    mut rx: mpsc::Receiver<Inbound>,
     edge: SharedTargetEdge,
     idle: Duration,
     stat: Rc<ChannelStat>,
@@ -1220,10 +1292,10 @@ async fn channel_targetward(
             // a whole cross-machine link because one local endpoint was detached is
             // worse than counting, and §7.4 already treats data for a channel with no
             // local endpoint as counted loss ("announced but unbound").
-            let Some(bytes) = rx.recv().await else {
+            let Some(inbound) = rx.recv().await else {
                 break; // source closed (torn down)
             };
-            stat.discarded_targetward.add(bytes.len() as u64);
+            stat.discarded_targetward.add(inbound.bytes.len() as u64);
             continue;
         };
         let msg = if holding.is_some() {
@@ -1235,12 +1307,11 @@ async fn channel_targetward(
                     continue;
                 }
                 // The peer dropped: yield the local endpoint's floor now, so a local
-                // operator is not blocked behind a vanished remote (§7.1), and drop
-                // whatever the dead connection left queued (§6, LEG-3). `select!`
-                // may take this arm even with a chunk already queued, so the drain
-                // belongs here and not only on the blocked paths below.
+                // operator is not blocked behind a vanished remote (§7.1). What the
+                // dead connection left queued is discarded as the loop dequeues it —
+                // every chunk names the connection that delivered it (§6, LEG-3,
+                // 37-LEG-1), so nothing here has to be swept up on a deadline.
                 _ = shared.disconnect.notified() => {
-                    purge_inbound(purging, &mut rx, 0, &stat).await;
                     release(&lock, id);
                     holding = None;
                     continue;
@@ -1249,17 +1320,22 @@ async fn channel_targetward(
         } else {
             rx.recv().await
         };
-        let Some(bytes) = msg else {
+        let Some(Inbound { epoch, bytes }) = msg else {
             break; // source closed (torn down)
         };
         let n = bytes.len() as u64;
-        // Snapshot the disconnect epoch before the two blocking awaits below. The
-        // `disconnect` pulse (a `Notify`) stores no permit, so a drop landing while
-        // this task is parked in `ensure_acquired`/`tx.send` — outside the `holding`
-        // select — is missed; re-reading the epoch after the write recovers it, so
-        // the §7.1 disconnect-release stays prompt instead of degrading to the idle
-        // timer (LEG-4).
-        let epoch = shared.disconnect_epoch.get();
+        // The connection that delivered this chunk is already gone: it is outage-era
+        // stale before it was ever considered, whether the pulse that ended it was
+        // observable from here or not (§6, 37-LEG-1). The check leads the acquire so a
+        // dead peer's backlog is never made to queue for a contended local floor
+        // first, and takes the floor back if this task still holds it (§7.1).
+        if purging && shared.disconnect_epoch.get() != epoch {
+            stat.purged_on_reconnect.add(n);
+            if let Some((old_lock, old_id)) = holding.take() {
+                release(&old_lock, old_id);
+            }
+            continue;
+        }
         if !ensure_acquired(&lock, id).await {
             // Endpoint torn down (or this origin cannot write). Same reasoning as the
             // send-error arm below: count and keep the task, because a later `connect`
@@ -1271,9 +1347,9 @@ async fn channel_targetward(
         holding = Some((lock.clone(), id));
         // The peer vanished while this chunk queued for a contended local lock: it is
         // outage-era stale before it was ever written, so purge it here rather than
-        // acquiring the floor and firing it (§6, LEG-3).
+        // firing it from the floor we just took (§6, LEG-3).
         if purging && shared.disconnect_epoch.get() != epoch {
-            purge_inbound(purging, &mut rx, n, &stat).await;
+            stat.purged_on_reconnect.add(n);
             release(&lock, id);
             holding = None;
             continue;
@@ -1308,7 +1384,10 @@ async fn channel_targetward(
                 continue;
             }
             None => {
-                purge_inbound(purging, &mut rx, n, &stat).await;
+                // The write was cancelled by the disconnect, and `Sender::send` is
+                // cancel-safe: this chunk was *not* handed to the graph, so the purge
+                // count is exact (§6, LEG-3).
+                stat.purged_on_reconnect.add(n);
                 release(&lock, id);
                 holding = None;
                 continue;
@@ -1316,39 +1395,15 @@ async fn channel_targetward(
         }
         // The chunk is delivered (no targetward drop, §5); if the peer vanished
         // while we acquired or wrote, yield the local floor now rather than holding
-        // it behind a vanished remote until the idle interval (§7.1, LEG-4), and
-        // drop the outage-era backlog behind it (§6, LEG-3).
+        // it behind a vanished remote until the idle interval (§7.1, LEG-4). The
+        // outage-era backlog behind it is discarded per chunk as the loop reaches it.
         if shared.disconnect_epoch.get() != epoch {
-            purge_inbound(purging, &mut rx, 0, &stat).await;
             release(&lock, id);
             holding = None;
         }
     }
     if let Some((lock, id)) = holding {
         release(&lock, id);
-    }
-}
-
-/// Drop this channel's outage-era targetward backlog, counting `in_flight` (the
-/// bytes of a chunk already taken from the queue and abandoned) along with it.
-///
-/// Draining runs to *quiescence* through the same shared helper the serial node and
-/// the leg's sending side use, so §6's "including a chunk held by a producer
-/// suspended mid-send" is honoured identically in all three places (DM-2/LEG-1). A
-/// no-op when purge-on-reconnect is off — then the backlog is the operator's
-/// declared intent.
-async fn purge_inbound(
-    purging: bool,
-    rx: &mut mpsc::Receiver<Chunk>,
-    in_flight: u64,
-    stat: &Rc<ChannelStat>,
-) {
-    if !purging {
-        return;
-    }
-    let purged = in_flight + boundary::drain_to_quiescence(rx).await;
-    if purged > 0 {
-        stat.purged_on_reconnect.add(purged);
     }
 }
 

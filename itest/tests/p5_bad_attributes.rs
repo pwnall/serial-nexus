@@ -70,6 +70,72 @@ attributes = { misspelled_option = true }
     );
 }
 
+// ---- (1b) An unknown key in the exec codec's attribute table is likewise structural ----
+
+/// 37-CODEC-2: §11's third review-hardened rule — *unknown configuration keys are
+/// refused naming the key, so a typo cannot silently become a default* — reaches the
+/// codec's opaque attribute table, which was the one door left open. A misspelled
+/// `restart_backoffms` used to load clean and quietly restore the 200 ms built-in,
+/// leaving an operator with a configuration whose stated backoff was not the one in
+/// force, visible in neither `dump` (which round-trips the key nothing reads) nor
+/// `state`. Structural, so it is refused with nothing created — the same atomicity
+/// the range check above already had, through the same `parse_attributes` door.
+#[test]
+fn unknown_exec_attribute_key_is_rejected_atomically() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+
+    let cfg = r#"
+[[node]]
+type = "codec"
+name = "mux"
+codec = "exec"
+faces = "target"
+channels = ["c0"]
+[node.attributes]
+argv = ["/bin/cat"]
+restart_backoffms = 150
+"#;
+    let err = rpc
+        .load_toml(cfg, false)
+        .expect_err("a misspelled exec attribute should have failed the load");
+
+    assert_eq!(
+        err.code, STRUCTURAL,
+        "unknown-key rejection was not a structural error: {err:?}"
+    );
+    assert!(
+        err.message.contains("restart_backoffms"),
+        "the rejection must name the offending key, which is the whole point: {:?}",
+        err.message
+    );
+    assert_eq!(
+        node_count(rpc),
+        0,
+        "a rejected load created nodes (must be atomic, nothing created): {:?}",
+        rpc.state()
+    );
+
+    // The correctly-spelled table still loads through the same door, so the gate is
+    // the typo and not exec attribute tables in general. `/bin/cat` is a legal argv
+    // whether or not it speaks the envelope: a child that misbehaves is a *runtime*
+    // fault (§7.6), never a load failure.
+    let good = r#"
+[[node]]
+type = "codec"
+name = "mux"
+codec = "exec"
+faces = "target"
+channels = ["c0"]
+[node.attributes]
+argv = ["/bin/cat"]
+restart_backoff_ms = 150
+"#;
+    rpc.load_toml(good, false)
+        .expect("a correctly-spelled exec attribute table must still load");
+    assert!(rpc.node("mux").is_some(), "the good config created no node");
+}
+
 // ---- (2) An unknown codec name is likewise structural; nothing created ----
 
 #[test]

@@ -172,7 +172,8 @@ fn crossover_rig_data_plane_send_and_exclusivity() {
     let Some((p0, p1)) = crossover_ports() else {
         eprintln!(
             "SKIP crossover_rig_data_plane_send_and_exclusivity: no crossover rig \
-             (attach two cross-wired cu.usbserial adapters, or set SNX_CROSSOVER_A/_B)"
+             (set SNX_CROSSOVER_A/_B to the two ports; on macOS, attaching exactly two \
+              cross-wired cu.usbserial adapters is detected without them)"
         );
         return;
     };
@@ -230,7 +231,10 @@ fn crossover_rig_data_plane_send_and_exclusivity() {
 #[test]
 fn crossover_rig_custom_baud_byte_exact() {
     let Some((p0, p1)) = crossover_ports() else {
-        eprintln!("SKIP crossover_rig_custom_baud_byte_exact: no crossover rig");
+        eprintln!(
+            "SKIP crossover_rig_custom_baud_byte_exact: no crossover rig \
+             (set SNX_CROSSOVER_A/_B; the cu.usbserial scan is macOS-only)"
+        );
         return;
     };
     let _rig = rig_guard();
@@ -257,7 +261,10 @@ fn crossover_rig_custom_baud_byte_exact() {
 #[test]
 fn crossover_rig_signal_verbs() {
     let Some((p0, p1)) = crossover_ports() else {
-        eprintln!("SKIP crossover_rig_signal_verbs: no crossover rig");
+        eprintln!(
+            "SKIP crossover_rig_signal_verbs: no crossover rig \
+             (set SNX_CROSSOVER_A/_B; the cu.usbserial scan is macOS-only)"
+        );
         return;
     };
     let _rig = rig_guard();
@@ -340,7 +347,10 @@ fn crossover_rig_signal_verbs() {
 #[test]
 fn crossover_rig_map_node_both_directions() {
     let Some((p0, p1)) = crossover_ports() else {
-        eprintln!("SKIP crossover_rig_map_node_both_directions: no crossover rig");
+        eprintln!(
+            "SKIP crossover_rig_map_node_both_directions: no crossover rig \
+             (set SNX_CROSSOVER_A/_B; the cu.usbserial scan is macOS-only)"
+        );
         return;
     };
     let _rig = rig_guard();

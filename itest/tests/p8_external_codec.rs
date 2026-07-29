@@ -16,7 +16,9 @@
 //!    (`cargo test -p acme-codec --features conformance`).
 //! 2. The custom `acme-daemon` reports its own `acme` codec **alongside** the built-in
 //!    `reference` codec via the unchanged `info` RPC (§15.16) — the CLI / RPC surface
-//!    never bakes in the codec list.
+//!    never bakes in the codec list. The *whole* list is pinned as well, because the
+//!    template's README prints it as what an embedder should expect and a containment
+//!    check cannot see it drift (37-DOC-4).
 //! 3. A config naming `codec = "acme"` loads, and the resulting node's state carries
 //!    `codec == "acme"` (it comes up `waiting` — no attached mux upstream).
 //!
@@ -29,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use serial_nexus_itest::{Rpc, TempRun, wait_until};
 
 /// The excluded template workspace root (`examples/external-codec/`), derived from this
@@ -127,7 +129,8 @@ fn external_codec_template_builds_and_serves_acme_alongside_builtins() {
     );
 
     // Hand-managed lifecycle: a *different* binary from `serial-nexus-daemon`, with its own
-    // `--socket` flag (it derives `<socket>.state.toml` for the state file).
+    // `--socket` flag (it derives `<socket-stem>.state.toml` for the state file —
+    // the socket's *stem*, review 32 RV-6).
     let run = TempRun::new();
     let socket = run.socket();
     let daemon = KillOnDrop(
@@ -157,6 +160,19 @@ fn external_codec_template_builds_and_serves_acme_alongside_builtins() {
     assert!(
         codecs_contains(codecs, "reference"),
         "the built-in reference codec is missing from the custom daemon: {info}"
+    );
+    // The whole list, not just membership: `examples/external-codec/README.md` prints
+    // this exact array as what an embedder should expect, and the containment asserts
+    // above cannot catch it drifting. `exec` is in it without being a registry entry —
+    // it is a child-process boundary routed before the registry (§7.6/§15.22) whose
+    // name is reserved, and `info` answers "which names may a config use", so it
+    // unions the reserved names in (`Registry::usable_codec_names`). Omitting it is
+    // what the README did (review 37, 37-DOC-4).
+    assert_eq!(
+        codecs,
+        &json!(["acme", "exec", "reference"]),
+        "the custom daemon's info.codecs is not the list the template README prints \
+         (37-DOC-4): {info}"
     );
 
     // (3) A config naming the acme codec loads (it comes up waiting: no attached mux

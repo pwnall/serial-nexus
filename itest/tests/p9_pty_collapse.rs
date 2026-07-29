@@ -96,7 +96,7 @@ use serial_nexus_itest::{Daemon, Rpc, TempRun, wait_until};
 // does; what only they need is gated with them so the file stays warning-clean on
 // the platforms where the second test is a skip.
 #[cfg(target_os = "linux")]
-use serial_nexus_itest::bin;
+use serial_nexus_itest::{bin, cpu_ticks};
 #[cfg(target_os = "linux")]
 use std::process::Child;
 
@@ -233,22 +233,6 @@ impl Drop for KillOnDrop {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-/// `utime + stime` of `pid` in clock ticks, read from `/proc/<pid>/stat`. The
-/// two fields are 14 and 15 (1-based) *after* the parenthesised comm field, which
-/// may itself contain spaces — so the split starts past the last `)`.
-#[cfg(target_os = "linux")]
-fn cpu_ticks(pid: u32) -> u64 {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .unwrap_or_else(|e| panic!("read /proc/{pid}/stat: {e}"));
-    let tail = &stat[stat.rfind(')').expect("comm field is parenthesised") + 1..];
-    let fields: Vec<&str> = tail.split_whitespace().collect();
-    // `tail` starts at field 3 (state), so utime (14) and stime (15) are at
-    // indices 11 and 12.
-    let utime: u64 = fields[11].parse().expect("utime");
-    let stime: u64 = fields[12].parse().expect("stime");
-    utime + stime
 }
 
 #[test]

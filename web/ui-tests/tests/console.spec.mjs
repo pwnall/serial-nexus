@@ -63,6 +63,50 @@ function sendBytes(endpoint, line) {
   ctl("send", endpoint, "--line", line);
 }
 
+/** Record every frame the page's WebSocket sends, returning a reader for them.
+ *
+ * Installed before the page loads. It observes and forwards — nothing about what the
+ * client sends changes — and it answers the one question the DOM cannot: *what did the
+ * console ask the daemon for*. "The retry carried `steal: true`" is a claim about a
+ * request, and inferring it from a cleared input box is how a client that stole
+ * automatically would pass a test written about the input box. */
+async function recordSentFrames(page) {
+  await page.addInitScript(() => {
+    window.__snxSent = [];
+    const send = WebSocket.prototype.send;
+    WebSocket.prototype.send = function (data) {
+      if (typeof data === "string") window.__snxSent.push(data);
+      return send.call(this, data);
+    };
+  });
+  return async (method) =>
+    (await page.evaluate(() => window.__snxSent.map((f) => JSON.parse(f)))).filter(
+      (m) => !method || m.method === method,
+    );
+}
+
+/** Whether this browser profile holds a stored history record for `endpoint`.
+ *
+ * By filename rather than by content, because the record whose *absence* matters most is
+ * an empty one: a console that never emitted a byte still gets a record on the first
+ * flush, and "was it deleted?" is exactly as real a question for it. The key is built
+ * from the page's own `opfs.mjs`, so a change to the mapping cannot make this quietly
+ * answer "no" forever. */
+async function storedRecordExists(page, endpoint) {
+  const instance = ctl("info").instance;
+  return page.evaluate(async ([ep, inst]) => {
+    const { fileName } = await import("/opfs.mjs");
+    const name = fileName(`${location.host}::${ep}::${inst}`);
+    const root = await navigator.storage.getDirectory();
+    try {
+      await root.getFileHandle(name, { create: false });
+      return true;
+    } catch {
+      return false;
+    }
+  }, [endpoint, instance]);
+}
+
 /** Add a device-free `map` node to the running graph and return its name. A standalone
  * map is a host-facing endpoint with no upstream, so it appears in the rail as a console
  * and reports `waiting` — which makes it the cheapest honest subject for both the
@@ -237,6 +281,15 @@ test("the terminal renders SGR colour, a CR overwrite and an unknown CSI", async
   sendBytes(ECHO, `${tag}C \x1b[?25lTAIL`);
   await expect(term).toContainText(`${tag}C TAIL`);
   await expect(term).not.toContainText("25l");
+
+  // …and the operator is told it happened. §17 sanctions consuming those sequences only
+  // together with counting them — "the counter being §5's honesty applied to the one
+  // surface where the operator cannot otherwise see what was thrown away" — and a tally
+  // computed at eighteen sites and rendered nowhere is the silent half of that sentence,
+  // not the honest one (review 37-WEBC-5).
+  await expect(page.locator("#pane-unknown")).toHaveText(
+    /^⚑ [1-9][0-9]* escape sequences not rendered$/,
+  );
 });
 
 // Review WEBUI-1 (= WEB-1b), reproduced exactly as the verifier did it: remove the
@@ -331,6 +384,180 @@ test("the rail carries each console's node status and says why", async ({ page }
     ctl("remove-node", down, "--cascade");
     ctl("remove-node", up, "--cascade");
   }
+});
+
+// Review 37-WEBC-7. §17's send contract is one sentence — "a LOCKED refusal shows the
+// holder by name with an explicit steal affordance — never an automatic steal" — and the
+// only automated coverage it had was negative: WEBUI-1's spec asserts that a *non*-lock
+// refusal raises no dialog. Nothing at any layer drove the `-32003` branch itself, so the
+// holder naming, the decline path and the steal retry rested on a manual checklist.
+//
+// The subject is built rather than borrowed. A map's edge into its upstream endpoint is
+// `held` by default (§7.8), and a registered `held` origin denies acquisition to every
+// other writer even on a free lock (§6/§15.23) — so one lone map wired into another gives
+// a console whose `send` is refused with `AppError::Locked` by a holder the daemon can be
+// asked to name. Device-free, and it does not touch the fixture graph the sibling specs
+// assert against.
+test("a LOCKED send names the holder and steals only when the operator says so", async ({
+  page,
+}) => {
+  const stamp = Date.now().toString(36);
+  const endpoint = addLoneMap(`lk${stamp}c`);
+  const holderNode = addLoneMap(`lk${stamp}h`);
+  ctl("connect", endpoint, `${holderNode}/raw`);
+  try {
+    // The daemon's own answer to "who holds it", which is what the dialog has to say. Read
+    // from `state` rather than restated, so a spec that passes cannot be one that agrees
+    // with the client's guess.
+    const holder = (ctl("state").nodes || []).find((n) => n.name === endpoint)?.lock?.holder;
+    expect(
+      holder,
+      `${endpoint} is not locked, so this spec cannot exercise the LOCKED branch — the ` +
+        "map's raw edge is supposed to be `held` (§7.8)",
+    ).toBeTruthy();
+
+    const sentSends = await recordSentFrames(page);
+    const dialogs = [];
+    await open(page);
+    await selectConsole(page, endpoint);
+
+    // 1. Refused, and the refusal is *named*. WEBUI-1 was the console inventing a holder;
+    //    the other half of that finding is the console that has one and does not say it.
+    const line = token("locked");
+    page.once("dialog", (d) => {
+      dialogs.push(d.message());
+      d.dismiss();
+    });
+    await send(page, line);
+    await expect.poll(() => dialogs.length, { timeout: 30_000 }).toBe(1);
+    expect(dialogs[0]).toContain(holder);
+    expect(dialogs[0], "the dialog must offer the steal, not perform it").toMatch(/steal/i);
+
+    // 2. Declining puts the line back in the box. A refused line was never delivered, so
+    //    binning it costs the operator the typing and the knowledge that it did not land.
+    await expect(page.locator("#sendline")).toHaveValue(line);
+    expect(
+      (await sentSends("send")).filter((m) => m.params.steal),
+      "nothing may be stolen before the operator accepts — §17 forbids the automatic steal",
+    ).toEqual([]);
+
+    // 3. Accepting retries — with the steal flag, which is the whole difference between
+    //    the two attempts and therefore the only thing that can explain the second one
+    //    succeeding where the first was refused.
+    page.once("dialog", (d) => {
+      dialogs.push(d.message());
+      d.accept();
+    });
+    await page.locator("#sendbtn").click();
+    await expect.poll(() => dialogs.length, { timeout: 30_000 }).toBe(2);
+    await expect(page.locator("#sendline")).toHaveValue("");
+    await expect(page.locator("#term")).not.toContainText("steal refused");
+    const steals = (await sentSends("send")).filter((m) => m.params.steal);
+    expect(steals.length, "exactly one retry, carrying the steal the operator granted").toBe(1);
+    expect(steals[0].params.line).toBe(line);
+    expect(steals[0].params.endpoint).toBe(endpoint);
+  } finally {
+    ctl("remove-node", holderNode, "--cascade");
+    ctl("remove-node", endpoint, "--cascade");
+  }
+});
+
+// Review 37-WEBC-1. `clear` guarded its OPFS delete with `historyKey`, which a selection
+// nulls synchronously and re-adopts only after `tap.close` and the OPFS load — and
+// `confirm` blocks the renderer, so the dialog itself holds that continuation parked for
+// as long as the operator is looking at it. A clear confirmed there deleted nothing, and
+// the resuming selection then re-rendered the record the operator had just confirmed
+// destroying. §15.32's clear-vs-snapshot race, arriving through selection instead of the
+// debounce.
+//
+// The window is entered deterministically rather than raced for: both clicks are
+// dispatched from one synchronous evaluation, so the second lands while `selectConsole`
+// is parked on its first await, which is where the defect lives.
+test("a clear confirmed during an in-flight selection deletes the record and does not restore it", async ({
+  page,
+}) => {
+  await open(page);
+  // Two device-free consoles: `m` is the subject, `up` the console being switched away
+  // from — the outgoing tap is what gives the selection its first await.
+  await selectConsole(page, "m");
+  await selectConsole(page, "up");
+  // A "nothing is stored" assertion that passes because nothing was ever stored is worth
+  // nothing; the flush above is what puts `m`'s record on disk.
+  await expect
+    .poll(() => storedRecordExists(page, "m"), {
+      timeout: 20_000,
+      message: "`m`'s scrollback was never persisted, so this spec cannot test its removal",
+    })
+    .toBe(true);
+
+  page.once("dialog", (d) => d.accept());
+  await page.evaluate(() => {
+    const row = [...document.querySelectorAll("#consoles li")].find(
+      (li) => li.querySelector(".cname")?.textContent === "m",
+    );
+    row.click();          // `selectConsole` runs to its first await and parks
+    document.getElementById("clearbtn").click();   // …and `confirm` holds it there
+  });
+
+  const term = page.locator("#term");
+  // Wait for the resumed selection to finish before judging it. `— no history —` is what
+  // a console with nothing stored reports after `tap.open`; the unfixed client reaches
+  // this point holding the record it failed to delete and prints `— stored history —`
+  // instead, so this is the positive form of the same assertion.
+  await expect(term).toContainText("history cleared");
+  await expect(term).toContainText("no history (set replay_ring");
+  await expect(
+    term,
+    "the resumed selection restored a record the operator had confirmed destroying",
+  ).not.toContainText("stored history");
+  // …and the delete reached storage, which is the half `#term` cannot see: the guard that
+  // used to stand here skipped it entirely.
+  await expect
+    .poll(() => storedRecordExists(page, "m"), { timeout: 20_000 })
+    .toBe(false);
+});
+
+// Review 37-WEBC-2. While a selection's `tap.open` is in flight, `currentTap` is null and
+// `history` is set — which is precisely the state the grace timer's resume reads as "this
+// console has no tap, open one". A watch-state flip in that window (a view switch, a tab
+// unhide) therefore started a second open in the same generation; both succeeded, the
+// client kept the later id, and the earlier tap streamed to nobody for the rest of the
+// page's life, invisible to the grace-interval release that only ever closes the tap the
+// client remembers.
+//
+// The flip is driven from inside the window rather than sprayed at it: the page's own
+// `WebSocket.send` fires one `visibilitychange` at the moment the `tap.open` frame goes
+// out, which is synchronous with the client parking on its reply.
+test("a watch-state flip during tap.open does not leak a second tap", async ({ page }) => {
+  await page.addInitScript(() => {
+    const send = WebSocket.prototype.send;
+    let armed = true;
+    WebSocket.prototype.send = function (data) {
+      const out = send.call(this, data);
+      if (armed && typeof data === "string" && data.includes('"tap.open"')) {
+        armed = false;
+        // The event §17's lazy-tap clause listens on, delivered while the reply the
+        // client is waiting for has not arrived.
+        document.dispatchEvent(new Event("visibilitychange"));
+      }
+      return out;
+    };
+  });
+  const sent = await recordSentFrames(page);
+
+  await open(page);
+  await selectConsole(page, "m");
+
+  // The second open is issued *synchronously* from inside the first one's `send`, so by
+  // the time the selection has settled both frames would already have gone out: counting
+  // them needs no waiting and cannot be won by a poll that looked too early.
+  const opens = await sent("tap.open");
+  expect(
+    opens.length,
+    "the resume path opened a second tap inside the selection's own open window",
+  ).toBe(1);
+  // And the cost the leak is measured in, at the daemon: one endpoint, one tap.
+  expect(tapsOn("m"), "the daemon is feeding a tap this page no longer remembers").toBe(1);
 });
 
 // Tagged `@slow` and run in the nightly lane, not per push — the project's `#[ignore]`

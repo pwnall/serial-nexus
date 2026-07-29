@@ -59,7 +59,9 @@ struct ServeArgs {
     #[arg(long)]
     token: Option<String>,
     /// Extra Host header values to accept beyond localhost/127.0.0.1/[::1] (§15.29
-    /// off-loopback Host validation), e.g. a hostname used behind `--tls`.
+    /// off-loopback Host validation), e.g. a hostname used behind `--tls`. A port may
+    /// be written (`example.com:8443`) and is ignored: Host is checked by name, and the
+    /// port is checked by the Origin header against the request's own authority.
     #[arg(long = "host", value_name = "HOST")]
     hosts: Vec<String>,
 }
@@ -137,14 +139,16 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let socket = serial_nexus_web::resolve_socket(args.socket);
 
     // Host values accepted off loopback (DNS-rebinding defense, §15.29): always the
-    // localhost family, plus any operator-declared names.
+    // localhost family, plus any operator-declared names — normalized to the form the
+    // gate actually compares, so a value written with a port is not a dead entry
+    // (review 37-WEBS-2).
     let mut hosts: Vec<String> = vec![
         "localhost".into(),
         "127.0.0.1".into(),
         "[::1]".into(),
         "::1".into(),
     ];
-    hosts.extend(args.hosts);
+    hosts.extend(serial_nexus_web::normalize_hosts(&args.hosts)?);
 
     // Build the TLS config for the encrypted tier (§15.29), if requested. A default
     // cert/key path lives in the runtime dir when the operator names none.

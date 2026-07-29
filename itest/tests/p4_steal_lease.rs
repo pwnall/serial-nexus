@@ -2,7 +2,7 @@
 //! `scripts/validate/phase4/steal-lease.sh` (design §6 arbitration, §10
 //! notifications, §15.20 two-lane control plane).
 //!
-//! Four properties of the write lock:
+//! Six properties of the write lock:
 //!   1. `lock --steal` transfers the lock, records the theft in state, and emits an
 //!      IMMEDIATE id-less `lock` notification (event-driven, distinct from the 200 ms
 //!      periodic `state` snapshot).
@@ -10,6 +10,11 @@
 //!   3. a stale lease timer NEVER fires across grants: unlock, re-lock (lease-free),
 //!      let the old timer elapse — the new grant survives (generation-guarded, §6).
 //!   4. re-arming a lease EXTENDS it: the earlier, shorter timer is invalidated.
+//!   5. a `send --steal`'s theft is recorded too, and survives its transient origin's
+//!      departure — §6's promise is about the *steal*, not about the stealer being
+//!      still around to be asked (37-LOCK-3).
+//!   6. `--lease-ms` is range-checked before the grant, like every other daemon-side
+//!      timer input (§15.34/§16.12, 37-LOCK-2).
 //!
 //! Needs no serial *device*: the lock is structural (created at graph-wire time from
 //! config, independent of device readiness) and the script asserts no bytes. So where
@@ -68,6 +73,14 @@ fn holder(rpc: &Rpc) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// The `lock.last_steal` record reported on `usb0` (§6), or `Value::Null` when no
+/// steal is on record.
+fn last_steal(rpc: &Rpc) -> Value {
+    rpc.node("usb0")
+        .and_then(|n| n.pointer("/lock/last_steal").cloned())
+        .unwrap_or(Value::Null)
+}
+
 #[test]
 fn steal_transfers_records_and_notifies_immediately() {
     let d = lock_graph_daemon();
@@ -104,13 +117,8 @@ fn steal_transfers_records_and_notifies_immediately() {
 
     // The holder is now ptyb, and state records the steal so the ousted holder sees it.
     assert_eq!(holder(rpc), json!("ptyb"), "holder not ptyb after steal");
-    let last_steal = rpc
-        .node("usb0")
-        .and_then(|n| n.get("lock").cloned())
-        .and_then(|l| l.get("last_steal").cloned())
-        .unwrap_or(Value::Null);
     assert_eq!(
-        last_steal,
+        last_steal(rpc),
         json!({ "from": "ptya", "by": "ptyb" }),
         "state did not record the steal (from ptya, by ptyb)"
     );
@@ -207,5 +215,103 @@ fn re_arming_a_lease_extends_it() {
         holder(rpc)
     );
 
+    rpc.unlock("ptya").expect("unlock ptya");
+}
+
+/// **37-LOCK-3.** A `send --steal` is recorded in state exactly as a `lock --steal`
+/// is, and the record outlives the transient origin that made it.
+///
+/// `send` registers an origin labelled `send`, steals, writes and unregisters inside
+/// one verb (§6) — so a record that resolved its parties' ids when `state` was asked
+/// had already lost one of them by the time the reply was serialized. The asymmetry
+/// was invisible: `lock --steal` (test 1 above) recorded fine, and §6's promise that a
+/// steal "is recorded in state so the previous holder can see what happened" silently
+/// covered one of its two spellings. The ousted holder is the party with no other way
+/// to learn what happened, which is why this is a guard and not a nicety.
+#[test]
+fn a_send_steal_is_recorded_in_state_after_its_transient_origin_leaves() {
+    let d = lock_graph_daemon();
+    let rpc = d.rpc();
+
+    rpc.lock("ptya", false, false, None).expect("lock ptya");
+    assert_eq!(
+        holder(rpc),
+        json!("ptya"),
+        "ptya should hold before the theft"
+    );
+
+    // `usb0`'s device is absent, so the node parks in `waiting` and its supervisor
+    // holds the targetward receiver across the outage — the line lands in the
+    // endpoint's channel rather than on a wire, which is all this needs (§7.1).
+    let sent = rpc
+        .send("usb0", "steal-me", true, 5_000)
+        .expect("send --steal must take the lock and deliver");
+    assert_eq!(
+        sent["delivered"],
+        json!(true),
+        "the stealing send did not deliver: {sent}"
+    );
+
+    // The verb has returned, so its origin is already unregistered and the lock free.
+    assert_eq!(
+        holder(rpc),
+        Value::Null,
+        "the transient origin did not release on its way out"
+    );
+    assert_eq!(
+        last_steal(rpc),
+        json!({ "from": "ptya", "by": "send" }),
+        "state lost the send-steal record when its transient origin left; ptya has no \
+         other way to learn its lock was taken (§6)"
+    );
+
+    // And it stays readable after the *victim* leaves too — the moment an operator
+    // investigating a wedged console actually asks.
+    rpc.remove_node("ptya", true)
+        .expect("remove-node ptya --cascade");
+    assert_eq!(
+        last_steal(rpc),
+        json!({ "from": "ptya", "by": "send" }),
+        "the record went with the victim's registration"
+    );
+}
+
+/// **37-LOCK-2.** `--lease-ms` is range-checked at parse, against the same
+/// `MAX_TIMER_MS` ceiling every other daemon-side timer input carries
+/// (§15.34/§16.12, invariant 13).
+///
+/// It was the one input outside that rule: a raw `u64` handed straight to a sleep
+/// task, so `--lease-ms 86400000` ("a day", the value the leg's own cap was written
+/// against) armed a release a day out on an endpoint the operator believed leased,
+/// and `u64::MAX` is the monotonic-clock overflow `send`'s deadline already clamps
+/// for. The refusal must land **before** the grant: a lease refused after the lock
+/// changed hands would be the worst of both.
+#[test]
+fn an_out_of_range_lease_is_refused_before_the_grant() {
+    const MAX_TIMER_MS: u64 = 3_600_000; // serial_nexus_core::config::MAX_TIMER_MS
+    let d = lock_graph_daemon();
+    let rpc = d.rpc();
+
+    for ms in [MAX_TIMER_MS + 1, u64::MAX] {
+        let err = rpc
+            .lock("ptya", false, false, Some(ms))
+            .expect_err("an out-of-range lease must be refused");
+        assert_eq!(err.code, -32602, "wrong code for {ms}: {}", err.message);
+        assert!(
+            err.message.contains("lease_ms") && err.message.contains(&MAX_TIMER_MS.to_string()),
+            "the refusal must name the field and the ceiling: {}",
+            err.message
+        );
+        assert_eq!(
+            holder(rpc),
+            Value::Null,
+            "the refused lease granted the lock anyway (ms = {ms})"
+        );
+    }
+
+    // The ceiling itself is legal — the check is a maximum, not an exclusive bound.
+    rpc.lock("ptya", false, false, Some(MAX_TIMER_MS))
+        .expect("a lease at exactly the maximum is accepted");
+    assert_eq!(holder(rpc), json!("ptya"));
     rpc.unlock("ptya").expect("unlock ptya");
 }

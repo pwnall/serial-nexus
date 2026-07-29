@@ -33,6 +33,20 @@
 //! these two must read past legitimate prose, that it does *not* trip on a comment)
 //! before it trusts its own clean verdict.
 //!
+//! That proof used to stop at the *matcher* (review 37, 37-TEST-1): the planted
+//! offender was a string, never a file, so nothing exercised [`walk_rs`],
+//! [`sources_under`] or [`crate_dirs`] — the walkers that have to find it. Both
+//! swallowed `read_dir` failure, so a walk that had shrunk to one directory, or to
+//! none, reported the same green as a clean tree, for the two gates enforcing
+//! invariants 1 and 5. Each scanning gate now takes the shape `meta_names.rs`
+//! already had: **plant a file in a scratch tree and require the walker to surface
+//! it**, then assert a floor on what the real scan visited and that no directory went
+//! unread. Non-vacuity witnesses (`sys/` carries the `unsafe`; `daemon/src/cell.rs`
+//! wraps the sanctioned cell; `poll_ready`/`poll_blocking` exist) are collected
+//! *through the same walk* rather than by reading a known path behind its back —
+//! "the property holds" and "the scan reached the file" are one claim, and reading
+//! the file separately answered only the first.
+//!
 //! ## The entry-point doc links (review 32)
 //!
 //! [`entry_point_doc_links_resolve`] is the newest member and the one with the longest
@@ -96,33 +110,127 @@ fn has_unsafe_usage(src: &str) -> bool {
     false
 }
 
-fn walk_rs(dir: &Path, visit: &mut impl FnMut(&Path, &str)) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if path.is_dir() {
-            // Skip build output, VCS, the excluded fuzz crate, and vendored trees.
-            if matches!(name.as_ref(), "target" | ".git" | "fuzz" | "node_modules") {
-                continue;
+/// This detector file, as a **repo-relative path** (review 37, 37-TEST-2).
+///
+/// Every gate below names the tokens it scans for, so each excludes this file from
+/// its own scan. The exclusion used to be matched on `file_name()`, which is
+/// depth-independent: a future `meta_gates.rs` *anywhere* in the workspace inherited
+/// a blanket exemption from the `unsafe`, `AsyncFd` and `CriticalCell` scans that
+/// nobody had stated — and for `AsyncFd` this file is invariant 1's only automated
+/// enforcement. That is the same TESTR-7 correction [`REFCELL_EXEMPT`] already
+/// carries, one instance over; [`self_exclusion_is_a_path_not_a_name`] proves it.
+const THIS_FILE: &str = "itest/tests/meta_gates.rs";
+
+/// The floor on `.rs` files a whole-tree [`walk_rs`] pass must reach.
+///
+/// The tree carries ~130 outside `fuzz/`. The floor exists because a walker that
+/// quietly stopped walking reports the same green as a clean tree (review 37,
+/// 37-TEST-1): `read_dir` failures were swallowed, so a scan over a shrunken file
+/// set — one crate, or none — passed the ban gates for invariants 1 and 5. Set well
+/// below the real count so ordinary deletions do not trip it, and far above the
+/// single-crate degradation it exists to catch.
+const MIN_RS_FILES: usize = 100;
+
+/// The floor on crate roots [`crate_dirs`] must find. Fifteen today (twelve workspace
+/// members plus the out-of-tree consumer template's three). Same reasoning as
+/// [`MIN_RS_FILES`]: the completeness half of the `RefCell` ban is only as good as the
+/// list of crates it ranges over.
+const MIN_CRATE_DIRS: usize = 12;
+
+/// `path` relative to `root`, with separators normalised, so a comparison against a
+/// repo-relative literal holds off Unix.
+fn rel_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// What one [`walk_rs`] pass actually did — the evidence a clean verdict needs.
+///
+/// `files` is the visited count a gate asserts a floor on; `unreadable` names the
+/// directories `read_dir` refused for a reason other than "gone". A vanished
+/// directory is a benign mid-walk race (a concurrent build removing a scratch tree);
+/// a permission error is the silent degradation 37-TEST-1 named, and a gate that
+/// walked half the tree must say so rather than report green.
+#[derive(Default)]
+struct WalkStats {
+    files: usize,
+    unreadable: Vec<String>,
+}
+
+fn walk_rs(dir: &Path, visit: &mut impl FnMut(&Path, &str)) -> WalkStats {
+    fn inner<F: FnMut(&Path, &str)>(dir: &Path, visit: &mut F, stats: &mut WalkStats) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    stats.unreadable.push(format!("{}: {e}", dir.display()));
+                }
+                return;
             }
-            walk_rs(&path, visit);
-        } else if name.ends_with(".rs")
-            && let Ok(src) = std::fs::read_to_string(&path)
-        {
-            visit(&path, &src);
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                // Skip build output, VCS, the excluded fuzz crate, and vendored trees.
+                if matches!(name.as_ref(), "target" | ".git" | "fuzz" | "node_modules") {
+                    continue;
+                }
+                inner(&path, visit, stats);
+            } else if name.ends_with(".rs")
+                && let Ok(src) = std::fs::read_to_string(&path)
+            {
+                stats.files += 1;
+                visit(&path, &src);
+            }
         }
+    }
+    let mut stats = WalkStats::default();
+    inner(dir, visit, &mut stats);
+    stats
+}
+
+/// Is `path` this detector file, matched on its **whole** path below `root`?
+fn is_this_file(root: &Path, path: &Path) -> bool {
+    rel_path(root, path) == THIS_FILE
+}
+
+/// A scratch tree that removes itself on drop.
+///
+/// The planted-violation walks below assert *after* writing, so a failing assertion
+/// unwinds past any hand-rolled cleanup; a guard keeps a red gate from leaving
+/// litter under `/tmp` on every run. Named by pid + call site, so parallel test
+/// binaries never share one.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("snx-meta-gates-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch tree");
+        Scratch(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Write `text` at `rel` below the scratch root, creating parents.
+    fn write(&self, rel: &str, text: &str) {
+        let path = self.0.join(rel);
+        std::fs::create_dir_all(path.parent().expect("a planted file has a parent"))
+            .expect("create scratch subdirectory");
+        std::fs::write(&path, text).expect("write planted file");
     }
 }
 
-/// Is `path` this detector file? It names the very tokens it scans for, so every
-/// gate here excludes itself (the same self-exclusion
-/// [`unsafe_is_confined_to_serial_nexus_sys`] applies inline).
-fn is_this_file(path: &Path) -> bool {
-    path.file_name() == Path::new(file!()).file_name()
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Does `hay` contain `needle` as a whole word (Rust-identifier boundaries)? So
@@ -171,10 +279,21 @@ fn has_code_token(src: &str, token: &str) -> bool {
 /// Every crate root in the tree (a directory holding a `Cargo.toml`), relative to
 /// `root`, excluding the workspace manifest itself. Used to prove the `RefCell` ban
 /// list is *complete* rather than merely non-empty.
-fn crate_dirs(root: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
+///
+/// `unreadable` collects the directories `read_dir` refused for a reason other than
+/// "gone", for the same reason [`WalkStats`] carries the field: this walker feeds the
+/// completeness half of invariant 5, and a crate it never reached is a crate whose
+/// missing `clippy.toml` reads as compliance.
+fn crate_dirs(root: &Path, unreadable: &mut Vec<String>) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>, unreadable: &mut Vec<String>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    unreadable.push(format!("{}: {e}", dir.display()));
+                }
+                return;
+            }
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -191,21 +310,50 @@ fn crate_dirs(root: &Path) -> Vec<PathBuf> {
             if path.join("Cargo.toml").is_file() {
                 out.push(path.clone());
             }
-            walk(&path, out);
+            walk(&path, out, unreadable);
         }
     }
     let mut out = Vec::new();
-    walk(root, &mut out);
+    walk(root, &mut out, unreadable);
     out
 }
 
-/// Every `.rs` under `dir`, as (path, source).
-fn sources_under(dir: &Path) -> Vec<(PathBuf, String)> {
+/// Every `.rs` under `dir`, as (path, source), plus the walk's own evidence. The
+/// tuple is deliberate: a caller that wants the sources has to hold the proof that
+/// the walk producing them happened.
+fn sources_under(dir: &Path) -> (Vec<(PathBuf, String)>, WalkStats) {
     let mut out = Vec::new();
-    walk_rs(dir, &mut |p, src| {
+    let stats = walk_rs(dir, &mut |p, src| {
         out.push((p.to_path_buf(), src.to_owned()))
     });
-    out
+    (out, stats)
+}
+
+/// **The self-exclusion is a path, not a base name** (review 37, 37-TEST-2).
+///
+/// Called by each of the three scanning gates rather than written once as a test of
+/// its own, because each of them *relies* on it: a widened exclusion is invisible
+/// from inside the gate it silences. Synthetic paths only — nothing is written to
+/// the tree, since the property under test is the matcher.
+fn assert_self_exclusion_is_a_path(root: &Path) {
+    assert!(
+        is_this_file(root, &root.join(THIS_FILE)),
+        "the detector no longer excludes itself ({THIS_FILE}) — it names every token \
+         it scans for, so the gates would be red forever"
+    );
+    for impostor in [
+        "daemon/src/meta_gates.rs",
+        "web/src/server/meta_gates.rs",
+        "sim/meta_gates.rs",
+    ] {
+        assert!(
+            !is_this_file(root, &root.join(impostor)),
+            "{impostor} is excluded from the unsafe / AsyncFd / CriticalCell scans by \
+             nothing but its base name. The exemption covers exactly {THIS_FILE}: a \
+             same-named file elsewhere would carry a blanket pass on invariants 1 and \
+             5, and for AsyncFd this gate is the only automated enforcement there is"
+        );
+    }
 }
 
 /// The crates that must carry the `disallowed-types` ban on `std::cell::RefCell`
@@ -240,6 +388,9 @@ fn is_refcell_exempt(root: &Path, path: &Path) -> bool {
 
 #[test]
 fn unsafe_is_confined_to_serial_nexus_sys() {
+    let root = repo_root();
+    assert_self_exclusion_is_a_path(&root);
+
     // 1. Prove the detector actually catches an `unsafe` usage. The sample is built by
     //    concatenation so this source file itself carries no literal match.
     let planted = format!("fn f() {{ {} {{ let _ = 1; }} }}", "unsafe");
@@ -248,24 +399,56 @@ fn unsafe_is_confined_to_serial_nexus_sys() {
         "the detector does not catch a planted unsafe usage"
     );
 
+    // 1b. …and prove the **walker** reaches a file carrying it (review 37, 37-TEST-1).
+    //     A matcher proved against a string says nothing about the walk that has to
+    //     find the offender: `read_dir` failures were swallowed, so a walk that
+    //     covered one directory — or none — reported the same green as a clean tree.
+    //     Planted nested, beside a non-`.rs` decoy and a copy under `target/`, so this
+    //     also pins the extension filter and the skip list the real scan depends on.
+    let scratch = Scratch::new("unsafe");
+    scratch.write("nested/deep/offender.rs", &planted);
+    scratch.write("nested/deep/offender.txt", &planted);
+    scratch.write("target/debug/build/offender.rs", &planted);
+    let mut planted_hits = Vec::new();
+    let stats = walk_rs(scratch.path(), &mut |path, src| {
+        if has_unsafe_usage(src) {
+            planted_hits.push(rel_path(scratch.path(), path));
+        }
+    });
+    assert_eq!(
+        planted_hits,
+        vec!["nested/deep/offender.rs".to_owned()],
+        "the walker missed a planted `unsafe` (or surfaced a file it must skip) — \
+         this gate would pass over anything"
+    );
+    assert_eq!(
+        stats.files, 1,
+        "the walker visited {} files in a scratch tree holding exactly one `.rs` \
+         outside target/ — the extension filter or the skip list has moved",
+        stats.files
+    );
+    drop(scratch);
+
     // 2. No `.rs` outside `serial-nexus-sys` may contain an `unsafe` usage. The
     //    directory is `sys/`, not the crate name: §15.40 renamed the packages and
     //    deliberately left the tree layout short, so a gate that scans the
     //    filesystem must spell the *directory*.
-    let root = repo_root();
-    let detector = Path::new(file!()).file_name().map(|n| n.to_os_string());
     let mut offenders = Vec::new();
-    walk_rs(&root, &mut |path, src| {
-        let rel = path
-            .strip_prefix(&root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
+    let mut sys_files = 0usize;
+    let mut sys_unsafe = 0usize;
+    let stats = walk_rs(&root, &mut |path, src| {
+        let rel = rel_path(&root, path);
         if rel.starts_with("sys/") {
+            // Counted, not skipped: step 3 needs the extraction target proved through
+            // this same walk rather than by reading a known file behind its back.
+            sys_files += 1;
+            if has_unsafe_usage(src) {
+                sys_unsafe += 1;
+            }
             return;
         }
         // Self-exclude this detector file (it names the keywords it scans for).
-        if path.file_name().map(|n| n.to_os_string()) == detector {
+        if is_this_file(&root, path) {
             return;
         }
         if has_unsafe_usage(src) {
@@ -277,11 +460,28 @@ fn unsafe_is_confined_to_serial_nexus_sys() {
         "`unsafe` found outside serial-nexus-sys/: {offenders:?}"
     );
 
-    // 3. Sanity: serial-nexus-sys genuinely carries the unsafe (else the split is a lie).
-    let sys = std::fs::read_to_string(root.join("sys/src/lib.rs")).expect("read sys/src/lib.rs");
+    // 2b. …and the scan was real: the whole tree, not a shrunken slice of it.
     assert!(
-        has_unsafe_usage(&sys),
-        "serial-nexus-sys carries no unsafe — the extraction target is wrong"
+        stats.unreadable.is_empty(),
+        "directories the scan could not read: {:?} — every `.rs` under them went \
+         unchecked, and this gate would still have reported green",
+        stats.unreadable
+    );
+    assert!(
+        stats.files >= MIN_RS_FILES,
+        "only {} `.rs` files walked (floor {MIN_RS_FILES}) — the walker has stopped \
+         seeing the tree, and a gate that checks nothing passes forever",
+        stats.files
+    );
+
+    // 3. Sanity: serial-nexus-sys genuinely carries the unsafe (else the split is a
+    //    lie) — established from the walk above, so "no offenders" cannot mean "the
+    //    walker never got there".
+    assert!(
+        sys_files > 0 && sys_unsafe > 0,
+        "the walk found {sys_unsafe} file(s) carrying `unsafe` among {sys_files} \
+         under sys/ — serial-nexus-sys is the extraction target and must carry it, or \
+         a clean verdict above means nothing was scanned"
     );
 }
 
@@ -306,6 +506,7 @@ fn refcell_ban_covers_every_crate_that_holds_daemon_state() {
     // 0. Prove the detector both fires and discriminates. Tokens are concatenated so
     //    this file carries no literal code occurrence of its own.
     let cell = format!("Ref{}", "Cell");
+    let critical = format!("Critical{}", "Cell");
     let planted = format!("    let s = std::cell::{cell}::new(GraphState::new());");
     assert!(
         has_code_token(&planted, &cell),
@@ -323,6 +524,7 @@ fn refcell_ban_covers_every_crate_that_holds_daemon_state() {
     );
 
     let root = repo_root();
+    assert_self_exclusion_is_a_path(&root);
 
     // 0b. …and prove the *exemption* is a path, not a name (review 32 TESTR-7). The
     //     sanctioned file is exempt; a same-named file at another path is not. Both
@@ -350,23 +552,106 @@ fn refcell_ban_covers_every_crate_that_holds_daemon_state() {
         );
     }
 
+    // 0c. …and prove both **walkers** this gate rides on actually walk (review 37,
+    //     37-TEST-1). `sources_under` must surface a planted offender nested under a
+    //     scratch crate, and `crate_dirs` must find that crate's root — the two
+    //     mechanisms behind assertions 1 and 3, neither of which had ever been driven
+    //     over a file. Both tokens are planted in both spellings the matchers claim to
+    //     cover: a code line (a hit) and a comment (not one).
+    //     The planted crate sits one level down, because a crate root the walker never
+    //     descends to is exactly the "new crate holds daemon state" case assertion 3
+    //     exists for.
+    let scratch = Scratch::new("refcell");
+    scratch.write(
+        "workspace/acrate/Cargo.toml",
+        "[package]\nname = \"planted\"\n",
+    );
+    scratch.write(
+        "workspace/acrate/src/nodes/holder.rs",
+        &format!("{planted}\n    let state = {critical}::new(GraphState::new());\n"),
+    );
+    scratch.write(
+        "workspace/acrate/src/prose.rs",
+        &format!("//! this crate uses neither std::cell::{cell} nor {critical}\n"),
+    );
+    let (sources, stats) = sources_under(&scratch.path().join("workspace/acrate/src"));
+    let hits = |token: &str| -> Vec<String> {
+        let mut hits: Vec<String> = sources
+            .iter()
+            .filter(|(_, src)| has_code_token(src, token))
+            .map(|(p, _)| rel_path(scratch.path(), p))
+            .collect();
+        hits.sort();
+        hits
+    };
+    let want = vec!["workspace/acrate/src/nodes/holder.rs".to_owned()];
+    assert_eq!(
+        hits(&cell),
+        want,
+        "the source walker missed a planted `{cell}` (or tripped on the comment that \
+         merely names it) — assertion 1 below would pass over anything"
+    );
+    assert_eq!(
+        hits(&critical),
+        want,
+        "the source walker missed a planted `{critical}` — assertion 3's completeness \
+         claim rests on this exact scan"
+    );
+    assert_eq!(
+        stats.files, 2,
+        "the source walker visited {} files where two were planted",
+        stats.files
+    );
+    let mut scratch_unreadable = Vec::new();
+    let scratch_crates = crate_dirs(scratch.path(), &mut scratch_unreadable);
+    assert_eq!(
+        scratch_crates
+            .iter()
+            .map(|d| rel_path(scratch.path(), d))
+            .collect::<Vec<_>>(),
+        vec!["workspace/acrate".to_owned()],
+        "the crate walker missed a planted crate root — assertion 3's completeness \
+         claim is only as wide as the crate list it ranges over"
+    );
+    assert!(
+        scratch_unreadable.is_empty(),
+        "the crate walker could not read {scratch_unreadable:?} in a tree it just created"
+    );
+    drop(scratch);
+
+    // The sanctioned `CriticalCell` file, as the ban-crate walk below finds it — the
+    // non-vacuity witness for assertions 1 and 3, collected *through the walker*
+    // rather than read behind its back at the end.
+    let mut exempt_witness: Option<String> = None;
+
     for krate in REFCELL_BAN_CRATES {
         let dir = root.join(krate);
-        assert!(dir.is_dir(), "ban-list crate {krate} does not exist");
 
         // 1. No raw RefCell in the crate's sources, the one exempt path excepted.
         let mut offenders = Vec::new();
-        for (path, src) in sources_under(&dir.join("src")) {
+        let (sources, stats) = sources_under(&dir.join("src"));
+        // Execution, not existence (AGENTS §3): `dir.is_dir()` said the ban-list crate
+        // was there and nothing said its sources had been read. A ban crate with no
+        // reachable sources is the shrunken-scan failure, wearing a green tick.
+        assert!(
+            stats.unreadable.is_empty(),
+            "directories under {krate}/src the scan could not read: {:?}",
+            stats.unreadable
+        );
+        assert!(
+            stats.files > 0,
+            "no sources walked under {krate}/src — ban-list crate {krate} is gone, \
+             moved, or unreadable, and assertion 1 just passed over nothing"
+        );
+        for (path, src) in sources {
             if is_refcell_exempt(&root, &path) {
+                if has_code_token(&src, &cell) && has_code_token(&src, &critical) {
+                    exempt_witness = Some(rel_path(&root, &path));
+                }
                 continue;
             }
             if has_code_token(&src, &cell) {
-                offenders.push(
-                    path.strip_prefix(&root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+                offenders.push(rel_path(&root, &path));
             }
         }
         assert!(
@@ -395,9 +680,21 @@ fn refcell_ban_covers_every_crate_that_holds_daemon_state() {
 
     // 3. Completeness: `CriticalCell` is the daemon-state wrapper the ban exists to
     //    force. Any crate reaching for it is a crate the ban must cover.
-    let critical = format!("Critical{}", "Cell");
+    let mut unreadable = Vec::new();
+    let crates = crate_dirs(&root, &mut unreadable);
+    assert!(
+        unreadable.is_empty(),
+        "directories the crate walk could not read: {unreadable:?} — a crate root \
+         under them is a crate this completeness claim never ranged over"
+    );
+    assert!(
+        crates.len() >= MIN_CRATE_DIRS,
+        "only {} crate roots found (floor {MIN_CRATE_DIRS}) — the crate walker has \
+         stopped seeing the tree, and assertion 3 is only as complete as this list",
+        crates.len()
+    );
     let mut uncovered = Vec::new();
-    for dir in crate_dirs(&root) {
+    for dir in crates {
         let name = dir
             .file_name()
             .unwrap_or_default()
@@ -407,15 +704,11 @@ fn refcell_ban_covers_every_crate_that_holds_daemon_state() {
             continue;
         }
         let uses_it = sources_under(&dir.join("src"))
+            .0
             .iter()
-            .any(|(p, src)| !is_this_file(p) && has_code_token(src, &critical));
+            .any(|(p, src)| !is_this_file(&root, p) && has_code_token(src, &critical));
         if uses_it {
-            uncovered.push(
-                dir.strip_prefix(&root)
-                    .unwrap_or(&dir)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            uncovered.push(rel_path(&root, &dir));
         }
     }
     assert!(
@@ -426,12 +719,16 @@ fn refcell_ban_covers_every_crate_that_holds_daemon_state() {
     );
 
     // Sanity: the ban list is not vacuous — `serial-nexus-daemon` genuinely carries the
-    // sanctioned `CriticalCell`, so assertion 3 is scanning for something real.
-    let cell_rs =
-        std::fs::read_to_string(root.join("daemon/src/cell.rs")).expect("read daemon/src/cell.rs");
-    assert!(
-        has_code_token(&cell_rs, &cell) && has_code_token(&cell_rs, &critical),
-        "daemon/src/cell.rs no longer wraps a {cell} — the exemption is stale"
+    // sanctioned `CriticalCell`, so assertions 1 and 3 are scanning for something real.
+    // The witness comes from the ban-crate walk above, not from a direct read of a
+    // known path: "the exemption is live" and "the walk reached the exempt file" are
+    // the same claim, and reading the file separately answered only the first.
+    assert_eq!(
+        exempt_witness.as_deref(),
+        Some(REFCELL_EXEMPT[0]),
+        "the ban-crate walk did not find a {cell} wrapped in a {critical} at \
+         {:?} — either the exemption is stale or the walk never reached it",
+        REFCELL_EXEMPT[0]
     );
 }
 
@@ -450,6 +747,8 @@ fn refcell_ban_covers_every_crate_that_holds_daemon_state() {
 #[test]
 fn no_asyncfd_is_used_anywhere_in_the_workspace() {
     let token = format!("Async{}", "Fd");
+    let root = repo_root();
+    assert_self_exclusion_is_a_path(&root);
 
     // 1. Prove the detector catches a real use, and does not trip on the doc comments
     //    that explain why there are none.
@@ -471,20 +770,58 @@ fn no_asyncfd_is_used_anywhere_in_the_workspace() {
         "the detector trips on the prose that documents the ban"
     );
 
+    // 1b. …and prove the **walker** reaches the file carrying one (review 37,
+    //     37-TEST-1). Both spellings the matcher claims to cover are planted, in
+    //     separate nested files, so this pins matcher *and* walk in one pass: this
+    //     gate is invariant 1's only automated enforcement, and a walk that had
+    //     quietly shrunk to nothing reported the same green as a clean tree.
+    let scratch = Scratch::new("asyncfd");
+    scratch.write(
+        "krate/src/nodes/user.rs",
+        &format!("use tokio::io::unix::{token};\n"),
+    );
+    scratch.write(
+        "krate/src/nodes/prose.rs",
+        &format!("//! readiness is never `{token}` here — it spins on a pty master\n"),
+    );
+    let mut planted_hits = Vec::new();
+    let stats = walk_rs(scratch.path(), &mut |path, src| {
+        if has_code_token(src, &token) {
+            planted_hits.push(rel_path(scratch.path(), path));
+        }
+    });
+    assert_eq!(
+        planted_hits,
+        vec!["krate/src/nodes/user.rs".to_owned()],
+        "the walker missed a planted `{token}` use (or tripped on the comment beside \
+         it) — invariant 1's only gate would pass over anything"
+    );
+    assert_eq!(
+        stats.files, 2,
+        "the walker visited {} files where two were planted",
+        stats.files
+    );
+    drop(scratch);
+
     // 2. No `.rs` in the workspace may use it. No allowlist (see the doc comment).
-    let root = repo_root();
     let mut offenders = Vec::new();
-    walk_rs(&root, &mut |path, src| {
-        if is_this_file(path) {
+    let mut replacement_seen = 0usize;
+    let stats = walk_rs(&root, &mut |path, src| {
+        let rel = rel_path(&root, path);
+        // Step 3's witness, collected through this same walk: `sys/` is where the
+        // sanctioned replacement lives, and "nobody uses AsyncFd" only means
+        // "poll(2) everywhere" if the walk actually reached it.
+        if rel.starts_with("sys/")
+            && has_code_token(src, "poll_ready")
+            && has_code_token(src, "poll_blocking")
+        {
+            replacement_seen += 1;
+        }
+        if is_this_file(&root, path) {
             return;
         }
         if has_code_token(src, &token) {
-            offenders.push(
-                path.strip_prefix(&root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            offenders.push(rel);
         }
     });
     assert!(
@@ -494,13 +831,27 @@ fn no_asyncfd_is_used_anywhere_in_the_workspace() {
          / `poll_blocking`"
     );
 
+    // 2b. …over the whole tree, not a shrunken slice of it.
+    assert!(
+        stats.unreadable.is_empty(),
+        "directories the scan could not read: {:?} — every `.rs` under them went \
+         unchecked, and this gate would still have reported green",
+        stats.unreadable
+    );
+    assert!(
+        stats.files >= MIN_RS_FILES,
+        "only {} `.rs` files walked (floor {MIN_RS_FILES}) — the walker has stopped \
+         seeing the tree, and a gate that checks nothing passes forever",
+        stats.files
+    );
+
     // 3. Sanity: the replacement the invariant names is really what the tree uses, so
     //    a clean verdict means "poll(2) everywhere", not "no readiness code left".
-    let sys = std::fs::read_to_string(root.join("sys/src/lib.rs")).expect("read sys/src/lib.rs");
     assert!(
-        has_code_token(&sys, "poll_ready") && has_code_token(&sys, "poll_blocking"),
-        "serial-nexus-sys no longer exposes poll_ready/poll_blocking — invariant 1's \
-         replacement is gone and this gate is measuring nothing"
+        replacement_seen > 0,
+        "the walk found no file under sys/ exposing poll_ready and poll_blocking — \
+         invariant 1's replacement is gone (or was never walked) and this gate is \
+         measuring nothing"
     );
 }
 
@@ -549,6 +900,63 @@ fn doctor_reports_no_unsupported_capability() {
     assert!(p1 == "supported" || p1 == "degraded", "P1 was {p1}");
 }
 
+/// The floor on fuzz target sources the `unstable_fuzz_api` gate must read. Nine
+/// today; the rule below is only as strong as the corpus it searches.
+const MIN_FUZZ_TARGETS: usize = 5;
+
+/// `src` with every `//`-style comment removed, line structure preserved.
+///
+/// The same conservative rule [`has_code_token`] documents, with the same accepted
+/// limits (no `/* … */`, and a `//` inside a string literal truncates its line), and
+/// for the same reason: prose about a token is not a use of it.
+fn strip_line_comments(src: &str) -> String {
+    src.lines()
+        .map(|line| match line.find("//") {
+            Some(i) => &line[..i],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The body of the block `header` introduces in `src`, delimited by **brace
+/// counting**. `None` if the header is absent or its braces never balance.
+///
+/// Call it on comment-stripped source ([`strip_line_comments`]) so a brace inside a
+/// comment cannot move the boundary.
+fn braced_body<'a>(src: &'a str, header: &str) -> Option<&'a str> {
+    let at = src.find(header)?;
+    let rest = &src[at..];
+    let open = rest.find('{')?;
+    let mut depth = 0usize;
+    for (i, c) in rest[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&rest[open + 1..open + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Every identifier `body`'s `pub use` statements re-export — the last `::` segment
+/// of each item, brace groups flattened.
+fn reexported_items(body: &str) -> Vec<String> {
+    body.split("pub use")
+        .skip(1)
+        .flat_map(|u| u[..u.find(';').unwrap_or(u.len())].split(['{', '}', ',']))
+        .filter_map(|t| t.rsplit("::").next())
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The `unstable_fuzz_api` bargain, enforced (design §15.26 amendment, notes §3.19).
 ///
 /// `serial-nexus-daemon` and `serial-nexus-web` each expose a `pub mod unstable_fuzz_api` that
@@ -566,31 +974,88 @@ fn doctor_reports_no_unsupported_capability() {
 /// Also asserts each module says what it is: the doc comment must disclaim stability,
 /// because the whole justification for the exception is that no embedder could depend
 /// on it by accident.
+///
+/// Two matcher corrections (review 37, 37-TEST-6), both latent when they were filed:
+/// the search for a driving target ran over **raw** target sources, so a re-export
+/// merely *named in a comment* satisfied the rule; and the module body was delimited
+/// by the first line-start `}`, so the first nested block inside either module would
+/// have exempted every re-export after it. Both are proved by the planted cases below.
 #[test]
 fn every_unstable_fuzz_api_export_has_a_fuzz_target() {
+    const HEADER: &str = "pub mod unstable_fuzz_api";
     let root = repo_root();
     let fuzz_dir = root.join("fuzz/fuzz_targets");
-    assert!(
-        fuzz_dir.is_dir(),
-        "fuzz/fuzz_targets is missing; the exception below has no consumer"
-    );
-    let targets: String = std::fs::read_dir(&fuzz_dir)
-        .expect("read fuzz_targets")
+    let target_sources: Vec<String> = std::fs::read_dir(&fuzz_dir)
+        .unwrap_or_else(|e| {
+            panic!(
+                "read {}: {e} — the §15.26 exception below has no consumer",
+                fuzz_dir.display()
+            )
+        })
         .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
         .filter_map(|e| std::fs::read_to_string(e.path()).ok())
         .collect();
+    assert!(
+        target_sources.len() >= MIN_FUZZ_TARGETS,
+        "only {} fuzz target(s) read (floor {MIN_FUZZ_TARGETS}) — a rule whose corpus \
+         stopped being read passes forever",
+        target_sources.len()
+    );
+    // Comments stripped: a target that only *mentions* a re-export in prose is not a
+    // target driving it, and the whole exception is bounded by "the fuzzer drives it".
+    let targets = strip_line_comments(&target_sources.join("\n"));
+
+    // 0. Self-proof, both matchers, both directions. The token is assembled so this
+    //    file carries no literal of its own.
+    let planted = format!("Planted{}Parser", "Fuzz");
+    assert!(
+        contains_word(
+            &strip_line_comments(&format!("use serial_nexus_daemon::x::{planted};")),
+            &planted
+        ),
+        "the comment stripper eats a real `use` line"
+    );
+    assert!(
+        !contains_word(
+            &strip_line_comments(&format!("// also worth fuzzing one day: {planted}")),
+            &planted
+        ),
+        "a re-export named only in a fuzz target's comment counts as driven — the one \
+         rule bounding the §15.26 exception is satisfied by prose"
+    );
+    // …and the body delimiter counts braces instead of stopping at the first
+    // line-start `}`. The planted module puts a nested block *before* its re-export,
+    // which is precisely the shape that truncated the old slice.
+    let nested = [
+        "pub mod unstable_fuzz_api {",
+        "    pub fn helper() -> u8 {",
+        "        1",
+        "}",
+        &format!("    pub use crate::control::{planted};"),
+        "}",
+    ]
+    .join("\n");
+    let nested_body = braced_body(&nested, HEADER).expect("the planted module is brace-delimited");
+    assert!(
+        reexported_items(nested_body).contains(&planted),
+        "the module-body delimiter stops at the first line-start `}}` — every \
+         re-export past the first nested block is silently exempt from the rule this \
+         gate exists to enforce"
+    );
 
     let mut checked = 0usize;
     for krate in ["daemon", "web"] {
         let lib = root.join(krate).join("src/lib.rs");
         let src =
             std::fs::read_to_string(&lib).unwrap_or_else(|e| panic!("read {}: {e}", lib.display()));
-        let Some(at) = src.find("pub mod unstable_fuzz_api") else {
+        let Some(at) = src.find(HEADER) else {
             continue; // the module is allowed to disappear — that is its promise
         };
 
         // The disclaimer is load-bearing: it is what makes "no embedder can depend on
-        // this by accident" true rather than hopeful.
+        // this by accident" true rather than hopeful. Read from the raw source — the
+        // disclaimer *is* a comment.
         let doc = &src[..at];
         assert!(
             doc.contains("Not part of") && (doc.contains("fuzz harness") || doc.contains("fuzz")),
@@ -598,22 +1063,17 @@ fn every_unstable_fuzz_api_export_has_a_fuzz_target() {
         );
 
         // Every identifier in the module's `pub use` list must appear in some target.
-        let body = &src[at..];
-        let body = &body[..body.find("\n}").expect("module body is brace-delimited")];
-        for item in body
-            .split("pub use")
-            .skip(1)
-            .flat_map(|u| u[..u.find(';').unwrap_or(u.len())].split(['{', '}', ',']))
-            .filter_map(|t| t.rsplit("::").next())
-            .map(str::trim)
-            .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_alphanumeric() || c == '_'))
-        {
+        let code = strip_line_comments(&src);
+        let body = braced_body(&code, HEADER)
+            .unwrap_or_else(|| panic!("{krate}'s unstable_fuzz_api body is not brace-balanced"));
+        for item in reexported_items(body) {
             assert!(
-                contains_word(&targets, item),
+                contains_word(&targets, &item),
                 "{krate}::unstable_fuzz_api re-exports `{item}`, but no fuzz target \
-                 under fuzz/fuzz_targets/ mentions it. The exception to §15.26 is \
-                 bounded by exactly this rule: re-export what the fuzzer drives, \
-                 nothing else. Add the target, or drop the re-export."
+                 under fuzz/fuzz_targets/ drives it (a mention in a comment does not \
+                 count). The exception to §15.26 is bounded by exactly this rule: \
+                 re-export what the fuzzer drives, nothing else. Add the target, or \
+                 drop the re-export."
             );
             checked += 1;
         }
@@ -750,7 +1210,12 @@ fn port_enumeration_cannot_open_a_device() {
     // sysfs attributes; reaching for `File::open` or `OpenOptions` is the shape a
     // device probe would take, and it needs no dependency to write.
     const OPENERS: &[&str] = &["OpenOptions", "File"];
-    let sources = sources_under(&root.join("core/src"));
+    let (sources, stats) = sources_under(&root.join("core/src"));
+    assert!(
+        stats.unreadable.is_empty(),
+        "directories under core/src the scan could not read: {:?}",
+        stats.unreadable
+    );
     assert!(
         !sources.is_empty(),
         "found no serial-nexus-core sources — this gate would pass vacuously"

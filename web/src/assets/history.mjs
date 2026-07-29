@@ -1,11 +1,12 @@
-// Pure offset-splice + retention for one console's scrollback (design §11.9 / §15.32).
+// Pure offset-splice + retention for one console's scrollback (design §15.32, §17's
+// browser-side history; the track item is plan §11.9).
 //
-// The daemon stamps every `tap.data` with a monotonic hostward byte `offset` (§11.8).
+// The daemon stamps every `tap.data` with a monotonic hostward byte `offset` (§10).
 // This module folds chunks into a single contiguous byte log, trimming whatever a
 // reconnect's `--replay` re-sends (so a reload never duplicates ring bytes), and caps
 // the retained bytes with a trim-oldest policy. It is deliberately free of the DOM and
 // of any storage backend — those live in `app.js` / `opfs.mjs` — so this splice/retention
-// core is unit-testable under `node --test` (that is the §11.9 CI-run test).
+// core is unit-testable under `node --test` (that is plan §11.9's CI-run test).
 //
 // State shape (a plain object, easy to snapshot to storage):
 //   { cap, frontier, epoch, chunks: Uint8Array[], total, dropped }
@@ -15,7 +16,7 @@
 // counts bytes lost to a real gap (the ring rotated past our frontier before we
 // reconnected) and is read by the caller, which marks every hole it counts (HIST-1).
 
-/// The default per-console retention cap: 16 MiB, trim-oldest (§11.9).
+/// The default per-console retention cap: 16 MiB, trim-oldest (§15.32).
 export const DEFAULT_CAP = 16 * 1024 * 1024;
 
 /// A fresh, empty history. `frontier === null` until the first chunk anchors it, and

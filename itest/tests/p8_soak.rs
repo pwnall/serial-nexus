@@ -55,7 +55,11 @@ mod linux_impl {
     use std::time::{Duration, Instant};
 
     use serde_json::Value;
-    use serial_nexus_itest::{Daemon, Sim, sha256_hex, wait_until};
+    // `seeded_bytes` and `file_len` come from the harness (§16.5, review 37 37-TEST-5):
+    // eight test files each carried their own copy of the sim's generator, so "matches
+    // the sim" was eight unchecked assertions. The shared one is pinned to the sim's
+    // own `sha256_sent` by `seeded_bytes_matches_the_sim`.
+    use serial_nexus_itest::{Daemon, Sim, file_len, seeded_bytes, sha256_hex, wait_until};
 
     /// The source seed (`--seed 7`).
     const SEED: u64 = 7;
@@ -74,31 +78,6 @@ mod linux_impl {
         pub rate_mib: u64,
         pub interval: Duration,
         pub rss_budget_kb: u64,
-    }
-
-    /// The `serial-nexus-sim` deterministic byte stream (splitmix64), copied verbatim from
-    /// `serial-nexus-sim`'s `seeded_bytes` (and matching `p3_firehose`). The source's own
-    /// `sha256` verdict is on a stdout `Sim::spawn` discards, so we reconstruct the
-    /// byte-exact ground truth from `(seed, size)` and hash it through `sha256_hex`.
-    fn seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
-        let mut s = seed;
-        let mut out = Vec::with_capacity(len);
-        while out.len() < len {
-            s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = s;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            out.extend_from_slice(&z.to_le_bytes());
-        }
-        out.truncate(len);
-        out
-    }
-
-    /// Current on-disk length of `p` (0 if absent) — the portable replacement for
-    /// `stat -c %s`.
-    fn file_len(p: &Path) -> u64 {
-        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
     }
 
     /// Scan `/proc` for the `serial-nexus-daemon` process whose NUL-separated argv carries

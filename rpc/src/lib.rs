@@ -334,6 +334,13 @@ pub enum AppError {
     /// the review found was silence — the connection died with no reply to either
     /// request, taking a web console's subscription and taps with it (CTRL-1).
     WaitInFlight,
+    /// `connect` refused because the target-facing endpoint's pump has not drained
+    /// the hostward receivers of its earlier edges yet (§4 rule 2 bounds *configured*
+    /// edges, not queued receivers). Purely transient — nothing changed and an
+    /// immediate retry is the remedy — and distinct from every code above, all of
+    /// which are properties of the request or the graph rather than of the moment
+    /// (37-DATA-1).
+    EdgeInboxFull,
 }
 
 impl AppError {
@@ -345,6 +352,7 @@ impl AppError {
         AppError::HasEdges,
         AppError::DeviceAbsent,
         AppError::WaitInFlight,
+        AppError::EdgeInboxFull,
     ];
 
     /// The numeric code, offset from [`error_codes::APP_ERROR_BASE`].
@@ -357,6 +365,7 @@ impl AppError {
                 AppError::HasEdges => 4,
                 AppError::DeviceAbsent => 5,
                 AppError::WaitInFlight => 6,
+                AppError::EdgeInboxFull => 7,
             }
     }
 
@@ -369,6 +378,7 @@ impl AppError {
             AppError::HasEdges => "has edges",
             AppError::DeviceAbsent => "device absent",
             AppError::WaitInFlight => "waiting verb in flight",
+            AppError::EdgeInboxFull => "edge inbox full",
         }
     }
 
@@ -390,6 +400,9 @@ impl AppError {
             }
             AppError::WaitInFlight => {
                 "a request was pipelined behind an in-flight waiting verb on the same connection; §15.20 runs one at a time, and the wait, its taps and its subscription are all left intact"
+            }
+            AppError::EdgeInboxFull => {
+                "`connect` refused: the target-facing endpoint has not drained the hostward receivers of its earlier edges yet. Transient — nothing changed, retry"
             }
         }
     }

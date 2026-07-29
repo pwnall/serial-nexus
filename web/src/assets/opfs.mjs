@@ -1,8 +1,9 @@
-// Thin Origin Private File System persistence for console scrollback (design §11.9 /
-// §15.32). Storage only — the splice/retention math is history.mjs. The I/O itself is
-// exercised in a real browser by `ui-tests/tests/history.spec.mjs`; the one piece of
-// pure logic here, the key→filename mapping, is exported and unit-tested, because a
-// non-injective mapping silently merged two consoles' records (review HIST-5).
+// Thin Origin Private File System persistence for console scrollback (design §15.32,
+// §17's browser-side history; the track item is plan §11.9). Storage only — the
+// splice/retention math is history.mjs. The I/O itself is exercised in a real browser by
+// `ui-tests/tests/history.spec.mjs`; the one piece of pure logic here, the key→filename
+// mapping, is exported and unit-tested, because a non-injective mapping silently merged
+// two consoles' records (review HIST-5).
 //
 // One flat file per console-history key holds an 8-byte little-endian hostward end-offset
 // header followed by the (already 16-MiB-capped) bytes, so a reload restores both the
@@ -129,8 +130,8 @@ export async function clear(key) {
 /// fewer than we hoped", which is the correct failure for a best-effort cache.
 ///
 /// Records are keyed by `host::endpoint::instance`, and `instance` is the daemon's
-/// *per-boot* nonce (§11.8) — so every restart mints a whole new set of filenames and,
-/// with only `clear(key)` for deletion, the old set was immortal. §15.32's retention
+/// *per-boot* nonce (§10's `info`) — so every restart mints a whole new set of filenames
+/// and, with only `clear(key)` for deletion, the old set was immortal. §15.32's retention
 /// model is "a per-console cap (default 16 MiB, trim-oldest)", i.e. bounded by
 /// consoles; the nonce silently multiplied that bound by the number of restarts, until
 /// the origin hit its quota and persistence died for good with no in-product way to

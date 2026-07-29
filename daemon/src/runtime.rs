@@ -244,9 +244,10 @@ pub(crate) async fn await_write_grant(
     }
 }
 
-/// Ensure `id` holds its endpoint's write lock, re-acquiring through the FIFO
-/// queue if a `send --steal` transiently ousted the held origin (§6 held
-/// priority). Returns `false` if the endpoint was torn down or this origin's edge
+/// Ensure `id` holds its endpoint's write lock, reclaiming it ahead of the
+/// on-demand FIFO queue if a `send --steal` transiently ousted the held origin
+/// (held-priority reclaim, §6/§15.23 — *not* a trip through the queue, as the
+/// body two lines below says). Returns `false` if the endpoint was torn down or this origin's edge
 /// went away. The fast path (the normal held case) is a single synchronous borrow;
 /// the slow path is the shared [`await_write_grant`] park, which holds no borrow
 /// across its await (§15.20). Shared by the in-process codec and the exec codec —
@@ -273,6 +274,59 @@ pub(crate) async fn reacquire_held(lock: &SharedLock, id: OriginId) -> bool {
         }
     })
     .await
+}
+
+/// The **non-parking** sibling of [`reacquire_held`]: answer "may `id` write right
+/// now?", reclaiming a free lock first if `id` is the endpoint's `held` origin (§6
+/// held priority, §15.23). Returns the answer; never suspends.
+///
+/// This is the read gate for a *boundary* origin — a pty client, and any later node
+/// that owns its own lifecycle loop — where [`reacquire_held`] cannot be used at all:
+/// that helper parks until the lock frees, and the pty reader's one loop also carries
+/// presence latching, termios reconciliation and last-close handling (§7.2/§6), so
+/// parking it inside the write gate is exactly the freeze CONC-1 exists to prevent.
+///
+/// A gate of bare `may_write` is not enough for a `held` edge, and the gap was
+/// silent: the reclaim §15.23 promises is driven by the interior pumps' call to
+/// [`reacquire_held`], and a `held` **pty** edge — a legal, validator-accepted shape
+/// — has no such pump. Every path that frees the lock while the held origin is not
+/// the holder (a completed `send --steal`, `unlock`, a lease expiry) then left the
+/// endpoint free but untakeable: this origin never reclaimed, and held priority
+/// inside [`EndpointLock::acquire`] denies every *other* origin on a free lock while
+/// a held origin is registered. The console backpressured forever and every
+/// contender got the locked error (37-LOCK-1).
+///
+/// The reclaim is attempted from the gate rather than from the lock's release path
+/// on purpose: §15.23 made held priority an *acquisition-time* property precisely so
+/// it holds by rule rather than by which caller happens to run, and this keeps the
+/// boundary's answer derived from the same rule the state machine enforces.
+///
+/// A fresh grant emits the §10 lock-change notification, as every other grant path
+/// does — and no more than that: it takes nothing from anyone, so there is nobody to
+/// wake. Purge-on-acquire is deliberately **not** run here, matching
+/// [`reacquire_held`]: a held origin's floor is permanent, a steal is a transient
+/// ouster of it, and the boundary observes the lock freeing at poll resolution rather
+/// than at the instant it happens — so purging here would discard console input typed
+/// *after* the endpoint was already this origin's again, which is loss §5 does not
+/// sanction, in exchange for a stale-command window §6 scopes to explicit
+/// acquisition.
+pub(crate) fn may_write_reclaiming(lock: &SharedLock, id: OriginId) -> bool {
+    // One critical section, no await inside it (§16.2). `reclaim_held` is a no-op
+    // for an on-demand or `never` origin, and true-without-granting under
+    // free-for-all — which `may_write` has already answered by then.
+    let (may, fresh) = lock.with_mut(|g| {
+        if g.may_write(id) {
+            (true, false)
+        } else {
+            let took = g.reclaim_held(id);
+            (took, took)
+        }
+    });
+    if fresh {
+        // The borrow is dropped; announce the transition like every other grant (§10).
+        lock.emit_change();
+    }
+    may
 }
 
 /// The maximum envelope payload per frame carrying `channel`: [`MAX_FRAME_SIZE`]
@@ -688,8 +742,9 @@ pub(crate) async fn forward_targetward(
     payload: impl FnOnce() -> Option<Chunk>,
 ) -> TargetwardLoss {
     let (tx, lock, id) = origin;
-    // A `send --steal` transiently ousts a held origin; re-acquire FIFO once the
-    // stealer releases, so the chunk is delayed, never dropped (§6). `false` means
+    // A `send --steal` transiently ousts a held origin; it reclaims the lock ahead
+    // of the on-demand FIFO queue once the stealer releases (§15.23), so the chunk
+    // is delayed, never dropped (§6). `false` means
     // the endpoint was torn down (or this origin cannot write): the bytes have
     // nowhere left to go.
     if !reacquire_held(lock, *id).await {
@@ -1099,7 +1154,20 @@ pub(crate) struct AttachOutcome {
     /// means it has no pump at all — a pty whose setup faulted, or a `faces = "host"`
     /// codec/exec channel whose driver is deferred (§14) — a dead edge that `load`
     /// would have produced just the same, so it is reported, never refused (§15.8).
+    ///
+    /// It does **not** cover the other way the hand-off can fail, an inbox that is
+    /// merely full: that is a transient the caller should refuse rather than report,
+    /// and [`attach_edge`] leaves the graph untouched for it (37-DATA-1). A `false`
+    /// here therefore still means exactly one thing — "the consumer has no pump" —
+    /// which is what makes it a usable diagnosis.
     pub consumer_live: bool,
+    /// The consuming endpoint's pump is healthy but has not drained the receivers of
+    /// earlier edges yet, so this attachment did **nothing** — see step 1 of
+    /// [`attach_edge`]. A transient, and the one outcome a caller must refuse rather
+    /// than report: `Wiring::build` cannot see it (the pumps are spawned after the
+    /// edge loop, against an inbox that starts empty), and `Daemon::connect` turns it
+    /// into a named retryable error (37-DATA-1).
+    pub inbox_full: bool,
 }
 
 /// Attach one edge: the **single** implementation of it (§16 one-rule-one-place),
@@ -1136,9 +1204,59 @@ pub(crate) fn attach_edge(parts: EdgeParts, mode: WriteMode, depth: usize) -> At
         counters,
     } = parts;
 
-    // 1. Register the attachment as an origin on the host endpoint's lock (§6),
-    //    labelled by the target's address so `lock`/`unlock` can name it. First,
-    //    before any byte can flow, so arbitration is decided from the first chunk.
+    // 1. Hostward: one dedicated channel per (host, target) edge at the producing
+    //    node's configured depth (§5/§7.1), so a slow consumer's drops are isolated
+    //    to its own channel — and hand its receiver to the consuming endpoint through
+    //    the inbox its pump is already parked on.
+    //
+    //    This step runs **first**, ahead of every mutation below, because it is the
+    //    only one that can fail in a way the graph must not keep half of. Its two
+    //    failures are different facts and used to be collapsed into one `is_ok()`
+    //    (37-DATA-1):
+    //
+    //    * `Closed` — the consuming endpoint has no pump at all: a pty whose setup
+    //      faulted, a deferred `faces = "host"` channel (§14). A property of the
+    //      *node*, permanent, and the dead edge `load` would have produced just the
+    //      same — so the attachment proceeds and is reported, never refused (§15.8).
+    //    * `Full` — the pump is healthy and simply has not been polled yet. §4 rule 2
+    //      bounds an endpoint to one *configured* edge at a time and says nothing
+    //      about receivers already queued, which `detach_edge_runtime` cannot retract;
+    //      so [`EDGE_INBOX_CAP`] connects landing before the pump next runs fill the
+    //      queue with stale (closed, already drained) entries. Reachable rather than
+    //      theoretical: one control connection dispatches a pipelined burst with no
+    //      scheduler yield between requests, so five connects with four interleaved
+    //      disconnects overflow it deterministically. Reporting that as "the consumer
+    //      has no pump" sent an operator to inspect a node that was never at fault,
+    //      and left a *configured* edge hostward-dead for good.
+    //
+    //    A full inbox therefore returns having attached nothing — no origin on the
+    //    lock, no fan-out sink, an untouched edge slot — so the caller's operation can
+    //    be refused as the transient it is, with no partial edge to unwind.
+    let (htx, hrx) = mpsc::channel(depth);
+    let consumer_live = match inbox.try_send(hrx) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!(
+                target = %target,
+                cap = EDGE_INBOX_CAP,
+                "edge inbox full: the consuming endpoint's pump has not drained the \
+                 receivers of earlier edges yet; attaching nothing"
+            );
+            return AttachOutcome {
+                registered: None,
+                addressable: false,
+                granted: false,
+                consumer_live: false,
+                inbox_full: true,
+            };
+        }
+    };
+
+    // 2. Register the attachment as an origin on the host endpoint's lock (§6),
+    //    labelled by the target's address so `lock`/`unlock` can name it. Before any
+    //    byte can flow — the fan-out sink below is what starts that — so arbitration
+    //    is decided from the first chunk.
     let registered = lock.map(|cell| {
         cell.with_mut(|l| l.register(origin, target.to_string(), mode));
         (cell, origin)
@@ -1147,7 +1265,7 @@ pub(crate) fn attach_edge(parts: EdgeParts, mode: WriteMode, depth: usize) -> At
         .as_ref()
         .is_some_and(|(cell, id)| cell.with(|l| l.holder() == Some(*id)));
 
-    // 2. Fill the consuming endpoint's live edge slot. `attached` is set whatever the
+    // 3. Fill the consuming endpoint's live edge slot. `attached` is set whatever the
     //    mode — a `never` edge is a real attachment that simply cannot write, and it
     //    is that flag, not the writer, that decides `active` vs `waiting` (§7.5,
     //    §15.8) — while the targetward path exists only for a writable mode.
@@ -1161,10 +1279,9 @@ pub(crate) fn attach_edge(parts: EdgeParts, mode: WriteMode, depth: usize) -> At
         e.writer = writer;
     });
 
-    // 3. Hostward: one dedicated channel per (host, target) edge at the producing
-    //    node's configured depth (§5/§7.1), so a slow consumer's drops are isolated
-    //    to its own channel.
-    let (htx, hrx) = mpsc::channel(depth);
+    // 4. Join the host endpoint's fan-out. **Last**, because this is the step that
+    //    opens the byte path: everything the producer broadcasts from here on has a
+    //    registered origin, a filled slot and a consumer holding the other end.
     let sink = AttachedSink {
         target,
         tx: htx,
@@ -1172,17 +1289,12 @@ pub(crate) fn attach_edge(parts: EdgeParts, mode: WriteMode, depth: usize) -> At
     };
     fanout.attach(sink);
 
-    // 4. Hand the consuming endpoint its receiver through the inbox its pump is
-    //    already parked on. A *full* inbox would mean that endpoint already has an
-    //    unconsumed edge, which §4 rule 2 has been validated against on both paths; a
-    //    *closed* one is the no-pump case [`AttachOutcome::consumer_live`] reports.
-    let consumer_live = inbox.try_send(hrx).is_ok();
-
     AttachOutcome {
         registered,
         addressable,
         granted,
         consumer_live,
+        inbox_full: false,
     }
 }
 
@@ -2029,6 +2141,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_boundary_held_origin_reclaims_a_lock_a_steal_freed() {
+        // 37-LOCK-1: the gate a boundary reader gets is the *only* reclaim driver a
+        // `held` pty edge has — nothing else ever calls `reclaim_held` for it — and a
+        // bare `may_write` there leaves the endpoint free-but-untakeable after any
+        // path that frees it (§6/§15.23).
+        let lock = empty_lock();
+        let held = OriginId(1);
+        let thief = OriginId(2);
+        lock.with_mut(|g| g.register(held, "console", WriteMode::Held));
+        assert!(
+            may_write_reclaiming(&lock, held),
+            "register grants a held origin the free lock"
+        );
+
+        // A `send --steal` and its release: the transient origin takes the lock, then
+        // unregisters, which clears the holder.
+        lock.with_mut(|g| g.register(thief, "send", WriteMode::OnDemand));
+        lock.with_mut(|g| g.steal(thief));
+        assert!(!may_write_reclaiming(&lock, held), "the stealer holds it");
+        lock.with_mut(|g| g.unregister(thief));
+        assert_eq!(lock.with(|g| g.holder()), None, "the steal released");
+
+        assert!(
+            may_write_reclaiming(&lock, held),
+            "a held boundary origin did not reclaim the freed lock; the endpoint is \
+             free but untakeable — held priority denies every other origin too (§15.23)"
+        );
+        assert_eq!(lock.with(|g| g.holder()), Some(held));
+    }
+
+    #[tokio::test]
+    async fn the_boundary_gate_does_not_invent_a_grant_for_an_on_demand_origin() {
+        // The other half of the gate's contract: reclaim is a `held`-only rule, so an
+        // on-demand origin still has to acquire explicitly (§6 exclusive-by-default).
+        let lock = empty_lock();
+        let id = OriginId(7);
+        lock.with_mut(|g| g.register(id, "console", WriteMode::OnDemand));
+        assert!(
+            !may_write_reclaiming(&lock, id),
+            "an on-demand origin was granted a free lock it never asked for"
+        );
+        assert_eq!(lock.with(|g| g.holder()), None);
+    }
+
     // --- the shared edge attachment (SIMPB-1) -----------------------------------
 
     /// One attached edge and everything a test inspects it through.
@@ -2107,6 +2264,61 @@ mod tests {
         assert!(out.addressable, "and is addressable by `lock`/`unlock`");
         assert_eq!(lock.with(|g| g.holder()), Some(OriginId(9)));
         assert!(slot.origin().is_some(), "a writable origin was installed");
+    }
+
+    #[tokio::test]
+    async fn attach_edge_attaches_nothing_when_the_edge_inbox_is_full() {
+        // 37-DATA-1. A full inbox is a *transient* — the consumer's pump has not been
+        // polled since the last few connects, and the entries ahead of us are stale
+        // (closed, already drained) — not the permanent no-pump condition
+        // `consumer_live` names. Handing it the same `false` used to leave a
+        // configured edge registered on the lock, sitting in the fan-out, and
+        // hostward-dead for good, under a diagnosis pointing at a healthy node.
+        let lock = empty_lock();
+        let (host_tx, _host_rx) = mpsc::channel::<Chunk>(4);
+        let (inbox_tx, _inbox_rx) = mpsc::channel(EDGE_INBOX_CAP);
+        for _ in 0..EDGE_INBOX_CAP {
+            let (_tx, rx) = mpsc::channel::<Chunk>(1);
+            inbox_tx.try_send(rx).expect("prefill the inbox");
+        }
+        let slot = TargetEdge::new();
+        let fanout = FanOutList::new();
+        let out = attach_edge(
+            EdgeParts {
+                target: "logger".parse().expect("address parses"),
+                origin: OriginId(9),
+                lock: Some(lock.clone()),
+                host_targetward: Some(host_tx),
+                fanout: fanout.clone(),
+                inbox: inbox_tx,
+                slot: slot.clone(),
+                counters: Arc::new(DropCounters::default()),
+            },
+            WriteMode::OnDemand,
+            4,
+        );
+
+        assert!(!out.consumer_live);
+        assert!(
+            out.registered.is_none(),
+            "a refused attachment registered an origin on the lock anyway"
+        );
+        assert!(!out.addressable);
+        assert!(!out.granted);
+        assert!(
+            !slot.with(|e| e.attached),
+            "a refused attachment filled the consumer's edge slot"
+        );
+        assert!(
+            fanout.is_empty(),
+            "a refused attachment joined the fan-out, so the producer now broadcasts \
+             into a receiver nobody holds"
+        );
+        assert!(
+            lock.with(|g| g.snapshot().origins.is_empty()),
+            "a refused attachment left an origin in `state` for an edge that carries \
+             no bytes"
+        );
     }
 
     // --- the shared targetward send-and-charge step (SIMP-2) --------------------

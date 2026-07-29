@@ -28,6 +28,11 @@
         <span id="pane-title">select a console</span>
         <span id="pane-lock"></span>
         <span id="pane-drops"></span>
+        <!-- The minimal ANSI subset's unknown-sequence tally (§17): the counter is
+             §5's honesty on the one surface where the operator cannot otherwise see
+             what was thrown away, which it only is once it is on screen. Beside the
+             drop badge, because the two report different losses of one stream. -->
+        <span id="pane-unknown" title="escape sequences this console's minimal ANSI subset consumed instead of rendering (§17)"></span>
         <span id="pane-storage" class="storage"></span>
         <span id="pane-tools">
           <button id="exportbtn" type="button" disabled>export</button>

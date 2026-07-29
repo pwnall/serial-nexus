@@ -8,6 +8,14 @@
 #     fallback (§7.2).
 #   - P1 (EXTPROC/TIOCPKT) may be `supported` OR `degraded` — the §7.2
 #     reconciliation poll is an unconditional backstop.
+#   - P3 (serial-port fit) may be `supported`, `degraded` OR `skipped` — it is opt-in
+#     behind --port (it opens a real device), so the passive run this gate normally
+#     makes skips, a port whose driver refuses a control degrades by design (§13), and
+#     an unreadable port skips with the reason attached. Every word being admissible is
+#     the point: the clause is a PRESENCE clause, and it exists because presence was
+#     the one thing nothing checked — a report that lost the P3 block entirely used to
+#     pass this file while its header claimed completeness against the 7.0 baseline
+#     (37-TOOL-5). `unsupported` is still refused, by the summary clause above.
 #   - P4 may be `supported` or `skipped` (skipped when no adapter is present).
 #   - P5 (rig discovery/certification) may be `supported`, `skipped` OR
 #     `degraded` — it is opt-in (transmits), so a run without --port skips; a run
@@ -49,6 +57,7 @@
 (.summary.unsupported == 0)
 and (any(.probes[]; .id == "P2" and .status == "supported"))
 and (any(.probes[]; .id == "P1" and (.status == "supported" or .status == "degraded")))
+and (any(.probes[]; .id == "P3" and (.status == "supported" or .status == "degraded" or .status == "skipped")))
 and (any(.probes[]; .id == "P4" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P5" and (.status == "supported" or .status == "skipped" or .status == "degraded")))
 and (any(.probes[]; .id == "P6" and (.status == "supported" or .status == "degraded")))

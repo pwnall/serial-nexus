@@ -19,7 +19,16 @@ import sys
 
 
 def read_exact(f, n):
-    """Read exactly n bytes, or return None at a clean EOF on a frame boundary."""
+    """Read exactly n bytes, or return None if the stream ends before n arrive.
+
+    None does NOT mean "a frame boundary": a short read mid-frame returns None too,
+    and the caller silently drops the partial frame. That is deliberate and worth
+    copying — the writer's end of this pipe can go away between any two reads, so a
+    truncated trailing frame is an ordinary teardown shape rather than corruption,
+    and a codec that raised on it would turn every clean stop into an error. What it
+    costs is that this function cannot tell the two apart, so it is not the thing to
+    reach for where a truncated frame has to be *reported*.
+    """
     buf = bytearray()
     while len(buf) < n:
         chunk = f.read(n - len(buf))

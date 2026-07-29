@@ -193,6 +193,7 @@ object with structured detail.
 | `-32004` | has edges | `remove-node` refused because edges are still attached and `--cascade` was not given |
 | `-32005` | device absent | `add-node` by raw path or serial number, but the device is not present so its identity cannot be captured (§12) |
 | `-32006` | waiting verb in flight | a request was pipelined behind an in-flight waiting verb on the same connection; §15.20 runs one at a time, and the wait, its taps and its subscription are all left intact |
+| `-32007` | edge inbox full | `connect` refused: the target-facing endpoint has not drained the hostward receivers of its earlier edges yet. Transient — nothing changed, retry |
 
 The `-32002` row's "always" is worth reading twice, because it was not always true:
 every path that refuses a configuration — `load`, `add-node`, `connect`, and the

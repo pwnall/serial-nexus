@@ -16,7 +16,7 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -325,6 +325,20 @@ struct WireArgs {
     /// flowing. Holds for `--hold-ms`.
     #[arg(long)]
     stall: bool,
+    /// Connect and then say (almost) nothing for this long (ms), driving the peer's
+    /// **overall handshake deadline** (§15.24: a trickling peer cannot wedge a
+    /// listener). On its own this is a mute peer — the connection opens and no hello
+    /// ever arrives; with `--trickle-hello` the hello is dribbled a byte at a time
+    /// across the window instead, so the peer sees a stream that is alive and never
+    /// completes. Either way the peer must hang up on its own deadline, and that —
+    /// observed as EOF inside the window — is the verdict. Sending nothing is the
+    /// whole point, so this runs *instead of* the ordinary hello.
+    #[arg(long)]
+    mute_ms: Option<u64>,
+    /// With `--mute-ms`: dribble the hello one byte at a time across the window,
+    /// deliberately withholding its final byte, rather than withholding all of it.
+    #[arg(long)]
+    trickle_hello: bool,
     /// Send `<channel>=<size>` seeded hostward data after the handshake
     /// (repeatable), e.g. `--send c0=64KiB`.
     #[arg(long = "send")]
@@ -1911,6 +1925,22 @@ impl SimStream {
         }
         Ok(())
     }
+    fn set_nonblocking(&self, on: bool) -> anyhow::Result<()> {
+        match self {
+            SimStream::Tcp(s) => s.set_nonblocking(on)?,
+            SimStream::Unix(s) => s.set_nonblocking(on)?,
+        }
+        Ok(())
+    }
+}
+
+impl AsFd for SimStream {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            SimStream::Tcp(s) => s.as_fd(),
+            SimStream::Unix(s) => s.as_fd(),
+        }
+    }
 }
 
 impl Read for SimStream {
@@ -1946,6 +1976,50 @@ fn is_timeout(e: &std::io::Error) -> bool {
     )
 }
 
+/// Milliseconds left until `deadline`, saturating at zero and clamped to `u16` —
+/// the shape [`wait_readable`]/[`wait_writable`] take.
+fn ms_until(deadline: Instant) -> u16 {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis()
+        .min(u16::MAX as u128) as u16
+}
+
+/// Write `buf` to a **non-blocking** socket with an overall deadline, returning how
+/// many bytes actually reached it. A short write parks in `poll(POLLOUT)` for what is
+/// left of the budget and no longer.
+///
+/// The stall mode's peer is by construction one that has stopped reading, so a plain
+/// `write_all` on a blocking socket parked there forever once the send buffer filled:
+/// the hold deadline was only ever checked *between* rounds, so the mode built to
+/// expose head-of-line blocking became the thing it was exposing — no verdict line, no
+/// exit, and the §9 conformance driver's verdict-on-exit contract broken (37-TOOL-4).
+/// A partial return is therefore a *result*, not an error: the caller stops the round
+/// and reports what went out.
+fn write_bounded(stream: &mut SimStream, buf: &[u8], deadline: Instant) -> usize {
+    let mut off = 0usize;
+    while off < buf.len() {
+        match stream.write(&buf[off..]) {
+            Ok(0) => break,
+            Ok(n) => off += n,
+            Err(e) if is_timeout(&e) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                // POLLERR/POLLHUP arrive unrequested; the `write` above decides what
+                // they mean next round, so nothing is masked here. A poll that times
+                // out is not necessarily the budget running out — `ms_until` clamps at
+                // `u16::MAX` — so the loop's own deadline check settles that.
+                if wait_writable(&*stream, ms_until(deadline).max(1)).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    off
+}
+
 // --- wire mode -------------------------------------------------------------
 
 fn run_wire(a: WireArgs) -> Value {
@@ -1973,6 +2047,11 @@ fn run_wire_inner(a: &WireArgs) -> anyhow::Result<Value> {
         // Force the requested version even when it differs from ours (the
         // struct carries it, so encode_hello emits it verbatim).
         encode_hello(&hello, &mut hello_bytes).map_err(|e| anyhow::anyhow!("encode hello: {e}"))?;
+    }
+    // A peer that never completes its hello (§15.24) runs *instead of* the ordinary
+    // handshake and owns its own verdict — sending nothing is the behavior.
+    if let Some(mute_ms) = a.mute_ms {
+        return wire_mute(&mut stream, a, Duration::from_millis(mute_ms), &hello_bytes);
     }
     stream.write_all(&hello_bytes)?;
     stream.flush()?;
@@ -2031,8 +2110,14 @@ fn run_wire_inner(a: &WireArgs) -> anyhow::Result<Value> {
     if a.stall {
         let deadline = Instant::now() + Duration::from_millis(a.hold_ms);
         let mut streamed: u64 = 0;
-        let mut round: u64 = 0;
+        let mut framed: u64 = 0;
         let block = seeded_bytes(a.seed, 16 * 1024);
+        // Bounded writes for the whole mode: a peer that has stopped reading is the
+        // shape this mode exists to expose, and a blocking `write_all` against one
+        // never returns (37-TOOL-4). Non-blocking plus a POLLOUT wait bounded by the
+        // remaining hold budget keeps the verdict on the exit path.
+        stream.set_nonblocking(true)?;
+        let mut write_stalled = false;
         while Instant::now() < deadline {
             for ch in &a.announce {
                 let mut frame = Vec::new();
@@ -2041,21 +2126,34 @@ fn run_wire_inner(a: &WireArgs) -> anyhow::Result<Value> {
                     &mut frame,
                 )
                 .is_ok()
-                    && stream.write_all(&frame).is_ok()
                 {
+                    framed += block.len() as u64;
+                    let wrote = write_bounded(&mut stream, &frame, deadline);
+                    if wrote < frame.len() {
+                        // The budget ran out inside one frame: the peer stopped
+                        // reading and stayed stopped. That is a finding, not a
+                        // failure — report it and end the hold.
+                        write_stalled = true;
+                        break;
+                    }
                     streamed += block.len() as u64;
                 }
             }
-            round += 1;
+            if write_stalled {
+                break;
+            }
             // Do NOT read the socket. A tiny pause bounds the hostward rate.
             thread::sleep(Duration::from_millis(5));
         }
-        let _ = round;
         return Ok(json!({
             "tool": "serial-nexus-sim", "mode": "wire",
             "behavior": "stall",
             "peer_version": peer_hello.as_ref().map(|h| h.version),
+            // Payload bytes that reached the socket, against what was framed for it:
+            // the two diverge exactly when `write_stalled` is true.
             "streamed_hostward": streamed,
+            "framed_hostward": framed,
+            "write_stalled": write_stalled,
             "pass": peer_hello.is_some(),
         }));
     }
@@ -2140,6 +2238,90 @@ fn run_wire_inner(a: &WireArgs) -> anyhow::Result<Value> {
         "peer_closed": peer_closed,
         "sent": sent, "echoed": echoed,
         "pass": pass,
+    }))
+}
+
+/// `--mute-ms` (optionally with `--trickle-hello`): connect, never complete a hello,
+/// and watch for the peer's own refusal — §15.24's "a trickling peer cannot wedge a
+/// listener", put as a question to a real listener.
+///
+/// The property under test is that the listener bounds the **whole** handshake rather
+/// than each read. A peer dribbling one byte at a time keeps every individual read
+/// productive while the hello never completes, so a per-read bound never fires; and
+/// because the reject-extras arm runs only *after* the handshake, one such peer would
+/// hold the listener against every peer behind it. The verdict is therefore simply
+/// whether the peer hung up (EOF) inside the window.
+///
+/// `--trickle-hello` withholds the hello's **final byte** rather than pacing to a rate
+/// the peer's deadline is assumed to lose to: incompleteness then holds for the whole
+/// window by construction, whatever that deadline turns out to be.
+fn wire_mute(
+    stream: &mut SimStream,
+    a: &WireArgs,
+    window: Duration,
+    hello: &[u8],
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + window;
+    let dribble: &[u8] = if a.trickle_hello && !hello.is_empty() {
+        &hello[..hello.len() - 1]
+    } else {
+        &[]
+    };
+    // Spread the dribble across the window with one step left over, so the last byte
+    // we are willing to send still lands inside it.
+    let step = window / (dribble.len() as u32 + 1);
+    let mut next_byte_at = Instant::now() + step;
+    let mut sent = 0usize;
+    let mut peer_bytes = 0u64;
+    let mut peer_closed = false;
+    let mut sink = [0u8; 4096];
+    while Instant::now() < deadline {
+        if sent < dribble.len() && Instant::now() >= next_byte_at {
+            // A write failing here *is* the hang-up (EPIPE after the peer closed),
+            // not an error verdict — the refusal is what this mode wants.
+            if stream.write_all(&dribble[sent..sent + 1]).is_err() || stream.flush().is_err() {
+                peer_closed = true;
+                break;
+            }
+            sent += 1;
+            next_byte_at = Instant::now() + step;
+        }
+        // Park in the read — never a spin (plan §3 rule 2) — until the next byte is
+        // due or the window ends, whichever comes first. A zero timeout means
+        // *blocking forever* to `SO_RCVTIMEO`, so the wait has a 1 ms floor.
+        let until = if sent < dribble.len() {
+            next_byte_at.min(deadline)
+        } else {
+            deadline
+        };
+        let wait = until
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        stream.set_read_timeout(Some(wait))?;
+        match stream.read(&mut sink) {
+            Ok(0) => {
+                peer_closed = true;
+                break;
+            }
+            Ok(n) => peer_bytes += n as u64,
+            Err(e) if is_timeout(&e) => {}
+            Err(_) => {
+                peer_closed = true;
+                break;
+            }
+        }
+    }
+    Ok(json!({
+        "tool": "serial-nexus-sim", "mode": "wire",
+        "behavior": if a.trickle_hello { "trickle-hello" } else { "mute" },
+        "hello_bytes_sent": sent,
+        "hello_bytes_withheld": hello.len() - sent,
+        // What the peer said before giving up — its own hello, which it writes first.
+        "peer_bytes": peer_bytes,
+        "peer_closed": peer_closed,
+        // The peer must refuse on its own overall handshake deadline. A window that
+        // elapsed with the connection still open *is* the wedge §15.24 forbids.
+        "pass": peer_closed,
     }))
 }
 

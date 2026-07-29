@@ -28,12 +28,16 @@
 //!   *link* name as the device name, missed every lookup, and degraded to `raw:`
 //!   carrying the "not stable across reboots" warning — backwards for the one path
 //!   whose purpose is reboot stability.
+//! * Review 37 `RES-1` — the same fault, one arm later and unreached by the fixes
+//!   above: **bare-serial** input still read by-id alone, so `add-node device =
+//!   "<serial>"` answered DEVICE_ABSENT in the very tree the RES-2 test builds, and
+//!   a serial two adapters carry captured whichever clone owned udev's single link.
 //!
 //! Ground truth is structured RPC only (`add-node`/`state`/`ports`/`dump`), never
-//! CLI text (§5). Three of the four tests are device-free — the fixture is
-//! symlinks, text files and FIFOs, so they run on every platform. The fourth needs
-//! an openable sim-pty serial device to prove the node actually *comes up*, which
-//! is Linux-only (a pts is not a `serial2` device on macOS, `ENOTTY`), so it
+//! CLI text (§5). Six of the seven tests are device-free — the fixture is symlinks,
+//! text files and FIFOs, so they run on every platform. The seventh needs an
+//! openable sim-pty serial device to prove the node actually *comes up*, which is
+//! Linux-only (a pts is not a `serial2` device on macOS, `ENOTTY`), so it
 //! self-skips.
 
 use std::path::Path;
@@ -41,6 +45,10 @@ use std::time::Duration;
 
 use serde_json::Value;
 use serial_nexus_itest::{Daemon, Sim, TempRun, serial_echo};
+
+/// JSON-RPC's standard invalid-params code, which is what `add-node` returns for
+/// structurally unusable resolver input (`ResolveError::Malformed`).
+const INVALID_PARAMS: i64 = -32602;
 
 /// Write `contents` to `p`, creating parents.
 fn write(p: &Path, contents: &str) {
@@ -463,6 +471,137 @@ fn adding_by_the_canonical_by_id_path_captures_the_usb_identity() {
             .unwrap_or_else(|| panic!("{name} missing from dump: {dumped:#}"));
         assert_eq!(device, "usb:0403:6001:A6008isP:00", "{dumped:#}");
         rpc.remove_node(name, false).expect("remove-node");
+    }
+}
+
+#[test]
+fn adding_by_a_bare_serial_number_works_without_a_by_id_tree() {
+    // Review 37 `RES-1`, the arm the RES-2 remediation did not reach. §12 makes the
+    // bare serial number a first-class capture form, and it read `/dev/serial/by-id`
+    // alone — so in the very tree the RES-2 test above builds (`/sys` mounted, no
+    // udev serial links at all) `add-node device = "UNIQ01"` came back DEVICE_ABSENT
+    // for an adapter that is right there. Same failure class as RES-2, same
+    // diagnostic pointing away from the cause, one arm over.
+    //
+    // Fail-first (unit level, `core/src/resolver.rs`): `resolve_input("UNIQ01")`
+    // returned `NotPresent { input: "UNIQ01" }` on this fixture.
+    let run = TempRun::new();
+    let root = run.join("devroot");
+    fifo(&root.join("dev/ttyUSB0"));
+    sysfs_device(
+        &root,
+        "1-1",
+        "ttyUSB0",
+        "0403",
+        "6001",
+        Some("UNIQ01"),
+        "00",
+        ("FTDI", "FT232R USB UART"),
+    );
+    assert!(
+        !root.join("dev/serial").exists(),
+        "the fixture must model a tree with no udev serial links at all"
+    );
+
+    let d = Daemon::start_with_args(&["--dev-root", root.to_str().expect("utf-8 fixture path")]);
+    let rpc = d.rpc();
+
+    let echo = rpc
+        .add_node_toml(&node_toml("console", "UNIQ01"))
+        .unwrap_or_else(|e| {
+            panic!(
+                "bare-serial add of a present adapter: [{}] {}",
+                e.code, e.message
+            )
+        });
+    // The serial number and the path are two spellings of one act on one device, so
+    // they must capture the same identity — a divergence is the resolver holding a
+    // second opinion about what binding it stores.
+    assert_eq!(str_at(&echo, "identity"), Some("usb:0403:6001:UNIQ01:00"));
+    assert_eq!(str_at(&echo, "kind"), Some("usb"));
+    assert_eq!(
+        echo.get("warning").unwrap_or(&Value::Null),
+        &Value::Null,
+        "a usb capture carries no fallback warning: {echo:#}"
+    );
+    assert!(
+        str_at(&echo, "resolved_path").is_some_and(|p| p.ends_with("/dev/ttyUSB0")),
+        "the capture did not bind the adapter it just described: {echo:#}"
+    );
+
+    // And what `dump` round-trips is the canonical identity, not the serial number
+    // the operator typed — so the configuration survives a cold start.
+    let dumped = rpc.dump();
+    let device = dumped["node"]
+        .as_array()
+        .expect("dump.node array")
+        .iter()
+        .find(|n| n["name"] == "console")
+        .and_then(|n| n["device"].as_str())
+        .unwrap_or_else(|| panic!("console missing from dump: {dumped:#}"));
+    assert_eq!(device, "usb:0403:6001:UNIQ01:00", "{dumped:#}");
+}
+
+#[test]
+fn a_bare_serial_number_two_adapters_carry_is_refused_naming_both() {
+    // `RES-1`'s ambiguity half. A raw path pins the device, so capture can degrade a
+    // duplicated serial to *that* device's by-path identity (§15.10); a serial
+    // number pins nothing, so there is no device to degrade to and picking one binds
+    // a physical port the operator never named. Before the fix the by-id scan found
+    // the single link udev publishes for the colliding name and captured whichever
+    // clone happened to own it — silently, with no warning anywhere.
+    //
+    // Fail-first (unit level): `resolve_input("DUP")` returned
+    // `Ok(Resolved { identity: "raw:/dev/ttyUSB0", … })` on this fixture.
+    let run = TempRun::new();
+    let root = run.join("devroot");
+    for (usbdir, dev_name, port) in [
+        ("1-1", "ttyUSB0", "pci-0000:00:14.0-usb-0:1:1.0-port0"),
+        ("2-1", "ttyUSB1", "pci-0000:00:14.0-usb-0:2:1.0-port0"),
+    ] {
+        fifo(&root.join("dev").join(dev_name));
+        sysfs_device(
+            &root,
+            usbdir,
+            dev_name,
+            "0403",
+            "6001",
+            Some("DUP"),
+            "00",
+            ("FTDI", "FT232R USB UART"),
+        );
+        by_path_link(&root, port, dev_name);
+    }
+    by_id_link(&root, "usb-FTDI_FT232R_USB_UART_DUP-if00-port0", "ttyUSB0");
+
+    let d = Daemon::start_with_args(&["--dev-root", root.to_str().expect("utf-8 fixture path")]);
+    let rpc = d.rpc();
+
+    let err = rpc
+        .add_node_toml(&node_toml("console", "DUP"))
+        .expect_err("a serial number two adapters carry must bind neither");
+    assert_eq!(
+        err.code, INVALID_PARAMS,
+        "an ambiguous serial is bad input, not an absent device: [{}] {}",
+        err.code, err.message
+    );
+    assert!(
+        err.message.contains("ttyUSB0") && err.message.contains("ttyUSB1"),
+        "the refusal must name every device that carries the serial: {}",
+        err.message
+    );
+    // Nothing was created, and the operator's way out is in front of them: `ports`
+    // lists both adapters under the by-path identity that pins one each.
+    assert!(
+        rpc.node("console").is_none(),
+        "a refused add created a node: {}",
+        rpc.state()
+    );
+    let ports = rpc.ports();
+    for dev_name in ["ttyUSB0", "ttyUSB1"] {
+        let p =
+            port_for(&ports, dev_name).unwrap_or_else(|| panic!("{dev_name} unlisted: {ports:#}"));
+        assert_eq!(str_at(p, "kind"), Some("by-path"), "{p:#}");
     }
 }
 

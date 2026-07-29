@@ -51,8 +51,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"
 anyhow = "1"
 
-# Serial ports (§13: serial2 chosen over the MPL serialport stack). serial2 is
-# opened blocking and driven by the daemon's own poll-based readiness (§15.18);
+# Serial ports (§13: serial2 chosen over the MPL serialport stack). serial2 opens
+# with `O_NONBLOCK | O_NOCTTY` and the daemon drives readiness with its own
+# poll(2) loop (§15.18), re-setting O_NONBLOCK itself so that loop's correctness
+# never rests on a dependency's open flags (review 37 `37-SER-3`);
 # serial2-tokio was dropped during implementation for exposing no accessor for the
 # inner fd, which the TIOCEXCL/TIOCGICOUNT ioctls require (§13, §15.1).
 serial2 = "0.2"

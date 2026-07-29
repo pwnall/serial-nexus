@@ -2612,6 +2612,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_oversize_name_or_channel_identity_is_rejected() {
+        // §3/§16.12's length bound, at the level `load`, `add-node` and `connect`
+        // actually run: the bound was proven only against directly built
+        // `GraphModel` shapes, so nothing pinned that `GraphConfig::validate` still
+        // reaches it — and a channel identity that crosses this level unbounded
+        // rides the header of every frame carrying its bytes, leaving the shared
+        // fragmenter unable to place a single byte (§5, §9 clause 4). The
+        // whitespace sibling above has exactly this config-level proof.
+        let long = "c".repeat(crate::graph::MAX_NAME_LEN + 1);
+        let leg = |name: &str, channels: Vec<String>| NodeConfig::Leg {
+            name: name.into(),
+            faces: Facing::Target,
+            transport: Transport::Unix,
+            role: LegRole::Connect,
+            address: "/run/snx/leg.sock".into(),
+            insecure_bind: false,
+            reconnect_initial_ms: 200,
+            reconnect_max_ms: 5_000,
+            idle_release_ms: 1_000,
+            purge_on_reconnect: true,
+            arbitration: Arbitration::Exclusive,
+            replay_ring: DEFAULT_REPLAY_RING,
+            channels,
+        };
+        let cfg = GraphConfig {
+            nodes: vec![
+                leg(&long, vec!["c0".into()]),
+                leg("uplink", vec![long.clone()]),
+            ],
+            edges: vec![],
+        };
+        let errs = cfg.validate();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::NameTooLong { node, endpoint: None, len, max }
+                    if node == &long
+                        && *len == crate::graph::MAX_NAME_LEN + 1
+                        && *max == crate::graph::MAX_NAME_LEN
+            )),
+            "expected NameTooLong for the node name, got {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::NameTooLong { node, endpoint: Some(c), .. }
+                    if node == "uplink" && c == &long
+            )),
+            "expected NameTooLong for the channel identity, got {errs:?}"
+        );
+
+        // The bound is a ceiling, not a fence: the same configuration exactly at the
+        // cap validates clean, so a guard that simply refused long-ish names would
+        // not satisfy this.
+        let at_cap = "c".repeat(crate::graph::MAX_NAME_LEN);
+        let ok = GraphConfig {
+            nodes: vec![leg(&at_cap, vec![at_cap.clone()])],
+            edges: vec![],
+        };
+        assert!(
+            !ok.validate()
+                .iter()
+                .any(|e| matches!(e, ValidationError::NameTooLong { .. })),
+            "names exactly at the cap must be accepted: {:?}",
+            ok.validate()
+        );
+    }
+
     // Proptest strategies producing well-typed (not necessarily graph-valid)
     // configurations, to prove serde round-trips. Every enum variant, every
     // Some/None option, non-default numerics, and edges are all reachable, so a

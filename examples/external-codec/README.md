@@ -14,14 +14,17 @@ contracts — never a dynamically loaded plugin:
   line — `Registry::with_builtins().register("acme", …)` — before `serial_nexus_daemon::run`.
 
 Everything else in the ecosystem — `serial-nexus-ctl`, `serial-nexus-sim`, `serial-nexus-doctor`,
-the validation scripts — works against `acme-daemon` unchanged, because they speak
+the `serial-nexus-itest` harness — works against `acme-daemon` unchanged, because they speak
 the RPC surface and the envelope, never the codec list (§15.16).
 
 The path dependencies here (`../../../codec-api`, `../../../daemon`) stand in
 for the version pins a real consumer would use against a released open core. This
 workspace is **excluded** from the root serial_nexus workspace and built from the
-consumer's own position by `scripts/validate/phase8/external-codec.sh`, so the
-pattern is proven to compile on every push rather than merely promised (plan §10.3).
+consumer's own position by `itest/tests/p8_external_codec.rs`, so the pattern is
+proven to compile *and serve* on every push rather than merely promised (plan
+§10.3). That gate builds this workspace from its own manifest with `--locked`, runs
+`acme-codec`'s conformance-kit test, boots `acme-daemon`, and asserts both the `info`
+codec list below and that a `codec = "acme"` node loads.
 
 ## Build and run
 
@@ -34,7 +37,13 @@ export XDG_RUNTIME_DIR=$(mktemp -d /tmp/acme.XXXXXX)
 ./target/debug/acme-daemon &
 
 # The daemon reports its own codec alongside the built-ins:
-serial-nexus-ctl --json info | jq '.codecs'      # ["acme","reference"]
+serial-nexus-ctl --json info | jq '.codecs'      # ["acme","exec","reference"]
 ```
+
+`exec` is in that list without being in the registry: it is a child-*process*
+boundary (§7.6/§15.22) routed before the registry is consulted, and its name is
+reserved so an embedder cannot shadow it. `info` answers the operator's question —
+which codec names a configuration may legally name — so it unions the reserved names
+over the registered ones rather than reporting the registry directly.
 
 A config may then name `codec = "acme"` on a `[[node]]` of `type = "codec"`.

@@ -28,8 +28,16 @@
 //! returns `None`. Data-plane ground truth is the sim client's byte-exact
 //! `sha256_sent`/`sha256_received`, never a judgement (§5). The two legs themselves
 //! run everywhere; only the echo round-trip needs the device.
+//!
+//! Three further leg-lifecycle guards follow it, each under its own section header
+//! and each needing no serial device: the receiving side's purge in both of its
+//! orderings — the peer that holds until the channel task is parked (LEG-3) and the
+//! peer that sends and leaves in one poll (37-LEG-1) — and the listen role's bind
+//! healing after a refusal (37-LEG-2).
 
-use std::net::TcpListener;
+use std::io::Write;
+use std::net::{Shutdown, TcpListener};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -474,32 +482,14 @@ fn waiters(rpc: &Rpc) -> Vec<String> {
         .unwrap_or_default()
 }
 
-#[test]
-fn a_receiving_leg_purges_its_own_targetward_backlog_on_peer_disconnect() {
-    // §6/§7.4's purge-on-reconnect guarantee — "twenty minutes of buffered commands
-    // must not fire into its boot prompt" — held on the *sending* side (asserted by
-    // the test above) and, until LEG-3, silently did not on the receiving one: a
-    // `faces = target` leg owns a bounded queue of wire-arriving chunks plus the one
-    // it is currently trying to write, and nothing purged them when the peer went
-    // away. The code comment even denied the backlog existed.
-    //
-    // The backlog is built deterministically rather than by racing a proxy: a second
-    // writer (`hog`) holds the local endpoint's write lock, so the leg's channel task
-    // takes its first chunk, parks in the FIFO queue behind `hog` — visible in
-    // `usb0.lock.waiters` — and everything after it stacks up in the channel's
-    // inbound queue. That parked chunk *is* §6's "chunk held by a producer suspended
-    // mid-send", the case a single non-yielding `try_recv` pass misses.
-    //
-    // No serial device: `usb0`'s device is absent, so it is `waiting` while its lock
-    // and origins exist structurally — this runs on every platform.
-    const FRAMES: usize = 4;
-    const FRAME_LEN: u64 = 64;
-    const TOTAL: u64 = FRAMES as u64 * FRAME_LEN;
-
-    let d = Daemon::start();
-    let rpc = d.rpc();
-    let leg = d.run().join("leg.sock");
-    let cfg = format!(
+/// The graph both receiving-side purge tests drive: a `faces = target` leg whose
+/// wire-arriving commands go targetward into `usb0`, plus a second local writer
+/// (`hog`) that can hold `usb0`'s floor so the leg's backlog is *built* rather than
+/// raced. `usb0`'s device is deliberately absent, so it is `waiting` while its lock
+/// and origins exist structurally — which is all the purge is about, and is why these
+/// two tests need no serial hardware and run on every platform.
+fn receiving_leg_config(dev: &Path, hog: &Path, leg: &Path) -> String {
+    format!(
         r#"
 [[node]]
 type = "serial"
@@ -526,10 +516,38 @@ write_mode = "on-demand"
 a = "usb0"
 b = "hog"
 "#,
-        dev = d.run().join("absent-device").display(),
-        hog = d.run().join("hog").display(),
+        dev = dev.display(),
+        hog = hog.display(),
         leg = leg.display(),
-    );
+    )
+}
+
+#[test]
+fn a_receiving_leg_purges_its_own_targetward_backlog_on_peer_disconnect() {
+    // §6/§7.4's purge-on-reconnect guarantee — "twenty minutes of buffered commands
+    // must not fire into its boot prompt" — held on the *sending* side (asserted by
+    // the test above) and, until LEG-3, silently did not on the receiving one: a
+    // `faces = target` leg owns a bounded queue of wire-arriving chunks plus the one
+    // it is currently trying to write, and nothing purged them when the peer went
+    // away. The code comment even denied the backlog existed.
+    //
+    // The backlog is built deterministically rather than by racing a proxy: a second
+    // writer (`hog`) holds the local endpoint's write lock, so the leg's channel task
+    // takes its first chunk, parks in the FIFO queue behind `hog` — visible in
+    // `usb0.lock.waiters` — and everything after it stacks up in the channel's
+    // inbound queue. That parked chunk *is* §6's "chunk held by a producer suspended
+    // mid-send", the case a single non-yielding `try_recv` pass misses.
+    //
+    // No serial device: `usb0`'s device is absent, so it is `waiting` while its lock
+    // and origins exist structurally — this runs on every platform.
+    const FRAMES: usize = 4;
+    const FRAME_LEN: u64 = 64;
+    const TOTAL: u64 = FRAMES as u64 * FRAME_LEN;
+
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let leg = d.run().join("leg.sock");
+    let cfg = receiving_leg_config(&d.run().join("absent-device"), &d.run().join("hog"), &leg);
     rpc.load_toml(&cfg, false)
         .expect("load receiving-leg graph");
     assert!(
@@ -621,5 +639,276 @@ b = "hog"
         wait_until(Duration::from_secs(5), || holder(rpc).is_none()),
         "the leg kept the local write lock after purging: {:?}",
         rpc.node("usb0")
+    );
+}
+
+// ---- 37-LEG-1: the same purge, for a peer that leaves in the same poll ----------
+
+/// A §9 `hello` frame in the shared envelope's wire layout: `u32 body_len | u32 magic
+/// | u16 version | u32 capabilities | u16 count | count × (u16 len | UTF-8 identity)`,
+/// big-endian throughout.
+///
+/// Hand-rolled on a raw socket, as `p12_leg_accounting` does: the harness does not
+/// depend on `serial-nexus-codec-api`, and the peer below has to put its **whole
+/// session** — hello, commands, and the half-close — on the wire before the daemon
+/// reads any of it. `serial-nexus-sim wire` offers no half-close, and a peer that
+/// closes both directions loses the race with the daemon's own hello (a full close
+/// mid-handshake is refused as a §9 clause-6 peer, and the commands are never read at
+/// all), so this is the one shape that makes the defect below deterministic rather
+/// than raced.
+fn hello_frame(channels: &[&str]) -> Vec<u8> {
+    const WIRE_MAGIC: u32 = 0x534E_584C; // "SNXL"
+    const WIRE_VERSION: u16 = 1;
+    let mut body = Vec::new();
+    body.extend_from_slice(&WIRE_MAGIC.to_be_bytes());
+    body.extend_from_slice(&WIRE_VERSION.to_be_bytes());
+    body.extend_from_slice(&0u32.to_be_bytes()); // capabilities
+    body.extend_from_slice(&(channels.len() as u16).to_be_bytes());
+    for ch in channels {
+        body.extend_from_slice(&(ch.len() as u16).to_be_bytes());
+        body.extend_from_slice(ch.as_bytes());
+    }
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// A §9 envelope data frame: `u32 body_len | u8 type=0 | u16 channel_len | channel |
+/// payload`, big-endian.
+fn data_frame(channel: &str, payload: &[u8]) -> Vec<u8> {
+    let mut body = vec![0u8]; // type 0 = data
+    body.extend_from_slice(&(channel.len() as u16).to_be_bytes());
+    body.extend_from_slice(channel.as_bytes());
+    body.extend_from_slice(payload);
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// Dial a `listen`+`unix` leg, retrying until it is *connectable* rather than merely
+/// until its socket file exists: `bind(2)` creates the inode and `listen(2)` is what
+/// stops `connect(2)` answering `ECONNREFUSED`, so a dial landing between them fails
+/// against a daemon that is coming up perfectly normally. Bounded and condition-driven
+/// rather than slept on (§5): the loop ends on the first success, and a leg that never
+/// listens fails loudly instead of hanging the suite.
+fn dial_leg(address: &Path) -> UnixStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match UnixStream::connect(address) {
+            Ok(s) => return s,
+            Err(e) if Instant::now() < deadline => {
+                assert!(
+                    matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ),
+                    "dial the leg at {}: {e}",
+                    address.display()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!(
+                "dial the leg at {}: {e} (still not accepting after 10 s)",
+                address.display()
+            ),
+        }
+    }
+}
+
+#[test]
+fn a_receiving_leg_purges_a_backlog_whose_peer_left_in_the_same_poll() {
+    // 37-LEG-1, the sibling above with the peer's hold removed. The receiving-side
+    // purge identifies an outage-era chunk by comparing the live disconnect epoch
+    // against the chunk's own — and the chunk's own used to be read *after*
+    // `rx.recv()` returned, which attributes it to whatever connection is live when
+    // the channel task is finally polled rather than to the one that delivered it.
+    //
+    // A peer that sends its commands and disconnects in one breath defeats that
+    // outright, and deterministically rather than by racing: the whole session is one
+    // `write(2)`, so the daemon's pump decodes every data frame, enqueues it, reads
+    // EOF and bumps the epoch inside a single poll of the supervise task — the channel
+    // task never gets to run in between, and the `Notify` pulse stores no permit, so
+    // there is nothing left for it to observe. Every queued chunk then snapshotted the
+    // *post*-bump epoch, both purge checks compared equal, and the dead connection's
+    // entire backlog was delivered into the device when the local floor freed:
+    // `accepted_targetward` credited, `purged_on_reconnect` zero — §6's stale-command
+    // hazard verbatim ("twenty minutes of buffered commands must not fire into its
+    // boot prompt").
+    //
+    // The sibling above pins only the peer-holds-until-parked ordering, in which the
+    // task takes its first chunk *before* the disconnect and so reads a pre-bump epoch
+    // by luck of scheduling.
+    const FRAMES: usize = 4;
+    const FRAME_LEN: usize = 64;
+    const TOTAL: u64 = (FRAMES * FRAME_LEN) as u64;
+
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let leg = d.run().join("leg.sock");
+    let cfg = receiving_leg_config(&d.run().join("absent-device"), &d.run().join("hog"), &leg);
+    rpc.load_toml(&cfg, false)
+        .expect("load receiving-leg graph");
+    assert!(
+        rpc.wait_status("hog", "active", Duration::from_secs(10)),
+        "hog pty not active: {:?}",
+        rpc.node("hog")
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || leg.exists()),
+        "the leg never bound its listen socket"
+    );
+
+    // A local writer holds the floor, so nothing the peer sends can be written while
+    // it is alive: the backlog is built by construction, not by rate.
+    rpc.lock("hog", false, false, None).expect("lock hog");
+    assert_eq!(holder(rpc).as_deref(), Some("hog"), "hog should hold usb0");
+
+    // The remote operator's whole session in one write: announce, four commands, then
+    // a half-close. Half rather than full, so the daemon's own hello still lands in
+    // the peer's receive buffer and the handshake completes — what must arrive
+    // together is the *backlog and the FIN*, which is exactly what the single write
+    // plus `shutdown(Write)` guarantees.
+    let mut session = hello_frame(&["c0"]);
+    for _ in 0..FRAMES {
+        session.extend_from_slice(&data_frame("c0", &[b'x'; FRAME_LEN]));
+    }
+    let mut peer = dial_leg(&leg);
+    peer.write_all(&session)
+        .expect("write the peer's whole session");
+    peer.flush().expect("flush the peer's session");
+    peer.shutdown(Shutdown::Write)
+        .expect("half-close the peer's writing direction");
+
+    // The pump read the backlog and the FIN together and ended the connection.
+    // `reconnect_count` is the unambiguous observable: the leg's `connection` reads
+    // `waiting` both before its first peer and after this one left.
+    assert!(
+        wait_until(Duration::from_secs(10), || reconnect_count(rpc, "uplink")
+            >= 1),
+        "the leg never registered the peer's disconnect: {:?}",
+        rpc.node("uplink")
+    );
+
+    // The local floor frees — the moment at which the unfixed daemon delivered a dead
+    // connection's backlog into the device.
+    rpc.unlock("hog").expect("unlock hog");
+
+    assert!(
+        wait_until(Duration::from_secs(10), || purged_on_reconnect(
+            rpc, "uplink", "c0"
+        ) == TOTAL),
+        "the backlog of a peer that left in the same poll was not purged \
+         (want {TOTAL} bytes, 37-LEG-1): {:?}",
+        rpc.node("uplink")
+    );
+    let node = rpc.node("uplink").expect("uplink node");
+    assert_eq!(
+        node.pointer("/channels/c0/accepted_targetward")
+            .and_then(Value::as_u64),
+        Some(0),
+        "an outage-era command reached the local graph: {node}"
+    );
+    // The purge is not a loss report in disguise (§5 keeps the two causes apart).
+    assert_eq!(
+        node.pointer("/channels/c0/discarded_targetward")
+            .and_then(Value::as_u64),
+        Some(0),
+        "purged bytes were also counted as an ordinary discard: {node}"
+    );
+    drop(peer);
+}
+
+// ---- 37-LEG-2: a listen bind that cannot happen *yet* heals on its own ----------
+
+#[test]
+fn a_refused_listen_bind_retries_until_the_address_frees() {
+    // §11: "environmental failures never fail a load: nodes whose environment is
+    // missing come up faulted-and-wait or waiting, visible in state, **healing on
+    // their own**", generalized to every boundary type by §15.8. A listen-role bind
+    // was the daemon's one environmental fault that never healed — it faulted the node
+    // and returned the supervisor, so the only recovery was remove-and-re-add
+    // (37-LEG-2), and every reason a bind fails is transient: an address whose
+    // interface is not up yet, a port a departing process still holds, a descriptor
+    // table momentarily exhausted.
+    //
+    // The incumbent below is a live socket at the leg's address, which the SEC-8
+    // reclaim rule correctly refuses to steal. Dropping it leaves the inode behind
+    // exactly as a crashed daemon would, so healing also requires the stale-socket
+    // check to re-run per attempt rather than being decided once.
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let leg = d.run().join("leg.sock");
+    let incumbent = std::os::unix::net::UnixListener::bind(&leg).expect("bind the incumbent");
+
+    let cfg = format!(
+        r#"
+[[node]]
+type = "leg"
+name = "downlink"
+faces = "host"
+transport = "unix"
+role = "listen"
+address = "{leg}"
+channels = ["console"]
+"#,
+        leg = leg.display(),
+    );
+    // The load succeeds — the configuration is structurally valid; it is the
+    // environment that refuses (§15.8).
+    rpc.load_toml(&cfg, false).expect("load leg graph");
+    assert!(
+        rpc.wait_status("downlink", "faulted", Duration::from_secs(10)),
+        "the leg did not fault on an occupied address: {:?}",
+        rpc.node("downlink")
+    );
+    let reason = rpc
+        .node("downlink")
+        .and_then(|n| {
+            n.get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase)
+        })
+        .unwrap_or_default();
+    assert!(
+        reason.contains("already listening"),
+        "the fault reason does not name what happened: {reason:?}"
+    );
+
+    // The incumbent goes away, leaving its inode behind.
+    drop(incumbent);
+    assert!(
+        wait_until(Duration::from_secs(20), || leg_connection(rpc, "downlink")
+            .as_deref()
+            == Some("waiting")),
+        "the leg never healed after its address freed: {:?}",
+        rpc.node("downlink")
+    );
+
+    // …and it is really listening, not merely reporting that it is: a peer connects
+    // and its announcement binds (§8).
+    let leg_str = leg.to_string_lossy().into_owned();
+    let _peer = Sim::spawn(
+        &[
+            "wire",
+            "--transport",
+            "unix",
+            "--address",
+            &leg_str,
+            "--announce",
+            "console",
+            "--hold-ms",
+            "8000",
+            "--timeout-ms",
+            "12000",
+        ],
+        None,
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            leg_connection(rpc, "downlink").as_deref() == Some("connected")
+                && channel_bound(rpc, "downlink", "console")
+        }),
+        "the healed leg never accepted a peer: {:?}",
+        rpc.node("downlink")
     );
 }

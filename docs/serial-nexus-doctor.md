@@ -163,11 +163,22 @@ Tier-2/3 run to start from it. That is not hypothetical — it is what the
 per-port `break` item is `set_break(true).is_ok() && set_break(false).is_ok()` on a
 port the doctor holds open alone — local ioctl acceptance — and `p5_certify_pair`
 transmits a rate ladder and a bulk baud-mismatch pattern and no break at all. So
-`brk` in P11 stays 0 at every tier on every kernel, and the Tier-1 verdict's old
-tail, "and no break was received by anything", was true of Tier 1 and equally true
-of Tier 3 while reading as though the tier were the reason. The 2026-07-29 Tier-3
-report is the proof: `break_ok: true` on both ports, `break=true` in both
-certificates, `brk=0` in both P11 blocks. Break *reception* is a job for
+**the doctor raises no `brk` on any port, at any tier, on any kernel**, and the
+Tier-1 verdict's old tail, "and no break was received by anything", was true of
+Tier 1 and equally true of Tier 3 while reading as though the tier were the reason.
+The two 2026-07-29 Tier-3 reports carry the assertion half on both boxes:
+`break_ok: true` on both ports and `break=true` in both certificates, on 6.18 and
+on 7.0 alike.
+
+*(Said as "`brk` stays 0 at every tier on every kernel" this would be a claim about
+the counter rather than about the doctor, and the 7.0 Tier-3 report falsifies that
+reading: `brk=2` on `/dev/ttyUSB1` there, against `brk=0` on both ports of the 6.18
+one. Which is the parenthetical below working as designed — the counter accumulates
+from driver bind, so a nonzero `brk` records a break something *other* than the
+doctor put on that line, and what did is not established by the report. The
+disambiguation is the one this page already prescribes for the same class of
+reading: replug the adapter, which rebinds the driver and zeroes the counters, and
+re-run.)* Break *reception* is a job for
 `p12_serial_exclusivity::a_break_straddled_by_a_replace_leaves_the_line_transmitting`,
 not for a probe.
 
@@ -218,9 +229,13 @@ as a null modem (`usb:0403:6001:BH00LL8O:00` on `/dev/ttyUSB0`,
 0 unsupported · 0 skipped** — 21 = 9 environment rows + 12 probe entries, P3 running
 once per named port. A **passive** run on the same box reported **17 supported ·
 3 skipped** (P3/P5/P11 skip without `--port`); both figures are real and neither
-supersedes the other. **That pair of adapters is no longer on this box** — it moved
-to the 6.18 production box on 2026-07-29, so neither figure is reproducible here
-today; the current passive figure is 13 · 6, below.
+supersedes the other. **That pair of adapters left this box and came back** — it
+moved to the 6.18 production box on 2026-07-29 and returned later the same day, so
+the *hardware* is here again while neither *figure* is reproducible: what moved
+under them is the instrument, not the rig (P12 arrived, P4 and P5 were rewritten —
+see the next paragraph but one). The two 7.0 figures that are in the tree today are
+**21 · 0 · 0 · 1** on the same cross-wired pair and **13 · 0 · 0 · 6** passive, both
+below.
 
 The raw numbers are not transcribed here — they change per box and per run, so
 the report itself is the record. Capture them with `serial-nexus-doctor --json >
@@ -245,31 +260,51 @@ a `Consequence` paragraph or a doc comment changes what an operator reads and le
 verified after the 2026-07-29 corrections below by rebuilding and re-running: still
 `01b257ece8c48470`.
 
-### All twelve probes at HEAD, 2026-07-29 — the baseline that is in the tree
+### All twelve probes, 2026-07-29 — the two 7.0 baselines that are in the tree
 
-Three sequential **passive** runs of the same `85699d66c5a5` binary, probe set
+**Tier 3, and it is the 7.0 run to read.** `da290c616631` binary, probe set
 `01b257ece8c48470`, committed as
+[`docs/doctor/linux-7.0-2026-07-29-tier3.json`](doctor/linux-7.0-2026-07-29-tier3.json).
+**21 supported · 0 degraded · 0 unsupported · 1 skipped** — 21 = 9 environment rows
++ 12 of the 13 probe rows (P3 runs once per named port, so twelve probes make
+thirteen rows); the thirteenth is P12, inert on Linux by design (§15.39), and it is
+the only non-supported row anywhere in the report. The cross-wired FT232R pair
+(`usb:0403:6001:BH00LL8O:00`, `usb:0403:6001:BH00L4KU:00`) came back to this box
+later on 2026-07-29 after its stay on the 6.18 production box, so P3/P5/P11 have two
+real ports again and P5 certifies at **Tier 3**: `rate_ladder=true
+deliberate_mismatch_observed=true`, with `custom_baud`/`break`/`icounter` true on
+both ports. Its `probe set` equals the 6.18 Tier-3 report's, which is this
+repository's stated comparability rule (`docs/doctor/README.md`) — the two commits
+differ, and the fingerprint, not the commit, is what licenses a field-by-field diff.
+
+**Three sequential passive runs, and a Tier-3 run does not replace them.** The same
+`85699d66c5a5` binary, the same probe set, committed as
 [`docs/doctor/linux-7.0-2026-07-29-passive-{1,2,3}.json`](doctor/). **13 supported ·
 0 degraded · 0 unsupported · 6 skipped**, and `jq -e -f expectations/linux.jq`
-**executes** clean against them (exit 0) — which is what proves HEAD's probe set and
-HEAD's `linux.jq` actually agree, a thing no amount of reading either file settles.
+**executes** clean against them (exit 0) — which is what proves that probe set and
+that `linux.jq` actually agree, a thing no amount of reading either file settles.
 
-Passive, and six skips, because **this box has no adapter attached any more**: the
-cross-wired FT232R pair (`BH00LL8O`, `BH00L4KU`) physically moved to the 6.18
-production box, which is how that box became Tier 3. So P3/P5/P11 skip for want of
-a `--port`, P4 skips with "no serial device visible", and the `/dev/serial/by-id`
-environment row exercises its **third arm** — `absent, and no serial device visible
-through sysfs, by-path or cu.* either` — which is the RES-2 rewrite's skip case
-observed rather than reasoned about. P12 skips on Linux by design (§15.39). None of
-that costs the cross-kernel diff anything: P1, P2, P6, P7, P8, P9 and P10 need no
-hardware and are the whole kernel-diff set.
+Passive, and six skips, because they were taken **while the pair was away on the
+6.18 box** — which is how that box became Tier 3 — not because this box is a
+hardware-less one. So in those three runs P3/P5/P11 skip for want of a `--port`, P4
+skips with "no serial device visible", and the `/dev/serial/by-id` environment row
+exercises its **third arm** — `absent, and no serial device visible through sysfs,
+by-path or cu.* either` — which is the RES-2 rewrite's skip case observed rather
+than reasoned about. That arm is reachable *only* while the box is bare, so those
+three runs remain the only in-tree observation of it. P12 skips on Linux by design
+(§15.39). None of it costs the cross-kernel diff anything either way: P1, P2, P6,
+P7, P8, P9 and P10 need no hardware and are the whole kernel-diff set.
 
 **Three runs, because one sample of a varying quantity is indistinguishable from a
 cross-kernel difference.** On one quiet box (load 0.44, sequential, nothing else
 running) P9's 1 ms median moved 1066–1068 µs and its zero-timeout cost 264–287 ns,
 while P10 produced **three different shapes** — `11776/3584/15360/3` (runs 1 and 3),
 `13824/0/13824/4` (run 2), and a hostward `15360/0/15360/4` in run 1. Read that
-before attributing any P10 or P9 delta to a kernel.
+before attributing any P10 or P9 delta to a kernel. The Tier-3 run is a fourth
+sample of the same quantities on the same box and lands inside both spreads — P9
+1068 µs at 1 ms and 262 ns at zero timeout (a hair under the passive band's 264),
+P10 `11776/3584/15360/3` in *both* directions, the runs-1-and-3 shape — so it
+widens the variance record rather than settling anything, which is the point.
 
 ## Confirmed on Linux 6.18 — P1–P4 (2026-07-19), P1–P11 (2026-07-27), all twelve at HEAD on a Tier-3 rig (2026-07-29)
 
@@ -350,7 +385,10 @@ left open:
    P11 fix: what an operator reads there is the `mismatch_pairs > 0` branch, the one
    `p11_blames_the_baud_mismatch_only_when_a_pair_was_certified` pins, and it could
    not have appeared before — the fix landed after both 2026-07-27 rig runs, macOS
-   cannot certify a pair, and the 7.0 box has no adapter.
+   cannot certify a pair, and the 7.0 box had no adapter at that moment. (It got the
+   pair back later the same day, so
+   [`linux-7.0-2026-07-29-tier3.json`](doctor/linux-7.0-2026-07-29-tier3.json) is the
+   second such rendering; this one is still the first.)
    **A Tier-3 certificate is not the whole of Tier 3.** Three items design §15.21
    and the plan's tiered checklist put at that tier are *not* discharged by it:
    break **reception** (see below), far-side **modem-line signalling** (the modem
@@ -405,8 +443,10 @@ left open:
 
 ### What the 2026-07-29 diff established
 
-Against the three HEAD 7.0 runs in [`docs/doctor/`](doctor/) — same binary, same
-commit, same fingerprint on both sides:
+Against the three passive 7.0 runs in [`docs/doctor/`](doctor/) — same binary, same
+commit, same fingerprint on both sides. (The 7.0 Tier-3 run came later the same day
+and is a *different* binary at the same fingerprint; it is what supplies the
+port-facing counterpart the last bullet used to say did not exist.)
 
 - **P6 is byte-identical to all three 7.0 runs on every measured field**:
   `passes 64 / pollhup 64 / pollin 0 / bytes_read 0 / [EIO=64]`,
@@ -442,12 +482,25 @@ commit, same fingerprint on both sides:
   on "several doctors running concurrently", which run 2, sequential on an idle box,
   did not need. Both now report what has been measured. Neither is in the probe-set
   fingerprint, so archived artifacts stay comparable across the edit — checked.)*
-- **P3, P4, P5 and P11 have no 7.0 counterpart in this diff at all.** The dev box
-  has no adapter, so all four skip there — the equal fingerprint makes the *passive*
-  probes comparable, not these. Every port-facing number in the 6.18 report is a
-  first measurement on that kernel, not a comparison; P11's agreement on ioctl
-  availability and field set is with the 2026-07-27 7.0 run, across a probe set that
-  has since moved.
+- **P3, P4, P5 and P11 have no counterpart in *this* diff — and now have one beside
+  it.** All four skip in the three passive runs, so the equal fingerprint makes the
+  passive probes comparable and not these. The gap closed later the same day: the
+  7.0 **Tier-3** report has all four on the same cross-wired pair at the same probe
+  set, and it agrees. **P3 is field-for-field identical on both ports and both
+  kernels** (`requested_baud`/`baud_readback` 250000, `custom_baud_ok`,
+  `tiocexcl_refuses_second_open`, `modem_calls_ok`, `break_ok`,
+  `tiocgicount_supported` all true). **P4 is identical** — `by_id_tree: present,
+  count: 2, sysfs_only: 0, other_candidates: 0` and the same two canonical
+  identities, so the sysfs ancestor walk derives the same answers on both. **P5's
+  observation lines are identical**, pairing verified both ways with
+  `rate_ladder=true deliberate_mismatch_observed=true` and the same per-port
+  certificate string. **P11 agrees on ioctl availability and field set** and differs
+  in absolute counts by construction — they accumulate from driver bind, so two
+  boxes that have driven the same adapters for different lengths of time must
+  differ. Note what this pair does *not* establish, for the same reason the 6.18
+  report's gap 1 does not: both boxes see the by-id tree, so the no-udev fallback
+  and the `/dev/serial/by-id` row's `degraded` middle arm remain unexercised on
+  either kernel.
 
 **The sub-microsecond outlier persists, and its named confounder is now excluded.**
 The zero-timeout `poll(2)` cost reads 526 ns (P2, 4096 samples) and 1323 ns (P9, 16

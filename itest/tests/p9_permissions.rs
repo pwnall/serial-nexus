@@ -121,7 +121,9 @@ fn secondary_group() -> Option<(String, u32)> {
 /// so a panicking assertion never leaks a daemon.
 struct FlaggedDaemon {
     child: Child,
-    run: TempRun,
+    socket: PathBuf,
+    /// Held for its `Drop` (the temp directory goes with it), not read.
+    _run: TempRun,
 }
 
 impl FlaggedDaemon {
@@ -130,9 +132,17 @@ impl FlaggedDaemon {
     /// becomes ready.
     fn spawn(extra: &[&str]) -> FlaggedDaemon {
         let run = TempRun::new();
+        let socket = run.socket();
+        Self::spawn_at(run, socket, extra)
+    }
+
+    /// [`Self::spawn`] with `--socket` pointed somewhere other than the run directory's
+    /// default — the seam SEAM-2 needs, where the flag names an operator's file rather
+    /// than a socket.
+    fn spawn_at(run: TempRun, socket: PathBuf, extra: &[&str]) -> FlaggedDaemon {
         let child = Command::new(bin("serial-nexus-daemon"))
             .arg("--socket")
-            .arg(run.socket())
+            .arg(&socket)
             .arg("--state-file")
             .arg(run.state_file())
             .args(extra)
@@ -141,11 +151,15 @@ impl FlaggedDaemon {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn serial-nexus-daemon");
-        FlaggedDaemon { child, run }
+        FlaggedDaemon {
+            child,
+            socket,
+            _run: run,
+        }
     }
 
     fn socket(&self) -> PathBuf {
-        self.run.socket()
+        self.socket.clone()
     }
 
     /// Wait until the daemon answers an `info` round trip — the same readiness
@@ -447,6 +461,73 @@ channels = ["console"]
     assert_eq!(
         after_teardown, before,
         "the operator's file changed during teardown"
+    );
+}
+
+// ============================================================================
+// 37-SEAM-2 — the control-socket path is an operator file until proven a stale socket.
+// ============================================================================
+
+/// `--socket` pointed at an existing **non-socket** file refuses to start and leaves the
+/// file byte-identical.
+///
+/// This is the control socket's twin of the leg case directly above, and it is here
+/// because it was missing for exactly as long as that one existed: §10's "standard
+/// stale-socket unlink dance" probed with `connect` and unlinked on *any* error, so
+/// `--socket /home/me/notes.txt` deleted that file on the way to failing anyway — a
+/// regular file refuses a dial just as a stale socket does, and nothing asked which it
+/// was. The refusal must cost the operator nothing but a daemon that did not start:
+/// no data, and no debris beside it either (the daemon's own sibling lock file is taken
+/// only once the path is known to be a socket).
+#[test]
+fn a_daemon_pointed_at_an_existing_file_refuses_and_leaves_it_intact() {
+    // The operator's directory is deliberately *not* the daemon's run directory: the
+    // daemon's goes away with it when it is reaped, and the file has to outlive that to
+    // be looked at.
+    let files = TempRun::new();
+    let notes = files.join("notes.txt");
+    let content = b"serial-nexus-itest: an operator file --socket must never unlink\n";
+    std::fs::write(&notes, content).expect("write the operator file");
+    let before = sha256_hex(content);
+
+    let d = FlaggedDaemon::spawn_at(TempRun::new(), notes.clone(), &[]);
+    let (code, stderr) = d
+        .wait_exit(Duration::from_secs(10))
+        .expect("the daemon kept running with --socket pointed at a regular file");
+
+    assert_ne!(
+        code,
+        Some(0),
+        "the daemon exited successfully with --socket on a regular file; stderr={stderr:?}"
+    );
+    // Secondary to the exit status, but an operator has to be able to act on it: the
+    // diagnostic must say which file it refused and why.
+    let said = stderr.to_ascii_lowercase();
+    assert!(
+        said.contains("not a unix socket")
+            && said.contains("refusing to unlink")
+            && stderr.contains(&notes.display().to_string()),
+        "the startup error does not name the file it refused and why: {stderr:?}"
+    );
+
+    // The file is untouched — existence is not enough; the bytes are the claim.
+    assert!(
+        notes.exists(),
+        "the daemon unlinked the operator's file it was pointed at (SEAM-2)"
+    );
+    assert_eq!(
+        sha256_hex(&std::fs::read(&notes).expect("read the operator file")),
+        before,
+        "the operator's file changed under a refused --socket"
+    );
+
+    // …and nothing was created beside it either: a refusal that leaves a `<file>.lock`
+    // next to somebody's notes is still a daemon writing where it was told not to.
+    let mut debris = notes.clone().into_os_string();
+    debris.push(".lock");
+    assert!(
+        !PathBuf::from(debris).exists(),
+        "the refused daemon left its lock file beside the operator's file"
     );
 }
 

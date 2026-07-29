@@ -331,7 +331,7 @@ None.
 | `wire_version` | integer | the daemon-to-daemon wire protocol version (§9) |
 | `envelope_version` | integer | the exec-codec envelope version (§8/§15.15) — a codec author pins against this |
 | `codecs` | array of string | every codec name a configuration may legally name, sorted: the registered in-process codecs **plus** the reserved `exec` child-process codec (§7.6), which is always available. `exec` is deliberately not a registry entry — it is a child *process*, routed before the registry is consulted — but that is an implementation fact, and leaving it out of this list made the discovery surface disagree with what a `codec = …` field accepts |
-| `instance` | integer | a per-boot nonce (§11.8). Tap byte offsets are only comparable within one daemon process; on restart the offsets reset to 0 and this value changes, so a client keyed on it (the web console's browser history, §17) detects the reset and starts fresh instead of splicing across it |
+| `instance` | integer | a per-boot nonce (plan §11.8). Tap byte offsets are only comparable within one daemon process; on restart the offsets reset to 0 and this value changes, so a client keyed on it (the web console's browser history, §17) detects the reset and starts fresh instead of splicing across it |
 
 ### CLI
 
@@ -513,7 +513,7 @@ on the connection that opened the tap, one per hostward chunk (and, right after
 | Param | Type | Description |
 | --- | --- | --- |
 | `tap` | integer | the tap id from the `tap.open` result |
-| `offset` | integer | the endpoint's monotonic hostward byte offset of this chunk's first byte (§11.8) — replay pieces carry their true stream offset, so a reconnecting client trims overlap and splices exactly. Offsets are comparable only within one daemon `instance` (see [`info`](#info)) |
+| `offset` | integer | the endpoint's monotonic hostward byte offset of this chunk's first byte (plan §11.8) — replay pieces carry their true stream offset, so a reconnecting client trims overlap and splices exactly. Offsets are comparable only within one daemon `instance` (see [`info`](#info)) |
 | `gap_before` | integer | bytes this endpoint's producer→hub feed did not carry immediately before this chunk — the feed full, or nothing listening — and which are therefore **not** represented in the offset space. Normally `0` |
 | `data` | string | base64 of the chunk's bytes |
 
@@ -568,10 +568,22 @@ connection receiving nothing, with no notification and no error.
 {"jsonrpc":"2.0","method":"tap.closed","params":{"tap":0,"endpoint":"console","reason":"graph replaced"}}
 ```
 
-Delivery is best effort, like `tap.data`: a connection that has stopped draining
-its bounded tap queue is already being counted as dropping. A later `tap.close`
-for that id is refused rather than reporting a success that closed nothing — see
-[`tap.close`](#tapclose).
+**This event is not droppable.** `tap.data` is bounded and lossy by design — a
+connection that stops draining its queue is counted as dropping (§5) — but the
+terminal event is not part of that bargain: a full queue is the ordinary steady
+state of a slow consumer on a firehose endpoint, which is exactly the client this
+notification exists for. It rides the tap's own queue while there is room, and an
+overflow lane when there is not, so a saturated client still gets it.
+
+The one visible consequence of that lane: when it is used, `tap.closed` arrives
+**ahead of** any `tap.data` for the same tap still queued behind it. Those bytes
+belong to an endpoint that no longer exists, and a client that treats the terminal
+event as terminal — dropping later frames carrying that tap id, which is what both
+`serial-nexus-ctl tap` and the web console do — is correct. Tap ids are never
+reused, so a late frame is never ambiguous.
+
+A later `tap.close` for that id is refused rather than reporting a success that
+closed nothing — see [`tap.close`](#tapclose).
 
 ---
 
@@ -597,7 +609,8 @@ Result:
 | `tap` | integer | the new tap id (used by `tap.close` and in `tap.data`) |
 | `endpoint` | string | echoed |
 | `replay_bytes` | integer | bytes of ring replayed ahead of the live stream — `0` is the explicit empty-replay marker (ring off, or as-yet unfilled) |
-| `from_offset` | integer | the endpoint offset this tap's stream begins at (§11.8): with a non-empty replay, the ring's oldest byte — or, when the ring is deeper than the connection's tap channel can be handed at once, the oldest byte of the newest slice that fits, the snapshot being trimmed at its **head** so that `from_offset + replay_bytes` always lands exactly on the live edge; otherwise the live edge, i.e. the offset the next `tap.data` will carry. A reconnecting client trims replay against the last offset it stored |
+| `replay_truncated` | integer | ring bytes `--replay` could **not** hand this tap: the snapshot's head, trimmed because this connection's bounded tap queue had room for fewer bytes than the ring holds. `0` in the ordinary case. Not a hole in the offset space — what *is* delivered is always the newest end of the ring and always contiguous with the live stream — but the only way to tell a short ring from a short channel, which `replay_bytes` alone cannot |
+| `from_offset` | integer | the endpoint offset this tap's stream begins at (plan §11.8): with a non-empty replay, the ring's oldest byte — or, when the ring is deeper than the connection's tap channel can be handed at once, the oldest byte of the newest slice that fits, the snapshot being trimmed at its **head** so that `from_offset + replay_bytes` always lands exactly on the live edge; otherwise the live edge, i.e. the offset the next `tap.data` will carry. A reconnecting client trims replay against the last offset it stored |
 | `epoch` | integer | which offset space `from_offset` counts in (§15.38). Unique per endpoint *hub* within a daemon process and never reused, so a client holding stored scrollback can tell an ordinary reconnect — where its own frontier is still meaningful and replay overlap must be trimmed — from a hub rebuild (`load --replace`, `add-node`, `remove-node`), after which offsets restart at 0 while the per-*boot* `info.instance` nonce, correctly, does not change. The two are indistinguishable from offsets alone: both present as `from_offset` below the client's frontier, because a replay ring exists to re-send bytes the client already has. Persist it beside the stored offset and re-anchor exactly when it changes |
 | `feed_dropped` | integer | the endpoint's producer→hub feed loss that the hub has **already charged to its taps** at open time — the reported-so-far watermark, which may sit below the running counter [`state`](#state) shows. The difference is deliberately excluded: it is delivered to this tap as its first `tap.data`'s `gap_before`, so `feed_dropped + Σgap_before` is the true loss and not twice it (see [the offset contract](#tapdata-notification)) |
 
@@ -607,7 +620,7 @@ host-facing endpoint has a hub — a tap observes a hostward stream).
 ```console
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tap.open","params":{"endpoint":"console","replay":true}}' \
     | nc -U "$SOCK"
-{"jsonrpc":"2.0","id":1,"result":{"endpoint":"console","epoch":1,"feed_dropped":0,"from_offset":0,"replay_bytes":0,"tap":0}}
+{"jsonrpc":"2.0","id":1,"result":{"endpoint":"console","epoch":1,"feed_dropped":0,"from_offset":0,"replay_bytes":0,"replay_truncated":0,"tap":0}}
 ```
 
 (Plain `nc -U` again: half-closing would end the connection and with it the tap.)

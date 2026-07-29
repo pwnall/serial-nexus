@@ -25,12 +25,16 @@
 //!   are present on the Linux/macOS boxes this suite targets.
 //! * The three sub-checks become three self-contained `#[test]`s (each spawns its own
 //!   sim), so a failure is attributable to one fixture.
+//!
+//! A fourth test guards the harness rather than a fixture: `--exec` reaches the child
+//! through `sh -c`, so the fixture path is quoted and a spaced path is proved to run
+//! (review 37, 37-EXTC-1).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde_json::Value;
-use serial_nexus_itest::bin;
+use serial_nexus_itest::{TempRun, bin};
 
 /// Absolute path to a fixture under the workspace's `tests/ext-codec/`. Derived from
 /// this crate's compile-time manifest dir (`itest/` — the directory, §15.40), so it is location- and
@@ -42,6 +46,19 @@ fn ext_codec(name: &str) -> PathBuf {
         .join("tests")
         .join("ext-codec")
         .join(name)
+}
+
+/// The `--exec` string for a fixture, **single-quoted** (review 37, 37-EXTC-1).
+///
+/// The sim runs `--exec` through `sh -c` verbatim (`ExecChild::spawn`), so the path
+/// has to survive word splitting: unquoted, a checkout directory containing a space
+/// (`~/My Projects/serial-nexus`) split the command and failed all three conformance
+/// tests below with the interpreter reporting a file it could not find — a harness
+/// fault that reads as a codec fault. The sibling `p5_envelope.rs` quotes the same
+/// path with a comment naming this exact hazard; this is that quoting, shared with
+/// the guard that proves it.
+fn exec_command(fixture: &Path) -> String {
+    format!("python3 '{}'", fixture.display())
 }
 
 /// Whether `python3` is invocable — the fixtures are Python. Absent ⇒ the test skips
@@ -60,7 +77,13 @@ fn have_python3() -> bool {
 /// half-duplex case), so we read stdout regardless of exit status and assert on the
 /// structured verdict, never the exit code or any human text.
 fn run_conformance(fixture: &str, extra: &[&str]) -> Value {
-    let exec = format!("python3 {}", ext_codec(fixture).display());
+    run_conformance_at(&ext_codec(fixture), extra)
+}
+
+/// [`run_conformance`] against a fixture at an arbitrary path — the seam the spaced-path
+/// guard needs, since the in-tree fixtures all live under a path this checkout chose.
+fn run_conformance_at(fixture: &Path, extra: &[&str]) -> Value {
+    let exec = exec_command(fixture);
     let out = Command::new(bin("serial-nexus-sim"))
         .arg("exec-conformance")
         .arg("--exec")
@@ -70,7 +93,8 @@ fn run_conformance(fixture: &str, extra: &[&str]) -> Value {
         .expect("run serial-nexus-sim exec-conformance");
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         panic!(
-            "parse exec-conformance verdict for {fixture}: {e}; stdout={:?} stderr={:?}",
+            "parse exec-conformance verdict for {}: {e}; stdout={:?} stderr={:?}",
+            fixture.display(),
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         )
@@ -154,5 +178,33 @@ fn half_duplex_fixture_caught_by_liveness() {
     assert!(
         check(&v, "golden"),
         "the half-duplex fixture should still pass golden (finite, closed input): {v}"
+    );
+}
+
+// (4) The exec string survives a fixture path containing a space (review 37,
+// 37-EXTC-1). Proved end to end rather than by inspecting the string: the fixture is
+// copied into a spaced directory and driven through the real sim, which is the only
+// thing that establishes the quoting survives `sh -c`'s word splitting rather than
+// merely Rust's formatting.
+#[test]
+fn a_fixture_path_containing_a_space_still_runs() {
+    if !have_python3() {
+        eprintln!("SKIP a_fixture_path_containing_a_space_still_runs: python3 not found");
+        return;
+    }
+    let run = TempRun::new();
+    let dir = run.join("ext codec");
+    std::fs::create_dir_all(&dir).expect("create the spaced fixture directory");
+    let fixture = dir.join("passthrough.py");
+    std::fs::copy(ext_codec("passthrough.py"), &fixture).expect("copy the passthrough fixture");
+
+    let v = run_conformance_at(&fixture, &[]);
+    assert_eq!(
+        v["pass"].as_bool(),
+        Some(true),
+        "the passthrough fixture failed from {} — the `--exec` string does not survive \
+         `sh -c`'s word splitting, so every conformance test above fails on a checkout \
+         whose path contains a space, blaming the codec for a harness fault: {v}",
+        fixture.display()
     );
 }

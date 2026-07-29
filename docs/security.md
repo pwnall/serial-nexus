@@ -243,10 +243,22 @@ answer three *different* questions — none substitutes for another (§15.29):
   A headless client (`serial-nexus-web wsclient`, `curl`) may instead present the
   unscoped name `nexus_session`: it is handed a token rather than a cookie jar and
   cannot know the bound port, which under the SSH forwarding §17 sanctions is not
-  even the port in its own URL.
+  even the port in its own URL. **Hand that client its token off the command
+  line.** `serial-nexus-web wsclient` reads `--token-file PATH` (preferred; keep the
+  file `0600`) and the environment variable `SERIAL_NEXUS_WEB_TOKEN`, and `--token`
+  remains for a single-user box while stating in its own help what it costs: on
+  Linux with the default `/proc` mount, a process's command line is readable by
+  *every* local user for as long as it runs — the same adversary the token exists
+  to gate — while `/proc/<pid>/environ` is readable only by the process's own user
+  and a `0600` file by nobody else at all (review 37, 37-WEBS-1).
 - **Host answers *was this addressed to a name we serve*.** Validated on every
   request against the localhost family plus any `--host` names, so a page that
   rebinds DNS to `127.0.0.1` still fails — its Host is its own, and it gets `403`.
+  The match is **by name**: a `--host` value may be written with the port the
+  operator reaches the console on (`console.lab:8443`, which is also what the
+  browser's header carries) and the port is normalized away, because the port is
+  `Origin`'s to check and an unparsable value is refused at startup naming the flag
+  (review 37, 37-WEBS-2).
 - **`Origin` answers *which page sent it*.** This is the one cookies cannot
   answer: cookies are **not port-scoped**, so a page served from another port on
   the same host is same-*site* and `SameSite=Strict` — a cookie policy, not a
@@ -302,7 +314,11 @@ loopback.
 the sanctioned non-loopback tiers, so the pre-auth path is bounded in three
 dimensions rather than trusted: a **5-second deadline** covers the TLS handshake
 and the delivery of a complete request head — a complete head is one round trip, and
-a peer that connects and says nothing is dropped, not held; the request head is
+a peer that connects and says nothing is dropped, not held. It is *one* deadline for
+both phases, taken as an instant when the connection is accepted and carried
+through: granting the handshake five seconds and then granting the head five more
+would let a TLS-tier peer that drips its `ClientHello` and then falls silent hold a
+pre-auth slot for twice the stated ceiling (review 37, 37-WEBS-5). The request head is
 capped at **16 KiB**; and the connection pool is split at the token gate (review
 32, WEB-5). **128** bounds the connections that have *passed* it — the permit is
 taken there, after the credential is known, and a request over the cap is answered
@@ -365,7 +381,12 @@ attacker's URL, so what it removes is the quiet channel, not every channel.
    invitation to write through it; both files are created with `create_new`; and the
    generated key is narrowed to `0600` explicitly, because an open-time mode applies
    only at creation and is masked by the umask, which is how a regenerate into a
-   pre-existing `0644` path once served a world-readable key.
+   pre-existing `0644` path once served a world-readable key. A generation that
+   fails part-way leaves nothing behind: a write that fails after its `create_new`
+   succeeded removes the file it just created, and a key that fails beside a cert
+   that succeeded removes the cert too — otherwise the next start reads the debris as
+   a half-present pair and tells the operator to supply a file this tool wrote
+   (review 37, 37-WEBS-7).
 3. **`--insecure-bind` (the named footgun).** A non-loopback bind without TLS is
    refused outright unless this flag is set — the same "a named footgun beats a
    patched binary" reasoning as the legs' `insecure_bind`. The token stays mandatory,

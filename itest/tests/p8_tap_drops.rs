@@ -48,19 +48,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use serial_nexus_itest::{Daemon, Rpc, Sim, serial_echo, sha256_hex, wait_until};
+use serial_nexus_itest::{Daemon, Rpc, Sim, file_len, serial_echo, sha256_hex, wait_until};
 
 /// The sourced hostward volume — 16 MiB, comfortably over the tap queue + socket
 /// buffer bound so the unread tap is guaranteed to drop (see the module note).
 const N: u64 = 16 * 1024 * 1024;
 /// Seed for the seeded echo batch (matches the bash's `SEED=11`).
 const SEED: u64 = 11;
-
-/// Current on-disk length of `p` (0 if absent) — the portable replacement for the
-/// bash's `stat -c %s … || echo 0`.
-fn file_len(p: &Path) -> u64 {
-    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-}
 
 /// Number of open taps reported in `state` (§17).
 fn taps_len(rpc: &Rpc) -> usize {

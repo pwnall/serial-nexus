@@ -1,6 +1,6 @@
 //! Phase 7 serial-signal + lifecycle slice, ported from
 //! `scripts/validate/phase7/signals.sh` (design §7.1 signal verbs, §6/§15.20 lock
-//! detach-release, §13 no-target doctrine). Three properties:
+//! detach-release, §13 no-target doctrine). Five properties:
 //!
 //! 1. The serial-signal verbs REACH the live port: `send-break` latches on a pts
 //!    (succeeds), while `set-modem`/`pulse-dtr` reach the driver and are cleanly
@@ -14,9 +14,17 @@
 //! 3. `remove-node --cascade` of a lock-HOLDING writer releases the surviving host
 //!    endpoint's lock cleanly — no phantom holder / origin, so the endpoint does not
 //!    wedge permanently locked by a departed writer (§6/§15.20).
+//! 4. The line-holding verbs (`send-break`, `pulse-dtr`) are mutually exclusive per
+//!    port: a second one issued from a second control connection is refused, so the
+//!    shorter verb's restore cannot clear the line under the longer one (37-SER-1).
+//! 5. A present-but-mistyped `ms`/`assert` is a named refusal, not a silent fall back
+//!    to the verb's default (37-SER-2).
+//!
+//! Properties 4 and 5 have no bash ancestor: they are review findings 37-SER-1 and
+//! 37-SER-2, and they follow the same self-skip discipline as the rest.
 //!
 //! Deviations from the bash, and why (each preserves the original *assertions*):
-//! * All three drive a `serial` node, so they obtain a lossless software device
+//! * All of them drive a `serial` node, so they obtain a lossless software device
 //!   from `serial_echo` (a `serial-nexus-sim pty --echo` pts) and **skip** where none
 //!   exists (macOS): the signal verbs and a serial endpoint's write-lock are
 //!   inherently serial-device operations. The pts behaves identically to the bash's
@@ -36,15 +44,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use serial_nexus_itest::{Daemon, Sim, serial_echo, sha256_hex, wait_until};
+use serial_nexus_itest::{Daemon, Rpc, Sim, file_len, serial_echo, sha256_hex, wait_until};
 
 const SIZE_256K: u64 = 256 * 1024;
-
-/// Current on-disk length of `p` (0 if absent) — the portable replacement for
-/// `stat -c %s … || echo 0`.
-fn file_len(p: &Path) -> u64 {
-    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-}
 
 /// Drive one seeded batch through an echo device: write `send_spec` (e.g.
 /// `seeded:256KiB`) into `tty`, read the echo back, and return the `client` verdict
@@ -340,5 +342,197 @@ b = "ptya"
         released,
         "cascade left a phantom lock holder/origin on usb0: {:?}",
         rpc.node("usb0").map(|n| n["lock"].clone())
+    );
+}
+
+// ---- Checks 4 & 5: the signal verbs' own refusals (§7.1) -------------------------
+
+/// Boot a daemon owning one free-for-all serial node (`usb0`) on `device`, active.
+/// The minimum graph the signal verbs need: no edge, no consumer, just a live port.
+fn signal_daemon(device: &Path) -> Daemon {
+    let d = Daemon::start();
+    let cfg = format!(
+        r#"
+[[node]]
+type = "serial"
+name = "usb0"
+device = "{dev}"
+arbitration = "free-for-all"
+"#,
+        dev = device.display(),
+    );
+    d.rpc().load_toml(&cfg, false).expect("load signal config");
+    assert!(
+        d.rpc()
+            .wait_status("usb0", "active", Duration::from_secs(20)),
+        "usb0 not active: {:?}",
+        d.rpc().node("usb0")
+    );
+    d
+}
+
+/// **37-SER-1.** Two line-holding verbs cannot overlap on one port.
+///
+/// Both verbs' restore guards gate on the port *generation*, which is unchanged
+/// while the port is simply open — so a `send-break --ms 3000` overlapped by a
+/// `send-break --ms 20` had the short verb's guard clear the break at 20 ms while the
+/// long one went on reporting success for its full 3 s. The overlap needs two control
+/// connections, which costs nothing: the one-waiting-verb rule is per connection
+/// (§10), and the design says outright that a client wanting concurrency opens a
+/// second one.
+///
+/// A physical line has one state, so the slot is per port; the refusal names the rule
+/// rather than queueing, because the caller asked for a *bounded* assertion and a
+/// queued one would be a different duration than the one it was told succeeded.
+#[test]
+fn a_second_line_holding_verb_is_refused_while_one_is_in_flight() {
+    let Some(echo) = serial_echo() else {
+        eprintln!(
+            "SKIP a_second_line_holding_verb_is_refused_while_one_is_in_flight: \
+             no serial device on this platform"
+        );
+        return;
+    };
+    let d = signal_daemon(echo.device());
+    let rpc = d.rpc();
+
+    // The long break runs on its own connection, on its own thread: `Rpc` is one
+    // request per connection and blocks until the reply, so a second connection is
+    // exactly how a second operator reaches this endpoint.
+    const HOLD_MS: u64 = 3_000;
+    let socket = d.socket();
+    let long = std::thread::spawn(move || Rpc::new(socket).send_break("usb0", HOLD_MS));
+
+    // Wait until the long verb is observably holding the line — with `pulse-dtr` as
+    // the probe, for a reason worth stating: on a pts its `TIOCMSET` fails ENOTTY
+    // *after* the slot is claimed and released, and nothing in that dispatch awaits,
+    // so the probe never holds the line for a scheduler-visible instant and cannot
+    // starve the verb it is waiting for. Probing with `send-break` instead has the
+    // probe win the startup race, hold the line for its own 20 ms, and refuse the
+    // very verb under test — which is what the first draft of this test did.
+    // The probe therefore doubles as the proof that the two verbs share one slot:
+    // "already in flight" here is a statement about the interlock, "ENOTTY" about
+    // the device, and they are not confusable.
+    let mut probe = String::new();
+    let holding = wait_until(Duration::from_millis(2_000), || {
+        match rpc.call("pulse-dtr", json!({ "node": "usb0", "ms": 20 })) {
+            Err(e) => {
+                probe = e.message.clone();
+                e.message.contains("already in flight")
+            }
+            Ok(_) => false,
+        }
+    });
+    assert!(
+        holding,
+        "`pulse-dtr` never met the in-flight refusal while a 3 s `send-break` held the \
+         line — the two line-holding verbs do not share a slot; last probe said: {probe}"
+    );
+
+    // Same-verb overlap, the shape the finding names: the short break's restore guard
+    // passes the generation check and clears the long verb's line at 20 ms, while the
+    // long verb goes on reporting success for its full duration.
+    let same = rpc
+        .send_break("usb0", 20)
+        .expect_err("a second `send-break` must be refused while one holds the line");
+    assert!(
+        same.message.contains("already in flight"),
+        "the refusal must name the rule it enforces, got: {}",
+        same.message
+    );
+
+    // The long verb ran its full duration and says so — nobody cleared its line.
+    let held = long
+        .join()
+        .expect("the long send-break thread panicked")
+        .expect("the long send-break must succeed");
+    assert_eq!(
+        held["break_ms"],
+        json!(HOLD_MS),
+        "the long verb did not report its own duration: {held}"
+    );
+
+    // The slot is released with the verb, not leaked: the next one is accepted.
+    rpc.send_break("usb0", 20)
+        .expect("the line slot is free once the holding verb returns");
+    assert_eq!(
+        rpc.node_status("usb0"),
+        "active",
+        "the overlap disturbed the node: {:?}",
+        rpc.node("usb0")
+    );
+}
+
+/// **37-SER-2.** A present-but-mistyped `ms`/`assert` is named, never replaced by the
+/// verb's default.
+///
+/// `as_u64`/`as_bool` answer `None` for a mistyped value exactly as they do for an
+/// absent key, so `"ms": "70000"` ran the range check against the *substituted*
+/// default and reported nothing wrong, and `"assert": "false"` (a string, which is
+/// truthy nowhere) drove DTR in the direction opposite to what the caller wrote.
+/// §11's "a typo cannot silently become a default" rule, applied to the RPC surface.
+///
+/// JSON `null` is the control: `serial-nexus-ctl` builds its params from `Option`
+/// fields and sends every optional key unconditionally, so `null` must keep reading
+/// as "unset" — a refusal there would refuse the shipped client's ordinary requests.
+#[test]
+fn a_mistyped_signal_param_is_named_rather_than_silently_defaulted() {
+    let Some(echo) = serial_echo() else {
+        eprintln!(
+            "SKIP a_mistyped_signal_param_is_named_rather_than_silently_defaulted: \
+             no serial device on this platform"
+        );
+        return;
+    };
+    let d = signal_daemon(echo.device());
+    let rpc = d.rpc();
+
+    // (verb, params, the field the refusal must name)
+    let cases: &[(&str, Value, &str)] = &[
+        // The exact value the review names: an operator's shell quoted the number, so
+        // the 70 s the daemon would have refused became the 250 ms default.
+        ("send-break", json!({ "node": "usb0", "ms": "70000" }), "ms"),
+        ("send-break", json!({ "node": "usb0", "ms": -5 }), "ms"),
+        ("send-break", json!({ "node": "usb0", "ms": 1.5 }), "ms"),
+        ("pulse-dtr", json!({ "node": "usb0", "ms": "20" }), "ms"),
+        // The sharper half: this one does not merely lose the caller's number, it
+        // inverts the caller's intent.
+        (
+            "pulse-dtr",
+            json!({ "node": "usb0", "ms": 20, "assert": "false" }),
+            "assert",
+        ),
+    ];
+    for (verb, params, field) in cases {
+        let Err(err) = rpc.call(verb, params.clone()) else {
+            panic!("`{verb}` {params} ran on the substituted default instead of refusing");
+        };
+        assert_eq!(
+            err.code, -32602,
+            "`{verb}` {params} must be invalid-params, got [{}] {}",
+            err.code, err.message
+        );
+        assert!(
+            err.message.contains(&format!("'{field}'")),
+            "the refusal must name the field, got: {}",
+            err.message
+        );
+    }
+
+    // `null` still means "unset": the verb runs on its default.
+    let ok = rpc
+        .call("send-break", json!({ "node": "usb0", "ms": null }))
+        .expect("an explicit null `ms` means unset, as every Option-built client sends");
+    assert_eq!(
+        ok["break_ms"],
+        json!(250),
+        "a null `ms` did not fall back to the verb default: {ok}"
+    );
+
+    assert_eq!(
+        rpc.node_status("usb0"),
+        "active",
+        "a refused param disturbed the node: {:?}",
+        rpc.node("usb0")
     );
 }

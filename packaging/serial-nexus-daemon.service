@@ -22,6 +22,14 @@ ExecStart=/usr/local/bin/serial-nexus-daemon \
 # The daemon prefers the persisted state file over --config when it exists (§11):
 # --config is the first-boot seed; incremental surgery (add-node/remove-node/rotate)
 # is captured in the state file and survives restarts and reboots.
+#
+# UPGRADING from a pre-rename release: the daemon adopts a snapshot found at this path
+# with §15.40's rename undone (plan §17.3), so a deployment that passes --state-file
+# needs no migration. This unit is the one exception, and it is systemd's doing rather
+# than the daemon's: DynamicUser= puts the real state directory under /var/lib/private/,
+# which is root-only, so the daemon cannot read the old file even knowing where it is.
+# One root `cp` before the first start carries it across — packaging/README.md,
+# "Upgrading to this build". Skipping it costs every node added since the last `load`.
 
 # --- Identity ------------------------------------------------------------------
 # A transient, unprivileged service identity. It still needs the `dialout` group to
@@ -38,8 +46,9 @@ SupplementaryGroups=dialout
 #
 # /run/serial-nexus-daemon holds the control socket (cleared on stop; §10 socket policy).
 # 0700 makes it owner-exclusive, bounding the brief post-bind window before the
-# daemon narrows the socket itself to 0600 (§10). If you widen the socket to a group
-# with --socket-group, also widen this to 0750 so that group can traverse to it.
+# daemon narrows the socket itself to 0600 (§10). Widening the socket to a group with
+# --socket-group means widening this too — and changing WHO owns it, which is not a
+# mode change at all; see the socket-group block below before touching either.
 RuntimeDirectory=serial-nexus-daemon
 RuntimeDirectoryMode=0700
 # /var/lib/serial-nexus-daemon holds the config snapshot so surgery survives a REBOOT (the
@@ -52,12 +61,39 @@ LogsDirectory=serial-nexus-daemon
 LogsDirectoryMode=0750
 
 # The control socket's file permissions ARE the authorization model (§10): 0600
-# owner-only by default. To let a `console-operators` group drive the daemon, create
-# that group and uncomment (widens the socket to 0660 owned by that group) — and
-# widen RuntimeDirectoryMode above to 0750 so the group can traverse to the socket:
-#   SupplementaryGroups=dialout console-operators
+# owner-only by default. Letting a `console-operators` group drive the daemon needs the
+# RUNTIME DIRECTORY to belong to that group as well, and that is the part a
+# SupplementaryGroups= line cannot buy: systemd chowns every *Directory= to User= and
+# Group=, full stop — systemd.exec(5), "the innermost specified directories will be
+# owned by the user and group specified in User= and Group=". Under DynamicUser= those
+# are the transient identity, so a 0750 /run/serial-nexus-daemon leaves the operators in
+# `other` and they get EACCES at connect(2) before the socket's own 0660 is ever
+# consulted. The group therefore has to be the service's PRIMARY group, which means a
+# static identity. Create it once:
+#   sudo groupadd --system console-operators
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin \
+#        --gid console-operators --groups dialout serial-nexus
+# then replace the DynamicUser= block above with the static one, and widen both:
+#   DynamicUser=no
+#   User=serial-nexus
+#   Group=console-operators
+#   SupplementaryGroups=dialout
 #   RuntimeDirectoryMode=0750
 #   ExecStart= ... --socket-group console-operators
+#
+# Verify rather than assume — the failure mode is silent, and one stat covers the whole
+# chain (traverse the directory, then open the socket):
+#   stat -c '%U %G %a' /run/serial-nexus-daemon \
+#        /run/serial-nexus-daemon/serial-nexus-daemon.sock
+#   # serial-nexus console-operators 750
+#   # serial-nexus console-operators 660
+#
+# Two consequences of the static identity, both deliberate. The state and log
+# directories lose systemd's /var/lib/private and /var/log/private indirection (that is
+# a DynamicUser= behaviour), so an existing install's snapshot has to be moved with it.
+# And LogsDirectoryMode=0750 now makes console logs readable by console-operators — the
+# same people who can already read every console live through the socket. Read
+# ../docs/security.md first: serial consoles are frequently root shells.
 
 # --- Lifecycle -----------------------------------------------------------------
 KillSignal=SIGTERM

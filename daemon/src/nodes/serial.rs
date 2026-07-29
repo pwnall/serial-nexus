@@ -6,15 +6,20 @@
 //! recheck (§12). A missing device does not fail the load: the node comes up
 //! `waiting` and heals when its device reappears (§7.1 faulted-and-wait).
 //!
-//! Byte flow: the blocking `serial2` fd is set non-blocking (for the drain loop)
-//! and *not* driven by `serial2-tokio` (which hides the fd we need for
-//! `TIOCEXCL`/`TIOCGICOUNT`) nor `tokio::io::unix::AsyncFd` (whose epoll readiness
-//! busy-loops on pty masters, §15.18). The **hostward reader runs on a dedicated
-//! blocking thread** — a `poll(2)` blocking wait wakes it the instant the device
-//! has data, so it drains at line rate and costs zero CPU while parked (§15.19).
-//! It broadcasts to every attached consumer (lossy `try_send`, §5). The low-rate
-//! **targetward writer** and the **reconnect supervisor** share one async task on
-//! the runtime thread; read and write on the shared fd are independent directions.
+//! Byte flow: the `serial2` fd is driven directly — *not* through `serial2-tokio`
+//! (which hides the fd we need for `TIOCEXCL`/`TIOCGICOUNT`) nor
+//! `tokio::io::unix::AsyncFd` (whose epoll readiness busy-loops on pty masters,
+//! §15.18). The drain loop needs the fd non-blocking, and the pinned `serial2` opens
+//! it `O_NONBLOCK | O_NOCTTY` and never clears it — so [`arm_reader`]'s
+//! `set_nonblocking` is a deliberate redundancy rather than the thing that makes the
+//! fd non-blocking: the readiness loop's correctness must not rest on a dependency's
+//! open flags, which are not part of its API (37-SER-3 corrected this prose, not the
+//! call). The **hostward reader runs on a dedicated blocking thread** — a `poll(2)`
+//! blocking wait wakes it the instant the device has data, so it drains at line rate
+//! and costs zero CPU while parked (§15.19). It broadcasts to every attached consumer
+//! (lossy `try_send`, §5). The low-rate **targetward writer** and the **reconnect
+//! supervisor** share one async task on the runtime thread; read and write on the
+//! shared fd are independent directions.
 //!
 //! **Faulted-and-wait (§7.1).** The reader thread signals device loss (an exit on
 //! `POLLHUP`/EOF/error) by pulsing a `Notify`; the supervisor then joins it, drops
@@ -195,6 +200,15 @@ struct SerialShared {
     /// Pulsed by the same transition, so a signal verb parked on its hold interval
     /// wakes at once instead of sleeping out a duration whose node is already gone.
     signal_gone: Rc<Notify>,
+    /// The port generation on which a **line-holding** signal verb (`send-break`,
+    /// `pulse-dtr`) currently holds a line, if one does (§7.1). One slot per port,
+    /// because a physical line has one state: two overlapping holds — reachable
+    /// today, since the one-waiting-verb rule is per *connection* — would have the
+    /// shorter one's restore clear the line while the longer one still reported
+    /// success for its full duration (37-SER-1). Keyed by generation rather than a
+    /// bare flag so a slot left by a verb whose port has since gone reads as free
+    /// for the successor port, exactly as [`RestoreGuard`] declines on it.
+    signal_in_flight: Option<u64>,
 }
 
 impl SerialShared {
@@ -312,6 +326,7 @@ impl SerialNode {
                 port,
                 generation: 0,
                 signal_gone: Rc::new(Notify::new()),
+                signal_in_flight: None,
             })),
             reader_slot: Rc::new(CriticalCell::new(BlockingReader::default())),
             discarded_unattached: Arc::new(AtomicU64::new(0)),
@@ -870,6 +885,11 @@ pub(crate) enum SignalError {
     /// `teardown`, `remove-node`, `load --replace`, or an ordinary reconnect. The
     /// verb declines rather than driving a line whose owner has changed.
     NodeGone,
+    /// Another line-holding verb already holds this port's one line slot
+    /// (37-SER-1). Refused rather than queued: the caller asked for a *bounded*
+    /// assertion, and a queued one would be a different duration than the one it
+    /// was told succeeded.
+    LineBusy,
 }
 
 impl std::fmt::Display for SignalError {
@@ -877,6 +897,10 @@ impl std::fmt::Display for SignalError {
         match self {
             SignalError::Io(e) => write!(f, "{e}"),
             SignalError::NodeGone => write!(f, "node was removed while signalling"),
+            SignalError::LineBusy => write!(
+                f,
+                "another line-holding signal verb is already in flight on this port"
+            ),
         }
     }
 }
@@ -954,6 +978,57 @@ impl SignalHandle {
             op,
         }
     }
+
+    /// Claim this port's one line-holding slot for the duration of a `send-break` /
+    /// `pulse-dtr` (§7.1, 37-SER-1), or refuse.
+    ///
+    /// The two verbs' restore guards gate on the port generation alone, which both
+    /// halves of an overlap pass — so the shorter verb's guard cleared the line under
+    /// the longer one, which went on reporting success for its full duration. A
+    /// second control connection is all it took, the one-waiting-verb rule being per
+    /// connection (§10). The slot makes them mutually exclusive per port, which is the
+    /// scope a physical line has; different nodes hold different slots.
+    ///
+    /// Taken **before** the line is asserted, so a refusal costs the wire nothing.
+    fn claim_line(&self) -> Result<LineLease, SignalError> {
+        self.shared.with_mut(|sh| {
+            if sh.port.is_none() || sh.generation != self.generation {
+                return Err(SignalError::NodeGone);
+            }
+            // A slot recorded against an older generation belongs to a verb whose port
+            // is gone; its guard will decline for the same reason, so it is free here.
+            if sh.signal_in_flight == Some(sh.generation) {
+                return Err(SignalError::LineBusy);
+            }
+            sh.signal_in_flight = Some(sh.generation);
+            Ok(())
+        })?;
+        Ok(LineLease {
+            shared: self.shared.clone(),
+            generation: self.generation,
+        })
+    }
+}
+
+/// Holds a port's line-holding slot (see [`SignalHandle::claim_line`]) and releases
+/// it on drop, including cancellation. Declared *before* the verb's [`RestoreGuard`]
+/// so it drops *after* it: the slot must not free while the line is still asserted,
+/// or the next verb would assert over a restore that has not run.
+struct LineLease {
+    shared: Rc<CriticalCell<SerialShared>>,
+    generation: u64,
+}
+
+impl Drop for LineLease {
+    fn drop(&mut self) {
+        self.shared.with_mut(|sh| {
+            // Only our own claim: a port transition inside the hold lets a successor
+            // verb take the slot on the new generation, and this drop must not free it.
+            if sh.signal_in_flight == Some(self.generation) {
+                sh.signal_in_flight = None;
+            }
+        });
+    }
 }
 
 /// Restores a break/modem line on drop (including cancellation), so a bounded
@@ -983,8 +1058,10 @@ impl Drop for RestoreGuard {
 }
 
 /// Assert a serial break for `ms` milliseconds, then clear it (§7.1). The clear
-/// runs even on cancellation, and never on a port this node no longer holds.
+/// runs even on cancellation, and never on a port this node no longer holds. Refused
+/// while another line-holding verb has this port's line (37-SER-1).
 pub(crate) async fn send_break(handle: &SignalHandle, ms: u64) -> Result<(), SignalError> {
+    let _lease = handle.claim_line()?;
     handle.try_port(|p| p.set_break(true))?;
     let _guard = handle.restore_guard(RestoreOp::ClearBreak);
     handle.hold(ms).await
@@ -992,12 +1069,15 @@ pub(crate) async fn send_break(handle: &SignalHandle, ms: u64) -> Result<(), Sig
 
 /// Pulse DTR: drive it to `assert` for `ms` milliseconds, then to `!assert` — the
 /// classic auto-reset toggle (§7.1). The final level is set even on cancellation, and
-/// never on a port this node no longer holds.
+/// never on a port this node no longer holds. Refused while another line-holding verb
+/// has this port's line (37-SER-1) — the two share one slot, because a `pulse-dtr`
+/// restore landing under a `send-break` is the same clobber either way round.
 pub(crate) async fn pulse_dtr(
     handle: &SignalHandle,
     ms: u64,
     assert: bool,
 ) -> Result<(), SignalError> {
+    let _lease = handle.claim_line()?;
     handle.try_port(|p| p.set_dtr(assert))?;
     let _guard = handle.restore_guard(RestoreOp::SetDtr(!assert));
     handle.hold(ms).await
@@ -1143,6 +1223,7 @@ mod tests {
                 port: None,
                 generation: 0,
                 signal_gone: Rc::new(Notify::new()),
+                signal_in_flight: None,
             })),
             reader_slot: Rc::new(CriticalCell::new(BlockingReader::default())),
             discarded: Arc::new(AtomicU64::new(0)),
@@ -1415,6 +1496,7 @@ mod tests {
             port: Some(Rc::new(port)),
             generation: 0,
             signal_gone: Rc::new(Notify::new()),
+            signal_in_flight: None,
         });
 
         release_port(&shared);
@@ -1484,6 +1566,7 @@ mod tests {
             )),
             generation: 0,
             signal_gone: Rc::new(Notify::new()),
+            signal_in_flight: None,
         }));
         let generation = shared.with(|sh| sh.generation);
 
@@ -1717,6 +1800,7 @@ mod tests {
                 )),
                 generation: 0,
                 signal_gone: Rc::new(Notify::new()),
+                signal_in_flight: None,
             }));
             let handle = SignalHandle {
                 shared: shared.clone(),
@@ -1743,5 +1827,64 @@ mod tests {
                 "a hold survived its node: {held:?}"
             );
         });
+    }
+
+    /// 37-SER-1: a port's line-holding slot admits one verb, and it is scoped to the
+    /// *port* — not to the node and not to the process.
+    ///
+    /// The overlap itself (two control connections, the shorter break clearing the
+    /// longer one's line) is proved end to end in `itest/tests/p7_signals.rs`. What
+    /// needs a unit is the half no RPC sequence can stage deterministically: a claim
+    /// left behind by a verb whose port has since gone must read as *free* for the
+    /// successor port — otherwise a reconnect during a long `send-break` would refuse
+    /// every later signal for the life of the node — and the departing verb's own
+    /// release must not then free the successor's claim.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_line_holding_slot_admits_one_verb_and_is_scoped_to_the_port() {
+        let pts = pts_fixture();
+        let shared = Rc::new(CriticalCell::new(SerialShared {
+            status: NodeState::new(NodeStatus::Active),
+            port: Some(Rc::new(
+                open_port(&pts.path, &open_params(ModemLines::default())).expect("open the pts"),
+            )),
+            generation: 0,
+            signal_gone: Rc::new(Notify::new()),
+            signal_in_flight: None,
+        }));
+        let handle_for = |shared: &Rc<CriticalCell<SerialShared>>| SignalHandle {
+            shared: shared.clone(),
+            generation: shared.with(|sh| sh.generation),
+            gone: shared.with(|sh| sh.signal_gone.clone()),
+        };
+
+        let first = handle_for(&shared);
+        let lease = first.claim_line().expect("the first claim on a free port");
+        assert!(
+            matches!(first.claim_line(), Err(SignalError::LineBusy)),
+            "a second line-holding verb took a port whose line is already held"
+        );
+        drop(lease);
+        drop(
+            first
+                .claim_line()
+                .expect("the slot is free again once the holder's lease drops"),
+        );
+
+        // A reconnect under a still-running verb: the same device, a new port
+        // identity. `set_port` is the one place a generation moves (§7.1).
+        let stale = first.claim_line().expect("claim on the pre-reconnect port");
+        let outgoing = shared.with_mut(|sh| sh.set_port(sh.port.clone()));
+        drop(outgoing);
+        let successor = handle_for(&shared);
+        let fresh = successor
+            .claim_line()
+            .expect("the successor port's slot is free: the stale claim is not its own");
+        drop(stale);
+        assert!(
+            matches!(successor.claim_line(), Err(SignalError::LineBusy)),
+            "the departing verb's release freed a claim it never made"
+        );
+        drop(fresh);
     }
 }

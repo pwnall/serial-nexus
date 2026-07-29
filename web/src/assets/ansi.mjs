@@ -46,8 +46,10 @@
 const MAX_SEQ = 64;
 
 /// The longest OSC/DCS string swallowed before the machine gives up and returns to
-/// ground. Without a bound, one unterminated `ESC ]` makes the console silently eat
-/// everything the device says for the rest of the session.
+/// ground — counted over *every* character the string consumes, ESC included, since a
+/// bound only the well-behaved half of the input advances is not a bound (37-WEBC-3).
+/// Without it, one unterminated `ESC ]` makes the console silently eat everything the
+/// device says for the rest of the session.
 const MAX_STRING = 4096;
 
 const GROUND = 0;
@@ -196,12 +198,20 @@ export function parseAnsi(st, text) {
       }
 
       case STRING: {
+        // Every character the string swallows counts toward the give-up bound, the ESC
+        // that hands off to STRING_ESC included. Counting only the plain ones let
+        // ESC-dense input — a stuck line spewing 0x1B — cycle STRING→STRING_ESC→STRING
+        // without ever advancing `strLen`, so `MAX_STRING` never fired: the console
+        // rendered nothing for the rest of the session, the honesty tally that exists to
+        // say so never moved either, and once ordinary bytes resumed a further
+        // `MAX_STRING` of them were still swallowed (review 37-WEBC-3).
+        st.strLen += 1;
         if (ch === "\x07") {
           st.unknown += 1;
           st.mode = GROUND;
         } else if (ch === "\x1b") {
           st.mode = STRING_ESC;
-        } else if (++st.strLen > MAX_STRING) {
+        } else if (st.strLen > MAX_STRING) {
           st.unknown += 1;
           st.mode = GROUND;
         }
@@ -209,7 +219,13 @@ export function parseAnsi(st, text) {
       }
 
       case STRING_ESC: {
+        st.strLen += 1;
         if (ch === "\\") {
+          st.unknown += 1;
+          st.mode = GROUND;
+        } else if (st.strLen > MAX_STRING) {
+          // The give-up has to live on both string states, or a run of nothing but ESC
+          // reaches the bound in one state and returns to the other before acting on it.
           st.unknown += 1;
           st.mode = GROUND;
         } else {

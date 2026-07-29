@@ -76,6 +76,62 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The `serial-nexus-sim` deterministic byte stream (splitmix64) — the generator behind
+/// every `seeded:<size>` payload the sim sends.
+///
+/// The ground truth a data-plane assertion needs is frequently on a stdout the harness
+/// discards (`Sim::spawn` nulls it), so a test that must know *which bytes* were sent
+/// reconstructs them from `(seed, len)` and hashes them through [`sha256_hex`]. Eight
+/// test files carried a byte-identical copy of this (review 37, 37-TEST-5); one copy
+/// with the sim-pinned vectors beside it (`seeded_bytes_matches_the_sim`) is what makes
+/// "matches the sim" a checked claim rather than a comment.
+pub fn seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        out.extend_from_slice(&z.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// Current on-disk length of `p`, or 0 if it is not there — the portable replacement
+/// for `stat -c %s` / `cat | wc -c`.
+///
+/// Absent reads as 0 on purpose: every caller polls this inside a [`wait_until`] while
+/// a log file is still being created, and "not yet" and "empty" are the same answer to
+/// the question being asked.
+pub fn file_len(p: &Path) -> u64 {
+    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+/// `utime + stime` of `pid` in clock ticks, read from `/proc/<pid>/stat` (Linux).
+///
+/// The two fields are 14 and 15 (1-based) and the parenthesised `comm` before them may
+/// itself contain spaces — including `)` — so the split starts past the **last** `)`.
+/// That detail is the reason this is shared rather than re-derived: it is invisible
+/// until a process is named something awkward, and it was hand-copied into two test
+/// files before this (review 37, 37-TEST-5).
+///
+/// Panics if the file cannot be read or parsed: a CPU budget measured against an
+/// unreadable counter is the vacuous pass §5 forbids.
+#[cfg(target_os = "linux")]
+pub fn cpu_ticks(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .unwrap_or_else(|e| panic!("read /proc/{pid}/stat: {e}"));
+    let tail = &stat[stat.rfind(')').expect("comm field is parenthesised") + 1..];
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    // `tail` starts at field 3 (state), so utime (14) and stime (15) are at 11 and 12.
+    let utime: u64 = fields[11].parse().expect("utime");
+    let stime: u64 = fields[12].parse().expect("stime");
+    utime + stime
+}
+
 /// Poll `cond` until it returns true or `timeout` elapses. Returns whether it became
 /// true. The harness's only wait primitive — no bare sleeps (§5).
 pub fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
@@ -377,8 +433,44 @@ impl Rpc {
             .write_all(line.as_bytes())
             .expect("write stream request");
         sub.stream.flush().expect("flush");
-        // Consume the ack (a response carrying our id) before notifications flow.
-        let _ = sub.read_line_until(Instant::now() + Duration::from_secs(10));
+
+        // Consume the ack (a response carrying our id) before notifications flow —
+        // **parsed**, not discarded (review 37, 37-TEST-4). `let _ =` threw away three
+        // different failures, and all three surfaced later as "timed out", which points
+        // diagnosis at the wrong half of the system: an *error* ack (the daemon refusing
+        // the subscribe or the tap) read as a healthy stream that then yields nothing; no
+        // ack at all read the same way; and a first line that is not the ack — a
+        // notification racing it — silently eaten, leaving the stream one message short
+        // of what the test is waiting for.
+        //
+        // The id check is meaningful because §10 orders these: the control loop writes a
+        // stream verb's response before it starts draining that connection's
+        // notification lane, so anything else arriving first is a real protocol change.
+        let ack = sub
+            .read_line_until(Instant::now() + Duration::from_secs(10))
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{method}` stream: the daemon sent no ack within 10s (§10 answers a \
+                     stream request before any notification flows)"
+                )
+            });
+        let ack: Value = serde_json::from_str(&ack)
+            .unwrap_or_else(|e| panic!("`{method}` stream: ack is not JSON: {e}; raw={ack:?}"));
+        if let Some(err) = ack.get("error").filter(|e| !e.is_null()) {
+            panic!(
+                "`{method}` stream refused by the daemon: [{}] {}",
+                err.get("code").and_then(Value::as_i64).unwrap_or(0),
+                err.get("message").and_then(Value::as_str).unwrap_or("")
+            );
+        }
+        assert_eq!(
+            ack.get("id").and_then(Value::as_i64),
+            Some(id),
+            "`{method}` stream: the first line carries id {:?}, not this request's {id} \
+             — a notification was consumed as the ack and the stream starts a message \
+             short",
+            ack.get("id")
+        );
         sub
     }
 
@@ -530,6 +622,52 @@ impl Daemon {
     pub fn socket(&self) -> PathBuf {
         self.run.socket()
     }
+
+    /// The daemon subprocess's pid.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Send `signal` (a `kill(1)` name — `"TERM"`, `"INT"`) and wait up to `timeout` for
+    /// the daemon to exit, returning its status (`None` if it was still running at the
+    /// deadline).
+    ///
+    /// The seam a clean-exit test needs (review 37, 37-SEAM-1). [`Drop`] issues
+    /// `shutdown` and then SIGKILLs — right for a test that is finished, but it means
+    /// nothing ever *observed* the post-loop teardown in `serve`: control socket
+    /// unlinked, pty symlinks removed, state file left intact. Deleting the signal arms
+    /// of that loop passed the whole suite.
+    ///
+    /// `kill(1)` rather than a raw `kill(2)`: everything outside `serial_nexus_sys` is
+    /// `unsafe`-free (invariant 3 / §16.3) and the harness carries no safe signal
+    /// wrapper, so it borrows the tool `p5_exec_crash` already uses.
+    pub fn signal_and_wait(
+        &mut self,
+        signal: &str,
+        timeout: Duration,
+    ) -> Option<std::process::ExitStatus> {
+        let pid = self.child.id();
+        let sent = Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg(pid.to_string())
+            .status()
+            .expect("run kill(1)");
+        assert!(sent.success(), "`kill -{signal} {pid}` failed: {sent}");
+        self.wait_for_exit(timeout)
+    }
+
+    /// Wait up to `timeout` for the daemon to exit on its own — after a signal, or after
+    /// the `shutdown` verb. `None` means it was still running at the deadline.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait().expect("try_wait on the daemon") {
+                Some(exit) => return Some(exit),
+                None if Instant::now() >= deadline => return None,
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
 }
 
 impl Drop for Daemon {
@@ -633,8 +771,15 @@ pub fn serial_echo() -> Option<SerialEcho> {
     None
 }
 
-/// Detect a two-port crossover rig: `SNX_CROSSOVER_A`/`_B` if set, else exactly two
-/// `/dev/cu.usbserial-*` (macOS) or two `/dev/serial/by-id/*` (Linux) adapters.
+/// Detect a two-port crossover rig: `SNX_CROSSOVER_A`/`_B` if both are set, on any
+/// platform; else — **macOS only** — exactly two `/dev/cu.usbserial-*` nodes.
+///
+/// There is deliberately no Linux by-id arm, and the asymmetry is worth stating where
+/// it bites (review 37 `37-DOC-3`): on Linux a physically cross-wired pair is invisible
+/// here until both variables are exported, so every rig-gated test self-skips on a box
+/// whose rig is attached and working, and a green run reads as hardware coverage that
+/// never executed. A doctor P5 reporting Tier 3 says nothing about whether these tests
+/// ran — it certifies the rig, not this detection (§15.21).
 pub fn crossover_ports() -> Option<(String, String)> {
     if let (Ok(a), Ok(b)) = (
         std::env::var("SNX_CROSSOVER_A"),
@@ -694,9 +839,20 @@ impl Subscription {
     }
 
     /// The next notification JSON within `timeout`, or `None` on timeout/close.
+    ///
+    /// A complete line that is **not** JSON panics rather than reading as `None`
+    /// (review 37, 37-TEST-4). `None` is how a timeout is spelled and [`Self::wait_for`]
+    /// treats it as terminal, so mapping a malformed line to `None` made the harness's
+    /// loudest possible failure — a daemon writing garbage onto a notification stream —
+    /// indistinguishable from its quietest, a daemon writing nothing. A partial line at
+    /// EOF is still `None`: [`Self::read_line_until`] only yields `\n`-terminated lines,
+    /// so nothing here can fire on a stream that was merely cut short.
     pub fn next(&mut self, timeout: Duration) -> Option<Value> {
         let line = self.read_line_until(Instant::now() + timeout)?;
-        serde_json::from_str(&line).ok()
+        Some(
+            serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("notification line is not JSON: {e}; raw={line:?}")),
+        )
     }
 
     /// Wait for a notification matching `pred` within `timeout`.
@@ -776,4 +932,151 @@ pub fn serial_pair() -> Option<SerialPair> {
     }
     #[allow(unreachable_code)]
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A [`Subscription`] over one end of a socket pair, with the other end handed back
+    /// so a test can play a badly-behaved daemon. The harness's own failure modes need a
+    /// peer that misbehaves on purpose, which no real daemon does — and the point of
+    /// these three is exactly that the harness must not translate misbehaviour into
+    /// silence.
+    fn paired_subscription() -> (Subscription, UnixStream) {
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        (
+            Subscription {
+                stream: client,
+                buf: Vec::new(),
+            },
+            server,
+        )
+    }
+
+    #[test]
+    fn a_well_formed_notification_line_parses() {
+        let (mut sub, mut server) = paired_subscription();
+        server
+            .write_all(b"{\"method\":\"state\",\"params\":{}}\n")
+            .expect("write the notification");
+        let note = sub.next(Duration::from_secs(5)).expect("a notification");
+        assert_eq!(note.get("method").and_then(Value::as_str), Some("state"));
+    }
+
+    /// The legitimate `None`s must stay `None`, or the guard below has replaced one
+    /// misdiagnosis with another: a closed stream is how every `wait_for` loop ends.
+    #[test]
+    fn a_closed_stream_still_reads_as_none() {
+        let (mut sub, server) = paired_subscription();
+        drop(server);
+        assert!(
+            sub.next(Duration::from_secs(5)).is_none(),
+            "a closed stream must read as `None`, not panic"
+        );
+    }
+
+    /// The sim-pinned vectors behind [`seeded_bytes`] (review 37, 37-TEST-5).
+    ///
+    /// `seeded_bytes` claims to reproduce what `serial-nexus-sim` sends, and eight test
+    /// files rested byte-exact assertions on that claim while nothing checked it. These
+    /// two digests are the sim's own `sha256_sent`, captured from
+    ///
+    /// ```text
+    /// serial-nexus-sim pty --echo --link $D/dev --timeout-ms 30000 &
+    /// serial-nexus-sim client --path $D/dev --send seeded:1KiB  --expect echo --seed 7
+    /// serial-nexus-sim client --path $D/dev --send seeded:64KiB --expect echo --seed 7
+    /// ```
+    ///
+    /// so a change to either generator now fails here instead of turning every
+    /// byte-exact data-plane assertion in the suite into a comparison of two identical
+    /// mistakes. Regenerate with the commands above if the sim's stream ever changes on
+    /// purpose.
+    const SIM_SEEDED_VECTORS: &[(u64, usize, &str)] = &[
+        (
+            7,
+            1024,
+            "901f39cd35b7f9ba4b44bbad8d9afc718b5c30ba6eed0e17595918d53d66fbc7",
+        ),
+        (
+            7,
+            65536,
+            "ccf5943c6c514320eb6a681df9e22cf3b6cd7dd90eb1385df4ac01244dc310a7",
+        ),
+    ];
+
+    #[test]
+    fn seeded_bytes_matches_the_sim() {
+        for &(seed, len, want) in SIM_SEEDED_VECTORS {
+            let got = seeded_bytes(seed, len);
+            assert_eq!(
+                got.len(),
+                len,
+                "seeded_bytes({seed}, {len}) is the wrong length"
+            );
+            assert_eq!(
+                sha256_hex(&got),
+                want,
+                "seeded_bytes({seed}, {len}) no longer reproduces `serial-nexus-sim`'s \
+                 stream — every byte-exact assertion that reconstructs ground truth \
+                 from a seed is now comparing the harness against itself"
+            );
+        }
+    }
+
+    /// A length that is not a multiple of the generator's 8-byte word is where a
+    /// re-derivation goes wrong (`truncate`, not "round up"), and several callers ask
+    /// for exactly such a length.
+    #[test]
+    fn seeded_bytes_is_a_prefix_at_any_length() {
+        let full = seeded_bytes(7, 1024);
+        for len in [0usize, 1, 7, 8, 9, 1000] {
+            assert_eq!(
+                seeded_bytes(7, len),
+                full[..len],
+                "seeded_bytes(7, {len}) is not the {len}-byte prefix of the same stream"
+            );
+        }
+    }
+
+    #[test]
+    fn file_len_reads_zero_for_an_absent_file() {
+        let run = TempRun::new();
+        let p = run.join("nothing-here");
+        assert_eq!(file_len(&p), 0);
+        std::fs::write(&p, b"0123456789").expect("write");
+        assert_eq!(file_len(&p), 10);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_ticks_reads_this_process_and_never_goes_backwards() {
+        let pid = std::process::id();
+        let before = cpu_ticks(pid);
+        // Burn a little, so the counter has something to move on. Not a timing
+        // assertion: the claim is only that the field is found and is monotone.
+        let mut acc = 0u64;
+        for i in 0..5_000_000u64 {
+            acc = acc.wrapping_add(i);
+        }
+        assert!(acc > 0);
+        assert!(
+            cpu_ticks(pid) >= before,
+            "utime+stime went backwards — the field offsets past the comm field are wrong"
+        );
+    }
+
+    /// **Review 37, 37-TEST-4.** A complete line that is not JSON used to map to `None`
+    /// — the same value a timeout produces, and [`Subscription::wait_for`] treats `None`
+    /// as terminal. A daemon emitting garbage therefore read as a daemon emitting
+    /// nothing, and every diagnosis started at the wrong end.
+    #[test]
+    #[should_panic(expected = "notification line is not JSON")]
+    fn a_malformed_notification_line_panics_instead_of_reading_as_a_timeout() {
+        let (mut sub, mut server) = paired_subscription();
+        server
+            .write_all(b"<html>503 Service Unavailable</html>\n")
+            .expect("write the garbage line");
+        let _ = sub.next(Duration::from_secs(5));
+    }
 }

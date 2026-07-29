@@ -191,6 +191,26 @@ test("an unterminated OSC gives up instead of eating the console forever", () =>
   assert.equal(textOf(ops), "back");
 });
 
+// Review 37-WEBC-3. The give-up above only fired for a *quiet* unterminated string: the
+// STRING→STRING_ESC→STRING cycle a bare ESC drives counted nothing, so a stuck line
+// spewing 0x1B held the machine in the string state forever. The console rendered
+// nothing, and `unknown` — the one place §17 says the operator can see what was thrown
+// away — stayed at exactly zero while it happened.
+test("an ESC-dense unterminated string still reaches the give-up bound", () => {
+  const st = newAnsiState();
+  parseAnsi(st, `\x1b]0;${"\x1bA".repeat(3000)}`);
+  assert.ok(
+    st.unknown > 0,
+    "the machine is still inside the string: the give-up bound counted only the " +
+      "characters the device chose not to send",
+  );
+  // …and ordinary output reaches the screen again, rather than being eaten for the rest
+  // of the session. The leading `\n` is a state-independent way back to ground, so this
+  // assertion measures the give-up rather than where the ESC run's parity left the
+  // machine.
+  assert.equal(textOf(parseAnsi(st, "\nback")), "back");
+});
+
 test("an absurd CSI parameter run is written off rather than buffered", () => {
   const st = newAnsiState();
   const ops = parseAnsi(st, `\x1b[${"1;".repeat(400)}mtext`);

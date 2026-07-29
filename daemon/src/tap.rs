@@ -19,6 +19,12 @@
 //! endpoint's hot path. A tap opened with `--replay` receives the ring snapshot and
 //! then the live stream with an **exact splice** — no gap, no duplication.
 //!
+//! A tap's stream ends with one **terminal** event, `tap.closed`, when the graph drops
+//! its endpoint. That event is not part of the bounded-and-lossy bargain the bytes
+//! make: §10 states the tap does not silently die, so it takes the tap's queue when
+//! there is room and the connection's overflow lane when there is not ([`Tap::terminal`],
+//! [`TapHub::detach_all`], 37-CTRL-1).
+//!
 //! Both live in one per-endpoint [`TapHub`] behind `Rc<CriticalCell<TapHub>>` on
 //! the runtime thread. The producer mirrors hostward bytes into a bounded feed
 //! channel (only while [`TapHub::active`] — a ring is configured or at least one
@@ -90,6 +96,11 @@ pub enum TapMsg {
     /// `remove-node` dropped the hub while this tap was open (§17, TAP-1). Without
     /// this the client sits on a live connection receiving nothing forever, with no
     /// notification and no error.
+    ///
+    /// Unlike [`TapMsg::Data`] this is **not** droppable: §10 promises the tap does
+    /// not silently die, and the moment it is most needed — a saturated queue on a
+    /// firehose endpoint — is exactly the moment a bounded lane has no room for it
+    /// (37-CTRL-1). [`Tap::terminal`] is the overflow lane that carries it then.
     Closed {
         tap_id: u64,
         endpoint: String,
@@ -97,7 +108,7 @@ pub enum TapMsg {
     },
 }
 
-/// The outcome of registering a tap (§11.8): how many replay bytes were queued and the
+/// The outcome of registering a tap (plan §11.8): how many replay bytes were queued and the
 /// endpoint offset the tap's stream begins at. With `--replay` and a non-empty ring,
 /// `from_offset` is the offset of the first *delivered* replay byte — the ring's oldest
 /// retained byte, or, when the ring is deeper than the connection can be handed at once,
@@ -115,7 +126,7 @@ pub struct Registered {
     /// `feed_dropped`.
     pub replay_truncated: u64,
     pub from_offset: u64,
-    /// The offset space `from_offset` is expressed in (§11.8, §15.38). Stable for
+    /// The offset space `from_offset` is expressed in (plan §11.8, §15.38). Stable for
     /// this hub's whole life and never reused, so a client that persists it beside
     /// its scrollback knows — rather than infers — when the space restarted.
     pub epoch: u64,
@@ -260,6 +271,18 @@ struct Tap {
     /// The connection's outbound channel (the §5 bounded boundary). `Closed`
     /// signals the connection dropped; `Full` is a counted drop.
     out: mpsc::Sender<TapMsg>,
+    /// The connection's **overflow lane for terminal events** (§10, 37-CTRL-1): where
+    /// this tap's [`TapMsg::Closed`] goes when `out` has no room for it. Unbounded,
+    /// and bounded anyway by construction — a tap emits exactly one terminal event and
+    /// is dropped from the hub in the same breath, so the lane holds at most one
+    /// message per tap the connection has open, a count it already pays for in `Tap`
+    /// and `OpenTap` handles.
+    ///
+    /// `None` only where nothing attached one: the window between [`TapHub::register`]
+    /// and the serving connection's [`OpenTap::attach_terminal`] — which no `.await`
+    /// can interleave, both running in one synchronous step on the runtime thread —
+    /// and the daemon's own unit fixtures, which keep no second lane.
+    terminal: Option<mpsc::UnboundedSender<TapMsg>>,
     /// Bytes dropped because `out` was full — shared with the daemon so `state`
     /// surfaces the tab's own drop counter (§5, §17).
     dropped: Rc<Cell<u64>>,
@@ -334,7 +357,7 @@ impl ReplayRing {
 pub struct TapHub {
     taps: Vec<Tap>,
     ring: Option<ReplayRing>,
-    /// Total hostward bytes ever ingested at this endpoint (§11.8): the monotonic
+    /// Total hostward bytes ever ingested at this endpoint (plan §11.8): the monotonic
     /// offset stamped on each delivered chunk. Wraps only at u64 (petabytes), never in
     /// a session; a daemon restart resets it and the `info` instance nonce changes so a
     /// client detects the reset rather than splicing across it.
@@ -360,7 +383,7 @@ pub struct TapHub {
     /// The endpoint display: reported in `state`, and named in the `tap.closed`
     /// notification so a client learns *which* of its taps died.
     endpoint: String,
-    /// This hub's identity, and therefore its **offset space**'s (§11.8). Unique per
+    /// This hub's identity, and therefore its **offset space**'s (plan §11.8). Unique per
     /// hub instance within a daemon process, monotonic, never reused.
     ///
     /// `ingested` is monotonic only for as long as *this* hub lives, and a hub is
@@ -427,7 +450,7 @@ impl TapHub {
     /// interleaves with [`Self::register`] (the exact-splice guarantee).
     ///
     /// **The offset space stays the delivered-bytes space, and feed loss is
-    /// signalled beside it** (TAP-1b, §11.8). `ingested` counts only bytes that
+    /// signalled beside it** (TAP-1b, plan §11.8). `ingested` counts only bytes that
     /// reached this hub, which is what keeps invariant 10 true in both halves: the
     /// ring holds `≤ ingested` bytes by construction, `from_offset = ingested −
     /// ring.len()` cannot underflow, *and* the ring stays contiguous in offset
@@ -456,7 +479,7 @@ impl TapHub {
         let observed = self.feed_dropped.load(Ordering::Relaxed);
         let gap_before = observed.wrapping_sub(self.feed_dropped_seen);
         self.feed_dropped_seen = observed;
-        // Offset of this chunk's first byte in the endpoint's hostward stream (§11.8),
+        // Offset of this chunk's first byte in the endpoint's hostward stream (plan §11.8),
         // stamped before advancing the running total.
         let offset = self.ingested;
         self.taps.retain(|tap| {
@@ -510,7 +533,7 @@ impl TapHub {
     ) -> Registered {
         let mut replay_bytes = 0u64;
         let mut replay_truncated = 0u64;
-        // Where this tap's stream begins (§11.8). With a non-empty deliverable slice
+        // Where this tap's stream begins (plan §11.8). With a non-empty deliverable slice
         // under `--replay` it is the offset of that slice's oldest byte; otherwise it is
         // the live edge, so the tap's first live `tap.data` carries exactly this offset.
         let mut from_offset = self.ingested;
@@ -555,7 +578,12 @@ impl TapHub {
                 piece_off += len;
             }
         }
-        self.taps.push(Tap { id, out, dropped });
+        self.taps.push(Tap {
+            id,
+            out,
+            terminal: None,
+            dropped,
+        });
         self.refresh_active();
         let registered = Registered {
             replay_bytes,
@@ -582,6 +610,21 @@ impl TapHub {
         registered
     }
 
+    /// Give one registered tap the connection's overflow lane for its terminal event
+    /// (§10, 37-CTRL-1), so [`Self::detach_all`] can deliver `tap.closed` past a
+    /// saturated data queue. Idempotent, and a no-op for an unknown id.
+    ///
+    /// Attached after [`Self::register`] rather than inside it because the lane belongs
+    /// to the *connection*, which is two frames above the hub's caller: the serving
+    /// connection creates it once and hands it to each tap it opens. The two calls are
+    /// one synchronous step on the runtime thread — no `.await` between them — so no
+    /// `detach_all` can land in the gap.
+    pub fn attach_terminal(&mut self, id: u64, terminal: mpsc::UnboundedSender<TapMsg>) {
+        if let Some(tap) = self.taps.iter_mut().find(|t| t.id == id) {
+            tap.terminal = Some(terminal);
+        }
+    }
+
     /// Remove a tap by id (explicit `tap.close` or connection drop). Idempotent: a
     /// not-found id is a no-op.
     pub fn close(&mut self, id: u64) {
@@ -591,12 +634,23 @@ impl TapHub {
 
     /// Detach every open tap because the graph dropped this hub's endpoint (§17,
     /// TAP-1): `teardown`, `load --replace`, or `remove-node`. Each tap's owning
-    /// connection is told with a terminal [`TapMsg::Closed`] on its own tap channel
-    /// — best effort, since a connection that has stopped draining its bounded
-    /// queue is already counted as dropping — and the hub is marked `orphaned`, so
-    /// a later `tap.close` on the surviving handle fails instead of reporting a
-    /// success that closed nothing. Returns the ids that were live, for the caller's
-    /// log line.
+    /// connection is told with a terminal [`TapMsg::Closed`], and the hub is marked
+    /// `orphaned`, so a later `tap.close` on the surviving handle fails instead of
+    /// reporting a success that closed nothing. Returns the ids that were live, for
+    /// the caller's log line.
+    ///
+    /// **The terminal event is not droppable** (37-CTRL-1). It rides the tap's own
+    /// bounded queue while there is room — the ordinary case, and the one that keeps
+    /// `tap.closed` ordered behind the bytes that preceded it — but a full queue is not
+    /// a reason to lose it: it is the *steady state* of a slow consumer on a firehose
+    /// endpoint, which is precisely the client §10's "the tap does not silently die"
+    /// was written for. Discarding the `Full` here left that client on a live
+    /// connection receiving nothing, with the loss uncounted and undetectable from the
+    /// channel, since `taps.clear()` drops the senders one line later. So the overflow
+    /// lane ([`Tap::terminal`]) carries it past the backlog instead, where the serving
+    /// connection drains it ahead of the data queue. Jumping the queue is deliberate
+    /// and is the whole point: the bytes behind it belong to an endpoint that no longer
+    /// exists, while the event says so.
     ///
     /// The ring is released here: connection-side [`OpenTap`] handles keep the hub
     /// alive after the graph is gone, and a detached hub can never be tapped again
@@ -605,11 +659,18 @@ impl TapHub {
     pub fn detach_all(&mut self, reason: TapCloseReason) -> Vec<u64> {
         let ids: Vec<u64> = self.taps.iter().map(|t| t.id).collect();
         for tap in &self.taps {
-            let _ = tap.out.try_send(TapMsg::Closed {
+            let closed = TapMsg::Closed {
                 tap_id: tap.id,
                 endpoint: self.endpoint.clone(),
                 reason: reason.as_str(),
-            });
+            };
+            // `Closed` means the connection itself is gone: there is nobody left to
+            // tell, on either lane.
+            if let Err(mpsc::error::TrySendError::Full(closed)) = tap.out.try_send(closed)
+                && let Some(terminal) = &tap.terminal
+            {
+                let _ = terminal.send(closed);
+            }
         }
         self.taps.clear();
         self.ring = None;
@@ -660,6 +721,15 @@ pub struct OpenTap {
 }
 
 impl OpenTap {
+    /// Hand this tap the connection's overflow lane for terminal events (§10,
+    /// 37-CTRL-1), so a `tap.closed` is delivered even when the connection's bounded
+    /// tap queue is full. Called by the serving connection immediately after
+    /// `tap.open` returns, in the same synchronous step.
+    pub fn attach_terminal(&self, terminal: mpsc::UnboundedSender<TapMsg>) {
+        self.hub
+            .with_mut(|h| h.attach_terminal(self.tap_id, terminal));
+    }
+
     /// Whether this tap's endpoint was dropped out from under it (§17, TAP-1) —
     /// what makes a later `tap.close` an error rather than a hollow success.
     pub fn is_orphaned(&self) -> bool {
@@ -751,7 +821,7 @@ mod tests {
         let dropped = Rc::new(Cell::new(0));
         let reg = hub.with_mut(|h| h.register(1, tx, dropped, true));
         assert_eq!(reg.replay_bytes, 8);
-        // 10 bytes ingested, ring keeps the last 8 → replay begins at offset 2 (§11.8).
+        // 10 bytes ingested, ring keeps the last 8 → replay begins at offset 2 (plan §11.8).
         assert_eq!(reg.from_offset, 2);
         // Live bytes after registration continue the stream.
         hub.with_mut(|h| h.ingest(&Chunk::from_static(b"abc")));
@@ -767,7 +837,7 @@ mod tests {
         let dropped = Rc::new(Cell::new(0));
         let reg = hub.with_mut(|h| h.register(1, tx, dropped, true));
         assert_eq!(reg.replay_bytes, 0); // explicit empty-replay marker (§17)
-        // No ring, but 4 bytes already flowed: the tap resumes at the live edge (§11.8).
+        // No ring, but 4 bytes already flowed: the tap resumes at the live edge (plan §11.8).
         assert_eq!(reg.from_offset, 4);
     }
 
@@ -1018,6 +1088,52 @@ mod tests {
                 assert_eq!(reason, "graph replaced");
             }
             _ => panic!("expected a terminal TapMsg::Closed"),
+        }
+    }
+
+    // 37-CTRL-1: the terminal event survives a **full** tap queue. A slow consumer on a
+    // firehose endpoint sits with its bounded queue full as its ordinary steady state —
+    // which is precisely the client §10's "the tap does not silently die" was written
+    // for, and precisely where a `try_send` that discards `Full` lost the event
+    // permanently: `taps.clear()` drops the senders one line later, so the loss was
+    // uncounted and undetectable from the channel, and the client sat on a live
+    // connection receiving nothing.
+    #[test]
+    fn detach_all_delivers_the_terminal_event_through_a_full_tap_queue() {
+        let (hub, _active, _fd) = TapHub::new("mux/console", 0);
+        let (tx, mut rx) = mpsc::channel(2);
+        let (term_tx, mut term_rx) = mpsc::unbounded_channel();
+        let dropped = Rc::new(Cell::new(0));
+        hub.with_mut(|h| h.register(9, tx, dropped.clone(), false));
+        hub.with_mut(|h| h.attach_terminal(9, term_tx));
+
+        // Saturate the queue: the surplus is counted and the tap stays live (§5).
+        for _ in 0..5 {
+            hub.with_mut(|h| h.ingest(&Chunk::from_static(b"ab")));
+        }
+        assert_eq!(dropped.get(), 6, "the fixture must leave the queue full");
+
+        let ids = hub.with_mut(|h| h.detach_all(TapCloseReason::Teardown));
+        assert_eq!(ids, vec![9]);
+
+        // The queued bytes are untouched — the terminal event displaced nothing…
+        assert!(matches!(rx.try_recv(), Ok(TapMsg::Data { .. })));
+        assert!(matches!(rx.try_recv(), Ok(TapMsg::Data { .. })));
+        // …and it reached the connection on the overflow lane instead of vanishing.
+        match term_rx.try_recv() {
+            Ok(TapMsg::Closed {
+                tap_id,
+                endpoint,
+                reason,
+            }) => {
+                assert_eq!(tap_id, 9);
+                assert_eq!(endpoint, "mux/console");
+                assert_eq!(reason, "teardown");
+            }
+            _ => panic!(
+                "a full tap queue swallowed the terminal tap.closed: the client is left \
+                 on a live connection receiving nothing (37-CTRL-1)"
+            ),
         }
     }
 }

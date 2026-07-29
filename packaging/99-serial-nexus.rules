@@ -9,9 +9,11 @@
 # file at all. Use these rules when you want a NARROWER grant than "all of dialout",
 # or a stable by-id symlink for a specific adapter.
 
-# Grant a dedicated group (create it, e.g. `sudo groupadd serialnexus`, and add it to
-# the unit's SupplementaryGroups) read/write to FTDI adapters only. Adjust idVendor
-# to your silicon (0403 = FTDI, 10c4 = Silicon Labs CP210x, 1a86 = QinHeng CH34x).
+# Grant a dedicated group read/write to FTDI adapters only. BOTH halves are required,
+# or the step silently does nothing: create the group (`sudo groupadd --system
+# serialnexus`) and name it in the unit's SupplementaryGroups= in place of `dialout` —
+# see step 4 of packaging/README.md. Adjust idVendor to your silicon
+# (0403 = FTDI, 10c4 = Silicon Labs CP210x, 1a86 = QinHeng CH34x).
 SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="0403", GROUP="serialnexus", MODE="0660"
 
 # The daemon addresses devices by resolver identity (usb:vid:pid:serial:iface), which

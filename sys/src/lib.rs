@@ -183,8 +183,12 @@ pub fn set_exclusive(fd: RawFd, on: bool) -> nix::Result<()> {
 /// [`write_fd`]) never blocks the current-thread runtime. `tokio::io::unix::AsyncFd`
 /// is deliberately *not* used for tty-family fds — it is prohibited for pty
 /// masters (§15.18), whose epoll readiness busy-loops the runtime (see
-/// [`poll_ready`]). `posix_openpt` and `serial2::SerialPort::open` both leave the
-/// fd blocking, so the data plane sets this itself.
+/// [`poll_ready`]). `posix_openpt` leaves the fd blocking, so the data plane sets
+/// this itself; the pinned `serial2` opens with `O_NONBLOCK | O_NOCTTY` already and
+/// never clears it, so that call is a documented redundancy rather than the thing
+/// that makes the serial fd non-blocking. Setting it there anyway is deliberate: the
+/// readiness loop's correctness must not rest on a dependency's open flags, which are
+/// not part of its API (37-SER-3 corrected the prose, not the call).
 pub fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
     // Safety: F_GETFL/F_SETFL take no memory arguments; fd is a valid open fd.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -192,6 +196,29 @@ pub fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Mark a fd close-on-exec (`FD_CLOEXEC`), so no child the daemon spawns inherits
+/// a copy of it (§7.2, §16.3).
+///
+/// The daemon does spawn children — the exec codec's (§7.6), which `fork`+`exec`
+/// with no fd cleanup of their own — and a fd that survives that exec is not merely
+/// untidy: a pty **master** in a codec child holds the console's pair open, so
+/// `remove-node`/`load --replace` no longer hangs up the slave and the pts index is
+/// never reclaimed, and it is a live handle on the console's targetward bytes in both
+/// directions. `posix_openpt` is specified to take only `O_RDWR | O_NOCTTY`
+/// portably — `O_CLOEXEC` there is a Linux extension — so the flag is set as a
+/// separate step, which is also the only shape that composes with `grantpt`.
+///
+/// `F_SETFD` carries exactly one flag, so this is a plain set rather than the
+/// read-modify-write [`set_nonblocking`] needs on `F_SETFL`.
+pub fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
+    // Safety: F_SETFD takes an int argument by value; fd is a valid open fd.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     if rc < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -1102,5 +1129,44 @@ mod tests {
         tx.write_all(b"hello").expect("write");
         // The write is to a socketpair buffer, so it is readable on return.
         assert_eq!(pending_input_bytes(rx.as_raw_fd()).expect("FIONREAD"), 5);
+    }
+
+    /// [`set_cloexec`] actually sets the flag the exec-inheritance guard rests on.
+    /// A fd is *not* close-on-exec by default, so the before-assertion is what makes
+    /// the after-assertion mean something (37-PTY-1).
+    #[test]
+    fn set_cloexec_marks_a_fd_close_on_exec() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (tx, _rx) = UnixStream::pair().expect("socketpair");
+        // `dup(2)` is specified to clear FD_CLOEXEC on the new descriptor, which is
+        // the only reliable way to get an inheritable fd here: std marks everything
+        // it opens close-on-exec, so duplicating is what reproduces the state a raw
+        // `posix_openpt` leaves behind.
+        // Safety: `tx` is open for the whole test; the returned fd is closed below.
+        let fd = unsafe { libc::dup(tx.as_raw_fd()) };
+        assert!(fd >= 0, "dup: {}", std::io::Error::last_os_error());
+
+        // Safety: F_GETFD takes no argument and reads no memory; `fd` is open.
+        let before = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(
+            before & libc::FD_CLOEXEC,
+            0,
+            "a dup'd fd is already close-on-exec, so this test proves nothing"
+        );
+
+        set_cloexec(fd).expect("set_cloexec");
+
+        // Safety: as above.
+        let after = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        // Safety: `fd` came from `dup` above and is not owned by anything else.
+        unsafe { libc::close(fd) };
+        assert_ne!(
+            after & libc::FD_CLOEXEC,
+            0,
+            "set_cloexec left FD_CLOEXEC clear; every exec-codec child would still \
+             inherit the fd (§7.2, §7.6)"
+        );
     }
 }

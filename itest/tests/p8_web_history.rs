@@ -1,6 +1,6 @@
 //! Phase 8 browser-side console modules: the pure, DOM- and storage-free ES modules the
-//! web console is built out of (§11.9 / design §15.32) — today the offset-splice +
-//! retention core (`history.mjs`, spliced by the §11.8 tap offsets so a reload never
+//! web console is built out of (plan §11.9 / design §15.32) — today the offset-splice +
+//! retention core (`history.mjs`, spliced by the plan §11.8 tap offsets so a reload never
 //! duplicates ring bytes) and the per-key write serializer (`saver.mjs`, which keeps two
 //! overlapping full-buffer OPFS rewrites from truncating each other, review WEB-5). Both
 //! are pure precisely so they are unit-testable outside a browser; their tests run here

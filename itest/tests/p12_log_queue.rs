@@ -24,6 +24,16 @@
 //! Ground truth is structured RPC state plus the on-disk file length, never CLI text,
 //! and the produced total is pinned by asserting each probe's own `received` (§5).
 //!
+//! That identity is pinned here only at **offset 0**: `/dev/full` refuses every write
+//! with nothing stored, and a rename fails before any byte moves, so no guard in this
+//! file can see a *partial* write — `write(2)` storing what fits and the retry getting
+//! ENOSPC, which is the ordinary shape of a disk filling up rather than a disk already
+//! full. Charging the whole chunk there made `written + dropped` exceed `produced` for a
+//! prefix that was durably in the file (LOG-1). Reproducing it needs a `write(2)` target
+//! that partial-writes on demand, which nothing reachable from a daemon fixture here
+//! provides, so that half is pinned beside the code:
+//! `daemon/src/nodes/log.rs`'s `a_partial_write_charges_only_the_unwritten_remainder`.
+//!
 //! **CONC-3** — a refused writer-thread `spawn` must fault the node, not panic the daemon
 //! out of `startup_load` — is pinned twice, and this file carries the end-to-end half:
 //! [`a_daemon_that_cannot_spawn_the_log_writer_starts_and_faults_the_node`] boots
@@ -50,7 +60,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use serial_nexus_itest::{Daemon, Rpc, Sim, TempRun, bin, daemon_answers, serial_echo, wait_until};
+use serial_nexus_itest::{
+    Daemon, Rpc, Sim, TempRun, bin, daemon_answers, file_len, serial_echo, wait_until,
+};
 
 /// One 8 KiB echo round-trip through the console pty: client → console → serial →
 /// echo device → back hostward → {console, log}.
@@ -94,10 +106,6 @@ fn log_counters(rpc: &Rpc, node: &str) -> (u64, u64) {
         n["dropped_bytes"].as_u64().unwrap_or(0),
         n["queued_bytes"].as_u64().unwrap_or(0),
     )
-}
-
-fn file_len(p: &Path) -> u64 {
-    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 
 #[test]

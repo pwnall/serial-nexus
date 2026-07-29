@@ -56,7 +56,18 @@ const MUX_CHANNEL: &str = "";
 
 /// The exec codec's validated attribute schema (§7.6). Deserialized from the
 /// opaque config table; a schema failure is structural and fails the load (§11).
+///
+/// `deny_unknown_fields` for the reason every table in `core/src/config.rs` carries
+/// it — §11's third review-hardened rule (§15.34): *unknown configuration keys are
+/// refused naming the key, so a typo cannot silently become a default*. A codec's
+/// opaque attribute table is the same door in a different wall, and it was the one
+/// left open: `restart_backoffms` or `enviroment` loaded clean and quietly restored
+/// the built-in default, which is the single shape of configuration error that shows
+/// up in neither `dump` (it round-trips the value the operator never set) nor
+/// `state`. Serde names the offending key and lists the legal ones, so the operator
+/// meets the same sentence the node schema gives them.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExecAttributes {
     /// The child command and its arguments (required, non-empty).
     argv: Vec<String>,
@@ -174,6 +185,12 @@ pub struct ExecCodecNode {
     /// back to active once a child is running. Carries the transition timestamp
     /// (§7), so a restart loop's `faulted` stamp moves with each real restart.
     status: Rc<CriticalCell<NodeState>>,
+    /// Whether a child process is currently up and pumping — the supervisor's half
+    /// of the status story, published so [`Self::set_upstream_attached`] can tell
+    /// "no upstream" from "no child" (CODEC-1). Between a crash and the respawn the
+    /// supervisor's `Faulted` stamp is the only truthful status, and edge surgery
+    /// must leave it alone.
+    child_live: Rc<Cell<bool>>,
     tasks: TaskSet,
 }
 
@@ -210,6 +227,7 @@ impl ExecCodecNode {
             unframable_discarded: Rc::new(Cell::new(0)),
             unconfigured: Rc::new(CriticalCell::new(UnconfiguredChannels::default())),
             status: Rc::new(CriticalCell::new(NodeState::new(NodeStatus::Active))),
+            child_live: Rc::new(Cell::new(false)),
             tasks: TaskSet::default(),
         }
     }
@@ -348,6 +366,7 @@ impl ExecCodecNode {
                 unframable_discarded: self.unframable_discarded.clone(),
                 unconfigured: self.unconfigured.clone(),
                 status: self.status.clone(),
+                child_live: self.child_live.clone(),
             })));
     }
 
@@ -355,6 +374,18 @@ impl ExecCodecNode {
     /// multiplexed side decides `active`/`waiting`; a channel endpoint faces host.
     pub fn set_upstream_attached(&mut self, endpoint: &EndpointAddr, attached: bool) {
         if !endpoint.is_default() || endpoint.node != self.name {
+            return;
+        }
+        // CODEC-1: surgery decides only whether a *running* child has an upstream to
+        // carry. While no child is up, the supervisor's `Faulted{child exited;
+        // restarting}` stamp is the only truthful status, and it stands for the whole
+        // `restart_backoff_ms` wait — legal up to [`MAX_TIMER_MS`], an hour. Nothing
+        // would correct an overwrite until the respawn, so a `connect` landing in that
+        // window reported a dead exec codec as `active` for as long as the operator had
+        // configured it to back off. Skipping costs nothing: the respawn re-decides
+        // active-vs-waiting off this same live edge slot, which is why the supervisor
+        // consults the slot rather than latching a status at start.
+        if !self.child_live.get() {
             return;
         }
         self.status.with_mut(|s| {
@@ -438,6 +469,7 @@ struct SuperviseArgs {
     unframable_discarded: Rc<Cell<u64>>,
     unconfigured: Rc<CriticalCell<UnconfiguredChannels>>,
     status: Rc<CriticalCell<NodeState>>,
+    child_live: Rc<Cell<bool>>,
 }
 
 /// Supervise the child: (re)spawn it, pump envelope frames both ways until it
@@ -459,6 +491,7 @@ async fn supervise(mut a: SuperviseArgs) {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
+                a.child_live.set(false);
                 a.restart_count.set(a.restart_count.get() + 1);
                 a.status.with_mut(|s| {
                     s.set(NodeStatus::Faulted {
@@ -476,7 +509,10 @@ async fn supervise(mut a: SuperviseArgs) {
         // The child is up, but a node with no upstream has nothing to carry: report
         // `waiting` until an edge attaches (§7.5/§15.8, §15.35). Consulting the live
         // slot here rather than latching a status at start keeps the supervisor and
-        // `connect` from racing to describe the same node.
+        // `connect` from racing to describe the same node — and publishing liveness
+        // first is the other half of that: from here until the child dies, edge
+        // surgery is free to re-decide active-vs-waiting (CODEC-1).
+        a.child_live.set(true);
         a.status.with_mut(|s| {
             s.set(if a.mux_edge.with(|e| e.attached) {
                 NodeStatus::Active
@@ -505,6 +541,9 @@ async fn supervise(mut a: SuperviseArgs) {
         let end = pump_child(stdin, stdout, stderr, &mut a.src_rx, &routing).await;
 
         let _ = child.kill().await;
+        // No child again until the next successful spawn, so whatever status this
+        // iteration stamps below is the supervisor's alone to keep (CODEC-1).
+        a.child_live.set(false);
         match end {
             // The merged source closed: the node was torn down (its forwarders
             // dropped their senders) or its upstream is gone. Stop; do not respawn.
@@ -721,6 +760,19 @@ async fn route_event(ev: Event, routing: &Routing<'_>) {
                     Some(&**s),
                 );
             }
+        }
+        // CODEC-4: the reserved identity is the *multiplexed side*, not a channel
+        // (§15.22) — the data arm above has always known that, and these three did
+        // not. A child announcing or closing the raw device stream says nothing about
+        // the graph's channels, and it has no per-channel stat by construction (the
+        // graph forbids an empty channel identity), so `stats.get("")` missed and the
+        // reserved name was filed as an *unconfigured channel*: `unconfigured_channels:
+        // [""]` in `state` plus the mis-spelled-channel WARN fired on an empty name,
+        // diagnosing a well-formed child as an operator typo. The arms are narrowed
+        // rather than removed — a real unconfigured identity still lands below.
+        EventKind::Open | EventKind::Close if ev.channel.as_str() == MUX_CHANNEL => {}
+        EventKind::Error(msg) if ev.channel.as_str() == MUX_CHANNEL => {
+            tracing::debug!(target: "exec-codec", "child multiplexed-side error: {msg}");
         }
         EventKind::Open => match stats.get(ev.channel.as_str()) {
             Some(s) => s.active.set(true),
@@ -966,6 +1018,140 @@ mod tests {
             f.mux_discarded.get(),
             0,
             "an unconfigured hostward identity is not a targetward loss"
+        );
+    }
+
+    /// CODEC-4: the reserved empty identity is the multiplexed side (§15.22), not a
+    /// channel, in the lifecycle arms as much as in the data arm. A child announcing
+    /// or closing the raw device stream used to file the reserved name as an
+    /// *unconfigured channel* — `unconfigured_channels: [""]` in `state`, plus the
+    /// mis-spelled-channel WARN on an empty name — which reads as an operator typo
+    /// on a child that is behaving exactly as `docs/codec-authors.md` documents.
+    #[tokio::test]
+    async fn lifecycle_events_on_the_reserved_identity_are_not_unconfigured_channels() {
+        let f = Fixture::new();
+        route_event(Event::open(MUX_CHANNEL), &f.routing()).await;
+        route_event(Event::close(MUX_CHANNEL), &f.routing()).await;
+        route_event(
+            Event::error(MUX_CHANNEL, "device framing violation"),
+            &f.routing(),
+        )
+        .await;
+
+        f.unconfigured.with(|u| {
+            let mut obj = serde_json::Map::new();
+            u.report_into(&mut obj);
+            assert_eq!(
+                obj["unconfigured_channels"],
+                json!([]),
+                "the reserved multiplexed identity is not a channel the operator forgot"
+            );
+            assert_eq!(obj["discarded_unconfigured_channel"], json!(0));
+        });
+
+        // Narrowed, not removed: a *real* unconfigured identity still lands.
+        route_event(Event::open("gps"), &f.routing()).await;
+        f.unconfigured.with(|u| {
+            let mut obj = serde_json::Map::new();
+            u.report_into(&mut obj);
+            assert_eq!(obj["unconfigured_channels"], json!(["gps"]));
+        });
+    }
+
+    /// The node fixture for the status tests: an exec codec built straight from a
+    /// `NodeConfig`, with no supervisor running, so a test can stand in for the
+    /// supervisor and drive `child_live`/`status` the way it does.
+    fn exec_node(name: &str) -> ExecCodecNode {
+        let attributes: toml::Table = "argv = [\"/bin/true\"]"
+            .parse()
+            .expect("test attributes parse");
+        ExecCodecNode::create(&NodeConfig::Codec {
+            name: name.to_owned(),
+            codec: "exec".to_owned(),
+            faces: Facing::Target,
+            channels: vec!["c0".to_owned()],
+            arbitration: serial_nexus_core::graph::Arbitration::default(),
+            replay_ring: 0,
+            attributes,
+        })
+    }
+
+    /// CODEC-1: mux-edge surgery must not overwrite the supervisor's `Faulted` stamp
+    /// while the crashed child sits in restart backoff. The backoff is configuration
+    /// (`restart_backoff_ms`, legal up to `MAX_TIMER_MS` — an hour), and between the
+    /// kill and the respawn nothing else re-decides the status: a `connect` landing in
+    /// that window reported a dead exec codec as `active` for the whole wait, which is
+    /// the one direction §15.8's honest-state rule cannot tolerate being wrong in.
+    #[test]
+    fn mux_edge_surgery_during_restart_backoff_keeps_the_faulted_stamp() {
+        let mut node = exec_node("mux");
+        let mux = EndpointAddr::node("mux");
+
+        // The supervisor's crash stamp: the child is gone and the backoff is running.
+        node.child_live.set(false);
+        node.status.with_mut(|s| {
+            s.set(NodeStatus::Faulted {
+                reason: "child exited; restarting (count 1)".to_owned(),
+            })
+        });
+
+        node.set_upstream_attached(&mux, true);
+        let after_connect = node.status();
+        let still_faulted = matches!(
+            after_connect.status(),
+            NodeStatus::Faulted { reason } if reason.contains("child exited")
+        );
+        assert!(
+            still_faulted,
+            "a connect overwrote the supervisor's fault: {:?}",
+            after_connect.status()
+        );
+        node.set_upstream_attached(&mux, false);
+        let after_disconnect = node.status();
+        assert!(
+            matches!(after_disconnect.status(), NodeStatus::Faulted { .. }),
+            "a disconnect overwrote the supervisor's fault: {:?}",
+            after_disconnect.status()
+        );
+
+        // With a child up, surgery is the authority again — the whole point of §15.35.
+        node.child_live.set(true);
+        node.set_upstream_attached(&mux, true);
+        assert!(
+            matches!(node.status().status(), NodeStatus::Active),
+            "a running child with an upstream is active"
+        );
+        node.set_upstream_attached(&mux, false);
+        assert!(
+            matches!(node.status().status(), NodeStatus::Waiting { .. }),
+            "a running child with no upstream waits"
+        );
+    }
+
+    /// CODEC-2: §11's third review-hardened rule — *unknown configuration keys are
+    /// refused naming the key, so a typo cannot silently become a default* — reaches
+    /// the codec's opaque attribute table too. `restart_backoffms` used to load clean
+    /// and quietly restore the 200 ms default: the one configuration error visible in
+    /// neither `dump` nor `state`.
+    #[test]
+    fn unknown_attribute_keys_are_refused_naming_the_key() {
+        let attrs = |src: &str| -> toml::Table { src.parse().expect("test attributes parse") };
+
+        for typo in ["restart_backoffms", "enviroment", "argvv"] {
+            let src = format!("argv = [\"/bin/true\"]\n{typo} = 1");
+            let Err(err) = parse_attributes(&attrs(&src)) else {
+                panic!("a misspelled `{typo}` must be refused, not silently defaulted");
+            };
+            assert!(err.contains(typo), "names the offending key: {err}");
+        }
+
+        // The legal table still loads, so the refusal is the unknown key and not
+        // exec attribute tables in general.
+        assert!(
+            parse_attributes(&attrs(
+                "argv = [\"/bin/true\"]\nrestart_backoff_ms = 250\n[env]\nTERM = \"dumb\""
+            ))
+            .is_ok()
         );
     }
 

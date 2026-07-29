@@ -252,9 +252,10 @@ impl TaskSet {
         }
     }
 
-    /// Whether any task is still held (i.e. whether this node was ever started and
-    /// has not been signalled). Used by a node whose `Drop` must decide between a
-    /// no-op and a full teardown.
+    /// Whether **no** task is still held — true for a node that was never started,
+    /// and true again once [`Self::abort_all`] has drained the handles. Used by a
+    /// node whose `Drop` must decide between a no-op and a full teardown, which
+    /// negates it (`!tasks.is_empty()` = "there is still something to stop").
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

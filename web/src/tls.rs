@@ -141,6 +141,10 @@ fn generate_self_signed(
         let _ = std::fs::remove_file(cert_path);
         return Err(e).with_context(|| format!("writing TLS key {}", key_path.display()));
     }
+    // Note that the two writers above clean up after *themselves* too (review
+    // 37-WEBS-7): the cross-file removal here only covers a key that failed beside a
+    // cert that succeeded, and a write that dies half-way through either file would
+    // otherwise leave that file behind with the same consequence.
 
     let cert_der = certified.cert.der().clone();
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -155,7 +159,29 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .write(true)
         .create_new(true)
         .open(path)?;
-    std::io::Write::write_all(&mut f, bytes)
+    write_created(path, &mut f, bytes)
+}
+
+/// Write `bytes` into `f`, a file **this call has just created** at `path`, removing
+/// the file again if the write fails (review 37-WEBS-7).
+///
+/// The removal is why the file has to have been created by the caller and by nobody
+/// else: `create_new` failing with `EEXIST` must propagate *without* touching the path,
+/// because the file there is then somebody else's. What this closes is the other half —
+/// a create that succeeded followed by a write that did not (`ENOSPC` on the runtime
+/// dir is the reachable one), which left a truncated cert or key on disk. Every later
+/// start then took the half-present-pair refusal, whose remedy — "supply the missing
+/// file" — misdirects for a garbage file this tool wrote itself, and generation could
+/// never retry. Symmetric with `generate_self_signed` removing the cert when the key
+/// write fails, for exactly the reason stated there.
+fn write_created(path: &Path, f: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    match std::io::Write::write_all(f, bytes) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(path);
+            Err(e)
+        }
+    }
 }
 
 /// Write a private key with owner-only (0600) permissions into a path that must not
@@ -180,8 +206,13 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // code still claimed 0600). Narrowing explicitly makes the mode a fact about the
     // file on disk; `serial-nexus-daemon`'s state-file write does the same for the same
     // reason. It runs before `write_all`, so there is no window at a wider mode.
-    f.set_permissions(std::fs::Permissions::from_mode(KEY_FILE_MODE))?;
-    std::io::Write::write_all(&mut f, bytes)
+    if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(KEY_FILE_MODE)) {
+        // Created-then-failed, so this call owns the path (see [`write_created`]): an
+        // empty key left here is the half-present pair the next start refuses.
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    write_created(path, &mut f, bytes)
 }
 
 #[cfg(test)]
@@ -348,6 +379,52 @@ mod tests {
             std::fs::read(&key).unwrap(),
             key_bytes,
             "the load branch rewrote the key"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Review **37-WEBS-7**: a write that fails *after* the create must take the file
+    /// it created with it.
+    ///
+    /// The failure is produced rather than simulated — a real `write_all` on a
+    /// read-only descriptor returns `EBADF` — because the property under test is what
+    /// happens to the path on the error path, and a stubbed error would prove only that
+    /// the code compiles. The consequence of leaving the file is not cosmetic: the next
+    /// start reads a lone cert (or a lone key) as half a pair and refuses with "supply
+    /// the missing file", which is wrong advice for a garbage file this tool wrote, and
+    /// generation can never retry into it.
+    #[test]
+    fn a_write_that_fails_after_the_create_leaves_no_partial_file() {
+        let dir = scratch_dir();
+        let path = dir.join("tls.crt");
+        std::fs::File::create(&path).unwrap();
+        // Read-only: the create half of the sequence has already succeeded, and the
+        // write is the half that fails.
+        let mut read_only = std::fs::File::open(&path).unwrap();
+
+        let err = write_created(&path, &mut read_only, b"half a certificate")
+            .expect_err("writing to a read-only descriptor must fail");
+        assert!(
+            err.raw_os_error().is_some(),
+            "the OS error is reported as itself, not swallowed by the cleanup: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "a failed write left {path:?} behind: the next start reads that as half a \
+             pair and tells the operator to supply the file this tool created"
+        );
+
+        // The other direction, and the reason the cleanup lives here rather than around
+        // the whole open-and-write: a `create_new` that loses to an existing file must
+        // propagate untouched, because that file is somebody else's.
+        let planted = dir.join("planted.crt");
+        std::fs::write(&planted, OPERATOR_CERT).unwrap();
+        assert!(write_new(&planted, b"generated").is_err());
+        assert_eq!(
+            std::fs::read(&planted).unwrap(),
+            OPERATOR_CERT,
+            "an EEXIST refusal must not remove the file it refused to overwrite"
         );
 
         std::fs::remove_dir_all(&dir).ok();

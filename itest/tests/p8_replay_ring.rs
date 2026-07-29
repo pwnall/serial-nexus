@@ -38,49 +38,20 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use serial_nexus_itest::{Daemon, Sim, serial_echo, sha256_hex, wait_until};
+use serial_nexus_itest::{Daemon, Sim, file_len, serial_echo, sha256_hex, wait_until};
 
 const R: u64 = 65536; // ring depth: 64 KiB
 const T: u64 = 524288; // total streamed: 512 KiB
 const RATE: u64 = 262144; // 256 KiB/s → the stream lasts ~2s, tap opens mid-stream
 const SEED: u64 = 23;
 
-/// Current on-disk length of `p` (0 if absent) — the portable replacement for
-/// `stat -c %s … || echo 0`.
-fn file_len(p: &Path) -> u64 {
-    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-}
-
-/// Standard base64 decode (alphabet `A-Za-z0-9+/`, `=` padding) — the inverse of the
-/// daemon's `serial_nexus_rpc::base64_encode` used for `tap.data`. Each `tap.data` payload is
-/// its own padded string, so decoding per-message and concatenating is exact.
+/// Standard base64 decode of a `tap.data` payload — `serial_nexus_rpc`'s tested
+/// decoder rather than a seventh hand-rolled copy (§16.5 one-rule-one-place, review
+/// 37 37-TEST-5). Panics on a malformed payload: these bytes were produced by
+/// `serial_nexus_rpc::base64_encode` on the other side of the socket, so anything
+/// else is a defect, not an input.
 fn base64_decode(s: &str) -> Vec<u8> {
-    fn val(c: u8) -> Option<u32> {
-        match c {
-            b'A'..=b'Z' => Some((c - b'A') as u32),
-            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let mut out = Vec::new();
-    let mut acc = 0u32;
-    let mut nbits = 0u32;
-    for &c in s.as_bytes() {
-        if c == b'=' {
-            break;
-        }
-        let Some(v) = val(c) else { continue }; // skip any stray whitespace/newlines
-        acc = (acc << 6) | v;
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((acc >> nbits) as u8);
-        }
-    }
-    out
+    serial_nexus_rpc::base64_decode(s).expect("a tap.data payload must be valid base64")
 }
 
 /// The `replay_ring` attribute of the node named `name` in a `dump` config, or `None`.

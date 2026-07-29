@@ -41,7 +41,7 @@ use sha1::{Digest, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, oneshot};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout_at};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
@@ -75,6 +75,13 @@ pub const MAX_HEAD: usize = 16 * 1024;
 /// also the ceiling on how long a stalled peer keeps a slot the operator might want. The
 /// slack that remains is for the TLS handshake, which shares this deadline and costs a
 /// couple of round trips.
+///
+/// **One deadline, not one per phase** (review 37-WEBS-5). It is taken as an *instant*
+/// at accept and carried through both pre-auth phases, because the two are sequential:
+/// granting the handshake five seconds and then granting the head five more let a
+/// TLS-tier peer that drips its `ClientHello` and then goes silent hold a pre-auth slot
+/// for twice what this constant — and `docs/security.md` — say a peer gets. The
+/// documented promise is the better behaviour, so the code keeps the promise.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connections **past the token gate** served at once. A browser tab costs a handful
@@ -284,6 +291,11 @@ pub async fn run(
                 continue;
             }
         };
+        // The single pre-authentication deadline, taken here so it covers everything
+        // this connection may do before it shows a credential (review 37-WEBS-5): the
+        // TLS handshake and the request head are two phases of one budget, not two
+        // budgets.
+        let deadline = Instant::now() + HEAD_TIMEOUT;
         // Join the pre-auth population here, synchronously, before the next accept:
         // registration cannot fail — which is exactly how an authenticated client stops
         // being deniable by silent peers — and the eviction it may trigger is what keeps
@@ -300,10 +312,14 @@ pub async fn run(
             // and it runs under the pre-auth ticket for the same reason.
             let served = async move {
                 match acceptor {
-                    Some(acc) => match timeout(HEAD_TIMEOUT, acc.accept(stream)).await {
+                    Some(acc) => match timeout_at(deadline, acc.accept(stream)).await {
                         Ok(Ok(tls_stream)) => {
-                            handle_conn(tls_stream, config, assets, secure, port, ticket, conns)
-                                .await
+                            // The *same* deadline, not a fresh one: what the handshake
+                            // spent is spent (review 37-WEBS-5).
+                            handle_conn(
+                                tls_stream, config, assets, secure, port, ticket, conns, deadline,
+                            )
+                            .await
                         }
                         Ok(Err(e)) => {
                             tracing::debug!("TLS handshake from {peer} failed: {e}");
@@ -314,7 +330,12 @@ pub async fn run(
                             Ok(())
                         }
                     },
-                    None => handle_conn(stream, config, assets, secure, port, ticket, conns).await,
+                    None => {
+                        handle_conn(
+                            stream, config, assets, secure, port, ticket, conns, deadline,
+                        )
+                        .await
+                    }
                 }
             };
             // Cancelling `served` drops the stream, which is the eviction. Past the token
@@ -408,6 +429,12 @@ impl Request {
     }
 }
 
+/// Serve one connection past the point TLS (if any) is terminated.
+///
+/// `deadline` is the pre-authentication budget taken at accept and already partly spent
+/// by the handshake — see [`HEAD_TIMEOUT`]. It is the caller's instant, deliberately,
+/// so this function cannot restart it.
+#[allow(clippy::too_many_arguments)]
 async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     mut stream: S,
     config: Arc<ServerConfig>,
@@ -416,10 +443,11 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     port: u16,
     pre_auth: PreAuthTicket,
     conns: Arc<Semaphore>,
+    deadline: Instant,
 ) -> anyhow::Result<()> {
     // A complete head, or the connection is dropped: an unauthenticated peer must not
     // be able to hold a task and an fd by staying silent.
-    let req = match timeout(HEAD_TIMEOUT, read_request(&mut stream)).await {
+    let req = match timeout_at(deadline, read_request(&mut stream)).await {
         Ok(read) => match read? {
             Some(req) => req,
             None => return Ok(()), // empty/closed
@@ -628,6 +656,27 @@ async fn upgrade_ws<S: AsyncRead + AsyncWrite + Unpin + 'static>(
             return write_simple(&mut stream, 400, "Bad Request", "not a WebSocket upgrade").await;
         }
     };
+    // First contact with the daemon happens *before* the 101 (review 37-WEBS-3). A
+    // browser that gets a completed handshake has, by definition, an open socket and a
+    // page that says "connected"; if the bridge then fails to reach the daemon, the
+    // socket is dropped with no Close frame — exactly the ambiguity WEB-4 removed for a
+    // daemon that dies mid-session, arriving instead at session birth. A `503` before
+    // the switch cannot be mistaken for a live console by anything: `onopen` never
+    // fires in a browser, and curl and the headless client see the status and the
+    // reason. It is answered after the upgrade request itself is judged well-formed, so
+    // a malformed upgrade still gets its `400` rather than a report about the daemon.
+    let daemon = match crate::bridge::connect(&config.socket).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("refusing a WebSocket upgrade: {e}");
+            let body = format!(
+                "the daemon is not reachable on {} — start serial-nexus-daemon (or point \
+                 --socket at it) and reload",
+                config.socket.display()
+            );
+            return write_simple(&mut stream, 503, "Service Unavailable", &body).await;
+        }
+    };
     let mut hasher = Sha1::new();
     hasher.update(key.as_bytes());
     hasher.update(WS_GUID.as_bytes());
@@ -645,7 +694,7 @@ async fn upgrade_ws<S: AsyncRead + AsyncWrite + Unpin + 'static>(
         .max_message_size(Some(WS_MAX_MESSAGE))
         .max_frame_size(Some(WS_MAX_FRAME));
     let ws = WebSocketStream::from_raw_socket(stream, Role::Server, Some(ws_config)).await;
-    crate::bridge::bridge(ws, config.socket.clone()).await
+    crate::bridge::bridge(ws, daemon).await
 }
 
 /// A restrictive CSP, sent with `nosniff` on every asset (§17, §15.35). The console
@@ -827,6 +876,50 @@ pub fn split_authority(authority: &str) -> Option<(&str, Option<u16>)> {
     }
 }
 
+/// Normalize the operator's `--host` values into the form the Host gate compares
+/// against: the bare name, with any port stripped (review 37-WEBS-2).
+///
+/// The gate compares against [`Request::host`], which strips the port, so a value that
+/// carries one — `example.com:8443`, the spelling the flag's own help invites and the
+/// spelling every browser writes into the header — could never match. The console then
+/// answered `403 unrecognized Host` to *every* request, including the operator's own
+/// bootstrap URL, with nothing said at startup to connect the two. Stripping it here
+/// makes the flag mean what it reads as.
+///
+/// Port-exactness is not given up with the port: it was never this gate's to enforce.
+/// Host answers *was this addressed to a name we serve* — DNS rebinding — and the port
+/// is [`origin_matches_host`]'s, compared against the request's own authority so that
+/// SSH-forwarded ports still agree (§15.29). Dropping a stated port therefore narrows
+/// nothing that was ever checked; it only stops the entry being dead.
+///
+/// An authority that does not parse is a startup failure naming the flag, rather than
+/// an entry that silently matches nothing.
+pub fn normalize_hosts(hosts: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::with_capacity(hosts.len());
+    for value in hosts {
+        let Some((host, port)) = split_authority(value) else {
+            anyhow::bail!(
+                "invalid --host {value:?}: expected a host name or address, optionally \
+                 with a port (`example.com`, `example.com:8443`, `[::1]`)"
+            );
+        };
+        if host.is_empty() {
+            anyhow::bail!("invalid --host {value:?}: the host name is empty");
+        }
+        if port.is_some() {
+            // Said once, at startup, because the alternative is an operator watching
+            // every request 403 with no hint that the flag is the reason.
+            tracing::info!(
+                "--host {value:?}: accepting Host {host:?} on any port. The Host check \
+                 is by name (§15.29); the port is checked by the Origin header, against \
+                 the request's own authority."
+            );
+        }
+        out.push(host.to_string());
+    }
+    Ok(out)
+}
+
 /// Whether `origin` designates this very server, judged against the request's own
 /// `Host` — which the caller has already confirmed is a name we serve.
 ///
@@ -894,6 +987,9 @@ fn ct_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests still wrap a bare duration: the server itself carries one
+    // pre-authentication *instant* through both phases (review 37-WEBS-5).
+    use tokio::time::timeout;
 
     /// The 8080-on-127.0.0.1 default, the shape every case below varies from.
     const HOST: &str = "127.0.0.1:8080";
@@ -1227,6 +1323,62 @@ mod tests {
         assert_eq!(split_authority("localhost:99999"), None);
     }
 
+    /// Review **37-WEBS-2**: an operator-declared host that carries a port has to
+    /// match, because the Host gate compares against a port-stripped header.
+    ///
+    /// Asserted through the gate's own comparison rather than on the returned strings
+    /// alone: what failed was not the normalizer (there was none) but the pairing of a
+    /// verbatim allow-list with a port-stripping accessor, so the test exercises both
+    /// halves against each other.
+    #[tokio::test]
+    async fn an_operator_host_with_a_port_still_matches_the_stripped_header() {
+        let allowed = normalize_hosts(&[
+            "example.com:8443".into(),
+            "console.lab".into(),
+            "[2001:db8::1]:8443".into(),
+        ])
+        .expect("these are well-formed authorities");
+
+        for (header, want) in [
+            ("example.com:8443", true),
+            ("example.com", true),
+            // The port genuinely is not this gate's business — `origin_matches_host`
+            // is what pins it, against the request's own authority.
+            ("example.com:9999", true),
+            ("console.lab:8443", true),
+            ("[2001:db8::1]:8443", true),
+            ("evil.example:8443", false),
+            // A name that merely contains an allowed one is not that name.
+            ("notexample.com", false),
+        ] {
+            let raw = format!("GET / HTTP/1.1\r\nHost: {header}\r\n\r\n");
+            let req = read_request(&mut raw.as_bytes())
+                .await
+                .expect("parse")
+                .expect("a head");
+            let host = req.host().expect("a Host header");
+            let ok = allowed
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(host) || bracketed_eq(a, host));
+            assert_eq!(
+                ok, want,
+                "Host {header:?} against --host {allowed:?} (stripped to {host:?})"
+            );
+        }
+        assert_eq!(
+            allowed,
+            vec!["example.com", "console.lab", "2001:db8::1"],
+            "the gate compares names, so that is what the flag is normalized to"
+        );
+
+        // An authority that cannot be parsed is a startup failure naming the flag, not
+        // an entry that quietly matches nothing.
+        for bad in ["example.com:http", "example.com:99999", ""] {
+            let err = normalize_hosts(&[bad.to_string()]).expect_err("{bad:?} must be refused");
+            assert!(format!("{err}").contains("--host"), "{err}");
+        }
+    }
+
     #[tokio::test]
     async fn a_request_head_parses_and_is_bounded() {
         let raw = b"GET /app.js?token=ab HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\
@@ -1248,6 +1400,59 @@ mod tests {
         // A head that never terminates is refused at MAX_HEAD, not buffered forever.
         let flood = vec![b'x'; MAX_HEAD + 64];
         assert!(read_request(&mut &flood[..]).await.is_err());
+    }
+
+    /// Review **37-WEBS-5**: the pre-authentication deadline belongs to the caller, and
+    /// the head phase may not restart it.
+    ///
+    /// `docs/security.md` and [`HEAD_TIMEOUT`] both promise *one* five-second budget
+    /// covering the TLS handshake and the head. The code granted the constant twice in
+    /// sequence, so a TLS-tier peer that drips its `ClientHello` for most of the first
+    /// budget and then falls silent held a pre-auth slot for close to twice the stated
+    /// ceiling. This hands `handle_conn` a budget that is already spent — what the
+    /// handshake leaves behind in that scenario — and asserts it answers at once
+    /// instead of starting a fresh five seconds of its own.
+    #[tokio::test]
+    async fn the_pre_auth_deadline_is_the_callers_and_is_never_restarted() {
+        let (ours, mut theirs) = tokio::io::duplex(1024);
+        let pool = PreAuthPool::new();
+        let (ticket, _evict) = pool.admit();
+        let config = Arc::new(ServerConfig {
+            token: "irrelevant: nothing here gets as far as the token".into(),
+            socket: PathBuf::from("/nonexistent"),
+            hosts: vec!["127.0.0.1".into()],
+        });
+
+        // `theirs` is held and never written to: the silent peer of the finding, whose
+        // whole cost is the slot it keeps.
+        let started = Instant::now();
+        let spent = started; // a budget the handshake has already used up
+        handle_conn(
+            ours,
+            config,
+            Arc::from("asset-credential"),
+            false,
+            8080,
+            ticket,
+            Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            spent,
+        )
+        .await
+        .expect("a timed-out head is answered, not an error");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < HEAD_TIMEOUT / 2,
+            "the head phase started a deadline of its own: it took {elapsed:?}, so a \
+             connection whose handshake spent the budget still gets most of another \
+             {HEAD_TIMEOUT:?}"
+        );
+
+        // …and it is answered, rather than dropped: the 408 is what tells a slow client
+        // from a refused one.
+        let mut buf = vec![0u8; 256];
+        let n = theirs.read(&mut buf).await.expect("read the response");
+        let response = String::from_utf8_lossy(&buf[..n]).into_owned();
+        assert!(response.starts_with("HTTP/1.1 408 "), "{response:?}");
     }
 
     #[tokio::test]

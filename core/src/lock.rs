@@ -118,10 +118,18 @@ pub struct EndpointLock {
     /// `steal`). A lease timer captures the generation at grant and only fires if
     /// it still matches, so a stale timer can never release a later grant (§6).
     generation: u64,
-    /// The most recent steal `(from, by)`, surfaced in state so an ousted holder
-    /// can see it (§6). Best-effort: dropped from the snapshot once either party
-    /// detaches.
-    stolen: Option<(OriginId, OriginId)>,
+    /// The most recent steal, surfaced in state so an ousted holder can see what
+    /// happened (§6).
+    ///
+    /// The parties' **labels** are copied in at steal time rather than the two
+    /// `OriginId`s being resolved lazily at snapshot: an id is only resolvable while
+    /// its origin is still registered, and `send --steal` unregisters its transient
+    /// origin milliseconds after the steal (§6), so the lazy form dropped the whole
+    /// record and §6's promise held for `lock --steal` and silently failed for
+    /// `send --steal` — the theft nobody could see afterwards being precisely the
+    /// one the ousted holder did not perform (37-LOCK-3). The record is a *past
+    /// event*; resolving it against the present was the category error.
+    stolen: Option<StealRecord>,
 }
 
 impl EndpointLock {
@@ -308,7 +316,16 @@ impl EndpointLock {
         }
         let previous = self.holder;
         if let Some(prev) = previous {
-            self.stolen = Some((prev, id));
+            // Both labels are captured here, while both origins are certainly
+            // registered — `steal` has just checked the stealer and read the holder
+            // (37-LOCK-3). A label that cannot be read is impossible at this point,
+            // so the fallback is unreachable rather than lossy; it is spelled rather
+            // than `expect`ed because a pure state machine has no business panicking
+            // on an accounting field.
+            self.stolen = Some(StealRecord {
+                from: self.label(prev).unwrap_or_default().to_owned(),
+                by: self.label(id).unwrap_or_default().to_owned(),
+            });
         }
         self.waiters.retain(|w| *w != id);
         self.holder = Some(id);
@@ -448,12 +465,7 @@ impl EndpointLock {
                 .filter_map(|w| self.label(*w))
                 .map(str::to_owned)
                 .collect(),
-            last_steal: self.stolen.and_then(|(from, by)| {
-                Some(StealRecord {
-                    from: self.label(from)?.to_owned(),
-                    by: self.label(by)?.to_owned(),
-                })
-            }),
+            last_steal: self.stolen.clone(),
         }
     }
 }
@@ -469,7 +481,9 @@ pub struct LockSnapshot {
     pub origins: Vec<OriginState>,
     /// Origins waiting for the lock, in FIFO order (front = next to be granted).
     pub waiters: Vec<String>,
-    /// The most recent steal, so an ousted holder can see what happened (§6).
+    /// The most recent steal, so an ousted holder can see what happened (§6). It
+    /// outlives both parties' registrations — a `send --steal`'s transient origin is
+    /// gone before the ousted holder can ask (37-LOCK-3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_steal: Option<StealRecord>,
 }
@@ -736,6 +750,45 @@ mod tests {
         // When 3 releases, the queued waiter 2 is next (steal preserved the queue).
         assert!(lock.release(OriginId(3)));
         assert_eq!(lock.acquire(OriginId(2)), Acquire::Granted);
+    }
+
+    /// 37-LOCK-3: the theft record outlives both parties' registrations.
+    ///
+    /// `send --steal` registers a transient origin, steals, writes, and unregisters
+    /// — all inside one verb (§6). Resolving the record's ids at snapshot therefore
+    /// answered `None` a few milliseconds later, so §6's "recorded in state so the
+    /// previous holder can see what happened" held for `lock --steal` and vanished
+    /// for exactly the steal the ousted holder had no other way to learn about.
+    #[test]
+    fn a_steal_record_survives_both_parties_leaving() {
+        let mut lock = EndpointLock::new(Arbitration::Exclusive);
+        lock.register(OriginId(1), "ptya", WriteMode::OnDemand);
+        lock.register(OriginId(2), "send", WriteMode::OnDemand);
+        lock.acquire(OriginId(1));
+        lock.steal(OriginId(2));
+
+        // The transient origin leaves the moment its verb finishes…
+        lock.unregister(OriginId(2));
+        assert_eq!(
+            lock.snapshot().last_steal,
+            Some(StealRecord {
+                from: "ptya".into(),
+                by: "send".into()
+            }),
+            "the record went with the stealer's registration"
+        );
+
+        // …and the record still reads after the victim leaves too (its own detach,
+        // `disconnect`, `remove-node`), which is when an operator goes looking.
+        lock.unregister(OriginId(1));
+        assert_eq!(
+            lock.snapshot().last_steal,
+            Some(StealRecord {
+                from: "ptya".into(),
+                by: "send".into()
+            }),
+            "the record went with the victim's registration"
+        );
     }
 
     #[test]

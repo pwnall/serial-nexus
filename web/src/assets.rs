@@ -13,7 +13,7 @@ const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_JS: &str = include_str!("assets/app.js");
 const APP_CSS: &str = include_str!("assets/app.css");
 // The ES modules app.js imports: the pure offset-splice/retention core and the
-// per-key write serializer (§11.9, both unit-tested under `node --test`), and the
+// per-key write serializer (plan §11.9, both unit-tested under `node --test`), and the
 // thin OPFS persistence adapter.
 const HISTORY_MJS: &str = include_str!("assets/history.mjs");
 const SAVER_MJS: &str = include_str!("assets/saver.mjs");

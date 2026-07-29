@@ -47,16 +47,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use serial_nexus_itest::{Daemon, Rpc, Sim, TempRun, bin, serial_echo, sha256_hex, wait_until};
+use serial_nexus_itest::{
+    Daemon, Rpc, Sim, TempRun, bin, file_len, seeded_bytes, serial_echo, sha256_hex, wait_until,
+};
 
 const SIZE_256K: u64 = 256 * 1024;
 const SIZE_32K: u64 = 32 * 1024;
-
-/// Current on-disk length of `p` (0 if absent) — the portable replacement for
-/// `stat -c %s … || echo 0`.
-fn file_len(p: &Path) -> u64 {
-    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-}
 
 /// Drive one seeded batch through an echo device and verify the full round trip:
 /// write `send_spec` (e.g. `seeded:32KiB`) into `tty`, read the echo back, and return
@@ -498,24 +494,6 @@ filename = "rot.log"
 }
 
 // ---- Check 4: rotation is ordered against the queue (§7.3, review LOG-3) --------
-
-/// The sim's deterministic SplitMix64 payload — reimplemented so this test owns the
-/// ground truth for *where* each batch's bytes landed, not just their checksum
-/// (identical to `serial-nexus-sim`'s; `len` a multiple of 8).
-fn seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
-    let mut s = seed;
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        out.extend_from_slice(&z.to_le_bytes());
-    }
-    out.truncate(len);
-    out
-}
 
 /// Create a FIFO at `path` with `mkfifo(1)`. `false` when the tool is missing or
 /// fails, which makes the caller **skip** — POSIX guarantees the utility, but the

@@ -110,7 +110,7 @@ test("a reload splices stored history against the replay ring exactly once", asy
   await selectConsole(page, ECHO);
 
   // The stored scrollback is replayed from OPFS, and then the daemon's ring replays
-  // the same bytes over the tap. The offsets (§11.8) are what stop the second copy
+  // the same bytes over the tap. The offsets (plan §11.8) are what stop the second copy
   // from being appended — this is the splice, asserted in the browser.
   await expect(page.locator("#term")).toContainText("stored history");
   await expect(page.locator("#term")).toContainText(first);

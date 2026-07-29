@@ -40,7 +40,7 @@
 //!    act with a line of evidence behind it; that is exactly the property an
 //!    allowlist buys and an inverted list would give away.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -92,13 +92,26 @@ const ALLOWED: &[&str] = &[
     "disconnect",
 ];
 
+/// Open this session's control-socket connection to the daemon (§17: one per browser
+/// WebSocket, since taps and `subscribe` are connection-scoped, §10).
+///
+/// Separate from [`bridge`] because *when* it happens is load-bearing (review
+/// 37-WEBS-3). Making first contact inside the bridge meant the upgrade's `101` had
+/// already been written, so a browser that arrived while the daemon was down completed
+/// its handshake, rendered "connected", and was dropped a moment later with no Close
+/// frame — the same ambiguity WEB-4 removed for a daemon that dies mid-session,
+/// reappearing at session birth. The caller now connects first and answers `503`
+/// instead, which no browser can mistake for an open socket.
+pub async fn connect(socket: &Path) -> anyhow::Result<UnixStream> {
+    UnixStream::connect(socket)
+        .await
+        .map_err(|e| anyhow::anyhow!("connecting to daemon {}: {e}", socket.display()))
+}
+
 pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     ws: WebSocketStream<S>,
-    socket: PathBuf,
+    daemon: UnixStream,
 ) -> anyhow::Result<()> {
-    let daemon = UnixStream::connect(&socket)
-        .await
-        .map_err(|e| anyhow::anyhow!("connecting to daemon {}: {e}", socket.display()))?;
     let (d_read, mut d_write) = daemon.into_split();
     let (mut ws_sink, mut ws_stream) = ws.split();
 

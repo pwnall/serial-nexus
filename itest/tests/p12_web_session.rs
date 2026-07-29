@@ -23,7 +23,12 @@
 //!   rendering "connected" over a dead daemon and its own "disconnected — reload to
 //!   reconnect" signal never fired.
 //!
-//! Both need no serial device, so they run on **every** platform (§5). The raw HTTP and
+//! * **37-WEBS-3** — WEB-4's mirror image at the *birth* of a session. The `101` was
+//!   written before the bridge made first contact with the daemon, so a browser that
+//!   connected while the daemon was down completed its handshake, rendered "connected",
+//!   and was dropped with no Close frame: the same ambiguity, one round trip earlier.
+//!
+//! All three need no serial device, so they run on **every** platform (§5). The raw HTTP and
 //! RFC 6455 clients below are deliberately local copies rather than shared with
 //! `p8_web.rs`: the close-frame assertion needs a reader that hands back the *opcode*,
 //! which `p8_web`'s message-level client folds away.
@@ -228,6 +233,42 @@ fn bootstrap_cookie(port: u16, token: &str) -> String {
         .expect("a Set-Cookie value has a name=value pair")
         .trim()
         .to_string()
+}
+
+/// Send a real RFC 6455 upgrade and return `(status, the whole response)` — the head
+/// *and* the body, which is where a refusal states its reason. Reads to EOF, which the
+/// server's `Connection: close` refusals reach at once.
+fn ws_upgrade(port: u16, cookie: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect web server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set read timeout");
+    // RFC 6455 §1.3's own example nonce, as everywhere else in this file.
+    let req = format!(
+        "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\nCookie: {cookie}\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).expect("write WS upgrade");
+    stream.flush().expect("flush WS upgrade");
+    // A `101` is followed by whatever the bridge sends and then (under the defect) an
+    // abrupt drop, so this is bounded by the read timeout rather than by EOF alone.
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text
+        .split("\r\n")
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("no HTTP status in the upgrade response: {text:?}"));
+    (status, text)
 }
 
 // ------------------------------------------------------- a raw RFC 6455 client ----
@@ -500,6 +541,71 @@ fn a_bridged_websocket_closes_when_the_daemon_goes_away() {
     assert!(
         reason.contains("daemon"),
         "the close reason must name the cause: {reason:?}"
+    );
+}
+
+// -------------------------------------------------------------------- 37-WEBS-3 ----
+
+/// Review **37-WEBS-3**: with the daemon down, the upgrade is refused *before* the
+/// `101`, so a console never reports itself connected to a daemon it never reached.
+///
+/// The defect is WEB-4's, one round trip earlier. WEB-4 established that a daemon that
+/// dies mid-session must produce a Close frame with a reason, because "a dead pane must
+/// never look live" (§17). At session *birth* the same page got the opposite: the
+/// handshake completed, `onopen` fired, the status line read "connected", and the
+/// socket was dropped a moment later with no Close frame at all — indistinguishable, to
+/// the page, from a network drop. Connecting to the daemon first turns that into an
+/// HTTP status no browser can mistake for an open socket, and one a `curl` or the
+/// headless client can read.
+///
+/// No daemon is started, which is the whole scenario: the socket path this server was
+/// pointed at has nothing behind it.
+#[test]
+fn a_websocket_upgrade_is_refused_before_the_101_when_the_daemon_is_down() {
+    let run = TempRun::new();
+    let socket = run.socket();
+    assert!(
+        !socket.exists(),
+        "the scenario is a daemon that is not there"
+    );
+    let web = WebServer::spawn(TOKEN_A, &socket, run.path());
+    let cookie = bootstrap_cookie(web.port, TOKEN_A);
+
+    let (code, response) = ws_upgrade(web.port, &cookie);
+    assert_ne!(
+        code, 101,
+        "the handshake completed over a daemon that was never reached: the page renders \
+         \"connected\" and is then dropped with no Close frame. Response was:\n{response}"
+    );
+    assert_eq!(
+        code, 503,
+        "an unreachable daemon is a Service Unavailable, not a token or protocol \
+         failure:\n{response}"
+    );
+    assert!(
+        response.contains("daemon"),
+        "the refusal must name what is missing — it is the operator's next action:\n\
+         {response}"
+    );
+    assert!(
+        response.contains(&socket.display().to_string()),
+        "…and which socket it looked on, since --socket is the thing to fix:\n{response}"
+    );
+
+    // The console itself still loads, so the operator sees the refusal in a page rather
+    // than a blank window: the assets never needed the daemon.
+    assert_eq!(
+        status(web.port, "/app.js", &[("Cookie", cookie.as_str())]),
+        200,
+        "a daemon-down console must still serve its own assets"
+    );
+
+    // And the refusal is about the daemon, not a blanket rejection of the route: an
+    // upgrade that is not one still gets its own answer.
+    assert_eq!(
+        status(web.port, "/ws", &[("Cookie", cookie.as_str())]),
+        400,
+        "a GET /ws without the RFC 6455 headers is a bad request, not a daemon report"
     );
 }
 

@@ -39,7 +39,11 @@ path = "/run/serial-nexus-daemon/console"
 # the verb names the NODE, the rotated files are named after the FILE: the current
 # console.log is renamed to console.log.000, then console.log.001, and so on (higher
 # is newer, no shifting cascade). Three digits by default; set `rotation_padding` for
-# more. The directory must be in the unit's ReadWritePaths.
+# more. The directory below is the unit's LogsDirectory=, created and chowned to the
+# service on every start, so it needs no ReadWritePaths= entry. One OUTSIDE that tree
+# needs both: the entry, *and* — under DynamicUser — a pre-chown to the service, because
+# ReadWritePaths only flips the mount to read-write and a root-owned directory stays
+# unwritable. A subdirectory of the one below avoids the whole question.
 [[node]]
 type = "log"
 name = "cap"

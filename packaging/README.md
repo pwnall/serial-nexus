@@ -26,15 +26,29 @@ sudo install -m0644 packaging/serial-nexus-daemon.example.toml /etc/serial-nexus
 # 3. (The default log directory /var/log/serial-nexus-daemon is created and chowned to the
 #    service automatically by the unit's LogsDirectory= — no manual step needed.)
 
-# 4. (Optional) narrower device access than the whole `dialout` group.
+# 4. (Optional) narrower device access than the whole `dialout` group. The rules hand
+#    matching adapters to a DEDICATED group, so the file alone does nothing: create the
+#    group first, and name it in the unit instead of `dialout` (keeping `dialout` too
+#    grants everything back and defeats the point). Read the rules file's own comments
+#    for which adapters it matches — it ships an FTDI vendor id you will likely edit.
+sudo groupadd --system serialnexus
 sudo install -m0644 packaging/99-serial-nexus.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
+#    …then in serial-nexus-daemon.service: SupplementaryGroups=serialnexus
+#    Half of this step is a silent failure either way: the rules without the group in
+#    the unit leave the serial node `faulted` on a permission error, and the group in
+#    the unit without the rules leaves nothing granting it anything.
 
 # 5. Install and start the service.
 sudo install -m0644 packaging/serial-nexus-daemon.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now serial-nexus-daemon
 ```
+
+**Upgrading from a pre-rename release?** Step 5 is not the last thing you do: the state
+snapshot has to be carried across by hand, and until it is, the daemon comes up on the
+step-2 seed with every node you added by `add-node`/`connect` since its last `load`
+missing. The procedure is in "Upgrading to this build" below.
 
 `RuntimeDirectory=`/`StateDirectory=` in the unit create `/run/serial-nexus-daemon` and
 `/var/lib/serial-nexus-daemon` automatically under the service's transient identity — no
@@ -77,10 +91,16 @@ sudo systemctl reload-or-restart serial-nexus-daemon   # note: no live reload; r
 ```
 
 The control socket is `/run/serial-nexus-daemon/serial-nexus-daemon.sock`, mode `0600` — **whoever
-can open it owns every console** (§10). To let a group of operators drive the daemon,
-create a group, add it to the unit's `SupplementaryGroups=`, and pass
-`--socket-group <group>` (widens the socket to `0660`). Read
-[`../docs/security.md`](../docs/security.md) before doing that: serial consoles are
+can open it owns every console** (§10). Letting a group of operators drive the daemon
+means giving that group the runtime **directory** as well as the socket, and the
+directory is not a mode change: systemd chowns every `*Directory=` to `User=`/`Group=`
+and to nothing else (`systemd.exec(5)`), so `SupplementaryGroups=` cannot reach it.
+Under `DynamicUser=` the directory belongs to the transient identity, the operators
+land in `other`, and they get `EACCES` at `connect(2)` before the socket's own mode is
+ever consulted. The working recipe is a **static** service identity whose primary group
+is the operators' group — it is spelled out in the unit's socket-group comment block,
+with the `stat` that confirms it. Read
+[`../docs/security.md`](../docs/security.md) before doing any of it: serial consoles are
 frequently root shells and bootloader prompts.
 
 ## Adjusting the sandbox
@@ -131,20 +151,48 @@ family prefix: the daemon `serialnexusd` is `serial-nexus-daemon`, the CLI
 `serialnexusctl` is `serial-nexus-ctl`, and the web console, capability checker and
 test double follow the same scheme. Reinstall the unit file and re-create the
 configuration directory under the new names shown in the install steps above — the old
-`/etc`, `/run` and `/var/lib` directories are not read.
+`/etc` and `/run` directories are not read. The old `/var/lib` one is, and it is the one
+that matters — the rest of this section is about getting its contents across.
 
 **Two defaults are still accepted on read, for this release only.** Both are
 daemon-owned paths nobody looks at, which is exactly why a rename is dangerous there:
 
-- a state snapshot at the pre-rename default (`serialnexusd.state.toml`, beside the
-  control socket) is **adopted** at startup, and the next configuration mutation
-  rewrites it under the current name. The old file is left exactly as it was — remove
-  it once the new one appears. Without this, an upgraded daemon would have found no
-  snapshot at the new path and come up with an **empty graph**, silently dropping every
-  node added by `add-node`/`connect` since the last `load`.
-- `serial-nexus-ctl` and `serial-nexus-web`, given no `--socket`, fall back to a
-  `serialnexusd.sock` left by a still-running pre-upgrade daemon — but only when no
-  current-name socket exists, so a live daemon is never passed over for a stale inode.
+- a state snapshot at a pre-rename path is **adopted** at startup, and the next
+  configuration mutation rewrites it under the current name. The old file is left
+  exactly as it was — remove it once the new one appears. Two shapes are recognised:
+  the socket-adjacent default (`serialnexusd.state.toml`), and an explicit
+  `--state-file` whose path is the current one with the rename undone — which is what
+  the unit passes, `/var/lib/<old daemon name>/state.toml` becoming
+  `/var/lib/serial-nexus-daemon/state.toml`. Without this, an upgraded daemon would have
+  found no snapshot at the new path and come up with an **empty graph**, silently
+  dropping every node added by `add-node`/`connect` since the last `load`.
+- `serial-nexus-ctl` and `serial-nexus-web`, given no `--socket`, fall back to a socket
+  left under the pre-rename name by a still-running pre-upgrade daemon — but only when
+  no current-name socket exists, so a live daemon is never passed over for a stale
+  inode.
+
+**The packaged unit needs one manual step anyway, and it is not optional.** Adoption
+knows where the old snapshot is; under `DynamicUser=` it cannot read it. systemd keeps
+the real state directory under `/var/lib/private/`, which is root-only, so the file has
+to be carried across by root. Do this once, between installing the new unit and putting
+it into service:
+
+```sh
+# 1. Let systemd create the new state directory (this start comes up on the seed).
+sudo systemctl start serial-nexus-daemon && sudo systemctl stop serial-nexus-daemon
+
+# 2. Copy the pre-rename snapshot over the seeded one. `cp` onto an existing file keeps
+#    that file's owner and its 0600 mode, and the next start re-chowns the directory
+#    anyway.
+sudo cp /var/lib/serialnexusd/state.toml /var/lib/serial-nexus-daemon/state.toml
+
+# 3. Start it for real, and confirm the graph came across before deleting anything.
+sudo systemctl start serial-nexus-daemon
+sudo serial-nexus-ctl state
+```
+
+A deployment that does *not* use `DynamicUser=` — a static `User=`, a container, a
+hand-run daemon — needs none of this: the daemon reads the pre-rename path itself.
 
 Nothing writes the old spelling again, and both fallbacks are deleted in the next
 release: finish the migration now rather than relying on them.

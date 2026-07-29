@@ -17,7 +17,10 @@
 //! this test runs on every platform. The peer is a background `serial-nexus-sim wire` double
 //! that holds the connection open while the daemon state is inspected.
 
-use std::time::Duration;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use serial_nexus_itest::{Daemon, Sim, wait_until};
@@ -305,4 +308,189 @@ channels = ["console", "trace"]
         "the truncated identity is neither recognisable nor marked: {:?}",
         truncated.0
     );
+}
+
+// ---- 37-LEG-3: §7.4's concurrent second connection is refused, and only it -------
+
+/// A §9 `hello` frame in the shared envelope's wire layout: `u32 body_len | u32 magic
+/// | u16 version | u32 capabilities | u16 count | count × (u16 len | UTF-8 identity)`,
+/// big-endian throughout. Hand-rolled, as `p12_leg_accounting` does: the harness does
+/// not depend on `serial-nexus-codec-api`, and the first peer below has to send data
+/// at a moment of the test's choosing — *after* the second peer has been refused —
+/// which `serial-nexus-sim wire` cannot express.
+fn hello_frame(channels: &[&str]) -> Vec<u8> {
+    const WIRE_MAGIC: u32 = 0x534E_584C; // "SNXL"
+    const WIRE_VERSION: u16 = 1;
+    let mut body = Vec::new();
+    body.extend_from_slice(&WIRE_MAGIC.to_be_bytes());
+    body.extend_from_slice(&WIRE_VERSION.to_be_bytes());
+    body.extend_from_slice(&0u32.to_be_bytes()); // capabilities
+    body.extend_from_slice(&(channels.len() as u16).to_be_bytes());
+    for ch in channels {
+        body.extend_from_slice(&(ch.len() as u16).to_be_bytes());
+        body.extend_from_slice(ch.as_bytes());
+    }
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// A §9 envelope data frame: `u32 body_len | u8 type=0 | u16 channel_len | channel |
+/// payload`, big-endian.
+fn data_frame(channel: &str, payload: &[u8]) -> Vec<u8> {
+    let mut body = vec![0u8]; // type 0 = data
+    body.extend_from_slice(&(channel.len() as u16).to_be_bytes());
+    body.extend_from_slice(channel.as_bytes());
+    body.extend_from_slice(payload);
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// Dial a `listen`+`unix` leg, retrying until it is *connectable* rather than merely
+/// until its socket file exists: `bind(2)` creates the inode and `listen(2)` is what
+/// stops `connect(2)` answering `ECONNREFUSED`, so a dial landing between them fails
+/// against a daemon that is coming up perfectly normally. Bounded and condition-driven
+/// rather than slept on (§5).
+fn dial_leg(address: &Path) -> UnixStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match UnixStream::connect(address) {
+            Ok(s) => return s,
+            Err(e) if Instant::now() < deadline => {
+                assert!(
+                    matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ),
+                    "dial the leg at {}: {e}",
+                    address.display()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!(
+                "dial the leg at {}: {e} (still not accepting after 10 s)",
+                address.display()
+            ),
+        }
+    }
+}
+
+/// The leg's `discarded_hostward` for `console` — where wire data for a configured
+/// channel with no local consumer lands (§5 counts the loss where it happens), and so
+/// the observable that the first peer's stream is still being decoded and routed.
+fn discarded_hostward(d: &Daemon) -> u64 {
+    downlink(d)
+        .pointer("/channels/console/discarded_hostward")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+#[test]
+fn a_concurrent_second_peer_is_refused_while_the_first_session_keeps_flowing() {
+    // §7.4: "one active peer per leg; concurrent second connections are refused."
+    // The refusal arm was unit-tested only through an injected always-failing accept
+    // (its backoff), never against a live listener with a real second peer and the
+    // first session's data flow asserted to survive it (37-LEG-3) — and "refused"
+    // has two halves that a test of the arm alone cannot separate: the newcomer is
+    // closed, *and* the incumbent is untouched. A leg that tore its session down and
+    // adopted the newcomer would satisfy the first half perfectly.
+    //
+    // Ground truth is a structured counter, never CLI text (§5): with no local
+    // consumer bound, `console`'s wire data is counted as `discarded_hostward`, so
+    // that counter moving is the observable form of "the first session is still being
+    // decoded and routed".
+    const FRAME_LEN: usize = 64;
+
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let leg_sock = d.run().join("leg.sock");
+    let cfg = format!(
+        r#"
+[[node]]
+type = "leg"
+name = "downlink"
+faces = "host"
+transport = "unix"
+role = "listen"
+address = "{leg}"
+arbitration = "free-for-all"
+channels = ["console"]
+"#,
+        leg = leg_sock.display(),
+    );
+    rpc.load_toml(&cfg, false).expect("load leg graph");
+    assert!(
+        wait_until(Duration::from_secs(10), || leg_sock.exists()),
+        "the leg never bound its listen socket"
+    );
+
+    // The incumbent: announce, then send one command's worth of data.
+    let mut first = dial_leg(&leg_sock);
+    first
+        .write_all(&hello_frame(&["console"]))
+        .expect("write the first peer's hello");
+    first
+        .write_all(&data_frame("console", &[b'a'; FRAME_LEN]))
+        .expect("write the first peer's data");
+    first.flush().expect("flush the first peer");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            downlink(&d).get("connection").and_then(Value::as_str) == Some("connected")
+                && discarded_hostward(&d) == FRAME_LEN as u64
+        }),
+        "the first peer's session never carried data: {:?}",
+        downlink(&d)
+    );
+    let peer_address = downlink(&d).get("peer_address").cloned();
+
+    // The newcomer. It is accepted at the socket layer — the refusal is the daemon's,
+    // not the kernel's — and then closed without a handshake, so a read sees EOF. The
+    // timeout is what distinguishes "refused" from "adopted as a second session": a
+    // leg that kept the connection open would block here instead.
+    let mut second = dial_leg(&leg_sock);
+    second
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set the second peer's read timeout");
+    let mut buf = [0u8; 64];
+    let refused = second.read(&mut buf);
+    assert!(
+        matches!(&refused, Ok(0)),
+        "the leg did not refuse a concurrent second peer (§7.4): {refused:?}"
+    );
+
+    // The incumbent is untouched: same connection, same peer, same binding, and no
+    // reconnect was recorded — the refusal is not a session bounce.
+    let dl = downlink(&d);
+    assert_eq!(
+        dl.get("connection").and_then(Value::as_str),
+        Some("connected"),
+        "the refusal disturbed the live session: {dl}"
+    );
+    assert_eq!(
+        dl.get("peer_address").cloned(),
+        peer_address,
+        "the leg swapped its peer for the newcomer: {dl}"
+    );
+    assert_eq!(binding(&d, "console"), "bound", "{dl}");
+    assert_eq!(
+        dl.get("reconnect_count").and_then(Value::as_u64),
+        Some(0),
+        "the refusal cost the incumbent its connection: {dl}"
+    );
+
+    // …and the first session still flows *after* the refusal, which is the half a
+    // test of the reject arm alone cannot see.
+    first
+        .write_all(&data_frame("console", &[b'b'; FRAME_LEN]))
+        .expect("write the first peer's post-refusal data");
+    first.flush().expect("flush the first peer again");
+    assert!(
+        wait_until(Duration::from_secs(10), || discarded_hostward(&d)
+            == 2 * FRAME_LEN as u64),
+        "the first peer's stream stopped after a second peer was refused: {:?}",
+        downlink(&d)
+    );
+    drop(second);
+    drop(first);
 }

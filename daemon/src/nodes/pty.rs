@@ -66,7 +66,7 @@ use crate::boundary::TaskSet;
 use crate::cell::CriticalCell;
 use crate::runtime::{
     ACTIVE_POLL, DropCounters, EdgeInbox, Handoff, LossCounter, READ_BUF, SharedTargetEdge,
-    WritableOrigin, back_off, try_forward_targetward,
+    WritableOrigin, back_off, may_write_reclaiming, try_forward_targetward,
 };
 use serial_nexus_sys as sys;
 
@@ -80,9 +80,23 @@ use serial_nexus_sys as sys;
 /// a third counter should add a field here rather than another parameter.
 #[derive(Default)]
 struct Losses {
-    /// Bytes read from the client and then lost because the host endpoint's
-    /// targetward channel was gone — an edge disconnected, or its node removed,
-    /// between the read and the send (§5: loss is counted where it happens).
+    /// Client bytes read off the master that this node had nowhere to hand on to,
+    /// in either of the two shapes that produce that (§5: loss is counted where it
+    /// happens; `docs/rpc/observation.md` states the same pair operator-facing).
+    ///
+    /// * **No writable origin at all** — an attached read-only spy edge
+    ///   (`write_mode = "never"`), or one a `disconnect` cleared. A spy console is
+    ///   still *read* (that is the shape: its termios and presence are what an
+    ///   operator wants surfaced), so everything typed into it lands here, which
+    ///   makes this the arm that dominates the counter in steady state rather than
+    ///   the exceptional one.
+    /// * **The endpoint went away mid-flight** — the targetward channel closed
+    ///   between the read and the send, because the edge was disconnected or its
+    ///   node removed (§15.35).
+    ///
+    /// Deliberately *not* where a detaching writer's un-delivered backlog lands:
+    /// that is purged on purpose and charged to the origin's own `purged` counter
+    /// (§6, [`record_detach_purge`]).
     targetward: Cell<u64>,
     /// Hostward bytes the kernel still held for a departed client and that the
     /// last-close reset discarded, so the next session starts on an empty pair
@@ -196,6 +210,14 @@ impl PtyNode {
     fn setup(&mut self) -> Result<(), String> {
         let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY)
             .map_err(|e| format!("posix_openpt: {e}"))?;
+        // Immediately, before any step below can spawn or fail: the daemon forks
+        // exec-codec children (§7.6) that do no fd cleanup of their own, and an
+        // inherited **master** keeps the pair open past `remove-node`/`load
+        // --replace` (the slave client never sees HUP, the pts index is never
+        // reclaimed) while handing the child a live handle on this console's bytes
+        // in both directions. `posix_openpt` takes only `O_RDWR | O_NOCTTY`
+        // portably, so the flag is a separate step (§7.2, §16.3).
+        sys::set_cloexec(master.as_raw_fd()).map_err(|e| format!("FD_CLOEXEC: {e}"))?;
         grantpt(&master).map_err(|e| format!("grantpt: {e}"))?;
         unlockpt(&master).map_err(|e| format!("unlockpt: {e}"))?;
         let pts = sys::ptsname(&master).map_err(|e| format!("ptsname: {e}"))?;
@@ -250,10 +272,18 @@ impl PtyNode {
     /// applied faults the node (an environmental failure, §15.8) rather than
     /// being silently dropped; leaving either unset keeps the daemon-user
     /// default the freshly allocated pts already has.
+    ///
+    /// **Ownership settles before the mode does, and the order is the point.** A
+    /// freshly allocated devpts node belongs to the `gid=` the mount was made with —
+    /// group `tty` on a stock Linux — so chmodding to the configured 0660 first would
+    /// hand every member of *that* group read/write on the console for the length of
+    /// the chown, a window the NSS lookups below widen by however long name
+    /// resolution takes, and one an fd opened inside it outlives, because a chown
+    /// does not revoke an open descriptor. Chowning first can only ever *narrow* the
+    /// set of processes the mount's own default already admits. The rule, stated so a
+    /// later edit cannot re-order this by accident: never widen a mode until
+    /// ownership matches the configuration.
     fn apply_perms(&self, pts: &str) -> Result<(), String> {
-        std::fs::set_permissions(pts, std::os::unix::fs::PermissionsExt::from_mode(self.mode))
-            .map_err(|e| format!("chmod {pts}: {e}"))?;
-
         let uid = match &self.owner {
             Some(owner) => Some(
                 nix::unistd::User::from_name(owner)
@@ -277,6 +307,8 @@ impl PtyNode {
         if uid.is_some() || gid.is_some() {
             nix::unistd::chown(pts, uid, gid).map_err(|e| format!("chown {pts}: {e}"))?;
         }
+        std::fs::set_permissions(pts, std::os::unix::fs::PermissionsExt::from_mode(self.mode))
+            .map_err(|e| format!("chmod {pts}: {e}"))?;
         Ok(())
     }
 
@@ -393,8 +425,10 @@ impl PtyNode {
             // client held the slave, and bytes dropped because the client was
             // too slow to drain its bounded buffer.
             "discarded_no_client": self.counters.discarded_absent(),
-            // Client bytes lost because this pty's host endpoint went away between
-            // the read and the send (§5, §15.35).
+            // Client bytes this pty had nowhere to hand on to (§5): typed into an
+            // attached read-only spy edge (the steady-state arm), or read while the
+            // host endpoint went away between the read and the send (§15.35). See
+            // [`Losses::targetward`] for why a detaching writer's backlog is not here.
             "discarded_targetward": self.loss.targetward.get(),
             "dropped_slow_consumer": self.counters.dropped_full(),
             // Device bytes the kernel still held for a client that never read them
@@ -898,8 +932,16 @@ async fn read_and_poll(
         // read and thrown away. An attached but read-only edge (`write_mode =
         // "never"`) still reads — that is the spy shape, whose termios and presence
         // an operator does want surfaced — and its stray writes go nowhere.
+        //
+        // The gate is `may_write_reclaiming`, not a bare `may_write`, because this
+        // loop is also this origin's **held-priority reclaim driver** (§6/§15.23):
+        // an interior pump reclaims through `reacquire_held`, and a `held` pty edge
+        // has no interior pump, so without the attempt here a `send --steal` (or an
+        // `unlock`, or a lease expiry) left the endpoint free-but-untakeable —
+        // reclaimed by nobody, and denied to everybody else by held priority
+        // (37-LOCK-1). Non-parking by necessity: see the helper's doc and CONC-1.
         let may_write = match &origin {
-            Some((_, l, id)) => l.with(|g| g.may_write(*id)),
+            Some((_, l, id)) => may_write_reclaiming(l, *id),
             None => edge.with(|e| e.attached),
         };
 

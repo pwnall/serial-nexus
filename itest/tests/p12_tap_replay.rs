@@ -1,5 +1,5 @@
 //! Review-32 regression guards for the tap hub's replay and gap accounting
-//! (`daemon/src/tap.rs`; design §5 replay ring, §11.8 offsets, invariant 10).
+//! (`daemon/src/tap.rs`; design §5 replay ring, plan §11.8 offsets, invariant 10).
 //! Two protocol facts a client splicing by offset depends on, each broken in a
 //! different direction before this file existed:
 //!
@@ -47,7 +47,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use serial_nexus_itest::{Daemon, Sim, serial_echo, sha256_hex, wait_until};
+use serial_nexus_itest::{Daemon, Sim, seeded_bytes, serial_echo, sha256_hex, wait_until};
 
 /// The ring under test: 10 MiB, deeper than one `tap.open` can deliver and well inside
 /// the 16 MiB `MAX_REPLAY_RING` the validator accepts.
@@ -64,51 +64,13 @@ const SEED: u64 = 91;
 /// itest is a black-box client, and a change to either constant should show up here.
 const BUDGET: u64 = 128 * 64 * 1024;
 
-/// The `serial-nexus-sim` deterministic byte stream (splitmix64), copied verbatim from
-/// `serial-nexus-sim`'s `seeded_bytes` as `p3_firehose` does — the source's own checksum is on
-/// a stdout `Sim::spawn` discards, and the stream is deterministic in `(seed, size)`.
-fn seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
-    let mut s = seed;
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        out.extend_from_slice(&z.to_le_bytes());
-    }
-    out.truncate(len);
-    out
-}
-
-/// Standard base64 decode — the inverse of the daemon's `tap.data` encoding.
+/// Standard base64 decode of a `tap.data` payload — `serial_nexus_rpc`'s tested
+/// decoder rather than a seventh hand-rolled copy (§16.5 one-rule-one-place, review
+/// 37 37-TEST-5). Panics on a malformed payload: these bytes were produced by
+/// `serial_nexus_rpc::base64_encode` on the other side of the socket, so anything
+/// else is a defect, not an input.
 fn base64_decode(s: &str) -> Vec<u8> {
-    fn val(c: u8) -> Option<u32> {
-        match c {
-            b'A'..=b'Z' => Some((c - b'A') as u32),
-            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let mut out = Vec::new();
-    let (mut acc, mut nbits) = (0u32, 0u32);
-    for &c in s.as_bytes() {
-        if c == b'=' {
-            break;
-        }
-        let Some(v) = val(c) else { continue };
-        acc = (acc << 6) | v;
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((acc >> nbits) as u8);
-        }
-    }
-    out
+    serial_nexus_rpc::base64_decode(s).expect("a tap.data payload must be valid base64")
 }
 
 /// One tap on its own raw control connection: the `tap.open` ack plus the `tap.data`
@@ -321,6 +283,15 @@ replay_ring = {ring}
         TOTAL,
         "a trimmed replay must still end on the live edge — from_offset {from_offset} \
          + replay_bytes {replay_bytes} != ingested {TOTAL} (TAP-1): {ack}"
+    );
+    // The shortfall reaches the client. `replay_bytes` alone cannot separate "the ring
+    // was this shallow" from "the channel could take no more", and an operator who
+    // configured a 10 MiB ring and was handed 8 MiB has nothing else to read it from —
+    // which is what the tap-side comments claimed was reported and was not (37-CTRL-3).
+    assert_eq!(
+        ack["replay_truncated"].as_u64(),
+        Some(RING - BUDGET),
+        "the shortfall a bounded delivery gave up never reached the client: {ack}"
     );
 
     // The identity of the bytes, which is the half the arithmetic cannot show: they are

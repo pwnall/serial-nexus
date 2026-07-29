@@ -67,6 +67,7 @@ pub mod app_errors {
     pub const LOCKED: i64 = AppError::Locked.code();
     pub const HAS_EDGES: i64 = AppError::HasEdges.code();
     pub const DEVICE_ABSENT: i64 = AppError::DeviceAbsent.code();
+    pub const EDGE_INBOX_FULL: i64 = AppError::EdgeInboxFull.code();
 }
 
 #[derive(Default)]
@@ -332,7 +333,7 @@ pub struct Daemon {
     /// prefers it, so incremental surgery survives a daemon restart. `None` disables
     /// persistence (unit tests via [`Daemon::default`]).
     state_file: Option<std::path::PathBuf>,
-    /// A per-boot nonce reported by `info` (§10/§11.8). Tap byte offsets are only
+    /// A per-boot nonce reported by `info` (§10/plan §11.8). Tap byte offsets are only
     /// meaningful within one daemon process; on restart the offsets reset to 0 and
     /// this nonce changes, so a client (the browser history of §17) keyed on it
     /// detects the reset and starts a fresh history instead of splicing across it.
@@ -368,7 +369,7 @@ enum WaitOutcome {
     Closed,
 }
 
-/// A per-boot instance nonce (§11.8). A fresh `RandomState` is seeded from the OS RNG
+/// A per-boot instance nonce (plan §11.8). A fresh `RandomState` is seeded from the OS RNG
 /// once per process, so hashing a per-process input yields a value that differs across
 /// daemon restarts without pulling in a randomness dependency; process id and a
 /// nanosecond timestamp are folded in as belt-and-suspenders so even an unlucky seed
@@ -480,7 +481,7 @@ impl Daemon {
         let result = match method {
             "load" => {
                 // `replace` (§11) is read before the params move into the config parse.
-                let replace = bool_param(&params, "replace").unwrap_or(false);
+                let replace = bool_param(&params, "replace")?.unwrap_or(false);
                 self.load(parse_config_param(params)?, replace)
             }
             "add-node" => self.add_node(params),
@@ -775,7 +776,7 @@ impl Daemon {
     /// self-heal: a dropped channel simply stops delivering (a closed `try_send`).
     fn remove_node(&self, params: Option<Value>) -> Result<Value, RpcError> {
         let name = node_param(&params)?.to_owned();
-        let cascade = bool_param(&params, "cascade").unwrap_or(false);
+        let cascade = bool_param(&params, "cascade")?.unwrap_or(false);
 
         self.state.with_mut(|st| {
             let idx = st.node_index(&name)?;
@@ -831,8 +832,19 @@ impl Daemon {
                         .map(|(h, t)| (h.to_string(), t.to_string()))
                 })
                 .collect();
+            // The same two facts `disconnect` reports, summed across the cascade
+            // (37-LIFE-1). `DetachedEdge` exists because these are "reported rather
+            // than done silently", and dropping the return on this path made the
+            // identical edge removal loud through one verb and mute through the other:
+            // an operator cascading a lock-holding writer changed who may write, and
+            // one cascading a writer with bytes queued lost them by design (§5
+            // all-loss-is-visible, §6).
+            let mut released_locks = 0u64;
+            let mut purged_bytes = 0u64;
             for (host, target) in &cascaded {
-                st.detach_edge_runtime(host, target);
+                let detached = st.detach_edge_runtime(host, target);
+                released_locks += u64::from(detached.released_lock);
+                purged_bytes = purged_bytes.saturating_add(detached.purged_bytes);
             }
 
             let mut node = st.nodes.remove(idx);
@@ -894,7 +906,17 @@ impl Daemon {
                 .retain(|e| e.a.node != name && e.b.node != name);
             st.config.nodes.retain(|n| n.name() != name);
 
-            Ok(json!({ "removed": name, "cascaded_edges": attached }))
+            Ok(json!({
+                "removed": name,
+                "cascaded_edges": attached,
+                // How many of those edges' origins held their endpoint's write lock,
+                // and how many bytes went with them — the `disconnect` fields, summed
+                // (37-LIFE-1). Always present, including the `0`/`0` of an edgeless
+                // removal: a field that appears only when nonzero is one a client
+                // learns to read as absent rather than as none.
+                "released_locks": released_locks,
+                "purged_bytes": purged_bytes,
+            }))
         })
     }
 
@@ -981,6 +1003,23 @@ impl Daemon {
                 mode,
                 crate::runtime::hostward_depth(&candidate, &host_addr.node),
             );
+
+            // The one attach outcome that is neither success nor a property of the
+            // graph: the consuming endpoint's pump is healthy and simply has not run
+            // yet, so `attach_edge` did nothing at all (37-DATA-1). Refusing is the
+            // whole point — reporting it as `consumer_live: false` named a node that
+            // was never at fault and left a *configured* edge hostward-dead for good,
+            // where the true remedy is to ask again a moment later. Nothing was
+            // mutated, so there is nothing to unwind here.
+            if attached.inbox_full {
+                return Err(RpcError::new(
+                    app_errors::EDGE_INBOX_FULL,
+                    format!(
+                        "endpoint {target:?} has not drained the edges attached before \
+                         this one yet; retry"
+                    ),
+                ));
+            }
 
             // What is left is the display-keyed bookkeeping (`Wiring::build` files the
             // same registration under an `EndpointAddr`) plus the two steps that are
@@ -1201,7 +1240,7 @@ impl Daemon {
         out: mpsc::Sender<crate::tap::TapMsg>,
     ) -> Result<(Value, crate::tap::OpenTap), RpcError> {
         let endpoint = str_param(&params, "endpoint")?;
-        let replay = bool_param(&params, "replay").unwrap_or(false);
+        let replay = bool_param(&params, "replay")?.unwrap_or(false);
         self.state.with_mut(|st| {
             let hub = st.tap_hubs.get(endpoint).cloned().ok_or_else(|| {
                 RpcError::invalid_params(format!("no host-facing endpoint {endpoint:?} to tap"))
@@ -1214,11 +1253,21 @@ impl Daemon {
                 "tap": tap_id,
                 "endpoint": endpoint,
                 "replay_bytes": reg.replay_bytes,
-                // The endpoint offset this tap's stream begins at (§11.8): a
+                // Ring bytes `--replay` could not hand this tap: the snapshot's head,
+                // trimmed because this connection's bounded tap channel had room for
+                // fewer bytes than the ring holds (TAP-1). Zero in the ordinary case,
+                // and not a hole in the offset space — what is delivered is always the
+                // newest, contiguous end of the ring. Reported rather than left to be
+                // inferred, because `replay_bytes` alone cannot distinguish a short
+                // ring from a short channel: an operator who configured a 16 MiB ring
+                // and was handed 8 MiB has nothing else to read the difference from
+                // (review 37 `37-CTRL-3`).
+                "replay_truncated": reg.replay_truncated,
+                // The endpoint offset this tap's stream begins at (plan §11.8): a
                 // reconnecting client trims replay overlap against the last offset it
                 // stored, so a reload never duplicates ring bytes into its history.
                 "from_offset": reg.from_offset,
-                // Which offset space `from_offset` counts in (§11.8, §15.38). Unique
+                // Which offset space `from_offset` counts in (§15.38; plan §11.8). Unique
                 // per hub instance and never reused, so a client holding stored
                 // scrollback can tell an ordinary reconnect — where its frontier is
                 // still meaningful and replay overlap must be trimmed — from a hub
@@ -1255,7 +1304,7 @@ impl Daemon {
             "wire_version": crate::WIRE_VERSION,
             "envelope_version": crate::ENVELOPE_VERSION,
             "codecs": self.registry.usable_codec_names(),
-            // Per-boot nonce (§11.8): tap byte offsets are only comparable within one
+            // Per-boot nonce (plan §11.8): tap byte offsets are only comparable within one
             // instance, so a client keys its stored history on this and starts fresh
             // when it changes across a restart.
             "instance": self.instance,
@@ -1364,7 +1413,7 @@ impl Daemon {
     /// mirrors `ValidationError::NumericOutOfRange`, as `exec::parse_attributes`
     /// does, so an operator meets one sentence about out-of-range numbers.
     fn signal_ms(params: &Option<Value>, verb: &str, default: u64) -> Result<u64, RpcError> {
-        let ms = u64_param(params, "ms").unwrap_or(default);
+        let ms = u64_param(params, "ms")?.unwrap_or(default);
         if ms > Self::MAX_SIGNAL_MS {
             return Err(RpcError::invalid_params(format!(
                 "{verb}: ms = {ms}, above the maximum {} (a numeric field is range-checked \
@@ -1412,8 +1461,8 @@ impl Daemon {
     /// left untouched). Acts on the live port only, not configuration (§15.8).
     fn set_modem(&self, params: Option<Value>) -> Result<Value, RpcError> {
         let node = node_param(&params)?.to_owned();
-        let dtr = bool_param(&params, "dtr");
-        let rts = bool_param(&params, "rts");
+        let dtr = bool_param(&params, "dtr")?;
+        let rts = bool_param(&params, "rts")?;
         let handle = self.signal_handle(&node)?;
         crate::nodes::serial::set_modem(&handle, dtr, rts)
             .map_err(|e| RpcError::invalid_params(format!("set-modem on {node:?}: {e}")))?;
@@ -1425,7 +1474,7 @@ impl Daemon {
     async fn pulse_dtr(&self, params: Option<Value>) -> Result<Value, RpcError> {
         let node = node_param(&params)?.to_owned();
         let ms = Self::signal_ms(&params, "pulse-dtr", 100)?;
-        let assert = bool_param(&params, "assert").unwrap_or(true);
+        let assert = bool_param(&params, "assert")?.unwrap_or(true);
         let handle = self.signal_handle(&node)?;
         crate::nodes::serial::pulse_dtr(&handle, ms, assert)
             .await
@@ -2069,11 +2118,31 @@ impl LockParams {
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::invalid_params("missing 'origin' in params"))?
             .to_owned();
+        let lease_ms = u64_param(params, "lease_ms")?;
+        // 37-LOCK-2: the lease was the one daemon-side timer input with no checked
+        // maximum — `after_grant` hands it straight to a sleep task, so
+        // `--lease-ms 86400000` for "a day" parked a release a day out, and
+        // `u64::MAX` overflows the monotonic clock the same way `send`'s deadline
+        // does. Its siblings already refuse (`signal_ms`) or clamp with a stated
+        // rationale (`send`), so this one refuses too: a lease is the operator's own
+        // number and a silently clamped one would report a bound it does not have.
+        // The wording mirrors `ValidationError::NumericOutOfRange`, as
+        // `exec::parse_attributes` does, so one sentence covers out-of-range numbers
+        // wherever they are met (§15.34/§16.12, invariant 13).
+        if let Some(ms) = lease_ms {
+            let max = serial_nexus_core::config::MAX_TIMER_MS;
+            if ms > max {
+                return Err(RpcError::invalid_params(format!(
+                    "lock: lease_ms = {ms}, above the maximum {max} (a numeric field is \
+                     range-checked before anything is granted, §11)"
+                )));
+            }
+        }
         Ok(LockParams {
             origin,
-            steal: p.get("steal").and_then(Value::as_bool).unwrap_or(false),
-            wait: p.get("wait").and_then(Value::as_bool).unwrap_or(false),
-            lease_ms: p.get("lease_ms").and_then(Value::as_u64),
+            steal: bool_param(params, "steal")?.unwrap_or(false),
+            wait: bool_param(params, "wait")?.unwrap_or(false),
+            lease_ms,
         })
     }
 }
@@ -2101,14 +2170,15 @@ impl SendParams {
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::invalid_params("missing 'line' in params"))?
             .to_owned();
+        // Mistyped values are named, not silently replaced by the defaults (37-SER-2).
+        // `timeout_ms` keeps its documented clamp rather than gaining a refusal: the
+        // clamp is a recorded decision about a deadline that means "effectively never"
+        // either way, whereas a *string* timeout is a caller error like any other.
         Ok(SendParams {
             endpoint,
             line,
-            timeout_ms: p
-                .get("timeout_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(DEFAULT_SEND_TIMEOUT_MS),
-            steal: p.get("steal").and_then(Value::as_bool).unwrap_or(false),
+            timeout_ms: u64_param(params, "timeout_ms")?.unwrap_or(DEFAULT_SEND_TIMEOUT_MS),
+            steal: bool_param(params, "steal")?.unwrap_or(false),
         })
     }
 }
@@ -2312,20 +2382,45 @@ fn node_param(params: &Option<Value>) -> Result<&str, RpcError> {
     str_param(params, "node")
 }
 
-/// An optional `u64` params field.
-fn u64_param(params: &Option<Value>, key: &str) -> Option<u64> {
-    params
-        .as_ref()
-        .and_then(|p| p.get(key))
-        .and_then(Value::as_u64)
+/// An optional `u64` params field, **refusing a present-but-mistyped value** rather
+/// than falling back to the verb's default (37-SER-2).
+///
+/// `as_u64` alone answers `None` for `"70000"`, `-5` and `1.5` exactly as it does for
+/// an absent key, so a raw RPC client that mistyped `ms` got the verb's default — and
+/// then the range check ran against the *substituted* number, reporting nothing wrong.
+/// That is §11's "a typo cannot silently become a default" rule, which the schema
+/// enforces for configuration, applied to the one surface that had escaped it.
+///
+/// **JSON `null` reads as absent**, here and in [`bool_param`]: `serial-nexus-ctl` and
+/// the web editor build their params from `Option` fields and send every optional key
+/// unconditionally, so `null` is how an unset flag is spelled on this wire. Refusing
+/// it would refuse the shipped clients' ordinary requests.
+fn u64_param(params: &Option<Value>, key: &str) -> Result<Option<u64>, RpcError> {
+    match params.as_ref().and_then(|p| p.get(key)) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "'{key}' must be a non-negative integer, got {v} (a mistyped field is \
+                 named rather than replaced by the default, §11)"
+            ))
+        }),
+    }
 }
 
-/// An optional `bool` params field.
-fn bool_param(params: &Option<Value>, key: &str) -> Option<bool> {
-    params
-        .as_ref()
-        .and_then(|p| p.get(key))
-        .and_then(Value::as_bool)
+/// An optional `bool` params field, refusing a present-but-mistyped value — the
+/// [`u64_param`] rule for booleans, and the sharper half of 37-SER-2: `"assert":
+/// "false"` is truthy nowhere, yet `as_bool` answered `None` and `pulse-dtr` then
+/// drove DTR in the direction *opposite* to what the caller wrote.
+fn bool_param(params: &Option<Value>, key: &str) -> Result<Option<bool>, RpcError> {
+    match params.as_ref().and_then(|p| p.get(key)) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_bool().map(Some).ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "'{key}' must be a boolean, got {v} (a mistyped field is named rather \
+                 than replaced by the default, §11)"
+            ))
+        }),
+    }
 }
 
 /// Extract the required `origin` string from an `unlock` request's params.

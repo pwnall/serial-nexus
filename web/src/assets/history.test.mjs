@@ -1,7 +1,7 @@
 // Unit tests for the browser console's pure (DOM- and storage-free) modules: the
-// offset-splice + retention core, and the per-key persistence serializer (§11.9). Run
-// with `node --test history.test.mjs`; the serial-nexus-itest `p8_web_history` test invokes
-// exactly this file and self-skips when `node` is absent, so it is the §11.9 CI-run
+// offset-splice + retention core, and the per-key persistence serializer (design §15.32).
+// Run with `node --test history.test.mjs`; the serial-nexus-itest `p8_web_history` invokes
+// exactly this file and self-skips when `node` is absent, so it is plan §11.9's CI-run
 // test — which is why saver.mjs's tests live here rather than in a sibling file the
 // gate would not run. `opfs.mjs` is storage code and stays on the browser suite, with
 // one exception imported here: its key→filename mapping is pure, and a non-injective
@@ -177,6 +177,61 @@ test("the queue is released after a successful drain", async () => {
   gates[0].resolve();
   await new Promise((r) => setTimeout(r, 0));
   assert.equal(saver.busy("k"), false);
+});
+
+// Review 37-WEBC-6. The queue orders writers against each other, and app.js's restore is
+// not a writer: it reads storage directly, so a `flushSave()` immediately followed by
+// `load(key)` on the same key — which is what re-selecting the already-selected console
+// does — read the record the queued snapshot was about to replace, and restored a
+// frontier lagging the stream by however long that write took.
+test("settled() waits for the queued snapshot, so a reader cannot overtake it", async () => {
+  const store = new Map([["k", 0]]);
+  const gates = [];
+  const write = (key, bytes, endOffset) =>
+    new Promise((resolve) => {
+      gates.push(() => {
+        store.set(key, endOffset);
+        resolve();
+      });
+    });
+  const saver = makeSaver(write);
+
+  saver.save("k", new Uint8Array(1), 10);
+  assert.equal(store.get("k"), 0, "the write is in flight, not committed");
+
+  const settled = saver.settled("k");
+  let done = false;
+  settled.then(() => {
+    done = true;
+  });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(done, false, "settled() must not resolve while the write is in flight");
+
+  gates[0]();
+  await settled;
+  assert.equal(store.get("k"), 10, "the reader that awaited it sees the new record");
+
+  // An idle key is the ordinary case — a selection whose console has nothing queued must
+  // not pay a turn of the event loop for a queue that does not exist.
+  await saver.settled("never-written");
+});
+
+test("settled() waits for every queued snapshot, not just the running one", async () => {
+  const { write, started, gates } = controllableWrites();
+  const saver = makeSaver(write);
+  saver.save("k", new Uint8Array(1), 10);
+  saver.save("k", new Uint8Array(1), 20); // queued behind the first
+  let done = false;
+  saver.settled("k").then(() => {
+    done = true;
+  });
+  gates[0].resolve();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(started.length, 2, "the queued snapshot started");
+  assert.equal(done, false, "and settled() is still waiting for it");
+  gates[1].resolve();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(done, true);
 });
 
 // The `load --replace` console freeze, from the client side: the daemon rebuilds an

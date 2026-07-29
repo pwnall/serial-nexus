@@ -363,7 +363,9 @@ after writing, and if you buffer or amplify, pump both directions concurrently
 
 An exec codec is a codec node with `codec = "exec"`; its `argv`, `env`, and
 restart backoff live in the opaque `attributes` table, which the exec codec
-validates (`argv` is required and non-empty; `restart_backoff_ms` is capped at
+validates (`argv` is required and non-empty; an unknown key in the table is refused
+naming the key, exactly as in the node schema, so a misspelled `restart_backoffms`
+cannot silently restore the default; `restart_backoff_ms` is capped at
 3600000 — one hour — against the same constant the schema's other timers use, and an
 out-of-range value is a **structural** failure naming the field, refused before
 anything is created and before a `--replace` teardown, §11). The node's `faces`

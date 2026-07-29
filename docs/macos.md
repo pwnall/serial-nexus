@@ -84,9 +84,20 @@ byte-exact above). The Rust harness (`serial-nexus-itest`) encodes exactly this 
 providers (`itest/src/lib.rs`): `serial_echo()` (one `serial-nexus-sim pty --echo`
 double) and `serial_pair()` (a `serial-nexus-sim nullmodem`) are **Linux-only** and return
 `None` elsewhere, so every test built on them self-skips on macOS; `crossover_ports()`
-finds the real rig (`SNX_CROSSOVER_A`/`_B`, else two `/dev/cu.usbserial-*` on macOS or
-two `/dev/serial/by-id/*` on Linux) and drives the `serial_hardware` test, itself
-skipping when no rig is attached.
+finds the real rig and drives the `serial_hardware` test, itself skipping when no rig
+is attached.
+
+**`crossover_ports()` auto-detects on macOS only, and that asymmetry bites on Linux.**
+It has two arms: `SNX_CROSSOVER_A`/`_B` if both are set, on every platform, and — under
+`#[cfg(target_os = "macos")]` alone — a scan that accepts exactly two
+`/dev/cu.usbserial-*` nodes. There is **no by-id arm**, so on Linux a physically
+cross-wired pair is invisible until those two variables are exported, and every
+rig-gated test (`serial_hardware.rs`, and
+`p12_serial_exclusivity::a_break_straddled_by_a_replace_leaves_the_line_transmitting`,
+the guard for the break clause) self-skips on a box whose rig is attached and working.
+A green run is then hardware coverage that never executed — the failure mode a
+self-skip is otherwise safe against. Export both variables on a Linux rig; do not read
+`serial-nexus-doctor` P5 reporting Tier 3 as evidence that these tests ran.
 
 The validation harness was fully migrated from the bash `scripts/validate/**` (which used
 `stat -c`, `nc -q`, `sha256sum`, `timeout`, `/dev/serial/by-id` — none macOS-portable) to
@@ -375,10 +386,23 @@ are the ones this page enumerates.
 
 ## Roadmap to "verified"
 
-macOS moves from *best-effort, cross-checked* to *verified* when two things land:
-the **macOS CI lane** (build + `serial-nexus-doctor --json` against `expectations/macos.jq`
-on every change) and a **hands-on pass** on real hardware that settles the
-EXTPROC/packet-mode question (§7.2) and the `cu.*` raw-capture path end to end.
-The **IOKit-backed resolver** (§14) is the larger follow-on that restores
-`usb:`/`by-path:` identities and bare-serial-number adds; it slots behind the
-existing `Resolver` API with no design change.
+Both things this section used to name as future have landed, and the update blocks at
+the top of this page are their record. The **macOS CI lane** runs on every push
+(`.github/workflows/ci.yml`, job `macos`): `cargo build --workspace --locked`, then
+`cargo test --workspace --locked`, then `serial-nexus-doctor --json` gated against
+`expectations/macos.jq` — a real gate rather than a smoke test, since P2 reports
+`degraded` there rather than `unsupported`. One property of that lane is worth keeping
+in view because the 2026-07-28 block is what it cost: `cargo test --workspace` stops at
+the first failing test binary, so a red macOS lane reports one failure and says nothing
+about what sits behind it. Reach for `--no-fail-fast` before concluding a single crate
+is the whole of it. The **hands-on pass** ran twice on a real FTDI crossover rig
+(2026-07-24, and the whole-suite pass of 2026-07-28): the EXTPROC/packet-mode question
+is settled and its *mechanism* named — Darwin's leading packet byte is `0x20`, so §7.2
+runs off the reconciliation backstop — and the `cu.*` raw-capture path is exercised end
+to end through a physical unplug and replug.
+
+What remains genuinely future is the **IOKit-backed resolver** (§14), which would
+restore `usb:`/`by-path:` identities and bare-serial-number adds; it slots behind the
+existing `Resolver` API with no design change. Until it lands, the `➖`/`✖` rows of the
+feature matrix above are the standing list of what "best-effort" costs on this
+platform.

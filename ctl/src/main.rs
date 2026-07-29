@@ -646,6 +646,31 @@ fn subscribe_stream(socket: &Path, count: Option<usize>) -> anyhow::Result<()> {
     let limit = count.unwrap_or(usize::MAX);
     let mut printed = 0usize;
     let mut stdout = std::io::stdout().lock();
+
+    // Read the subscribe acknowledgement FIRST, exactly as `tap_stream` does, and
+    // *examine* it. Swallowing every Response frame swallowed the error reply to this
+    // very request too — and a daemon that refuses `subscribe` (a version skew across
+    // the §15.16 graceful-degradation boundary) deliberately keeps the connection open,
+    // so the loop below then blocked in `read_line` on a socket that would never carry
+    // another byte: no output, no exit, no diagnosis (37-TOOL-2). A refusal is now the
+    // ordinary error path, naming the code like every other client-side failure.
+    //
+    // Nothing can be lost by reading it here: the daemon writes the ack *before* it
+    // counts the connection as a subscriber, so no notification can precede it. The
+    // stray-frame tolerance is defensive only, as it is in `tap_stream`.
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            anyhow::bail!("connection closed before the subscribe acknowledgement");
+        }
+        if let Ok(Incoming::Response(resp)) = serde_json::from_str::<Incoming>(line.trim()) {
+            if let Some(err) = resp.error {
+                anyhow::bail!("subscribe failed: {} ({})", err.message, err.code);
+            }
+            break;
+        }
+    }
+
     while printed < limit {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
@@ -656,7 +681,8 @@ fn subscribe_stream(socket: &Path, count: Option<usize>) -> anyhow::Result<()> {
             continue;
         }
         match serde_json::from_str::<Incoming>(trimmed) {
-            // The ack for the subscribe request itself — swallow it.
+            // A later Response on this connection is not ours to print — one
+            // subscription per connection, and its ack was read above.
             Ok(Incoming::Response(_)) => {}
             Ok(Incoming::Notification(note)) => {
                 writeln!(stdout, "{}", serde_json::to_string(&note)?)?;
@@ -762,12 +788,27 @@ fn tap_closed(params: Option<&Value>, written: u64, stop_bytes: Option<u64>) -> 
     };
     let (endpoint, reason) = (field("endpoint"), field("reason"));
     if let Some(limit) = stop_bytes {
-        anyhow::bail!(
-            "tap closed: {endpoint} ({reason}) — {written} of {limit} requested byte(s) received"
-        );
+        return Err(short_read(
+            &format!("tap closed: {endpoint} ({reason})"),
+            written,
+            limit,
+        ));
     }
     eprintln!("tap closed: {endpoint} ({reason}) — {written} byte(s) received");
     Ok(())
+}
+
+/// The short-read error every "the stream ended before the `--bytes` budget did" path
+/// raises: `what` names how the stream ended, the tail names the shortfall.
+///
+/// One helper because there are **two** such paths and they used to disagree. The
+/// terminal `tap.closed` errored per the documented rule, while a plain connection EOF
+/// — a daemon crash, an abrupt close — simply broke the read loop and fell through to
+/// `Ok(())`: exit 0 over a silently truncated capture, which is the one outcome
+/// `--bytes N` exists to make impossible (37-TOOL-1). The condition is identical, so
+/// the status and the sentence are now identical too.
+fn short_read(what: &str, written: u64, limit: u64) -> anyhow::Error {
+    anyhow::anyhow!("{what} — {written} of {limit} requested byte(s) received")
 }
 
 /// Open the socket, `tap.open` the endpoint, and write each `tap.data`
@@ -818,7 +859,7 @@ fn tap_stream(
             }
             let ack = resp.result.unwrap_or(Value::Null);
             eprintln!("tap opened: {ack}");
-            // `from_offset` is where this tap's stream begins (§11.8) — the anchor the
+            // `from_offset` is where this tap's stream begins (plan §11.8) — the anchor the
             // offset-continuity check below counts from, so a drop before the very
             // first chunk is visible too (review 32, CTL-2).
             break TapContinuity::new(ack.get("from_offset").and_then(Value::as_u64));
@@ -836,6 +877,17 @@ fn tap_stream(
     while written < limit {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
+            // Clean EOF: the daemon closed the connection without a `tap.closed` —
+            // it crashed, was killed, or dropped us. With a budget outstanding that is
+            // the same short read `tap_closed` errors on, so it takes the same exit
+            // (37-TOOL-1); unbounded, it is an orderly end of stream and exits 0.
+            if let Some(l) = stop_bytes {
+                return Err(short_read(
+                    &format!("tap stream ended: {endpoint} (connection closed)"),
+                    written,
+                    l,
+                ));
+            }
             break; // daemon closed the connection
         }
         let trimmed = line.trim();
