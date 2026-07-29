@@ -3333,6 +3333,39 @@ filesystem spells the **directory**, a manifest or a `use` spells the **crate**,
 spells the **binary**. A textual rename that does not distinguish them will convert all three to
 whichever it saw first.
 
+### 3.23 The P5 certificate's scope is narrower than §15.21's sentence, deliberately (review 37 `37-TOOL-3`)
+
+**Design:** §15.21 (echoed by §13 and plan §3) promises the rig certificate covers "deliberate baud
+and parity mismatches proving the error counters observable, break reception, and a modem-line map".
+**Reality:** `p5_certify_pair` performs the rate ladder plus a deliberate **baud** mismatch only —
+every open is `Parity::None` — and the per-port `break` item is local ioctl acceptance, never
+reception into an open peer (`doctor/src/probes.rs`; `docs/serial-nexus-doctor.md` already states
+both limits, and the §4 P5 entry above records that `brk = 0` everywhere is structural).
+**Decision: keep the probe as shipped and record the narrowing here.** The missing pieces are not
+uncovered — parity/framing-error observation and break assertion ride the Tier-3 checklist and the
+`crossover_ports()`-gated `serial_hardware.rs` suite, which is where §16.7 wants
+sim-unreachable behavior anyway — and widening P5 would put more TX-emitting machinery into the one
+probe whose job is certifying the rig *before* anything else is trusted, not exhausting it. The
+residue is honest: the certificate proves data integrity and clock accuracy; the checklist proves
+the signal repertoire. The design sentence is the stale side; annotate §15.21 (and the §13/plan §3
+echoes) at the next design revision — annotate, never rewrite (§15's own rule).
+
+### 3.24 Design §11's "resolver-input well-formedness" clause names the wrong verb (review 37 `37-CFG-1`)
+
+**Design:** §11's load-atomicity sentence lists "resolver-input well-formedness" among the checks run
+before anything is created.
+**Reality:** `Daemon::load` runs `GraphConfig::validate` plus `precheck_codecs` and never touches the
+resolver; `resolve_input`'s sole caller is `add-node`. A structurally meaningless identity loads and
+sits `waiting`, while `add-node` refuses the identical string with `-32602`.
+**Decision: the code is right and stays; this is §3.20(a)'s asymmetry read from the design side.**
+Load-by-identity must never require the device — or its identity syntax — to be resolvable, because
+that is what lets configurations survive cold starts with hardware unplugged (§12); making `load`
+resolve would break the property the identity design exists for, and the destructive-typo path is
+closed structurally by `deny_unknown_fields` before `--replace` can reach teardown. What §11's
+sentence actually describes is `add-node`'s *capture* rule (§12's "raw path requires the device
+present at that moment"). The design sentence should be qualified at the next design revision;
+recorded here so the next review reads the clause as a documentation artifact, not a validation gap.
+
 ---
 
 ## 4. Findings carried forward (from serial-nexus-doctor)
