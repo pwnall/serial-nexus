@@ -91,6 +91,28 @@ followed by `cargo build -p serial-nexus-daemon-bin` before the itest meant anyt
 review 32's "a guard that drives the fix cannot fail against the code that lacked it", one
 layer down in the toolchain, and it is invisible: the proof simply passes and reports nothing.
 
+**Tier-3 hardware validation, and the certificate for this tree.** All four
+`itest/tests/serial_hardware.rs` tests *ran* rather than self-skipped against the cross-wired
+FTDI FT232R pair (`/dev/ttyUSB0` `BH00L4KU` ↔ `/dev/ttyUSB1` `BH00LL8O`): byte-exact both
+directions at 115200 and at the custom rate 250000, the `send` verb reaching the far port,
+`TIOCEXCL` exclusivity, the map node both directions over the physical wire, and the serial
+signal verbs on a real UART with the break surfacing at the peer RX as a one-byte `0x00`.
+The whole suite with the rig attached and `SNX_WEB_UI=required`: 111 targets, 0 failures.
+The §15.21 certificate was taken *after* that run rather than before it, because the tooling
+was briefly unable to invoke the doctor with `--port`; nothing failed, so nothing needed
+attributing, but the documented order was inverted and is recorded as such rather than
+tidied away. The certificate is committed as
+`docs/doctor/linux-7.0-2026-07-29-tier3-2.json` — binary `2e5874bbe090` (the remediation
+commit), probe set `01b257ece8c48470`, equal to every other artifact in that directory and
+therefore diff-comparable with all of them — **21 · 0 · 0 · 1**, the one skip being P12,
+inert on Linux by design. P5 reports the pair crossed in *both* directions with
+`rate_ladder=true deliberate_mismatch_observed=true` on both ports, and it passes
+`expectations/linux.jq`. P11's `brk=3`/`frame=5` on `/dev/ttyUSB1` are the certification's
+own break and deliberate-mismatch phases surfacing in the driver counters — which is the
+direct evidence behind this session's correction to `docs/serial-nexus-doctor.md`, whose
+claim that `brk` stays 0 at every tier on every kernel was already false of the *committed*
+artifact before it was false of this one.
+
 ---
 
 ## DEPENDENCY UPDATE — everything to latest stable, and the Tier-3 rig that checked it (2026-07-29 session)

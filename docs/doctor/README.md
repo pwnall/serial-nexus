@@ -24,6 +24,7 @@ anything built before 2026-07-28 — is not comparable with these.
 
 | File | Kernel / box | Binary | Probe set | Rig | Verdicts |
 |---|---|---|---|---|---|
+| [`linux-7.0-2026-07-29-tier3-2.json`](linux-7.0-2026-07-29-tier3-2.json) | 7.0.0-28-generic, Ubuntu 26.04 — the dev box | `2e5874bbe090` | `01b257ece8c48470` | **Tier 3** — the same cross-wired FT232R pair (`BH00L4KU` ↔ `BH00LL8O`) | 21 supported · 0 degraded · 0 unsupported · 1 skipped |
 | [`linux-6.18-2026-07-29-tier3.md`](linux-6.18-2026-07-29-tier3.md) | 6.18.14-1rodete4-amd64, Debian rodete — **the production box** | `85699d66c5a5` | `01b257ece8c48470` | **Tier 3** — two FTDI FT232R cross-wired (`BH00LL8O` ↔ `BH00L4KU`) | 21 supported · 0 degraded · 0 unsupported · 1 skipped |
 | [`linux-7.0-2026-07-29-tier3.json`](linux-7.0-2026-07-29-tier3.json) | 7.0.0-28-generic, Ubuntu 26.04 — the dev box | `da290c616631` | `01b257ece8c48470` | **Tier 3** — the same cross-wired FT232R pair (`BH00L4KU` ↔ `BH00LL8O`), moved back | 21 supported · 0 degraded · 0 unsupported · 1 skipped |
 | [`linux-7.0-2026-07-29-passive-1.json`](linux-7.0-2026-07-29-passive-1.json) | 7.0.0-28-generic, Ubuntu 26.04 — the dev box | `85699d66c5a5` | `01b257ece8c48470` | none (passive; no adapter attached) | 13 supported · 0 degraded · 0 unsupported · 6 skipped |
@@ -33,15 +34,15 @@ anything built before 2026-07-28 — is not comparable with these.
 Files are named for the UTC day of their own `generated` stamp, which is why the
 7.0 runs read `2026-07-29` despite being taken on the evening of the 28th local.
 
-**The four 2026-07-29 reports below the newest one predate the §15.40 rename and still
-say so inside**, because they are captured tool output: their `tool` field carries the
-binary's pre-rename name, and nothing in this directory is hand-edited to read more
-tidily. That is the whole point of committing them — an artifact edited after the fact is
-an assertion again, not a check — so the retired-name meta-gate exempts exactly those four
-files by name, and `README.md` (this file) not at all. The Tier-3 7.0 report at the top of
-the index needs no exemption: it was produced by a post-rename binary and carries the
-current name on its own, which is what "a future report will fix itself" looks like in
-practice.
+**Four of these reports predate the §15.40 rename and still say so inside** — the 6.18
+Tier-3 report and the three 7.0 passive runs — because they are captured tool output:
+their `tool` field carries the binary's pre-rename name, and nothing in this directory is
+hand-edited to read more tidily. That is the whole point of committing them — an artifact
+edited after the fact is an assertion again, not a check — so the retired-name meta-gate
+exempts exactly those four by name, and `README.md` (this file) not at all. The **two**
+7.0 Tier-3 reports need no exemption: both were produced by post-rename binaries and
+carry the current name on their own, which is what "a future report will fix itself"
+looks like in practice.
 
 Same binary, same commit, same fingerprint on both sides of the diff: these two
 kernels are comparable field by field, and `docs/serial-nexus-doctor.md` does the
