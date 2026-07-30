@@ -39,6 +39,24 @@ const SKIP_DIRS: &[&str] = &[
     "playwright-report",
 ];
 
+/// Is `dir` the root of a **nested checkout** — another worktree or clone living inside
+/// this one?
+///
+/// Skipped, because a nested checkout is a second copy of this tree: every retired name
+/// and every consumer-context term in it is reported as a violation *of this tree*, at a
+/// path that is not this tree's. Measured: one `git worktree add` under
+/// `.claude/worktrees/` turns both gates in this file red, plus two in `meta_gates.rs`.
+///
+/// Keyed on "is a checkout" rather than on the directory's *name*, because a name list
+/// has to guess where worktrees get put — and `.claude` specifically must **not** be
+/// skipped wholesale, since `.claude/settings.json` is tracked and §15.41's privacy rule
+/// is tree-wide. `git worktree add` leaves a `.git` **file**; a clone leaves a `.git`
+/// **directory**; `exists()` covers both, and the root handed to [`walk_text`] is itself
+/// never tested.
+fn is_nested_checkout(dir: &Path) -> bool {
+    dir.join(".git").exists()
+}
+
 /// Walk every readable UTF-8 file under `dir`, handing `(path relative to root, text)`
 /// to `visit`. Non-UTF-8 files are skipped, which is exactly right: a token scan has
 /// nothing to say about a binary, and `read_to_string` is the cheapest way to tell.
@@ -51,7 +69,7 @@ fn walk_text(root: &Path, dir: &Path, visit: &mut impl FnMut(&str, &str)) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if path.is_dir() {
-            if SKIP_DIRS.contains(&name.as_ref()) {
+            if SKIP_DIRS.contains(&name.as_ref()) || is_nested_checkout(&path) {
                 continue;
             }
             walk_text(root, &path, visit);
@@ -213,6 +231,28 @@ fn retired_names_appear_only_where_history_lives() {
         format!("// the {planted} used to live here\n"),
     )
     .expect("write planted file");
+    // The same name inside a nested **worktree** and a nested **clone**, neither of which
+    // is part of this tree and neither of which may be reported. A skip is a matcher and
+    // gets planted in every spelling it claims to cover (AGENTS §3): keying on the
+    // directory's name rather than on "is a checkout" catches one of these and misses the
+    // other, and the assertion below is what says which.
+    std::fs::create_dir_all(scratch.join("wt")).expect("create scratch worktree");
+    std::fs::write(
+        scratch.join("wt/.git"),
+        "gitdir: /elsewhere/.git/worktrees/wt\n",
+    )
+    .expect("write gitfile");
+    std::fs::write(
+        scratch.join("wt/thing.rs"),
+        format!("// the {planted} used to live here\n"),
+    )
+    .expect("write planted file in the worktree");
+    std::fs::create_dir_all(scratch.join("clone/.git")).expect("create scratch clone");
+    std::fs::write(
+        scratch.join("clone/thing.rs"),
+        format!("// the {planted} used to live here\n"),
+    )
+    .expect("write planted file in the clone");
     let mut planted_hits = Vec::new();
     walk_text(&scratch, &scratch, &mut |rel, text| {
         for token in RETIRED {
@@ -225,8 +265,9 @@ fn retired_names_appear_only_where_history_lives() {
     assert_eq!(
         planted_hits,
         vec![format!("nested/thing.rs:{planted}")],
-        "the walker or the matcher missed a planted retired name — this gate would \
-         pass over anything"
+        "the walker or the matcher missed a planted retired name, or surfaced one from a \
+         nested worktree/clone — this gate would either pass over anything or convict the \
+         repository of a copy's contents"
     );
 
     // 2. …and the converted names must NOT fire, or the gate is unusable and gets

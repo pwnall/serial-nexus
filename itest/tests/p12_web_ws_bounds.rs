@@ -21,10 +21,43 @@
 //! and one *fragmented message* over the message cap, so deleting either config call
 //! fails a test of its own.
 //!
+//! Note what is and is not a *promise* here. §17 and `docs/security.md` say the cap
+//! "bounds what one frame can make the server buffer"; neither says the connection ends,
+//! and 37-WEBS-4 asked for the caps to be **asserted at all**. So the load-bearing
+//! assertions are the two that pin the documented property — no reply, and no mutation in
+//! the daemon's own configuration — and they run first. `closed()` is kept behind them
+//! because a server that quietly discarded the frame and carried on would satisfy both
+//! (silence is not refusal), but it is the weaker claim and it must never be what takes a
+//! run down.
+//!
 //! No serial device is involved, so this runs on **every** platform (§5). The raw RFC
 //! 6455 client is a local copy, as in `p12_web_session.rs` and `p12_web_token_transport.rs`:
 //! this one has to emit frames those cannot — payloads past the 16-bit length form, and
 //! a continuation sequence.
+//!
+//! ## The closure oracle, and why it is not `read() == Ok(0)`
+//!
+//! This file was green on Linux and red on macOS for one run and amber the next, against
+//! a server measured correct on both. The caps were never the problem: `closed()` was.
+//! The refusal is enforced at frame-header parse, so the over-cap payload is never
+//! drained and the server's `close(2)` runs with unread bytes queued — which is an **RST**,
+//! not a FIN, on every mainstream stack. Two consequences the old oracle got wrong, and
+//! one Darwin detail that decided which way each run fell:
+//!
+//! 1. the Close frame the server does send is consumed by `response_arrives` on the line
+//!    above (see [`Ws::close_seen`]);
+//! 2. the reset surfaces as an `ErrorKind`, and `matches!(read, Ok(0))` scored it the same
+//!    as a live-but-quiet peer (see [`ends_a_connection`]);
+//! 3. Darwin's `setsockopt(SO_RCVTIMEO)` returns `EINVAL` on a socket carrying a pending
+//!    RST, so `fill` returned *without reading* and left the error for the bare probe,
+//!    where Linux consumed it in `fill` and left a plain EOF behind. That is the whole of
+//!    the platform split, and it is a coin flip either way — Linux was lucky, not right.
+//!
+//! The predicate is now derived from what the server promises (the session is over)
+//! rather than from which of the two shutdown paths a kernel happened to take — the same
+//! correction `docs/macos.md` delta 4 states for socket-buffer-derived assertions. It is
+//! *stricter* on Linux than what it replaces: a Close frame is now positive evidence the
+//! server ended the session deliberately, where an EOF alone is merely consistent with it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -164,6 +197,46 @@ struct Frame {
     payload: Vec<u8>,
 }
 
+/// Why [`Ws::fill`] stopped short of the byte count it was asked for.
+///
+/// A `bool` here is what made this file fail on macOS and pass on Linux for the same
+/// server behaviour. The three ways a read can end — *nothing yet*, a clean FIN, an
+/// abortive reset — are three different answers to "is this session over", and
+/// collapsing them into one `false` threw away the only copy: a pending socket error is
+/// a **one-shot** on every stack (`so_error`/`sk_err` is cleared by the read that
+/// reports it), so a later probe cannot ask again. [`Ws::closed`] is the caller that
+/// needs the distinction, and it sits one frame above the code that used to discard it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// The deadline passed with the request still unmet. The peer is **silent**, which
+    /// is emphatically not the same as gone — telling those two apart is the whole job
+    /// of [`Ws::closed`].
+    Deadline,
+    /// `read` returned 0: the peer sent FIN.
+    Eof,
+    /// `read` failed with this kind.
+    Io(std::io::ErrorKind),
+}
+
+/// The [`std::io::ErrorKind`]s that mean *this connection is over*, as against "nothing
+/// to read yet".
+///
+/// An RST is a **stronger** ending than a FIN, not a weaker one, and these tests
+/// deliberately engineer one: tungstenite enforces the frame cap while parsing the frame
+/// *header*, so the server never drains the over-cap payload, and its `close(2)`
+/// therefore runs with unread bytes still queued — which every mainstream stack answers
+/// with an RST instead of a FIN (RFC 1122 §4.2.2.13). Reading that reset as "not closed"
+/// is backwards, and it is what the `matches!(read, Ok(0))` this replaces did.
+fn ends_a_connection(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::BrokenPipe
+    )
+}
+
 /// A raw WebSocket client that can emit payloads past the 16-bit length form and
 /// multi-frame (continuation) messages — the two shapes the caps under test are about.
 ///
@@ -173,6 +246,18 @@ struct Frame {
 struct Ws {
     stream: TcpStream,
     pending: Vec<u8>,
+    /// The payload of the first Close frame this session saw, latched the moment it is
+    /// drained.
+    ///
+    /// Without the latch the two helpers that read this socket **compete for one frame**:
+    /// the server's Close lands inside the ten-second window `response_arrives` is
+    /// sitting in, `response_arrives` correctly reports "no reply, the peer closed" — and
+    /// drops the frame on the floor. `closed`, called on the very next line, is then
+    /// asked to prove the thing that was just discarded. That is not a corner case, it is
+    /// the path a *promptly correct* server takes, so the assertion was most likely to
+    /// fail against the best-behaved server. Latching in [`Ws::recv_frame`], the one
+    /// commit point, means no caller can forget.
+    close_seen: Option<Vec<u8>>,
 }
 
 impl Ws {
@@ -190,6 +275,7 @@ impl Ws {
         let mut ws = Ws {
             stream,
             pending: Vec::new(),
+            close_seen: None,
         };
         // RFC 6455 §1.3's own example nonce: the server only hashes it into the accept
         // digest, so a fixed one keeps this deterministic.
@@ -208,7 +294,7 @@ impl Ws {
             // One byte at a time: anything past the blank line stays in `pending` for
             // `recv_frame`, so the first server frame is never swallowed.
             assert!(
-                ws.fill(1, deadline),
+                ws.fill(1, deadline).is_ok(),
                 "no complete HTTP response head from the WS upgrade; got {:?}",
                 String::from_utf8_lossy(&head)
             );
@@ -228,28 +314,36 @@ impl Ws {
     }
 
     /// Append to `pending` until it holds `n` bytes or the deadline passes. Never
-    /// consumes, so a failure costs the caller nothing.
-    fn fill(&mut self, n: usize, deadline: Instant) -> bool {
+    /// consumes, so a failure costs the caller nothing — and reports *why* it stopped,
+    /// which is the part [`Ws::closed`] cannot reconstruct afterwards (see [`Stop`]).
+    fn fill(&mut self, n: usize, deadline: Instant) -> Result<(), Stop> {
         let mut buf = [0u8; 4096];
         while self.pending.len() < n {
             let now = Instant::now();
             if now >= deadline {
-                return false;
+                return Err(Stop::Deadline);
             }
-            if self
+            // A failure here is deliberately **not** a reason to stop. Darwin rejects
+            // `SO_RCVTIMEO` with `EINVAL` once the socket is carrying a pending RST, so
+            // bailing out on it is what let the reset go unobserved on macOS while Linux —
+            // where the same call succeeds — consumed it here and left a plain EOF behind
+            // for the next read. That divergence, not the caps, is the whole of the macOS
+            // failure this file used to have. The read below is the call that reports the
+            // reset, and it is the answer `closed` needs; a deadline from a previous
+            // iteration (or from `connect`) is still armed, so this cannot block forever.
+            let _ = self
                 .stream
-                .set_read_timeout(Some((deadline - now).max(Duration::from_millis(1))))
-                .is_err()
-            {
-                return false;
-            }
+                .set_read_timeout(Some((deadline - now).max(Duration::from_millis(1))));
             match self.stream.read(&mut buf) {
-                Ok(0) => return false, // EOF
+                Ok(0) => return Err(Stop::Eof),
                 Ok(k) => self.pending.extend_from_slice(&buf[..k]),
-                Err(_) => return false,
+                // `Read::read` does not retry `EINTR`, and one signal must not be read as
+                // a closed connection.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(Stop::Io(e.kind())),
             }
         }
-        true
+        Ok(())
     }
 
     /// Emit one frame with an explicit opcode and FIN bit, masked as RFC 6455 §5.3
@@ -296,11 +390,9 @@ impl Ws {
         Ok(())
     }
 
-    /// The next whole frame by `deadline`, or `None` (deadline, EOF, or error).
-    fn recv_frame(&mut self, deadline: Instant) -> Option<Frame> {
-        if !self.fill(2, deadline) {
-            return None;
-        }
+    /// The next whole frame by `deadline`, or why the wait ended without one.
+    fn recv_frame(&mut self, deadline: Instant) -> Result<Frame, Stop> {
+        self.fill(2, deadline)?;
         let (b0, b1) = (self.pending[0], self.pending[1]);
         assert!(
             b1 & 0x80 == 0,
@@ -308,33 +400,38 @@ impl Ws {
         );
         let (header_len, len) = match b1 & 0x7f {
             126 => {
-                if !self.fill(4, deadline) {
-                    return None;
-                }
+                self.fill(4, deadline)?;
                 (
                     4,
                     u16::from_be_bytes([self.pending[2], self.pending[3]]) as usize,
                 )
             }
             127 => {
-                if !self.fill(10, deadline) {
-                    return None;
-                }
+                self.fill(10, deadline)?;
                 let mut n = [0u8; 8];
                 n.copy_from_slice(&self.pending[2..10]);
                 (10, u64::from_be_bytes(n) as usize)
             }
             n => (2, n as usize),
         };
-        if !self.fill(header_len + len, deadline) {
-            return None;
-        }
+        self.fill(header_len + len, deadline)?;
         // The one commit point: the frame is whole, so take all of it at once.
         let frame: Vec<u8> = self.pending.drain(..header_len + len).collect();
-        Some(Frame {
-            opcode: b0 & 0x0f,
-            payload: frame[header_len..].to_vec(),
-        })
+        let opcode = b0 & 0x0f;
+        let payload = frame[header_len..].to_vec();
+        // Latched here, at the single commit point, so that no caller can consume a Close
+        // frame without the session recording that it happened — see `Ws::close_seen`.
+        if opcode == 0x8 && self.close_seen.is_none() {
+            self.close_seen = Some(payload.clone());
+        }
+        Ok(Frame { opcode, payload })
+    }
+
+    /// The reason text of the Close frame this session saw, if it saw one carrying a
+    /// body. RFC 6455 §5.5.1: `[u16 status code][UTF-8 reason]`, both optional.
+    fn close_reason(&self) -> Option<String> {
+        let payload = self.close_seen.as_ref()?;
+        (payload.len() > 2).then(|| String::from_utf8_lossy(&payload[2..]).into_owned())
     }
 
     /// Wait for the correlated response to `id`, reporting whether it arrives before the
@@ -342,11 +439,11 @@ impl Ws {
     fn response_arrives(&mut self, id: u64) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            let Some(frame) = self.recv_frame(deadline) else {
+            let Ok(frame) = self.recv_frame(deadline) else {
                 return false;
             };
             if frame.opcode == 0x8 {
-                return false; // closed
+                return false; // closed — and `recv_frame` has latched it for `closed()`
             }
             if let Ok(v) = serde_json::from_slice::<Value>(&frame.payload)
                 && v.get("id") == Some(&Value::from(id))
@@ -357,31 +454,53 @@ impl Ws {
         false
     }
 
-    /// Whether the server has closed this connection — a Close frame or an EOF, both of
-    /// which end the session — within a bounded wait.
+    /// Whether the server has **ended** this session, within a bounded wait — as against
+    /// having merely gone quiet.
     ///
-    /// A connection that is merely *silent* is not closed, and is deliberately not
-    /// reported as one: that distinction is what stops a server which quietly discarded
-    /// the frame from passing for one that refused it. `recv_frame` cannot make it —
-    /// a deadline and an EOF both come back as `None` — so the socket is asked directly.
+    /// A connection that is only *silent* is deliberately not reported as closed: that
+    /// distinction is what stops a server which quietly discarded the frame from passing
+    /// for one that refused it, and it is the only thing this helper is for.
+    ///
+    /// Three endings count, and the previous version recognised one of them:
+    ///
+    /// * a **Close frame**, wherever in the session it was seen — [`Ws::close_seen`]
+    ///   explains why it has to be a latch rather than a fresh read;
+    /// * **EOF**, a graceful FIN;
+    /// * an **abortive close**, which arrives as an error kind, not as `Ok(0)` — see
+    ///   [`ends_a_connection`] for why these tests guarantee one.
+    ///
+    /// Only [`Stop::Deadline`] — nothing at all within the window — is "still open". The
+    /// old form asked the socket for a bare `Ok(0)` after `fill` had already consumed and
+    /// discarded the reset, so on macOS it reported a session that had demonstrably ended
+    /// as open. It was never right on Linux either; it was lucky there.
     fn closed(&mut self) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            if self.close_seen.is_some() {
+                return true;
+            }
             match self.recv_frame(deadline) {
-                Some(frame) if frame.opcode == 0x8 => return true,
-                // Anything else is ordinary traffic (the daemon's `state` notification
-                // arrives unbidden); keep reading until the connection ends.
-                Some(_) => continue,
-                None => break,
+                // Ordinary traffic (the daemon's `state` notification arrives unbidden);
+                // keep reading until the session ends.
+                Ok(_) => continue,
+                Err(Stop::Eof) => return true,
+                Err(Stop::Io(kind)) => return ends_a_connection(kind),
+                Err(Stop::Deadline) => return false,
             }
         }
-        self.stream
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .ok();
-        let mut byte = [0u8; 1];
-        matches!(self.stream.read(&mut byte), Ok(0))
     }
 }
+
+/// The reason text on the *other* Close frame `web/src/bridge.rs` can send — the WEB-4
+/// "say why the console is losing its connection" path, which fires when the **daemon**
+/// goes away and has nothing to do with a size cap.
+///
+/// Asserted against so that an unrelated mid-test daemon departure cannot be mistaken for
+/// a cap refusal: without this, `!response_arrives(..)` (satisfied by silence) and
+/// `closed()` (satisfied by any ending) would both pass with the two `WebSocketConfig`
+/// calls deleted. Best-effort by nature — a refusal's own Close frame carries no body at
+/// all, and an RST can destroy it in flight — so it can only ever convict, never acquit.
+const DAEMON_GONE_REASON: &str = "daemon connection closed";
 
 // ------------------------------------------------------------------ the payloads ----
 
@@ -458,13 +577,23 @@ fn a_frame_over_the_cap_is_refused_and_its_request_never_reaches_the_daemon() {
         "an over-cap frame was served: the {WS_MAX_FRAME}-byte frame cap §17 and \
          docs/security.md promise is not in force"
     );
+    // Before the closure assertion, not after it: this is the strongest and the most
+    // OS-independent evidence in the file — the one the module doc is built around — and
+    // ordering it behind `closed()` meant that a closure oracle which misjudged *how* the
+    // session ended took the cap assertion down with it, unrun.
+    assert!(
+        !daemon_has_node(&d.rpc().dump(), "webs4_over_frame"),
+        "the request inside an over-cap frame reached the daemon and mutated the graph"
+    );
     assert!(
         ws.closed(),
         "an over-cap frame must end the connection, not be silently skipped"
     );
-    assert!(
-        !daemon_has_node(&d.rpc().dump(), "webs4_over_frame"),
-        "the request inside an over-cap frame reached the daemon and mutated the graph"
+    assert_ne!(
+        ws.close_reason().as_deref(),
+        Some(DAEMON_GONE_REASON),
+        "the session ended because the daemon went away, not because the frame cap \
+         refused anything — this run proves nothing about the cap"
     );
 }
 
@@ -526,12 +655,19 @@ fn a_fragmented_message_over_the_cap_is_refused_and_never_reaches_the_daemon() {
          cap §17 and docs/security.md promise is not in force",
         over.len()
     );
+    // Ordered ahead of the closure assertion for the reason given in the frame-cap test.
+    assert!(
+        !daemon_has_node(&d.rpc().dump(), "webs4_over_message"),
+        "the request inside an over-cap message reached the daemon and mutated the graph"
+    );
     assert!(
         ws.closed(),
         "an over-cap message must end the connection, not be silently skipped"
     );
-    assert!(
-        !daemon_has_node(&d.rpc().dump(), "webs4_over_message"),
-        "the request inside an over-cap message reached the daemon and mutated the graph"
+    assert_ne!(
+        ws.close_reason().as_deref(),
+        Some(DAEMON_GONE_REASON),
+        "the session ended because the daemon went away, not because the message cap \
+         refused anything — this run proves nothing about the cap"
     );
 }

@@ -1,6 +1,6 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-29 (**phases 0-8 + simplification + extension + web-console + v10 + v11
+**As of:** 2026-07-30 (**phases 0-8 + simplification + extension + web-console + v10 + v11
 console-map + review-26 remediation + v12 graph-editing + v13 browser-UI automation +
 review-32 remediation tracks done**, plus the **v14 rename track** — every binary, crate
 and default path moved to the `serial-nexus-*` / `serial_nexus_*` family, design §15.40,
@@ -13,6 +13,124 @@ remediation ledgers are in `docs/historical/`. Section references (§) point at 
 design.
 
 ---
+
+## macOS VALIDATION — the red lane was two harness defects, not one (2026-07-30 session)
+
+**Scale and gates.** A whole-gate pass on the Mac (macOS 15.7.8 / Darwin 24.6.0, x86_64, load
+avg 1.7 on 12 cores — §8 measured before anything was attributed to code), against `a102977`.
+Final: **710 passing / 0 failing / 4 ignored**, 101 test binaries + 8 doc-test targets, with
+`cargo build --workspace --locked` (including `serial-nexus-web`, which builds natively here
+and needs no exclusion), `fmt`, **both** clippy gates, `cargo deny check licenses bans
+sources`, `expectations/macos.jq`, all ten meta-gates, and `p8_web_ui` + `p8_web_history`
+under `SNX_WEB_UI=required` all green — plus **all four `serial_hardware.rs` rig tests** on
+the physical FT232R crossover, auto-detected by `crossover_ports()`'s macOS arm. The first
+committed macOS doctor artifact, `docs/doctor/macos-24.6.0-2026-07-30-tier3.json`, carries
+probe set `01b257ece8c48470`, the same fingerprint as the Linux reports.
+
+**The CI failure: `p12_web_ws_bounds`, and the product was never wrong.** Both over-cap tests
+failed on `ws.closed()` in CI; on the local Mac only one did, which is the tell that made the
+rest of the diagnosis follow — a deterministic platform difference does not fail 2/2 on one
+box and 1/2 on another. The mechanism is `docs/macos.md` delta 6: the refusal fires at frame-
+header parse so the payload is never drained, `close(2)` with unread bytes queued is an RST,
+and Darwin's `setsockopt(SO_RCVTIMEO)` — which the harness re-arms before every read —
+returns `EINVAL` on a socket carrying a pending reset, so the pending `ECONNRESET` reached a
+predicate spelled `matches!(read, Ok(0))` instead of being consumed a frame lower as it is on
+Linux. Three separable test defects, all in one helper: the Close frame the server *does*
+send was drained and dropped by `response_arrives` on the line above; `fill` collapsed
+deadline / EOF / error into one `bool`, discarding a one-shot socket error that cannot be
+asked for twice; and the probe covered only a graceful FIN. Fixed by giving `fill` a `Stop`
+reason, latching the Close frame at the single commit point in `recv_frame`, and accepting
+Close ∨ EOF ∨ a terminal `ErrorKind` while still refusing a mere deadline — so "silent" and
+"closed" stay distinguishable, which is the helper's entire purpose.
+
+Two assertions were also reordered ahead of the closure check, because the strongest and most
+OS-independent evidence in the file — the daemon's own configuration afterwards — sat *behind*
+the oracle that misjudged, and never ran on a failing run.
+
+**Verification (§9).** Diagnosed from an instrumented run, then verified by three independent
+skeptics with different lenses, none of which had read the diagnosis, on a tree that did not
+move (the empirical one worked in a throwaway worktree). All three converged; the
+`SO_RCVTIMEO`/`EINVAL` mechanism came from the verification, not the diagnosis, and a C
+repro pinned it: `setsockopt` → `EINVAL(22)`, `read` → `ECONNRESET(54)`, `read` → `0`. The
+product lens measured the caps boundary-exact (`cap-1` and `cap` served, `cap+1` refused),
+246 over-cap trials with 0 daemon mutations, no fd leak over 200 refused sessions, and `401`
+for an unauthenticated peer — **PRODUCT_DEFECT = no**. Fail-first: the fixed tests were run
+15× on the Mac (15/15 green, against a race that used to flip), then re-proved sensitive by
+deleting both `WebSocketConfig` calls — 5/5 runs red, 0 passed / 2 failed, and failing on the
+**cap** assertion with the same messages the review-37 ledger recorded, not on the closure
+one. The oracle was weakened nowhere.
+
+**A second defect CI structurally cannot see.** `cargo clippy --workspace --all-targets --
+-D warnings` does not pass on macOS: `p12_pty_setup.rs`'s `two_consoles_that_both_come_up` is
+called only from a `#[cfg(target_os = "linux")]` test, so it is dead code off Linux. Its
+sibling `fd_flags` carries the gate; this one was missed. The `check` job that runs clippy is
+`ubuntu-latest`, and the `macos` job runs no lint at all — so this gate had never once
+executed on the platform that fails it. Now gated, with the reason in the doc comment.
+
+**A third defect, found by tripping over it: the meta-gate walkers descend into nested
+checkouts.** The adversarial verification above ran one of its skeptics in a `git worktree`
+under `.claude/worktrees/`, and the next whole-suite run came back with four meta-gates red
+— `unsafe_is_confined_to_serial_nexus_sys` naming `.claude/worktrees/…/sys/src/lib.rs`,
+`no_asyncfd_is_used_anywhere_in_the_workspace` naming the detector file itself, and both
+`meta_names.rs` scans. Every finding was true of the *copy* and vacuous about the repository
+under test. Three walkers were affected (`walk_text`, `walk_rs`, `crate_dirs`), each carrying
+a skip list of bare directory *names*.
+
+Fixed by skipping any directory that **is a checkout** — `dir.join(".git").exists()` — rather
+than by adding `.claude` to the name lists. The distinction is load-bearing in both
+directions and both were proved: a worktree leaves a `.git` **file** and a clone a `.git`
+**directory**, so a name-keyed skip catches one and misses the other (fail-first: with the
+predicate neutered the scratch plant surfaces `wt/thing.rs` *and* `clone/thing.rs`, and with
+it only `nested/thing.rs`); and `.claude` must **not** be skipped wholesale, because
+`.claude/settings.json` is tracked project configuration and §15.41's privacy rule is
+tree-wide — proved by planting a retired name at `.claude/probe-scan.md` and watching the
+gate convict it. End to end: with a real `git worktree add .claude/worktrees/…` present, all
+ten meta-gates stay green. The plants live in the scratch trees the two gates already build,
+which is §3's rule applied to a *skip* — a skip is a matcher too, and gets planted in every
+spelling it claims to cover.
+
+**Two process gaps, both self-inflicted, both closed.** (1) The macOS lane still ran plain
+`cargo test --workspace`; the 2026-07-28 block below is the record of one failure hiding
+three for six consecutive pushes, and the lesson never reached `.github/workflows/ci.yml`.
+It has `--no-fail-fast` now — deliberately only on that lane, the one nobody runs before
+pushing. (2) That block and the LEG-2 one cited rules as living in `AGENTS.md` §2 and §5 that
+were not in `AGENTS.md` at all — the section numbers shifted under the rename track and the
+prose kept the old ones. Both rules are now actually written there (§6 for `--no-fail-fast`,
+§9 for "assert the promise, never a proxy for it — in space or in time"), and the two
+citations here repointed. A rule that exists only in a citation is not a rule.
+
+**Two observability gaps in the WS bridge, filed here rather than fixed in the same
+commit.** Both surfaced from the product lens of the verification above; both are
+**cross-platform**, neither is an enforcement failure, and neither is macOS's doing — which
+is why they are recorded as their own item instead of riding along with a platform fix:
+
+- **A cap violation is logged nowhere.** `web/src/bridge.rs`'s browser-read arm collapses
+  `Some(Err(_))` — a tungstenite `Capacity` error among them — into the same `break false`
+  as a clean browser disconnect, and `bridge()` then returns `Ok(())`, so even
+  `server.rs`'s `tracing::debug!("connection from {peer} ended")` says nothing that
+  distinguishes them. An operator gets **zero signal** that a peer tripped a security cap
+  §17 and `docs/security.md` both advertise. A bound nobody can observe being hit is a
+  bound nobody can tell is working, which is the same argument 37-WEBS-4 made about it
+  being untested.
+- **The refusal's Close frame carries no status code.** The cap path exits through the
+  writer's `ws_sink.close()`, i.e. tungstenite's `close(None)`, so the wire bytes are
+  `0x88 0x00` — an empty payload, which a browser surfaces as `CloseEvent.code` **1005**
+  (no status received). RFC 6455 defines **1009** (Message Too Big) for exactly this, and
+  the bridge already has the machinery: the daemon-gone path sends a coded `CloseFrame`
+  with a reason precisely so a page can say *why* (review WEB-4). The console cannot
+  currently tell "the server refused my frame" from "the socket dropped".
+
+Note the second is what makes the first test-visible: `p12_web_ws_bounds` can only assert
+that the close was **not** the daemon-gone one (a negative), because the refusal's own close
+carries nothing to assert *on*. A coded close would let that guard convict positively.
+
+**One caveat for anyone re-running this.** `cargo test` does not emit the plain
+`target/debug/serial-nexus-*` artifacts the harness boots, so after touching product source
+you must `cargo build --workspace` again or the suite silently exercises the *previous*
+binary. This bit once during this very session — a suite run against a stale
+`serial-nexus-web` left over from the fail-first deletion reported the cap tests red on a
+tree whose source was already restored. The CI workflow comments say this; it is easy to do
+anyway.
 
 ## REVIEW-37 REMEDIATION — all 82 findings dispositioned (2026-07-29 session)
 
@@ -343,7 +461,7 @@ guard a pts structurally cannot run.
 test fail-fasts per crate*. One `serial-nexus-daemon` unit test had been failing there, so the lane
 stopped before the integration harness every time: red on six consecutive pushes, always
 reported as the same single failure, with **three more sitting behind it that nobody had
-seen**. `--no-fail-fast` surfaced all four at once. That is now a rule in AGENTS §2 — when
+seen**. `--no-fail-fast` surfaced all four at once. That is now a rule in AGENTS §6 — when
 you are validating a *platform* rather than a change, pass `--no-fail-fast`, because the
 per-crate stop makes "one known failure" and "four unknown ones" look identical.
 
@@ -377,7 +495,7 @@ timeouts the suite's timing changed and `WirePeer::dial` began failing `ECONNREF
 the full suite, never in isolation, which is the shape that reads as flakiness and gets
 chased as one (§8). It is not a flake: the callers wait on `sock.exists()`, and **`bind(2)`
 creates the socket file one syscall before `listen(2)` stops `connect(2)` refusing**. The
-dial now retries to a bounded deadline. Generalised into an AGENTS §5 rule beside the other
+dial now retries to a bounded deadline. Generalised into an AGENTS §9 rule beside the other
 two, because all three are one mistake — a proxy standing in for the thing you need, in
 space or in time.
 
@@ -2826,7 +2944,11 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 The current whole-suite figure is **723 passing, 0 failed, 4 ignored** across 111 test
 targets on Linux (2026-07-29, after the review-37 remediation); of those, one is the doc-tested
 twelve-line embedder `main` in `daemon/src/lib.rs`, which is the §15.26 entry surface
-proving it still compiles under the family names.
+proving it still compiles under the family names. On **macOS** the same tree is **710
+passing, 0 failed, 4 ignored** across 101 binaries + 8 doc-test targets (2026-07-30, Darwin
+24.6.0 / 15.7.8, x86_64, with the FT232R crossover attached so `serial_hardware.rs` runs
+rather than self-skipping); the shortfall against Linux is the Linux-only targets and the
+serial-device tests that self-skip where a pts is not a serial device, not failures.
 
 **Hardware integration test (Tier-3, opt-in):** `itest/tests/serial_hardware.rs` — the
 end-to-end test on *real* silicon (design §13/§15.17/§15.21, plan §5), which replaced the

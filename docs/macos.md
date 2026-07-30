@@ -5,6 +5,65 @@ the one every mechanism is specified against; macOS is supported where plain
 POSIX carries the design, and degrades — never crashes, never silently misbehaves
 — everywhere the design leans on a Linux-only facility.
 
+## Update — 2026-07-30 validation pass (macOS 15.7.8 / Darwin 24.6.0, x86_64, real FTDI crossover rig)
+
+A whole-gate pass on the Mac, run to settle the red macOS CI lane on `a102977`. **710 pass,
+0 fail, 4 ignored** across 101 test binaries + 8 doc-test targets, with `fmt`, both clippy
+gates, `cargo deny`, `expectations/macos.jq`, `p8_web_ui`, `p8_web_history` and all ten
+meta-gates green, and **all four `serial_hardware.rs` rig tests passing** on the physical
+crossover. The first committed macOS `serial-nexus-doctor` artifact came out of this pass —
+`docs/doctor/macos-24.6.0-2026-07-30-tier3.json`, same `probe set` fingerprint as the Linux
+reports, so it diffs against them field for field. Until now every macOS claim on this page
+cited a scrollback, which §7 does not permit.
+
+Two defects, **both in the harness, neither in the product**, and both invisible to CI's
+matrix for the same structural reason — the macOS lane runs a *subset* of the gates:
+
+- **The CI failure: `p12_web_ws_bounds`' closure oracle, not the caps.** Both over-cap tests
+  failed on `ws.closed()`. The caps were measured correct at the boundary on this platform
+  (`cap-1` and `cap` served, `cap+1` refused; 246 over-cap trials, 0 daemon mutations, no fd
+  leak, the session genuinely dead afterwards). What was wrong is delta 6 below. Fixed, and
+  the fix re-proved fail-first with both `WebSocketConfig` calls deleted.
+- **`cargo clippy --workspace --all-targets -- -D warnings` did not pass on macOS at all.**
+  `p12_pty_setup.rs`'s helper `two_consoles_that_both_come_up` is reachable only from a
+  `#[cfg(target_os = "linux")]` test, so off Linux it is dead code and `-D warnings` makes
+  that fatal. Its sibling `fd_flags` was gated; this one was missed. **CI cannot catch this
+  class**: clippy runs in the `check` job, which is `ubuntu-latest` only. A Mac is the only
+  place this gate has ever been run.
+
+Two process gaps closed in the same pass. The macOS lane still ran plain `cargo test
+--workspace` — no `--no-fail-fast` — even though the 2026-07-28 block below is the record of
+what that costs; it has it now. And `docs/implementation-notes.md` cited two rules as living
+in `AGENTS.md` that were not in it (the section numbers had shifted under the rename track);
+both rules are now actually written there, in §6 and §9.
+
+### 6. TCP close semantics: an RST is an ending, and `read() == Ok(0)` does not see one
+
+**New with this pass, and the cause of the CI failure.** When `serial-nexus-web` refuses an
+over-cap frame, tungstenite raises the capacity error while parsing the frame **header**, so
+the payload is never drained; the server's `close(2)` therefore runs with ~132 KiB still
+queued, and every mainstream stack answers that with an **RST** rather than a FIN (RFC 1122
+§4.2.2.13). A test that asserts closure as `matches!(read, Ok(0))` scores that reset the same
+as a live-but-silent peer — backwards, since an RST is the *stronger* ending.
+
+Linux passed anyway, and the reason is a Darwin detail worth recording on its own:
+**`setsockopt(SO_RCVTIMEO)` returns `EINVAL` on a socket carrying a pending RST.** The
+harness re-arms the read deadline before every read, so on Darwin that call fails, the helper
+returns *without reading*, and the pending `ECONNRESET` is left for the next bare probe —
+which reports it as an error. On Linux the same call succeeds, the read inside the helper
+consumes the one-shot socket error, and the probe that follows sees a plain `Ok(0)`. Measured
+here at the syscall level: `setsockopt` → `EINVAL(22)`, then `read` → `ECONNRESET(54)`, then
+`read` → `0`. Same server, same bytes, opposite verdicts — and it is a coin flip on both
+platforms, which is why one of the two tests passed locally while both failed in CI.
+
+**Lesson, the delta-4 one again in a second dress: derive a closure predicate from what the
+server promises — the session is over — not from which of the two shutdown paths a kernel
+took.** The oracle now accepts a Close frame (latched where it is drained, because the
+helper that waits for a reply consumes it first), EOF, or a terminal `ErrorKind`, and treats
+only a deadline as "still open". That is *stricter* on Linux than what it replaced: a Close
+frame is positive evidence the server ended the session deliberately, where an EOF alone is
+merely consistent with it. **verified.**
+
 ## Update — 2026-07-28 full-suite pass (macOS 15.7.8 / Darwin 24.6.0, x86_64, real FTDI crossover rig)
 
 The first pass to run the **whole** suite on a Mac. That had never happened: the macOS

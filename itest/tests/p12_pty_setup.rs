@@ -1316,6 +1316,12 @@ fn the_pty_master_is_close_on_exec_so_no_child_inherits_a_console() {
 
 /// [`TWO_CONSOLES`] without the unresolvable group — two consoles that both come up,
 /// which is what a master-fd census needs.
+///
+/// Gated with its only caller, the procfs-based `FD_CLOEXEC` census below: without the
+/// gate this is dead code off Linux, and `-D warnings` makes that a hard clippy failure
+/// on a Mac — one the CI matrix cannot see, because the lane that runs clippy is the
+/// Linux one. Its sibling `fd_flags` was gated; this was missed.
+#[cfg(target_os = "linux")]
 fn two_consoles_that_both_come_up(run: &TempRun) -> String {
     two_consoles(run)
         .lines()

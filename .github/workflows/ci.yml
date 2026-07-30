@@ -173,8 +173,15 @@ jobs:
       # the serial-nexus-itest harness boots — build the workspace bins first.
       - name: Build workspace binaries (serial-nexus-itest boots them as subprocesses)
         run: cargo build --workspace --locked
+      # `--no-fail-fast` here and not on the Linux lane, because this is the lane nobody
+      # runs before pushing. `cargo test --workspace` stops at the first failing test
+      # BINARY, so a red macOS job reports one crate and says nothing about the 80-odd
+      # targets behind it — which is exactly how one failing unit test hid three more for
+      # six consecutive pushes (docs/macos.md, the 2026-07-28 block). The lesson was
+      # written down then and never reached this file; a job that is going to be red
+      # anyway costs nothing by being red *completely*.
       - name: Build + test (portable core + integration harness; serial tests self-skip)
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
       - name: Capability report + macos.jq gate
         run: |
           cargo run -q --locked -p serial-nexus-doctor -- --markdown | tee serial-nexus-doctor-macos.md

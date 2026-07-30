@@ -159,6 +159,26 @@ struct WalkStats {
     unreadable: Vec<String>,
 }
 
+/// Is `dir` the root of a **nested checkout** — another worktree or clone living inside
+/// this one?
+///
+/// Skipped by every walker here, because a nested checkout is a second copy of this tree
+/// and scanning it reports each of its own files as a violation *of this tree*. Measured:
+/// a single `git worktree add` under `.claude/worktrees/` turns four of these gates red
+/// at once, naming `sys/src/lib.rs` and this very file — findings that are true of the
+/// copy and vacuous about the repository under test.
+///
+/// Keyed on "is a checkout" rather than on the directory's *name* on purpose. A name list
+/// would have to guess where someone puts a worktree, and `.claude` in particular must
+/// **not** be skipped wholesale: `.claude/settings.json` is tracked project configuration
+/// and the §15.41 privacy rule is tree-wide, so it has to stay in the scan. A worktree has
+/// a `.git` **file** (a gitfile pointing at the parent) and a clone has a `.git`
+/// directory; `exists()` covers both. The repository root itself is never tested, because
+/// these walkers examine entries *below* the root they are given.
+fn is_nested_checkout(dir: &Path) -> bool {
+    dir.join(".git").exists()
+}
+
 fn walk_rs(dir: &Path, visit: &mut impl FnMut(&Path, &str)) -> WalkStats {
     fn inner<F: FnMut(&Path, &str)>(dir: &Path, visit: &mut F, stats: &mut WalkStats) {
         let entries = match std::fs::read_dir(dir) {
@@ -175,8 +195,11 @@ fn walk_rs(dir: &Path, visit: &mut impl FnMut(&Path, &str)) -> WalkStats {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if path.is_dir() {
-                // Skip build output, VCS, the excluded fuzz crate, and vendored trees.
-                if matches!(name.as_ref(), "target" | ".git" | "fuzz" | "node_modules") {
+                // Skip build output, VCS, the excluded fuzz crate, vendored trees, and
+                // any nested worktree/clone (see `is_nested_checkout`).
+                if matches!(name.as_ref(), "target" | ".git" | "fuzz" | "node_modules")
+                    || is_nested_checkout(&path)
+                {
                     continue;
                 }
                 inner(&path, visit, stats);
@@ -302,9 +325,13 @@ fn crate_dirs(root: &Path, unreadable: &mut Vec<String>) -> Vec<PathBuf> {
             }
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            // Build output, VCS, vendored trees, and the workspace-excluded fuzz
-            // crate (its own toolchain, no daemon state).
-            if matches!(name.as_ref(), "target" | ".git" | "fuzz" | "node_modules") {
+            // Build output, VCS, vendored trees, the workspace-excluded fuzz crate (its
+            // own toolchain, no daemon state), and any nested worktree/clone — whose
+            // crates are this workspace's crates counted twice (see
+            // `is_nested_checkout`).
+            if matches!(name.as_ref(), "target" | ".git" | "fuzz" | "node_modules")
+                || is_nested_checkout(&path)
+            {
                 continue;
             }
             if path.join("Cargo.toml").is_file() {
@@ -409,6 +436,17 @@ fn unsafe_is_confined_to_serial_nexus_sys() {
     scratch.write("nested/deep/offender.rs", &planted);
     scratch.write("nested/deep/offender.txt", &planted);
     scratch.write("target/debug/build/offender.rs", &planted);
+    // A nested **worktree** (a `.git` gitfile, which is what `git worktree add` leaves)
+    // and a nested **clone** (a `.git` directory), each carrying the offender. Both must
+    // be skipped whole: they are copies of a tree, not part of this one, and before this
+    // was true a single worktree under `.claude/worktrees/` turned this gate red against
+    // its own duplicate. Planted in both spellings because a skip is a matcher too
+    // (AGENTS §3) — keying on the directory's name instead of on "is a checkout" passes
+    // one of these two and fails the other.
+    scratch.write("wt/.git", "gitdir: /elsewhere/.git/worktrees/wt\n");
+    scratch.write("wt/src/offender.rs", &planted);
+    scratch.write("clone/.git/HEAD", "ref: refs/heads/main\n");
+    scratch.write("clone/src/offender.rs", &planted);
     let mut planted_hits = Vec::new();
     let stats = walk_rs(scratch.path(), &mut |path, src| {
         if has_unsafe_usage(src) {
@@ -418,13 +456,15 @@ fn unsafe_is_confined_to_serial_nexus_sys() {
     assert_eq!(
         planted_hits,
         vec!["nested/deep/offender.rs".to_owned()],
-        "the walker missed a planted `unsafe` (or surfaced a file it must skip) — \
-         this gate would pass over anything"
+        "the walker missed a planted `unsafe`, or surfaced one inside a directory it must \
+         skip (`target/`, a nested worktree, a nested clone) — this gate would either pass \
+         over anything or convict the repository of a copy's contents"
     );
     assert_eq!(
         stats.files, 1,
         "the walker visited {} files in a scratch tree holding exactly one `.rs` \
-         outside target/ — the extension filter or the skip list has moved",
+         outside target/ and the two nested checkouts — the extension filter or the skip \
+         list has moved",
         stats.files
     );
     drop(scratch);
