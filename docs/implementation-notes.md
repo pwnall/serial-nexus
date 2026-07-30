@@ -99,10 +99,11 @@ prose kept the old ones. Both rules are now actually written there (§6 for `--n
 §9 for "assert the promise, never a proxy for it — in space or in time"), and the two
 citations here repointed. A rule that exists only in a citation is not a rule.
 
-**Two observability gaps in the WS bridge, filed here rather than fixed in the same
-commit.** Both surfaced from the product lens of the verification above; both are
-**cross-platform**, neither is an enforcement failure, and neither is macOS's doing — which
-is why they are recorded as their own item instead of riding along with a platform fix:
+**Two observability gaps in the WS bridge — filed in the commit above, fixed in the one
+after it.** Both surfaced from the product lens of the verification; both are
+**cross-platform**, neither was an enforcement failure, and neither was macOS's doing —
+which is why they were recorded as their own item and fixed on their own commit rather
+than riding along with a platform fix:
 
 - **A cap violation is logged nowhere.** `web/src/bridge.rs`'s browser-read arm collapses
   `Some(Err(_))` — a tungstenite `Capacity` error among them — into the same `break false`
@@ -120,9 +121,31 @@ is why they are recorded as their own item instead of riding along with a platfo
   with a reason precisely so a page can say *why* (review WEB-4). The console cannot
   currently tell "the server refused my frame" from "the socket dropped".
 
-Note the second is what makes the first test-visible: `p12_web_ws_bounds` can only assert
-that the close was **not** the daemon-gone one (a negative), because the refusal's own close
-carries nothing to assert *on*. A coded close would let that guard convict positively.
+**The fix.** `bridge()`'s ending was a `bool` — "was it the daemon?" — which is why a
+refusal could not be named: it collapsed the two endings the server *causes* into the one
+it merely observes. It is now an `Ending` enum, and the refusal arm both `warn!`s and
+closes with `CloseCode::Size`. `app.js` stops discarding the `CloseEvent`: a coded close
+now reaches the badge, so a refused frame, a dead daemon (the WEB-4 `1001`, which the page
+had also been throwing away) and a pulled cable no longer print the same eight words.
+`docs/security.md`'s cap paragraph states the code and the log, so both are promises now
+rather than incidents of the implementation.
+
+Guarded, and each guard proved fail-first against its own fix: deleting the `warn!` fails
+both `p12_web_ws_bounds` tests on *"said nothing about it"*, and downgrading the close code
+to `1008` fails them on *"ended with close code 1008, not 1009"*. The code assertion is
+conditional on a Close frame arriving — the refusal's RST can destroy it — but that is not
+slack in practice: with the expected code deliberately set wrong it bit **10 runs out of
+10** on this Mac. A new device-free browser spec asserts the last link no raw client can,
+that Chromium reports `CloseEvent.code === 1009`; it sends past the *message* cap rather
+than the frame cap on purpose, because a browser may fragment one `send` into any number
+of legal frames and a payload sized against the frame cap can arrive without tripping
+anything (it did, first try, and hung the spec).
+
+What is deliberately *not* asserted: `disconnectMessage`'s text. The console's own socket
+never sends anything near a cap and the page does not expose it, so the string is read
+rather than run; the code it maps from is asserted at both ends. Said out loud here
+because an unasserted behaviour that nobody writes down is the same shape as the defect
+37-WEBS-4 filed in the first place.
 
 **One caveat for anyone re-running this.** `cargo test` does not emit the plain
 `target/debug/serial-nexus-*` artifacts the harness boots, so after touching product source

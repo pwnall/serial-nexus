@@ -344,7 +344,16 @@ operator, so it would ration the browser without separating it from the attacker
 WebSocket messages are capped at **1 MiB** (frames at 256 KiB) — the browser→server
 direction carries JSON-RPC requests only, so the cap costs nothing and bounds what
 one frame can make the server buffer. The hostward `tap.data` firehose flows the
-other way and is untouched.
+other way and is untouched. Tripping either cap **ends the session, says so, and is
+logged**: the bridge closes with RFC 6455 **`1009`** ("Message Too Big") and warns on the
+server's own log. Neither is decoration. A bound nobody can observe being enforced is a
+bound nobody can tell is still there, and until the close carried a code the page saw
+`1005` ("no status received") — indistinguishable from a dropped socket, so a console
+could not tell a refusal from a network fault and an operator got no signal at all.
+Best-effort on the wire by nature: the refusal happens at frame-header parse, so the
+over-cap payload is never drained and the server's close may reach the peer as a reset
+that destroys its own Close frame in flight (`docs/macos.md` delta 6). The *enforcement*
+does not depend on the notification arriving.
 
 **The served assets carry a `default-src 'none'` policy, and its `connect-src` is
 `'self'` alone.** Nothing the page needs is off-origin or inline — scripts and styles

@@ -78,8 +78,19 @@ const HOSE_BYTES: &str = "64MiB";
 /// `--grep` mistake) and the gate stayed green, while its own assertion message promised
 /// that "a *removed* spec … trips it". The gate already knows which fixture it built, so
 /// it can hold the suite to the right number instead of to the smaller of the two.
-const SPECS_WITH_DEVICE: usize = 21;
-const SPECS_DEVICE_FREE: usize = 11;
+/// **Both carry slack as of 2026-07-30, and the numbers above are stale.** Measured on
+/// the macOS rig (device-free fixture, so `SPECS_DEVICE_FREE` is the arm that ran): the
+/// per-push suite reported **15 passed, 10 skipped**, against a floor of 11. Adding the
+/// 1009 close-code spec to `console.spec.mjs` accounts for one of those; the other three
+/// predate it. Each floor is raised by exactly the spec added here rather than to the
+/// measured figure, because the with-device arm cannot be measured on a Mac — a pts is
+/// not a serial device here (`docs/macos.md`), so `serial_echo()` is `None` and the ten
+/// device-gated specs never run — and a floor guessed above the truth reddens the Linux
+/// lane for a reason that is not the tree's. Re-measure both on a Linux rig and set them
+/// to the counts it reports; the comment above describes what they are *for*, and that
+/// intent is right even while the constants lag.
+const SPECS_WITH_DEVICE: usize = 22;
+const SPECS_DEVICE_FREE: usize = 12;
 
 #[test]
 fn the_web_console_passes_its_headless_chromium_suite() {

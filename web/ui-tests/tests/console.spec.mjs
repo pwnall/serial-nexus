@@ -690,3 +690,52 @@ test(
     await expect.poll(() => tapsOn("m"), { timeout: 30_000 }).toBe(1);
   },
 );
+
+// The WebSocket size caps §17 and `docs/security.md` promise, as a *real browser*
+// experiences them — which is the only place the last link of the chain is visible.
+//
+// `p12_web_ws_bounds.rs` already proves the caps hold and that the bridge closes with
+// 1009 (RFC 6455 "Message Too Big"). What a raw client cannot show is that the code
+// survives to `CloseEvent.code` in Chromium and that the console turns it into something
+// an operator can read: before the bridge coded this close, the page got 1005 ("no status
+// received") and every ending — refused frame, dead daemon, pulled cable — printed the
+// same eight words.
+//
+// Device-free: no console is selected and nothing is sent to a serial node.
+test("an over-cap message closes the browser's socket with 1009", async ({
+  page,
+}) => {
+  await open(page);
+
+  // A second socket from the page's own origin, so the `Path=/ws` session cookie rides
+  // along exactly as it does for the console's. Driven from page context because the
+  // point is what *this browser's* WebSocket implementation reports.
+  const code = await page.evaluate(async () => {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const sock = new WebSocket(`${proto}//${location.host}/ws`);
+    await new Promise((resolve, reject) => {
+      sock.onopen = resolve;
+      sock.onerror = () => reject(new Error("the probe socket never opened"));
+    });
+    const closed = new Promise((resolve) => {
+      sock.onclose = (ev) => resolve(ev.code);
+    });
+    // Past the 1 MiB *message* cap, not merely the 256 KiB frame cap: a browser is free
+    // to fragment one `send` into as many frames as it likes, so a payload sized against
+    // the frame cap may arrive as a train of legal frames and never trip anything. The
+    // message cap is the one bound that holds however Chromium chooses to split this.
+    sock.send("x".repeat(1536 * 1024));
+    return closed;
+  });
+  expect(code).toBe(1009);
+
+  // The console's own socket is untouched by the probe above, and stays up — the cap is
+  // per-connection, and a page must not lose its bridge because something else on the
+  // origin tripped one.
+  await expect(page.locator("#conn")).toHaveClass("connected");
+});
+
+// NOTE on what is deliberately *not* asserted here: `app.js`'s `disconnectMessage` turns
+// the 1009 above into the badge text, and no spec drives it, because the console's own
+// socket never sends anything near the cap and the page does not expose it. The code
+// reaching the browser is asserted (above); the string it maps to is read, not run.

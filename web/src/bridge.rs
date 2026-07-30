@@ -108,6 +108,26 @@ pub async fn connect(socket: &Path) -> anyhow::Result<UnixStream> {
         .map_err(|e| anyhow::anyhow!("connecting to daemon {}: {e}", socket.display()))
 }
 
+/// Why a bridge session ended — and, for the two endings that are *ours*, what to tell
+/// the browser on the way out.
+///
+/// This was a `bool` ("was it the daemon?"), which collapsed the two endings the server
+/// causes into the one it merely observes. A frame the size caps refused scored the same
+/// as a tab being closed: no Close code, and no log line anywhere, so a peer tripping a
+/// documented security bound was indistinguishable from an idle disconnect in both the
+/// console and the operator's terminal. §17's own principle — a dead pane must never look
+/// live, and it must say *why* (review WEB-4) — was implemented for the daemon-gone case
+/// only, because that was the only case this type could name.
+enum Ending {
+    /// The daemon connection ended, or a write to it failed.
+    DaemonGone,
+    /// The browser closed, or its stream ended without an error we caused.
+    BrowserGone,
+    /// The framing layer refused what the browser sent — a size cap above all (§17,
+    /// `docs/security.md`), but any protocol-level error lands here.
+    Refused(String),
+}
+
 pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     ws: WebSocketStream<S>,
     daemon: UnixStream,
@@ -171,17 +191,22 @@ pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     // There is no keepalive and no watchdog anywhere in this binary, so nothing else
     // would have noticed: the page kept rendering "connected" over a dead daemon and
     // its own "disconnected — reload to reconnect" signal never fired.
-    let daemon_gone = loop {
+    let ending = loop {
         let msg = tokio::select! {
             // `biased` so a daemon that has already ended is observed before another
             // browser frame is taken off the wire — there is nowhere left to send it.
             biased;
             // Ready exactly once, and this arm breaks, so it is never polled again.
-            _ = &mut daemon_eof => break true,
+            _ = &mut daemon_eof => break Ending::DaemonGone,
             next = ws_stream.next() => match next {
                 Some(Ok(m)) => m,
-                // `None` (browser closed) or a frame error: the browser is gone.
-                _ => break false,
+                // A framing error is the server refusing the browser's bytes — the size
+                // caps of §17 are enforced here, inside tungstenite, and this is the only
+                // place their enforcement is observable. Distinguished from `None` (the
+                // browser simply went away) so that both the operator and the page are
+                // told which happened.
+                Some(Err(e)) => break Ending::Refused(e.to_string()),
+                None => break Ending::BrowserGone,
             },
         };
         match msg {
@@ -200,14 +225,14 @@ pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
                 // closes fails with EPIPE. That is the *other* way the daemon's
                 // departure surfaces, and it is a departure, not a browser error.
                 if d_write.write_all(line.as_bytes()).await.is_err() {
-                    break true;
+                    break Ending::DaemonGone;
                 }
             }
             Message::Binary(_) => {} // the protocol is JSON text only
             Message::Ping(p) => {
                 let _ = to_browser.send(Message::Pong(p)).await;
             }
-            Message::Close(_) => break false,
+            Message::Close(_) => break Ending::BrowserGone,
             _ => {}
         }
     };
@@ -215,14 +240,43 @@ pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     // Say *why* the console is losing its connection (WEB-4). A Close frame carrying a
     // reason is what lets the page tell "the daemon went away" — restart it and reload
     // — from a network drop, and §17's own principle is that a dead pane must never
-    // look live. `Away` (1001) is the RFC 6455 code for an endpoint going away.
-    if daemon_gone {
-        let _ = to_browser
-            .send(Message::Close(Some(CloseFrame {
-                code: CloseCode::Away,
-                reason: "daemon connection closed".into(),
-            })))
-            .await;
+    // look live.
+    //
+    // Both endings the *server* causes get a code; only a browser that left of its own
+    // accord gets nothing, because there is nobody to tell. Best-effort by nature: a
+    // refusal leaves the over-cap payload undrained, so the socket may already be
+    // carrying a reset by the time this frame is written, and the send simply fails.
+    // That is why it is worth sending rather than worth relying on — the console can act
+    // on the frame when it arrives, and is no worse off when it does not.
+    match &ending {
+        // `Away` (1001) is the RFC 6455 code for an endpoint going away.
+        Ending::DaemonGone => {
+            let _ = to_browser
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Away,
+                    reason: "daemon connection closed".into(),
+                })))
+                .await;
+        }
+        // `Size` (1009, "Message Too Big") is the code RFC 6455 defines for exactly the
+        // caps §17 and `docs/security.md` promise. Without it the refusal closed with an
+        // empty payload — `CloseEvent.code` 1005, "no status received" — and a console
+        // could not tell a refused frame from a dropped socket.
+        //
+        // The operator is told too, at `warn`: a bound nobody can observe being enforced
+        // is a bound nobody can tell is still there, which is the same argument review
+        // 37-WEBS-4 made about it being untested. This is the one place a cap violation
+        // is visible at all, so it is the one place that can say so.
+        Ending::Refused(why) => {
+            tracing::warn!("refusing a browser frame and closing the bridge: {why}");
+            let _ = to_browser
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Size,
+                    reason: "frame or message refused by the server's size caps".into(),
+                })))
+                .await;
+        }
+        Ending::BrowserGone => {}
     }
 
     // Either side gone: dropping d_write closes the daemon connection, which ends the

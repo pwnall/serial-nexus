@@ -86,6 +86,14 @@ const WS_MAX_FRAME: usize = 256 * 1024;
 struct WebServer {
     child: Child,
     port: u16,
+    /// Everything the child has written to stdout, where its tracing subscriber writes.
+    ///
+    /// Kept rather than dropped after the port is scraped, because the operator-facing
+    /// half of a size cap is a **log line**: a bound nobody can see being enforced is a
+    /// bound nobody can tell is still there. Asserting on it is what stops the `warn!`
+    /// being deleted with this suite green — the same argument 37-WEBS-4 made about the
+    /// caps themselves.
+    logs: Arc<Mutex<Vec<String>>>,
 }
 
 impl WebServer {
@@ -141,7 +149,19 @@ impl WebServer {
         WebServer {
             child,
             port: port.expect("a port once the URL line was found"),
+            logs: lines,
         }
+    }
+
+    /// Wait, bounded, for a stdout line containing `needle`.
+    ///
+    /// Polled rather than read once: the refusal is logged by the server on its own
+    /// schedule, and the client observes the closed socket first — so a single look is a
+    /// race the server usually loses.
+    fn logged(&self, needle: &str) -> bool {
+        wait_until(Duration::from_secs(10), || {
+            self.logs.lock().unwrap().iter().any(|l| l.contains(needle))
+        })
     }
 }
 
@@ -427,11 +447,12 @@ impl Ws {
         Ok(Frame { opcode, payload })
     }
 
-    /// The reason text of the Close frame this session saw, if it saw one carrying a
-    /// body. RFC 6455 §5.5.1: `[u16 status code][UTF-8 reason]`, both optional.
-    fn close_reason(&self) -> Option<String> {
+    /// The status code of the Close frame this session saw, if it saw one carrying a
+    /// code. RFC 6455 §5.5.1: `[u16 status code][UTF-8 reason]`, both optional — an empty
+    /// payload is a close with *no* code, which a browser reports as 1005.
+    fn close_code(&self) -> Option<u16> {
         let payload = self.close_seen.as_ref()?;
-        (payload.len() > 2).then(|| String::from_utf8_lossy(&payload[2..]).into_owned())
+        (payload.len() >= 2).then(|| u16::from_be_bytes([payload[0], payload[1]]))
     }
 
     /// Wait for the correlated response to `id`, reporting whether it arrives before the
@@ -491,16 +512,29 @@ impl Ws {
     }
 }
 
-/// The reason text on the *other* Close frame `web/src/bridge.rs` can send — the WEB-4
-/// "say why the console is losing its connection" path, which fires when the **daemon**
-/// goes away and has nothing to do with a size cap.
+/// RFC 6455's `1009` ("Message Too Big") — the code the bridge closes a refused session
+/// with, and the code that says the *cap* is what ended it.
 ///
-/// Asserted against so that an unrelated mid-test daemon departure cannot be mistaken for
-/// a cap refusal: without this, `!response_arrives(..)` (satisfied by silence) and
-/// `closed()` (satisfied by any ending) would both pass with the two `WebSocketConfig`
-/// calls deleted. Best-effort by nature — a refusal's own Close frame carries no body at
-/// all, and an RST can destroy it in flight — so it can only ever convict, never acquit.
-const DAEMON_GONE_REASON: &str = "daemon connection closed";
+/// Checked so that an unrelated ending cannot be mistaken for a cap refusal: `closed()` is
+/// satisfied by any ending at all, including the `1001` the WEB-4 daemon-gone path sends,
+/// so without this a mid-test daemon departure would let the file go green with both
+/// `WebSocketConfig` calls deleted.
+///
+/// **Conditional on a Close frame arriving**, and that is not a weakness that can be
+/// engineered away: the refusal leaves the over-cap payload undrained, so the server's
+/// `close(2)` emits an RST that may destroy its own Close frame in flight (`docs/macos.md`
+/// delta 6). The frame is best-effort on the wire, so the assertion is best-effort too —
+/// it convicts when the evidence arrives and abstains when it does not, which is the
+/// honest shape. `closed()` is what holds unconditionally.
+const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
+
+/// The distinguishing fragment of the `warn!` the bridge emits when the framing layer
+/// refuses a browser's bytes.
+///
+/// Matched on a fragment rather than the whole line so that rewording the message does
+/// not fail this gate, while deleting it does — the assertion is about an operator being
+/// told at all, not about the exact words.
+const REFUSAL_LOG: &str = "refusing a browser frame";
 
 // ------------------------------------------------------------------ the payloads ----
 
@@ -589,11 +623,19 @@ fn a_frame_over_the_cap_is_refused_and_its_request_never_reaches_the_daemon() {
         ws.closed(),
         "an over-cap frame must end the connection, not be silently skipped"
     );
-    assert_ne!(
-        ws.close_reason().as_deref(),
-        Some(DAEMON_GONE_REASON),
-        "the session ended because the daemon went away, not because the frame cap \
-         refused anything — this run proves nothing about the cap"
+    if let Some(code) = ws.close_code() {
+        assert_eq!(
+            code, CLOSE_MESSAGE_TOO_BIG,
+            "the session ended with close code {code}, not {CLOSE_MESSAGE_TOO_BIG} — \
+             something other than the frame cap ended it, so this run proves nothing \
+             about the cap"
+        );
+    }
+    assert!(
+        web.logged(REFUSAL_LOG),
+        "the server refused an over-cap frame and said nothing about it: an operator \
+         watching this daemon cannot tell a tripped security cap from an idle browser \
+         disconnect"
     );
 }
 
@@ -664,10 +706,18 @@ fn a_fragmented_message_over_the_cap_is_refused_and_never_reaches_the_daemon() {
         ws.closed(),
         "an over-cap message must end the connection, not be silently skipped"
     );
-    assert_ne!(
-        ws.close_reason().as_deref(),
-        Some(DAEMON_GONE_REASON),
-        "the session ended because the daemon went away, not because the message cap \
-         refused anything — this run proves nothing about the cap"
+    if let Some(code) = ws.close_code() {
+        assert_eq!(
+            code, CLOSE_MESSAGE_TOO_BIG,
+            "the session ended with close code {code}, not {CLOSE_MESSAGE_TOO_BIG} — \
+             something other than the message cap ended it, so this run proves nothing \
+             about the cap"
+        );
+    }
+    assert!(
+        web.logged(REFUSAL_LOG),
+        "the server refused an over-cap message and said nothing about it: an operator \
+         watching this daemon cannot tell a tripped security cap from an idle browser \
+         disconnect"
     );
 }

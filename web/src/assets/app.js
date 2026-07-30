@@ -166,6 +166,27 @@ function rpcFull(method, params) {
   });
 }
 
+// What the connection badge says when the socket closes, from the CloseEvent the server
+// took the trouble to send (§17, review WEB-4: "a dead pane must never look live", and it
+// must say *why*). The bridge codes the two endings it causes — 1001 with a reason when
+// the daemon went away, 1009 when its WebSocket size caps refused what this page sent —
+// and until now both arrived here and were discarded, so a refused frame, a dead daemon
+// and a pulled network cable produced the same eight words.
+//
+// Anything else, including a bare 1005 ("no status received", which is what an abortive
+// close leaves), falls through to the generic line: an ending we cannot explain must not
+// be narrated as one we can.
+function disconnectMessage(ev) {
+  const tail = "reload to reconnect";
+  if (ev && ev.code === 1009) {
+    return `disconnected — the server refused an oversized message; ${tail}`;
+  }
+  if (ev && ev.code === 1001 && ev.reason) {
+    return `disconnected — ${ev.reason}; ${tail}`;
+  }
+  return `disconnected — ${tail}`;
+}
+
 function connect() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   ws = new WebSocket(`${proto}//${location.host}/ws`);
@@ -199,8 +220,8 @@ function connect() {
     renderStorageBadge();
     refreshState();
   };
-  ws.onclose = () => {
-    connEl.textContent = "disconnected — reload to reconnect";
+  ws.onclose = (ev) => {
+    connEl.textContent = disconnectMessage(ev);
     connEl.className = "disconnected";
     sendLine.disabled = sendBtn.disabled = true;
     // The daemon dropped every tap with the connection; a grace timer still counting
