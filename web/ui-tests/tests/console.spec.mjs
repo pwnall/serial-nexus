@@ -694,15 +694,14 @@ test(
 // The WebSocket size caps §17 and `docs/security.md` promise, as a *real browser*
 // experiences them — which is the only place the last link of the chain is visible.
 //
-// `p12_web_ws_bounds.rs` already proves the caps hold and that the bridge closes with
-// 1009 (RFC 6455 "Message Too Big"). What a raw client cannot show is that the code
-// survives to `CloseEvent.code` in Chromium and that the console turns it into something
-// an operator can read: before the bridge coded this close, the page got 1005 ("no status
-// received") and every ending — refused frame, dead daemon, pulled cable — printed the
-// same eight words.
+// `p12_web_ws_bounds.rs` proves the caps hold, that nothing reaches the daemon, and that
+// the bridge closes with 1009. What only a browser can show is the blast radius: a real
+// `WebSocket` on this origin trips the cap, and the console sitting beside it keeps its
+// bridge. See the comment on the assertion for why the *code* is deliberately not
+// re-asserted here.
 //
 // Device-free: no console is selected and nothing is sent to a serial node.
-test("an over-cap message closes the browser's socket with 1009", async ({
+test("an over-cap message closes the browser's own socket, and only that one", async ({
   page,
 }) => {
   await open(page);
@@ -727,15 +726,33 @@ test("an over-cap message closes the browser's socket with 1009", async ({
     sock.send("x".repeat(1536 * 1024));
     return closed;
   });
-  expect(code).toBe(1009);
 
-  // The console's own socket is untouched by the probe above, and stays up — the cap is
-  // per-connection, and a page must not lose its bridge because something else on the
-  // origin tripped one.
+  // What a browser can prove here, and what it cannot.
+  //
+  // CANNOT: that the code is 1009. This started life as `toBe(1009)`, passed per-push and
+  // on a developer's Mac, and failed the nightly at 1006 ("abnormal closure — no Close
+  // frame received"). The refusal lands partway through a message the browser is still
+  // sending, so the server stops reading with bytes queued and its `close(2)` leaves as an
+  // RST that can destroy the Close frame it just wrote. Measured on a Mac: 1009, 1006,
+  // 1009 over three runs of the *fixed* server. And the obvious repair — tolerate 1006,
+  // reject 1005, on the theory that an uncoded close is the pre-fix shape — was measured
+  // and is wrong: the *reverted* server also reports 1006, because the RST destroys an
+  // empty Close frame exactly as willingly as a coded one. Fixed and unfixed are therefore
+  // indistinguishable from here on any given run, which makes a code assertion in this
+  // file a coin toss dressed as a guard.
+  //
+  // The 1009 guard lives in `p12_web_ws_bounds.rs` instead, against a raw client whose
+  // timing is far kinder — with the expected code deliberately set wrong it bit 10 runs
+  // out of 10 there. Duplicating it here would add flake, not coverage.
+  //
+  // CAN, deterministically: the socket ends, whatever the code; and the cap is
+  // per-connection, so the console's own bridge is untouched by another socket on the
+  // same origin tripping one. `undefined` would mean the close never fired at all.
+  expect(typeof code).toBe("number");
   await expect(page.locator("#conn")).toHaveClass("connected");
 });
 
-// NOTE on what is deliberately *not* asserted here: `app.js`'s `disconnectMessage` turns
-// the 1009 above into the badge text, and no spec drives it, because the console's own
-// socket never sends anything near the cap and the page does not expose it. The code
-// reaching the browser is asserted (above); the string it maps to is read, not run.
+// NOTE on what is deliberately *not* asserted anywhere: `app.js`'s `disconnectMessage`
+// turns a coded close into the badge text, and no spec drives it — the console's own
+// socket never sends anything near a cap and the page does not expose it. The mapping is
+// read, not run.

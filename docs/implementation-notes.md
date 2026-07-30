@@ -135,11 +135,37 @@ both `p12_web_ws_bounds` tests on *"said nothing about it"*, and downgrading the
 to `1008` fails them on *"ended with close code 1008, not 1009"*. The code assertion is
 conditional on a Close frame arriving — the refusal's RST can destroy it — but that is not
 slack in practice: with the expected code deliberately set wrong it bit **10 runs out of
-10** on this Mac. A new device-free browser spec asserts the last link no raw client can,
-that Chromium reports `CloseEvent.code === 1009`; it sends past the *message* cap rather
-than the frame cap on purpose, because a browser may fragment one `send` into any number
-of legal frames and a payload sized against the frame cap can arrive without tripping
+10** on this Mac. A new device-free browser spec sends past the *message* cap rather than
+the frame cap on purpose, because a browser may fragment one `send` into any number of
+legal frames and a payload sized against the frame cap can arrive without tripping
 anything (it did, first try, and hung the spec).
+
+**That spec tried to assert the 1009 in Chromium, and could not — recorded because the
+correction is the useful part.** It shipped as `expect(code).toBe(1009)`, passed per-push
+and on the Mac, and failed the first nightly at **1006** ("abnormal closure — no Close
+frame received"). The refusal lands partway through a message the browser is still
+sending, so the server stops reading with bytes queued and its `close(2)` leaves as an RST
+that can destroy the Close frame it just wrote — the same physics as the `closed()` oracle
+two sections up, met from the other side. Measured on the *fixed* server: 1009, 1006, 1009
+over three runs.
+
+The obvious repair is also wrong, and was measured rather than reasoned about: tolerate
+1006, reject 1005, on the theory that an uncoded close is the pre-fix shape. The
+**reverted** server reports **1006** too — an RST destroys an empty Close frame exactly as
+willingly as a coded one — so fixed and unfixed are indistinguishable from a browser on
+any given run, and the assertion would have been a coin toss dressed as a guard. The spec
+now asserts only what a browser can settle deterministically: the probe socket ends, and
+the console's own bridge beside it does not, the cap being per-connection. The 1009 guard
+stays where its timing is kind, in `p12_web_ws_bounds.rs`.
+
+**Consequence worth stating plainly: the coded close is best-effort on the wire, not a
+guarantee.** An operator's console will usually be told why it was disconnected and
+sometimes will not, and nothing in the design promises otherwise. Making it reliable needs
+a *lingering close* — draining and discarding what was refused, under a byte and time
+bound, before closing, which is what HTTP servers do to avoid RST-ing away their own error
+responses. That is a real change with a security dimension (it reads more attacker-chosen
+bytes, though it buffers none) and it is **not** made here; it is recorded as the option
+should the console's disconnect reason ever need to be dependable.
 
 What is deliberately *not* asserted: `disconnectMessage`'s text. The console's own socket
 never sends anything near a cap and the page does not expose it, so the string is read
