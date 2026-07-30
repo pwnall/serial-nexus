@@ -14,6 +14,70 @@ design.
 
 ---
 
+## LINGERING CLOSE — the refusal notice now survives its own close (2026-07-30 session)
+
+**What changed.** `web/src/bridge.rs` closes an oversize-refused WebSocket *gracefully*:
+half-close, then read and discard what the peer still has in flight into one 8 KiB stack
+buffer until its FIN, `LINGER_BUDGET` (1 MiB), or `LINGER_DEADLINE` (250 ms) — then close.
+The point is a **FIN instead of an RST**: the caps leave the peer mid-send, `close(2)` with
+bytes queued resets, and a reset destroys the peer's receive buffer including the `1009`
+Close frame the bridge just wrote to explain itself. Measured before: a real Chromium got
+the code on about two attempts in three, and the browser suite's assertion on it had to be
+withdrawn as a coin toss (entry below).
+
+**The guard, and the guard it replaced — the useful part of this entry.** The first
+oracle asserted that *the client's write of the tail succeeded*, on the reasoning that the
+server must have kept reading to absorb it. It was proved fail-first 5/5 on this Mac and it
+is **worthless on Linux**: the proxy runs through kernel socket-buffer capacity, and Linux
+loopback autotunes the send buffer into the megabytes, so the whole message fits and
+`write_all` returns `Ok` whether or not anything drained. It would have passed vacuously on
+the one platform CI runs — and the tell was already in this file, in the entry below: the
+nightly failed at `1006` on Linux *while that client had no trouble finishing its send*.
+One-box fail-first evidence is exactly what §8 says to distrust, and this is what it looks
+like when the box in question is the friendly one.
+
+The oracle now asserts the **shape of the close**: `Ws::drain_to_end` reports `Stop::Eof`
+for a clean FIN and `Stop::Io(kind)` for a reset, and the test requires `Eof`. That is a
+function of *"was anything unread at close"* — kernel-independent, not buffer-dependent.
+Fail-first 6/6 with the drain removed (`Io(ConnectionReset)` against `Eof`), and the tail is
+sized to sit above tungstenite's 128 KiB read-buffer prefetch and below the drain budget:
+`WS_MAX_MESSAGE + 384 KiB` over 12 fragments trips the cap on fragment 9 and leaves ~469
+KiB unread against a 1 MiB budget.
+
+**What it costs, measured rather than asserted.** A refused connection holds its permit for
+up to the deadline, so the pool turns over at `MAX_CONNECTIONS / LINGER_DEADLINE` = 512
+refusals/s instead of immediately; hold time per refusal went 0.5 ms → 250 ms, and a
+credentialed peer sustaining 512/s denied a legitimate console ~80% of its attempts where
+before it denied none. The first version of the doc comment claimed the change "cannot make
+things worse"; that was false in the availability dimension and now says so. Two things
+keep it *low*: the path is reachable only past the token gate, and the same credential can
+already pin all 128 permits **permanently and for free** with idle sockets, there being no
+keepalive or idle timeout on an established bridge — so this is dominated by a primitive
+§17 already accepts. A clean FIN also leaves an orphaned `FIN_WAIT_2` per refusal where an
+RST left nothing, bounded by `tcp_max_orphans`, whose overflow behaviour is the reset this
+replaced.
+
+**Two narrowings that came out of reviewing the cost.** `Ending::Refused` now carries
+whether the error was a size cap: only an oversize refusal lingers (a malformed two-byte
+frame has nothing in flight and pays nothing), and only an oversize refusal closes `1009` —
+the others close `1002 Protocol`, where before every protocol error was reported to the
+browser as "too big", which it was not. And `shutdown()` moved *inside* the timeout: on the
+TLS tier it loops until `close_notify` is written and pends forever against a peer whose
+window is shut, so the docstring's "at most `LINGER_DEADLINE`" was false for the first
+statement in the function. Not independently reachable today — `writer.await` hangs first
+on that peer — but the bound should be true as written.
+
+**Not a design amendment.** §17 states the principle ("a dead pane must never look live",
+and must say why — review WEB-4); this is that principle's transport finally working, not a
+new promise. `docs/security.md`'s cap paragraph said in as many words that "the over-cap
+payload is never drained", which this makes false, and it is rewritten; the sentence
+"bounds what one frame can make the server **buffer**" is kept verbatim, because reading
+and discarding is not buffering and that precision is now load-bearing.
+
+**`SO_LINGER` is not an alternative, categorically.** It waits on the *send* queue; the RST
+here is caused by a non-empty *receive* queue. `SO_LINGER{1,0}` is the opposite knob — it
+forces the reset. The only thing that empties a receive queue is reading it.
+
 ## macOS VALIDATION — the red lane was two harness defects, not one (2026-07-30 session)
 
 **Scale and gates.** A whole-gate pass on the Mac (macOS 15.7.8 / Darwin 24.6.0, x86_64, load
@@ -158,14 +222,10 @@ now asserts only what a browser can settle deterministically: the probe socket e
 the console's own bridge beside it does not, the cap being per-connection. The 1009 guard
 stays where its timing is kind, in `p12_web_ws_bounds.rs`.
 
-**Consequence worth stating plainly: the coded close is best-effort on the wire, not a
-guarantee.** An operator's console will usually be told why it was disconnected and
-sometimes will not, and nothing in the design promises otherwise. Making it reliable needs
-a *lingering close* — draining and discarding what was refused, under a byte and time
-bound, before closing, which is what HTTP servers do to avoid RST-ing away their own error
-responses. That is a real change with a security dimension (it reads more attacker-chosen
-bytes, though it buffers none) and it is **not** made here; it is recorded as the option
-should the console's disconnect reason ever need to be dependable.
+**Consequence stated plainly at the time: the coded close was best-effort on the wire, not
+a guarantee.** An operator's console would usually be told why it was disconnected and
+sometimes would not. **Superseded — the lingering close was made in the following session;
+see the entry above.** The paragraph stays because its reasoning is why that entry exists.
 
 What is deliberately *not* asserted: `disconnectMessage`'s text. The console's own socket
 never sends anything near a cap and the page does not expose it, so the string is read
@@ -2990,10 +3050,10 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **723 passing, 0 failed, 4 ignored** across 111 test
+The current whole-suite figure is **724 passing, 0 failed, 4 ignored** across 111 test
 targets on Linux (2026-07-29, after the review-37 remediation); of those, one is the doc-tested
 twelve-line embedder `main` in `daemon/src/lib.rs`, which is the §15.26 entry surface
-proving it still compiles under the family names. On **macOS** the same tree is **710
+proving it still compiles under the family names. On **macOS** the same tree is **711
 passing, 0 failed, 4 ignored** across 101 binaries + 8 doc-test targets (2026-07-30, Darwin
 24.6.0 / 15.7.8, x86_64, with the FT232R crossover attached so `serial_hardware.rs` runs
 rather than self-skipping); the shortfall against Linux is the Linux-only targets and the

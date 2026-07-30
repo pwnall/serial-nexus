@@ -350,10 +350,30 @@ server's own log. Neither is decoration. A bound nobody can observe being enforc
 bound nobody can tell is still there, and until the close carried a code the page saw
 `1005` ("no status received") — indistinguishable from a dropped socket, so a console
 could not tell a refusal from a network fault and an operator got no signal at all.
-Best-effort on the wire by nature: the refusal happens at frame-header parse, so the
-over-cap payload is never drained and the server's close may reach the peer as a reset
-that destroys its own Close frame in flight (`docs/macos.md` delta 6). The *enforcement*
-does not depend on the notification arriving.
+For the notification to be worth anything it has to survive the close, and it did not:
+the refusal leaves the peer mid-send, a `close(2)` with bytes still queued is an **RST**
+(RFC 1122 §4.2.2.13), and an RST discards the peer's receive buffer — including the Close
+frame just written to explain the refusal (`docs/macos.md` delta 6). A real browser saw the
+code on roughly two attempts in three. So a refused connection now closes **gracefully**:
+it half-closes and then reads and discards whatever the peer still has in flight — into one
+8 KiB stack buffer, never parsed, never forwarded — until the peer's own FIN, **1 MiB**
+discarded, or **250 ms** elapsed, whichever comes first.
+
+Reading is not buffering, and the distinction is the whole of why this is compatible with
+the cap above: the cap bounds what one frame can make the server *buffer*, and the drain's
+memory is a constant. The peer buys nothing by it — no drained byte is examined, the
+refused request still never reaches the daemon, the session is still over. What it costs is
+a bounded delay on a **post-token** path, charged against that connection's slot in the
+128: a refused connection holds its permit for up to the deadline, so the pool turns over
+at 512 refusals a second rather than immediately, and a credentialed peer sustaining that
+rate can deny a console its connection. That is strictly weaker than what the same
+credential already buys — 128 idle sockets pin the pool permanently and for free — which is
+why the deadline is a quarter of a second and not a comfortable few. Only *oversize*
+refusals linger; a malformed frame has nothing in flight to drain and pays nothing. On the
+TLS tier the discarded bytes are decrypted first, bounded by the same two numbers. Past
+either bound the socket is dropped as before, reset and all — so the drain can only improve
+the odds the console learns *why*, and the *enforcement* has never depended on the
+notification arriving.
 
 **The served assets carry a `default-src 'none'` policy, and its `connect-src` is
 `'self'` alone.** Nothing the page needs is off-origin or inline — scripts and styles

@@ -41,11 +41,12 @@
 //!    allowlist buys and an inverted list would give away.
 
 use std::path::Path;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use serial_nexus_rpc::error_codes::{INVALID_REQUEST, METHOD_NOT_FOUND};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::WebSocketStream;
@@ -123,9 +124,103 @@ enum Ending {
     DaemonGone,
     /// The browser closed, or its stream ended without an error we caused.
     BrowserGone,
-    /// The framing layer refused what the browser sent — a size cap above all (§17,
-    /// `docs/security.md`), but any protocol-level error lands here.
-    Refused(String),
+    /// The framing layer refused what the browser sent. `oversize` separates the size
+    /// caps of §17 from every other protocol error, because the two want different
+    /// answers: only a cap violation leaves a large unread payload worth draining, and
+    /// only a cap violation is a `1009`. Lumping them together meant a two-byte malformed
+    /// frame — nothing in flight, nothing to drain — bought the full linger deadline and
+    /// was reported to the browser as "too big", which it was not.
+    Refused { why: String, oversize: bool },
+}
+
+/// How long [`linger_close`] will spend draining a refused peer, and how much of it it
+/// will read before giving up.
+///
+/// Both are deliberately small. What has to be absorbed is only what the peer had already
+/// put on the wire when the cap tripped — for the 1 MiB message cap that is a fraction of
+/// a MiB on a local link — not whatever it would like to send next. A peer that keeps
+/// talking past either bound gets the abortive close it would have got anyway.
+const LINGER_BUDGET: usize = 1 << 20; // 1 MiB
+const LINGER_DEADLINE: Duration = Duration::from_millis(250);
+
+/// Close a refused connection *gracefully*: signal end-of-write, then read and discard
+/// what the peer has in flight until it stops, so that the final `close(2)` finds an empty
+/// receive queue.
+///
+/// **Why this exists.** The frame cap is enforced while parsing a frame *header*, so the
+/// payload behind it is never read at all; the message cap is enforced as fragments are
+/// accumulated, so the frame that crosses it has been read but its successors have not.
+/// Either way the peer is left mid-send with bytes still queued. Closing a TCP socket with unread bytes still
+/// queued makes the kernel send an **RST** instead of a FIN (RFC 1122 §4.2.2.13), and an
+/// RST discards the peer's receive buffer — including the Close frame the bridge just
+/// wrote to say *why* it was closing. Measured before this landed: a real Chromium saw
+/// the coded `1009` on roughly two connection attempts in three and `1006` ("no Close
+/// frame received") on the rest, and the browser suite's attempt to assert the code had
+/// to be withdrawn as a coin toss. The notification existed and did not arrive.
+///
+/// This is the standard lingering close — what an HTTP server does so that an error
+/// response it just wrote is not RST-ed away before the client can read it.
+///
+/// **It buffers nothing.** Bytes are read into one small stack buffer and dropped, so the
+/// cap's actual promise — that one frame cannot make the server *buffer* without bound —
+/// is untouched. What it costs is bounded work and a bounded delay: at most
+/// [`LINGER_BUDGET`] read-and-discarded and at most [`LINGER_DEADLINE`] of waiting, on a
+/// path only a peer that already passed the token gate can reach. That delay is held
+/// against the connection permit (`MAX_CONNECTIONS`, taken in `server.rs` at the token
+/// gate and released when this returns), which is the reason the deadline is a quarter of
+/// a second and not a comfortable few: it is a slot a refused connection keeps warm.
+///
+/// **Its failure mode is the previous behaviour, exactly.** Exceed either bound, or meet a
+/// peer that never stops sending, and the socket is dropped with data still queued — an
+/// RST, and a Close frame that may not arrive. Nothing is allowed to depend on it having
+/// worked.
+///
+/// **What it does make worse, measured rather than hoped at.** A refused connection now
+/// holds its permit for up to [`LINGER_DEADLINE`] instead of releasing it at once, so the
+/// pool turns over at `MAX_CONNECTIONS / LINGER_DEADLINE` = 512 refusals a second rather
+/// than effectively unbounded. Measured on a 12-core box: hold time per refusal 0.5 ms →
+/// 250 ms, and a credentialed peer opening refusals at 512/s denied a legitimate console
+/// ~80% of its attempts, where before it denied none. Two things keep that at *low* rather
+/// than *serious*, and neither is an excuse to widen the deadline: the path is reachable
+/// only past the token gate, and the same credential can already pin all 128 permits
+/// **permanently and for free** by opening 128 idle sockets — there is no keepalive or
+/// idle timeout on an established bridge — so this is strictly dominated by a primitive
+/// the threat model already accepts (§17: web access is operator access). A clean FIN also
+/// leaves an orphaned `FIN_WAIT_2` per refusal where an RST left nothing; that is bounded
+/// by `tcp_max_orphans`, whose own overflow behaviour is the reset this replaced.
+///
+/// Narrowing to *oversize* refusals (see [`Ending::Refused`]) is what keeps the cost
+/// proportionate: a malformed two-byte frame has nothing in flight to drain and now pays
+/// nothing for it.
+async fn linger_close<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) {
+    // Half-close first: the peer sees our FIN, stops writing, and closes — which turns
+    // the drain below into a short read to EOF rather than a wait on the deadline. It also
+    // flushes the Close frame's own transport (a TLS `close_notify` on the wss tier).
+    let _ = tokio::time::timeout(LINGER_DEADLINE, async {
+        // Inside the deadline, not before it: on the TLS tier `shutdown` queues a
+        // `close_notify` and then loops until it is written, which pends forever against a
+        // peer whose window is shut. Nothing else here can outrun the clock, and this must
+        // not either — the docstring's bound is only true if every await is under it.
+        let _ = stream.shutdown().await;
+        let mut scratch = [0u8; 8192];
+        let mut discarded = 0usize;
+        loop {
+            match stream.read(&mut scratch).await {
+                // The peer's FIN: the queue is empty and will stay empty, which is the
+                // whole point — `close(2)` after this is a clean four-way teardown.
+                Ok(0) => break,
+                Ok(n) => {
+                    discarded += n;
+                    if discarded >= LINGER_BUDGET {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+    .await;
+    // `stream` drops here: `close(2)`, now with nothing owed.
 }
 
 pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
@@ -146,6 +241,11 @@ pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
         .await?;
 
     // Writer: drain the funnel into the WebSocket sink.
+    //
+    // Hands the sink back on the way out. Only [`linger_close`] wants it — reuniting the
+    // two halves is the one way to reach the socket underneath after the WebSocket layer
+    // has finished with it — and a task that returns what it borrowed is cheaper than a
+    // second channel to pass it through.
     let writer = tokio::task::spawn_local(async move {
         while let Some(msg) = to_browser_rx.recv().await {
             if ws_sink.send(msg).await.is_err() {
@@ -153,6 +253,7 @@ pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
             }
         }
         let _ = ws_sink.close().await;
+        ws_sink
     });
 
     // Daemon → browser: forward each JSON line verbatim as a text frame. On the way
@@ -205,7 +306,10 @@ pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
                 // place their enforcement is observable. Distinguished from `None` (the
                 // browser simply went away) so that both the operator and the page are
                 // told which happened.
-                Some(Err(e)) => break Ending::Refused(e.to_string()),
+                Some(Err(e)) => {
+                    let oversize = matches!(e, tokio_tungstenite::tungstenite::Error::Capacity(_));
+                    break Ending::Refused { why: e.to_string(), oversize };
+                }
                 None => break Ending::BrowserGone,
             },
         };
@@ -243,11 +347,10 @@ pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     // look live.
     //
     // Both endings the *server* causes get a code; only a browser that left of its own
-    // accord gets nothing, because there is nobody to tell. Best-effort by nature: a
-    // refusal leaves the over-cap payload undrained, so the socket may already be
-    // carrying a reset by the time this frame is written, and the send simply fails.
-    // That is why it is worth sending rather than worth relying on — the console can act
-    // on the frame when it arrives, and is no worse off when it does not.
+    // accord gets nothing, because there is nobody to tell. Still best-effort — the send
+    // can fail against a peer that has already gone — but no longer a coin toss on the
+    // refusal path: `linger_close` below exists so that this frame is not destroyed by the
+    // server's own reset a moment after it is written.
     match &ending {
         // `Away` (1001) is the RFC 6455 code for an endpoint going away.
         Ending::DaemonGone => {
@@ -267,12 +370,20 @@ pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
         // is a bound nobody can tell is still there, which is the same argument review
         // 37-WEBS-4 made about it being untested. This is the one place a cap violation
         // is visible at all, so it is the one place that can say so.
-        Ending::Refused(why) => {
+        Ending::Refused { why, oversize } => {
             tracing::warn!("refusing a browser frame and closing the bridge: {why}");
+            let (code, reason) = if *oversize {
+                (
+                    CloseCode::Size,
+                    "frame or message refused by the server's size caps",
+                )
+            } else {
+                (CloseCode::Protocol, "malformed WebSocket frame")
+            };
             let _ = to_browser
                 .send(Message::Close(Some(CloseFrame {
-                    code: CloseCode::Size,
-                    reason: "frame or message refused by the server's size caps".into(),
+                    code,
+                    reason: reason.into(),
                 })))
                 .await;
         }
@@ -286,7 +397,16 @@ pub async fn bridge<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     drop(d_write);
     drop(to_browser);
     let _ = daemon_to_browser.await;
-    let _ = writer.await;
+    let ws_sink = writer.await.ok();
+
+    // The Close frame above is on the wire by now — and, on a refusal, would usually be
+    // destroyed a moment later without this. See [`linger_close`].
+    if matches!(ending, Ending::Refused { oversize: true, .. })
+        && let Some(sink) = ws_sink
+        && let Ok(ws) = ws_stream.reunite(sink)
+    {
+        linger_close(ws.into_inner()).await;
+    }
     Ok(())
 }
 

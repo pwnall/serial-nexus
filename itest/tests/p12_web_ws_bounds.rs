@@ -58,6 +58,14 @@
 //! correction `docs/macos.md` delta 4 states for socket-buffer-derived assertions. It is
 //! *stricter* on Linux than what it replaces: a Close frame is now positive evidence the
 //! server ended the session deliberately, where an EOF alone is merely consistent with it.
+//!
+//! **Superseded in part, and left standing because the reasoning is still the reason.**
+//! The bridge now closes a refused connection *gracefully* — it drains what it refused
+//! first, so the RST above is avoided and the Close frame arrives. Point 3's Darwin detail
+//! and the oracle built on it remain exactly right: the drain is bounded, gives up
+//! honestly past its budget, and this file is not permitted to assume it worked.
+//! `a_refused_connection_drains_what_it_refused_before_closing` is where that assumption
+//! is turned into an assertion.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -241,12 +249,17 @@ enum Stop {
 /// The [`std::io::ErrorKind`]s that mean *this connection is over*, as against "nothing
 /// to read yet".
 ///
-/// An RST is a **stronger** ending than a FIN, not a weaker one, and these tests
-/// deliberately engineer one: tungstenite enforces the frame cap while parsing the frame
-/// *header*, so the server never drains the over-cap payload, and its `close(2)`
-/// therefore runs with unread bytes still queued — which every mainstream stack answers
-/// with an RST instead of a FIN (RFC 1122 §4.2.2.13). Reading that reset as "not closed"
-/// is backwards, and it is what the `matches!(read, Ok(0))` this replaces did.
+/// An RST is a **stronger** ending than a FIN, not a weaker one, and reading it as "not
+/// closed" is backwards — which is what the `matches!(read, Ok(0))` this replaces did. The
+/// refusal path leaves the peer mid-send, so `close(2)` can run with unread bytes queued,
+/// and every mainstream stack answers that with an RST (RFC 1122 §4.2.2.13).
+///
+/// **Since the lingering close, a reset here is the *degraded* path rather than the
+/// expected one** — the bridge now drains what it refused before closing, and
+/// `a_refused_connection_drains_what_it_refused_before_closing` holds it to that. These
+/// kinds stay accepted because the drain is bounded and gives up honestly (a peer past the
+/// budget or the deadline still gets the abortive close), and because this predicate
+/// serves every ending, not only a refusal.
 fn ends_a_connection(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -475,6 +488,26 @@ impl Ws {
         false
     }
 
+    /// Read until the connection ends, and report **how**: [`Stop::Eof`] for a clean FIN,
+    /// [`Stop::Io`] for an abortive close, [`Stop::Deadline`] for a peer that never ended
+    /// at all.
+    ///
+    /// [`Ws::closed`] deliberately flattens those three into a `bool`, because the two cap
+    /// tests only care *that* the session ended. The lingering-close guard cares about
+    /// nothing else: a FIN means the server had drained what it refused before closing, a
+    /// reset means it had not. Unlike "did the client's write succeed", that distinction
+    /// does not run through the kernel's socket-buffer sizes, so it means the same thing
+    /// on a Linux runner as on a Mac.
+    fn drain_to_end(&mut self) -> Stop {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match self.recv_frame(deadline) {
+                Ok(_) => continue,
+                Err(stop) => return stop,
+            }
+        }
+    }
+
     /// Whether the server has **ended** this session, within a bounded wait — as against
     /// having merely gone quiet.
     ///
@@ -520,12 +553,15 @@ impl Ws {
 /// so without this a mid-test daemon departure would let the file go green with both
 /// `WebSocketConfig` calls deleted.
 ///
-/// **Conditional on a Close frame arriving**, and that is not a weakness that can be
-/// engineered away: the refusal leaves the over-cap payload undrained, so the server's
-/// `close(2)` emits an RST that may destroy its own Close frame in flight (`docs/macos.md`
-/// delta 6). The frame is best-effort on the wire, so the assertion is best-effort too —
-/// it convicts when the evidence arrives and abstains when it does not, which is the
-/// honest shape. `closed()` is what holds unconditionally.
+/// **Conditional on a Close frame arriving.** When this was written that was said to be
+/// "not a weakness that can be engineered away", on the grounds that the refusal left the
+/// payload undrained and the resulting RST could destroy the Close frame in flight
+/// (`docs/macos.md` delta 6). It was engineered away: the bridge now drains what it
+/// refused before closing, so the frame arrives. The `if let` stays here anyway, because
+/// these two tests do not *establish* the drain — they would still be correct against a
+/// server that never drained — and a guard should not quietly depend on a property it
+/// does not assert. `a_refused_connection_drains_what_it_refused_before_closing` asserts
+/// it, and asserts this code unconditionally on the strength of it.
 const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
 
 /// The distinguishing fragment of the `warn!` the bridge emits when the framing layer
@@ -719,5 +755,112 @@ fn a_fragmented_message_over_the_cap_is_refused_and_never_reaches_the_daemon() {
         "the server refused an over-cap message and said nothing about it: an operator \
          watching this daemon cannot tell a tripped security cap from an idle browser \
          disconnect"
+    );
+}
+
+/// The **lingering close**: a refused connection drains what it refused before closing, so
+/// its own Close frame survives to reach the browser.
+///
+/// The caps leave the peer mid-send — the frame cap refuses at the header, the message cap
+/// while accumulating fragments — so bytes are still queued when the bridge gives up on
+/// the connection. `close(2)` with a non-empty receive queue is an **RST** (RFC 1122
+/// §4.2.2.13), and an RST discards the peer's receive buffer including the Close frame the
+/// bridge just wrote to explain itself. That is not theory: a real Chromium saw `1006`
+/// ("no Close frame received") in CI where this box saw `1009`, and the browser suite's
+/// attempt to assert the code had to be withdrawn as a coin toss.
+///
+/// **The oracle is the shape of the close, not the luck of a race.** Whether any single
+/// run would have lost the Close frame is a race, and a guard built on one is that coin
+/// toss again. Whether the server drained is not: with the drain the receive queue is
+/// empty at close and the client reads to a clean **EOF**; without it the queue holds
+/// hundreds of KiB and the kernel is obliged to reset.
+///
+/// A rejected oracle worth recording, because it looks stronger and is not: *"the client's
+/// write of the tail succeeded, therefore the server kept reading."* That runs through
+/// kernel socket-buffer capacity, and on Linux loopback the send buffer autotunes into the
+/// megabytes — the whole message fits, `write_all` returns `Ok` whether or not anything
+/// drained, and the guard passes vacuously on the one platform CI actually runs. It failed
+/// 5/5 with the drain removed *on a Mac*, which is exactly the kind of one-box evidence
+/// §8 exists to distrust.
+///
+/// **Sizing.** The tail must exceed what tungstenite has already pulled into its own read
+/// buffer (128 KiB by default), or the kernel queue could be empty at close and the
+/// fail-first would silently evaporate; and it must stay under the bridge's
+/// `LINGER_BUDGET`, or the drain gives up by design and the reset is correct rather than a
+/// regression. With `WS_MAX_MESSAGE + 384 KiB` over 12 fragments the cap trips on
+/// fragment 9, leaving ~469 KiB unread against a 1 MiB budget: clear of both bounds.
+#[test]
+fn a_refused_connection_drains_what_it_refused_before_closing() {
+    /// Mirrors `web/src/bridge.rs`'s `LINGER_BUDGET`, for the reason the caps above are
+    /// mirrored: what is under test is the shipped binary at this number.
+    const LINGER_BUDGET: usize = 1 << 20;
+    /// Chosen against both bounds — see the doc comment. A compile-time check, because
+    /// two constants disagreeing is a thing to catch at build time, and `assert!` on
+    /// constants is a clippy error besides.
+    const REMAINDER: usize = 384 * 1024;
+    const _: () = assert!(REMAINDER < LINGER_BUDGET);
+
+    let d = Daemon::start();
+    let logs = d.run().join("weblogs");
+    std::fs::create_dir_all(&logs).expect("mkdir");
+    let web = WebServer::spawn(TOKEN, &d.socket(), d.run().path());
+    let cookie = bootstrap_cookie(web.port);
+    let mut ws = Ws::connect(web.port, &cookie);
+
+    ws.send_text(r#"{"jsonrpc":"2.0","id":1,"method":"info"}"#)
+        .expect("write the liveness probe");
+    assert!(ws.response_arrives(1), "the bridge never answered `info`");
+
+    let over = padded_add_node("webs4_drained", &logs, 2, WS_MAX_MESSAGE + REMAINDER);
+    // Enough fragments that each stays under the frame cap, so the *message* cap is what
+    // trips and the tail is the remainder of a legal continuation sequence.
+    let parts = 12;
+    assert!(
+        over.len().div_ceil(parts) < WS_MAX_FRAME,
+        "each fragment must stay under the frame cap, or this tests the wrong cap"
+    );
+    // A write error is not the subject here and is not a failure: whether the tail lands
+    // in a socket buffer or meets a closed peer is exactly the platform-dependent thing
+    // this test refuses to assert on.
+    let _ = ws.send_fragmented_text(&over, parts);
+
+    // The refusal still holds in every respect that mattered before draining did.
+    assert!(
+        !ws.response_arrives(2),
+        "a {}-byte message was served: draining what was refused must not mean serving it",
+        over.len()
+    );
+    assert!(
+        !daemon_has_node(&d.rpc().dump(), "webs4_drained"),
+        "the request inside an over-cap message reached the daemon and mutated the graph"
+    );
+
+    // The subject.
+    let end = ws.drain_to_end();
+    assert_eq!(
+        end,
+        Stop::Eof,
+        "a refused connection must end with a clean FIN, which means the server drained \
+         what it refused before closing. {}",
+        match end {
+            Stop::Io(kind) => format!(
+                "Got {kind:?} instead: the server closed with ~{} KiB still queued, so the \
+                 kernel reset the connection and the Close frame explaining the refusal \
+                 went with it",
+                REMAINDER / 1024
+            ),
+            Stop::Deadline =>
+                "The connection never ended at all, which is a different bug: the refusal \
+                 is not closing the session"
+                    .to_owned(),
+            Stop::Eof => String::new(),
+        }
+    );
+    // Unconditional, where the two cap tests can only manage `if let`: a drained close is
+    // what makes the Close frame's arrival something to rely on rather than hope for.
+    assert_eq!(
+        ws.close_code(),
+        Some(CLOSE_MESSAGE_TOO_BIG),
+        "a drained close must deliver its status code — that is what the draining is for"
     );
 }
