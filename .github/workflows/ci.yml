@@ -10,6 +10,13 @@ permissions:
 on:
   push:
   pull_request:
+  # The nightly lane on demand, from the Actions tab or `gh workflow run CI --ref <ref>`.
+  # Without this the only way to exercise a soak, the include-ignored sweep or the fuzz
+  # battery against a given commit was to wait for 06:00 UTC — and the nightlies run
+  # against the default branch's own ref, so a fix sitting on a branch could not be
+  # nightly-tested at all before it landed. That is backwards for exactly the changes
+  # these lanes exist to catch.
+  workflow_dispatch:
   schedule:
     # Nightly lane (§Phase 8): the longer soak, the full include-ignored sweep, and
     # the fuzz battery — too slow for every push. 06:00 UTC daily.
@@ -22,9 +29,18 @@ on:
 # own ref, so a key shared with pushes plus a blanket `cancel-in-progress` would let an
 # ordinary push kill a soak/sweep/fuzz run halfway and lose that night's coverage
 # silently. Nightlies are a day apart and never overlap, so their group never queues.
+#
+# `workflow_dispatch` is exempt for the same reason and no other: a manual run carries
+# the same half-hour soak, and someone who clicks twice — or dispatches a second ref
+# while the first is still going — should not silently lose the run they are waiting on.
+# The event name is in the group key, so a dispatch is already safe from being cancelled
+# by a push; this covers dispatch-versus-dispatch. The cost is that a mistaken manual run
+# has to be cancelled by hand rather than superseded, which is the right trade for a lane
+# whose whole value is that it finished.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+  cancel-in-progress: >-
+    ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
 
 # Toolchain policy: EVERY job that compiles repo code pins the MSRV, from this one
 # variable. AGENTS.md invariant 6 makes 1.97 a *two-way* constraint — the sources need
@@ -273,7 +289,10 @@ jobs:
   # the same SOAK_* env knobs the bash used. A true 24-hour soak runs on dedicated
   # hardware before a release; CI runs a bounded slice.
   soak-nightly:
-    if: github.event_name == 'schedule'
+    # Scheduled or hand-started; see the `workflow_dispatch` note on `on:` above.
+    if: >-
+      github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -296,7 +315,10 @@ jobs:
   # author's machine is a reliability claim on the honor system." Now just the Rust
   # suite with ignored tests included; the exit code is the verdict.
   sweep-nightly:
-    if: github.event_name == 'schedule'
+    # Scheduled or hand-started; see the `workflow_dispatch` note on `on:` above.
+    if: >-
+      github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -315,7 +337,10 @@ jobs:
   # minute of real browser time to surface the counter it is asserting. Playwright's
   # spelling of the `#[ignore]` + nightly-sweep convention the Rust suite already uses.
   web-ui-nightly:
-    if: github.event_name == 'schedule'
+    # Scheduled or hand-started; see the `workflow_dispatch` note on `on:` above.
+    if: >-
+      github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -357,7 +382,10 @@ jobs:
   # externally-reachable surface, on top of the existing proptest coverage. Needs a
   # nightly toolchain and libFuzzer — the one job that does NOT pin the MSRV.
   fuzz-nightly:
-    if: github.event_name == 'schedule'
+    # Scheduled or hand-started; see the `workflow_dispatch` note on `on:` above.
+    if: >-
+      github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
