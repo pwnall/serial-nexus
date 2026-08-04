@@ -8,8 +8,8 @@
 # well-formed report and that the portable mechanisms did not regress, while letting
 # the Linux-only probes skip/degrade/report unsupported without failing CI:
 #
-#   - The report is structurally sound: a summary object and all twelve probes
-#     (P1..P12) present, each carrying a status. (`>= 12` rather than `== 12`
+#   - The report is structurally sound: a summary object and all thirteen probes
+#     (P1..P13) present, each carrying a status. (`>= 13` rather than `== 13`
 #     because P3 emits one probe per --port.)
 #   - P2 (PTY presence, POLLHUP) is POSIX — it must NOT be `unsupported`
 #     (`supported` or `degraded` while unverified on a given macOS runner is fine).
@@ -47,7 +47,7 @@
 # Evaluates to `true` (exit 0) only when every clause below holds.
 
 (.summary != null)
-and (.probes | length >= 12)
+and (.probes | length >= 13)
 and (all(.probes[]; .status != null))
 and (any(.probes[]; .id == "P1"))
 and (any(.probes[]; .id == "P2" and (.status == "supported" or .status == "degraded")))
@@ -68,6 +68,15 @@ and (any(.probes[]; .id == "P11"))
 # silent regression a presence-only clause would wave through. Its numbers are the
 # point, like P6/P7's.
 and (any(.probes[]; .id == "P12" and (.status == "supported" or .status == "degraded")))
+# P13 (last-close disposition) is pty-only and portable, so it must measure here —
+# and macOS is the platform it was built for. Reading XNU, `ptsclose` calls
+# `ttylclose` -> `ttywflush` -> `ttywait` before any flush, so the expected answer
+# here is `waits-then-discards` with a `close_microseconds` in the hundreds of
+# thousands, against Linux's `retains` at single-digit microseconds. The clause is
+# still presence-and-status only, deliberately: pinning the word would make a kernel
+# that changed its mind fail the lane instead of reporting the change, which is the
+# opposite of what this probe is for. Read the numbers, diff them, then decide.
+and (any(.probes[]; .id == "P13" and (.status == "supported" or .status == "degraded")))
 # Provenance, same as `linux.jq` and for the same reason: a report that cannot say
 # which build produced it makes every cross-platform claim rest on an accident.
 # Structure only — `commit` may read `unknown` off a tarball build.

@@ -73,13 +73,22 @@ and (any(.probes[]; .id == "P11" and (.status == "supported" or .status == "degr
 # where it is the only mechanism. `supported` would mean a Linux kernel grew the
 # edge too, which is interesting and not a failure.
 and (any(.probes[]; .id == "P12" and .status != "unsupported"))
+# P13 (last-close disposition of unread client bytes) is presence-gated for the same
+# reason as P6/P7: all three of `retains` / `discards` / `waits-then-discards` are
+# legitimate kernel policies and the daemon is correct under each, so demanding a
+# verdict word would assert the very thing a cross-kernel run goes looking for. It
+# never skips — a probe error degrades, leaving the question open — so those two words
+# are the whole set. Its `policy` and `close_microseconds` observations are the
+# content: the first is the answer, the second is what separates `discards` from
+# `waits-then-discards`, which no other probe in this set can tell apart.
+and (any(.probes[]; .id == "P13" and (.status == "supported" or .status == "degraded")))
 # And the clause that makes the ones above worth having: a kernel-diff probe that
 # RAN must carry measurements. A verdict word cannot be diffed, so a probe whose
 # observations went empty would pass every clause above while making the 6.18 run
 # useless. (`skipped` is exempt — it measured nothing by definition, and its
 # `reason` says why.)
 and (all(.probes[]; . as $p
-      | ((["P6","P7","P8","P9","P10","P12"] | index($p.id)) == null)
+      | ((["P6","P7","P8","P9","P10","P12","P13"] | index($p.id)) == null)
       or ($p.status == "skipped")
       or (($p.observations | length) > 0)))
 # And the clause that closes the hole the 2026-07-27 6.18 run walked through: an

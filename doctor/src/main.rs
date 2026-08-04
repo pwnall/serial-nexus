@@ -135,6 +135,15 @@ fn main() {
     // diff key across kernels, and renumbering P8..P11 would silently invalidate
     // every archived report.
     probe_list.push(probes::p12_session_edge());
+    // P13 completes the trio: P7 asks what a collapsed session leaves *readable*,
+    // P12 whether the boundary arrives as an *edge*, and P13 what the kernel does
+    // with client bytes the master never read — retain, discard, or block the close
+    // waiting for the reader. The first two cannot separate the last two answers,
+    // because a master that never drains makes a drain-wait time out and look
+    // exactly like a flush; P13's `close_microseconds` is what tells them apart
+    // (notes §3.29, `docs/macos.md` 2026-08-04). Same append-only numbering rule as
+    // P12: an id is a diff key across kernels, so new questions take new numbers.
+    probe_list.push(probes::p13_last_close_disposition());
 
     // P8/P9/P10 — the data-plane shape measurements (invariant 1, §15.19's timer
     // floor, the hostward_buffer defaults). Pty- and poll-only, so passive like

@@ -3050,8 +3050,9 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **724 passing, 0 failed, 4 ignored** across 111 test
-targets on Linux (2026-07-29, after the review-37 remediation); of those, one is the doc-tested
+The current whole-suite figure is **725 passing, 0 failed, 4 ignored** across 111 test
+targets on Linux (2026-08-04, after the P13 probe added one doctor unit test to the
+724 the review-37 remediation left on 2026-07-29); of those, one is the doc-tested
 twelve-line embedder `main` in `daemon/src/lib.rs`, which is the §15.26 entry surface
 proving it still compiles under the family names. On **macOS** the same tree is **711
 passing, 0 failed, 4 ignored** across 101 binaries + 8 doc-test targets (2026-07-30, Darwin
@@ -3809,7 +3810,8 @@ there in as many words. This is §9's "proxy in time" in its third dress, after 
 `docs/macos.md` already records — its delta 4 (a Linux-only closure predicate) and its delta 6 (an
 RST scored as a live-but-silent peer).
 **Decision:** the observation moves *above* `drop(client)` — the assertion stays below the lifecycle
-ones, so a tree with MAP-1 regressed still fails with MAP-1's message — and the ordering is enforced
+ones so the more specific failure reports first, which is presentational and nothing more — and the
+ordering is enforced
 **by the compiler, not by a comment**. The wait lives in `settled_while_open(rpc, &client, ..)`,
 which borrows the client; `drop(client)` moves it, so moving the call below the close does not merely
 weaken the test, it fails to build with `error[E0382]: borrow of moved value: client`. Proved by
@@ -3819,6 +3821,21 @@ counter on the map is 0" cannot by itself separate *the bytes never reached the 
 read them and accounted them elsewhere* — `discarded_targetward` and `discarded_at_last_close` live
 on `p0`, and the 08-03 dump omitted them. **The rule this generalizes to, for anyone writing the next
 one: a byte counter is read while the client that fed it is still open.**
+
+**What the reorder costs, stated rather than glossed.** The *assertion* becomes logically stronger —
+the map's counters are monotone `Cell<u64>` bumped only by `.add`, so "flowed during the live
+session" implies "reads 64 afterwards" and not the reverse. The *test* does not become uniformly
+stronger, and cannot: the two observations are not both available on one run. Waiting for the counter
+before the close inserts an RPC round-trip there, which guarantees the daemon has drained the master
+*before* the close happens — so this test no longer traverses the write-then-immediately-close
+residual path, the one `nodes/pty.rs` describes as "a closing writer's residual must still be
+forwarded (not purged) before the close is finalized". It never covered that promise deliberately: it
+traversed it by accident, and only on kernels that retain, which is why the coverage evaporated the
+moment a kernel disagreed. **Gap recorded, not waved past** — if that promise wants a guard it needs
+its own, built on controlled backpressure (a saturated endpoint, so the residual is a held `pending`
+chunk rather than a poll-gap race) instead of on winning a microsecond window. The other cost is
+cosmetic: a failing `never` arm now takes ~20 s rather than ~10 s, because the pre-close wait spends
+its budget before the lifecycle wait spends its own.
 
 **A dynamic Linux referee was tried first and withdrawn — record it so it is not retried.** The idea
 was to precede the close with `tcflush(TCOFLUSH)`, "the same `ttyflush` XNU performs at last close",
@@ -3860,6 +3877,35 @@ safe because a `SOCK_STREAM` peer's queued data is delivered before EOF — no k
 `p9_pty_collapse`'s collapsed-session loop and `p9_unwired_interior` write bytes before a close but
 assert only lifecycle, which `SessionLatch` carries as an edge (§15.39) where bytes have no such
 carrier. A byte assertion added to either lands straight in this class.
+
+### 3.30 P13 measures the last-close disposition, because P7 structurally cannot
+
+**Design:** §7 (and AGENTS.md §7) says a kernel disagreement is settled by a probe that *measures*
+rather than by prose that assumes, and §16.13 says a kernel claim in prose cites a committed
+`docs/doctor/` artifact.
+**Reality:** the tree carried a kernel claim with no probe behind it — that XNU's last close destroys
+bytes the master has not read — and the existing set could not have checked it. P7 asks what a
+collapsed session leaves *readable* against a master **nobody drains**, and against such a master a
+kernel that discards promptly and a kernel that waits for a reader and then discards produce byte-
+identical observations: nothing readable, `terminal_read: "eof"`. The two are behaviourally very
+different (§3.29): under "discard" a lost byte is a lost microsecond race, while under
+"wait-then-discard" it means a reader stalled for the whole timeout, which is a daemon-side event
+wearing a kernel costume.
+**Decision:** `P13` measures the disposition directly and reports `policy` alongside
+**`close_microseconds`**, which is the field that separates the two — a kernel that decided
+immediately spends microseconds there, one that waited spends its timeout. Three shapes: no reader,
+reader-drains-first, and a no-reader `O_NONBLOCK` slave, that last one because `ttylclose` branches
+on exactly that flag, making the pair a controlled A/B on the branch rather than an inference about
+it. It never judges: all three policies are legitimate and the daemon is correct under each, so the
+verdict is `Supported` whenever the measurement completes and the answer lives in the numbers.
+Measured on Linux 7.0.0-29: **`retains`, 7 µs, 64/64 recovered**, agreeing with the standalone C
+measurement taken during the §3.29 triage. The classifier is split out as `p13_policy` and unit-tested
+across all four quadrants including the pair that differs *only* in the close duration — a classifier
+that read the byte count alone would collapse them, which is the conflation the probe exists to undo.
+Both expectation files gained a presence-and-status clause (never a required word: pinning the answer
+would make a kernel that changed its mind fail the lane instead of reporting the change), and
+`macos.jq`'s structural count moved 12 → 13. **The macOS artifact is still owed** — until the doctor
+runs on a Mac and that report is committed, `docs/macos.md`'s open question stays open.
 
 ---
 

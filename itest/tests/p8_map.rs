@@ -971,12 +971,24 @@ b = "console/raw"
 ///
 /// Why the ordering is load-bearing at all: reading the counter *after* the close
 /// asserts that the kernel retained bytes across the slave's last close, which no
-/// kernel promises. Linux retains them (measured on 7.0.0-29: `close(2)` returns in
-/// ~1 µs and the master still reads all 64, then EIO), so the old order could not
-/// fail here and never had. Darwin is under no obligation to agree, and that is
-/// sufficient: the assertion was wrong wherever it ran. Observing before the close is
-/// the *stricter* claim on both platforms — it says the bytes flowed during the live
-/// session, not merely eventually.
+/// kernel promises. Linux retains them (doctor P13: `retains`, `close(2)` in ~7 µs,
+/// 64/64 recovered), so the old order could not fail here and never had. Darwin is
+/// under no obligation to agree, and that is sufficient: the assertion was wrong
+/// wherever it ran.
+///
+/// **Precisely what is and is not stronger here, because the loose version of this
+/// sentence is wrong.** The *assertion* is logically stronger: the map's counters are
+/// monotone `Cell<u64>` bumped only by `.add`, so "flowed during the live session"
+/// implies "reads 64 afterwards" while the converse does not hold. The *test* is not
+/// uniformly stronger, and cannot be — the two observations cannot both be taken on
+/// one run. Waiting for the counter before the close inserts an RPC round-trip there,
+/// which guarantees the daemon has drained the master *before* the close happens; so
+/// this test no longer traverses the write-then-immediately-close residual path that
+/// `pty.rs`'s "a closing writer's residual must still be forwarded (not purged)
+/// before the close is finalized" describes. It never covered that promise
+/// deliberately — it traversed it by accident, and only on kernels that retain. If
+/// that promise wants a guard it needs its own, built on a controlled backpressure
+/// setup rather than on winning a poll-gap race. Recorded as a gap, not waved past.
 ///
 /// This reorder is **not** advertised as the root cause of the 2026-08-03 macOS red.
 /// XNU's `ptsclose` runs `ttylclose` → `ttywflush` → `ttywait` before any flush, which
@@ -1096,9 +1108,17 @@ b = "p0"
 
         // Where the typed bytes landed is observed *while the client is still open* —
         // and the borrow in `settled_while_open`'s signature is what enforces that,
-        // not this comment. Only the observation is taken here; the assertion stays
-        // below, after the lifecycle ones, so a tree with MAP-1 regressed still fails
-        // with MAP-1's message rather than this one.
+        // not this comment. Only the observation is taken here; the assertion is
+        // deferred below so the more specific lifecycle failures report first.
+        //
+        // That ordering is presentational, and deliberately not sold as more. It does
+        // NOT guarantee "a MAP-1 regression fails with MAP-1's message": measured, a
+        // revert of the map half alone (drop the targetward `rx` instead of spawning
+        // the pump) leaves `pty.rs`'s reader alive — `Handoff::Lost` breaks rather
+        // than returning, by design — so both lifecycle assertions pass and the
+        // accounting one below is the *only* detector, in this order or the old one.
+        // Only the two-part revert (map half + `Handoff::Lost => return`) produces
+        // MAP-1's message, and it did so before this change too.
         let settled = settled_while_open(rpc, &client, write_mode, TYPED);
 
         // The property: the client exits, and the PTY's reader must still be alive to

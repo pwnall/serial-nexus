@@ -954,6 +954,246 @@ pub fn p12_session_edge() -> Probe {
 }
 
 // ---------------------------------------------------------------------------
+// P13 — what a pts slave's last close does to bytes the master has not read
+// (§5's accounting, §7.2's drain-before-close ordering, harness rule notes §3.29)
+// ---------------------------------------------------------------------------
+
+/// How the master behaved during the session whose close is being timed.
+#[derive(Clone, Copy)]
+enum CloseShape {
+    /// The master never reads while the client is attached — the shape a poll
+    /// loop produces when the whole session falls inside one poll gap.
+    NoReader,
+    /// The master drains before the close, the way a healthy reader does.
+    ReaderDrains,
+    /// As `NoReader`, but the slave carries `O_NONBLOCK`. XNU's `ttylclose`
+    /// branches on exactly this flag, so the pair is a controlled A/B on the
+    /// branch rather than an inference about it.
+    NoReaderNonblocking,
+}
+
+impl CloseShape {
+    fn key(self) -> &'static str {
+        match self {
+            CloseShape::NoReader => "a_no_reader_blocking_slave",
+            CloseShape::ReaderDrains => "b_reader_drains_before_close",
+            CloseShape::NoReaderNonblocking => "c_no_reader_nonblocking_slave",
+        }
+    }
+}
+
+/// One timed last-close and what survived it.
+struct CloseResult {
+    /// How long `close(2)` on the slave took. The three-way discriminator: a
+    /// kernel that *waits* for the reader spends milliseconds here, one that
+    /// flushes or retains returns in microseconds.
+    close_us: u64,
+    /// Bytes the master recovered *before* the close (0 for the no-reader shapes).
+    bytes_before: u64,
+    /// Bytes the master recovered *after* the close.
+    bytes_after: u64,
+    /// How the master's post-close drain ended (`eof` / `EIO` / …).
+    terminal: String,
+}
+
+impl CloseResult {
+    fn observations(&self, written: u64) -> serde_json::Value {
+        serde_json::json!({
+            "bytes_written_by_slave": written,
+            "bytes_recovered_before_close": self.bytes_before,
+            "bytes_recovered_after_close": self.bytes_after,
+            "bytes_recovered_total": self.bytes_before + self.bytes_after,
+            "bytes_lost": written.saturating_sub(self.bytes_before + self.bytes_after),
+            "close_microseconds": self.close_us,
+            "terminal_read": self.terminal,
+        })
+    }
+}
+
+/// How many bytes the slave writes before the close. Small on purpose: this
+/// measures a *policy*, not a capacity, and P10 already measures the depth.
+const P13_PAYLOAD: usize = 64;
+/// A close is "waiting for the reader" rather than returning promptly beyond
+/// this. Two orders of magnitude above the microsecond-scale prompt return
+/// measured on Linux, and two below Darwin's `t_timeout` (60 ticks), so neither
+/// kernel lands near the boundary.
+const P13_WAIT_THRESHOLD_US: u64 = 1_000;
+
+/// What does this kernel do with bytes a pts client wrote and the master has not
+/// read, when the client closes?
+///
+/// **Why this exists.** The three answers are behaviourally different and, until
+/// this probe, indistinguishable from anything the tree recorded:
+///
+/// * **retain** — the bytes stay readable past the hangup (Linux: `close(2)`
+///   returns in ~1 µs and the master still reads all of them, then `EIO`);
+/// * **flush** — the close discards them promptly;
+/// * **wait, then flush** — the close *blocks*, nudging the master awake, and
+///   discards only if the reader never comes. XNU's `ptsclose` sets
+///   `t_timeout = 60` ticks and calls `ttylclose` → `ttywflush` → `ttywait`
+///   before any flush, which is this third answer.
+///
+/// `close_microseconds` separates them, which no observation in the set did.
+/// P7 asks what a collapsed session leaves *readable* against a master nobody
+/// drains — a yes/no that "flush" and "wait, then flush" answer identically,
+/// because a master that never reads makes the wait time out either way. The
+/// distinction is not academic: under "flush" a harness that closes before
+/// checking a counter is racing microseconds and should almost always lose;
+/// under "wait, then flush" it should almost always *win*, and a loss means the
+/// reader stalled for the whole timeout — a daemon-side event wearing a kernel
+/// costume. `docs/macos.md` (2026-08-04) records a macOS CI failure whose two
+/// readings differ exactly this way, and names this probe as the separator.
+///
+/// **What it does not do.** It never judges the answer. All three are legitimate
+/// and the shipped daemon is correct under each — §7.2 drains before finalizing a
+/// close, and §5 accounts what it reads. The verdict is `Supported` whenever the
+/// measurement completed, and the *policy* is stated in the consequence line so a
+/// cross-platform diff reads it directly. What it does bind is a **harness** rule
+/// (notes §3.29): a test reads a byte counter while the client that fed it is
+/// still open, on every platform, whatever this probe says — because "retain" is
+/// a property of the kernel under the test, never of the product under test.
+///
+/// **Cost.** Microseconds on a kernel that retains or flushes. On one that waits,
+/// shapes `a` and `c` each pay their timeout once — up to ~0.6 s apiece on
+/// Darwin — which is the price of measuring the thing that matters and is paid
+/// only where the answer is interesting.
+pub fn p13_last_close_disposition() -> Probe {
+    let p = Probe::new(
+        "P13",
+        "disposition of unread client bytes at a pts last close",
+        "When a pty client writes bytes the master has not read and then closes, does this kernel retain them, discard them, or block the close waiting for the reader?",
+    );
+    let shapes = [
+        CloseShape::NoReader,
+        CloseShape::ReaderDrains,
+        CloseShape::NoReaderNonblocking,
+    ];
+    let mut p = p;
+    let mut results: Vec<(CloseShape, CloseResult)> = Vec::new();
+    for shape in shapes {
+        match p13_shape(shape) {
+            Ok(r) => {
+                p = p.observe(shape.key(), r.observations(P13_PAYLOAD as u64));
+                results.push((shape, r));
+            }
+            Err(e) => p = p.observe(shape.key(), format!("probe error: {e}")),
+        }
+    }
+
+    let no_reader = results
+        .iter()
+        .find(|(s, _)| matches!(s, CloseShape::NoReader))
+        .map(|(_, r)| r);
+    let drained = results
+        .iter()
+        .find(|(s, _)| matches!(s, CloseShape::ReaderDrains))
+        .map(|(_, r)| r);
+
+    let Some(bare) = no_reader else {
+        return p.verdict(
+            Status::Degraded,
+            "The last-close disposition did not measure, so which of retain / discard / wait-then-discard this kernel implements is unknown. A harness must read a byte counter while its client is still open regardless (notes §3.29) — that rule does not depend on this answer.",
+        );
+    };
+
+    let recovered = bare.bytes_before + bare.bytes_after;
+    let waited = bare.close_us >= P13_WAIT_THRESHOLD_US;
+    let policy = p13_policy(bare.close_us, recovered);
+    let drained_note = match drained {
+        Some(d) => format!(
+            " With a master that drains before the close, {} of {P13_PAYLOAD} byte(s) are recovered and the close takes {} µs — the healthy-reader case, and the one the daemon is in.",
+            d.bytes_before + d.bytes_after,
+            d.close_us
+        ),
+        None => String::new(),
+    };
+
+    p.observe("policy", policy)
+        .observe("close_waits_for_reader", waited)
+        .verdict(
+            Status::Supported,
+            &format!(
+                "This kernel **{policy}** bytes a pts client wrote but the master never read: with no reader, {recovered} of {P13_PAYLOAD} byte(s) survive the last close and `close(2)` takes {} µs (terminal read `{}`).{drained_note} Numbers, not a verdict — every policy is legitimate and the daemon is correct under each (§7.2 drains before finalizing a close, §5 accounts what it reads). Read it for two things: a cross-kernel diff, and the reason a harness reads a byte counter while its client is still open rather than after (notes §3.29). A `waits-then-*` kernel additionally means a lost byte implies a reader stalled for the whole timeout, not a lost microsecond race.",
+                bare.close_us, bare.terminal
+            ),
+        )
+}
+
+/// Name the kernel's last-close policy from the two numbers that determine it.
+///
+/// Split out from the probe so it can be tested against all four quadrants: the
+/// interesting pair (`discards` vs `waits-then-discards`) differs *only* in
+/// `close_us`, and a classifier that read the byte count alone would collapse them
+/// into one word — which is precisely the conflation P13 exists to undo.
+fn p13_policy(close_us: u64, recovered: u64) -> &'static str {
+    match (close_us >= P13_WAIT_THRESHOLD_US, recovered > 0) {
+        (false, true) => "retains",
+        (false, false) => "discards",
+        (true, true) => "waits-then-retains",
+        (true, false) => "waits-then-discards",
+    }
+}
+
+fn p13_shape(shape: CloseShape) -> anyhow::Result<CloseResult> {
+    let master = new_master()?;
+    let pts = sys::ptsname(&master)?;
+    let fd = master.as_raw_fd();
+    sys::set_nonblocking(fd)?;
+    apply_pty_baseline(&master, &pts)?;
+    sys::set_packet_mode(fd, true)?;
+
+    let mut buf = [0u8; 4096];
+    // Prime and quiesce exactly as P6/P7 do, so what the measured session leaves
+    // behind is its own and not the setup's.
+    {
+        let prime = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+        std::thread::sleep(PTY_SETTLE);
+        let _ = read_available(fd, &mut buf, 64);
+        drop(prime);
+    }
+    std::thread::sleep(PTY_SETTLE);
+    let _ = read_available(fd, &mut buf, 64);
+
+    let mut flags = OFlag::O_RDWR | OFlag::O_NOCTTY;
+    if matches!(shape, CloseShape::NoReaderNonblocking) {
+        flags |= OFlag::O_NONBLOCK;
+    }
+    let slave = open(pts.as_str(), flags, Mode::empty())?;
+    nix::unistd::write(&slave, &[b'x'; P13_PAYLOAD])?;
+    std::thread::sleep(PTY_SETTLE);
+
+    // The one variable: whether anything drained the master during the session.
+    let bytes_before = match shape {
+        CloseShape::ReaderDrains => {
+            let (bytes, reads, ..) = read_available(fd, &mut buf, 64);
+            // One packet-mode control byte rides in front of each read's payload and
+            // is not client data, so the payload is `bytes - reads`. Subtracting a
+            // constant 1 would under-count a drain that took several reads.
+            bytes.saturating_sub(reads)
+        }
+        _ => 0,
+    };
+
+    // The measurement. `drop` is not timed reliably enough to trust here, so the
+    // close is explicit and bracketed.
+    let t0 = Instant::now();
+    drop(slave);
+    let close_us = t0.elapsed().as_micros() as u64;
+
+    std::thread::sleep(PTY_SETTLE);
+    let (raw_after, reads_after, _, terminal) = read_available(fd, &mut buf, 64);
+    // Same control-byte correction as above.
+    let bytes_after = raw_after.saturating_sub(reads_after);
+
+    Ok(CloseResult {
+        close_us,
+        bytes_before,
+        bytes_after,
+        terminal,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // P8 — epoll vs read(2) on a pty master (invariant 1, §15.18, §13)
 //
 // Linux-only in substance, but NOT `#[cfg]`-gated: `serial_nexus_sys::Epoll` keeps a
@@ -3790,5 +4030,25 @@ mod tests {
         cert.fail_if(false, "custom_baud", false);
         cert.fail_if(true, "break", false);
         assert_eq!(cert.failures, vec![fail("break", false)]);
+    }
+
+    /// P13's whole reason for existing is that a byte count alone cannot separate
+    /// a kernel that discarded promptly from one that waited for a reader first —
+    /// both end with nothing recovered. Pin all four quadrants, and pin the pair
+    /// that differs *only* in the close duration, or a later simplification that
+    /// drops `close_us` from the classifier would pass every other test here.
+    #[test]
+    fn p13_policy_reads_the_close_duration_not_only_the_byte_count() {
+        let slow = P13_WAIT_THRESHOLD_US;
+        let fast = P13_WAIT_THRESHOLD_US - 1;
+        assert_eq!(p13_policy(fast, 64), "retains");
+        assert_eq!(p13_policy(fast, 0), "discards");
+        assert_eq!(p13_policy(slow, 64), "waits-then-retains");
+        assert_eq!(p13_policy(slow, 0), "waits-then-discards");
+        // The conflation the probe undoes: same bytes, different verdict.
+        assert_ne!(p13_policy(fast, 0), p13_policy(slow, 0));
+        // And the Linux answer this tree measures, so a threshold edit that
+        // reclassified the platform of record cannot land silently.
+        assert_eq!(p13_policy(7, 64), "retains");
     }
 }

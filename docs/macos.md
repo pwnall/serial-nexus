@@ -109,7 +109,16 @@ Two things this pass did **not** settle, recorded so the next one does not re-de
   `terminal_read: "eof"` for all three shapes where Linux gives `EIO`, which is consistent with
   either. Prefer "the bytes are not recoverable here" over the mechanism until a probe separates
   them.
-- **A probe would answer it (§7), and it is the P7 the artifact above does not contain.** P7 asks
+- **The probe now exists: `P13`, added in the same change set.** It writes at the slave, closes, and
+  reports `policy` (`retains` / `discards` / `waits-then-discards`) alongside `close_microseconds`,
+  across three shapes — no reader, reader-drains-first, and a no-reader `O_NONBLOCK` slave, that last
+  one because `ttylclose` branches on exactly that flag. On Linux 7.0.0-29 it measures **`retains`,
+  7 µs, 64/64 recovered**. If the reading above is right, macOS will report **`waits-then-discards`
+  with a `close_microseconds` in the hundreds of thousands**, and that single number settles which of
+  the two hypotheses is live — because it is the one measurement `discards` and `waits-then-discards`
+  do not share. **Run the doctor on a Mac and commit the artifact (§16.13); until then this remains
+  open.** The paragraph below is what P13 was built to replace.
+- **Why the existing set could not answer it.** P7 asks
   what a collapsed session leaves readable against a master nobody drains. The unmeasured question
   is the one this test actually asks: with a master being *actively drained* on the daemon's poll
   cadence, how long after the slave's `close(2)` may the master first read and still recover the
