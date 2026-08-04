@@ -958,6 +958,61 @@ b = "console/raw"
 
 // ---- 6: the read-only map is inert, not destructive (the controlled A/B) --------
 
+/// Wait for the map's targetward accounting to settle, **while the pts client that
+/// produced the bytes is still open** (notes §3.29).
+///
+/// The `&File` is the enforcement, and it is the whole reason this is a function
+/// rather than an inline `wait_until`. Its caller closes the client with
+/// `drop(client)`, which *moves* it; so moving this call below that line does not
+/// merely weaken the test, it **fails to compile** (`borrow of moved value:
+/// client`). The ordering is a property the compiler checks, not a comment a future
+/// editor can step over — which matters because the previous shape of this test made
+/// it a comment, and the comment lost.
+///
+/// Why the ordering is load-bearing at all: reading the counter *after* the close
+/// asserts that the kernel retained bytes across the slave's last close, which no
+/// kernel promises. Linux retains them (measured on 7.0.0-29: `close(2)` returns in
+/// ~1 µs and the master still reads all 64, then EIO), so the old order could not
+/// fail here and never had. Darwin is under no obligation to agree, and that is
+/// sufficient: the assertion was wrong wherever it ran. Observing before the close is
+/// the *stricter* claim on both platforms — it says the bytes flowed during the live
+/// session, not merely eventually.
+///
+/// This reorder is **not** advertised as the root cause of the 2026-08-03 macOS red.
+/// XNU's `ptsclose` runs `ttylclose` → `ttywflush` → `ttywait` before any flush, which
+/// *waits* up to `t_timeout` (≈0.6 s) for the master to drain, so the old ordering's
+/// expected Darwin outcome was green — and a red means the reader did not drain in
+/// that window, which is a stall, not a kernel coin flip. `docs/macos.md` (2026-08-04)
+/// carries the source excerpt and the probe that separates the two.
+///
+/// One thing this deliberately does **not** do is emulate Darwin's close so a Linux
+/// run can referee the ordering dynamically. That was tried and withdrawn:
+/// `tcflush(TCOFLUSH)` on a Linux pts slave is not XNU's `ttyflush`. It empties the
+/// peer's flip buffer only, never the master's ldisc `read_buf`, so it is a race
+/// against the flip-to-ldisc push rather than a queue flush — measured on this box
+/// at 300 trials per row, it destroys the bytes 100% of the time at a 0 µs delay and
+/// **0%** at 20 µs and beyond. In this function's position it would run an RPC
+/// round-trip after the write and so destroy nothing at all: dead code that reads
+/// like a guard. The compile-time borrow is strictly stronger and costs nothing.
+fn settled_while_open(
+    rpc: &serial_nexus_itest::Rpc,
+    client: &std::fs::File,
+    write_mode: &str,
+    typed: u64,
+) -> bool {
+    // Make the borrow load-bearing rather than ornamental: a live fd answers fstat.
+    client
+        .metadata()
+        .expect("the client must still be open while its bytes are accounted");
+    wait_until(Duration::from_secs(10), || {
+        let n = rpc.node("console").unwrap_or(Value::Null);
+        match write_mode {
+            "never" => n["targetward"]["discarded_no_raw_edge"].as_u64() == Some(typed),
+            _ => n["targetward"]["bytes_in"].as_u64() == Some(typed),
+        }
+    })
+}
+
 #[test]
 fn a_read_only_map_leaves_its_writers_pty_alive() {
     // MAP-1 (runtime), as the reviewer's reproduction 21 isolated it: one graph, one
@@ -1039,6 +1094,13 @@ b = "p0"
             .expect("type at the console");
         client.flush().expect("flush");
 
+        // Where the typed bytes landed is observed *while the client is still open* —
+        // and the borrow in `settled_while_open`'s signature is what enforces that,
+        // not this comment. Only the observation is taken here; the assertion stays
+        // below, after the lifecycle ones, so a tree with MAP-1 regressed still fails
+        // with MAP-1's message rather than this one.
+        let settled = settled_while_open(rpc, &client, write_mode, TYPED);
+
         // The property: the client exits, and the PTY's reader must still be alive to
         // notice. With the dropped receiver, the first typed byte hit a closed channel
         // and ended `read_and_poll`, so this stayed `true` indefinitely.
@@ -1067,18 +1129,20 @@ b = "p0"
         );
 
         // The typed bytes went somewhere defensible, and *which* somewhere is the
-        // whole difference between the two arms.
-        let settled = wait_until(Duration::from_secs(10), || {
-            let n = rpc.node("console").unwrap_or(Value::Null);
-            match write_mode {
-                "never" => n["targetward"]["discarded_no_raw_edge"].as_u64() == Some(TYPED),
-                _ => n["targetward"]["bytes_in"].as_u64() == Some(TYPED),
-            }
-        });
+        // whole difference between the two arms (observed above, before the close).
+        //
+        // Both nodes are dumped, not just the map. The 2026-08-03 macOS failure
+        // printed `console` alone, and "every counter on the map is 0" cannot on its
+        // own separate *the bytes never reached the daemon* from *the pty read them
+        // and accounted them somewhere else* — `p0` is where `discarded_targetward`
+        // and `discarded_at_last_close` live, so a dump without it sends the next
+        // reader to re-derive by hand what the assertion could simply have said.
         let node = rpc.node("console").expect("map node in state");
         assert!(
             settled,
-            "[{write_mode}] targetward accounting did not settle: {node}"
+            "[{write_mode}] targetward accounting did not settle: console={node} \
+             p0={:?}",
+            rpc.node("p0")
         );
         if write_mode == "never" {
             // Inert: the bytes are swallowed and counted (§5), and the transform is

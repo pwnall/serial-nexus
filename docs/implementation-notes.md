@@ -3780,6 +3780,87 @@ is what makes the common heal — a predecessor's inode outliving the peer that 
 it — work at all. A successful bind sets `waiting`, so the heal is observable rather than silent.
 §7.4's sentence names only the connect role's retry because the bind used to be one-shot.
 
+### 3.29 A harness never reads a byte counter after closing the client that produced it
+
+**Design:** §5 says every byte is accounted where it is lost, and §7.2 gives the pty reader the
+drain-before-close ordering that makes a closing client's residual reach the graph rather than the
+purge. Neither says anything about what a *test* may assume of the kernel between those two events,
+because from the daemon's side there is nothing to say.
+**Reality:** `p8_map`'s `a_read_only_map_leaves_its_writers_pty_alive` typed 64 bytes at a pts,
+closed the slave, and only then waited on the map's `discarded_no_raw_edge`. That asserts *the bytes
+survived the slave's last close* — which no kernel promises — in place of *the bytes flowed during
+the live session*, which is the property the map actually offers. Linux retains them (measured at
+HEAD on 7.0.0-29: `close(2)` on the slave returns in ~1 µs and the master still reads all 64, then
+EIO), so on Linux the guard could not fail for this reason and never had, and Darwin is under no
+obligation to agree — which is enough to make the assertion wrong wherever it runs.
+
+**What this entry deliberately does not claim.** It does not claim to explain the 08-03/08-04 macOS
+red (29 observed CI passes and no observed failure 07-26 → 08-02, then two reds with every targetward
+counter 0, on an unmoved tree and a byte-identical runner image). Read against XNU's source rather
+than this repo's summary of it, `ptsclose` runs `ttylclose` → `ttywflush` → `ttywait` *first*, which
+**waits** up to `t_timeout` (60 ticks, ≈0.6 s) for the master to drain and only flushes destructively
+if that wait fails or the fd is `O_NONBLOCK` — so for the blocking fd this test opens, the expected
+Darwin outcome of the *old* ordering is green, matching 29/29, and a red means the reader did not
+drain inside ~0.6 s. That is a **reader stall**, a different defect class. `docs/macos.md`
+(2026-08-04) carries the source excerpt, the correction to this repo's standing mechanism claim, and
+the probe that separates the two hypotheses. The reorder below is justified as removing a latent
+proxy-in-time defect, **not** as a root-cause fix; it may also mask the stall signal, which is stated
+there in as many words. This is §9's "proxy in time" in its third dress, after the two
+`docs/macos.md` already records — its delta 4 (a Linux-only closure predicate) and its delta 6 (an
+RST scored as a live-but-silent peer).
+**Decision:** the observation moves *above* `drop(client)` — the assertion stays below the lifecycle
+ones, so a tree with MAP-1 regressed still fails with MAP-1's message — and the ordering is enforced
+**by the compiler, not by a comment**. The wait lives in `settled_while_open(rpc, &client, ..)`,
+which borrows the client; `drop(client)` moves it, so moving the call below the close does not merely
+weaken the test, it fails to build with `error[E0382]: borrow of moved value: client`. Proved by
+regressing it: the file does not compile. That is deterministic on every platform and costs nothing
+at runtime. The failing assertion now also dumps the **pty** node beside the map, because "every
+counter on the map is 0" cannot by itself separate *the bytes never reached the daemon* from *the pty
+read them and accounted them elsewhere* — `discarded_targetward` and `discarded_at_last_close` live
+on `p0`, and the 08-03 dump omitted them. **The rule this generalizes to, for anyone writing the next
+one: a byte counter is read while the client that fed it is still open.**
+
+**A dynamic Linux referee was tried first and withdrawn — record it so it is not retried.** The idea
+was to precede the close with `tcflush(TCOFLUSH)`, "the same `ttyflush` XNU performs at last close",
+so a Linux run would punish the bad ordering instead of tolerating it. It is not the same operation.
+On Linux a slave-side `TCOFLUSH` reaches `pty_flush_buffer`, which empties the *peer's flip buffer*
+and never the master's ldisc `read_buf` — so it is a race against the flip-to-ldisc push, not a queue
+flush. Measured on this box, 300 trials per row: it destroys the bytes **100% at a 0 µs delay and 0%
+at 20 µs and every delay beyond** (20 µs, 50 µs, 100 µs, 200 µs, 500 µs, 1 ms, 5 ms, 20 ms). In the
+shipped position it would run an RPC round-trip after the write — `wait_until` alone sleeps 20 ms
+between probes — and so destroy nothing whatever: **dead code that reads like a guard**, which is
+worse than no guard. It also bought `itest` a `nix` dependency for the safe `tcflush` spelling
+(invariant 3 / §16.3 confines `unsafe` to `serial-nexus-sys`), now reverted. The borrow is strictly
+stronger, and the withdrawn approach is a good illustration of §9: an emulation is evidence only once
+you have measured that it emulates.
+
+The sweep behind that rule, because one fixed instance is not a fixed class. Seven further guards
+share the shape and are **latent, not broken** — each is either Linux-gated or rig-gated, so none is
+red today, and none is touched here:
+
+| where | what closes | asserted after the close |
+|---|---|---|
+| `itest/tests/serial_hardware.rs:104` `inject_verify` (both rig callers) | a one-shot `Sim::client --send`, no `--hold-ms` | the whole 32 KiB arrived, SHA-256-exact |
+| `itest/tests/p4_exclusivity.rs:321` | the holder's one-shot `Sim::client` | sink `received == 65536`, SHA-256-exact |
+| `itest/tests/p4_free_for_all.rs:130` | two background writers that exit on completion | sink `received == TOTAL` |
+| `itest/tests/p4_purge.rs:241` | `drop(client)` on a locked-out holding `Sim` | `purged == 2048` **exactly** |
+| `itest/tests/p4_purge.rs:347` | one-shot `Sim::client` | sink `received == 2048`, SHA-256-exact |
+| `itest/tests/p12_pty_setup.rs:1017` | `drop(a)` on a never-reading client | `discarded_at_last_close > 0` |
+| `itest/tests/p6_outage.rs:331` | one-shot `Sim::client` | `purged_on_reconnect > 0` |
+
+`serial_hardware.rs:228` already half-knew — it warns that "only rates fast enough to drain before
+the one-shot `Sim::client` injector closes its pty are reliable here" and attributes the race to
+*baud*, when the variable is the kernel's retention policy. `p12_pty_setup.rs:1017` must **not** be
+ported to macOS whatever else is done: `discarded_at_last_close` is structurally always 0 there
+(`docs/macos.md` §3), so the counter it asserts has nothing to name.
+
+Two shapes that look like the class and are not, so a blanket rule is not misapplied: AF_UNIX
+siblings (`p6_outage.rs:601`/`:779`, `p12_leg_accounting.rs:517`, `p6_fragmentation.rs:338`) are
+safe because a `SOCK_STREAM` peer's queued data is delivered before EOF — no kernel flushes it; and
+`p9_pty_collapse`'s collapsed-session loop and `p9_unwired_interior` write bytes before a close but
+assert only lifecycle, which `SessionLatch` carries as an edge (§15.39) where bytes have no such
+carrier. A byte assertion added to either lands straight in this class.
+
 ---
 
 ## 4. Findings carried forward (from serial-nexus-doctor)

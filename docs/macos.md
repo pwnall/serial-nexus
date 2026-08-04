@@ -5,6 +5,117 @@ the one every mechanism is specified against; macOS is supported where plain
 POSIX carries the design, and degrades — never crashes, never silently misbehaves
 — everywhere the design leans on a Linux-only facility.
 
+## Update — 2026-08-04 CI triage (macos-26-arm64 runner; diagnosed and re-proved on Linux)
+
+The nightly macOS lane went red on 08-03 and 08-04 on one target, `p8_map`'s
+`a_read_only_map_leaves_its_writers_pty_alive` (`never` arm): *targetward accounting did not
+settle*, with every counter on the map at 0 while `client_present` had gone true→false and the
+mapped endpoint's lock had detach-released. So the reader task was alive and the close was
+observed — the daemon simply never saw the 64 typed bytes.
+
+**Nothing about the environment moved, which is the part worth recording.** The tree has been
+`fa523b1` since 07-30; the runner image was `macos-26-arm64` version `20260707.563` on the red runs
+*and* on the green ones before them. Across the 40 most recent CI runs the macOS job's `p8_map` line
+reads `... ok` **29 times, spanning 2026-07-26 to 08-02, with no observed failure** before 08-03
+(nine further runs are silent here — their macOS job failed at an earlier target and never reached
+`p8_map` — so this is 29 observed passes, not a 29-long unbroken chain). A defect that arrives with
+no input change is a race whose odds shifted, not a regression, and it should be diagnosed as one.
+
+**A latent harness defect is fixed here. The cause of the red is NOT settled, and this section is
+written to keep those two apart.** The guard asserted that bytes typed at a pts *survive the slave's
+last close* — which no kernel promises — instead of that they *flowed during the live session*,
+which is what the map promises. That is §9's proxy "in time", after delta 4's Linux-only closure
+predicate and delta 6's RST-read-as-a-live-peer, and it is worth removing on its own merits. What it
+is **not** is a demonstrated explanation of 08-03.
+
+**Correcting this page's own model of the Darwin close, which the first draft of this section leaned
+on.** Delta 3 below and its restatements say `ptsclose` → `ttyclose` → `ttyflush(FREAD|FWRITE)`, i.e.
+the queues are emptied at the slave's last close. Read against the source
+(`apple-oss-distributions/xnu`, `bsd/kern/tty_dev.c` and `bsd/kern/tty.c`, fetched 2026-08-04), that
+names the **fallback** path as though it were the only one. The actual sequence is:
+
+```c
+/* ptsclose(), tty_dev.c — note the timeout, and that l_close runs BEFORE ttyclose */
+save_timeout = tp->t_timeout;  tp->t_timeout = 60;
+err = (*linesw[tp->t_line].l_close)(tp, flag);        /* ttylclose */
+(void)ttyclose(tp);
+
+/* ttylclose(), tty.c */
+if ((flag & FNONBLOCK) || ttywflush(tp)) { ttyflush(tp, FREAD | FWRITE); }
+
+/* ttywflush() → ttywait(): drain-WAIT, not flush */
+while ((tp->t_outq.c_cc || ISSET(tp->t_state, TS_BUSY)) &&
+       ISSET(tp->t_state, TS_CONNECTED) && tp->t_oproc) {
+        (*tp->t_oproc)(tp);                            /* ptsstart: wake the master's readers */
+        error = ttysleep(tp, TSA_OCOMPLETE(tp), TTOPRI | PCATCH, "ttywai", tp->t_timeout);
+        ...
+}
+```
+
+For a **blocking** slave fd with a live master — which is exactly what this test opens — the last
+close therefore *waits for the reader to drain*, nudging the master awake each round, for up to
+`t_timeout` = 60 ticks (≈0.6 s at `hz` 100). The destructive `ttyflush(FREAD|FWRITE)` runs **only**
+if that wait errors or times out, or if the fd carried `O_NONBLOCK`. When the drain succeeds,
+`ttywflush` flushes `FREAD` alone and returns 0, and the destructive flush is skipped.
+
+**That reading predicts the CI history the "destruction" reading cannot.** The daemon's reader polls
+at ≤5 ms, which is 120× inside a 0.6 s window, so the bytes get drained and the old ordering passes
+— 29 times out of 29, which is what happened. Under the destruction reading the same 29 runs have a
+probability on the order of 10⁻⁸⁴. The corrected model also says what a **red** run means: the
+reader did not drain within ~0.6 s, i.e. a **reader stall** — a daemon- or runner-side event, not a
+kernel coin flip. So the fix below removes a real latent defect *and may mask that signal*, and the
+probe named at the end of this section is how the next macOS run tells us which it was. Nothing here
+should be read as "08-03 is explained."
+
+**The fix makes the ordering a compile error, not a kernel race.** The wait now lives in
+`settled_while_open(rpc, &client, ..)`, which borrows the client that `drop(client)` moves — so
+moving the observation back below the close fails to build (`error[E0382]: borrow of moved value`),
+on every platform, deterministically. Fix and rule: `docs/implementation-notes.md` §3.29.
+
+**One instructive detour, recorded so it is not retried.** The first attempt was to emulate the
+Darwin close on Linux — precede the close with `tcflush(TCOFLUSH)`, "the same `ttyflush`" — so a
+Linux run could referee the ordering dynamically. It reproduced the CI panic verbatim, which is why
+it was believed. It is nevertheless **not the same operation**: on Linux a slave-side `TCOFLUSH`
+empties the peer's flip buffer and never the master's ldisc `read_buf`, so it races the
+flip-to-ldisc push rather than flushing a queue. Measured, 300 trials per delay: 100% destroyed at
+0 µs, **0% at 20 µs and every delay beyond**. In the position the shipped test would have used it —
+after an RPC round-trip — it destroys nothing at all. It reproduced the failure only because the
+reproduction ran it microseconds after the write. An emulation is evidence only once you have
+measured that it emulates (§9); this one was withdrawn on that measurement.
+
+Two things this pass did **not** settle, recorded so the next one does not re-derive them:
+
+- **Why the test was ever green here is the open question, and it is sharper than it looks.** The
+  intuition to resist is "rare race": the arithmetic points the other way. `docs/doctor/macos-24.6.0-2026-07-30-tier3.json`
+  (commit `a1029778fda9`, probe set `01b257ece8c48470`) has P7 `c_open_write_close` at
+  `bytes_readable_after_close: 0`, `terminal_read: "eof"` — a written byte destroyed even with a
+  settle before the close, so for a *quiescent* master the flush is unconditional here. And the
+  daemon's reader is a spin-sleep poller, not a blocking one (`ACTIVE_POLL` 200 µs doubling to
+  `IDLE_POLL` 5 ms, `runtime.rs`), so a client's write cannot wake it; against a write-then-close
+  window microseconds wide it should lose nearly every time. Both facts predict **near-always red on
+  macOS**, and the observed record is 29 passes and 0 failures from 07-26 to 08-02. Those 29 were
+  real runs of this test, not skips or fail-fast aborts — the job logs carry
+  `a_read_only_map_leaves_its_writers_pty_alive ... ok` on each. So the model is wrong somewhere,
+  and **no guess is recorded here**: §7 does not permit one, and the fix deliberately no longer
+  depends on the answer.
+
+  Two limits on that P7 citation, both §7-relevant and neither closed here. **It is a different
+  kernel and a different architecture from the one that went red**: the artifact is macOS 15.7.8 /
+  Darwin 24.6.0 on x86_64, and the CI lane is `macos-26-arm64`. There is no committed report from
+  the runner's kernel at all, so every Darwin sentence on this page is evidence about the *rig*,
+  applied to CI by assumption. And the *mechanism* named — `ttyflush` at last close — is an
+  attribution, not an observation: P7 measures that nothing is readable afterwards, which an XNU
+  `ptcread` returning EOF once `TS_ISOPEN` clears would produce identically. macOS P7 reports
+  `terminal_read: "eof"` for all three shapes where Linux gives `EIO`, which is consistent with
+  either. Prefer "the bytes are not recoverable here" over the mechanism until a probe separates
+  them.
+- **A probe would answer it (§7), and it is the P7 the artifact above does not contain.** P7 asks
+  what a collapsed session leaves readable against a master nobody drains. The unmeasured question
+  is the one this test actually asks: with a master being *actively drained* on the daemon's poll
+  cadence, how long after the slave's `close(2)` may the master first read and still recover the
+  bytes — a number, parameterized by delay, rather than a yes/no against a quiescent reader. That
+  is what would turn this page's "is entitled to destroy them" into evidence. Not built here.
+
 ## Update — 2026-07-30 validation pass (macOS 15.7.8 / Darwin 24.6.0, x86_64, real FTDI crossover rig)
 
 A whole-gate pass on the Mac, run to settle the red macOS CI lane on `a102977`. **710 pass,
@@ -314,6 +425,18 @@ probe, a health check, a bare `stty` — used to leave its `usb0` write lock hel
 XNU's `ptsclose` → `ttyclose` flushes both tty queues at the slave's last close, so
 the packet above is destroyed before the daemon's next poll, and `read_and_poll`'s
 `saw_session` latch (§6 detach-release, invariant 16) has nothing to arm on: `was` is
+<!-- ANNOTATION 2026-08-04 (superseding sentence, not a rewrite — §5): the sentence
+     above names the FALLBACK path as if it were the only one. `ptsclose` runs
+     `l_close`/`ttylclose` first, which calls `ttywflush` → `ttywait` and *waits* up to
+     `t_timeout` (60 ticks) for the master to drain, flushing `FREAD|FWRITE` only if
+     that wait fails or the fd is `O_NONBLOCK`. See the 2026-08-04 block at the top of
+     this file for the source excerpt. The delta's own *conclusion* is unaffected: the
+     session shape it describes carries a control packet in the FREAD queue, which
+     `ttywflush` flushes even on the success path, so the packet is destroyed either
+     way and `SessionLatch` is still the mechanism that carries detach-release here.
+     What the sentence must not be reused for is the TARGETWARD direction — data the
+     slave wrote and the master has not read — which the drain-wait normally
+     preserves. -->
 false because no poll landed during the 53 µs session, and every level-triggered
 observable — poll revents, `FIONREAD`, `TIOCOUTQ`, `TIOCGPGRP`, `TIOCMGET`,
 `TIOCGWINSZ`, the pts inode's timestamps — is byte-identical to no session at all.
