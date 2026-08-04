@@ -3991,6 +3991,39 @@ stay diffable; what a diff against a pre-2026-08-04 report shows is the two keys
 numbers unchanged, which is exactly the correction. Those artifacts are frozen records (§16.13) and
 are **not** rewritten: they printed what the tool printed on their date.
 
+### 3.33 The editor spec's status oracle could not see a refusal, and one assertion was vacuous
+
+**Design:** §15.35's whole point at the browser layer, stated in `graph-editor.spec.mjs`'s own header,
+is "that the daemon's refusal reaches the operator's eyes verbatim rather than being paraphrased into
+'failed'". `editor.mjs` honours it: `say(false, …)` prints `${label} refused: ${error.message}`
+because "paraphrasing it here would cost the operator the only precise thing they got".
+**Reality:** the spec then threw that away twice over, and the CI failure on `83239a5` is what
+surfaced it. `editor.mjs` renders **one** status div and flips its class between `ok` and `err`, so a
+locator spelled `.estatus.ok`:
+
+1. **cannot see a refusal at all.** On the refusal path the element stops matching, so the wait burns
+   its full 20 s and dies with `element(s) not found` — the daemon's named rule, rendered on screen,
+   never reaches the report. The 2026-08-04 `web-ui` failure was undiagnosable for exactly this
+   reason; a re-run passed, so it was a flake, but *which* rule the connect broke is still unknown
+   and now unknowable. That is §9's proxy oracle: it cannot separate *still pending* from *refused*,
+   and it discards the evidence on the one path where evidence exists.
+2. **was outright vacuous in one place.** The labels are `connect a ↔ b` and `disconnect a ↔ b`, so
+   after a disconnect the status reads `disconnect usb0 ↔ console/raw ok` — which **contains the
+   substring `connect`**. The fault test's second assertion, `toContainText("connect")` issued right
+   after clicking connect, therefore matched the *stale* line instantly and asserted nothing. Checked
+   rather than eyeballed: `"disconnect usb0 ↔ console/raw ok".includes("connect")` is `true`, and
+   `/^connect\b/.test(…)` is `false`.
+
+**Decision:** two helpers, `statusOk` / `statusErr`, that wait on `.estatus` *whatever it says* and
+then assert the class — so a refusal ends the wait at once and the message quotes it. Proved by
+planting one: asserting the illegal connect as a success now fails with `the editor's status line
+reports a refusal, not /^connect\b/` and `Received string: "estatus err"`, where the old form gave
+`element(s) not found`. Verb matchers are anchored regexes (`/^connect\b/`), which is what closes the
+vacuity; a node *name* is unique per run and stays a plain string. The class assertion carries a
+short timeout because `say()` sets `className` and `textContent` in one call, so once the text
+matches the class cannot still change — a long timeout there would only buy 20 s of waiting for a
+settled value. Browser gate re-run 3× locally under `SNX_WEB_UI=required`, green each time.
+
 ---
 
 ## 4. Findings carried forward (from serial-nexus-doctor)

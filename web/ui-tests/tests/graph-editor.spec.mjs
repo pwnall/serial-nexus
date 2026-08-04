@@ -29,6 +29,64 @@ function gnode(page, name) {
   return page.locator(`#graphview .gnode:has(.gname:text-is("${name}"))`);
 }
 
+/**
+ * Wait for the editor's status line to mention `text`, then require the verb to
+ * have *succeeded* — two steps against `.estatus`, deliberately, rather than one
+ * against `.estatus.ok`.
+ *
+ * `editor.mjs` renders **one** status div and flips its class between `ok` and
+ * `err`. So a locator written as `.estatus.ok` matches *nothing at all* when the
+ * verb was refused: the wait then burns its whole timeout and dies with
+ * `element(s) not found`, and the daemon's own words — which `editor.mjs` renders
+ * precisely because "a refusal names the rule it broke … paraphrasing it here would
+ * cost the operator the only precise thing they got" — never reach the report. That
+ * is a proxy oracle in the sense AGENTS.md §9 means: it cannot tell *still pending*
+ * from *refused*, and it discards the evidence on the one path where evidence
+ * matters. A CI failure on 2026-08-04 (`83239a5`, `graph-editor.spec.mjs:141`) was
+ * unreadable for exactly this reason — 20 s of "element(s) not found" and no clue
+ * which rule the connect broke.
+ *
+ * This form waits on the status line whatever it says, so a refusal ends the wait
+ * immediately and the assertion quotes it.
+ *
+ * **Pass a `/^verb\b/` regex, not a bare verb string, and the reason is not style.**
+ * `editor.mjs` renders `` `${label} ok` `` with labels like `connect a ↔ b` and
+ * `disconnect a ↔ b`, so the *previous* verb's status is still on screen when the
+ * next one is clicked — and `"disconnect usb0 ↔ console/raw ok"` **contains** the
+ * substring `"connect"`. A `toContainText("connect")` written after a disconnect
+ * therefore matches the stale line instantly and asserts nothing at all. That was
+ * live in this file (the fault test's second assertion) until 2026-08-04. Anchoring
+ * at the start of the status text is what makes the wait real; a node *name*, which
+ * is unique per run and appears mid-line, is safe as a plain string.
+ *
+ * The class check gets a short timeout on purpose: `say()` sets `className` and
+ * `textContent` in one call, so by the time the text matches the class is already
+ * final. A long one here would only buy 20 s of waiting for a value that cannot
+ * still change.
+ */
+async function statusOk(page, matcher) {
+  const status = page.locator("#editorview .estatus");
+  await expect(status).toContainText(matcher);
+  await expect(
+    status,
+    `the editor's status line reports a refusal, not ${matcher}`,
+  ).toHaveClass(/\bok\b/, { timeout: 2000 });
+}
+
+/** The mirror of {@link statusOk}: the verb must be *refused*, and for the stated
+ * reason. Same two-step, same argument — asserting through `.estatus.err` alone
+ * would report "not visible" if the daemon unexpectedly *accepted*, which is the
+ * one outcome this test exists to catch. */
+async function statusErr(page, text) {
+  const status = page.locator("#editorview .estatus");
+  await expect(status).toContainText(text);
+  await expect(
+    status,
+    `the editor accepted a verb the daemon must refuse ("${text}")`,
+  ).toHaveClass(/\berr\b/, { timeout: 2000 });
+  return status;
+}
+
 test("the graph page draws the daemon's own topology", async ({ page }) => {
   await open(page);
   await selectView(page, "graph");
@@ -69,7 +127,7 @@ test("a scripted fault flips the indicator through waiting and back", async ({
     d.accept();
   });
   await row.getByRole("button", { name: "disconnect" }).click();
-  await expect(page.locator("#editorview .estatus.ok")).toContainText("disconnect");
+  await statusOk(page, /^disconnect\b/);
 
   await selectView(page, "graph");
   // Live via `subscribe` (§17): no reload, no poll in the test.
@@ -81,7 +139,7 @@ test("a scripted fault flips the indicator through waiting and back", async ({
   await page.locator('#editorview input[placeholder^="endpoint a"]').fill(FAULT_A);
   await page.locator('#editorview input[placeholder^="endpoint b"]').fill(FAULT_B);
   await page.getByRole("button", { name: "connect", exact: true }).click();
-  await expect(page.locator("#editorview .estatus.ok")).toContainText("connect");
+  await statusOk(page, /^connect\b/);
 
   await selectView(page, "graph");
   await expect(gnode(page, FAULT_NODE)).toHaveClass(/active/);
@@ -100,11 +158,9 @@ test("an illegal connect surfaces the daemon's named structural error", async ({
   await page.locator('#editorview input[placeholder^="endpoint b"]').fill(FAULT_NODE);
   await page.getByRole("button", { name: "connect", exact: true }).click();
 
-  const status = page.locator("#editorview .estatus.err");
-  await expect(status).toBeVisible();
   // Verbatim: the operator reads the rule that was broken, which is the only precise
   // thing they got.
-  await expect(status).toContainText("two host-facing endpoints");
+  const status = await statusErr(page, "two host-facing endpoints");
   await expect(status).toContainText("must join one host to one target");
 
   // Nothing changed — a refusal that half-applied would be worse than one that failed.
@@ -131,16 +187,14 @@ test("adding a console through the editor makes bytes flow end to end", async ({
     await fields.nth(1).locator("input").fill(RUN);
     await fields.nth(2).locator("input").fill(file);
     await page.getByRole("button", { name: "add node" }).click();
-    await expect(page.locator("#editorview .estatus.ok")).toContainText(name);
+    await statusOk(page, name);
 
     await page
       .locator('#editorview input[placeholder^="endpoint a"]')
       .fill(ECHO);
     await page.locator('#editorview input[placeholder^="endpoint b"]').fill(name);
     await page.getByRole("button", { name: "connect", exact: true }).click();
-    await expect(page.locator("#editorview .estatus.ok")).toContainText(
-      "connect",
-    );
+    await statusOk(page, /^connect\b/);
 
     // Built entirely from the browser; now drive bytes through what the browser built.
     await selectView(page, "console");
