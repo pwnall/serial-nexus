@@ -3907,9 +3907,52 @@ would make a kernel that changed its mind fail the lane instead of reporting the
 `macos.jq`'s structural count moved 12 → 13. **The macOS artifact is still owed** — until the doctor
 runs on a Mac and that report is committed, `docs/macos.md`'s open question stays open.
 
----
+### 3.31 OPEN DEFECT — an interior node's queued targetward bytes die uncounted at teardown
 
-## 4. Findings carried forward (from serial-nexus-doctor)
+**Not a deviation and not justified: a §5 violation, recorded here because it was found and
+reproduced during the §3.29 triage and must not be lost.** Filed 2026-08-04; **unfixed at time of
+writing**, deliberately, because the fix adds an observation-surface field and that is the reader's
+call, not a drive-by.
+
+**The rule being broken**, stated verbatim in `daemon/src/runtime.rs`'s `TargetwardLoss` doc:
+"Targetward is the direction §5 forbids dropping on, so *every* non-delivery exit of *every* pump has
+to reach a counter." The type exists precisely because that obligation "was a review convention
+rather than a compiler rule … and twice shipped with an exit that charged nothing".
+
+**The path.** `MapNode::signal_stop` calls `TaskSet::abort_all`, which drops the `targetward_map`
+future *together with its `rx: mpsc::Receiver<Chunk>`* and every chunk queued in it, plus the chunk
+parked inside `forward_targetward`'s `.await`. Those are bytes the pty already `read(2)`-ed off a pts
+master and handed on. The pump body itself is scrupulous — every one of its exits charges — but
+nothing ever runs it again, so no exit is taken at all. `daemon.rs`'s cascade path is
+`node.signal_stop(); node.teardown();`, and the reply's `purged_bytes` cannot cover the gap because
+`Node::purge_origin` returns 0 for every non-pty kind. A **log** node *is* flushed before removal on
+the same path; the targetward queue is not. The same shape exists on the pty's own `signal_stop`,
+which drops `read_and_poll` while its `pending: Option<Chunk>` may hold an already-read payload.
+
+**Reproduced on this box**, HEAD daemon, graph `p0`(pty) → `console`(map) → `usb0`(serial, device
+absent so targetward backpressures), client writing until the pipeline saturates:
+
+```
+client wrote 1740288; map targetward.bytes_in 931840;  IN FLIGHT = 808448
+remove-node console --cascade -> {"cascaded_edges":2,"purged_bytes":18947,"released_locks":2}
+after: p0.discarded_targetward 4095, everything else 0; usb0 all 0
+accounted at removal: 18947 + 4095 = 23042 of 808448
+```
+
+**Why it is not "obviously by design".** `daemon.rs` justifies the interior-origin zero for
+`disconnect` on the grounds that "what it holds sits in its own bounded channel, which the node keeps
+and will deliver if it is wired again" — true there, false at the removal site, where the node is
+destroyed and will never deliver. The same file states the opposite intent for this very call site:
+"an operator cascading a writer with bytes queued lost them by design (§5 all-loss-is-visible)" —
+*visible* being the word the implementation does not honour.
+
+**Shape of the fix, for whoever takes it.** Drain the receiver (and any parked chunk) at teardown and
+charge it, rather than aborting the task out from under it. The blocker is naming, not mechanism:
+none of the existing counters names this loss, and reusing `discarded_no_raw_edge` would be a
+misnomer of exactly the kind §5's counters exist to prevent — so it wants a new field
+(`discarded_at_teardown` or similar) on the map and the codec, which means `docs/rpc/observation.md`
+carries a row before the registry gate will accept it (the `-32007` precedent from review 37). A
+fail-first guard is easy and should come first: the reproduction above is already deterministic.
 
 Full report: `docs/serial-nexus-doctor.md`. Re-runnable per system with
 `cargo run -p serial-nexus-doctor` (Markdown) / `--json | jq -e -f expectations/linux.jq`.
