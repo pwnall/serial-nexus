@@ -3050,9 +3050,10 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **726 passing, 0 failed, 4 ignored** across 111 test
-targets on Linux (2026-08-04: the P13 probe's unit test and `p8_map`'s residual-forward
-guard, on top of the 724 the review-37 remediation left on 2026-07-29); of those, one is the doc-tested
+The current whole-suite figure is **729 passing, 0 failed, 4 ignored** across 112 test
+targets on Linux (2026-08-04: the P13 probe's unit test, `p8_map`'s residual-forward
+guard and `p13_teardown_accounting`'s three, on top of the 724 the review-37
+remediation left on 2026-07-29); of those, one is the doc-tested
 twelve-line embedder `main` in `daemon/src/lib.rs`, which is the §15.26 entry surface
 proving it still compiles under the family names. On **macOS** the same tree is **711
 passing, 0 failed, 4 ignored** across 101 binaries + 8 doc-test targets (2026-07-30, Darwin
@@ -3923,52 +3924,87 @@ would make a kernel that changed its mind fail the lane instead of reporting the
 `macos.jq`'s structural count moved 12 → 13. **The macOS artifact is still owed** — until the doctor
 runs on a Mac and that report is committed, `docs/macos.md`'s open question stays open.
 
-### 3.31 OPEN DEFECT — an interior node's queued targetward bytes die uncounted at teardown
+### 3.31 An interior node's queued targetward bytes died uncounted at teardown — fixed
 
-**Not a deviation and not justified: a §5 violation, recorded here because it was found and
-reproduced during the §3.29 triage and must not be lost.** Filed 2026-08-04; **unfixed at time of
-writing**, deliberately, because the fix adds an observation-surface field and that is the reader's
-call, not a drive-by.
+**Design:** §5 forbids dropping targetward and requires every loss to be visible and
+attributable. `runtime.rs`'s `TargetwardLoss` states the operational form verbatim: "Targetward is
+the direction §5 forbids dropping on, so *every* non-delivery exit of *every* pump has to reach a
+counter" — a type that exists because the obligation "was a review convention rather than a compiler
+rule … and twice shipped with an exit that charged nothing".
+**Reality:** this was the third instance, and it evaded that type completely. Every interior pump
+took its `mpsc::Receiver<Chunk>` **by value**, which moved it into the spawned future. So
+`TaskSet::abort_all` — the whole of `signal_stop` for every kind but `log` — dropped the receiver
+*and every chunk queued in it*, and no exit of the pump ran to charge them. The pump bodies were
+scrupulous; they simply never got another turn. Reproduced on the shipped daemon, one
+`remove-node --cascade` on a saturated map: **808 448 bytes in flight, 23 042 accounted, every node
+counter `0`** and the reply's `purged_bytes` structurally unable to cover it (`Node::purge_origin`
+returns 0 for every non-pty kind). Found by adversarial verification of the §3.29 work and
+reproduced before being believed.
 
-**The rule being broken**, stated verbatim in `daemon/src/runtime.rs`'s `TargetwardLoss` doc:
-"Targetward is the direction §5 forbids dropping on, so *every* non-delivery exit of *every* pump has
-to reach a counter." The type exists precisely because that obligation "was a review convention
-rather than a compiler rule … and twice shipped with an exit that charged nothing".
+**Decision — the shape, and why it is this shape.** Two constraints ruled out the obvious fixes:
 
-**The path.** `MapNode::signal_stop` calls `TaskSet::abort_all`, which drops the `targetward_map`
-future *together with its `rx: mpsc::Receiver<Chunk>`* and every chunk queued in it, plus the chunk
-parked inside `forward_targetward`'s `.await`. Those are bytes the pty already `read(2)`-ed off a pts
-master and handed on. The pump body itself is scrupulous — every one of its exits charges — but
-nothing ever runs it again, so no exit is taken at all. `daemon.rs`'s cascade path is
-`node.signal_stop(); node.teardown();`, and the reply's `purged_bytes` cannot cover the gap because
-`Node::purge_origin` returns 0 for every non-pty kind. A **log** node *is* flushed before removal on
-the same path; the targetward queue is not. The same shape exists on the pty's own `signal_stop`,
-which drops `read_and_poll` while its `pending: Option<Chunk>` may hold an already-read payload.
+* *The node cannot drain the queue*, because it does not hold it — the receiver is inside the
+  future. So the receiver now lives in a shared slot, `TargetwardInbox`, that the node keeps a
+  handle on: `TeardownLoss::watch(rx)` at the spawn, `drain()` at the top of `signal_stop`.
+* *A `Drop` guard on the receiver would charge too late.* Aborting a task does not drop its future
+  synchronously — the `LocalSet` gets to it after the enclosing critical section returns — and
+  `remove-node` is a **synchronous** handler, so its reply would be composed before the charge
+  landed. Worse, on that path the node is destroyed, so a counter living on the node has no reader
+  left. The count has to exist at the instant the operator asks for it.
 
-**Reproduced on this box**, HEAD daemon, graph `p0`(pty) → `console`(map) → `usb0`(serial, device
-absent so targetward backpressures), client writing until the pipeline saturates:
+`TargetwardInbox::recv` reaches the receiver through `poll_fn` + tokio's `poll_recv`, so the
+`CriticalCell` borrow is taken and released *inside* a synchronous closure on every poll and never
+spans an `.await` — invariant 1 / §16.2 upheld structurally rather than by hand, with no new
+`unsafe`. Draining is `try_recv` to exhaustion: synchronous and non-blocking, so it belongs in the
+cheap half of teardown exactly as `abort_all`'s doc requires, and it is idempotent because the
+removal path calls `signal_stop` twice. **Order matters and is stated where the swap happens**:
+drain *before* `abort_all`, since abort is what drops the future the queue lives in. Draining first
+also ends the pump *gracefully* — an emptied inbox answers `None`, so the `while let` finishes by
+itself — which makes the abort a backstop rather than the mechanism.
 
-```
-client wrote 1740288; map targetward.bytes_in 931840;  IN FLIGHT = 808448
-remove-node console --cascade -> {"cascaded_edges":2,"purged_bytes":18947,"released_locks":2}
-after: p0.discarded_targetward 4095, everything else 0; usb0 all 0
-accounted at removal: 18947 + 4095 = 23042 of 808448
-```
+The chunk a pump is holding *mid-flight* is counted too: `recv` records its length and clears it at
+the top of the next `recv`, the one place a pump can be in only when the previous chunk's fate is
+settled. The one inaccuracy is the sliver between a successful delivery and the next `recv`, where
+this over-reports by one chunk — deliberate, and the same direction the codec's residual rule
+takes: err toward reporting loss, never toward hiding it.
 
-**Why it is not "obviously by design".** `daemon.rs` justifies the interior-origin zero for
-`disconnect` on the grounds that "what it holds sits in its own bounded channel, which the node keeps
-and will deliver if it is wired again" — true there, false at the removal site, where the node is
-destroyed and will never deliver. The same file states the opposite intent for this very call site:
-"an operator cascading a writer with bytes queued lost them by design (§5 all-loss-is-visible)" —
-*visible* being the word the implementation does not honour.
+**Where it surfaces.** A new `discarded_at_teardown` on `map`, `codec` and `exec` in `state`, and
+the same figure in the `remove-node` reply — because `state` cannot report the last loss of a node
+that no longer appears in `state`. `docs/rpc/observation.md` and `docs/rpc/configuration.md` carry
+both, including the sentence that `purged_bytes` and `discarded_at_teardown` are different losses
+and must not be summed: the first is §6's deliberate purge at the edges, the second is what the
+node's own pump had accepted and not yet delivered.
 
-**Shape of the fix, for whoever takes it.** Drain the receiver (and any parked chunk) at teardown and
-charge it, rather than aborting the task out from under it. The blocker is naming, not mechanism:
-none of the existing counters names this loss, and reusing `discarded_no_raw_edge` would be a
-misnomer of exactly the kind §5's counters exist to prevent — so it wants a new field
-(`discarded_at_teardown` or similar) on the map and the codec, which means `docs/rpc/observation.md`
-carries a row before the registry gate will accept it (the `-32007` precedent from review 37). A
-fail-first guard is easy and should come first: the reproduction above is already deterministic.
+**Guard.** `itest/tests/p13_teardown_accounting.rs`, three tests, device-free and deterministic on
+every platform. The determinism comes from two choices worth keeping: a map whose *raw* side is
+unattached parks its pump inside `await_origin` (§5 forbids discarding for a detached edge, so it
+must stall its writers), and the bytes go in through **`send`**, which is RPC-acked — so "in flight"
+is a fact the harness observed rather than a timing assumption, and the assertions are equalities
+rather than thresholds. One of the three is the conservation law itself: destroyed + purged + pty
+== queued. Fail-first proof, by removing `TeardownLoss::drain()` from `MapNode::signal_stop` in
+place and rebuilding: **3/3 fail**, with `destroyed 0 + purged 0 + pty 0 must equal the 2560
+queued` — the shipped defect, verbatim.
+
+**Exactly what is covered, because "map, codec and exec are fixed" would be too broad.** What is
+drained and counted is each node's **host-facing targetward queue** — the arbitrated
+`mpsc::Receiver` an endpoint's writers feed — plus the chunk its pump is holding. That is the whole
+of the map's and the codec's targetward exposure. It is *not* the whole of exec's: exec's
+per-channel forwarders pull from those queues and push into an internal merged
+`mpsc::Receiver<(String, Chunk)>` (`CHANNEL_CAP` again) that `pump_child` reads, and a chunk that has
+moved into that second stage is beyond this handle's reach. So exec's number is a floor, not a
+total, and closing the rest means giving the merge stage the same treatment — the same shape of work
+as `serial`/`leg` below. Stated here rather than discovered later by someone diffing the counter
+against a conservation sum.
+
+**What is deliberately NOT fixed here, and why not half-done.** `serial` and `leg` own targetward
+queues of the same shape and lose them the same way. Their receivers are also fed to
+`boundary::drain_to_quiescence` on the purge-on-reconnect path (§7.1, §7.4), so adopting the shared
+inbox means moving that helper onto it — a §16.5 one-rule-one-place change rather than the four
+lines the interior kinds needed. They therefore report nothing at all rather than a counter that
+reads `0` while bytes are being destroyed, which would be worse than the silence it replaced. The
+pty's sibling is different again and not fixable this way: its undelivered payload is a `pending`
+slot inside the reader's own stack frame, not a queue anything else can reach.
+
 
 ### 3.32 P10's direction labels were inverted, in the keys and the prose alike
 

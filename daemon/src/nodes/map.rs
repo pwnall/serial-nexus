@@ -34,12 +34,11 @@ use serial_nexus_core::config::{MAP_RAW_ENDPOINT, NodeConfig};
 use serial_nexus_core::graph::EndpointAddr;
 use serial_nexus_core::map::MapDirection;
 use serial_nexus_core::state::{NodeState, NodeStatus};
-use tokio::sync::mpsc;
 
 use crate::boundary::TaskSet;
 use crate::runtime::{
-    DropCounters, EdgeInbox, LossCounter, SharedFanOut, SharedTargetEdge, Wiring, await_origin,
-    forward_targetward,
+    DropCounters, EdgeInbox, LossCounter, SharedFanOut, SharedTargetEdge, TargetwardInbox,
+    TeardownLoss, Wiring, await_origin, forward_targetward,
 };
 use crate::tap::TapFeed;
 
@@ -140,6 +139,11 @@ pub struct MapNode {
     /// loss, so they are counted (§5), mirroring the exec codec's
     /// `mux_discarded_targetward`.
     targetward_discarded: Rc<Cell<u64>>,
+    /// Targetward bytes destroyed because this node was torn down while they were
+    /// still queued for it (§5, notes §3.31). Distinct from `targetward_discarded`:
+    /// that one names bytes this map *decided* to swallow while running, this one
+    /// names bytes it never got to look at.
+    teardown_loss: TeardownLoss,
     tasks: TaskSet,
     /// The node's observed status *and the moment it entered it* (§7).
     status: NodeState,
@@ -180,6 +184,7 @@ impl MapNode {
             raw_edge: None,
             hostward_unattached: Rc::new(Cell::new(0)),
             targetward_discarded: Rc::new(Cell::new(0)),
+            teardown_loss: TeardownLoss::default(),
             tasks: TaskSet::default(),
             status: NodeState::new(NodeStatus::Active),
         })
@@ -246,9 +251,12 @@ impl MapNode {
                 .raw_edge
                 .clone()
                 .unwrap_or_else(crate::runtime::TargetEdge::new);
+            // The node keeps a handle on the queue rather than handing it away
+            // outright, so `signal_stop` can count what teardown destroys (§5,
+            // notes §3.31).
             self.tasks.push(tokio::task::spawn_local(targetward_map(
                 self.targetward.clone(),
-                rx,
+                self.teardown_loss.watch(rx),
                 edge,
                 self.targetward_discarded.clone(),
             )));
@@ -300,6 +308,10 @@ impl MapNode {
                 "discarded_no_raw_edge".to_owned(),
                 json!(self.targetward_discarded.get()),
             );
+            obj.insert(
+                "discarded_at_teardown".to_owned(),
+                json!(self.teardown_loss.bytes()),
+            );
         }
         json!({
             "hostward": hostward,
@@ -319,7 +331,19 @@ impl MapNode {
     /// dies, so "a node's tasks die with the node" holds by type rather than by a
     /// hand-written copy of this body (SIMPB-10).
     pub fn signal_stop(&mut self) {
+        // Count before aborting, and in that order: `abort_all` is what drops the
+        // pump's future, and the queue goes with it. Draining first also stops the
+        // pump *gracefully* — an emptied inbox answers `None` — so the abort below
+        // is a backstop rather than the mechanism (§5, notes §3.31).
+        self.teardown_loss.drain();
         self.tasks.abort_all();
+    }
+
+    /// Targetward bytes this node destroyed at teardown, for the verb that removed
+    /// it to report (§5: the node is about to stop existing, so `state` cannot be
+    /// the only home for its last loss).
+    pub fn discarded_at_teardown(&self) -> u64 {
+        self.teardown_loss.bytes()
     }
 
     pub fn teardown(&mut self) {
@@ -371,7 +395,7 @@ async fn hostward_map(
 /// boundary owns any framing (a codec channel) or writes raw (a serial).
 async fn targetward_map(
     dir: Rc<Direction>,
-    mut rx: mpsc::Receiver<Chunk>,
+    rx: TargetwardInbox,
     edge: SharedTargetEdge,
     discarded: Rc<Cell<u64>>,
 ) {
@@ -416,6 +440,7 @@ async fn targetward_map(
 mod tests {
     use super::*;
     use crate::runtime::DropCounters;
+    use tokio::sync::mpsc;
 
     /// Wrap one receiver as an [`EdgeInbox`] carrying exactly that edge, then
     /// closed — so a pump under test drains it and returns rather than parking.
@@ -533,7 +558,7 @@ mod tests {
             // writers exactly as a steal does.)
             let handle = tokio::task::spawn_local(targetward_map(
                 identity_direction(),
-                rx,
+                TargetwardInbox::new(rx),
                 crate::runtime::TargetEdge::read_only(),
                 discarded.clone(),
             ));

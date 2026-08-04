@@ -50,9 +50,15 @@ None beyond the transport-level codes.
 ```console
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"teardown"}' | nc -N -U "$SOCK" | jq .result
 {
-  "torn_down": 3
+  "torn_down": 3,
+  "discarded_at_teardown": 0
 }
 ```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `torn_down` | integer | how many nodes were removed |
+| `discarded_at_teardown` | integer | targetward bytes the nodes were still holding for consumers that went away with them, summed across the graph — what tearing down cost, as against `torn_down`'s count of what it removed (§5: loss is always visible). Nonzero only where an interior node (`map`, `codec`, `exec`) had a non-empty targetward queue; see [`remove-node`](configuration.md#remove-node) for the single-node form and [observation.md](observation.md) for the per-node counter |
 
 Every open tap receives a terminal
 [`tap.closed`](observation.md#tapclosed-notification) notification on its own

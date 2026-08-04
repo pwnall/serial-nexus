@@ -46,7 +46,8 @@ use crate::boundary::TaskSet;
 use crate::cell::CriticalCell;
 use crate::runtime::{
     DropCounters, EdgeInbox, HostwardChannelStat, LossCounter, SharedFanOut, SharedTargetEdge,
-    Wiring, await_origin, forward_targetward, frame_ranges, route_channel_data,
+    TargetwardInbox, TeardownLoss, Wiring, await_origin, forward_targetward, frame_ranges,
+    route_channel_data,
 };
 use crate::tap::TapFeed;
 
@@ -280,6 +281,10 @@ pub struct CodecNode {
     /// The demux-side protocol health (WIRE-1). Shared with the demux task, which
     /// is what faults the node on a `Codec::demux` refusal.
     demux: Rc<DemuxHealth>,
+    /// Targetward bytes destroyed because this node was torn down while they were
+    /// still queued for it (§5, notes §3.31): what its pumps never got to look at,
+    /// as distinct from what they looked at and decided to discard.
+    teardown_loss: TeardownLoss,
     tasks: TaskSet,
     /// The node's observed status *and the moment it entered it* (§7). Shared with
     /// the demux task (WIRE-1) the way the exec codec shares its own, so a framing
@@ -306,6 +311,7 @@ impl CodecNode {
             .map(|c| (c.clone(), Rc::new(ChannelStat::default())))
             .collect();
         CodecNode {
+            teardown_loss: TeardownLoss::default(),
             name: name.clone(),
             codec_name: codec_name.clone(),
             faces: *faces,
@@ -358,7 +364,7 @@ impl CodecNode {
             };
             self.tasks
                 .push(tokio::task::spawn_local(unwired_targetward_drain(
-                    rx,
+                    self.teardown_loss.watch(rx),
                     self.mux_discarded_targetward.clone(),
                 )));
         }
@@ -472,7 +478,7 @@ impl CodecNode {
             };
             self.tasks.push(tokio::task::spawn_local(channel_targetward(
                 ch,
-                rx,
+                self.teardown_loss.watch(rx),
                 mux_edge.clone(),
                 self.codec.clone(),
                 stat,
@@ -556,6 +562,7 @@ impl CodecNode {
             "last_demux_error": self.demux.last.with(|l| l.clone()),
             // The multiplexed side's own hostward drops (the codec falling behind
             // the serial), so the loss stays located and attributable (§5).
+            "discarded_at_teardown": self.teardown_loss.bytes(),
             "multiplexed": {
                 "dropped_slow_consumer": self.mux_counters.as_ref().map_or(0, |c| c.dropped_full()),
                 // Targetward bytes drained at an unwired multiplexed endpoint (the
@@ -584,11 +591,20 @@ impl CodecNode {
     /// dies, so "a node's tasks die with the node" holds by type rather than by a
     /// hand-written copy of this body (SIMPB-10).
     pub fn signal_stop(&mut self) {
+        // Count what teardown destroys before `abort_all` drops the futures the
+        // queues live in — the ordering is the fix (§5, notes §3.31).
+        self.teardown_loss.drain();
         self.tasks.abort_all();
     }
 
     pub fn teardown(&mut self) {
         self.signal_stop();
+    }
+
+    /// Targetward bytes this node destroyed at teardown (§5, notes §3.31). `0` until
+    /// `signal_stop` has run, which is where the queues are drained and counted.
+    pub fn discarded_at_teardown(&self) -> u64 {
+        self.teardown_loss.bytes()
     }
 }
 
@@ -757,7 +773,7 @@ async fn hostward_demux(
 /// them, and for a pty origin the failed write ends `read_and_poll` along with
 /// presence latching, last-close handling and detach-release (MAP-1). Draining makes
 /// the node inert instead of destructive, with the loss attributable in `state`.
-async fn unwired_targetward_drain(mut rx: mpsc::Receiver<Chunk>, discarded: Rc<Cell<u64>>) {
+async fn unwired_targetward_drain(rx: TargetwardInbox, discarded: Rc<Cell<u64>>) {
     while let Some(bytes) = rx.recv().await {
         discarded.add(bytes.len() as u64);
     }
@@ -774,7 +790,7 @@ async fn unwired_targetward_drain(mut rx: mpsc::Receiver<Chunk>, discarded: Rc<C
 /// never dropped.
 async fn channel_targetward(
     channel: String,
-    mut rx: mpsc::Receiver<Chunk>,
+    rx: TargetwardInbox,
     mux_edge: SharedTargetEdge,
     codec: Rc<CriticalCell<Box<dyn Codec>>>,
     stat: Rc<ChannelStat>,
@@ -1273,7 +1289,7 @@ mod signal_tests {
         drop(in_tx); // close the source so the task drains its one chunk and returns
         channel_targetward(
             channel.to_owned(),
-            in_rx,
+            TargetwardInbox::new(in_rx),
             bound_edge(mux_tx),
             codec,
             stat.clone(),
@@ -1364,7 +1380,7 @@ mod tests {
                 // is the other half of the rule and a different test.)
                 let task = tokio::task::spawn_local(channel_targetward(
                     "console".to_owned(),
-                    rx,
+                    TargetwardInbox::new(rx),
                     TargetEdge::read_only(),
                     Rc::new(CriticalCell::new(Box::new(
                         serial_nexus_codec_reference::ReferenceCodec::new(),
@@ -1411,7 +1427,14 @@ mod tests {
         in_tx.send(Chunk::from(payload.clone())).await.unwrap();
         drop(in_tx); // close the source so the task drains its one chunk and returns
 
-        channel_targetward(channel, in_rx, edge, codec.clone(), stat.clone()).await;
+        channel_targetward(
+            channel,
+            TargetwardInbox::new(in_rx),
+            edge,
+            codec.clone(),
+            stat.clone(),
+        )
+        .await;
 
         // Every framed piece round-trips through `demux` byte-exact, with no loss.
         let mut reassembled: Vec<u8> = Vec::new();

@@ -834,6 +834,153 @@ pub type EdgeInboxTx = mpsc::Sender<mpsc::Receiver<Chunk>>;
 /// draining the previous edge's tail.
 pub(crate) const EDGE_INBOX_CAP: usize = 4;
 
+/// A host-facing endpoint's targetward receiver, held where the **node** can still
+/// reach it after handing it to a pump (§5, notes §3.31).
+///
+/// **Why this type exists.** Every interior pump used to take the raw
+/// `mpsc::Receiver<Chunk>` by value, which moved it into the spawned future. So when
+/// `TaskSet::abort_all` dropped that future — the whole of `signal_stop` for every
+/// node but `log` — it dropped the receiver *and every chunk queued in it*, and no
+/// exit of the pump ran to charge them. The pump bodies were scrupulous; they simply
+/// never got another turn. Measured on the shipped daemon: a `remove-node --cascade`
+/// on a saturated map destroyed **808 448 bytes** with 23 042 accounted and every
+/// node counter reading 0. That is the one thing §5 forbids outright, and
+/// [`TargetwardLoss`]'s own doc states the rule it broke: "every non-delivery exit of
+/// every pump has to reach a counter".
+///
+/// **Why a shared slot rather than a drain in `Drop`.** A `Drop` on the receiver
+/// would charge the bytes, but *asynchronously* — the future is dropped when the
+/// runtime processes the cancellation, and `remove-node` is a **synchronous** handler
+/// (`daemon.rs`), so its reply would be composed before the charge landed. Worse, on
+/// that path the node is destroyed, so a counter living on the node has no reader
+/// left. The loss has to be countable at the instant the operator asks for it, which
+/// means the node — not the future — must be able to reach the queue.
+///
+/// **Why it does not break invariant 1 / §16.2.** The receiver lives in a
+/// [`CriticalCell`], and [`Self::recv`] reaches it through `poll_fn` + tokio's
+/// `poll_recv`: the borrow is taken and released *inside* a synchronous closure on
+/// every poll and never spans an `.await`. That is the same structural guarantee
+/// `CriticalCell` exists to give, obtained without a single new `unsafe` or a
+/// hand-upheld rule.
+///
+/// Taking the receiver away is also how a pump is stopped *gracefully*: once the slot
+/// is empty [`Self::recv`] answers `None`, so the pump's `while let` ends by itself
+/// instead of being cut mid-flight.
+#[derive(Clone)]
+pub(crate) struct TargetwardInbox {
+    slot: Rc<CriticalCell<Option<mpsc::Receiver<Chunk>>>>,
+    /// Length of the chunk the pump currently has in its hands — taken out of the
+    /// queue but not yet delivered or charged.
+    ///
+    /// Cleared at the top of every [`Self::recv`], which is the one place a pump can
+    /// be in only when the previous chunk's fate is settled. A teardown that lands
+    /// while a chunk is mid-flight therefore still counts it, and the only inaccuracy
+    /// is the sliver between a successful delivery and the next `recv` — where this
+    /// over-reports by one chunk. That direction is deliberate and matches the
+    /// codec's residual rule: err toward reporting loss, never toward hiding it.
+    held: Rc<Cell<u64>>,
+}
+
+impl TargetwardInbox {
+    pub(crate) fn new(rx: mpsc::Receiver<Chunk>) -> Self {
+        TargetwardInbox {
+            slot: Rc::new(CriticalCell::new(Some(rx))),
+            held: Rc::new(Cell::new(0)),
+        }
+    }
+
+    /// The pump's receive. `None` means the endpoint is finished — either its senders
+    /// are all gone, or [`Self::drain_and_count`] took the queue away at teardown.
+    pub(crate) async fn recv(&self) -> Option<Chunk> {
+        // The previous chunk has been dealt with by definition: a pump only reaches
+        // its next `recv` after disposing of the last one.
+        self.held.set(0);
+        let chunk = std::future::poll_fn(|cx| {
+            self.slot.with_mut(|slot| match slot {
+                Some(rx) => rx.poll_recv(cx),
+                None => std::task::Poll::Ready(None),
+            })
+        })
+        .await;
+        self.held
+            .set(chunk.as_ref().map_or(0, |c| c.len() as u64) as u64);
+        chunk
+    }
+
+    /// Take the queue away and count everything that will never be delivered: what is
+    /// still buffered, plus the chunk the pump is holding.
+    ///
+    /// Synchronous and non-blocking (`try_recv` to exhaustion), so it belongs in the
+    /// cheap half of teardown and a caller may do it for every node before paying any
+    /// node's join cost — the property `TaskSet::abort_all`'s doc is protecting.
+    ///
+    /// Idempotent: the slot is empty afterwards, so a second call counts 0 rather
+    /// than double-charging. `signal_stop` is called twice on the removal path
+    /// (`teardown` re-runs it), which makes that a correctness requirement and not a
+    /// nicety.
+    pub(crate) fn drain_and_count(&self) -> u64 {
+        let queued = self.slot.with_mut(|slot| {
+            let mut rx = match slot.take() {
+                Some(rx) => rx,
+                None => return 0,
+            };
+            let mut bytes = 0u64;
+            while let Ok(chunk) = rx.try_recv() {
+                bytes += chunk.len() as u64;
+            }
+            bytes
+        });
+        queued + self.held.replace(0)
+    }
+}
+
+/// Every targetward queue one node owns, and the tally of what its teardown
+/// destroyed (§5, notes §3.31).
+///
+/// A node holds one of these instead of tracking inboxes by hand, so "count what you
+/// destroy" is four lines wherever it applies and cannot drift between kinds:
+/// [`Self::watch`] where the pump is spawned, [`Self::drain`] at the top of
+/// `signal_stop`, [`Self::bytes`] in `state_extra` and in the removal reply.
+///
+/// The ordering rule lives here rather than in seven call sites: `drain` must run
+/// **before** `TaskSet::abort_all`, because abort is what drops the futures the
+/// queues live in. Draining first is also what lets the pumps end *gracefully* —
+/// an emptied inbox answers `None` — so the abort is a backstop, not the mechanism.
+#[derive(Default)]
+pub(crate) struct TeardownLoss {
+    inboxes: Vec<TargetwardInbox>,
+    bytes: Cell<u64>,
+}
+
+impl TeardownLoss {
+    /// Wrap a targetward receiver on its way into a pump, keeping the node's handle
+    /// on it. The returned inbox is what the pump receives from.
+    pub(crate) fn watch(&mut self, rx: mpsc::Receiver<Chunk>) -> TargetwardInbox {
+        let inbox = TargetwardInbox::new(rx);
+        self.inboxes.push(inbox.clone());
+        inbox
+    }
+
+    /// Take every queue away and add up what will never be delivered. Idempotent:
+    /// the queues are empty afterwards, which matters because the removal path calls
+    /// `signal_stop` twice (`teardown` re-runs it).
+    pub(crate) fn drain(&self) {
+        let lost: u64 = self
+            .inboxes
+            .iter()
+            .map(TargetwardInbox::drain_and_count)
+            .sum();
+        if lost > 0 {
+            self.bytes.set(self.bytes.get().saturating_add(lost));
+        }
+    }
+
+    /// Bytes destroyed so far. `0` until [`Self::drain`] has run.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes.get()
+    }
+}
+
 /// What one hostward [`fan_out`] did with its chunk, for the producer's own
 /// per-node/per-channel bookkeeping.
 pub(crate) struct FanOut {

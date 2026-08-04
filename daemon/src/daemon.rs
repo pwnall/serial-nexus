@@ -850,6 +850,12 @@ impl Daemon {
             let mut node = st.nodes.remove(idx);
             node.signal_stop();
             node.teardown();
+            // What the node destroyed on its way out: bytes that were queued for its
+            // targetward pump and will now never be delivered (§5, notes §3.31). This
+            // has to be read *here*, between the stop and the drop, because the node
+            // is the only holder of the count and is about to stop existing — a
+            // `state` counter cannot report the loss of the thing that carried it.
+            let discarded_at_teardown = node.discarded_at_teardown();
 
             // Tell any tap on this node's endpoints that its endpoint is gone (§17,
             // TAP-1): the connection-side `OpenTap` handles outlive the hub, so a
@@ -916,6 +922,12 @@ impl Daemon {
                 // learns to read as absent rather than as none.
                 "released_locks": released_locks,
                 "purged_bytes": purged_bytes,
+                // The third loss this verb can cause, and the one that used to be
+                // silent (§5 all-loss-is-visible, notes §3.31). `purged_bytes` is §6's
+                // deliberate purge at the edges; this is what the node itself was
+                // still holding for a consumer that is going away with it. Always
+                // present, for the reason stated above.
+                "discarded_at_teardown": discarded_at_teardown,
             }))
         })
     }
@@ -1978,9 +1990,15 @@ impl Daemon {
             for n in &mut st.nodes {
                 n.signal_stop();
             }
-            // Pass 2: join them, now that they are all already unwinding.
+            // Pass 2: join them, now that they are all already unwinding — and sum
+            // what their targetward queues destroyed on the way out (§5, notes
+            // §3.31). Read here for the same reason `remove-node` reads it: after
+            // this loop the nodes are gone and `state` has nobody left to ask.
+            let mut discarded_at_teardown = 0u64;
             for mut n in st.nodes.drain(..) {
                 n.teardown();
+                discarded_at_teardown =
+                    discarded_at_teardown.saturating_add(n.discarded_at_teardown());
             }
             st.config = GraphConfig::default();
             st.endpoint_locks.clear();
@@ -1998,7 +2016,11 @@ impl Daemon {
             // ingest task self-terminates as the node teardowns above drop the
             // producers' feed senders.
             st.detach_taps(reason, |_| false);
-            json!({ "torn_down": count })
+            // `torn_down` is how many nodes went; `discarded_at_teardown` is what
+            // going cost, summed across them (§5 all-loss-is-visible, notes §3.31).
+            // Always present, `0` included: a field that appears only when nonzero is
+            // one a client learns to read as absent rather than as none.
+            json!({ "torn_down": count, "discarded_at_teardown": discarded_at_teardown })
         })
     }
 
@@ -2519,7 +2541,13 @@ mod tests {
         assert_eq!(result["feed_dropped"], json!(0));
 
         let torn = daemon.teardown();
-        assert_eq!(torn, json!({ "torn_down": 0 }));
+        // The whole reply, not a subset: this equality is what pins the verb's wire
+        // shape, and it is why adding `discarded_at_teardown` (§5, notes §3.31) had
+        // to come here too rather than landing unnoticed. An empty graph destroys
+        // nothing, so the new field reads `0` — present, as every count in this
+        // family is, because a field that appears only when nonzero is one a client
+        // learns to read as absent rather than as none.
+        assert_eq!(torn, json!({ "torn_down": 0, "discarded_at_teardown": 0 }));
 
         match rx.try_recv() {
             Ok(crate::tap::TapMsg::Closed {

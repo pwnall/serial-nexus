@@ -46,7 +46,7 @@ use crate::cell::CriticalCell;
 use crate::nodes::codec::UnconfiguredChannels;
 use crate::runtime::{
     CHANNEL_CAP, DataFrame, DropCounters, HostwardChannelStat, LossCounter, READ_BUF, SharedFanOut,
-    SharedTargetEdge, Wiring, data_frames, forward_targetward, route_channel_data,
+    SharedTargetEdge, TeardownLoss, Wiring, data_frames, forward_targetward, route_channel_data,
 };
 use crate::tap::TapFeed;
 
@@ -191,6 +191,10 @@ pub struct ExecCodecNode {
     /// supervisor's `Faulted` stamp is the only truthful status, and edge surgery
     /// must leave it alone.
     child_live: Rc<Cell<bool>>,
+    /// Targetward bytes destroyed because this node was torn down while they were
+    /// still queued for it (§5, notes §3.31): what its pumps never got to look at,
+    /// as distinct from what they looked at and decided to discard.
+    teardown_loss: TeardownLoss,
     tasks: TaskSet,
 }
 
@@ -215,6 +219,7 @@ impl ExecCodecNode {
             .map(|c| (c.clone(), Rc::new(ChannelStat::default())))
             .collect();
         ExecCodecNode {
+            teardown_loss: TeardownLoss::default(),
             name: name.clone(),
             faces: *faces,
             channels: channels.clone(),
@@ -255,9 +260,10 @@ impl ExecCodecNode {
             )
             .collect();
         for addr in addrs {
-            let Some(mut rx) = wiring.host_targetward_rx.remove(&addr) else {
+            let Some(rx) = wiring.host_targetward_rx.remove(&addr) else {
                 continue;
             };
+            let rx = self.teardown_loss.watch(rx);
             let discarded = self.mux_discarded_targetward.clone();
             self.tasks.push(tokio::task::spawn_local(async move {
                 while let Some(bytes) = rx.recv().await {
@@ -337,7 +343,8 @@ impl ExecCodecNode {
                 }
             }));
         }
-        for (ch, mut rx) in channel_rxs {
+        for (ch, rx) in channel_rxs {
+            let rx = self.teardown_loss.watch(rx);
             let src_tx = src_tx.clone();
             self.tasks.push(tokio::task::spawn_local(async move {
                 while let Some(chunk) = rx.recv().await {
@@ -425,6 +432,7 @@ impl ExecCodecNode {
             // Bytes that never reached the child because the envelope refused to
             // frame them (§5 all-loss-counted; unreachable for a sane channel id).
             "discarded_unframable": self.unframable_discarded.get(),
+            "discarded_at_teardown": self.teardown_loss.bytes(),
             "multiplexed": {
                 "dropped_slow_consumer": self.mux_counters.as_ref().map_or(0, |c| c.dropped_full()),
                 "discarded_targetward": self.mux_discarded_targetward.get(),
@@ -447,11 +455,20 @@ impl ExecCodecNode {
     /// dies, so "a node's tasks die with the node" holds by type rather than by a
     /// hand-written copy of this body (SIMPB-10).
     pub fn signal_stop(&mut self) {
+        // Count what teardown destroys before `abort_all` drops the futures the
+        // queues live in — the ordering is the fix (§5, notes §3.31).
+        self.teardown_loss.drain();
         self.tasks.abort_all();
     }
 
     pub fn teardown(&mut self) {
         self.signal_stop();
+    }
+
+    /// Targetward bytes this node destroyed at teardown (§5, notes §3.31). `0` until
+    /// `signal_stop` has run, which is where the queues are drained and counted.
+    pub fn discarded_at_teardown(&self) -> u64 {
+        self.teardown_loss.bytes()
     }
 }
 

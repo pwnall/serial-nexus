@@ -133,6 +133,28 @@ where it happens") makes one family of them meaningful everywhere. Per kind:
 * **exec** — `discarded_unframable`, `multiplexed.dropped_slow_consumer`,
   `multiplexed.discarded_targetward`, `restart_count`, and per channel
   `discarded_unattached`.
+* **map, codec and exec alike** — `discarded_at_teardown`: targetward bytes that were
+  queued for the node's own pump and were destroyed because the node was torn down
+  and will never deliver them. It reads `0` for the whole of a node's working life
+  and moves exactly once, at `signal_stop`, so on a *surviving* node it is always `0`
+  and the queued bytes are backlog rather than loss — the node may still deliver them
+  if a `connect` gives it somewhere to go. It is therefore mostly read from the
+  [`remove-node`](configuration.md#remove-node) reply, which carries the same figure
+  for the node it just destroyed: `state` cannot report the last loss of a node that
+  no longer appears in `state`. Distinct from every neighbouring counter, and the
+  distinction is the point: `discarded_no_raw_edge` (map) and
+  `multiplexed.discarded_targetward` (codec/exec) name bytes the pump *looked at* and
+  decided to swallow, while this names bytes it never got to look at; §6's per-origin
+  `purged` names bytes discarded *deliberately* when the write floor settled. Until
+  2026-08-04 this loss had no name at all and one cascade destroyed 808 448 bytes in
+  silence (`docs/implementation-notes.md` §3.31). Two limits, both deliberate and both
+  recorded there rather than left to be discovered against a conservation sum: it
+  counts each node's **host-facing** targetward queue (the whole of the map's and the
+  codec's exposure, but a *floor* for `exec`, whose forwarders feed a second internal
+  merge stage this handle does not reach); and `serial` and `leg` own queues of the
+  same shape and report nothing at all, which is the honest answer until they get the
+  same treatment — a counter reading `0` while bytes are destroyed would be worse than
+  the silence it replaced.
 * **codec and exec alike** — `discarded_unconfigured_channel` (bytes decoded onto
   a channel identity the node is not configured for: still dropped, §8 — an
   announcement never grows the graph — but counted where they are lost, §5), the

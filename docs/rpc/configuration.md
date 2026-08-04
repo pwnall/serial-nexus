@@ -282,11 +282,25 @@ origin's declared mode is untouched by a removal.
 | `cascaded_edges` | integer | number of attached edges removed (0 when none) |
 | `released_locks` | integer | how many of those cascaded edges held their endpoint's write lock and released it on the way out. `0` unless `cascade` removed a lock-holding writer |
 | `purged_bytes` | integer | un-flushed targetward bytes discarded with the cascaded origins, summed — the same fact [`disconnect`](#disconnect) reports for one edge, and honest for the same reason (§5: loss is always visible). Nonzero only where a **pty** origin was cascaded |
+| `discarded_at_teardown` | integer | targetward bytes the **removed node itself** was still holding for a consumer that is going away with it: what was queued for its own pump and will now never be delivered. Nonzero only for the interior kinds that own a host-facing targetward queue (`map`, `codec`, `exec`); for `exec` it is a floor rather than a total, and `serial`/`leg` do not report it at all — see [observation.md](observation.md). Always present, `0` included |
 
-The last two rows exist because the identical edge removal used to be loud through
+The last three rows exist because the identical edge removal used to be loud through
 `disconnect` and mute through this verb: an operator cascading a lock-holding writer
 changed who may write, and one cascading a writer with bytes queued lost them by design.
 Both are reported rather than done silently (review 37 `37-LIFE-1`).
+
+`purged_bytes` and `discarded_at_teardown` are **different losses and must not be
+added together as one number**. The first is §6's deliberate purge *at the edges* —
+bytes an origin had offered while the floor question was unsettled. The second is what
+the node's own pump had already accepted and had not yet delivered when the node
+stopped existing. Until 2026-08-04 only the first was reported and the second was
+silent: a `remove-node --cascade` on a saturated map destroyed 808 448 bytes and
+answered `purged_bytes: 0` with every node counter reading `0`
+(`docs/implementation-notes.md` §3.31). The same figure appears on the node's own
+`state` while it still exists — see
+[observation.md](observation.md) — which is where a `disconnect` that leaves the node
+alive reports it, since there the bytes are backlog the node may still deliver rather
+than loss.
 
 ### CLI
 
