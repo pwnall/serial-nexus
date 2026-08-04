@@ -1716,10 +1716,20 @@ impl FillResult {
 /// session, which is precisely the situation where knowing the real depth beats
 /// guessing at it.
 ///
-/// Both directions are measured because they are different buffers: master→slave
-/// is what a `pty` node writes *targetward* to its client, slave→master is what a
-/// client writes and the node reads *hostward*. Each runs on its own pair so
-/// neither fill perturbs the other.
+/// Both directions are measured because they are different buffers, and which is
+/// which is the opposite of the intuitive reading: a `pty` node holds the **master**
+/// and its client holds the slave, so **slave→master is *targetward*** — the client
+/// typing, travelling toward the device, which `nodes/pty.rs` reads off the master
+/// and hands to `try_forward_targetward` — while master→slave is *hostward*, the
+/// node delivering device output to its client. Each runs on its own pair so neither
+/// fill perturbs the other.
+///
+/// Both labels were inverted here through the 2026-07-30 artifacts, in the keys and
+/// in the consequence prose alike. The cost was not cosmetic: the number an operator
+/// reads when sizing `hostward_buffer` was the *other* direction's depth. Corrected
+/// 2026-08-04. The `probe_set` fingerprint covers ids and questions, so it does not
+/// move; a diff against an older report shows the two keys renamed with their
+/// numbers unchanged, which is exactly the swap.
 pub fn p10_pty_buffer_depth() -> Probe {
     let p = Probe::new(
         "P10",
@@ -1729,12 +1739,12 @@ pub fn p10_pty_buffer_depth() -> Probe {
     match (p10_fill_direction(true), p10_fill_direction(false)) {
         (Ok(targetward), Ok(hostward)) => {
             let p = p
-                .observe("master_to_slave_targetward", targetward.observations())
-                .observe("slave_to_master_hostward", hostward.observations());
+                .observe("slave_to_master_targetward", targetward.observations())
+                .observe("master_to_slave_hostward", hostward.observations());
             p.verdict(
                 Status::Supported,
                 &format!(
-                    "This kernel's pty accepts {} byte(s) master→slave (targetward, what a pty node writes to its client) and {} byte(s) slave→master (hostward, what the node reads) before answering EAGAIN, reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands (three sequential 7.0 runs on an idle box measured 11776–15360 first-pass and 13824–15360 total, and 6.18 has produced two of those shapes across two runs), so across kernels a one-chunk difference is noise and only an order-of-magnitude one is signal. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}",
+                    "This kernel's pty accepts {} byte(s) slave→master (**targetward** — a client typing, travelling toward the device) and {} byte(s) master→slave (**hostward** — the node delivering device output to its client) before answering EAGAIN, reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands (three sequential 7.0 runs on an idle box measured 11776–15360 first-pass and 13824–15360 total, and 6.18 has produced two of those shapes across two runs), so across kernels a one-chunk difference is noise and only an order-of-magnitude one is signal. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}",
                     targetward.bytes,
                     hostward.bytes,
                     targetward.total(),
@@ -1777,10 +1787,21 @@ fn p10_fill_direction(targetward: bool) -> anyhow::Result<FillResult> {
     sys::set_nonblocking(slave_fd)?;
     std::thread::sleep(PTY_SETTLE);
 
+    // Which fd is written decides which *graph* direction is being filled, and the
+    // mapping is the opposite of what it looks like. A pty node holds the **master**
+    // and its client holds the slave; `nodes/pty.rs` reads the master and calls
+    // `try_forward_targetward` on what it finds. So **slave → master is targetward**
+    // (the client typing, travelling toward the device) and master → slave is
+    // hostward (the node delivering device output to its client). This was inverted
+    // here through the 2026-07-30 artifacts: both keys and the consequence prose
+    // named each direction as the other, so an operator sizing `hostward_buffer`
+    // against the printed number was reading the wrong direction's depth. Corrected
+    // 2026-08-04; a diff against an older `docs/doctor/` report shows the keys
+    // renamed, and the *numbers* under them swapped meaning rather than changing.
     let (write_to, peer) = if targetward {
-        (master_fd, slave_fd)
-    } else {
         (slave_fd, master_fd)
+    } else {
+        (master_fd, slave_fd)
     };
     Ok(p10_fill(write_to, peer))
 }

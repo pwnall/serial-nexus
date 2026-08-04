@@ -986,9 +986,14 @@ b = "console/raw"
 /// this test no longer traverses the write-then-immediately-close residual path that
 /// `pty.rs`'s "a closing writer's residual must still be forwarded (not purged)
 /// before the close is finalized" describes. It never covered that promise
-/// deliberately — it traversed it by accident, and only on kernels that retain. If
-/// that promise wants a guard it needs its own, built on a controlled backpressure
-/// setup rather than on winning a poll-gap race. Recorded as a gap, not waved past.
+/// deliberately — it traversed it by accident, and only on kernels that retain.
+///
+/// That gap is **closed, not merely noted**:
+/// [`a_closing_writers_residual_is_forwarded_not_purged`] below is the deliberate
+/// guard for it, and was proved fail-first against a daemon with the drain gated on
+/// `now` — a regression this test passes and that one catches, with `purged: 64`
+/// where `discarded_no_raw_edge: 64` belongs. Do not "simplify" the two into one:
+/// they need opposite orderings, and that is the whole point.
 ///
 /// This reorder is **not** advertised as the root cause of the 2026-08-03 macOS red.
 /// XNU's `ptsclose` runs `ttylclose` → `ttywflush` → `ttywait` before any flush, which
@@ -1180,4 +1185,129 @@ b = "p0"
             );
         }
     }
+}
+
+// ---- 7: the residual-forward promise, kept where it is observable ---------------
+
+/// A closing writer's residual is **forwarded, not purged** — `nodes/pty.rs`'s
+/// stated promise: *"Drain available data for a writer that may write, regardless of
+/// a simultaneous POLLHUP: a closing writer's residual must still be forwarded (not
+/// purged) before the close is finalized."*
+///
+/// **Why this test exists, and why it is the one place in the suite that closes
+/// first.** Its sibling above deliberately observes the counter *before* the close
+/// (notes §3.29) — which, as a side effect, guarantees the daemon drained the master
+/// in an earlier poll pass, so the close there is always observed in a data-free
+/// pass and this promise is never exercised. Adversarial verification of that change
+/// found the gap by planting the natural regression of the promise:
+///
+/// ```text
+/// - if pending.is_none() && may_write && re.contains(PollFlags::POLLIN) {
+/// + if pending.is_none() && may_write && now && re.contains(PollFlags::POLLIN) {
+/// ```
+///
+/// a plausible "consistency" edit, since the sibling `TIOCPKT_IOCTL` branch really is
+/// gated on `now`. With it, the residual is purged at detach instead of forwarded and
+/// the dump shows `purged: 64` where `discarded_no_raw_edge: 64` belongs. The
+/// reordered sibling passes that regression; this test fails it. Coverage restored
+/// rather than merely mourned in a note.
+///
+/// **Why it is Linux-gated, which is the interesting part.** Closing first is exactly
+/// the shape §3.29 forbids in general, and the reason is that it silently assumes the
+/// kernel keeps unread bytes across the slave's last close. That assumption is not
+/// portable — and it is now *measured* rather than assumed: doctor **P13** reports
+/// this kernel's policy directly (`retains`, `close(2)` in ~7 µs, 64/64 recovered on
+/// Linux 7.0.0-29). So the gate here is not "macOS is awkward"; it is "this guard is
+/// only meaningful where P13 says `retains`, and Linux is where that is measured".
+/// Run the doctor before extending it to another platform, and read P13 first.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_closing_writers_residual_is_forwarded_not_purged() {
+    const TYPED: u64 = 64;
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let p0 = d.run().join("p0");
+    let cfg = format!(
+        r#"
+[[node]]
+type = "serial"
+name = "usb0"
+device = "{dev}"
+[[node]]
+type = "map"
+name = "console"
+targetward = ["lfcrlf"]
+[[node]]
+type = "pty"
+name = "p0"
+path = "{p0}"
+[[edge]]
+a = "usb0"
+b = "console/raw"
+write_mode = "never"
+[[edge]]
+a = "console"
+b = "p0"
+"#,
+        dev = d.run().join("absent-device").display(),
+        p0 = p0.display(),
+    );
+    rpc.load_toml(&cfg, false).expect("load");
+    assert!(
+        rpc.wait_status("p0", "active", Duration::from_secs(10)),
+        "p0 not active: {:?}",
+        rpc.node("p0")
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || p0.exists()),
+        "p0 symlink never appeared"
+    );
+    rpc.lock("p0", false, false, None).expect("lock p0");
+
+    let mut client = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(&p0)
+        .unwrap_or_else(|e| panic!("open pty slave: {e}"));
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            rpc.node("p0")
+                .and_then(|n| n.get("client_present").and_then(Value::as_bool))
+                == Some(true)
+        }),
+        "the client never became present"
+    );
+
+    // Type and close with nothing in between, so the daemon's next poll finds the
+    // data and the hangup together — the pass the promise is about. On a kernel that
+    // retains (P13), those bytes are still there for that pass to drain.
+    client
+        .write_all(&vec![b'x'; TYPED as usize])
+        .expect("type at the console");
+    client.flush().expect("flush");
+    drop(client);
+
+    // Forwarded: the map counts them as its own consumer-absent loss. Purged: they
+    // are charged to the origin's `purged` tally instead, and the map counts nothing
+    // — which is the regression's signature, so both halves are asserted.
+    let settled = wait_until(Duration::from_secs(10), || {
+        rpc.node("console")
+            .and_then(|n| n["targetward"]["discarded_no_raw_edge"].as_u64())
+            == Some(TYPED)
+    });
+    let node = rpc.node("console").expect("map node in state");
+    assert!(
+        settled,
+        "the closing writer's residual was not forwarded to the map — pty.rs drained \
+         it into the detach purge instead of forwarding it (look for `purged: {TYPED}` \
+         below): console={node} p0={:?}",
+        rpc.node("p0")
+    );
+    assert_eq!(
+        node.pointer("/lock/origins/0/purged")
+            .and_then(Value::as_u64),
+        Some(0),
+        "the residual must be forwarded, never purged-at-detach: {node}"
+    );
 }

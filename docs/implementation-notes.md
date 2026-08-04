@@ -3050,9 +3050,9 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **725 passing, 0 failed, 4 ignored** across 111 test
-targets on Linux (2026-08-04, after the P13 probe added one doctor unit test to the
-724 the review-37 remediation left on 2026-07-29); of those, one is the doc-tested
+The current whole-suite figure is **726 passing, 0 failed, 4 ignored** across 111 test
+targets on Linux (2026-08-04: the P13 probe's unit test and `p8_map`'s residual-forward
+guard, on top of the 724 the review-37 remediation left on 2026-07-29); of those, one is the doc-tested
 twelve-line embedder `main` in `daemon/src/lib.rs`, which is the §15.26 entry surface
 proving it still compiles under the family names. On **macOS** the same tree is **711
 passing, 0 failed, 4 ignored** across 101 binaries + 8 doc-test targets (2026-07-30, Darwin
@@ -3831,11 +3831,27 @@ before the close inserts an RPC round-trip there, which guarantees the daemon ha
 residual path, the one `nodes/pty.rs` describes as "a closing writer's residual must still be
 forwarded (not purged) before the close is finalized". It never covered that promise deliberately: it
 traversed it by accident, and only on kernels that retain, which is why the coverage evaporated the
-moment a kernel disagreed. **Gap recorded, not waved past** — if that promise wants a guard it needs
-its own, built on controlled backpressure (a saturated endpoint, so the residual is a held `pending`
-chunk rather than a poll-gap race) instead of on winning a microsecond window. The other cost is
-cosmetic: a failing `never` arm now takes ~20 s rather than ~10 s, because the pre-close wait spends
-its budget before the lifecycle wait spends its own.
+moment a kernel disagreed.
+
+**That gap is closed in the same change set, not merely recorded.** Adversarial verification found it
+by planting the promise's natural regression — gating the drain on `now`, a plausible "consistency"
+edit since the sibling `TIOCPKT_IOCTL` branch really is gated that way — and showing the reordered
+test passes it. `p8_map`'s new `a_closing_writers_residual_is_forwarded_not_purged` fails it, with the
+signature the promise predicts: `purged: 64` on the origin where `discarded_no_raw_edge: 64` belongs.
+Fail-first proof, both directions, on the same tree:
+
+| against a daemon with the drain gated on `now` | result |
+|---|---|
+| `a_read_only_map_leaves_its_writers_pty_alive` (reordered) | passes — the coverage loss, demonstrated |
+| `a_closing_writers_residual_is_forwarded_not_purged` (new) | **FAILED**, `"purged": 64` |
+
+That test is the one place in the suite that deliberately closes *before* reading a counter, so it
+carries the exception in its doc comment: the guard is meaningful only where the kernel retains, and
+that is no longer an assumption — **doctor P13 measures it** (`retains` on Linux 7.0.0-29), so the
+`#[cfg(target_os = "linux")]` gate has a measurement behind it rather than a platform prejudice. Read
+P13 before extending it anywhere. The other cost of the reorder is cosmetic: a failing `never` arm
+now takes ~20 s rather than ~10 s, because the pre-close wait spends its budget before the lifecycle
+wait spends its own.
 
 **A dynamic Linux referee was tried first and withdrawn — record it so it is not retried.** The idea
 was to precede the close with `tcflush(TCOFLUSH)`, "the same `ttyflush` XNU performs at last close",
@@ -3953,6 +3969,31 @@ misnomer of exactly the kind §5's counters exist to prevent — so it wants a n
 (`discarded_at_teardown` or similar) on the map and the codec, which means `docs/rpc/observation.md`
 carries a row before the registry gate will accept it (the `-32007` precedent from review 37). A
 fail-first guard is easy and should come first: the reproduction above is already deterministic.
+
+### 3.32 P10's direction labels were inverted, in the keys and the prose alike
+
+**Design:** a pty node holds the **master** and its client holds the slave; §5's directions are named
+from the graph, so client→node→device is *targetward* and device→node→client is *hostward*.
+`nodes/pty.rs` settles it operationally: it reads the master and hands what it finds to
+`try_forward_targetward`.
+**Reality:** `p10_pty_buffer_depth` filled master→slave and labelled it `targetward`, and slave→master
+and labelled it `hostward` — backwards, in the observation keys, the consequence sentence and the
+function's doc comment together, so nothing internal contradicted anything else. The cost is not
+cosmetic, which is why this is a defect and not a typo: P10's stated purpose is to be read when
+sizing `hostward_buffer`, and the number printed under that word was the *other* direction's depth.
+Found while auditing the probe set during the §3.29 triage, and settled against `pty.rs`'s forwarding
+call rather than against the prose that was wrong.
+**Decision:** the fill mapping, both keys and both descriptions are corrected, and the reason the
+mapping "looks backwards" is stated where the swap happens. The keys are
+`slave_to_master_targetward` and `master_to_slave_hostward`. **`probe_set` does not move** — the
+fingerprint covers ids and questions, and neither changed — so the committed `docs/doctor/` artifacts
+stay diffable; what a diff against a pre-2026-08-04 report shows is the two keys renamed with their
+numbers unchanged, which is exactly the correction. Those artifacts are frozen records (§16.13) and
+are **not** rewritten: they printed what the tool printed on their date.
+
+---
+
+## 4. Findings carried forward (from serial-nexus-doctor)
 
 Full report: `docs/serial-nexus-doctor.md`. Re-runnable per system with
 `cargo run -p serial-nexus-doctor` (Markdown) / `--json | jq -e -f expectations/linux.jq`.
