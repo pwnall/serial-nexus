@@ -7568,3 +7568,80 @@ environment that cannot bind `0.0.0.0:0` with `--tls`. `SNX_TLS=required` covers
 both, as a third instance of one mechanism rather than a third mechanism. Both arms
 run, not predicted: with `curl` hidden the test skips and stays green, and with
 `SNX_TLS=required` it fails naming which skip fired.
+
+### 3.58 Plan §18 item 3, run as far as this box allows — and the protocol's own weak arm
+
+**Plan:** §18 item 3. **Rules:** plan §3 rules 13, 14; AGENTS §6 (`--no-fail-fast`
+for platform validation), §8 (measure the box), §9 (record refuted diagnoses; no
+root-cause claim without evidence).
+
+**Pre-registration, written before any run.** Notes §3.54 records two rig tests
+failing together in 2 of 5 full rig-attached runs —
+`p12_serial_exclusivity::a_break_straddled_by_a_replace_leaves_the_line_transmitting`
+and `serial_hardware::crossover_rig_custom_baud_byte_exact` — against 0 of 5 before
+the replug work existed, with both 0 of 5 in isolation, the direct replug→rig
+sequence 0 of 2, and the obvious ordering story refuted. Two hypotheses: **H1**, the
+suite got longer (contention, not the replug tests); **H2**, the replug tests did
+something. Predictions:
+
+| arm | H1 predicts | H2 predicts |
+|---|---|---|
+| A — `--test-threads=1`, replug lane **green** | pass (concurrency removed) | may still fail (the tests still run, serially) |
+| B — replug tests not executing, binary still built | pass | pass |
+
+**Arm B does not discriminate, and that is a property of the protocol §3.54
+pre-registered rather than a result** — both hypotheses predict the same outcome.
+Recorded here because it was noticed *before* the runs, not after them.
+
+**What ran.** Four full rig-attached workspace runs at `4621cff`, on a settled box
+(load 0.06–0.87 throughout, 8 cores, nothing else building):
+
+| run | shape | wall | result | the two §3.54 tests |
+|---|---|---|---|---|
+| B1 | default threads | 179.3 s | 810 passed, **1 failed**, 4 ignored | both **ok** |
+| B2 | default threads | 176.7 s | 811 passed, 0 failed, 4 ignored | both **ok** |
+| B3 | default threads | 177.2 s | 811 passed, 0 failed, 4 ignored | both **ok** |
+| A | `--test-threads=1` | 280.2 s | 811 passed, 0 failed, 4 ignored | both **ok** |
+
+**The §3.54 pair did not reproduce: 0 failing of 4.** That refutes nothing and
+confirms nothing, and the three reasons are stated rather than buried.
+
+1. **The replug lane did not run.** `scripts/bless --verify` reports the installed
+   copy `Stale` — the kernel strips `security.capability` on every rewrite and this
+   tree has been rebuilt many times — and re-blessing needs one interactive `sudo
+   setcap` this session could not issue (`sudo -n true` → "interactive
+   authentication is required"). So every run above is the **`SNX_REPLUG` absent**
+   configuration, which §3.54 already measured at 0 failing of 5. This is not the
+   configuration the flake was seen in.
+2. **One of the two tests was modified this session.** `serial_hardware.rs`'s
+   `inject_verify` was converted to `settled_while_open` (notes §3.56), so
+   `crossover_rig_custom_baud_byte_exact` is not the test §3.54 measured. A green
+   run here cannot be read as "the flake is gone".
+3. **Arm A was run in its non-discriminating form.** With the replug lane absent,
+   `--test-threads=1` collapses into arm B plus serialization, and the arm that
+   separates H1 from H2 — replug green *and* serialized — was not run.
+
+**One result that is new, and it is evidence about the family rather than the
+case.** Run B1's single failure was **not** either §3.54 test: it was
+`p8_web_ui::the_web_console_passes_its_headless_chromium_suite`, and inside it
+`graph-editor.spec.mjs:171 › adding a console through the editor makes bytes flow
+end to end`, failing with *"the editor's status line reports a refusal, not
+/^connect\b/"*. Measured immediately afterwards: **1 of 3 in-suite, 0 of 5 in
+isolation** (24.3–24.9 s each, all green). That is the same signature §3.54 reports
+for the two rig tests — fails inside a long suite, never alone — on a test that
+touches no serial hardware, no USB, and no replug binary at all. It is therefore a
+datum for **H1's family** (something about a long, loaded suite) and against reading
+the §3.54 pair as replug-specific. **Mechanism not established and no root cause
+claimed**; a browser-driven editor test failing under contention has at least three
+innocent readings and this session separated none of them.
+
+**What the next rig session should run, and why it is not either of §3.54's arms.**
+Neither arm isolates the replug *operation* from the presence of one more test
+binary in the run. The design that does: keep `p7_replug_hardware` executing with
+its hold reduced to a no-op — authorize immediately, no down time — and compare
+against the same run with the normal hold. Same binary count, same suite length,
+same test names; only the USB cycle differs. Run it blessed, five of each, and
+capture failing names verbatim with no retries.
+
+**Owed, and it is one command:** `scripts/bless` (build + install + one `sudo
+setcap`), then the rig lane per AGENTS §3 with `SNX_REPLUG*` set.
