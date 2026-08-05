@@ -82,6 +82,19 @@ pub fn read_icounts(_fd: RawFd) -> nix::Result<SerialIcounts> {
     Err(nix::errno::Errno::ENOTSUP)
 }
 
+/// Whether this build has a real `TIOCGICOUNT` behind [`read_icounts`].
+///
+/// It lives beside the two arms so it cannot drift from them, and it exists
+/// because `Err` does not mean the same thing on both. On Linux the ioctl exists
+/// and an `Err` is a *measurement* — a pts answers `ENOTTY` because that driver
+/// does not implement it, which is exactly what makes "not a UART" true there.
+/// Everywhere else the arm above is a compile-time `ENOTSUP` stub, so every fd
+/// answers `Err`, a genuine FTDI adapter included, and no rig, cable or re-seat
+/// can change it. A caller reporting an item as uncharacterized has to tell those
+/// two apart: design §7 asks it to name the observation rather than send an
+/// operator after a fault the kernel cannot produce.
+pub const ICOUNTS_SUPPORTED: bool = cfg!(target_os = "linux");
+
 /// Serializes the non-reentrant `ptsname(3)` arm below (see [`ptsname`]'s
 /// *Safety* section). Held only across the call and the copy-out — never across
 /// an `.await`, and never by the data plane's hot paths, which do not resolve
@@ -824,6 +837,20 @@ pub fn pending_output_bytes(_fd: RawFd) -> nix::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The constant and the arm this build compiled must agree, or P5 would
+    /// explain a Linux measurement with a Darwin mechanism, or the reverse.
+    #[test]
+    fn the_icounts_constant_matches_the_arm_this_build_compiled() {
+        assert_eq!(ICOUNTS_SUPPORTED, cfg!(target_os = "linux"));
+        #[cfg(not(target_os = "linux"))]
+        {
+            // The stub never touches the fd, so an invalid one proves the arm:
+            // what is asserted is that *no* fd can succeed here, which is the
+            // claim P5's consequence line makes to the operator.
+            assert!(matches!(read_icounts(-1), Err(nix::errno::Errno::ENOTSUP)));
+        }
+    }
 
     /// A pty pair built the way `PtyNode::setup` builds one — baseline termios
     /// through a momentary slave open, packet mode on the master, slave primed

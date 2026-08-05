@@ -78,7 +78,10 @@ still have degraded — and zero certificate items were evaluated. It now evalua
 `custom_baud`, `break` and `rate_ladder=true` over the physical crossover, naming `icounter` and
 `deliberate_mismatch` as the two it cannot. The modem map is reported and never judged; it reads all
 four lines false, which is a 3-wire crossover having none to assert. The report still never prints **Tier 3**, because the
-`!uncertified.is_empty()` arm returns before the tier-naming arm.
+`!uncertified.is_empty()` arm returns before the tier-naming arm. *(Fixed 2026-08-05, notes §3.49; the
+observation above is left as the true record of that run, and the next capture must print
+`Topology: **Tier 3**` in the same line, with the two counter items named as unmeasurable on this
+kernel rather than listed bare.)*
 
 **P13 did not invert.** `baseline_packet_bytes` reads **1** in all three shapes, same as Linux — the
 feared ~72 (XNU appending the termios struct) did not happen. `waits-then-discards` reproduces at

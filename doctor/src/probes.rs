@@ -2885,6 +2885,26 @@ const P5_UNCHARACTERIZED: &str = "not a UART";
 #[cfg(not(target_os = "linux"))]
 const P5_UNCHARACTERIZED: &str = "not characterizable here (TIOCGICOUNT is Linux-only)";
 
+/// Why a failed `icounter` item is not the rig's fault where `TIOCGICOUNT` does
+/// not exist — the mechanism P5's verdict owes the operator (§7).
+const P5_WHY_NO_ICOUNTER: &str = "the driver's input counters are read with TIOCGICOUNT, which exists only on Linux (`serial_nexus_sys::read_icounts` is a compile-time ENOTSUP stub elsewhere), so every port answers Err here however real it is";
+
+/// The same absence reaching the *pair* item, stated separately because the two
+/// halves of the deliberate mismatch do not fail together. The bulk pattern is
+/// still transmitted and may well be corrupted on the wire; it is the witness
+/// that is missing, so `after > before` reduces to `0 > 0` and the item can never
+/// certify here — which is not the same claim as "the mismatch did not run", and
+/// the tier sentence in the same verdict says it did.
+const P5_WHY_NO_MISMATCH: &str = "its second half is the receiver's frame-error counter, read with that same Linux-only TIOCGICOUNT — the mismatched traffic was transmitted, but nothing on this kernel can witness the counter, so the item reads false whatever the wire did";
+
+/// `Some(why)` when this build cannot measure the driver input counters at all,
+/// so the two certificate items that read them are excused from the rig's tally
+/// by the platform rather than by the cable. One helper, so the two call sites
+/// cannot disagree about which platform that is.
+fn p5_icounts_unmeasurable(why: &'static str) -> Option<&'static str> {
+    (!sys::ICOUNTS_SUPPORTED).then_some(why)
+}
+
 /// One failed certificate item, named so the verdict can cite it (§15.21).
 ///
 /// `integrity` separates the two consequences the certificate can carry: a *data*
@@ -2897,6 +2917,12 @@ const P5_UNCHARACTERIZED: &str = "not characterizable here (TIOCGICOUNT is Linux
 struct CertFailure {
     item: String,
     integrity: bool,
+    /// `Some(mechanism)` when this kernel gives no way to measure the item at
+    /// all, so it did not *fail*: no cable, adapter or re-seat can make it pass
+    /// here. The reason rides on the failure rather than being matched out of
+    /// `item` in the verdict, so the excuse can never widen to an item that
+    /// genuinely failed on a path this kernel does measure (§7, notes §3.45 E).
+    unmeasurable_here: Option<&'static str>,
 }
 
 impl CertFailure {
@@ -2906,7 +2932,7 @@ impl CertFailure {
     fn qualified(self, subject: &str) -> CertFailure {
         CertFailure {
             item: format!("{subject}: {}", self.item),
-            integrity: self.integrity,
+            ..self
         }
     }
 }
@@ -2956,6 +2982,9 @@ impl Certificate {
             failures: vec![CertFailure {
                 item: item.to_owned(),
                 integrity: false,
+                // A port that would not reopen is a rig state every kernel can
+                // observe: it is uncharacterized, not unmeasurable.
+                unmeasurable_here: None,
             }],
         }
     }
@@ -2967,12 +2996,22 @@ impl Certificate {
         Certificate::new(format!("skipped ({reason})"))
     }
 
-    /// Record `item` as failed when `failed`, with its consequence class.
-    fn fail_if(&mut self, failed: bool, item: &str, integrity: bool) {
+    /// Record `item` as failed when `failed`, with its consequence class and —
+    /// the fourth argument, which every site must answer rather than default —
+    /// whether this kernel could have measured it at all (`None` = it could, so
+    /// the failure is the rig's).
+    fn fail_if(
+        &mut self,
+        failed: bool,
+        item: &str,
+        integrity: bool,
+        unmeasurable_here: Option<&'static str>,
+    ) {
         if failed {
             self.failures.push(CertFailure {
                 item: item.to_owned(),
                 integrity,
+                unmeasurable_here,
             });
         }
     }
@@ -3000,15 +3039,38 @@ fn p5_certify_port(port: &Path) -> Certificate {
         sp.read_ri().map(|b| b.to_string()).unwrap_or("?".into()),
     );
     let icounter = sys::read_icounts(sp.as_raw_fd()).is_ok();
+    p5_port_certificate(custom_baud_ok, break_ok, &modem, icounter)
+}
+
+/// Fold one port's raw measurements into its certificate. Pure, split out for the
+/// reason [`p5_verdict`] was: the part that must be tested is the *classification*
+/// — which failures are the rig's and which are the kernel's — and it cannot be
+/// reached through [`p5_certify_port`] without a bench. A pts is not a substitute:
+/// [`p5_is_uart`] rejects one on both kernels (`TIOCMGET` and `TIOCGICOUNT` both
+/// answer `ENOTTY` there — measured over a socat pair on Linux 7.0, where P5
+/// reports `skipped (not a UART)`), so the caller never runs and a pts-driven
+/// guard would pass vacuously everywhere (§9).
+fn p5_port_certificate(
+    custom_baud_ok: bool,
+    break_ok: bool,
+    modem: &str,
+    icounter: bool,
+) -> Certificate {
     let mut cert = Certificate::new(format!(
         "custom_baud={custom_baud_ok} break={break_ok} modem[{modem}] icounter={icounter}"
     ));
     // None of these is a data-integrity failure: the port carries bytes, but a
     // checklist tier that leans on a nonstandard rate, on break reception, or on
     // the driver counters would be running uncertified (§15.21) → degrade, named.
-    cert.fail_if(!custom_baud_ok, "custom_baud", false);
-    cert.fail_if(!break_ok, "break", false);
-    cert.fail_if(!icounter, "icounter", false);
+    cert.fail_if(!custom_baud_ok, "custom_baud", false, None);
+    cert.fail_if(!break_ok, "break", false, None);
+    // The counters are the one item whose *measurability* is a platform fact.
+    cert.fail_if(
+        !icounter,
+        "icounter",
+        false,
+        p5_icounts_unmeasurable(P5_WHY_NO_ICOUNTER),
+    );
     cert
 }
 
@@ -3064,7 +3126,7 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> Certificate {
                 format!("rate_ladder={ladder_ok} mismatch=reopen-failed"),
                 "mismatch_reopen",
             );
-            cert.fail_if(!ladder_ok, "rate_ladder", true);
+            cert.fail_if(!ladder_ok, "rate_ladder", true, None);
             return cert;
         };
         std::thread::sleep(P5_OPEN_SETTLE); // settle both ends before the mismatch probe
@@ -3085,21 +3147,35 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> Certificate {
             .unwrap_or(before);
         !contains_sub(&got, unit) && after > before
     };
-    let mut cert = Certificate::new(format!(
-        "rate_ladder={ladder_ok} deliberate_mismatch_observed={mismatch_observed}"
-    ));
+    let mut cert = p5_pair_certificate(ladder_ok, mismatch_observed);
     // Reaching here means the bulk mismatch pattern was written to the wire —
     // which is the claim P11 needs, independent of whether it was *observed* to
     // corrupt anything. The two early returns above never get here, and that is
     // the distinction: a certificate that bailed on a reopen transmitted nothing.
     cert.mismatch_transmitted = true;
+    cert
+}
+
+/// The pair half of [`p5_port_certificate`], pure for the same reason.
+fn p5_pair_certificate(ladder_ok: bool, mismatch_observed: bool) -> Certificate {
+    let mut cert = Certificate::new(format!(
+        "rate_ladder={ladder_ok} deliberate_mismatch_observed={mismatch_observed}"
+    ));
     // The ladder is the integrity item: a rung that did not round-trip means the
     // rig itself corrupts or loses data, so no tier failure measured through it is
     // attributable to serial_nexus (§15.21) — a stop condition, not a footnote.
-    cert.fail_if(!ladder_ok, "rate_ladder", true);
+    // It is measurable on every kernel: it reads bytes, not counters.
+    cert.fail_if(!ladder_ok, "rate_ladder", true, None);
     // An unobserved deliberate mismatch means the error counters are not
     // observable on this rig: the data path is fine, the characterization is not.
-    cert.fail_if(!mismatch_observed, "deliberate_mismatch", false);
+    // Where the counters cannot be read at all, that reading is the platform's,
+    // not the rig's — `false` there is `0 > 0`, not a result.
+    cert.fail_if(
+        !mismatch_observed,
+        "deliberate_mismatch",
+        false,
+        p5_icounts_unmeasurable(P5_WHY_NO_MISMATCH),
+    );
     cert
 }
 
@@ -3372,6 +3448,9 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &serial_nexus_core::Resolver) -> (Pro
                 CertFailure {
                     item: "pair_reopen".to_owned(),
                     integrity: false,
+                    // A pair that would not reopen is a rig state every kernel
+                    // can observe: uncharacterized, not unmeasurable.
+                    unmeasurable_here: None,
                 }
                 .qualified(&subject),
             );
@@ -3401,6 +3480,42 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &serial_nexus_core::Resolver) -> (Pro
     (p.verdict(status, &consequence), facts)
 }
 
+/// The tier sentence: **what the certificate covers** — the topology discovery
+/// found, plus whether the pair items reached the wire.
+///
+/// Extracted from [`p5_verdict`]'s certified arm because it is not a property of
+/// the verdict at all. Sequencing the only site that named a tier behind "and no
+/// certificate item failed" is what kept the word Tier out of a Darwin report
+/// whose cross-wired FT232R pair had just certified `rate_ladder=true` over
+/// physical silicon: the tier is a discovery fact and the certificate is a
+/// separate one, which is exactly the distinction [`RigFacts`]'s two counts were
+/// added to preserve (§15.21, notes §3.42/§3.45 E).
+fn p5_tier_scope(facts: RigFacts) -> String {
+    match facts.tier() {
+        3 if facts.mismatch_pairs > 0 => format!(
+            "**Tier 3** — {n} cross-wired {pair}, independent clocks, so the rate ladder and the deliberate baud mismatch ran.",
+            n = facts.mismatch_pairs,
+            pair = if facts.mismatch_pairs == 1 {
+                "pair"
+            } else {
+                "pairs"
+            },
+        ),
+        3 => "**Tier 3 wiring, uncertified** — a cross-wired pair was discovered, but its independent-clock certificate did not complete, so the rate ladder and the deliberate baud mismatch did **not** run. The pair's certificate line above says why."
+            .to_owned(),
+        2 => "**Tier 2** — a TX↔RX jumper: a real driver data path, but on one clock, so the rate ladder and the deliberate baud mismatch did **not** run (both need a cross-wired pair)."
+            .to_owned(),
+        // Deliberately does *not* say "and no break was received by anything":
+        // true of Tier 1 and equally true of Tier 3, because no probe here
+        // drives a break into an open, counting peer at any tier — so a
+        // tier-scoped sentence for a binary-scoped fact read as a promise that
+        // upgrading the rig would get you break reception. It would not; that
+        // is a job for the suite's `crossover_ports()`-gated guards.
+        _ => "**Tier 1** — a dangling converter: per-port items only. The rate ladder and the deliberate baud mismatch did **not** run."
+            .to_owned(),
+    }
+}
+
 /// Fold discovery and every certificate into P5's one verdict (§15.21, DOC-1b).
 ///
 /// Pure, so the fold is unit-testable without a bench — the rest of P5 needs
@@ -3413,6 +3528,10 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &serial_nexus_core::Resolver) -> (Pro
 /// else is `Supported`, with the two pre-existing consequence lines preserved
 /// verbatim so the certified and the skipped-on-a-sim paths read as they always
 /// have.
+///
+/// The **tier** is not part of that precedence: it is what discovery saw, so the
+/// uncertified arm names it too. It stays out of the miswired and hung-up arms,
+/// where discovery is exactly what is in doubt.
 fn p5_verdict(
     clean: bool,
     any_uart: bool,
@@ -3429,6 +3548,48 @@ fn p5_verdict(
     };
     let integrity = named(true);
     let uncertified = named(false);
+    // §7 wants the observation named, and "uncertified" is not one. An item this
+    // kernel cannot measure did not *fail* — no cable, adapter or re-seat makes it
+    // pass here — so listing it beside items that really did fail sends a Darwin
+    // operator chasing a rig fault no Darwin box can produce (notes §3.45 E (i);
+    // the pre-widening text said "TIOCGICOUNT, which is Linux-only" and the
+    // widened one said nothing). Grouped by mechanism in first-seen order, so a
+    // second mechanism gets its own sentence without touching this fold and the
+    // clauses follow the item list. Read off the failure rather than matched out
+    // of the item name, so the excuse can never widen to an item that failed on a
+    // path this kernel does measure.
+    let mut unmeasurable: Vec<(&str, Vec<&str>)> = Vec::new();
+    for f in failures.iter().filter(|f| !f.integrity) {
+        if let Some(why) = f.unmeasurable_here {
+            match unmeasurable.iter_mut().find(|(w, _)| *w == why) {
+                Some((_, items)) => items.push(f.item.as_str()),
+                None => unmeasurable.push((why, vec![f.item.as_str()])),
+            }
+        }
+    }
+    let structural = if unmeasurable.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::new();
+        for (why, items) in &unmeasurable {
+            let items = items.join(", ");
+            s.push_str(&format!(
+                " {items} cannot be measured on this kernel at all: {why}."
+            ));
+        }
+        s.push_str(
+            " That is the platform, not the rig: re-seating a cable cannot change it, and those items certify only on a Linux box (§13's best-effort tier).",
+        );
+        s
+    };
+    // Built once. Two arms below print this clause and they must keep printing the
+    // same one as it grows — it grew today, and duplicated text is how the two
+    // halves of a consequence line drift apart.
+    let also = if uncertified.is_empty() {
+        String::new()
+    } else {
+        format!(" Also uncertified: {}.{structural}", uncertified.join(", "))
+    };
 
     if !integrity.is_empty() {
         return (
@@ -3440,11 +3601,10 @@ fn p5_verdict(
         );
     }
     if !clean {
-        let also = if uncertified.is_empty() {
-            String::new()
-        } else {
-            format!(" Also uncertified: {}.", uncertified.join(", "))
-        };
+        // No tier is named here or in the `hung_up` arm below, deliberately: the
+        // tier is what *discovery* saw, and in these two arms discovery is exactly
+        // what is in doubt. Naming one would be the §9 proxy in space — a topology
+        // word standing in for a topology nobody established.
         return (
             Status::Degraded,
             format!(
@@ -3461,11 +3621,6 @@ fn p5_verdict(
         // leave the verdict `supported` (DOC-1b). It stays `degraded`, never
         // `unsupported`: the rig may well be fine once the peer is back, and
         // `unsupported` is reserved for a rig that demonstrably ate bytes.
-        let also = if uncertified.is_empty() {
-            String::new()
-        } else {
-            format!(" Also uncertified: {}.", uncertified.join(", "))
-        };
         return (
             Status::Degraded,
             format!(
@@ -3475,11 +3630,28 @@ fn p5_verdict(
         );
     }
     if !uncertified.is_empty() {
+        // **The tier belongs here too, and this is where it went missing.** Both
+        // discovery gates returned above, so the topology at this point is exactly
+        // as established as it is in the certified arm below — it was never the
+        // certificate that made it knowable, which is the whole reason `RigFacts`
+        // carries `discovered_pairs` and `mismatch_pairs` as two counts. Leaving
+        // the only tier-naming site behind this early return meant a rig could
+        // certify `rate_ladder=true` over a physical crossover and never have its
+        // tier printed: `grep -c "Tier [0-9]"` is 0 over all three 2026-08-05
+        // Darwin captures, whose sole differing input against the Linux triple of
+        // the same binary is this list (§3.42's pre-registration, §3.45 E).
+        let topology = if any_uart {
+            format!(" Topology: {}", p5_tier_scope(facts))
+        } else {
+            // Nothing certified, so there is no certificate to scope and no tier
+            // is claimed — the `else` arm below owns that case's wording.
+            String::new()
+        };
         return (
             Status::Degraded,
             format!(
-                "The rig carries data, but is not fully characterized ({}) — a tier leaning on that item would be running uncertified (§15.21). Everything else above is certified.",
-                uncertified.join(", ")
+                "The rig carries data, but is not fully characterized ({items}) — a tier leaning on that item would be running uncertified (§15.21).{structural} Everything else above is certified.{topology}",
+                items = uncertified.join(", ")
             ),
         );
     }
@@ -3500,29 +3672,7 @@ fn p5_verdict(
         // observation line reading `paired with …`, whenever a discovered pair
         // failed to reopen for characterization.
         let tier = facts.tier();
-        let scope = match tier {
-            3 if facts.mismatch_pairs > 0 => format!(
-                "**Tier 3** — {n} cross-wired {pair}, independent clocks, so the rate ladder and the deliberate baud mismatch ran.",
-                n = facts.mismatch_pairs,
-                pair = if facts.mismatch_pairs == 1 {
-                    "pair"
-                } else {
-                    "pairs"
-                },
-            ),
-            3 => "**Tier 3 wiring, uncertified** — a cross-wired pair was discovered, but its independent-clock certificate did not complete, so the rate ladder and the deliberate baud mismatch did **not** run. The pair's certificate line above says why."
-                .to_owned(),
-            2 => "**Tier 2** — a TX↔RX jumper: a real driver data path, but on one clock, so the rate ladder and the deliberate baud mismatch did **not** run (both need a cross-wired pair)."
-                .to_owned(),
-            // Deliberately does *not* say "and no break was received by anything":
-            // true of Tier 1 and equally true of Tier 3, because no probe here
-            // drives a break into an open, counting peer at any tier — so a
-            // tier-scoped sentence for a binary-scoped fact read as a promise that
-            // upgrading the rig would get you break reception. It would not; that
-            // is a job for the suite's `crossover_ports()`-gated guards.
-            _ => "**Tier 1** — a dangling converter: per-port items only. The rate ladder and the deliberate baud mismatch did **not** run."
-                .to_owned(),
-        };
+        let scope = p5_tier_scope(facts);
         // The ceiling clause is only meaningful below a complete top-tier
         // certificate — appending "may not start above Tier 3" would be vacuous
         // advice in the one case where the operator has the whole thing.
@@ -4110,6 +4260,26 @@ mod tests {
         CertFailure {
             item: item.to_owned(),
             integrity,
+            unmeasurable_here: None,
+        }
+    }
+
+    /// An uncertified item this kernel had no way to measure — the shape both
+    /// counter-reading items take off Linux.
+    fn unmeasurable(item: &str, why: &'static str) -> CertFailure {
+        CertFailure {
+            item: item.to_owned(),
+            integrity: false,
+            unmeasurable_here: Some(why),
+        }
+    }
+
+    /// A TX↔RX jumper: Tier 2.
+    fn jumpered() -> RigFacts {
+        RigFacts {
+            discovered_pairs: 0,
+            mismatch_pairs: 0,
+            loopbacks: 1,
         }
     }
 
@@ -4496,13 +4666,8 @@ mod tests {
     #[test]
     fn the_certificate_names_its_tier_and_what_that_tier_did_not_run() {
         let dangling = RigFacts::default();
-        let jumpered = RigFacts {
-            discovered_pairs: 0,
-            mismatch_pairs: 0,
-            loopbacks: 1,
-        };
         assert_eq!(
-            (dangling.tier(), jumpered.tier(), paired().tier()),
+            (dangling.tier(), jumpered().tier(), paired().tier()),
             (1, 2, 3)
         );
 
@@ -4515,7 +4680,7 @@ mod tests {
             "a Tier-1 certificate implied the pair items ran: {why}"
         );
 
-        let (_, why) = p5_verdict(true, true, &[], &[], jumpered);
+        let (_, why) = p5_verdict(true, true, &[], &[], jumpered());
         assert!(why.contains("Tier 2"), "tier not named: {why}");
         assert!(
             why.contains("did **not** run"),
@@ -4550,7 +4715,7 @@ mod tests {
         );
 
         // And no state's line may be mistaken for another's.
-        let lines: Vec<String> = [dangling, jumpered, paired(), paired_uncertified()]
+        let lines: Vec<String> = [dangling, jumpered(), paired(), paired_uncertified()]
             .iter()
             .map(|f| p5_verdict(true, true, &[], &[], *f).1)
             .collect();
@@ -4562,6 +4727,170 @@ mod tests {
             4,
             "two rig states produced the same certificate line"
         );
+    }
+
+    /// **A degraded certificate still names the tier discovery found.** §3.42
+    /// pre-registered "P5 reports Tier 3 with `rate_ladder=true`" for the first
+    /// Darwin rig run. The rig delivered exactly that — ports paired both ways,
+    /// `rate_ladder=true` over the physical crossover — and the word Tier never
+    /// appeared: `grep -c "Tier [0-9]"` is **0** over all three 2026-08-05 Darwin
+    /// captures, against `**Tier 3**` in all three Linux captures of the *same
+    /// binary*. The single differing input is the `failures` list, and the only
+    /// site that named a tier sat after the early return it triggers.
+    ///
+    /// Driven here by a *measurable* failure, so what is under test is the
+    /// ordering on every platform rather than the platform — the Darwin-shaped
+    /// input gets its own guard below.
+    #[test]
+    fn an_uncertified_rig_still_names_the_tier_discovery_found() {
+        let (status, why) = p5_verdict(true, true, &[fail("usb-A: break", false)], &[], paired());
+        assert_eq!(status.label(), "degraded", "{why}");
+        assert!(
+            why.contains("Tier 3"),
+            "a degraded certificate did not name its tier: {why}"
+        );
+        assert!(why.contains("usb-A: break"), "item dropped: {why}");
+        // Naming the tier must not promote the sentence: the certified arm's
+        // opening is what a tiered run reads to decide it may start (§15.21).
+        assert!(!why.contains("Rig discovered and certified"), "{why}");
+
+        // The sentence tracks the topology rather than a constant that happens to
+        // read Tier 3 on the box the guard was written on.
+        let (_, why) = p5_verdict(true, true, &[fail("usb-A: break", false)], &[], jumpered());
+        assert!(why.contains("Tier 2"), "{why}");
+
+        // Nothing certified (a pair that would not reopen, `any_uart` false):
+        // there is no certificate to scope, so no tier may be claimed.
+        let (_, why) = p5_verdict(
+            true,
+            false,
+            &[fail("a ↔ b: pair_reopen", false)],
+            &[],
+            paired(),
+        );
+        assert!(
+            !why.contains("Tier"),
+            "a tier was claimed with nothing certified: {why}"
+        );
+    }
+
+    /// **An item this kernel cannot measure is named as such — and no other item
+    /// is.** The old consequence said the skipped items were skipped because
+    /// "TIOCGICOUNT, which is Linux-only"; the widened predicate replaced it with
+    /// a bare list, so a Darwin operator could re-seat cables chasing something no
+    /// Darwin box can produce (§7 wants the observation named; notes §3.45 E (i)).
+    ///
+    /// The negative half is the one with teeth, and it is what proves the
+    /// *matcher* rather than the walker: an excuse that fires on every uncertified
+    /// item reads as passing here while telling the operator to stop looking at a
+    /// cable that really is loose.
+    #[test]
+    fn only_the_items_this_kernel_cannot_measure_are_excused_by_the_platform() {
+        // The Darwin shape, from the three 2026-08-05 captures (two per-port
+        // `icounter`, one per-pair `deliberate_mismatch`), plus a `break` that
+        // Darwin measures perfectly well — it reads true there — and that here
+        // failed.
+        let darwin = [
+            unmeasurable("A: icounter", P5_WHY_NO_ICOUNTER),
+            unmeasurable("B: icounter", P5_WHY_NO_ICOUNTER),
+            unmeasurable("A ↔ B: deliberate_mismatch", P5_WHY_NO_MISMATCH),
+            fail("A: break", false),
+        ];
+        let (status, why) = p5_verdict(true, true, &darwin, &[], paired());
+        assert_eq!(status.label(), "degraded", "{why}");
+        for item in [
+            "A: icounter",
+            "B: icounter",
+            "A ↔ B: deliberate_mismatch",
+            "A: break",
+        ] {
+            assert!(why.contains(item), "item dropped: {why}");
+        }
+        assert!(
+            why.contains("A: icounter, B: icounter cannot be measured on this kernel at all"),
+            "{why}"
+        );
+        assert!(
+            why.contains("A ↔ B: deliberate_mismatch cannot be measured on this kernel at all"),
+            "{why}"
+        );
+        assert!(why.contains("TIOCGICOUNT"), "mechanism not named: {why}");
+        assert!(why.contains("Tier 3"), "{why}");
+        // The transmitted-but-unwitnessed distinction survives: the tier sentence
+        // in the same line says the mismatch ran, so the excuse must not read as
+        // "it did not".
+        assert!(why.contains("deliberate baud mismatch ran"), "{why}");
+        assert!(why.contains("was transmitted"), "{why}");
+        assert!(
+            !why.contains("A: break cannot be measured"),
+            "a measurable failure was excused as the platform's: {why}"
+        );
+
+        // On a rig whose failures are all measurable the clause is absent
+        // entirely — which is what every Linux run must read.
+        let (_, why) = p5_verdict(true, true, &[fail("A: break", false)], &[], paired());
+        assert!(!why.contains("cannot be measured"), "{why}");
+        assert!(!why.contains("TIOCGICOUNT"), "{why}");
+
+        // The miswiring arm prints the same list, so it owes the same mechanism.
+        let (_, why) = p5_verdict(false, true, &darwin, &[], paired());
+        assert!(why.contains("miswired"), "{why}");
+        assert!(why.contains("TIOCGICOUNT"), "{why}");
+    }
+
+    /// **The two counter items are excused exactly where the ioctl is absent.**
+    /// The fold above is only as good as what the certificate records, and that
+    /// binding cannot be reached through `p5_certify_port` without a bench: a pts
+    /// is rejected by `p5_is_uart` on both kernels, so a pts-driven guard would
+    /// pass vacuously (§9). Asserted on the pure builders instead, in the form
+    /// that comes out **stricter on the platform of record**: off Linux both items
+    /// must carry the mechanism, on Linux neither may — there `icounter=false` is
+    /// a measurement (a pts answering `ENOTTY`) and a platform excuse would be
+    /// false.
+    #[test]
+    fn the_counter_items_are_platform_excused_exactly_where_the_ioctl_is_absent() {
+        let excused = |c: &Certificate, item: &str| -> Option<&'static str> {
+            c.failures
+                .iter()
+                .find(|f| f.item == item)
+                .unwrap_or_else(|| panic!("{item} not recorded: {:?}", c.failures))
+                .unmeasurable_here
+        };
+        let counters_absent = p5_port_certificate(true, true, "cts=false", false);
+        let mismatch_unobserved = p5_pair_certificate(true, false);
+        assert_eq!(
+            excused(&counters_absent, "icounter").is_some(),
+            !sys::ICOUNTS_SUPPORTED,
+            "icounter excused on the wrong platform"
+        );
+        assert_eq!(
+            excused(&mismatch_unobserved, "deliberate_mismatch").is_some(),
+            !sys::ICOUNTS_SUPPORTED,
+            "deliberate_mismatch excused on the wrong platform"
+        );
+        // Never the items that do not read a counter, on any platform.
+        let rig_faults = p5_port_certificate(false, false, "cts=false", true);
+        assert_eq!(excused(&rig_faults, "custom_baud"), None);
+        assert_eq!(excused(&rig_faults, "break"), None);
+        assert_eq!(
+            excused(&p5_pair_certificate(false, true), "rate_ladder"),
+            None
+        );
+        // A passing item records nothing, so no excuse can leak from one.
+        assert!(
+            p5_port_certificate(true, true, "cts=false", true)
+                .failures
+                .is_empty()
+        );
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(
+                excused(&counters_absent, "icounter")
+                    .expect("the stub platform must excuse it")
+                    .contains("TIOCGICOUNT"),
+                "the mechanism must be the ioctl's absence"
+            );
+        }
     }
 
     /// A data-integrity failure is a stop condition: the certificate is the
@@ -4987,8 +5316,8 @@ mod tests {
     #[test]
     fn fail_if_records_only_failures() {
         let mut cert = Certificate::new("line");
-        cert.fail_if(false, "custom_baud", false);
-        cert.fail_if(true, "break", false);
+        cert.fail_if(false, "custom_baud", false, None);
+        cert.fail_if(true, "break", false, None);
         assert_eq!(cert.failures, vec![fail("break", false)]);
     }
 

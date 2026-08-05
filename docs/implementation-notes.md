@@ -3050,8 +3050,9 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **744 passing, 0 failed, 4 ignored** across 113 test
-targets on Linux (2026-08-05: §3.38's listener-barrier guard, §3.39's orphan-leash fixture and guard, §3.40's two baseline guards, and earlier the same day the three doctor guards of §3.34 and the kernel-naming fix
+The current whole-suite figure is **748 passing, 0 failed, 4 ignored** across 113 test
+targets on Linux (2026-08-05: §3.49's three P5 guards plus its `serial_nexus_sys`
+`ICOUNTS_SUPPORTED` guard, added to two existing targets; §3.38's listener-barrier guard, §3.39's orphan-leash fixture and guard, §3.40's two baseline guards, and earlier the same day the three doctor guards of §3.34 and the kernel-naming fix
 — `termios_mode_tells_the_daemons_baseline_from_a_cooked_pty`,
 `p10_recoverability_separates_a_deep_buffer_from_a_black_hole` and
 `the_os_name_survives_a_box_with_no_os_release_file` — on top of the 729 left by
@@ -5071,12 +5072,22 @@ items evaluated went from zero to five. **§3.42's pre-registration is half-met 
 structural:** ports certify and `rate_ladder` is true, but the report never names **Tier 3** —
 `grep -c "Tier [0-9]"` over it is **0**, because `p5_verdict`'s `!uncertified.is_empty()` arm returns
 before the tier-naming arm. Filed, not fixed.
+<!-- ANNOTATION 2026-08-05 (§5): closed by §3.49. The tier sentence was hoisted out of the
+     status decision into `p5_tier_scope` and the uncertified arm prints it as
+     `Topology: **Tier 3** …`. The arms were deliberately NOT reordered — that would have
+     flipped Darwin back to `supported` and undone the honest direction this entry
+     established. The observation above stands as the record of the 1a9a8fc run. -->
 
 **Open, named, and not fixed here.** (i) The new P5 consequence lists `icounter` and
 `deliberate_mismatch` as uncertified without saying they are *structurally* unmeasurable on this
 kernel — the old text said "TIOCGICOUNT, which is Linux-only" and the new text says neither, so a
 Darwin operator could re-seat cables chasing something no Darwin box can produce. §7 wants the
-observation named, and the mechanism is now missing. (ii) **P4 is vacuous on Darwin and the Linux
+observation named, and the mechanism is now missing.
+<!-- ANNOTATION 2026-08-05 (§5): (i) is closed by §3.49. The mechanism is carried as DATA on
+     `CertFailure.unmeasurable_here`, set from `sys::ICOUNTS_SUPPORTED` at exactly the two
+     counter-reading `fail_if` sites, never matched out of the item name — so it cannot widen
+     to an item that genuinely failed. -->
+(ii) **P4 is vacuous on Darwin and the Linux
 gate would admit the same shape**: `count: 0` with `status: supported`, because the `skipped` early
 return needs `adapters.is_empty() && candidates.is_empty()` and Darwin has 4 candidates, so
 `for a in &adapters` runs zero times, `all_resolved` keeps its initialised `true`, and the
@@ -5288,6 +5299,125 @@ the lane nobody is standing on.
 `canonical: 2` and a character-identical consequence; the Darwin shape, reproduced on Linux through
 the `--dev-root` seam, now reports `degraded` with `canonical: 0`, `unidentified: 4`, and each
 device's `raw:` identity named.
+
+---
+
+### 3.49 P5's tier was sequenced behind its certificate, and "uncertified" was standing in for "unmeasurable"
+
+**Design:** §15.21 (the certificate is the precondition a tiered run starts from) and §7 (a kernel
+that differs is `degraded` **with the observation named**).
+
+**The control flow, quoted, because the defect is entirely in it.** `p5_verdict` is a worst-first
+precedence chain of six early-returning arms: (1) integrity failures → `Unsupported`; (2) `!clean`
+→ `Degraded`; (3) `!hung_up.is_empty()` → `Degraded`; (4) `!uncertified.is_empty()` → `Degraded`;
+(5) `any_uart` → `Supported`, **and this was the only site that computed `facts.tier()` and emitted
+"**Tier 3** …"**; (6) `else` → `Supported`, the "characterization does not run on this platform at
+all" arm. So the tier printed if and only if the chain reached arm 5 — i.e. only when *every*
+certificate item passed.
+
+**What that cost, measured, not argued.** Of the five inputs to
+`p5_verdict(clean, any_uart, failures, hung_up, facts)`, **four are identical** between the
+2026-08-05 Linux triple (`linux-7.0-2026-08-05b-tier3{,-2,-3}.json`) and the Darwin triple of the
+*same binary* (`macos-24.6.0-2026-08-05-1a9a8fc-tier3{,-2,-3}.json`): `clean=true` (both ports read
+`paired with …` in both directions on both), `any_uart=true`, `hung_up=[]`, and
+`facts = {discovered_pairs: 1, mismatch_pairs: 1, loopbacks: 0}`. The single differing input is
+`failures` — empty on Linux, three non-integrity `CertFailure`s on Darwin (`BH00L4KU: icounter`,
+`BH00LL8O: icounter`, `BH00L4KU ↔ BH00LL8O: deliberate_mismatch`). Arm 4 therefore fired on Darwin,
+arm 5 never ran, and `grep -c "Tier [0-9]"` over all three Darwin captures is **0** against
+`**Tier 3**` in all three Linux ones. A cross-wired FT232R pair had just certified `rate_ladder=true`
+over physical silicon and its topology went unnamed. **The tier is a discovery fact and it was
+sequenced behind a certificate fact** — precisely the distinction `RigFacts`' two counts exist to
+preserve (§3.42, §3.45 E).
+
+**And the second half: "uncertified" is not an observation.** The two items on that Darwin list are
+**structurally unmeasurable off Linux**, read from the code rather than assumed. `sys::read_icounts`
+has a `#[cfg(not(target_os = "linux"))]` arm that is an unconditional `Err(ENOTSUP)`. Exactly two
+certificate items read it: `icounter` in `p5_certify_port` *is* `read_icounts(fd).is_ok()`, so it is
+false for every fd off Linux, a genuine FTDI included; and `deliberate_mismatch` in
+`p5_certify_pair` is `!contains_sub(&got, unit) && after > before`, where both counter reads collapse
+to `unwrap_or(0)`/`unwrap_or(before)` off Linux, so the second conjunct is `0 > 0` and the item can
+never be observed **whatever the wire did**. Its first conjunct — the corruption itself — *is*
+measurable there and the bulk pattern really was transmitted, which is why the two get different
+explanations rather than one shared sentence.
+
+**Which items are NOT excused, and why that list is load-bearing.** `custom_baud` and `break` (both
+read **true** on Darwin in 3 of 3 — they measured fine and merely could have failed), `reopen`,
+`pair_reopen` and `mismatch_reopen` (rig states every kernel observes), and `rate_ladder` (the
+integrity item; it reads *bytes*, not counters, and Darwin certifies it true over the physical
+crossover). On **Linux** none of the five is structural either: `icounter=false` there is a real
+measurement — a pts answers `ENOTTY` because that driver does not implement the ioctl — so the
+mechanism clause must never appear in a Linux report.
+
+**The fix, in the shape that cannot widen.**
+1. The tier sentence moved out of the status decision into `p5_tier_scope(facts)`, printed by arm 4
+   as `Topology: **Tier 3** …` (gated on `any_uart`, since a `pair_reopen` failure reaches arm 4 with
+   nothing certified). **The arms were deliberately not reordered:** moving arm 5 above arm 4 would
+   have flipped Darwin back to `supported` and undone §3.45 E's honest direction, re-breaking
+   §15.21's "a precondition has to be able to fail". Arms 2 and 3 deliberately get **no** tier —
+   there discovery itself is what is in doubt, and a topology word standing in for an unestablished
+   topology is the §9 proxy in space.
+2. The mechanism is carried as **data**: `CertFailure` gains
+   `unmeasurable_here: Option<&'static str>`, set from the new `sys::ICOUNTS_SUPPORTED` at exactly
+   the two counter-reading `fail_if` sites through one helper. The verdict reads it off the failure
+   and never matches item names, so the excuse cannot widen to an item that genuinely failed on a
+   path this kernel does measure. `fail_if` takes the answer as a required fourth argument and
+   `Certificate::unavailable`/`pair_reopen` answer `None` explicitly, so the compiler enforces that
+   every new item states which kind it is.
+3. `p5_certify_port`/`p5_certify_pair` split their pure folds out as `p5_port_certificate` and
+   `p5_pair_certificate` — the same move `p5_verdict` got, for the same reason: the part that must be
+   tested is the *classification*, and it cannot be reached through the measuring function without a
+   bench. A pts is not a substitute (`p5_is_uart` rejects one on both kernels), so a pts-driven guard
+   would pass vacuously everywhere (§9).
+
+**`sys::ICOUNTS_SUPPORTED` lives beside the two `read_icounts` arms** so it cannot drift from them,
+with a guard asserting it equals `cfg!(target_os = "linux")` and — on the stub arm only — that an
+invalid fd still answers `ENOTSUP`, which is the claim P5's consequence makes to the operator.
+
+**Fail-first, four mutations, three of them reproducible on Linux and the fourth stated as not.**
+Reproduced in-tree by reverting each edit in place (§8: no `git stash`), failing-test names captured
+verbatim, then re-applied:
+- **M1** — drop `{topology}` from arm 4's format string. Fails
+  `probes::tests::an_uncertified_rig_still_names_the_tier_discovery_found`:
+  *"a degraded certificate did not name its tier: The rig carries data, but is not fully characterized
+  (usb-A: break) — a tier leaning on that item would be running uncertified (§15.21). Everything else
+  above is certified."* This is the Darwin defect reproduced **on Linux** with a *measurable* failure,
+  so the guard is not platform-shaped.
+- **M3** — widen the excuse to every platform (`p5_icounts_unmeasurable` returns `Some(why)` always).
+  Fails `probes::tests::the_counter_items_are_platform_excused_exactly_where_the_ioctl_is_absent`:
+  *"assertion `left == right` failed: icounter excused on the wrong platform / left: true /
+  right: false"*.
+- **M4** — widen the *matcher* instead of the flag (`f.unmeasurable_here.or(Some(P5_WHY_NO_ICOUNTER))`
+  in the fold). Fails
+  `probes::tests::only_the_items_this_kernel_cannot_measure_are_excused_by_the_platform` on its
+  negative assertion, printing *"… A: icounter, B: icounter, A: break cannot be measured on this
+  kernel at all: …"*. This is the assertion that proves the guard's **matcher** and not merely its
+  walker: an excuse that fired on everything would otherwise read as a pass.
+- **M2** — revert the mechanism wiring (`p5_icounts_unmeasurable` returns `None` always). This
+  reproduces today's shipped behaviour and is **invisible on Linux** — the platform-binding guard
+  passes trivially there. Stated rather than hidden; M3 is the Linux-visible mutation for the same
+  defect, pinning the wiring from the other side.
+
+**Linux is byte-identical, checked rather than assumed.** `p5_verdict(true, true, &[], &[], paired())`
+was asserted character-for-character against the committed
+`docs/doctor/linux-7.0-2026-08-05b-tier3.json` P5 consequence, and both certificate observation lines
+(`custom_baud=true break=true modem[…] icounter=true`, `rate_ladder=true
+deliberate_mismatch_observed=true`) against the same artifact's observation values; a full
+`serial-nexus-doctor --json` before and after differs only in the build commit and in timing numbers.
+No `expectations/*.jq` change is owed: no status moves, and neither gate inspects P5's consequence
+text.
+
+**Pre-registered Darwin prediction, so the next capture can refute this.** The next macOS rig run
+must print, in one `degraded` P5 line: `Topology: **Tier 3** — 1 cross-wired pair, …`; the two
+`icounter` items grouped into one "cannot be measured on this kernel at all" sentence naming
+TIOCGICOUNT; `deliberate_mismatch` in its own sentence naming that the traffic *was transmitted*;
+and `break`/`custom_baud`/`rate_ladder` in **neither** clause.
+
+**Named, not fixed (so it is not a silent re-fix later, §5).** Three sentences in shipped prose still
+describe P5's UART predicate as *"TIOCGICOUNT, which is Linux-only"*, which §3.42 made false when the
+predicate became the `TIOCMGET || TIOCGICOUNT` disjunction: `p5_verdict`'s final `else` arm and its
+paired test assertion, the `supported` bullet in `docs/serial-nexus-doctor.md`, and `docs/macos.md`
+around lines 707 and 889. They are adjacent to this change and out of its scope; the correction is
+owed and is recorded here rather than folded in quietly.
 
 ---
 

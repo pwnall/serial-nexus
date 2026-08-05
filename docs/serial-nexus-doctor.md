@@ -161,7 +161,11 @@ DOC-1b). The precedence is worst-first:
   `deliberate_mismatch` (TX at 115200 into an RX at 9600 must corrupt the nonce
   *and* raise the frame-error counter — proof the counters are observable); or a
   port that would not reopen for characterization at all. A tier leaning on that
-  item would be running uncertified; everything else is certified.
+  item would be running uncertified; everything else is certified — and the
+  verdict names the **tier** discovery found even here, plus, for `icounter` and
+  `deliberate_mismatch` off Linux, the mechanism: those two read `TIOCGICOUNT`,
+  which does not exist there, so no rig can certify them and re-seating a cable is
+  the wrong instruction.
 - **`supported`** — discovered and certified, **at a named tier**. On a non-UART
   (the CI pts sim) characterization reports `skipped (not a UART)` and records
   **no** failure, by §15.21's design, so P5's logic never waits for a bench.
