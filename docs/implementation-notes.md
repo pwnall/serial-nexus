@@ -4601,6 +4601,57 @@ every single-valued assertion would still hold.
 actually does with the flag, and `baseline_via_master` reads **true** — not the `false` this
 session assumed. If `baseline_via_master` comes back `false`, refutation 2 above is itself wrong.
 
+### 3.41 P13 gets the baseline repair; P8, P9 and P12 are measured not to need it
+
+**Design:** §7.2's baseline, and §7's rule that a kernel question is settled by measuring.
+
+**Three of the four need nothing, and each for a different reason — recorded so the next reader
+does not re-derive them.**
+
+* **P8 — no change.** It is `skipped` with zero observations in all three committed Darwin
+  captures, so no number escapes to be wrong. The precise reason matters and is not the obvious
+  one: `apply_pty_baseline` *does* run inside `p8_inner` on Darwin; the probe then fails at
+  `Epoll::new()` and discards everything. It is safe because nothing is reported, not because the
+  fallback never fires.
+* **P9 — no change.** Measured on Linux: a forced-cooked slave (ICANON+ECHO, with and without
+  packet mode) changes neither the poll cost (143 ns vs 152 ns — noise) nor readiness
+  (`ready = 0/4096` in every arm). The probe already self-certifies its own precondition with
+  `ready_passes_total: 0`, which both kernels report.
+* **P12 — no change**, upholding the 2026-08-05 annotation with a sharper reason than it had: the
+  edge is `EV_EOF` on an `EVFILT_READ` knote — a hangup property, termios-independent — and adding
+  a baseline re-assert to the shapes would **destroy shape `a`** by turning a bare open/close into
+  a tcsetattr session. The a/b/c contrast *is* the instrument.
+
+**P13 — repaired.** The `[b'x'; 64]` payload does survive a cooked discipline (measured: cooked and
+raw both recover exactly 64, and a `\n` control proves the mechanism is live by expanding 64 → 128
+under ONLCR), and close duration is termios-flat on Linux (raw 1–19 µs, cooked 2–12 µs). But the
+probe could not *testify* to its own configuration — the same deficiency P10's repair closed — so it
+now re-asserts on the slave it measures and reports `slave_termios_mode`, with a tripwire that
+degrades if any shape was not raw.
+
+**The repair carries a Darwin-only hazard Linux is structurally blind to, which is why it drains.**
+With the master in packet mode a slave-side `tcsetattr` raises `TIOCPKT_IOCTL` — measured on Linux
+as exactly one byte, `0x40`, which the caller's existing `bytes - reads` correction already absorbs.
+A BSD `ptcread` may copy the whole `struct termios` after that control byte, which a per-read
+correction cannot subtract, and ~72 uncounted bytes landing in `bytes_after` would flip Darwin's
+headline from `waits-then-discards` to **`waits-then-retains`** — an inverted result caused by the
+instrument. Rather than bet on which BSD does what, the bytes are consumed before the measurement
+window opens and **reported** as `baseline_packet_bytes`, so the next Darwin capture answers the
+question with a number instead of an assumption (§7).
+
+**Pre-registered for the next Mac run:** P13 stays `waits-then-discards` with
+`slave_termios_mode: "raw"` on all three shapes. `baseline_packet_bytes` reads **1** if XNU appends
+nothing, or **~72** if it appends the termios struct — either is informative, and the second would
+have silently inverted the headline before this change.
+
+**Not taken here:** P9 and P2 both report a "zero-timeout poll" median and they differ 8–11× on
+Darwin (22832/22980/16098 ns against 2091/2102/2086) while agreeing on Linux (195 vs 263 ns). The
+two are not the same measurement — P2's fd is hung up and its mask is POLLHUP-only, so every pass
+returns ready, where P9's fd has a slave open and asks about POLLIN, so none does. A Linux 2×2 ruled
+out sample count and cold start (all four cells 145–152 ns). Decomposing it properly needs P9 to
+reproduce P2's shape inside itself; that is a new measurement rather than a repair, and it is filed
+rather than smuggled into this change.
+
 ---
 
 ## 4. Findings carried forward (from serial-nexus-doctor)

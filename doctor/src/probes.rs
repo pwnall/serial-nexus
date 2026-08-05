@@ -1239,6 +1239,14 @@ struct CloseResult {
     bytes_after: u64,
     /// How the master's post-close drain ended (`eof` / `EIO` / …).
     terminal: String,
+    /// The line discipline the measured slave was actually in. A close policy read
+    /// in some other discipline is another configuration's number wearing this
+    /// one's name (notes §3.34).
+    slave_mode: &'static str,
+    /// Bytes the baseline re-assert itself put on the master, consumed before the
+    /// measurement window opened. Reported, not assumed: Linux queues one
+    /// `TIOCPKT_IOCTL` control byte and a BSD may queue a termios struct behind it.
+    baseline_packet_bytes: u64,
 }
 
 impl CloseResult {
@@ -1251,6 +1259,8 @@ impl CloseResult {
             "bytes_lost": written.saturating_sub(self.bytes_before + self.bytes_after),
             "close_microseconds": self.close_us,
             "terminal_read": self.terminal,
+            "slave_termios_mode": self.slave_mode,
+            "baseline_packet_bytes": self.baseline_packet_bytes,
         })
     }
 }
@@ -1353,9 +1363,28 @@ pub fn p13_last_close_disposition() -> Probe {
         None => String::new(),
     };
 
-    p.observe("policy", policy)
-        .observe("close_waits_for_reader", waited)
-        .verdict(
+    // §7.2's baseline is the discipline the daemon's pty runs. Idempotent where
+    // the master carries the baseline and load-bearing where it does not, so this
+    // should never fire on either kernel of record — which is the shape a tripwire
+    // is supposed to have (notes §3.34, P10's `slave_termios_mode`).
+    let cooked: Vec<&str> = results
+        .iter()
+        .filter(|(_, r)| r.slave_mode != "raw")
+        .map(|(s, _)| s.key())
+        .collect();
+    let p = p
+        .observe("policy", policy)
+        .observe("close_waits_for_reader", waited);
+    if !cooked.is_empty() {
+        return p.verdict(
+            Status::Degraded,
+            &format!(
+                "The last-close policy read **{policy}**, but the measured slave was not in §7.2's baseline discipline for shape(s) {} — these are some other configuration's numbers and must not be diffed against a run reporting `slave_termios_mode: \"raw\"`. The re-assert on the measured slave failed or was undone; re-check it before reading any figure here (notes §3.34).",
+                cooked.join(", ")
+            ),
+        );
+    }
+    p.verdict(
             Status::Supported,
             &format!(
                 "This kernel **{policy}** bytes a pts client wrote but the master never read: with no reader, {recovered} of {P13_PAYLOAD} byte(s) survive the last close and `close(2)` takes {} µs (terminal read `{}`).{drained_note} Numbers, not a verdict — every policy is legitimate and the daemon is correct under each (§7.2 drains before finalizing a close, §5 accounts what it reads). Read it for two things: a cross-kernel diff, and the reason a harness reads a byte counter while its client is still open rather than after (notes §3.29). A `waits-then-*` kernel additionally means a lost byte implies a reader stalled for the whole timeout, not a lost microsecond race.",
@@ -1377,6 +1406,38 @@ fn p13_policy(close_us: u64, recovered: u64) -> &'static str {
         (true, true) => "waits-then-retains",
         (true, false) => "waits-then-discards",
     }
+}
+
+/// Put the slave P13 measures into §7.2's baseline and clear the cost of doing so
+/// off the master, returning the resulting discipline and the bytes the re-assert
+/// queued.
+///
+/// **Two separate jobs, and the second is the one that matters.** The re-assert is
+/// P10's repair (notes §3.34) applied to P13's slave: `apply_pty_baseline` reaches
+/// the master where the master is a terminal and otherwise a slave it opens and
+/// immediately drops, and a BSD pty resets slave termios at that last close — so
+/// without this the probe measures a cooked pty the daemon never runs, and says
+/// nothing about which it measured. Applied on every platform: a repair that only
+/// executes off the platform of record is a §9 proxy in space.
+///
+/// The drain exists because the re-assert is not free on the wire. With the
+/// master in packet mode, a slave-side `tcsetattr` raises `TIOCPKT_IOCTL` —
+/// measured on Linux 7.0.0-29 as exactly one byte, `0x40`. One bare control byte is
+/// absorbed by the `bytes - reads` correction the caller already applies, so on
+/// Linux this drain changes no reported figure. It is here for the kernel this tree
+/// cannot interrogate: a BSD `ptcread` may copy the whole `struct termios` after that
+/// control byte, which the per-read correction cannot subtract, and ~72 uncounted
+/// bytes landing in `bytes_after` would flip Darwin's measured `waits-then-discards`
+/// to `waits-then-retains` — an inverted headline caused by the instrument. Rather
+/// than assume which BSD does what, the bytes are consumed before the measurement
+/// window opens and **reported**, so the next Darwin capture answers it with a
+/// number (§7).
+fn p13_arm_slave<Fd: AsFd>(slave: &Fd, master_fd: RawFd, buf: &mut [u8]) -> (&'static str, u64) {
+    let _ = set_baseline(slave);
+    let mode = termios_mode(slave);
+    std::thread::sleep(PTY_SETTLE);
+    let (queued, ..) = read_available(master_fd, buf, 64);
+    (mode, queued)
 }
 
 fn p13_shape(shape: CloseShape) -> anyhow::Result<CloseResult> {
@@ -1404,6 +1465,13 @@ fn p13_shape(shape: CloseShape) -> anyhow::Result<CloseResult> {
         flags |= OFlag::O_NONBLOCK;
     }
     let slave = open(pts.as_str(), flags, Mode::empty())?;
+    let (slave_mode, baseline_packet_bytes) = p13_arm_slave(&slave, fd, &mut buf);
+
+    // The payload is 64 `x`. That it survives a cooked discipline unchanged is a
+    // property of the *byte*, not an accident to rely on silently: OPOST/ONLCR
+    // expands `\n` and leaves `x` alone, measured on 7.0.0-29 as 64 recovered raw
+    // and cooked alike where a `\n` payload came back 128. The re-assert above is
+    // what makes that irrelevant rather than load-bearing.
     nix::unistd::write(&slave, &[b'x'; P13_PAYLOAD])?;
     std::thread::sleep(PTY_SETTLE);
 
@@ -1435,6 +1503,8 @@ fn p13_shape(shape: CloseShape) -> anyhow::Result<CloseResult> {
         bytes_before,
         bytes_after,
         terminal,
+        slave_mode,
+        baseline_packet_bytes,
     })
 }
 
