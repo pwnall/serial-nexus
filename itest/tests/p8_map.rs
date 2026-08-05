@@ -958,73 +958,36 @@ b = "console/raw"
 /// Wait for the map's targetward accounting to settle, **while the pts client that
 /// produced the bytes is still open** (notes §3.29).
 ///
-/// The `&File` is the enforcement, and it is the whole reason this is a function
-/// rather than an inline `wait_until`. Its caller closes the client with
-/// `drop(client)`, which *moves* it; so moving this call below that line does not
-/// merely weaken the test, it **fails to compile** (`borrow of moved value:
-/// client`). The ordering is a property the compiler checks, not a comment a future
-/// editor can step over — which matters because the previous shape of this test made
-/// it a comment, and the comment lost.
+/// The rule, the borrow mechanism, the withdrawn `tcflush(TCOFLUSH)` referee and the
+/// full "precisely what is and is not stronger" argument now live on
+/// [`serial_nexus_itest::settled_while_open`], because six further guards in this
+/// suite needed the same enforcement and a rule that lives in one test file is a rule
+/// the next test file re-derives (notes §3.55). Read it there before editing either
+/// side of this ordering.
 ///
-/// Why the ordering is load-bearing at all: reading the counter *after* the close
-/// asserts that the kernel retained bytes across the slave's last close, which no
-/// kernel promises. Linux retains them (doctor P13: `retains`, `close(2)` in ~7 µs,
-/// 64/64 recovered), so the old order could not fail here and never had. Darwin is
-/// under no obligation to agree, and that is sufficient: the assertion was wrong
-/// wherever it ran.
-///
-/// **Precisely what is and is not stronger here, because the loose version of this
-/// sentence is wrong.** The *assertion* is logically stronger: the map's counters are
-/// monotone `Cell<u64>` bumped only by `.add`, so "flowed during the live session"
-/// implies "reads 64 afterwards" while the converse does not hold. The *test* is not
-/// uniformly stronger, and cannot be — the two observations cannot both be taken on
-/// one run. Waiting for the counter before the close inserts an RPC round-trip there,
-/// which guarantees the daemon has drained the master *before* the close happens; so
-/// this test no longer traverses the write-then-immediately-close residual path that
-/// `pty.rs`'s "a closing writer's residual must still be forwarded (not purged)
-/// before the close is finalized" describes. It never covered that promise
-/// deliberately — it traversed it by accident, and only on kernels that retain.
-///
-/// That gap is **closed, not merely noted**:
-/// [`a_closing_writers_residual_is_forwarded_not_purged`] below is the deliberate
-/// guard for it, and was proved fail-first against a daemon with the drain gated on
-/// `now` — a regression this test passes and that one catches, with `purged: 64`
-/// where `discarded_no_raw_edge: 64` belongs. Do not "simplify" the two into one:
-/// they need opposite orderings, and that is the whole point.
-///
-/// This reorder is **not** advertised as the root cause of the 2026-08-03 macOS red.
-/// XNU's `ptsclose` runs `ttylclose` → `ttywflush` → `ttywait` before any flush, which
-/// *waits* up to `t_timeout` (≈0.6 s) for the master to drain, so the old ordering's
-/// expected Darwin outcome was green — and a red means the reader did not drain in
-/// that window, which is a stall, not a kernel coin flip. `docs/macos.md` (2026-08-04)
-/// carries the source excerpt and the probe that separates the two.
-///
-/// One thing this deliberately does **not** do is emulate Darwin's close so a Linux
-/// run can referee the ordering dynamically. That was tried and withdrawn:
-/// `tcflush(TCOFLUSH)` on a Linux pts slave is not XNU's `ttyflush`. It empties the
-/// peer's flip buffer only, never the master's ldisc `read_buf`, so it is a race
-/// against the flip-to-ldisc push rather than a queue flush — measured on this box
-/// at 300 trials per row, it destroys the bytes 100% of the time at a 0 µs delay and
-/// **0%** at 20 µs and beyond. In this function's position it would run an RPC
-/// round-trip after the write and so destroy nothing at all: dead code that reads
-/// like a guard. The compile-time borrow is strictly stronger and costs nothing.
+/// What stays local is the map's own predicate: the `never` arm counts
+/// `discarded_no_raw_edge` (the read-only map swallows and names the bytes) and the
+/// `held` arm counts `bytes_in` (a writable map transforms them). The two arms are the
+/// controlled A/B, so the counter is chosen by the arm rather than by a flag inside
+/// the daemon.
 fn settled_while_open(
     rpc: &serial_nexus_itest::Rpc,
-    client: &std::fs::File,
+    client: &mut std::fs::File,
     write_mode: &str,
     typed: u64,
 ) -> bool {
-    // Make the borrow load-bearing rather than ornamental: a live fd answers fstat.
-    client
-        .metadata()
-        .expect("the client must still be open while its bytes are accounted");
-    wait_until(Duration::from_secs(10), || {
-        let n = rpc.node("console").unwrap_or(Value::Null);
-        match write_mode {
-            "never" => n["targetward"]["discarded_no_raw_edge"].as_u64() == Some(typed),
-            _ => n["targetward"]["bytes_in"].as_u64() == Some(typed),
-        }
-    })
+    serial_nexus_itest::settled_while_open(
+        &mut [client],
+        &format!("[{write_mode}] the map's targetward accounting"),
+        Duration::from_secs(10),
+        || {
+            let n = rpc.node("console").unwrap_or(Value::Null);
+            match write_mode {
+                "never" => n["targetward"]["discarded_no_raw_edge"].as_u64() == Some(typed),
+                _ => n["targetward"]["bytes_in"].as_u64() == Some(typed),
+            }
+        },
+    )
 }
 
 #[test]
@@ -1121,7 +1084,7 @@ b = "p0"
         // accounting one below is the *only* detector, in this order or the old one.
         // Only the two-part revert (map half + `Handoff::Lost => return`) produces
         // MAP-1's message, and it did so before this change too.
-        let settled = settled_while_open(rpc, &client, write_mode, TYPED);
+        let settled = settled_while_open(rpc, &mut client, write_mode, TYPED);
 
         // The property: the client exits, and the PTY's reader must still be alive to
         // notice. With the dropped receiver, the first typed byte hit a closed channel

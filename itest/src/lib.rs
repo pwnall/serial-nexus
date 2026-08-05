@@ -755,6 +755,227 @@ impl Drop for Sim {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The read-after-close rule: notes §3.29 / design §15.46 / plan §3 rule 8.
+// ---------------------------------------------------------------------------
+
+/// Something whose being **open** is a precondition of a byte-counter reading, and
+/// which can prove it at the instant that counter is read.
+///
+/// The two implementations answer the same question with different syscalls, and both
+/// are cheap enough to run on every observation:
+///
+/// * [`std::fs::File`] — an open fd answers `fstat`. Rust owns the descriptor, so the
+///   type system has already ruled out the interesting failure; the call is what keeps
+///   the parameter from being ornamental, so a later editor deleting the "unused"
+///   witness has to delete a syscall rather than a name.
+/// * [`Sim`] — a subprocess is open while it has not exited, which
+///   `Child::try_wait` answers without reaping a live child. This one is **not**
+///   decorative: every `Sim` held open across an observation is held by a
+///   `--hold-ms` timer, and a timer is §9's proxy in time. The check converts "the
+///   hold might have expired under load" from a silent vacuous pass into a named
+///   failure.
+pub trait OpenWitness {
+    /// How this witness names itself in a failure message.
+    fn label(&self) -> String;
+    /// `Ok(())` if this witness is demonstrably still open *now*, else why not.
+    fn prove_open(&mut self) -> Result<(), String>;
+}
+
+impl OpenWitness for std::fs::File {
+    fn label(&self) -> String {
+        "the held pty slave".to_owned()
+    }
+    fn prove_open(&mut self) -> Result<(), String> {
+        self.metadata()
+            .map(|_| ())
+            .map_err(|e| format!("fstat on the held fd failed: {e}"))
+    }
+}
+
+impl OpenWitness for Sim {
+    fn label(&self) -> String {
+        "the held serial-nexus-sim child".to_owned()
+    }
+    fn prove_open(&mut self) -> Result<(), String> {
+        match self.child.try_wait() {
+            Ok(None) => Ok(()),
+            Ok(Some(st)) => Err(format!(
+                "the sim already exited ({st}) — its --hold-ms elapsed before the \
+                 observation finished, so this reading was taken against a closed slave"
+            )),
+            Err(e) => Err(format!("try_wait on the sim failed: {e}")),
+        }
+    }
+}
+
+/// Open a pty node's slave (through its symlink) as a blocking, non-controlling fd —
+/// the witness half of [`settled_while_open`].
+///
+/// `O_NOCTTY` because a test process must never acquire a controlling terminal from a
+/// node it is only observing. Blocking rather than `O_NONBLOCK` deliberately: doctor
+/// P13 measures an `O_NONBLOCK` slave losing its queued bytes **unconditionally** in
+/// 29 µs on Darwin, against ~600 ms of drain-wait for a blocking one, so a witness
+/// opened non-blocking would arm the very hazard it is held to disarm.
+///
+/// Panics on failure — a witness that could not be taken must fail loudly, never
+/// degrade the observation to the unwitnessed one it replaced (§5's anti-tautology
+/// rule).
+pub fn attach_slave(path: &Path) -> std::fs::File {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(path)
+        .unwrap_or_else(|e| panic!("open pty slave {} as a witness: {e}", path.display()))
+}
+
+/// Wait for a byte counter to settle **while the client that produced those bytes is
+/// still open** (notes §3.29, design §15.46, plan §3 rule 8).
+///
+/// The witness borrow is the enforcement, and it is the whole reason this is a
+/// function rather than an inline [`wait_until`]. Its caller closes the client with
+/// `drop(client)`, which *moves* it; so moving this call below that line does not
+/// merely weaken the test, it **fails to compile** (`borrow of moved value:
+/// client`). The ordering is a property the compiler checks, not a comment a future
+/// editor can step over — which matters because the previous shape of the first of
+/// these tests made it a comment, and the comment lost.
+///
+/// Why the ordering is load-bearing at all: reading the counter *after* the close
+/// asserts that the kernel retained bytes across the slave's last close, which no
+/// kernel promises. Linux retains them (doctor P13: `retains`, `close(2)` in tens of
+/// µs, 64/64 recovered, `docs/doctor/linux-7.0-2026-08-05-tier3.json`), so the old
+/// order could not fail there and never had. Darwin does not — `waits-then-discards`,
+/// 600104 µs and 0 of 64 with no reader, 29 µs and 0 of 64 for an `O_NONBLOCK` slave
+/// (`docs/doctor/macos-24.6.0-2026-08-05-tier3.json`) — and that is sufficient: the
+/// assertion was wrong wherever it ran.
+///
+/// **What the witness actually proves, stated precisely because the loose version of
+/// this sentence is wrong.** Every kernel attaches its flush to the *last* close of
+/// the pty — XNU runs `ptsclose` → `ttylclose` → `ttywflush` when the reference count
+/// reaches zero, and Linux charges `discarded_at_last_close` at the same edge. So a
+/// witness fd the harness holds on the same slave is exactly as strong as holding the
+/// writing client open: while any fd remains, no kernel reaches its flush. That is why
+/// several callers open the slave themselves and let a one-shot
+/// `serial-nexus-sim client` do the writing — the sim's own exit is then not the last
+/// close, and the harness keeps a compile-checked handle on the session instead of a
+/// deadline on a subprocess.
+///
+/// **Precisely what is and is not stronger.** The *assertion* is logically stronger:
+/// the counters this waits on are monotone `Cell<u64>` bumped only by `.add`, so
+/// "flowed during the live session" implies "reads N afterwards" while the converse
+/// does not hold. The *test* is not uniformly stronger, and cannot be — the two
+/// observations cannot both be taken on one run. Waiting for the counter before the
+/// close inserts an RPC round-trip there, which guarantees the daemon has drained the
+/// master *before* the close happens; so a converted test no longer traverses the
+/// write-then-immediately-close residual path that `pty.rs`'s "a closing writer's
+/// residual must still be forwarded (not purged) before the close is finalized"
+/// describes. It never covered that promise deliberately — it traversed it by
+/// accident, and only on kernels that retain.
+///
+/// That gap is **closed, not merely noted**: `p8_map`'s
+/// `a_closing_writers_residual_is_forwarded_not_purged` is the deliberate guard for
+/// it, and was proved fail-first against a daemon with the drain gated on `now` — a
+/// regression the converted test passes and that one catches, with `purged: 64` where
+/// `discarded_no_raw_edge: 64` belongs. Do not "simplify" the two into one: they need
+/// opposite orderings, and that is the whole point. Two further guards keep the
+/// closes-first shape on purpose — `p4_purge`'s purge-on-detach check and
+/// `p12_pty_setup`'s `discarded_at_last_close` check — because the counters they
+/// assert come into existence *because* of the close and read 0 before it. Each says
+/// so in its own doc comment and each carries a positive pre-close witness so the
+/// post-close number is not its only evidence.
+///
+/// This helper is **not** advertised as the root cause of the 2026-08-03 macOS red.
+/// XNU's `ptsclose` waits up to `t_timeout` (≈0.6 s) for the master to drain before
+/// any flush, so the old ordering's expected Darwin outcome was green — and a red
+/// means the reader did not drain in that window, which is a stall, not a kernel coin
+/// flip. `docs/macos.md` (2026-08-04) carries the source excerpt and the probe that
+/// separates the two.
+///
+/// One thing this deliberately does **not** do is emulate Darwin's close so a Linux
+/// run can referee the ordering dynamically. That was tried and withdrawn:
+/// `tcflush(TCOFLUSH)` on a Linux pts slave is not XNU's `ttyflush`. It empties the
+/// peer's flip buffer only, never the master's ldisc `read_buf`, so it is a race
+/// against the flip-to-ldisc push rather than a queue flush — measured on this box at
+/// 300 trials per row, it destroys the bytes 100% of the time at a 0 µs delay and
+/// **0%** at 20 µs and beyond. In this function's position it would run an RPC
+/// round-trip after the write and so destroy nothing at all: dead code that reads like
+/// a guard. The compile-time borrow is strictly stronger and costs nothing.
+///
+/// The openness is proven **twice**: once before the wait, so an observation that
+/// began against an already-closed client is never scored, and once at the moment the
+/// condition became true (or the deadline expired), so a witness that closed *during*
+/// the wait is named rather than tolerated. The return value is deliberately a `bool`
+/// rather than an assertion, so a caller can defer its message below the lifecycle
+/// checks that give a more specific diagnosis first.
+pub fn settled_while_open(
+    witnesses: &mut [&mut dyn OpenWitness],
+    what: &str,
+    timeout: Duration,
+    cond: impl FnMut() -> bool,
+) -> bool {
+    assert!(
+        !witnesses.is_empty(),
+        "{what}: settled_while_open with no witness is the defect it exists to \
+         prevent — the observation would be unordered against every close in the test"
+    );
+    prove_all(witnesses, what, "when the observation began");
+    let settled = wait_until(timeout, cond);
+    prove_all(
+        witnesses,
+        what,
+        if settled {
+            "when its byte counter was read"
+        } else {
+            "while its byte counter was being waited on"
+        },
+    );
+    settled
+}
+
+/// [`settled_while_open`] for an observation that **blocks** rather than polls: a sim
+/// subprocess's verdict, read to EOF, is a byte count as much as a `state` counter is.
+///
+/// Same contract and same enforcement — the witnesses are borrowed, so moving this
+/// call below the close that ends the session is `E0382`, and they are proven open on
+/// both sides of the blocking call. The value the closure returns is handed straight
+/// back, so the caller can defer its assertions below the lifecycle checks exactly as
+/// with the polling form. Read [`settled_while_open`]'s doc comment for the rule; this
+/// is the same rule with `FnOnce` in place of `wait_until`.
+pub fn observed_while_open<T>(
+    witnesses: &mut [&mut dyn OpenWitness],
+    what: &str,
+    observe: impl FnOnce() -> T,
+) -> T {
+    assert!(
+        !witnesses.is_empty(),
+        "{what}: observed_while_open with no witness is the defect it exists to \
+         prevent — the observation would be unordered against every close in the test"
+    );
+    prove_all(witnesses, what, "when the observation began");
+    let out = observe();
+    prove_all(witnesses, what, "when its byte counter was read");
+    out
+}
+
+/// Panic unless every witness is still open, naming the one that is not and the rule
+/// it broke. Split out so both the pre- and post-checks report identically.
+fn prove_all(witnesses: &mut [&mut dyn OpenWitness], what: &str, when: &str) {
+    for w in witnesses.iter_mut() {
+        if let Err(why) = w.prove_open() {
+            panic!(
+                "{what}: {} was no longer open {when} — {why}.\n\
+                 A byte counter read after its producer closed asserts that the \
+                 *kernel* retained the bytes across the slave's last close, which \
+                 Linux does and Darwin does not (notes §3.29, plan §3 rule 8; doctor \
+                 P13 measures both).",
+                w.label()
+            );
+        }
+    }
+}
+
 /// A single software serial device that echoes what is written to it — the Linux
 /// software-loopback "device" for echo round-trip tests. **Not available on macOS** (a
 /// pty cannot be a serial device there — `serial2` → `ENOTTY`); those tests skip. Keeps
@@ -802,14 +1023,46 @@ pub fn serial_echo() -> Option<SerialEcho> {
 }
 
 /// Detect a two-port crossover rig: `SNX_CROSSOVER_A`/`_B` if both are set, on any
-/// platform; else — **macOS only** — exactly two `/dev/cu.usbserial-*` nodes.
+/// platform; else — **macOS only, and only when the operator has opted in** —
+/// exactly two `/dev/cu.usbserial-*` nodes.
 ///
-/// There is deliberately no Linux by-id arm, and the asymmetry is worth stating where
-/// it bites (review 37 `37-DOC-3`): on Linux a physically cross-wired pair is invisible
-/// here until both variables are exported, so every rig-gated test self-skips on a box
-/// whose rig is attached and working, and a green run reads as hardware coverage that
-/// never executed. A doctor P5 reporting Tier 3 says nothing about whether these tests
-/// ran — it certifies the rig, not this detection (§15.21).
+/// **The doctrine is now the same on both platforms, and that is plan §18 item 5
+/// discharged** (design §13's no-target doctrine). [`rig_candidates`] states the
+/// rule this function used to break on one platform: *reported, never
+/// auto-selected* — two adapters being present is not two adapters being
+/// cross-wired, and a harness that opened whatever it found would transmit
+/// 32 KiB at 250000 baud and pulse DTR on equipment nobody verified. That is the
+/// same reason `serial-nexus-doctor` is passive until a port is named. The macOS
+/// arm did exactly what the rule forbids, silently, on a plain
+/// `cargo test --workspace`.
+///
+/// **What was decided, and what it cost.** Deleting the arm outright was the
+/// obvious transplant and is *not* what happened, because it is not free: the
+/// software serial doubles are Linux-only — a pty is not a serial device on
+/// Darwin, where `serial2` answers `ENOTTY` — so this scan is macOS's **only**
+/// serial provider, and removing it would make eleven tests self-skip on a
+/// working box. That is notes §3.35's defect wearing the other hat, and this tree
+/// has already paid once for a green run that was coverage never executed. So the
+/// arm survives behind a **named opt-in**: set `SNX_CROSSOVER` to anything at all
+/// (`scan`, `required`, `1`) and the scan runs; leave it unset and the pair is
+/// reported in the skip message and never chosen. An operator gets the coverage by
+/// saying one word, and nobody transmits on unknown hardware by accident.
+///
+/// Three consequences worth stating rather than discovering. The macOS platform
+/// record taken before this change (`docs/macos.md`, the `fa4b12d` run) was
+/// produced by the unconditional scan and needs `SNX_CROSSOVER` exported to
+/// reproduce. `SNX_CROSSOVER=required` becomes **reachable** on a Mac for the first
+/// time — it previously could not fire there, because required-mode only triggers
+/// on a skip and the scan prevented skips, so the one knob that exists to stop a
+/// vacuous green run was structurally dead on the platform that most needed it.
+/// And the selection is now **announced**: a run that transmits on scanned
+/// hardware says which two nodes it picked, in its own output, so the choice is
+/// auditable after the fact instead of being inferred from a filename.
+///
+/// The Linux side is unchanged and the asymmetry it used to carry is gone: on both
+/// platforms a physically cross-wired pair is invisible here until the operator
+/// says so. A doctor P5 reporting Tier 3 still says nothing about whether these
+/// tests ran — it certifies the rig, not this detection (§15.21).
 pub fn crossover_ports() -> Option<(String, String)> {
     if let (Ok(a), Ok(b)) = (
         std::env::var("SNX_CROSSOVER_A"),
@@ -819,6 +1072,13 @@ pub fn crossover_ports() -> Option<(String, String)> {
     }
     #[cfg(target_os = "macos")]
     {
+        // The opt-in. Any value — this is a switch, not a vocabulary, and
+        // `required` (the spelling an operator already knows) must turn the scan
+        // *on* as well as making its absence fatal, or required-mode would demand
+        // a rig it had just refused to look for.
+        if std::env::var("SNX_CROSSOVER").is_err() {
+            return None;
+        }
         let mut ports: Vec<String> = std::fs::read_dir("/dev")
             .ok()?
             .flatten()
@@ -833,6 +1093,15 @@ pub fn crossover_ports() -> Option<(String, String)> {
             .collect();
         ports.sort();
         if ports.len() == 2 {
+            // Say what was chosen. A scan that selects silently is indistinguishable
+            // in the output from a pair the operator named, and the two carry very
+            // different warranties.
+            eprintln!(
+                "RIG: SNX_CROSSOVER is set and no ports were named, so the macOS scan \
+                 selected {} and {} — verify they are the cross-wired pair, because \
+                 this harness will transmit and pulse DTR on both.",
+                ports[0], ports[1]
+            );
             return Some((ports[0].clone(), ports[1].clone()));
         }
     }
@@ -1541,4 +1810,35 @@ mod tests {
             .expect("write the garbage line");
         let _ = sub.next(Duration::from_secs(5));
     }
+}
+
+/// Announce the TLS round-trip's self-skip — and refuse to skip when the operator
+/// has said the tier must be exercised.
+///
+/// **The one skip class that had no `required` spelling** (plan §3 rule 11, plan §18
+/// item 10). `web_tls_round_trip` is the only proof that the TLS tier's *handshake*
+/// works rather than merely that it binds, and it carries **two** silent skips: no
+/// `curl` on `PATH` (plan §11.6 names curl as the client, and `std` ships no TLS
+/// client), and an environment that cannot bind `0.0.0.0:0` with `--tls`. Either one
+/// turns the tier's only end-to-end guard into a green line, and nothing in the
+/// output distinguishes that from a run that exercised it — the shape notes §3.35
+/// measured and §3.43 measured again, both times on a box where the capability was
+/// present and the harness never used it.
+///
+/// `SNX_TLS=required` turns both into hard failures, exactly as `SNX_CROSSOVER` and
+/// `SNX_REPLUG` do for their classes. It is a third instance of one mechanism rather
+/// than a third mechanism: same variable shape, same word, same failure text — a skip
+/// class that invented its own spelling would be a fourth thing to remember.
+///
+/// `reason` names *which* of the two skips fired, because they call for different
+/// actions: one is a missing tool, the other is a sandbox that will not bind.
+pub fn skip_no_tls(test: &str, reason: &str) {
+    assert!(
+        std::env::var("SNX_TLS").as_deref() != Ok("required"),
+        "SNX_TLS=required, but {test} skipped: {reason}.\n\
+         Required mode exists so a box that can run the TLS round-trip cannot report \
+         a green run for the one guard that proves the handshake rather than the bind \
+         (plan §11.6, §3 rule 11)."
+    );
+    eprintln!("SKIP {test}: {reason}");
 }

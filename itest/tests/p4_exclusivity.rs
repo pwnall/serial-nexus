@@ -24,7 +24,9 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use serial_nexus_itest::{Daemon, Sim, serial_pair_or_rig, skip_no_pair};
+use serial_nexus_itest::{
+    Daemon, Sim, attach_slave, observed_while_open, serial_pair_or_rig, skip_no_pair,
+};
 
 /// `AppError::Locked` (serial-nexus-rpc): `APP_ERROR_BASE (-32000) - 3`. A contended,
 /// un-waited `lock`/`send` is refused with this code (§6/§16.8).
@@ -255,7 +257,7 @@ fn exclusive_write_lock_is_byte_exact() {
         "lock ptya not acquired: {acq:?}"
     );
 
-    let pb = Sim::spawn(
+    let mut pb = Sim::spawn(
         &[
             "client",
             "--path",
@@ -271,7 +273,7 @@ fn exclusive_write_lock_is_byte_exact() {
         ],
         None,
     );
-    let ps = Sim::spawn(
+    let mut ps = Sim::spawn(
         &[
             "client",
             "--path",
@@ -312,9 +314,19 @@ fn exclusive_write_lock_is_byte_exact() {
         ])
     });
 
-    // The holder streams 64 KiB; only its bytes may flow to the device. Its client
-    // detaches when the send completes (no --hold-ms), which is the detach-release
-    // trigger asserted at the end.
+    // The holder's pty session, opened by the harness and held across the sink's
+    // count — the §3.29 witness (notes §3.55, plan §3 rule 8).
+    //
+    // The one-shot `Sim::client` below returns when the *kernel* accepted its last
+    // byte, not when the daemon read it, so its close used to land while up to a pty
+    // buffer's worth of the holder's 64 KiB was still inside the pair — and the
+    // `received == 65536` assertion below then quietly asserted that the kernel had
+    // retained those bytes across the slave's last close. Linux does (doctor P13
+    // `retains`); Darwin does not (`waits-then-discards`). This fd makes the sim's exit
+    // not be the last close, so the count is taken against a live session.
+    let mut holder_session = attach_slave(std::path::Path::new(ta.as_str()));
+
+    // The holder streams 64 KiB; only its bytes may flow to the device.
     let holder = Sim::client(&[
         "--path",
         ta.as_str(),
@@ -330,12 +342,41 @@ fn exclusive_write_lock_is_byte_exact() {
         .expect("holder reported sha256_sent")
         .to_owned();
 
-    let sink = sink.join().expect("sink thread");
+    // The sink's verdict is collected while three things are still open, and all three
+    // are checked at the instant of the reading rather than assumed:
+    //
+    //  * `holder_session`, for the reason above;
+    //  * `pb` and `ps`, the locked-out writers — **and that check is not decorative.**
+    //    They are held by `--hold-ms 20000` against a `--timeout-ms 25000`, which is a
+    //    timer, i.e. §9's proxy in time. If either expired before the holder finished
+    //    streaming, its buffered bytes would be purged at its own detach and this
+    //    test's whole claim — "a non-holder's buffered bytes never reach the device" —
+    //    would pass because there was nothing left to leak. That is a vacuous pass no
+    //    counter in the graph can distinguish from a real one, and it gets louder the
+    //    slower the box. `Sim`'s witness answers `try_wait`, so an expired hold is now
+    //    a named failure. (The timer itself stays: the sim's slave is held by a
+    //    subprocess this harness cannot leash without a sim-side stdin-EOF hold, which
+    //    is out of scope here and recorded in notes §3.55.)
+    let sink = observed_while_open(
+        &mut [&mut holder_session, &mut pb, &mut ps],
+        "the device's byte count under an exclusive lock",
+        || sink.join().expect("sink thread"),
+    );
     let recv = sink["received"].as_u64().unwrap_or(0);
     let sha_sink = sink["sha256"].as_str().unwrap_or("");
 
+    // Release the locked-out writers and end the holder's session, in that order. The
+    // holder's close is the detach-release trigger asserted below, and it must be the
+    // *last* close on ttyA or the daemon never sees a present→absent edge.
+    drop(pb);
+    drop(ps);
+    drop(holder_session);
+
     // Byte-exact exclusivity: the device received exactly the holder's 64 KiB — a
     // non-holder or the spy would have interleaved bytes and changed the checksum.
+    // Asserted below the closes, from values read above them (§3.29's ordering: the
+    // observation is early, the message is late so the lifecycle failure reports
+    // first).
     assert_eq!(
         recv, 65536,
         "device received {recv} bytes, expected 65536 (a non-holder leaked?): {sink:?}"
@@ -345,10 +386,6 @@ fn exclusive_write_lock_is_byte_exact() {
         sha_holder.as_str(),
         "device checksum != seeded-A (exclusivity broken)"
     );
-
-    // Release the locked-out writers now that the exclusivity window is proven.
-    drop(pb);
-    drop(ps);
 
     // Detach-release (§6): the holder's client sent and detached, so the lock frees
     // automatically — no explicit unlock.

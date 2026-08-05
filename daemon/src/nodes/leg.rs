@@ -81,8 +81,8 @@ use crate::boundary::{self, TaskSet};
 use crate::cell::CriticalCell;
 use crate::runtime::{
     CHANNEL_CAP, DataFrame, DropCounters, Grant, HostwardChannelStat, LossCounter, READ_BUF,
-    SharedFanOut, SharedLock, SharedTargetEdge, Wiring, await_write_grant, data_frames,
-    route_channel_data,
+    SharedFanOut, SharedLock, SharedTargetEdge, TargetwardInbox, TeardownBytes, TeardownLoss,
+    Wiring, await_write_grant, data_frames, route_channel_data,
 };
 use crate::tap::TapFeed;
 
@@ -394,6 +394,33 @@ pub struct LegNode {
     /// leg could shed tens of megabytes with every counter in `state` reading zero
     /// (LEG-1). Kept exactly as `map.rs`, `codec.rs` and `exec.rs` keep theirs.
     channel_counters: HashMap<String, Arc<DropCounters>>,
+    /// Per channel, the node's handle on that channel's §5-targetward queue and the
+    /// tally of what teardown destroyed in it (§5, §15.50, notes §3.31/§3.55).
+    ///
+    /// **Per channel, not per node**, because a leg's whole reporting idiom is per
+    /// channel and §5 asks for loss that is *attributable*: an operator whose
+    /// `remove-node` reports 400 KiB destroyed has a very different next question if it
+    /// all came from one wedged channel. The node-level figure the removal reply
+    /// carries ([`Self::discarded_at_teardown`]) is the sum.
+    ///
+    /// **Which queue that is depends on which way the leg faces**, and both are
+    /// targetward in §5's sense — bytes headed for a device, on the direction the
+    /// design forbids dropping:
+    ///
+    /// * `faces = host`: the arbitrated `mpsc::Receiver<Chunk>` every local writing
+    ///   origin on that channel's host-facing endpoint feeds. Identical in shape to the
+    ///   queue §15.50 already charges on `map`/`codec`/`exec`.
+    /// * `faces = target`: the `mpsc::Receiver<Inbound>` of wire-arriving chunks
+    ///   [`channel_targetward`] hands into the local graph. A different item type — it
+    ///   carries 37-LEG-1's provenance tag — which is why the ledger's inbox is generic
+    ///   over its item rather than over `Chunk` alone.
+    ///
+    /// What is deliberately **not** here: a `faces = target` leg's per-channel relay
+    /// (local hostward device data on its way to the wire). Those bytes are hostward,
+    /// whose §5 policy is drop-and-count at the consuming boundary, and charging them
+    /// to a counter named `discarded_at_teardown` would report hostward loss under a
+    /// targetward name.
+    channel_teardown: HashMap<String, TeardownLoss>,
     shared: Rc<LegShared>,
     tasks: TaskSet,
 }
@@ -434,6 +461,10 @@ impl LegNode {
             channels: channels.clone(),
             stats: Rc::new(stats),
             channel_counters: HashMap::new(),
+            channel_teardown: channels
+                .iter()
+                .map(|c| (c.clone(), TeardownLoss::default()))
+                .collect(),
             shared: Rc::new(LegShared::new(*purge_on_reconnect)),
             tasks: TaskSet::default(),
         }
@@ -470,6 +501,14 @@ impl LegNode {
                 .cloned()
                 .expect("stats is keyed by self.channels")
         };
+        // Taken out for the duration of the wiring walk and put back at the end, because
+        // `TeardownLoss::watch` needs `&mut` on the entry while `self.stats` and
+        // `self.channels` are still being read. Same panic discipline as `stat_for`
+        // (37-LEG-5): `create` keys this map off the very `channels` the loops below
+        // walk, so a missing entry is a broken invariant, and a defaulted one would
+        // drop a channel out of the teardown ledger — the accounting gap this whole
+        // change exists to close.
+        let mut teardown = std::mem::take(&mut self.channel_teardown);
         // How the pump routes decoded wire events back into the local graph.
         let recv_route: RecvRoute = match self.faces {
             Facing::Host => {
@@ -484,6 +523,15 @@ impl LegNode {
                         feeds.insert(ch.clone(), feed);
                     }
                     if let Some(rx) = wiring.host_targetward_rx.remove(&addr) {
+                        // Watched: this is the §5-targetward queue local writers feed,
+                        // the shape §15.50 charges. Before this it lived inside the
+                        // supervisor's future, so `TaskSet::abort_all` destroyed
+                        // whatever a peerless leg had accumulated in it and no counter
+                        // in the daemon had ever seen those bytes.
+                        let rx = teardown
+                            .get_mut(ch)
+                            .expect("channel_teardown is keyed by self.channels")
+                            .watch(rx);
                         send_receivers.push((ch.clone(), rx, stat_for(ch)));
                     }
                 }
@@ -500,6 +548,15 @@ impl LegNode {
                     // and parks again (§15.35).
                     if let Some(mut inbox) = wiring.target_inbox.remove(&addr) {
                         let (relay_tx, relay_rx) = mpsc::channel::<Chunk>(CHANNEL_CAP);
+                        // Deliberately **not** watched. The relay carries local
+                        // *hostward* device data on its way to the wire; §5 governs
+                        // that direction with drop-and-count at the consuming boundary
+                        // (`dropped_slow_consumer` below), so charging it to
+                        // `discarded_at_teardown` would report a hostward loss under a
+                        // targetward name. The inbox wrapper is still used, because it
+                        // is what `next_send` polls — being *watched* is what makes a
+                        // queue teardown-charged, not being an inbox.
+                        let relay_rx = TargetwardInbox::new(relay_rx);
                         send_receivers.push((ch.clone(), relay_rx, stat_for(ch)));
                         self.tasks.push(tokio::task::spawn_local(async move {
                             while let Some(mut rx) = inbox.recv().await {
@@ -532,6 +589,15 @@ impl LegNode {
                         .remove(&addr)
                         .unwrap_or_else(crate::runtime::TargetEdge::new);
                     let (inbound_tx, inbound_rx) = mpsc::channel::<Inbound>(CHANNEL_CAP);
+                    // Watched: wire-arriving bytes headed into the local graph are
+                    // targetward, so a teardown that destroys this queue owes §5 the
+                    // same number a `map`'s does. The item type differs — every chunk
+                    // carries 37-LEG-1's provenance tag — which is the reason the
+                    // ledger's inbox is generic over its item.
+                    let inbound_rx = teardown
+                        .get_mut(ch)
+                        .expect("channel_teardown is keyed by self.channels")
+                        .watch(inbound_rx);
                     inbound_txs.insert(ch.clone(), inbound_tx);
                     let stat = stat_for(ch);
                     let idle = Duration::from_millis(self.idle_release_ms);
@@ -546,6 +612,8 @@ impl LegNode {
                 RecvRoute::Target(inbound_txs)
             }
         };
+
+        self.channel_teardown = teardown;
 
         self.tasks
             .push(tokio::task::spawn_local(supervise(SuperviseArgs {
@@ -594,6 +662,19 @@ impl LegNode {
                         .channel_counters
                         .get(ch)
                         .map_or(0, |c| c.dropped_full()),
+                    // Targetward bytes this channel's own queue was still holding when
+                    // the node stopped (§15.50). It reads `0` for the whole of a
+                    // channel's working life and moves exactly once, at `signal_stop`,
+                    // so on a leg you can still see in `state` it is always `0` and the
+                    // queue behind it is backlog rather than loss — a peerless
+                    // `faces = host` leg is *designed* to accumulate one (§5
+                    // backpressure), and that backlog is delivered the moment a peer
+                    // arrives. The figure that matters is the one the `remove-node`
+                    // reply carries.
+                    "discarded_at_teardown": self
+                        .channel_teardown
+                        .get(ch)
+                        .map_or(0, TeardownLoss::bytes),
                 });
                 (ch.clone(), obj)
             })
@@ -619,6 +700,11 @@ impl LegNode {
             // Wire frames whose unconfigured identity the LEG-2 cap refused to
             // record: a peer inventing identities is visible rather than silent.
             "unbound_overflow": unbound_overflow,
+            // The node-level sum of the per-channel figure above, present for the same
+            // reason `map`/`codec`/`exec` carry one: it is the number the `remove-node`
+            // and `teardown` replies quote, and reading the two in one place is what
+            // makes the reply checkable against `state` before the node is gone.
+            "discarded_at_teardown": self.discarded_at_teardown(),
             "channels": channels,
         });
         // The §9 named footgun: surface it as a visible, greppable confession in
@@ -652,8 +738,27 @@ impl LegNode {
     /// The leg has nothing to join, so [`Self::teardown`] is exactly this; the split
     /// exists so the two-phase shape is uniform across node kinds. Idempotent.
     pub fn signal_stop(&mut self) {
+        // Count before aborting, and in that order: `abort_all` is what drops the
+        // futures the per-channel targetward queues live in, and every chunk queued in
+        // them goes with it (§5, §15.50). Draining first also ends the pumps
+        // *gracefully* — an emptied inbox answers `None` — so the abort is a backstop
+        // rather than the mechanism.
+        for loss in self.channel_teardown.values() {
+            loss.drain();
+        }
         self.tasks.abort_all();
         self.unlink_listen_socket();
+    }
+
+    /// Targetward bytes this node destroyed at teardown, summed over its channels, for
+    /// the verb that removed it to report (§5: the node is about to stop existing, so
+    /// `state` cannot be the only home for its last loss). The per-channel split — the
+    /// attributable half of the same fact — stays in [`Self::state_extra`].
+    pub fn discarded_at_teardown(&self) -> u64 {
+        self.channel_teardown
+            .values()
+            .map(TeardownLoss::bytes)
+            .fold(0u64, u64::saturating_add)
     }
 
     pub fn teardown(&mut self) {
@@ -696,7 +801,7 @@ fn connection_str(state: &NodeState) -> &'static str {
 /// stat (for the `bound` gate — a `waiting` channel is not drained onto the wire,
 /// so its writers backpressure per faulted-and-wait rather than have their bytes
 /// dropped at the unconfigured peer).
-type SendReceiver = (String, mpsc::Receiver<Chunk>, Rc<ChannelStat>);
+type SendReceiver = (String, TargetwardInbox, Rc<ChannelStat>);
 
 /// How the pump routes a decoded wire event into the local graph.
 enum RecvRoute {
@@ -729,6 +834,15 @@ struct Inbound {
     bytes: Chunk,
 }
 
+impl TeardownBytes for Inbound {
+    /// The payload only. The provenance tag is bookkeeping this node added on the way
+    /// in, not something a peer sent or a device would have received, so counting it
+    /// would inflate a §5 loss figure with the daemon's own overhead.
+    fn teardown_bytes(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+}
+
 struct SuperviseArgs {
     faces: Facing,
     transport: Transport,
@@ -755,7 +869,7 @@ enum PumpEnd {
 /// directions until it drops, then fault, back off, and retry (§7.4). The send
 /// receivers, the recv route, and the per-channel targetward tasks persist across
 /// reconnects; only the socket and the pump are per-connection.
-async fn supervise(mut a: SuperviseArgs) {
+async fn supervise(a: SuperviseArgs) {
     // Exponential reconnect backoff (§7.4), reset on a good connection. The listen
     // role's bind shares the schedule with the connect role's dial: both are the same
     // environmental retry.
@@ -895,14 +1009,16 @@ async fn supervise(mut a: SuperviseArgs) {
         // arrives from the wire and is purged in `channel_targetward`, which owns it
         // (LEG-3).
         //
-        // The drain runs to *quiescence* via the shared helper — drain, yield,
-        // redrain, bounded rounds — because §6 names the case a single `try_recv`
-        // pass misses: "including a chunk held by a producer suspended mid-send"
-        // (DM-2/LEG-1). It is the same helper the serial node's purge uses, so the
-        // two instances of the one purge rule cannot drift again.
+        // The drain runs to *quiescence* on the shared inbox — drain, yield, redrain,
+        // bounded rounds — because §6 names the case a single `try_recv` pass misses:
+        // "including a chunk held by a producer suspended mid-send" (DM-2/LEG-1). It is
+        // the same method the serial node's purge calls, so the two instances of the one
+        // purge rule cannot drift again; and because it drains *through* the node's slot
+        // rather than borrowing the receiver out of it, a `remove-node` landing on one of
+        // its yields still finds the queue where the node can count it (§15.50).
         if connected_before && a.shared.purge_on_reconnect && a.faces == Facing::Host {
-            for (_ch, rx, stat) in &mut a.send_receivers {
-                let purged = boundary::drain_to_quiescence(rx).await;
+            for (_ch, rx, stat) in &a.send_receivers {
+                let purged = rx.purge_to_quiescence().await;
                 if purged > 0 {
                     stat.purged_on_reconnect.add(purged);
                 }
@@ -917,7 +1033,7 @@ async fn supervise(mut a: SuperviseArgs) {
             read_half,
             write_half,
             leftover,
-            &mut a.send_receivers,
+            &a.send_receivers,
             send_is_hostward,
             &a.recv_route,
             &a.stats,
@@ -982,7 +1098,10 @@ async fn pump(
     mut read_half: tokio::io::ReadHalf<Box<dyn DuplexStream>>,
     mut write_half: tokio::io::WriteHalf<Box<dyn DuplexStream>>,
     leftover: Vec<u8>,
-    send_receivers: &mut [SendReceiver],
+    // Shared, not exclusive: an inbox's receive goes through its shared slot, which is
+    // the whole point of the §15.50 ledger — the node keeps a handle on the queue this
+    // pump is draining, so aborting the pump no longer takes the queue with it.
+    send_receivers: &[SendReceiver],
     send_is_hostward: bool,
     recv_route: &RecvRoute,
     stats: &Rc<HashMap<String, Rc<ChannelStat>>>,
@@ -1327,7 +1446,7 @@ fn note_undeliverable(
 /// the tag it was stamped with before the suspension, so it is attributed correctly
 /// whichever side of the disconnect it lands on.
 async fn channel_targetward(
-    mut rx: mpsc::Receiver<Inbound>,
+    rx: TargetwardInbox<Inbound>,
     edge: SharedTargetEdge,
     idle: Duration,
     stat: Rc<ChannelStat>,
@@ -1526,13 +1645,23 @@ fn release(lock: &SharedLock, id: OriginId) {
 /// when every receiver is closed (all local producers gone) — binding is stable for
 /// a pump's lifetime, so a skipped channel never needs its waker re-registered here.
 fn next_send<'a>(
-    receivers: &'a mut [SendReceiver],
+    receivers: &'a [SendReceiver],
     start: &'a mut usize,
 ) -> impl std::future::Future<Output = Option<(String, Chunk)>> + 'a {
     std::future::poll_fn(move |cx: &mut Context<'_>| {
         let n = receivers.len();
         if n == 0 {
             return Poll::Ready(None);
+        }
+        // Settle every inbox's mid-flight chunk before polling any of them (§15.50).
+        // This is the multiplexed analogue of `TargetwardInbox::recv`'s clear-at-the-top:
+        // the write half only re-enters `next_send` once the previous chunk has reached
+        // the wire or been charged as an unframable residual, and that chunk may have
+        // come from *any* of these inboxes. Clearing only the inbox we happen to poll
+        // would leave a producer's `held` set for as long as its siblings kept the write
+        // half busy, so a teardown would charge a chunk that went out minutes ago.
+        for (_ch, rx, _stat) in receivers.iter() {
+            rx.settle_held();
         }
         let mut all_closed = true;
         for k in 0..n {

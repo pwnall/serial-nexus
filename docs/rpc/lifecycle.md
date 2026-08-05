@@ -33,7 +33,13 @@ None.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `torn_down` | integer | number of nodes torn down |
+| `torn_down` | integer | how many nodes were removed |
+| `discarded_at_teardown` | integer | targetward bytes the nodes were still holding for consumers that went away with them, summed across the graph — what tearing down cost, as against `torn_down`'s count of what it removed (§5: loss is always visible). Nonzero only where a node with a targetward queue had a non-empty one: `map`, `codec` and `exec` on their host-facing queues, `serial` on the backlog a `waiting` device accumulates, and `leg` on its per-channel queues. For `exec` the figure is a **floor** rather than a total — its per-channel forwarders feed a second internal merge stage this handle does not reach — and `pty` and `log` contribute nothing because they own no queue of this shape. See [`remove-node`](configuration.md#remove-node) for the single-node form and [observation.md](observation.md) for the per-node counter. Always present, `0` included |
+
+Both fields are always present. `discarded_at_teardown` is a *loss* figure and must not
+be added to the `purged_bytes` [`remove-node`](configuration.md#remove-node) reports
+alongside it there: they name different losses, and the reason is spelled out on that
+page.
 
 ### CLI
 
@@ -54,11 +60,6 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"teardown"}' | nc -N -U "$SOCK
   "discarded_at_teardown": 0
 }
 ```
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `torn_down` | integer | how many nodes were removed |
-| `discarded_at_teardown` | integer | targetward bytes the nodes were still holding for consumers that went away with them, summed across the graph — what tearing down cost, as against `torn_down`'s count of what it removed (§5: loss is always visible). Nonzero only where an interior node (`map`, `codec`, `exec`) had a non-empty targetward queue; see [`remove-node`](configuration.md#remove-node) for the single-node form and [observation.md](observation.md) for the per-node counter |
 
 Every open tap receives a terminal
 [`tap.closed`](observation.md#tapclosed-notification) notification on its own

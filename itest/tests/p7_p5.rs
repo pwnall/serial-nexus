@@ -296,3 +296,102 @@ fn p5_reports_a_peer_that_hangs_up_mid_probe_as_hung_up_not_dangling() {
         "P5 certified a rig it could not classify: {p}"
     );
 }
+
+/// The P14 probe object from a doctor report.
+fn p14_probe(report: &Value) -> Value {
+    report["probes"]
+        .as_array()
+        .expect("report has a probes array")
+        .iter()
+        .find(|p| p["id"] == json!("P14"))
+        .cloned()
+        .expect("report contains the P14 probe")
+}
+
+/// **P14's plumbing runs against the software null modem, and its claim does not**
+/// (design §15.51, plan §18 item 11).
+///
+/// This is the guard for the one way a ceiling search can be catastrophically
+/// wrong: a pts pair carries bytes perfectly at every rate, because nothing clocks
+/// it. `serial-nexus-sim nullmodem` reads `discovered_pairs: 1` in P5, so a P14 that
+/// gated on the pair *count* would climb the whole ladder, pass every rung
+/// including `u32::MAX`, and report `structural-cap` — a confident wire number
+/// with no wire, on the platform CI actually runs. The gate is [`p5_is_uart`],
+/// which a pts fails on both kernels, and the assertion below is that P14 says so
+/// **positively** rather than merely declining to answer.
+///
+/// The skip is asserted, never inferred from silence: a report with no P14 block
+/// at all would satisfy "did not claim a ceiling" while proving the opposite of
+/// what this test is for, so `p14_probe` panics on absence and the reason string is
+/// pinned. That, and not the verdict word, is what makes the matcher provable —
+/// `p5_classifies_paired_dangling_and_loopback_ports` above pins the same
+/// `not a UART` spelling for P5's certificate, so the two cannot drift apart.
+#[test]
+fn p14_reports_skipped_not_a_uart_against_the_software_null_modem() {
+    let Some(pair) = serial_pair() else {
+        eprintln!(
+            "SKIP: p7_p5 needs software serial doubles (Linux sim pty); \
+             serial_pair() is None on this platform"
+        );
+        return;
+    };
+    let (a, b) = pair.ports();
+    let (a, b) = (a.to_string(), b.to_string());
+    let both_up = wait_until(Duration::from_secs(5), || Path::new(&b).exists());
+    assert!(both_up, "null-modem second port never appeared at {b}");
+
+    let report = run_doctor(&[a.as_str(), b.as_str()]);
+
+    // The precondition this test would be vacuous without: P5 really did pair the
+    // two halves in both directions. If discovery failed, P14 would skip for the
+    // *wrong* reason ("no verified cross-paired rig") and the UART gate below would
+    // never have been reached.
+    let p5 = p5_probe(&report);
+    assert!(
+        obs(&p5, &a).starts_with("paired with"),
+        "the null modem was not discovered as a pair, so this test cannot reach \
+         P14's UART gate: {}",
+        obs(&p5, &a)
+    );
+
+    let p14 = p14_probe(&report);
+    assert_eq!(
+        p14["status"],
+        json!("skipped"),
+        "P14 must not answer over a software null modem: {p14}"
+    );
+    let reason = p14["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("not a UART") || reason.contains("not characterizable"),
+        "P14 skipped for the wrong reason — the pair WAS discovered, so the skip \
+         must name the missing clock, not the missing rig: {reason:?}"
+    );
+
+    // The plumbing ran: the probe is present, it saw the pair, and it said so.
+    // Without these the assertions above are satisfied by a probe that never
+    // executed at all.
+    let pairs_seen = p14["observations"]
+        .as_array()
+        .expect("P14 has an observations array")
+        .iter()
+        .find(|o| o["key"] == json!("pairs_discovered"))
+        .and_then(|o| o["value"].as_u64())
+        .expect("P14 reports how many pairs it was handed");
+    assert_eq!(
+        pairs_seen, 1,
+        "P14 was not handed the discovered pair, so its skip is about the rig \
+         being absent rather than about the pts having no clock"
+    );
+
+    // And the claim itself is absent. A `max_reliable_baud` on a pts is the exact
+    // failure this guard exists to catch, whatever the verdict word says.
+    assert!(
+        !p14["observations"]
+            .as_array()
+            .expect("P14 has an observations array")
+            .iter()
+            .any(|o| o["key"] == json!("max_reliable_baud")),
+        "P14 reported a ceiling for a software null modem: {}",
+        p14["observations"]
+    );
+}

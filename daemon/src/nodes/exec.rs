@@ -432,6 +432,21 @@ impl ExecCodecNode {
             // Bytes that never reached the child because the envelope refused to
             // frame them (§5 all-loss-counted; unreachable for a sane channel id).
             "discarded_unframable": self.unframable_discarded.get(),
+            // A **floor, not a total**, and the one kind whose figure is (§5, §15.50,
+            // notes §3.31). What is watched is the host-facing per-channel queues the
+            // forwarders read from; those forwarders then push into `src_tx`, a second
+            // *internal* merged queue `pump_child` reads, and a chunk that has already
+            // moved into that stage is beyond this handle's reach. So a torn-down exec
+            // can destroy more than it reports — never less, which is the direction §5
+            // requires when a figure has to be inexact.
+            //
+            // Closing it no longer needs a new mechanism: since `serial` and `leg`
+            // adopted the ledger the inbox is generic over its item type (notes §3.55),
+            // so the merge queue needs only a `TeardownBytes` impl for its
+            // `(String, Chunk)` and the same `watch`/`drain` pair. What it needs is a
+            // guard, and the guard is the hard half — "a chunk is sitting in the merge
+            // queue" is not something an RPC ack can make true, so it wants a child
+            // that has stopped reading its stdin.
             "discarded_at_teardown": self.teardown_loss.bytes(),
             "multiplexed": {
                 "dropped_slow_consumer": self.mux_counters.as_ref().map_or(0, |c| c.dropped_full()),

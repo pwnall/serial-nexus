@@ -718,7 +718,7 @@ item the update block reports **verified**, the update block wins.
 | Doctor P2 (PTY presence / `POLLHUP`) | ✅ | ❓ | Presence detection is POSIX but the exact `POLLHUP` timing is **unverified.** **needs a Mac.** |
 | Doctor P3 (serial-port fit / UART cert) | ✅ | ✅ | Custom baud, `TIOCEXCL`, modem lines, break all pass on a named `--port`; only the `TIOCGICOUNT` sub-clause is absent. **verified** (P3 `supported` on both rig ports). |
 | Doctor P4 (by-id resolution) | ✅ | ➖ skipped | No by-id tree → `skipped ("no adapter")`. **cross-checked.** |
-| Doctor P5 (rig certification) | ✅ | ➖ partial | Discovery **pairs both ports** (crossover proven bidirectionally); the counter-based characterization stays `skipped` — `p5_is_uart` gates on `TIOCGICOUNT`, Linux-only. **verified** (discovery) / cert Linux-only. |
+| Doctor P5 (rig certification) | ✅ | ➖ partial | Discovery **pairs both ports** (crossover proven bidirectionally) **and the certificate now runs**: `p5_is_uart` is the portable disjunction `TIOCMGET \|\| TIOCGICOUNT` since §15.47, so a real adapter certifies here — `custom_baud=true break=true` per port and `rate_ladder=true` over the wire in `docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3.json` (`1a9a8fca1c36`). Exactly two items stay unmeasurable, `icounter` and `deliberate_mismatch`, both reading `TIOCGICOUNT`; P5 is `degraded` naming them, with the mechanism carried as data rather than as a bare `false`. **verified** (discovery + five certificate items) / two items platform-excused. |
 | Doctor env: `dialout`/`plugdev` membership | ✅ | ➖ skipped | `getgroups` is unavailable in nix on Apple, so supplementary membership is reported **unknown/skipped**. macOS serial access is governed by device-node ownership, not these groups. **cross-checked.** |
 | Doctor env: device-node access check | ✅ | ✅ (expected) | `access(2)` on the node path is cross-platform. **expected.** |
 
@@ -937,8 +937,12 @@ here for free, and the counter that names the discard has nothing to name. **ver
   node re-asserts on the rising presence edge. **P10 has been repaired** (it re-asserts
   on the slave it measures and reports `slave_termios_mode`), because its output was
   demonstrably wrong: its Darwin depths were a cooked pty's, and mode is worth an order
-  of magnitude — measured on Linux 7.0.0-29, raw accepts ~13.8 KiB hostward and returns
-  all of it while cooked accepts ~23.5 KiB and returns none. **Six siblings are not
+  of magnitude — measured on Linux 7.0.0-29, raw accepts less hostward and returns all
+  of it while cooked accepts more and returns none. (The figures this sentence used to
+  quote are withdrawn: a scratchpad pair no committed `docs/doctor/` artifact backs,
+  whose raw half disagreed with the committed Linux capture — notes §3.34's filing,
+  discharged by plan §18 item 1. The annotation at the top of this file records the
+  finding and stays.) **Six siblings are not
   repaired and this is deliberate**: P6, P7, P8, P9, P12 and P13 take the same fallback,
   so their Darwin answers are not *known* to be measured on the daemon's configuration.
   They are not thereby wrong — a readability question or a targetward write survives a

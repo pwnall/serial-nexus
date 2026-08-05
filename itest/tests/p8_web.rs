@@ -1720,7 +1720,10 @@ fn web_tls_round_trip() {
     // and `std` ships no TLS client, so curl is the client here (the one surviving
     // curl dependency in this file) and the test **self-skips** without it.
     if curl(&["--version"]).map(|(ok, _)| ok) != Some(true) {
-        eprintln!("SKIP web_tls_round_trip: curl not found (plan §11.6 names it as the client)");
+        serial_nexus_itest::skip_no_tls(
+            "web_tls_round_trip",
+            "curl not found (plan §11.6 names it as the client)",
+        );
         return;
     }
 
@@ -1744,7 +1747,10 @@ fn web_tls_round_trip() {
             "the TLS server neither printed an https URL nor exited — it is broken, \
              not merely unable to bind"
         );
-        eprintln!("SKIP web_tls_round_trip: this environment cannot bind 0.0.0.0:0 with --tls");
+        serial_nexus_itest::skip_no_tls(
+            "web_tls_round_trip",
+            "this environment cannot bind 0.0.0.0:0 with --tls",
+        );
         return;
     };
 

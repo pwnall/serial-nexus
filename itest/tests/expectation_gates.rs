@@ -275,3 +275,442 @@ fn both_expectation_files_carry_the_same_p4_population_clause() {
         );
     }
 }
+
+/// The clause-identity guard for P14 (§15.51), for the reason the two above give.
+#[test]
+fn both_expectation_files_carry_the_same_p14_clauses() {
+    let status = r#"and (any(.probes[]; .id == "P14" and (.status == "supported" or .status == "skipped" or .status == "degraded")))"#;
+    let presence = r#"and (all(.probes[]; . as $p | ($p.id != "P14") or ($p.status == "skipped")
+      or (($p.observations | any(.key == "max_reliable_baud"))
+          and ($p.observations | any(.key == "ceiling_kind"))
+          and ($p.observations | any(.key == "structural_max_baud" and (.value | type == "number")))
+          and ($p.observations | any(.key == "ceiling_is_a_floor_over" and (.value | type == "string"))))))"#;
+    for name in ["expectations/linux.jq", "expectations/macos.jq"] {
+        let path = repo_root().join(name);
+        let text = std::fs::read_to_string(&path).expect("the expectation file is readable");
+        for (what, clause) in [("status", status), ("presence", presence)] {
+            assert!(
+                text.contains(clause),
+                "{name} does not carry the P14 {what} clause verbatim — the behavioural \
+                 proof in this file runs on one platform's gate and reaches the other \
+                 only through this identity"
+            );
+        }
+        assert!(
+            text.contains(r#""P14"] | index($p.id)) == null)"#),
+            "{name} does not list P14 among the probes that must carry measurements \
+             when they run"
+        );
+    }
+}
+
+/// **The P14 presence clause, proven against a planted violation in every spelling
+/// it claims to cover** (plan §3 rule 10).
+///
+/// The hazard this refuses is specific: P14's answer is a number, and a gate that
+/// pinned it would assert the very thing the probe measures. So the clause gates
+/// *presence* — and a presence clause is exactly the kind that passes vacuously if
+/// its matcher is wrong, because on the box that wrote it every key happens to be
+/// there. Two spellings, because the two ways a report can lose a cell are not the
+/// same edit: a probe that reports `supported` having dropped the number, and one
+/// that keeps the number but drops the sentence bounding what it licenses.
+///
+/// It runs passively — no `--port`, so P14 itself reports `skipped`. That is
+/// deliberate and is the whole reason the planted reports force `.status`: the
+/// clause exempts `skipped`, so a plant that left it alone would prove nothing, and
+/// the exemption is what a rig-less CI lane relies on.
+#[test]
+fn the_p14_presence_clause_rejects_a_ceiling_reported_without_its_number_or_its_bound() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let expectation = platform_expectation();
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    // The honest passive report must PASS: P14 skips without a named port, and a
+    // gate that rejected that would fail every CI run.
+    assert!(
+        gate_accepts(&expectation, &report),
+        "{} rejected an honest passive report: {}",
+        expectation.display(),
+        jq_filter(r#".probes[] | select(.id=="P14")"#, &report)
+    );
+    assert_eq!(
+        jq_filter(r#".probes[] | select(.id=="P14") | .status"#, &report).trim(),
+        "\"skipped\"",
+        "a passive run must skip P14 — it transmits, so it is opt-in (§13)"
+    );
+
+    // Spelling 1 — `supported` with no ceiling reported. This is the shape a probe
+    // takes when its search is rewritten and the observation is forgotten: the
+    // verdict word survives, the measurement does not, and a verdict word cannot be
+    // diffed across kernels.
+    let planted = jq_filter(
+        r#"(.probes[] | select(.id=="P14")) |= (.status = "supported" | .observations = [])"#,
+        &report,
+    );
+    assert!(
+        !gate_accepts(&expectation, &planted),
+        "{} admitted a `supported` P14 carrying no observations at all",
+        expectation.display()
+    );
+
+    // Spelling 2 — the number present, the sentence that bounds it deleted. A
+    // ceiling with no statement of what it is a floor over is the reading §15.51
+    // spends a paragraph refusing: it invites "3 Mbaud works" when what was measured
+    // is "three constant-airtime round-trips per direction passed at 3 Mbaud".
+    let planted = jq_filter(
+        r#"(.probes[] | select(.id=="P14")) |= (.status = "supported"
+           | .observations = [{"key":"max_reliable_baud","value":3000000},
+                              {"key":"ceiling_kind","value":"adapter-refused"},
+                              {"key":"structural_max_baud","value":4294967295}])"#,
+        &report,
+    );
+    assert!(
+        !gate_accepts(&expectation, &planted),
+        "{} admitted a P14 ceiling with no statement of what the number is a floor over",
+        expectation.display()
+    );
+
+    // And the control that keeps the two plants honest: the same forced `supported`
+    // with the full cell set present is ACCEPTED. Without this, a clause that
+    // rejected every forced-`supported` report — for some reason having nothing to
+    // do with P14 — would pass both plants above while testing nothing.
+    let honest = jq_filter(
+        r#"(.probes[] | select(.id=="P14")) |= (.status = "supported"
+           | .observations = [{"key":"max_reliable_baud","value":3000000},
+                              {"key":"ceiling_kind","value":"adapter-refused"},
+                              {"key":"structural_max_baud","value":4294967295},
+                              {"key":"ceiling_is_a_floor_over","value":"the rates this ladder probed"}])"#,
+        &report,
+    );
+    assert!(
+        gate_accepts(&expectation, &honest),
+        "{} rejected a complete P14 block — the two plants above then prove nothing",
+        expectation.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P4's no-udev arm, driven through the shipped binary (plan §18 item 9)
+// ---------------------------------------------------------------------------
+
+/// The sysfs half of a USB tty device — the USB device dir, its interface dir, and
+/// the `class/tty/<dev>/device` link the resolver's ancestor walk starts from.
+/// Deliberately separate from the `/dev` node and from the udev symlinks, because
+/// what these fixtures vary is exactly *which* of the three exist.
+fn sysfs_usb_tty(root: &Path, usbdir: &str, dev_name: &str, serial: &str) {
+    let usbdev = root.join("sys/bus/usb/devices").join(usbdir);
+    std::fs::create_dir_all(&usbdev).expect("mkdir usb device dir");
+    for (f, v) in [
+        ("idVendor", "0403"),
+        ("idProduct", "6001"),
+        ("serial", serial),
+        ("manufacturer", "FTDI"),
+        ("product", "FT232R USB UART"),
+    ] {
+        std::fs::write(usbdev.join(f), v).expect("write sysfs attribute");
+    }
+    let iface = usbdev.join(format!("{usbdir}:1.0"));
+    std::fs::create_dir_all(&iface).expect("mkdir interface dir");
+    std::fs::write(iface.join("bInterfaceNumber"), "00").expect("write bInterfaceNumber");
+    let class = root.join("sys/class/tty").join(dev_name);
+    std::fs::create_dir_all(&class).expect("mkdir class/tty");
+    std::os::unix::fs::symlink(
+        format!("../../../bus/usb/devices/{usbdir}/{usbdir}:1.0"),
+        class.join("device"),
+    )
+    .expect("symlink class/tty device");
+    // A plain file, not a FIFO: `is_dev_node` accepts one, and nothing in this
+    // file may block on a read. (`meta_gates.rs` carries the structural guard
+    // that resolution stays passive; this is only the fixture.)
+    let dev = root.join("dev").join(dev_name);
+    std::fs::create_dir_all(dev.parent().expect("dev has a parent")).expect("mkdir dev");
+    std::fs::write(&dev, b"").expect("write dev node");
+}
+
+fn by_id_link(root: &Path, name: &str, dev_name: &str) {
+    let by_id = root.join("dev/serial/by-id");
+    std::fs::create_dir_all(&by_id).expect("mkdir by-id");
+    std::os::unix::fs::symlink(format!("../../{dev_name}"), by_id.join(name))
+        .expect("symlink by-id");
+}
+
+/// Run the shipped doctor over a fixture tree and return its P4 probe object.
+fn p4_over(root: &Path) -> serde_json::Value {
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--dev-root")
+        .arg(root)
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("the doctor emits JSON");
+    report["probes"]
+        .as_array()
+        .expect("the report has a probes array")
+        .iter()
+        .find(|p| p["id"] == serde_json::json!("P4"))
+        .cloned()
+        .expect("the report contains P4")
+}
+
+fn p4_obs(p4: &serde_json::Value, key: &str) -> Option<serde_json::Value> {
+    p4["observations"]
+        .as_array()
+        .expect("P4 has an observations array")
+        .iter()
+        .find(|o| o["key"].as_str() == Some(key))
+        .map(|o| o["value"].clone())
+}
+
+/// **P4's no-udev arm, executed through the shipped binary for the first time**
+/// (plan §18 item 9).
+///
+/// §12 grew a `<sys>/class/tty` fallback precisely so a box with no udev by-id
+/// tree still resolves canonical identities — a container's bare `--device=`, a
+/// busybox-mdev image. Until now that arm was exercised only by the doctor's own
+/// in-crate unit tests and by a daemon-level resolver test; **no committed
+/// `docs/doctor/` artifact has ever printed its consequence sentence**, because
+/// every capture came from a box where udev names everything. `--dev-root` reroots
+/// `/dev` and `/sys` together, so the whole arm fires with no hardware at all.
+#[test]
+fn p4_reports_the_no_udev_arm_from_the_shipped_binary() {
+    let t = TmpTree::new("p4-noudev");
+    sysfs_usb_tty(t.path(), "1-1", "ttyUSB0", "UNIQ01");
+    assert!(
+        !t.path().join("dev/serial").exists(),
+        "the fixture must have no by-id tree at all, or this is not the no-udev arm"
+    );
+
+    let p4 = p4_over(t.path());
+    assert_eq!(p4["status"], serde_json::json!("supported"), "{p4}");
+    assert_eq!(p4_obs(&p4, "by_id_tree"), Some("absent".into()));
+    assert_eq!(p4_obs(&p4, "sysfs_tty_listing"), Some("present".into()));
+    // udev named nothing, and the sysfs listing named everything.
+    assert_eq!(p4_obs(&p4, "count"), Some(0.into()));
+    assert_eq!(p4_obs(&p4, "sysfs_only"), Some(1.into()));
+    assert_eq!(p4_obs(&p4, "canonical"), Some(1.into()));
+    assert_eq!(
+        p4_obs(&p4, &t.path().join("dev/ttyUSB0").display().to_string()),
+        Some("usb:0403:6001:UNIQ01:00".into()),
+        "the sysfs-only device must resolve to a canonical identity: {p4}"
+    );
+    let why = p4["consequence"].as_str().unwrap_or_default();
+    assert!(
+        why.contains("No /dev/serial/by-id tree here"),
+        "the no-udev consequence never fired: {why}"
+    );
+    assert!(
+        why.contains("identities came from the <sys>/class/tty listing"),
+        "the provenance sentence never fired: {why}"
+    );
+
+    // And the honest report from this tree must PASS the lane's own gate — a gate
+    // that rejects a supported box is not a stricter gate, it is a broken one.
+    if have_jq() {
+        let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+            .arg("--dev-root")
+            .arg(t.path())
+            .arg("--json")
+            .output()
+            .expect("the doctor runs");
+        let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+        assert!(
+            gate_accepts(&platform_expectation(), &report),
+            "the expectation file rejected an honest no-udev tree"
+        );
+    }
+}
+
+/// **The `<sys>/class/tty` listing contributes a device no other source reaches —
+/// and that is now witnessed rather than assumed** (plan §18 item 9).
+///
+/// This is the test the ledger item is actually about. The listing's contribution
+/// is a `seen.entry(name).or_insert(None)` merge in the resolver, and on every box
+/// anyone has ever captured a report from, udev names every port — so the merge
+/// finds every key already present, `sysfs_only` reads **0**, and *the report would
+/// have printed identically had the merge returned nothing*. Checked against the
+/// committed artifacts: `sysfs_only` is 0 in
+/// `docs/doctor/linux-7.0-2026-08-05-f8315cc-tier3.json` and its passive sibling,
+/// and 0 on Darwin (`macos-24.6.0-2026-08-05-1a9a8fc-tier3.json`), which has no
+/// such listing at all.
+///
+/// The discriminating tree is therefore a **mixed** one: one device udev names,
+/// one reachable only through sysfs. The status is deliberately *not* the
+/// discriminator — it reads `supported` either way, which is exactly why a status
+/// clause could never have caught this.
+#[test]
+fn the_sysfs_tty_listing_contributes_a_device_no_other_source_can_reach() {
+    let t = TmpTree::new("p4-mixed");
+    // Distinct usbdir AND distinct serial per device: two devices sharing a serial
+    // are ambiguous, and the resolver demotes both to by-path — which would make
+    // `canonical` collapse for a reason that has nothing to do with the merge.
+    sysfs_usb_tty(t.path(), "1-1", "ttyUSB0", "UNIQ01");
+    by_id_link(
+        t.path(),
+        "usb-FTDI_FT232R_USB_UART_UNIQ01-if00-port0",
+        "ttyUSB0",
+    );
+    sysfs_usb_tty(t.path(), "1-2", "ttyUSB1", "UNIQ02");
+
+    let p4 = p4_over(t.path());
+    assert_eq!(p4_obs(&p4, "by_id_tree"), Some("present".into()));
+    assert_eq!(
+        p4_obs(&p4, "count"),
+        Some(1.into()),
+        "udev named exactly one of the two devices"
+    );
+    assert_eq!(
+        p4_obs(&p4, "sysfs_only"),
+        Some(1.into()),
+        "the second device is reachable ONLY through the sysfs listing, so it is \
+         the listing's contribution made visible: {p4}"
+    );
+    assert_eq!(
+        p4_obs(&p4, "canonical"),
+        Some(2.into()),
+        "both devices must resolve canonically — the merge adds, it does not \
+         replace: {p4}"
+    );
+    // The by-id device keeps its by-id key: `or_insert` must not clobber an entry
+    // udev already named. An `insert` there would leave this observation absent.
+    assert_eq!(
+        p4_obs(&p4, "usb-FTDI_FT232R_USB_UART_UNIQ01-if00-port0"),
+        Some("usb:0403:6001:UNIQ01:00".into()),
+        "the sysfs merge overwrote a device udev had already named: {p4}"
+    );
+    assert_eq!(
+        p4_obs(&p4, &t.path().join("dev/ttyUSB1").display().to_string()),
+        Some("usb:0403:6001:UNIQ02:00".into()),
+        "the sysfs-only device is missing from the report: {p4}"
+    );
+    // The provenance sentence must NOT fire here: a by-id tree exists, so the
+    // consequence's precondition is correctly false.
+    assert!(
+        !p4["consequence"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("No /dev/serial/by-id tree"),
+        "the no-udev sentence fired over a tree that has a by-id listing: {p4}"
+    );
+
+    // **The negative control** (plan §3 rule 10 — prove the matcher, not only the
+    // walker). The same assertions run against a tree with the by-id device alone:
+    // `sysfs_only` must fall to 0 and the second device's key must vanish. Without
+    // this, every number above could be satisfied by a probe that reported the same
+    // figures for any tree at all.
+    let c = TmpTree::new("p4-control");
+    sysfs_usb_tty(c.path(), "1-1", "ttyUSB0", "UNIQ01");
+    by_id_link(
+        c.path(),
+        "usb-FTDI_FT232R_USB_UART_UNIQ01-if00-port0",
+        "ttyUSB0",
+    );
+    let control = p4_over(c.path());
+    assert_eq!(
+        p4_obs(&control, "sysfs_only"),
+        Some(0.into()),
+        "a tree udev names completely must report no sysfs-only device: {control}"
+    );
+    assert_eq!(p4_obs(&control, "canonical"), Some(1.into()));
+    assert_eq!(
+        p4_obs(
+            &control,
+            &c.path().join("dev/ttyUSB1").display().to_string()
+        ),
+        None,
+        "the control tree has no second device, so no key may name one"
+    );
+}
+
+/// The clause-identity guard for §15.52's handshake presence clause.
+#[test]
+fn both_expectation_files_carry_the_same_handshake_clause() {
+    let clause = r#"and (all(.probes[]; . as $p | ($p.id != "P5")
+      or (($p.observations | any((.key | endswith(" cert"))
+             and (.value | type == "string") and (.value | startswith("rate_ladder")))) | not)
+      or ($p.observations | any((.key | endswith(" handshake")) and (.value | type == "string")))))"#;
+    for name in ["expectations/linux.jq", "expectations/macos.jq"] {
+        let path = repo_root().join(name);
+        let text = std::fs::read_to_string(&path).expect("the expectation file is readable");
+        assert!(
+            text.contains(clause),
+            "{name} does not carry the P5 handshake clause verbatim — a rig-only \
+             clause reaches the other platform's lane only through this identity"
+        );
+    }
+}
+
+/// **The handshake clause has teeth, proven against a planted violation** (§15.52,
+/// plan §3 rule 10).
+///
+/// A conditional clause is the shape that passes vacuously most easily: if its
+/// antecedent never fires, it is silent forever and looks green. So this builds the
+/// antecedent synthetically — a P5 block carrying a pair certificate line that
+/// starts with `rate_ladder`, which is what "a pair was certified" looks like — and
+/// asserts the gate REJECTS it when the handshake reading is absent and ACCEPTS it
+/// when present. Synthetic rather than rig-driven on purpose: the clause must be
+/// provable on a CI box with no adapters, which is every box that runs this file.
+///
+/// The by-hand rig version was run too, on the real crossover: deleting the
+/// handshake observation from a live Tier-3 capture makes `jq -e -f
+/// expectations/linux.jq` reject it, and the untouched capture passes.
+#[test]
+fn the_handshake_clause_rejects_a_certified_pair_that_reports_no_handshake() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let expectation = platform_expectation();
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    // Antecedent present, handshake absent — must be REJECTED.
+    let planted = jq_filter(
+        r#"(.probes[] | select(.id=="P5")) |= (.status = "supported"
+           | .observations = [{"key":"a ↔ b cert","value":"rate_ladder=true deliberate_mismatch_observed=true"}])"#,
+        &report,
+    );
+    assert!(
+        !gate_accepts(&expectation, &planted),
+        "{} admitted a certified pair with no handshake reading — the certificate's \
+         own modem map is taken with the peer port closed and cannot answer what the \
+         wire carries (§15.52)",
+        expectation.display()
+    );
+
+    // The same block WITH the reading — must be ACCEPTED, or the rejection above
+    // proves nothing about the handshake and everything about some other clause.
+    let honest = jq_filter(
+        r#"(.probes[] | select(.id=="P5")) |= (.status = "supported"
+           | .observations = [{"key":"a ↔ b cert","value":"rate_ladder=true deliberate_mismatch_observed=true"},
+                              {"key":"a ↔ b handshake","value":"3-wire: no handshake lines carried [rts_a_to_cts_b=false]"}])"#,
+        &report,
+    );
+    assert!(
+        gate_accepts(&expectation, &honest),
+        "{} rejected a certified pair that DID report its handshake — and note the \
+         value says 3-wire, which must pass: whether this rig crosses RTS is the \
+         operator's cabling, not a gate condition",
+        expectation.display()
+    );
+
+    // And the antecedent really is conditional: a passive report, which has no pair
+    // certificate at all, must pass untouched. Without this the clause could be
+    // demanding a handshake from every report and nobody would notice until a
+    // rig-less lane went red.
+    assert!(
+        gate_accepts(&expectation, &report),
+        "{} rejected an honest passive report",
+        expectation.display()
+    );
+}

@@ -91,7 +91,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use serial_nexus_itest::{Daemon, Rpc, TempRun, serial_echo, wait_until};
+use serial_nexus_itest::{Daemon, Rpc, TempRun, serial_echo, settled_while_open, wait_until};
 
 /// Open a pty slave the way a client does — never adopting it as this process's
 /// controlling terminal. `nonblocking` is what lets the CONC-1 test *detect* that
@@ -955,6 +955,39 @@ fn drain_into(slave: &mut std::fs::File, sink: &mut Vec<u8>) {
 ///
 /// Linux-only: it needs a software serial device to emit (`serial_echo` is `None`
 /// elsewhere; §5's platform rule).
+///
+/// **This is the second of the two deliberate exceptions to notes §3.29's rule**
+/// (§3.55). That rule — *a byte counter is read while the client that fed it is still
+/// open* — exists because reading one afterwards asserts that the kernel retained the
+/// bytes across the slave's last close, which doctor P13 measures rather than assumes
+/// (`retains` on Linux 7.0.0-29, `waits-then-discards` on Darwin 24.6.0). Here
+/// `discarded_at_last_close` **is** the last close's own product: it reads 0 for the
+/// whole of a session's life and moves exactly once, at the close this test performs.
+/// There is no earlier ordering that observes it, so converting this guard would
+/// delete it rather than strengthen it — the same shape as `p8_map`'s
+/// `a_closing_writers_residual_is_forwarded_not_purged` and `p4_purge`'s
+/// purge-on-detach check, and treated the same way.
+///
+/// It must **not** be ported to macOS whatever else is done with this class: on Darwin
+/// `discarded_at_last_close` is structurally always 0 (`docs/macos.md` §3), so the
+/// counter it asserts would have nothing to name and the guard would read green while
+/// measuring nothing (plan §18 item 6 says so in as many words).
+///
+/// What the exception owes is a pre-close witness, so the post-close number is not the
+/// only evidence, and it now has one: with the first client proven open, the console
+/// is asserted to have shed **none** of the `total` bytes an independent consumer (the
+/// log) has already received in full. That closes the branch the `discarded_at_last_close`
+/// message used to have to hedge about — "either the queue was never filled, and this
+/// test then proves nothing, or …" — because a console that had already accounted for
+/// everything while its client was attached is refused before the close happens.
+///
+/// Its limit is stated at the assertion rather than glossed: no counter the pty node
+/// publishes separates *queued in the pair* from *delivered to a reader*, so this
+/// witness cannot see a client that drained the console — measured, not supposed, by
+/// planting exactly that client and watching the guard stay green. Closing it needs
+/// `FIONREAD` on the slave, which this crate may not issue (`unsafe` lives only in
+/// `serial_nexus_sys`). The premise is kept instead by a property of this file: `a` is
+/// never read from between its attach and its drop.
 #[test]
 fn a_fresh_console_session_does_not_inherit_the_previous_sessions_bytes() {
     let Some(echo) = serial_echo() else {
@@ -993,7 +1026,7 @@ fn a_fresh_console_session_does_not_inherit_the_previous_sessions_bytes() {
     );
 
     // --- Session A: attach, never read, and let the device fill the pair. ---
-    let a = attach(&console, true);
+    let mut a = attach(&console, true);
     assert!(
         wait_until(Duration::from_secs(10), || client_present(rpc, "console")
             == Some(true)),
@@ -1014,6 +1047,61 @@ fn a_fresh_console_session_does_not_inherit_the_previous_sessions_bytes() {
         rpc.node("usb0")
     );
 
+    // Quiescence *and* §5's conservation law, asserted after the stale-byte check
+    // below so an unfixed daemon fails on the defect rather than on this wait.
+    let accounted = || {
+        counter(rpc, "console", "discarded_no_client")
+            + counter(rpc, "console", "dropped_slow_consumer")
+            + counter(rpc, "console", "discarded_at_last_close")
+    };
+
+    // The positive pre-close witness this exception owes (see the doc comment): with
+    // the session proven open, how many of the fanned-out bytes are in neither counter
+    // and therefore still inside the pair. A zero here would mean the pair was already
+    // empty and the `discarded_at_last_close > 0` assertion below could only ever have
+    // been proving something else.
+    // The pre-close witness this exception owes (see the doc comment), taken with the
+    // session proven open: the console was fanned `total` bytes — witnessed
+    // *independently* by the log file above, a second consumer on the same fan-out
+    // that has all of them — and the console has shed **none** of them, so every one
+    // is still in flight inside the daemon and the kernel pair at this instant. That
+    // is what the last close is about to charge.
+    //
+    // **What this does and does not license, because two earlier shapes of it were
+    // wrong and one was measured wrong** (notes §3.55). It licenses "nothing has been
+    // lost yet", which is the premise `discarded_at_last_close > 0` needs and which
+    // the message below no longer has to hedge about. It does **not** separate "queued
+    // in the pair" from "delivered to a reader": both are absent from every counter
+    // the pty node publishes, so a planted session A that drained the console read
+    // exactly the same numbers and this witness stayed green — its executed fail-first
+    // control, recorded because it refuted the witness rather than confirming it. The
+    // instrument that would close it is `FIONREAD` on the slave (doctor P10 uses it),
+    // and this crate cannot issue it: `unsafe` lives only in `serial_nexus_sys`
+    // (AGENTS.md invariant 3 / §16.3). What keeps the premise true meanwhile is a
+    // property of this file — `a` is never read from between its attach and its drop —
+    // and that is stated here rather than implied.
+    //
+    // The first shape tried, `dropped_slow_consumer > 0`, was refuted by measurement on
+    // this box: the console's hostward bridge backpressures rather than shedding here,
+    // so all three loss counters read 0 with 65537 bytes fanned out, and the whole
+    // 65537 lands on `discarded_at_last_close` at the close. A guard built on that
+    // reading would have reddened the healthy run.
+    let unshed = settled_while_open(
+        &mut [&mut a],
+        "the console's loss accounting before the first client detaches",
+        Duration::from_secs(15),
+        || accounted() < total,
+    );
+    assert!(
+        unshed,
+        "the console had already accounted for all {total} fanned-out bytes while its \
+         client was still attached ({} logged independently), so nothing was left \
+         inside the pair and the last-close charge below would have nothing to name — \
+         this test would then prove nothing: console={:?}",
+        logged(),
+        rpc.node("console")
+    );
+
     drop(a); // the client detaches without ever having read a byte
     assert!(
         wait_until(Duration::from_secs(10), || client_present(rpc, "console")
@@ -1022,13 +1110,6 @@ fn a_fresh_console_session_does_not_inherit_the_previous_sessions_bytes() {
          handler never ran (§7.2)"
     );
 
-    // Quiescence *and* §5's conservation law, asserted after the stale-byte check
-    // below so an unfixed daemon fails on the defect rather than on this wait.
-    let accounted = || {
-        counter(rpc, "console", "discarded_no_client")
-            + counter(rpc, "console", "dropped_slow_consumer")
-            + counter(rpc, "console", "discarded_at_last_close")
-    };
     let settled = wait_until(Duration::from_secs(15), || accounted() >= total);
 
     // --- Session B: a fresh client, which must see only what arrives from now on ---
@@ -1071,13 +1152,18 @@ fn a_fresh_console_session_does_not_inherit_the_previous_sessions_bytes() {
 
     // §5, both halves: the bytes are gone *and* they were named. An unfixed daemon
     // reports no `discarded_at_last_close` at all, which is the silent-loss shape
-    // the rule exists to forbid.
+    // the rule exists to forbid. The premise half of that sentence — "the queue was
+    // never filled" — is no longer an alternative this assertion has to hedge about,
+    // because `outstanding` measured it before the close; the hedge stays in the
+    // message only so a reader who reaches this line first sees both branches.
     assert!(
         counter(rpc, "console", "discarded_at_last_close") > 0,
         "nothing was charged to `discarded_at_last_close` after a client that never \
-         read detached from a full pair: either the queue was never filled (this \
-         test then proves nothing) or kilobytes were discarded with no counter \
-         moving, which §5 forbids. console={:?}",
+         read detached from a pair the pre-close witness measured as saturated — so \
+         kilobytes were discarded with no counter moving, which §5 forbids. The other \
+         branch this message used to have to hedge about (\"the queue was never \
+         filled, so this test proves nothing\") is closed by that witness. \
+         console={:?}",
         rpc.node("console")
     );
     assert!(

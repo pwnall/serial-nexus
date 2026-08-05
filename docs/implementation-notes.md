@@ -4044,6 +4044,15 @@ The sweep behind that rule, because one fixed instance is not a fixed class. Sev
 share the shape and are **latent, not broken** — each is either Linux-gated or rig-gated, so none is
 red today, and none is touched here:
 
+<!-- ANNOTATION 2026-08-05 (§5): *Dispositioned in §3.56 — and "none is red today" went stale before
+     it was.* Row 3, `p4_free_for_all`, stopped being latent when `serial_pair` gained the rig
+     fallback: design §15.48 records it failing **12 of 12 on Darwin**, losing 5–31 bytes of 32768,
+     against 20 of 20 on Linux over the same rig at the same commit. Read "latent" as "latent on the
+     kernel this table was written on". Five of the seven rows are converted in §3.56 (1, 2, 3, 5,
+     7); rows 4 and 6 are **not convertible** and become documented exceptions there, because the
+     counters they assert come into existence *because* of the close and read 0 before it. The line
+     numbers below are from 2026-08-04 and have all drifted; the tests are named in §3.56. -->
+
 | where | what closes | asserted after the close |
 |---|---|---|
 | `itest/tests/serial_hardware.rs:104` `inject_verify` (both rig callers) | a one-shot `Sim::client --send`, no `--hold-ms` | the whole 32 KiB arrived, SHA-256-exact |
@@ -4059,6 +4068,12 @@ the one-shot `Sim::client` injector closes its pty are reliable here" and attrib
 *baud*, when the variable is the kernel's retention policy. `p12_pty_setup.rs:1017` must **not** be
 ported to macOS whatever else is done: `discarded_at_last_close` is structurally always 0 there
 (`docs/macos.md` §3), so the counter it asserts has nothing to name.
+
+<!-- ANNOTATION 2026-08-05 (§5): the `serial_hardware.rs` comment named here is **corrected in
+     place** by §3.56, which states the variable (the kernel's last-close policy, P13) instead of
+     the rate, and records that the test no longer depends on either. The `p12_pty_setup.rs`
+     sentence stands unchanged and is restated in that test's own doc comment. -->
+
 
 Two shapes that look like the class and are not, so a blanket rule is not misapplied: AF_UNIX
 siblings (`p6_outage.rs:601`/`:779`, `p12_leg_accounting.rs:517`, `p6_fragmentation.rs:338`) are
@@ -6937,3 +6952,619 @@ identities are unaffected, so `SNX_REPLUG_DEV`/`_B` stay correct, but a
 `SNX_CROSSOVER_A=/dev/ttyUSB0` now names the opposite adapter — harmless on a
 symmetric crossover, and the test says so in its output rather than leaving it to be
 found.
+
+### 3.55 The teardown ledger's two named siblings closed: `serial` and `leg`
+
+**Design:** §15.50 charges an interior node's queued targetward bytes at destruction and
+names its own residue in the same breath: "`serial` and `leg` own queues of the same
+shape and deliberately report nothing yet — a counter reading 0 while bytes are
+destroyed would be worse than the silence it replaced — so their adoption is scheduled
+work (plan §18), never a silent default". Plan §18 item 2 is that work, and it stated
+the shape in advance: "a shared-layer change of design §16.1's class, never a local
+patch (notes §3.31 files it under §16.5)".
+**Reality:** both are closed. `remove-node` and `teardown` now report
+`discarded_at_teardown` for `serial` and `leg` as they already did for `map`, `codec`
+and `exec`, and the two silences were reproduced verbatim before the fix rather than
+argued from the code.
+
+**The serial case is the sharper of the two, and it is worth saying why.** The deepest
+targetward backlog this daemon can legally hold is the one a `waiting` serial node
+accumulates: §5 and §7.1's whole answer to an absent device is that its origins
+*backpressure* — the channel fills, nothing is dropped — so those bytes are owed to the
+operator until the device returns. That queue lived inside `SuperviseCtx`, i.e. inside
+the supervisor's future, so `TaskSet::abort_all` destroyed it. The design's own
+strongest promise about targetward data was made on the one queue nothing counted. The
+leg's is the same shape one layer out: a `faces = host` leg whose peer has never dialled
+holds an unbound channel that `next_send` skips by design ("waiting: open but
+deliberately not drained"), and a `faces = target` leg's channel tasks hold a wire-fed
+queue of the same kind.
+
+**Why this could not be four lines per node, and what it forced.** The interior kinds
+needed exactly four call sites each (`watch`, `drain`, `bytes` twice). `serial` and `leg`
+could not, for two reasons that only appear together.
+
+* *The queues do not all carry a `Chunk`.* A `faces = target` leg's targetward queue
+  carries `Inbound { epoch, bytes }` — 37-LEG-1's per-chunk provenance tag. So
+  `TargetwardInbox` became generic over its item behind a one-method
+  `TeardownBytes` trait, with `TeardownLoss` holding `Box<dyn TeardownDrain>` so one
+  node can watch queues of different item types. A default type parameter
+  (`TargetwardInbox<T = Chunk>`) kept every existing spelling in `map`/`codec`/`exec`
+  compiling unchanged, which is how a generalization this wide touched three adopters
+  not at all.
+* *The same receivers feed the purge*, which is what notes §3.31 predicted would make
+  this a §16.5 change. `boundary::drain_to_quiescence(&mut Receiver<Chunk>)` is gone;
+  the bounded drain-then-yield rounds now live on `TargetwardInbox::purge_to_quiescence`
+  and are the daemon's only statement of that policy. Its three XC-PURGE-1 guards moved
+  with it, unchanged, to `runtime.rs`'s tests — they have now been written against
+  `nodes/serial.rs`, then `boundary.rs`, then `runtime.rs`, and the rule they pin has
+  not moved once.
+
+**The move was forced by a defect, not by tidiness, and this is the part the plan did
+not predict.** The obvious adaptation is to lend the receiver: `slot.take()`, hand it to
+the existing helper, put it back. That is wrong here, and wrong in exactly the way
+§3.31's original defect was wrong. The helper holds the receiver on its own stack across
+the `yield_now` between rounds — the yield exists precisely so a sender suspended in
+`tx.send().await` can resolve and push one more chunk — so a `remove-node` landing on
+that yield finds an empty slot, charges `0`, aborts the task, and destroys the chunks
+that sender just pushed. The whole point of `TargetwardInbox` is that the node can reach
+its queue *at the instant the operator asks*, and a lend is a window in which it cannot.
+So `purge_to_quiescence` runs every round through `slot.with_mut` and the receiver never
+leaves. `a_purge_leaves_the_queue_where_a_teardown_can_still_count_it` pins it, and its
+own fail-first shape is stated in its doc comment: the lending version answers `0`.
+
+**Where it surfaces.** `discarded_at_teardown` on `serial` in `state`, and on `leg` both
+**per channel** and summed on the node. Per channel because §5 asks for loss that is
+*attributable* and one number for eight channels tells an operator what was lost without
+telling them where; the node-level sum is what the reply quotes. `docs/rpc/observation.md`
+carries the per-kind breakdown, `docs/rpc/configuration.md` the `remove-node` row, and
+`docs/rpc/lifecycle.md`'s `teardown` result — see the defect below.
+
+**Exactly what is covered, restated because "serial and leg are fixed" would be too
+broad.** For `serial`: the single arbitrated host-facing targetward receiver, plus the
+chunk the writer holds. For `leg`: per channel, the `faces = host` arbitrated targetward
+receiver *or* the `faces = target` wire-fed `Inbound` receiver, plus each pump's held
+chunk. Deliberately **not** covered, and for a stated reason: a `faces = target` leg's
+per-channel *relay* carries local hostward device data on its way to the wire. Those
+bytes travel the other direction, whose §5 policy is drop-and-count at the consuming
+boundary (`dropped_slow_consumer`), and charging them here would report a hostward loss
+under a targetward name.
+
+**The `leg`'s multiplexed write half needed one thing the interior kinds did not.**
+`TargetwardInbox`'s mid-flight `held` slot is cleared "at the top of the next receive,
+the one place a pump can be in only when the previous chunk's fate is settled". A
+multiplexer breaks that: `next_send` round-robins one write half over N inboxes, so the
+settling point is before polling *any* of them, not before polling the one that produced
+the chunk. Clearing only the polled inbox would leave a producer's `held` set for as long
+as its siblings kept the write half busy, turning §3.31's deliberate one-chunk
+over-report into one unbounded in time. Hence `settle_held`, called across the whole set
+at the top of `next_send`.
+
+**Guards, and the fail-first proofs, executed.** Four new tests in
+`itest/tests/p13_teardown_accounting.rs`, in the existing idiom: device-free, RPC-acked
+`send`s so "in flight" is observed rather than assumed, and conservation asserted as an
+equality. Two per node — the reply reports what it destroyed, and the conservation law
+across the removal. Both reverts were done in place and `serial-nexus-daemon-bin` rebuilt
+each time (plan §3 rules 9 and 10).
+
+Removing `self.teardown_loss.drain()` from `SerialNode::signal_stop`, **2 of 7 fail and
+the leg's two stay green**:
+
+```
+assertion `left == right` failed: the removal must report every targetward byte it
+destroyed (§5): {"cascaded_edges":0,"discarded_at_teardown":0,"purged_bytes":0,
+"released_locks":0,"removed":"usb0"}
+  left: Some(0)
+ right: Some(8016)
+
+assertion `left == right` failed: conservation across the removal: destroyed 0 + purged 0
++ purged-on-reconnect 0 must equal the 2560 accepted, with delivery witnessed at zero by
+`open: false`.
+  left: 0
+ right: 2560
+```
+
+Removing the `channel_teardown` drain from `LegNode::signal_stop`, **the mirror image —
+the leg's two fail and the serial's two stay green**:
+
+```
+assertion `left == right` failed: the removal must report every targetward byte it
+destroyed (§5): {"cascaded_edges":0,"discarded_at_teardown":0,"purged_bytes":0,
+"released_locks":0,"removed":"uplink"}
+  left: Some(0)
+ right: Some(4040)
+```
+
+That the two reverts redden disjoint pairs is worth more than either proof alone: it is
+what says the two adoptions are independent rather than one mechanism answering for both.
+
+**Delivery is witnessed, not assumed, and the two nodes differ there.** The leg counts
+what it puts on the wire (`accepted_targetward`), so its conservation law reads entirely
+off reported counters and is the stricter of the two. A serial node has no
+"bytes written to the device" counter, so the zero has to come from somewhere else: the
+guard asserts `open: false` on the node immediately before the removal, and a node with
+no port has written nothing. Stating that as a witness rather than leaving it implicit is
+§9's rule — a guard that assumed delivery was zero would pass vacuously the day someone
+gave the fixture a real device.
+
+**`exec`'s floor is named rather than closed**, which is what plan §18 item 2 asked for,
+and the naming now says something new. The mechanism to close it no longer has to be
+built: the inbox is generic, so exec's internal merged `mpsc::Receiver<(String, Chunk)>`
+needs only a `TeardownBytes` impl and the same `watch`/`drain` pair. What is missing is
+the *guard*, and it is the hard half — "a chunk is sitting in the merge queue" is not a
+state an RPC ack can establish, so it wants an exec child that has stopped reading its
+stdin. Recorded at the counter in `exec.rs` and in `docs/rpc/observation.md`.
+
+**One shipped documentation defect fixed on the way (plan §18 item 1 names it too).**
+`docs/rpc/lifecycle.md` carried **two** result tables for `teardown`: a normative one
+under `### Result` listing only `torn_down`, and a second, unheaded one after the example
+carrying both fields with a *different* wording of `torn_down`. The example between them
+emitted both fields, so the normative table was the wrong one. Collapsed to a single table
+under `### Result`, following `configuration.md`'s `remove-node` section as the shape,
+with both relative links preserved (`meta_gates::entry_point_doc_links_resolve` run).
+
+**Two files outside plan §18 item 2's stated scope had to change, and both were forced
+rather than chosen.** `daemon/src/nodes/mod.rs` holds the `Node::discarded_at_teardown`
+dispatch — its `Serial | Pty | Log | Leg => 0` arm *is* the shipped statement of the
+silence, so it cannot be removed from anywhere else. And `daemon/src/boundary.rs` had to
+lose `drain_to_quiescence`: once both callers moved, it was dead code, and the gate is
+`-D warnings`. That is a good outcome rather than a concession — leaving it would have
+shipped two spellings of one purge rule, which is the §16.1 class this item was filed
+under.
+
+**Gates run for this change** (targeted, since the tree was under concurrent edit):
+`cargo clippy -p serial-nexus-daemon --all-targets -- -D warnings` and the minimal-daemon
+clippy (`-p serial-nexus-daemon-bin -p serial-nexus-daemon --no-default-features`), both
+clean; `cargo test -p serial-nexus-daemon --lib` 174 passed; and the itest binaries that
+touch a leg, a serial node or a purge — `p13_teardown_accounting` (7), `p12_leg_accounting`,
+`p6_outage`, `p6_fragmentation`, `p6_hostility`, `p6_binding`, `p6_head_of_line`,
+`p6_insecure_bind`, `p6_reference`, `p9_leg_arbitration`, `p7_matrix`, `p7_unplug`,
+`p11_replace_atomicity`, `p4_purge`, `p4_waiting`, `p12_send_deadline`, `p10_edge_surgery`,
+`p9_unwired_interior`, `control_plane`, `data_path`, `p3_counters`, `p3_exact_loss`,
+`p5_info`, `p12_control_streams`, `p8_map`, `p12_resolver_identity`,
+`p7_snapshot_lifecycle`, `p12_config_rules`, `meta_gates`, `meta_names` — all green. The
+suite count moves by **+4** (the four new `p13_teardown_accounting` tests) plus **+1** in
+`serial-nexus-daemon`'s lib target (`a_purge_leaves_the_queue_where_a_teardown_can_still_count_it`;
+the three XC-PURGE-1 guards moved between targets rather than being added, so they are
+not a delta). No new cargo target. A whole-workspace run was **not** taken here and the
+headline figure in AGENTS.md §2 is therefore left for whoever runs one.
+
+### 3.56 §3.29's seven latent siblings, dispositioned: five converted, two argued as exceptions
+
+**Design:** plan §18 item 6, and the rule it enforces — design §15.46 / plan §3 rule 8 / AGENTS.md
+§6: *a byte counter is read while the client that fed it is still open*, because reading it
+afterwards asserts that the **kernel** retained the bytes across the slave's last close. Doctor P13
+measures that rather than assuming it: `retains` on Linux 7.0.0-29 (`close(2)` in tens of µs, 64/64
+recovered — `docs/doctor/linux-7.0-2026-08-05-tier3.json`) and `waits-then-discards` on Darwin 24.6.0
+(600104 µs and 0 of 64 with no reader; 29 µs and 0 of 64 for an `O_NONBLOCK` slave —
+`docs/doctor/macos-24.6.0-2026-08-05-tier3.json`).
+
+**Reality:** the rule lived in one helper, in one test file, with one caller. §3.29's own sweep table
+named seven further guards of the same shape and left every one of them alone, on the reasoning that
+each was Linux- or rig-gated so "none is red today". That premise expired: `p4_free_for_all` fails
+**12 of 12 on Darwin** over the crossover rig, losing 5–31 bytes of 32768, against 20 of 20 on Linux
+over the same rig at the same commit (design §15.48, notes §3.51) — which is this class's predicted
+signature, though not, on that evidence alone, its established mechanism.
+
+#### The helper is promoted, and generalized without losing its teeth
+
+`settled_while_open` moves from a private fn in `itest/tests/p8_map.rs` to
+`itest/src/lib.rs`, carrying its whole 70-line argument: the borrow rationale, the "precisely what is
+and is not stronger" paragraph, the pointer to the deliberate closes-first exception, and the
+**withdrawn** `tcflush(TCOFLUSH)` referee (which on a Linux pts empties the peer's flip buffer, not
+the master's ldisc `read_buf`, and destroys the bytes 100% at a 0 µs delay and 0% at 20 µs and
+beyond — dead code that reads like a guard). Three shapes now exist:
+
+* `trait OpenWitness` — `label()` plus `prove_open() -> Result<(), String>`, object-safe, so a call
+  site can name several witnesses of different types at once.
+* `settled_while_open(&mut [&mut dyn OpenWitness], what, timeout, cond) -> bool` — the polling form,
+  unchanged in contract. The witnesses are proven open **twice**: before the wait, so an observation
+  that began against an already-closed client is never scored, and at the instant the condition
+  became true, so a witness that closed *during* the wait is named rather than tolerated.
+* `observed_while_open(&mut [&mut dyn OpenWitness], what, FnOnce) -> T` — the same rule for an
+  observation that **blocks** instead of polling. Four of the seven sites read a sim subprocess's
+  verdict to EOF, which is a byte count as much as a `state` counter is, and wrapping a `join()` or a
+  `wait_with_output()` in a `wait_until` predicate is contortion, not enforcement.
+
+`attach_slave(path)` joins them: a blocking, `O_NOCTTY` open of a pty node's slave. Blocking
+deliberately — P13 measures an `O_NONBLOCK` slave losing its queued bytes *unconditionally* in 29 µs
+on Darwin against ~600 ms of drain-wait for a blocking one, so a witness opened non-blocking would
+arm the hazard it is held to disarm.
+
+**Two implementations of `prove_open`, and only one of them is decorative.** `std::fs::File` answers
+`fstat`; Rust owns the descriptor, so the type system has already ruled out the interesting failure
+and the syscall exists to keep the parameter from being ornamental. `Sim` answers `Child::try_wait`,
+and that one is load-bearing — see the vacuity below.
+
+**The enforcement is unchanged and is the whole point**: the witness is *borrowed*, so the caller's
+later `drop(witness)` moves it and relocating the observation below the close is `E0382` at compile
+time on every platform, not a comment a future editor can step over.
+
+#### What each of the seven became
+
+| # | site | disposition |
+|---|---|---|
+| 1 | `serial_hardware::inject_verify` (4 rig call sites) | converted — harness fd on the injector slave, held across the arrival wait |
+| 2 | `p4_exclusivity::exclusive_write_lock_is_byte_exact` | converted — harness fd on `ttyA`, **plus** the two locked-out `Sim`s as witnesses |
+| 3 | `p4_free_for_all` | converted — harness fds on both writer slaves, held across the sink's verdict |
+| 4 | `p4_purge::non_holder_backlog_is_purged_on_detach…` | **exception**, argued in its doc comment |
+| 5 | `p4_purge::synchronous_grant_lets_a_post_grant_command_through_intact` | converted — harness fd on `ttyB`, attached *after* the grant |
+| 6 | `p12_pty_setup::a_fresh_console_session_does_not_inherit…` | **exception**, argued in its doc comment |
+| 7 | `p6_outage::outage_faults_then_purges_then_recovers_byte_clean` | converted — harness fd on `p0`, held across the purge reading |
+
+The converted shape is uniform: the harness opens the slave itself and lets the existing one-shot
+`serial-nexus-sim client` do the writing. **That is exactly as strong as holding the writing client
+open, and the reason is worth stating rather than assuming**: every kernel hangs its flush on the
+*last* close — XNU runs `ptsclose` → `ttylclose` → `ttywflush` when the reference count reaches zero,
+and Linux charges `discarded_at_last_close` at the same edge — so while any fd remains on the slave,
+no kernel reaches its flush. It also buys the thing a `--hold-ms` cannot: there is no timer, so
+nothing to expire under load (§9's proxy in time), and the close is a `drop` the compiler can see.
+
+Two conversions carry a second change each. `p6_outage`'s single-shot read of `purged_on_reconnect`
+became a bounded wait, which fixes a race the old code had: `leg.rs` sets the node status to
+connected at the top of the connect path and runs the purge several statements later, so observing
+`connected` never implied the purge had been counted. And `p4_purge`'s `spawn_holding_client` — a
+`Sim` on a `--hold-ms 5000` timer — became `hold_a_locked_out_backlog`, which writes the 2048 seeded
+bytes **from the harness** and hands back the still-open slave.
+
+#### The two exceptions, and what they owe
+
+Sites 4 and 6 assert counters that come into existence *because* of the close and read 0 before it:
+purge-on-detach is the detach's own effect, and `discarded_at_last_close` moves exactly once, at the
+close. No ordering observes them early; converting them would delete them rather than strengthen
+them. They are therefore treated exactly as `p8_map`'s
+`a_closing_writers_residual_is_forwarded_not_purged` already is — the post-close assertion stays,
+each test's doc comment argues the exception and cites P13's *measured* policy, and neither moves to
+a kernel P13 has not measured. Site 6 in particular is **not** ported to macOS, where
+`discarded_at_last_close` is structurally 0 (`docs/macos.md` §3) and the guard would read green while
+measuring nothing.
+
+What they owe in exchange is a pre-close positive witness, so the post-close number is not the only
+evidence.
+
+* Site 4 gets a real one. The 2048 bytes are now written by the harness, so `write_all` returning
+  `Ok(())` **is** the statement that the kernel accepted exactly that many into an unread buffer —
+  the test's own premise, previously never checked. Its predecessor was `purged == 0` before the
+  detach, a zero equally true of a client that wrote nothing at all. The payload is deliberately not
+  filtered for control bytes: §7.2 promises the pair is already raw, so a byte-for-byte 2048 reaching
+  the purge counter *checks* that promise, and a pair left cooked would expand `0x0a` under
+  `OPOST`/`ONLCR` and redden the exact count. It does not: 2048 exactly, measured.
+* Site 6's witness went through **three shapes, two of them refuted by their own controls**, and the
+  record keeps all three because §9 says a refuted diagnosis is as load-bearing as a confirmed one.
+  (i) `total - accounted() > 0` — "bytes are still inside the pair". Planting a session A that
+  *drains* the console left it green: bytes delivered to a reader are absent from every loss counter
+  too, so the metric could not see the premise being destroyed. (ii) `dropped_slow_consumer > 0` —
+  "the pair is saturated". Refuted by measurement on this box: the console's hostward bridge
+  backpressures rather than shedding in this graph, so all three loss counters read **0** with 65537
+  bytes fanned out and the whole 65537 lands on `discarded_at_last_close` at the close — a guard
+  built on that reading would have reddened the healthy run. (iii) shipped: with the session proven
+  open, the console must have shed **none** of the `total` bytes that an independent consumer (the
+  log file) has already received in full. Its limit is named at the assertion rather than glossed:
+  no counter the pty node publishes separates *queued in the pair* from *delivered to a reader*, and
+  closing that would need `FIONREAD` on the slave, which this crate may not issue (`unsafe` lives
+  only in `serial_nexus_sys`, AGENTS.md invariant 3). What keeps the premise true meanwhile is a
+  property of the file — `a` is never read from between its attach and its drop — stated rather than
+  implied.
+
+#### A vacuity the recon did not predict, and its executed proof
+
+`p4_exclusivity` holds two locked-out writers open with `--hold-ms 20000` against a `--timeout-ms
+25000`, so that "a non-holder's buffered bytes never reach the device" has bytes to be about. If
+either hold expires before the holder finishes streaming, that writer's backlog is purged at its own
+detach and the test's whole claim passes **because there is nothing left to leak** — a vacuous pass
+no counter in the graph distinguishes from a real one, and one that gets likelier the slower the box.
+That is what the `Sim` implementation of `OpenWitness` is for, and both halves were run:
+
+```
+# the holds shortened to 1000 ms (a loaded box), witnesses in place -> RED
+thread 'exclusive_write_lock_is_byte_exact' panicked at itest/src/lib.rs:967:13:
+the device's byte count under an exclusive lock: the held serial-nexus-sim child was no longer open
+when its byte counter was read — the sim already exited (exit status: 0) — its --hold-ms elapsed
+before the observation finished, so this reading was taken against a closed slave.
+A byte counter read after its producer closed asserts that the *kernel* retained the bytes across the
+slave's last close, which Linux does and Darwin does not (notes §3.29, plan §3 rule 8; doctor P13
+measures both).
+
+# the same shortened holds, the two Sim witnesses removed from the list -> GREEN
+test exclusive_write_lock_is_byte_exact ... ok
+```
+
+The timer itself stays, and the reason is recorded rather than hidden: the sim's slave is held by a
+subprocess this harness cannot leash without a sim-side stdin-EOF hold (the shape §3.54 built for
+`serial-nexus-replug hold`), and `sim/` was outside this change's scope. The check is what converts
+the timer from a silent proxy into a named failure.
+
+#### Fail-first, executed
+
+The compile-enforced sites were each regressed by moving the observation below the close. Verbatim,
+one of the six:
+
+```
+error[E0382]: borrow of moved value: `witness`
+   --> itest/tests/serial_hardware.rs:144:15
+    |
+124 |     let mut witness = attach_slave(inj);
+    |         ----------- move occurs because `witness` has type `File`, which does not implement the `Copy` trait
+...
+142 |     drop(witness);
+    |          ------- value moved here
+143 |     let arrived = settled_while_open(
+144 |         &mut [&mut witness],
+    |               ^^^^^^^^^^^^ value borrowed here after move
+```
+
+The same regression was run and captured at `p4_free_for_all.rs:219` (both sessions, two errors),
+`p4_purge.rs:466`, `p6_outage.rs:385`, `p8_map.rs:1093`, and `p4_exclusivity.rs:365` — where it
+produced **three** errors, one per witness, including the two of type `Sim`, which proves the borrow
+carries through the `&mut [&mut dyn OpenWitness]` slice for a non-`File` witness as well.
+
+Behavioural fail-firsts, each run against the tree and then restored:
+
+| plant | result |
+|---|---|
+| `p4_exclusivity`: locked-out holds shortened to 1000 ms | **RED** with the witness message above |
+| the same, `Sim` witnesses removed | **GREEN** — the vacuous pass, demonstrated |
+| `p12_pty_setup`: session A attaches *after* the fan-out (an empty pair) | **RED**: `the console had already accounted for all 65537 fanned-out bytes while its client was still attached (65537 logged independently) …` |
+| `p12_pty_setup`: session A drains the console (witness shape (i)) | **GREEN** — the refutation that produced shape (iii) |
+| `p4_purge`: the harness writes `SB - 1` bytes | **RED**: `purge-on-detach did not count exactly 2048, got Some(2047)` |
+
+#### Runs, on a measured box
+
+Linux 7.0.0-29, 8 cores, load average 0.21–0.76 throughout, both FTDI adapters attached.
+
+* All seven touched targets, `SNX_CROSSOVER=required` with both ports named: **31 passed, 0 failed,
+  0 ignored** (p12_pty_setup 8, p8_map 9, p6_outage 4, p4_purge 3, p4_exclusivity 2,
+  p4_free_for_all 1, serial_hardware 4). No self-skips; `serial_hardware` took 10.37 s, which is the
+  figure a genuinely-executing rig lane reads (§3.35).
+* `p4_free_for_all` over the **rig** (`SNX_SERIAL_PAIR=rig`, which is what design §15.48's "20 of 20"
+  figure means — software wins by default even with the ports exported): **20 passed / 0 failed of
+  20**, matching the pre-conversion Linux figure exactly. The conversion neither fixed nor broke
+  anything on the kernel of record, which is the honest Linux outcome for a Darwin-only red.
+* `p4_exclusivity` over the rig: **5 of 5**.
+* `p6_outage` ten times: **10 of 10**. Run because the conversion holds a second fd on `p0` across
+  the reconnect, and step 6a's flood barrier reasons in detail about where the post-reconnect
+  hostward backlog lands. The witness is dropped before that barrier for exactly this reason.
+
+Suite-count effect on the touched targets: **zero**. No test was added or removed; seven guards
+changed shape and two gained assertions inside tests that already existed. A whole-workspace run was
+not taken here (the tree is being edited concurrently), so AGENTS.md §2's headline figure is left for
+whoever takes one.
+
+#### The pre-registered falsifier for the next Darwin run (plan §3 rule 13)
+
+This does **not** claim to have fixed `p4_free_for_all` on Darwin; nothing here was tested on Darwin,
+and design §15.48/§9 forbid a root-cause claim on this evidence. What it does is remove one
+hypothesis cheaply, and the next Darwin rig run decides between three outcomes, written down before
+it happens:
+
+* **Held** — the test passes on Darwin over the rig, repeatedly. Then the loss was the writers'
+  last close destroying the tail of a payload the kernel had accepted but the daemon had not yet
+  read, which is §3.29's class exactly, and the 5–31-byte magnitude fits a 1024-byte Darwin pty
+  buffer draining at 11520 B/s against a ~90 ms residual.
+* **Fired** — the test still fails 12 of 12, with the same 5–31 bytes short and `timed_out: true`.
+  Then the read-after-close explanation is **refuted** for this site: the bytes are lost somewhere
+  the pty session's lifetime does not reach — candidates in order, the UART's own FIFO under two
+  concurrent writers merging onto one free-for-all endpoint, and the sink's `--recv` deadline. The
+  conversion should stay anyway (the rule is not conditional on this test), and plan §18 keeps the
+  item open with one hypothesis eliminated rather than zero.
+* **Half-met** — it passes sometimes. Then the close is *a* contributor and not the only one, and the
+  next instrument is a per-direction byte-count diff at the sink rather than another rerun.
+
+A fourth outcome would be evidence against the conversion itself and is worth naming: if the test
+begins failing on **Linux** over the rig, the extra fd is perturbing the graph (it keeps
+`client_present` true and suppresses the detach purge), and the 20-of-20 above is the baseline to
+compare against. Note also that Darwin's `p6_hostility` flake and the two-test rig-lane flake of
+§3.54 are unrelated shapes; do not fuse them into this reading.
+
+### 3.57 P14 lands, and the ceiling turns out to be a silent 400x fallback
+
+**Design:** §15.51 (P14), §15.52 (the handshake block, new this session).
+**Plan:** §18 items 11, 1, 9, 5, 10, 7 (partial). **Rules:** plan §3 rules 9, 10, 11,
+13, 14; AGENTS §7, §9.
+
+**What landed.** `P14`, the maximum-rate search: a ladder climb with a bounded
+refinement over a P5-verified cross-paired rig, reporting `max_reliable_baud` plus
+`ceiling_kind` — a number and its reason for stopping, never a grade. Opt-in behind
+`--port` exactly as P3/P5/P11 are, additionally gated on a cross-paired rig whose
+baseline integrity passed, and registered **last** in the binary, because it is by
+far the largest wall-clock consumer and anywhere else it would perturb the timing
+measurements P6..P13 take.
+
+`p5_rig` now returns a third value, `Vec<VerifiedPair>`, carrying the discovered
+pairs **by path**. `RigFacts` stays `Copy` and unchanged: it answers "what kind of
+rig is this" for a verdict, and growing it a `Vec` would have rewritten twenty-five
+by-value call sites to buy nothing those readers use.
+
+**The measured answer is a finding, not a number.** On the bench rig (two FT232R
+cross-wired, Linux 7.0.0-29) every body rung from 9600 to **3000000** passes three
+byte-exact round-trips in both directions with zero frame and overrun deltas.
+4000000 is `adapter-refused` — and the refusal is the interesting part: `ftdi_sio`
+**accepts the ask at the syscall and reads back 9600**, four hundred times below the
+request, with no errno anywhere. An operator who sets `baud = 4000000` on this
+adapter today gets a 9600-baud port and no diagnostic at all. That is exactly the
+experiment §15.51 says the doctor should run first. Refinement brackets the ceiling
+to [3000000, 3062500). Two sequential runs agree to the byte and to five
+milliseconds: `max_reliable_baud 3000000`, `first_unreliable_baud 3062500`,
+`ceiling_kind adapter-refused`, search 21957 ms and 21962 ms.
+
+**Cost, measured.** The search is ~22 s, so a Tier-3 doctor run goes from §3.53's
+11.6 s to **~35 s**. A passive run is unchanged at ~3.9 s: P14 skips without
+`--port`.
+
+**The refusal discriminator is read off the error, not off its message.** serial2
+collapses two very different failures into one `Err`: a `tcsetattr` the kernel
+rejected, and its own post-set verification finding the driver landed more than 2.5%
+from the ask. They are separable without matching on the crate's error *string* —
+which is not a contract — because only the first carries an errno. So
+`raw_os_error().is_some()` means the ask was refused before any byte moved (the
+platform) and its absence means the ask was accepted and the clock landed elsewhere
+(the adapter). Both arms report the read-back beside the request, so the
+classification is corroborated by a number rather than resting on the rule alone. On
+Linux the errno arm never fires for these rates, which is why the read-back is the
+load-bearing evidence.
+
+**A harness bug that produced a wrong number first**, recorded because it is the
+kind that reads as a hardware fact. The first ground-truth measurement wrote the
+whole payload and *then* read, and reported a ceiling of **250000 baud** on a rig
+byte-exact to 3000000. At and above 460800 the payload outruns the receiver's buffer
+while the sender is still writing, so the loss is the harness's and so is the
+number. P14 polls both directions concurrently — which is what the daemon does (§5)
+— and that is the only shape whose failures belong to the wire. The design does not
+say this; it was found by measuring, before any probe code existed.
+
+**Fail-first, executed, four mutations on the pure core.** (a) `p14_next_rate`
+collapsed to always-climb → the non-monotone bracket test and the refinement-bound
+test both red. (b) `p14_verdict` made to grade the number (degrade below 1 Mbaud) →
+the never-grades test and the Darwin ask-ceiling test both red. (c) the open end's
+clamp to `u32::MAX` deleted → the termination test red. (d) `p14_ceiling` made to
+answer `structural-cap` whenever no failure bounds the floor → the bracket test red.
+That last one guards a specific hazard: **the absence of a reason must not be
+dressed up as a fifth reason**, or a truncated search prints the most impressive
+answer in the taxonomy by default. `ceiling_kind` is therefore `Option`, `null`
+renders in JSON, and the verdict degrades on it.
+
+**Clippy caught a vacuous assertion of mine, and the repair is the interesting
+half.** The termination test asserted `proposed.iter().all(|&r| r <= P14_MAX_BAUD)`
+— always true, because `P14_MAX_BAUD` *is* `u32::MAX` and `r` is a `u32`. A guard
+that cannot fail, in the test whose whole subject is a bound. What an unclamped
+doubling actually produces is a **wrap**: `3_072_000_000 * 2` truncates to
+`1_849_032_704`, *smaller* than the rung before it. So the property is
+**monotonicity**, which is checkable in the type the field really has, and it is
+what reddens under mutation (c).
+
+**The sim hazard is measured, not asserted.** A pts pair carries bytes perfectly at
+every rate because nothing clocks it, and `serial-nexus-sim nullmodem` reads
+`discovered_pairs: 1` in P5 — so a P14 gated on the pair *count* would climb the
+whole ladder against the software double. With **both** of P14's gates removed
+(mutation E2) that is exactly what happens: 25 rungs pass, including `4294967295`,
+and the probe reports `max_reliable_baud: 4294967295`, `ceiling_kind:
+structural-cap`, `status: supported`. A confident wire number with no wire, on the
+platform CI runs. Two independent gates prevent it — the UART predicate skips, and
+P5's baseline-integrity flag degrades — and removing only the first (mutation E)
+still degrades rather than answering. `p14_reports_skipped_not_a_uart_against_the_software_null_modem`
+guards the outer layer positively, asserting the skip and the *absence* of a
+`max_reliable_baud` key rather than inferring safety from silence.
+
+**Digests.** `probe_set` moves `a131e1f4b46d6c83` → **`94d64d8bbacf1174`**,
+deliberately: a new question *is* a new instrument, and §15.44's unequal direction is
+the sound one. Every artifact committed before this point is refused by the digest
+rather than silently diffed across, which is what that digest is for. `field_set`
+moves too.
+
+---
+
+**§15.52 — the handshake block, and it reproduces a hand measurement.** P5's pair
+block gains a handshake-continuity reading taken with **both ports open**, which no
+other modem read in the probe is: every read in the certificate happens with the
+peer closed and therefore cannot answer what the wire carries. It reproduces notes
+§3.53 (i) exactly, and the report now says it rather than a session note:
+
+```
+5-wire crossover: RTS/CTS both ways, DTR moves nothing
+[rts_a_to_cts_b=true rts_b_to_cts_a=true dtr_a_to_dsr_b=false
+ dtr_a_to_dcd_b=false dtr_a_to_ri_b=false dtr_b_to_dsr_a=false]
+```
+
+**Reported, never judged** — no `fail_if`, no verdict movement — because a 3-wire
+rig is §5's own stated assumption and an item that degraded one would report the
+operator's cabling as a fault, and would move the verdict on committed artifacts
+whose rigs nobody has re-inspected. The DTR arm is the **in-probe negative control**:
+on a rig where RTS crosses and DTR does not, a `read_cts` returning a constant and a
+rig with every line bridged both fail it. Both polarities are driven, because a line
+stuck high passes a one-polarity test, and `stuck-high`/`inverted` are spellings the
+classifier can produce rather than collapsing into `true`/`false`. The gate clause is
+presence-only and **conditional on a pair certificate having run**, proven against a
+planted violation in both directions (the reading deleted → rejected; the reading
+present and saying `3-wire` → accepted, because whether *this* rig crosses RTS is
+the operator's cabling).
+
+This entry closes only the *doctor* half of plan §18 item 7. The end-to-end
+`rts-cts` behaviour test — the daemon actually pausing a writer on CTS — is **not**
+done and stays open: §15.52 draws the boundary (P5 measures line continuity; driving
+the lines through the daemon is the suite's job), and the measured precondition that
+test would gate on now exists.
+
+---
+
+**Plan §18 item 1, the prose-truth sweep.** Three claim families repaired, each with
+a guard that did not exist before.
+
+*(a) P5's UART predicate.* `P5_UNCHARACTERIZED` was `#[cfg]`-forked and its non-Linux
+half said "not characterizable here (TIOCGICOUNT is Linux-only)"; `p5_verdict`'s
+final arm said "no port certifies here however real it is … run the certificate on a
+Linux box". Both were true of the predicate §15.47 replaced and false of the shipped
+one. They are now **one sentence on both kernels**, whose subject is the *port*: it
+answered neither `TIOCMGET` nor `TIOCGICOUNT`, which is what a pts looks like
+everywhere. **The guard is the load-bearing part.** The old paired assertion was
+`#[cfg(not(target_os = "linux"))]`, so it did not compile on the platform of record
+— the defect was unreachable from the box every developer sits at, and repairing the
+string reddened nothing. That is AGENTS §9's proxy in space sitting inside the guard
+for a defect that was itself a proxy in space. The portable form is **stricter on
+Linux**, which §9 names as the tell, and both new guards were proven red by reverting
+the specific constant and the specific arm in place.
+
+*(b) "the certificate has to come from a Linux box"* — deleted from
+`docs/serial-nexus-doctor.md` and replaced with the artifact that refutes it
+(`docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3.json`, `1a9a8fca1c36`: both ports
+`custom_baud=true break=true`, the pair `rate_ladder=true`, P5 `degraded` naming
+`icounter` and `deliberate_mismatch` as the two platform-excused items). The
+`docs/macos.md` feature-matrix row and `docs/doctor/README.md`'s Tier-3 paragraph
+follow. The README's "`Tier 3` appears nowhere in any macOS artifact" clause is
+**kept**, because it is still true — but its *reason* changed, and the paragraph now
+says which: every committed macOS capture predates §3.49's hoist of the tier sentence
+out of the certified arm.
+
+*(c) The unbacked P10 figures.* "raw ~13.8 KiB / cooked ~23.5 KiB" is withdrawn from
+the `termios_mode` doc comment, the **shipped P10 consequence string** and the guard
+doc comment, and from `docs/macos.md`'s live prose; the relation is kept in the form
+`expectations/linux.jq` already uses. `the_shipped_p10_consequence_quotes_no_uncommitted_figure`
+is new and exists because **nothing asserted that string** — neither expectation file
+inspects consequence text and neither digest can see it, so dropping the figures
+would otherwise have reddened nothing. Proven red by putting the figures back.
+
+*(d)* `docs/rpc/lifecycle.md`'s competing `teardown` tables — fixed under §3.55.
+
+---
+
+**Plan §18 item 9, P4's no-udev arm, and the "would print identically" claim
+measured.** Two guards in `itest/tests/expectation_gates.rs` drive the *shipped
+binary* over `--dev-root` fixture trees: one with no by-id tree at all (the
+container / busybox-mdev shape, whose consequence sentence no committed artifact has
+ever printed), one **mixed** — one device udev names, one reachable only through
+`<sys>/class/tty`. The mixed tree is the discriminator, because `sysfs_only` reads 0
+on every box anyone has captured from.
+
+Three executed mutations. **M1**, the sysfs merge loop deleted: the mixed tree still
+reports `status: supported` with the *identical* consequence "Resolver produces
+canonical identities; configs survive replug and cold start (§12)." while
+`sysfs_only` falls 1→0 and `canonical` 2→1 — the ledger's "would print identically
+had it returned nothing" claim, now witnessed rather than argued. **M2**,
+`or_insert` → `insert`: only the mixed test reds, proving the guard sees the merge's
+*semantics* and not merely the loop's presence. A negative control runs in the same
+body — the same assertions against a tree with the by-id device alone must report
+`sysfs_only: 0` and no second key — so the numbers cannot be satisfied by a probe
+that answers the same for any tree.
+
+---
+
+**Plan §18 item 5, the macOS `crossover_ports` doctrine — decided, not deferred.**
+The arm auto-selected any two `cu.usbserial*` nodes it found, which is exactly what
+`rig_candidates`'s own doc forbids ("reported, never auto-selected"), and it did so
+on a plain `cargo test --workspace`. Deleting it outright is *not* free: the software
+serial doubles are Linux-only (a pty is not a serial device on Darwin), so the scan
+is macOS's only serial provider and removing it would make eleven tests self-skip on
+a working box — notes §3.35's defect wearing the other hat. **The decision is: the
+doctrine transplants, behind a named opt-in.** `SNX_CROSSOVER` set to anything runs
+the scan; unset, the pair is reported in the skip message and never chosen. Three
+consequences are stated rather than left to be discovered: the pre-change macOS
+platform record needs `SNX_CROSSOVER` exported to reproduce; **`SNX_CROSSOVER=required`
+becomes reachable on a Mac for the first time**, having been structurally dead there
+(required-mode fires only on a skip, and the scan prevented skips); and the selection
+is now announced, so a run that transmitted on scanned hardware says which two nodes
+it picked.
+
+**Plan §18 item 10, the last skip class without a `required` spelling.**
+`web_tls_round_trip` carried **two** silent skips, not one — no `curl`, and an
+environment that cannot bind `0.0.0.0:0` with `--tls`. `SNX_TLS=required` covers
+both, as a third instance of one mechanism rather than a third mechanism. Both arms
+run, not predicted: with `curl` hidden the test skips and stays green, and with
+`SNX_TLS=required` it fails naming which skip fired.

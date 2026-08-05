@@ -48,9 +48,11 @@ struct Cli {
     /// Emit Markdown (the default).
     #[arg(long)]
     markdown: bool,
-    /// A serial port to include in P3, P5 and P11 (repeatable). Required to open
-    /// any real port — passive by default (§3), because opening a port toggles
-    /// DTR on equipment that may be live.
+    /// A serial port to include in P3, P5, P11 and P14 (repeatable). Required to
+    /// open any real port — passive by default (§3), because opening a port
+    /// toggles DTR on equipment that may be live. P14 additionally *transmits at
+    /// every rate it tries*, up to the adapter's ceiling, so naming two ports is
+    /// a statement that they are wired to each other and to nothing else.
     #[arg(long = "port")]
     ports: Vec<PathBuf>,
     /// Root prefix for /dev and /sys resolution — a test seam for fixture by-id
@@ -137,6 +139,10 @@ fn main() {
     // must not explain their counters with an item P5 never transmitted. A skipped
     // P5 leaves the default — no certified pair, which is exactly true.
     let mut rig = probes::RigFacts::default();
+    // The pairs discovery verified, carried by path. `RigFacts` answers "what
+    // kind of rig is this" for a verdict; P14 has to transmit on the pair, so it
+    // needs the ports themselves (§15.51).
+    let mut pairs: Vec<probes::VerifiedPair> = Vec::new();
     if cli.ports.is_empty() {
         probe_list.push(
             report::Probe::new(
@@ -151,9 +157,10 @@ fn main() {
         );
     } else {
         let resolver = serial_nexus_core::Resolver::with_roots(&cli.dev_root, &sys_root);
-        let (p5, facts) = probes::p5_rig(&cli.ports, &resolver);
+        let (p5, facts, verified) = probes::p5_rig(&cli.ports, &resolver);
         probe_list.push(p5);
         rig = facts;
+        pairs = verified;
     }
 
     // P6/P7 — the two pty last-close measurements (§6 detach-release, §7.2). Both
@@ -200,6 +207,18 @@ fn main() {
     // none (the skip branch above, or a dangling converter) P11 must not offer it
     // as the reason a `frame` count is nonzero.
     probe_list.push(probes::p11_line_state(&cli.ports, rig));
+
+    // P14 — the maximum-rate search (§15.51). **Last, and that is a rule rather
+    // than a habit.** The ordering note above P6/P7 says nothing may be inserted
+    // ahead of P5 because the passive probes are wall-clock timed; P14 is by far
+    // the largest wall-clock consumer in this binary — it climbs a rate ladder
+    // with three constant-airtime round-trips per direction per rung — so
+    // anywhere but the end it would perturb every timing measurement P6..P13
+    // takes. It is opt-in behind `--port` like P3/P5/P11 and additionally needs
+    // a cross-paired rig, and it reports its own skips (the `p11_line_state`
+    // shape), so there is no placeholder branch and no way for a passive run and
+    // a rig run of this binary to word the question differently.
+    probe_list.push(probes::p14_max_rate(&cli.ports, &pairs));
 
     let report = Report::new(generated_unix_ms, environment, probe_list);
 

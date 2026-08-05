@@ -94,11 +94,18 @@ are the first Linux capture to spell the convention as written.
 
 **"Tier 3" in the Rig column means two different things either side of the Linux
 boundary, and the macOS rows say so.** P5 certifies a pair by characterizing each
-port, and its UART predicate is `TIOCGICOUNT` — a Linux-only ioctl. On Darwin every
-port therefore reports `cert: skipped (not characterizable here)`, the cross-pair
-rate-ladder and deliberate-mismatch line is absent from the report altogether, and
-the string `Tier 3` appears **nowhere in any macOS artifact** (it appears once in each
-Linux Tier-3 artifact, in P5's own consequence). What the macOS captures do measure is
+port; its UART predicate **was** `TIOCGICOUNT`, a Linux-only ioctl, and under that
+predicate every Darwin port reported `cert: skipped (not characterizable here)` with
+the cross-pair rate-ladder line absent from the report altogether — the state the
+`fa4b12d` and `7ead470` rows below index. §15.47 widened the predicate to
+`TIOCMGET || TIOCGICOUNT`, and from `1a9a8fc` onward the Darwin captures **do** carry
+per-port certificates and a `rate_ladder=true` pair line; read the artifact, not this
+paragraph, for which state a given row is in. What has **not** changed is that the
+string `Tier 3` appears **nowhere in any macOS artifact** committed here (it appears
+once in each Linux Tier-3 artifact, in P5's own consequence) — and the reason is now a
+different one: every macOS capture in this directory predates §3.49's hoist of the
+tier sentence out of the certified arm, so on those runs the tier was computed and
+never printed. A macOS capture taken after that hoist would print it. What the macOS captures do measure is
 the *topology* — P5 pairs `BH00L4KU` ↔ `BH00LL8O` in both directions — which is
 Tier-3 wiring. `doctor/src/probes.rs` already carries the exact phrase for this state,
 "**Tier 3 wiring, uncertified**", and the rows above now use it rather than borrowing

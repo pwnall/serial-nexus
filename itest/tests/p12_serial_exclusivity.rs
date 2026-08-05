@@ -396,8 +396,12 @@ arbitration = "free-for-all"
 ///
 /// Self-skips without a rig (a skip is a valid verdict, §5) — set `SNX_CROSSOVER_A` and
 /// `SNX_CROSSOVER_B` to two cross-wired adapters (plain `/dev` paths: the rig suite
-/// compares them against `resolved_path`), or attach `cu.usbserial-*` pairs on macOS. It
-/// is the only test in this file that needs one.
+/// compares them against `resolved_path`). On macOS a pair of `cu.usbserial-*` nodes
+/// can be scanned for instead, but **only with `SNX_CROSSOVER` set**: the arm used to
+/// fire unconditionally, which made a plain `cargo test --workspace` transmit and
+/// pulse DTR on whatever two adapters happened to be plugged in — the thing the Linux
+/// side refuses on principle (plan §18 item 5; `crossover_ports`'s doc carries the
+/// decision). It is the only test in this file that needs a rig.
 ///
 /// **Why not `serial_pair()`**, which needs no hardware and would run in CI: the Linux
 /// sim null modem is a byte-copy loop between two ptys, and neither a pts nor that loop

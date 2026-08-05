@@ -85,8 +85,13 @@ where it happens") makes one family of them meaningful everywhere. Per kind:
 
 * **serial** — `discarded_unattached` (hostward bytes with no consumer bound),
   `purged_on_reconnect` (targetward backlog discarded when the device came back,
-  §7.1), and `driver_counters` (`frame`/`overrun`/`parity`/`buf_overrun` from
-  `TIOCGICOUNT`, `null` where the device does not support it).
+  §7.1), `discarded_at_teardown` (the targetward backlog destroyed when the node
+  stopped — see below; `0` on any node you can still see in `state`), and
+  `driver_counters` (`frame`/`overrun`/`parity`/`buf_overrun` from
+  `TIOCGICOUNT`, `null` where the device does not support it). The two targetward
+  figures are the two ways the same backlog can end and must not be confused: the
+  first is the drop §6 sanctions on a reconnect, the second is the node ceasing to
+  exist with bytes still owed.
 * **pty** — `discarded_no_client` (no process held the slave),
   `dropped_slow_consumer` (the client did not drain its bounded buffer),
   `discarded_targetward` (client bytes read off the master that this node could
@@ -133,28 +138,48 @@ where it happens") makes one family of them meaningful everywhere. Per kind:
 * **exec** — `discarded_unframable`, `multiplexed.dropped_slow_consumer`,
   `multiplexed.discarded_targetward`, `restart_count`, and per channel
   `discarded_unattached`.
-* **map, codec and exec alike** — `discarded_at_teardown`: targetward bytes that were
-  queued for the node's own pump and were destroyed because the node was torn down
-  and will never deliver them. It reads `0` for the whole of a node's working life
+* **map, codec, exec, serial and leg alike** — `discarded_at_teardown`: targetward bytes
+  that were queued for the node's own pump and were destroyed because the node was torn
+  down and will never deliver them. It reads `0` for the whole of a node's working life
   and moves exactly once, at `signal_stop`, so on a *surviving* node it is always `0`
   and the queued bytes are backlog rather than loss — the node may still deliver them
-  if a `connect` gives it somewhere to go. It is therefore mostly read from the
+  if a `connect` gives it somewhere to go, if the device comes back, or if a peer
+  arrives. It is therefore mostly read from the
   [`remove-node`](configuration.md#remove-node) reply, which carries the same figure
   for the node it just destroyed: `state` cannot report the last loss of a node that
   no longer appears in `state`. Distinct from every neighbouring counter, and the
   distinction is the point: `discarded_no_raw_edge` (map) and
   `multiplexed.discarded_targetward` (codec/exec) name bytes the pump *looked at* and
   decided to swallow, while this names bytes it never got to look at; §6's per-origin
-  `purged` names bytes discarded *deliberately* when the write floor settled. Until
+  `purged` names bytes discarded *deliberately* when the write floor settled; and
+  `purged_on_reconnect` (serial, leg) names the one *sanctioned* targetward drop, bytes
+  a reconnect deliberately threw away rather than fire into a rebooted device. Until
   2026-08-04 this loss had no name at all and one cascade destroyed 808 448 bytes in
-  silence (`docs/implementation-notes.md` §3.31). Two limits, both deliberate and both
-  recorded there rather than left to be discovered against a conservation sum: it
-  counts each node's **host-facing** targetward queue (the whole of the map's and the
-  codec's exposure, but a *floor* for `exec`, whose forwarders feed a second internal
-  merge stage this handle does not reach); and `serial` and `leg` own queues of the
-  same shape and report nothing at all, which is the honest answer until they get the
-  same treatment — a counter reading `0` while bytes are destroyed would be worse than
-  the silence it replaced.
+  silence (`docs/implementation-notes.md` §3.31). What each kind's figure covers:
+
+  * **map** and **codec** — their whole host-facing targetward exposure, exactly.
+  * **exec** — a **floor, not a total**, and deliberately so. What is counted is the
+    per-channel host-facing queues its forwarders read from. Those forwarders then push
+    into a second, *internal* merged queue that `pump_child` reads, and a chunk that has
+    already moved into that stage is beyond this handle's reach — so a torn-down `exec`
+    can destroy more than it reports, never less. Closing the rest means giving the
+    merge stage the same treatment. Stated here rather than left to be discovered by
+    someone diffing the counter against a conservation sum.
+  * **serial** — the backlog a `waiting` node accumulates, which is the deepest one the
+    daemon legally holds: §5/§7.1's whole answer to an absent device is that its origins
+    backpressure rather than lose their commands, so those bytes are owed until the node
+    stops existing.
+  * **leg** — reported **per channel** as well as summed on the node, because §5 asks for
+    loss that is attributable and one number for eight channels says what was lost
+    without saying where. A `faces = "host"` leg's counted queue is the arbitrated
+    targetward stream local writers feed; a `faces = "target"` leg's is the wire-arriving
+    stream its channel tasks hand into the local graph. A `faces = "target"` leg's
+    per-channel *hostward* relay is deliberately excluded — those bytes travel the other
+    way, and hostward loss is `dropped_slow_consumer`'s to report.
+  * **pty** and **log** — structurally `0`: neither owns a queue of this shape. The pty's
+    own undelivered payload is a `pending` slot inside its reader's stack frame, which
+    is not reachable this way and is not fixed by this counter
+    (`docs/implementation-notes.md` §3.31, still open).
 * **codec and exec alike** — `discarded_unconfigured_channel` (bytes decoded onto
   a channel identity the node is not configured for: still dropped, §8 — an
   announcement never grows the graph — but counted where they are lost, §5), the
@@ -171,7 +196,11 @@ where it happens") makes one family of them meaningful everywhere. Per kind:
   upstream producer shed because a `faces = "target"` channel's intake was full,
   structurally zero for `faces = "host"`, whose channel endpoints are host-facing
   and have no such boundary; each drop is charged to the direction it was actually
-  travelling. Node-level `unbound_overflow` counts
+  travelling. Per channel also `discarded_at_teardown` — that channel's targetward
+  queue destroyed when the node stopped, `0` on any leg you can still see in `state`
+  — with the node-level sum of the same figure beside `unbound_overflow`, which is
+  what the [`remove-node`](configuration.md#remove-node) reply quotes. Node-level
+  `unbound_overflow` counts
   wire frames whose unconfigured channel identity the bounded `unbound` list
   refused to record, so a peer inventing identities is visible rather than
   silent; the identities it did record appear in `channels` as

@@ -102,6 +102,19 @@ and (all(.probes[]; . as $p
       or ($p.status != "supported")
       or (((([$p.observations[] | select(.key == "canonical") | .value] | first) // -1)) > 0)))
 and (any(.probes[]; .id == "P5" and (.status == "supported" or .status == "skipped" or .status == "degraded")))
+# **A certified pair must carry its handshake reading** (§15.52). The certificate's
+# own modem map is read with the peer port *closed*, so it cannot answer what the
+# wire carries; the handshake block is the only read taken with both ports open,
+# and it is what turns "this rig might have RTS/CTS" into a measurement. Presence
+# only, and conditioned on a pair certificate having run — whether *this* rig
+# crosses RTS is the operator's cabling, a 3-wire rig is §5's own stated
+# assumption, and a clause that pinned the answer would redden every honest bench
+# (plan §3 rule 14). A passive run has no pair, so the antecedent is false and the
+# clause is silent.
+and (all(.probes[]; . as $p | ($p.id != "P5")
+      or (($p.observations | any((.key | endswith(" cert"))
+             and (.value | type == "string") and (.value | startswith("rate_ladder")))) | not)
+      or ($p.observations | any((.key | endswith(" handshake")) and (.value | type == "string")))))
 and (any(.probes[]; .id == "P6" and (.status == "supported" or .status == "degraded")))
 and (any(.probes[]; .id == "P7" and (.status == "supported" or .status == "degraded")))
 and (any(.probes[]; .id == "P8" and (.status == "supported" or .status == "skipped")))
@@ -148,13 +161,39 @@ and (all(.probes[]; . as $p | ($p.id != "P12") or
 # content: the first is the answer, the second is what separates `discards` from
 # `waits-then-discards`, which no other probe in this set can tell apart.
 and (any(.probes[]; .id == "P13" and (.status == "supported" or .status == "degraded")))
+# P14 (maximum-rate search, §15.51) is opt-in behind `--port` *and* needs a
+# cross-paired rig, so `skipped` is the expected answer on every passive run and
+# on every box with one adapter. `degraded` is admissible and is not a
+# loosening: §15.51 gives that word to exactly three states in which the probe
+# could not *ask* its question — P5's rate ladder did not round-trip under it,
+# the search did not complete, or the closing restore did not put the rig back —
+# and forbidding it here would force the one probe that knows its own
+# measurement is unsound to report a confident number instead, which is the
+# defect `expectations/linux.jq`'s P10 clause already exists to prevent.
+# `unsupported` stays a gate failure through the summary clause: a rig that tops
+# out at 115200 is slow, not a contradicted design premise.
+and (any(.probes[]; .id == "P14" and (.status == "supported" or .status == "skipped" or .status == "degraded")))
+# **And the answer is never pinned.** The ceiling is a property of the operator's
+# silicon — an FT232R stops at 3 Mbaud, an H-series part advertises 12, and a
+# Darwin ask-surface may refuse below either — so a clause naming a number, or
+# even a `ceiling_kind`, would be this file asserting the very thing the probe
+# was written to find out (plan §3 rule 14). What is gated is that the two cells
+# a reader needs are *present*: the number, and the reason the search stopped.
+# Both may read `null` — an incomplete search has no ceiling and says so, and the
+# absence of a reason must not be dressed up as a fifth reason — so the clause
+# tests `has`, never a type and never a value.
+and (all(.probes[]; . as $p | ($p.id != "P14") or ($p.status == "skipped")
+      or (($p.observations | any(.key == "max_reliable_baud"))
+          and ($p.observations | any(.key == "ceiling_kind"))
+          and ($p.observations | any(.key == "structural_max_baud" and (.value | type == "number")))
+          and ($p.observations | any(.key == "ceiling_is_a_floor_over" and (.value | type == "string"))))))
 # And the clause that makes the ones above worth having: a kernel-diff probe that
 # RAN must carry measurements. A verdict word cannot be diffed, so a probe whose
 # observations went empty would pass every clause above while making the 6.18 run
 # useless. (`skipped` is exempt — it measured nothing by definition, and its
 # `reason` says why.)
 and (all(.probes[]; . as $p
-      | ((["P6","P7","P8","P9","P10","P12","P13"] | index($p.id)) == null)
+      | ((["P6","P7","P8","P9","P10","P12","P13","P14"] | index($p.id)) == null)
       or ($p.status == "skipped")
       or (($p.observations | length) > 0)))
 # And the clause that closes the hole the 2026-07-27 6.18 run walked through: an

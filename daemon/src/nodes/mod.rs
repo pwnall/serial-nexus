@@ -271,30 +271,31 @@ impl Node {
     /// Targetward bytes this node destroyed at teardown, for the verb that removed it
     /// to report (§5, notes §3.31).
     ///
-    /// Only the interior kinds that own a host-facing targetward queue can answer
-    /// anything but `0`, and only after [`Self::signal_stop`] has run — that is where
-    /// the queue is drained and counted. Every other kind returns `0` because it has
-    /// no such queue, not because its loss is unreported: a boundary node's own
-    /// discards live on its `state` counters, which survive it in every path but a
-    /// removal.
+    /// Only a kind that owns a targetward queue can answer anything but `0`, and only
+    /// after [`Self::signal_stop`] has run — that is where the queue is drained and
+    /// counted. `0` from a kind that has no such queue is not an unreported loss: a
+    /// boundary node's own discards live on its `state` counters, which survive it in
+    /// every path but a removal.
+    ///
+    /// `serial` and `leg` joined the interior kinds here in notes §3.55, which is where
+    /// the ledger's two named siblings were closed. Adopting them was the shared-layer
+    /// change notes §3.31 said it would be rather than the four lines `map`/`codec`/
+    /// `exec` needed: their queues also feed the purge-on-reconnect drain (§7.1, §7.4),
+    /// so that helper moved onto the inbox — and it had to, because a helper holding
+    /// the receiver across its own yields is a window in which the node cannot count
+    /// what a `remove-node` is about to destroy.
     pub fn discarded_at_teardown(&self) -> u64 {
         match self {
             Node::Map(n) => n.discarded_at_teardown(),
             Node::Codec(n) => n.discarded_at_teardown(),
             Node::Exec(n) => n.discarded_at_teardown(),
-            // Boundary kinds: `serial` and `leg` own targetward queues too and lose
-            // them the same way, but their receivers are also fed to
-            // `boundary::drain_to_quiescence` on the purge-on-reconnect path (§7.1,
-            // §7.4), so adopting the shared inbox means moving that helper onto it —
-            // a §16.5 one-rule-one-place change rather than the four lines the
-            // interior kinds needed. Recorded as the remaining sibling in notes
-            // §3.31 rather than half-done here: a counter that reports `0` while
-            // bytes are being destroyed is worse than no counter at all.
-            //
-            // `pty` and `log` have no host-facing targetward queue of this shape at
-            // all — the pty's undelivered payload is a held `pending` slot inside its
-            // reader (also §3.31), and the log is target-facing.
-            Node::Serial(_) | Node::Pty(_) | Node::Log(_) | Node::Leg(_) => 0,
+            Node::Serial(n) => n.discarded_at_teardown(),
+            Node::Leg(n) => n.discarded_at_teardown(),
+            // `pty` and `log` have no targetward queue of this shape at all — the pty's
+            // undelivered payload is a held `pending` slot inside its reader's own stack
+            // frame, which is not reachable this way (notes §3.31, still open), and the
+            // log is target-facing.
+            Node::Pty(_) | Node::Log(_) => 0,
         }
     }
 }

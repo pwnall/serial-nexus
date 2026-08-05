@@ -18,21 +18,28 @@
 //! macOS (serial2 → `ENOTTY`), so these tests self-skip off Linux (a skip is a
 //! valid verdict, §5), the same discipline the bash hardware rig used.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use serial_nexus_itest::{Daemon, Rpc, Sim, bin, wait_until};
+use serial_nexus_itest::{
+    Daemon, Rpc, Sim, attach_slave, bin, observed_while_open, seeded_bytes, settled_while_open,
+    wait_until,
+};
 
 /// A locked-out writer's backlog. Fits the PTY kernel buffer (so `write_all` never
 /// blocks and the bytes are counted exactly), and doubles as the exact expected
 /// purge count.
 const SB: u64 = 2048;
 /// Deterministic payload seed shared by sender and sink, so a checksum comparison —
-/// not a judgement — decides "the same bytes arrived".
+/// not a judgement — decides "the same bytes arrived". [`SEED_N`] is the same number
+/// for the calls that generate the stream in-process rather than through the sim's
+/// `--seed` argv; `seeded_bytes_matches_the_sim` is what keeps the two generators one
+/// generator.
 const SEED: &str = "13";
+const SEED_N: u64 = 13;
 
 /// One ptyb origin on one serial endpoint (exclusive by default, §6): the client
 /// writes into `ptyb`, whose backlog flows targetward to `usb0`'s device. A fresh
@@ -176,29 +183,79 @@ fn load_and_activate(rpc: &Rpc, tty_b: &Path, device: &Path) {
     );
 }
 
-/// Spawn a locked-out client that writes `SB` seeded bytes and holds the slave open
-/// (so it stays `present` while we detach or acquire around it).
-fn spawn_holding_client(tty_b: &Path) -> Sim {
-    Sim::spawn(
-        &[
-            "client",
-            "--path",
-            &tty_b.to_string_lossy(),
-            "--send",
-            &format!("seeded:{SB}"),
-            "--seed",
-            SEED,
-            "--hold-ms",
-            "5000",
-            "--timeout-ms",
-            "8000",
-        ],
-        None,
-    )
+/// Attach a locked-out client **from this process**, write `SB` seeded bytes into its
+/// kernel buffer, and hand the still-open slave back so the caller owns the detach.
+///
+/// **Why the harness writes rather than a `serial-nexus-sim client --hold-ms`
+/// subprocess** (notes §3.55): the two checks that use this both need a *positive*
+/// pre-close witness that `SB` bytes really are queued, and the only party that can
+/// give one is the writer. `write_all` returning `Ok(())` for a `SB`-byte slice is
+/// exactly that statement — the kernel accepted every one of them — and the sim
+/// reports the same fact only in a verdict it prints on exit, which is the close these
+/// checks are measuring. `SB` is sized to fit the pty buffer on both kernels, so the
+/// call never blocks and the count is exact rather than "as much as drained".
+///
+/// Two lesser properties come with it. The `--hold-ms 5000` these calls used to carry
+/// was a timer, §9's proxy in time: on a loaded box a hold can expire before the
+/// detach the test means to observe, and nothing in the graph distinguishes that from
+/// a correct run. And an owned `File` makes the detach a `drop` the compiler can see,
+/// which is what [`serial_nexus_itest::settled_while_open`] is built on.
+///
+/// The payload is the same seeded stream the sim would have sent, and it is
+/// deliberately not filtered for control bytes: §7.2 promises the daemon has already
+/// put the pair in raw mode, so a byte-for-byte `SB` reaching the purge counter is a
+/// *check* of that promise. A pair left in cooked mode would expand `0x0a` under
+/// `OPOST`/`ONLCR` and redden the exact-count assertion, which is the direction a
+/// guard is supposed to fail in.
+fn hold_a_locked_out_backlog(tty_b: &Path) -> std::fs::File {
+    let mut slave = attach_slave(tty_b);
+    let payload = seeded_bytes(SEED_N, SB as usize);
+    assert_eq!(
+        payload.len() as u64,
+        SB,
+        "the harness oracle sized the payload wrong"
+    );
+    slave
+        .write_all(&payload)
+        .unwrap_or_else(|e| panic!("write {SB} locked-out bytes into {}: {e}", tty_b.display()));
+    slave
+        .flush()
+        .unwrap_or_else(|e| panic!("flush the locked-out backlog: {e}"));
+    slave
 }
 
 /// Check 1 — the 3 a.m. hazard + purge-on-detach: a locked-out client's backlog is
 /// purged-and-counted on detach and never fires, even though the lock was free.
+///
+/// **This is one of the two deliberate exceptions to notes §3.29's rule**, and it is
+/// worth saying why in full, because the rule's whole point is that exceptions are
+/// argued rather than assumed (§3.55).
+///
+/// The rule is *a byte counter is read while the client that fed it is still open*,
+/// because reading it afterwards asserts that the kernel retained the bytes across the
+/// slave's last close — which doctor P13 measures as `retains` on Linux 7.0.0-29
+/// (`docs/doctor/linux-7.0-2026-08-05-tier3.json`) and `waits-then-discards` on Darwin
+/// 24.6.0 (`docs/doctor/macos-24.6.0-2026-08-05-tier3.json`), so it is a kernel
+/// property and not a promise. Here the counter being read, `purged`, **comes into
+/// existence because of the close**: purge-on-detach is the close's own effect, and it
+/// reads 0 before it by construction. There is no ordering that observes it early;
+/// converting this guard would not strengthen it, it would delete it. That is the same
+/// shape as `p8_map`'s `a_closing_writers_residual_is_forwarded_not_purged`, and it is
+/// treated the same way — the test is Linux-gated (via [`skip_off_linux`], for the
+/// software serial sink) on a kernel P13 has measured, and it does not move to a
+/// kernel it has not.
+///
+/// What the exception owes in exchange is that the post-close number must not be the
+/// *only* evidence, and it no longer is. Before the detach this test now establishes,
+/// with the session proven open at the instant of each reading:
+///
+/// * a **positive** witness that `SB` bytes are queued — [`hold_a_locked_out_backlog`]
+///   wrote them from this process and `write_all` returned, so the kernel accepted
+///   every one. The previous witness was `purged == 0`, a zero, which is equally true
+///   of a client that wrote nothing at all;
+/// * that the daemon saw the client attach (`client_present`), so the origin exists;
+/// * that nothing has been purged yet, which is now a *second* fact about a backlog
+///   already known to exist rather than the only one.
 #[test]
 fn non_holder_backlog_is_purged_on_detach_and_never_reaches_device() {
     if skip_off_linux("non_holder_backlog_is_purged_on_detach_and_never_reaches_device") {
@@ -217,27 +274,42 @@ fn non_holder_backlog_is_purged_on_detach_and_never_reaches_device() {
 
     // A locked-out client types SB bytes into its kernel buffer and holds the slave.
     // It never acquired, so under the exclusive default the daemon does not read it.
-    let client = spawn_holding_client(&tty_b);
+    // `write_all` has already returned inside the helper, which is the positive
+    // witness: exactly SB bytes are in that buffer, right now, unread.
+    let mut client = hold_a_locked_out_backlog(&tty_b);
+    let present = settled_while_open(
+        &mut [&mut client],
+        "the locked-out client's presence",
+        Duration::from_secs(5),
+        || client_present(rpc),
+    );
     assert!(
-        wait_until(Duration::from_secs(5), || client_present(rpc)),
+        present,
         "locked-out client never became present: {:?}",
         rpc.node("ptyb")
     );
 
-    // No holder, nothing purged yet: its bytes are simply buffered (§6).
-    assert_eq!(
-        holder(rpc),
-        Value::Null,
-        "endpoint has a holder it should not"
+    // No holder, nothing purged yet: its bytes are simply buffered (§6). Both readings
+    // are taken with the session proven open, so "nothing purged" is a statement about
+    // a backlog that demonstrably exists rather than about an empty pty.
+    let quiet = settled_while_open(
+        &mut [&mut client],
+        "the pre-detach state of a locked-out backlog",
+        Duration::from_secs(5),
+        || holder(rpc) == Value::Null && purged(rpc, "ptyb") == Some(0),
     );
-    assert_eq!(
-        purged(rpc, "ptyb"),
-        Some(0),
-        "purged should be 0 before detach"
+    assert!(
+        quiet,
+        "before the detach the endpoint must be holderless with nothing purged, \
+         got holder={:?} purged={:?}",
+        holder(rpc),
+        purged(rpc, "ptyb")
     );
 
     // Detach the client: its backlog is purged-on-detach, counted exactly, and never
     // fires — the lock was free the whole time, but a non-holder's bytes never fire.
+    // This close is the exception (see the doc comment): the counter below is the
+    // close's own product, so it cannot be read before it.
     drop(client);
     assert!(
         wait_until(Duration::from_secs(5), || purged(rpc, "ptyb") == Some(SB)),
@@ -273,17 +345,22 @@ fn pre_grant_backlog_is_purged_on_acquire_and_never_reaches_device() {
     load_and_activate(rpc, &tty_b, &device);
 
     // The client writes SB bytes BEFORE acquiring (the incorrect-but-guarded case)
-    // and holds the slave open.
-    let client = spawn_holding_client(&tty_b);
-    assert!(
-        wait_until(Duration::from_secs(5), || client_present(rpc)),
-        "client never became present: {:?}",
-        rpc.node("ptyb")
+    // and holds the slave open. This check was never in §3.29's class — every counter
+    // it reads is read while the client is open — but it shares the writer, and the
+    // writer's positive witness (`write_all` returned for SB bytes) is what makes
+    // "purged exactly SB" below a statement about a known backlog.
+    let mut client = hold_a_locked_out_backlog(&tty_b);
+    let present = settled_while_open(
+        &mut [&mut client],
+        "the pre-grant client's presence",
+        Duration::from_secs(5),
+        || client_present(rpc) && purged(rpc, "ptyb") == Some(0),
     );
-    assert_eq!(
-        purged(rpc, "ptyb"),
-        Some(0),
-        "purged should be 0 before acquire"
+    assert!(
+        present,
+        "client never became present with an unpurged backlog: {:?} purged={:?}",
+        rpc.node("ptyb"),
+        purged(rpc, "ptyb")
     );
 
     // Acquire: purge-on-acquire drains and discards the pre-grant backlog, counted.
@@ -298,8 +375,14 @@ fn pre_grant_backlog_is_purged_on_acquire_and_never_reaches_device() {
         json!("ptyb"),
         "ptyb should hold the lock after acquire"
     );
+    let counted = settled_while_open(
+        &mut [&mut client],
+        "purge-on-acquire's count",
+        Duration::from_secs(5),
+        || purged(rpc, "ptyb") == Some(SB),
+    );
     assert!(
-        wait_until(Duration::from_secs(5), || purged(rpc, "ptyb") == Some(SB)),
+        counted,
         "purge-on-acquire did not discard+count exactly {SB}, got {:?}",
         purged(rpc, "ptyb")
     );
@@ -343,6 +426,17 @@ fn synchronous_grant_lets_a_post_grant_command_through_intact() {
         "lock ptyb was not acquired: {ack}"
     );
 
+    // The post-grant session, attached **after** the grant so the check's premise
+    // ("no client attached at acquire time, so nothing to purge") is untouched, and
+    // held across the device's byte count (notes §3.29 / §3.55, plan §3 rule 8). The
+    // one-shot `Sim::client` below closes the moment its `write_all` returns, i.e.
+    // when the kernel accepted the last byte rather than when the daemon read it, so
+    // `received == SB` afterwards used to assert that the kernel had retained the tail
+    // across the slave's last close — true on Linux (doctor P13 `retains`), false on
+    // Darwin (`waits-then-discards`). With this fd open the sim's exit is not the last
+    // close, so the count is taken against a live session.
+    let mut session = attach_slave(&tty_b);
+
     // The post-grant command: a one-shot client that sends SB seeded bytes and exits.
     let client = Sim::client(&[
         "--path",
@@ -366,7 +460,14 @@ fn synchronous_grant_lets_a_post_grant_command_through_intact() {
 
     // The post-grant command reaches the device intact, byte-for-byte, with nothing
     // purged — a racy (lazy-drain) purge would have discarded or corrupted it.
-    let v = sink.verdict();
+    let v = observed_while_open(
+        &mut [&mut session],
+        "the device's count of a post-grant command",
+        || sink.verdict(),
+    );
+    // The session ends here, and nowhere earlier: moving the observation below this
+    // line is `E0382`.
+    drop(session);
     assert_eq!(
         v.get("received").and_then(Value::as_u64),
         Some(SB),

@@ -42,7 +42,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use serial_nexus_itest::{Daemon, Rpc, Sim, serial_echo, wait_until};
+use serial_nexus_itest::{
+    Daemon, Rpc, Sim, attach_slave, serial_echo, settled_while_open, wait_until,
+};
 
 /// Two distinct free ephemeral TCP ports on loopback (the portable replacement for
 /// the bash `free_port` python one-liner). Both listeners are held simultaneously
@@ -328,6 +330,23 @@ write_mode = "on-demand"
     //    command hazard purge-on-reconnect exists to defuse (§6/§7.4). The send-only
     //    client (no `--expect`) writes and returns; its verdict is intentionally
     //    ignored (the bash's `|| true`).
+    //
+    //    **The console session outlives that client, deliberately** (notes §3.29 /
+    //    §3.55, plan §3 rule 8). The counter step 6 reads — `purged_on_reconnect` — is
+    //    produced by *these* bytes, and the one-shot client below closes its slave the
+    //    instant its `write_all` returns, i.e. when the kernel accepted the last byte
+    //    rather than when the daemon read it. Reading the counter afterwards therefore
+    //    asserted that the kernel had retained the tail across the slave's last close:
+    //    doctor P13 measures that as `retains` on Linux 7.0.0-29 and
+    //    `waits-then-discards` on Darwin 24.6.0, so it was a kernel property standing in
+    //    for a product one. The harness's own fd on the same slave is what makes the
+    //    sim's exit not be the last close.
+    //
+    //    It is held only until step 6 has its number, and dropped before step 6a: that
+    //    barrier reasons in detail about where the post-reconnect hostward flood lands,
+    //    and a silent extra reader in the middle of it would be a change to what it
+    //    measures rather than to how it is ordered.
+    let mut console_session = attach_slave(&p0);
     let _ = Sim::client(&[
         "--path",
         &p0_str,
@@ -353,9 +372,25 @@ write_mode = "on-demand"
 
     // 6. Purge-on-reconnect: the outage-era targetward backlog was discarded with a
     //    counter (§7.4), so stale commands never fire post-restore.
+    //
+    //    A bounded wait rather than a single read, and that is a second fix hiding in
+    //    the first: the leg sets its status to connected at the top of the connect path
+    //    and runs the purge a few statements *later* (`leg.rs`, the
+    //    `connected_before && purge_on_reconnect && faces == Host` block), so observing
+    //    "connected" never implied the purge had already been counted. The old
+    //    single-shot read was racing that gap.
+    let recorded = settled_while_open(
+        &mut [&mut console_session],
+        "purge-on-reconnect's count of the outage-era backlog",
+        Duration::from_secs(10),
+        || purged_on_reconnect(rpc_b, "downlink", "c0") > 0,
+    );
+    // The session ends here, before step 6a's barrier: moving the observation below
+    // this line is `E0382`.
+    drop(console_session);
     let purged = purged_on_reconnect(rpc_b, "downlink", "c0");
     assert!(
-        purged > 0,
+        recorded && purged > 0,
         "purge-on-reconnect counter did not record outage-era backlog (got {purged}): {:?}",
         rpc_b.node("downlink")
     );

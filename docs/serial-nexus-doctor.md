@@ -37,6 +37,7 @@ listed port could be wired to live equipment.
 | **P11** | Real-port line-state counters: do `TIOCGICOUNT` (driver error/edge counters) and `TIOCMGET` (modem lines) answer on a real port, and what do they read? (§5, §7.1) | `supported` / `degraded` (counters absent — macOS has no `TIOCGICOUNT`) / `skipped` (no `--port`). **Opt-in for the same reason as P3/P5: opening a port toggles DTR.** Its consequence text reads P5's certified-pair count: the deliberate baud mismatch transmits only over a cross-wired pair, so on a rig without one P11 reports that the item did not run rather than offering it as the reason a `frame` count is nonzero. |
 | **P12** | Session-boundary **edge** on a pty master: does an edge latch report a collapsed client session that left *nothing readable*, and does it stay silent while idle? (§6 detach-release, §15.39) | **P7's sibling — read the two together.** They ask the same question of the two different mechanisms that can carry detach-release, and the answer differs by platform: Linux keeps a readable packet (P7's subject) and this is `skipped` there by design; Darwin destroys it at last close, so the *edge* is the only mechanism and this is what carries §6. `supported` → the termios-only shape posts an edge **and** an idle hung-up master posts none in 200 reader-shaped passes. `degraded` → either the shape posts nothing (read P7: if it is `supported`, the packet route is carrying it), or — the dangerous direction, reported first — an idle master posts edges, which re-fires the last-close handler on a pair no client touched and releases a lock the operator took. `idle_edges_in_200_passes` is the anti-spin number; `a_open_close_edge` is reported because Darwin covers a shape Linux deliberately does not. **Three windows and a control, and the reading rule turns on the control.** `idle_window_tight` is the historical 200 back-to-back passes, unchanged in key, count and shape (six committed artifacts carry it) but now carrying its wall clock — in **microseconds**, because those passes cost 134–175 µs on Linux 7.0.0-29 and a millisecond field would print `0`. `idle_window_paced` asks the same question 64 times at the daemon's own 5 ms `IDLE_POLL`, which is the loop `nodes/pty.rs` actually runs; an edge in only one of the two is time-driven versus syscall-driven. `live_session_window` is the negative control — the same window with a client **attached**, where an edge would fire §6 detach-release mid-session and hand away the write lock of a client that never left. Then the rule: **`control_session_edge: false` makes every idle count `unmeasured`, not `quiet`.** After the windows the probe closes a slave on the same master through the same latch; if that boundary posts nothing the instrument is inert and `supported` is refused, because `EV_CLEAR` on a master already hung up at `watch()` time is exactly the shape where "0 edges" could be structurally guaranteed rather than measured. **P12 now carries observations while `skipped` on Linux, and that is deliberate:** the windows run on every platform, so a Linux report's `control_session_edge: false` beside a full set of executed passes is the inert arm proving itself inert — the negative control the kernel that *depends* on this mechanism cannot provide for itself, and a Linux `true` there would mean the latch had grown a second implementation nobody measured (notes §3.50). |
 | **P13** | Disposition of unread client bytes at a pts **last close**: when a client writes bytes the master has not read and then closes, does this kernel **retain** them, **discard** them, or **block the close** waiting for the reader? Three shapes — no reader, reader-drains-first, and a no-reader `O_NONBLOCK` slave (XNU's `ttylclose` branches on exactly that flag). (§5's accounting, §7.2's drain-before-close ordering, notes §3.29) | **P7/P12's third sibling, and the one that separates the two answers they cannot.** P7 asks what a collapsed session leaves *readable* against a master nobody drains — a yes/no that `discards` and `waits-then-discards` answer identically, because an undrained wait times out and looks exactly like a flush. `close_microseconds` tells them apart: microseconds means the kernel decided immediately, hundreds of milliseconds means it waited for a reader that never came. Always `supported` when it measures (a probe error `degrades`): every policy is legitimate and the daemon is correct under each. Measured `retains`, 20 µs, 64/64 recovered on Linux 7.0.0-29 (`docs/doctor/linux-7.0-2026-08-05-tier3.json`, binary `71fc5a815852`, probe set `a131e1f4b46d6c83`, 2026-08-05; the no-reader shape's close is a handful of microseconds run to run — 20, 10 and 13 across the three committed captures — so read the *scale*, microseconds, which is the quantity that separates the policies, not the digit), and **`waits-then-discards` on Darwin 24.6.0 / macOS 15.7.8** — `close_waits_for_reader: true`, 600104 µs with 0 of 64 recovered against no reader, 23 µs with 64 of 64 when the master drains first, and 29 µs with 0 of 64 for an `O_NONBLOCK` slave (`docs/doctor/macos-24.6.0-2026-08-05-tier3.json`, binary `fa4b12d6f529`, probe set `a131e1f4b46d6c83`, 2026-08-05). The `waits-then-*` arm is therefore measured, not hypothetical, and the two kernels differ by ~86000× in `close_microseconds` — which is the field that exists to separate them. Both cautions this row used to carry are **discharged**: the Linux figures are artifact-backed (three captures committed 2026-08-05) and both sides carry probe set `a131e1f4b46d6c83`, so this is a lawful field-by-field diff rather than a recorded reading. One caution replaces them, and it is narrower: a shared fingerprint certifies the two runs asked the same *questions*, not that they asked them of the same *configuration* — see P10's `slave_termios_mode`. The reason it exists: under `discards` a lost byte is a lost microsecond race, while under `waits-then-discards` it means a reader stalled for the *whole timeout* — a daemon-side event, not a kernel one — and `docs/macos.md` (2026-08-04) records a macOS CI failure whose competing readings differ on precisely that. |
+| **P14** | Maximum reliable rate: on a P5-verified cross-paired rig whose baseline integrity has passed, what is the highest baud rate at which a seeded payload still round-trips **byte-exact in both directions**, and what stopped the search? (§15.51) | **A number plus its reason for stopping, never a grade.** `supported` whenever the measurement completes, whatever the ceiling — a rig that tops out at 115200 is slow, not broken. `skipped` without an opted-in verified UART pair (a passive run, a single adapter, or a software null modem, which passes every rate because nothing clocks it). `degraded` only where the question could not be *asked*: P5's rate ladder did not round-trip under it, the search did not complete, or the closing restore did not put the rig back. Never `unsupported`. Read `ceiling_kind` beside `max_reliable_baud` — they are one answer: `unreliable-corrupt` (bytes came back wrong) and `unreliable-timed-out` (bytes did not come back) are separated because a loss and a stall are different facts; `adapter-refused` means the ask was accepted and the driver landed elsewhere, which `actual_baud_a`/`_b` name; `platform-refused` means the set call itself failed with an errno, so it is a fact about **the platform's ask surface and not about the wire**; `structural-cap` means every rate the 32-bit configuration field can spell passed, which names the instrument's own limit. **Opt-in behind `--port` like P3/P5/P11, and it transmits at every rate it tries** — naming two ports is a statement that they are wired to each other and to nothing else. It runs last in the binary, because it is by far the largest wall-clock consumer and anywhere else it would perturb P6..P13's timing measurements. |
 
 ### Every report says what produced it
 
@@ -185,14 +186,22 @@ DOC-1b). The precedence is worst-first:
 - **`supported`** — discovered and certified, **at a named tier**. On a non-UART
   (the CI pts sim) characterization reports `skipped (not a UART)` and records
   **no** failure, by §15.21's design, so P5's logic never waits for a bench.
-  **Off Linux it always skips, and says so differently.** The UART predicate is
-  `TIOCGICOUNT`, which is Linux-only, so it answers "no" for every port on macOS —
-  a real FTDI adapter included. Measured 2026-07-28 on macOS 15.7.8 with two
-  genuine adapters cross-wired: discovery named the pair correctly in both
-  directions, and characterization reported `skipped (not characterizable here
-  (TIOCGICOUNT is Linux-only))` rather than calling the operator's hardware a
-  non-UART. So on a Mac, **read P5 for discovery and pairing only** — the
-  certificate a tiered checklist run starts from has to come from a Linux box.
+  **The UART predicate is portable, and the certificate runs off Linux.** It is
+  the disjunction `TIOCMGET || TIOCGICOUNT` (§15.47): a pts fails both on both
+  kernels, and a real adapter answers `TIOCMGET` on both, so a cross-wired FTDI
+  pair certifies on macOS. Read it in the committed artifact rather than here —
+  `docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3.json` (binary `1a9a8fca1c36`,
+  2026-08-05) reports `custom_baud=true break=true` on both ports and
+  `rate_ladder=true` over the physical wire, with P5 `degraded` rather than
+  `supported` — which is the honest direction, because exactly two certificate
+  items stay unmeasurable there: `icounter` and `deliberate_mismatch`, both of
+  which read `TIOCGICOUNT`. **That is the whole macOS shortfall**, and the verdict
+  names it as a platform fact with the mechanism attached, never as a rig fault.
+  *(Historical, and superseded: on 2026-07-28, before the predicate widened, the
+  same two adapters on the same Mac were reported `skipped (not characterizable
+  here (TIOCGICOUNT is Linux-only))` and this page said the certificate "has to
+  come from a Linux box". Both statements were true of the old predicate and are
+  false of the shipped one — notes §3.42.)*
 
 `supported` names the tier because the tiers certify different things and the word
 alone does not distinguish them: **Tier 3** (a cross-wired pair) is the only one
@@ -232,6 +241,69 @@ not for a probe.
 The negative-control ritual therefore means what it says: pull one wire, re-run
 P5, and the asymmetry is named at discovery *and* whatever it broke in the
 certificate is named in the verdict.
+
+### P14 measures the ceiling, and states what the number is a floor over
+
+P5 proves integrity at three named rates — 9600, 115200 and one nonstandard rate
+— which answers *is this rig wired and honest* and deliberately never *how fast
+can it go*. P14 answers the second question, on the same pair, after the first
+has passed. That precondition is not a formality: a ceiling searched for over a
+rig that corrupts bytes at 9600 measures the wiring, not the clocks, so a pair
+whose ladder did not round-trip makes P14 `degraded` and the search does not run.
+
+**Why a ladder and not a bisection.** Two hardware facts rule bisection out.
+Achievable UART rates are quantized by each adapter's divisor model, so most of
+the integer range between two rungs consists of rates the hardware rounds to
+something else; and reliability is not guaranteed monotone in the requested rate,
+because a rate with a poor divisor fit can fail below a cleaner-fitting higher
+one. So phase 1 *climbs* a ladder with a fixed body — the standard rates 9600
+through 921600, then the divisor-friendly family 1M, 1.5M, 2M, 3M, 4M, 6M, 8M,
+12M — and phase 2 refines between the highest rate that passed and the lowest
+that failed, with at most four requested midpoints. Four, because past a few
+steps on a quantized axis every midpoint lands on the same divisor.
+
+**The ladder has an open end, so the probe's own list is never the ceiling.**
+Above the fixed body the rate doubles until something stops it, and the final
+doubling is *clamped* to the largest value the configuration field can spell
+rather than being allowed to overflow. That is what makes `structural-cap` mean
+"every rate the field can spell passed" instead of "the doubling wrapped", and it
+is why future hardware raises the answer without a probe change. The termination
+is proven by construction in a unit test that walks an all-pass history to
+exhaustion and asserts every proposal fits the field.
+
+**What the number is, and is not.** `max_reliable_baud` is a **floor over the
+probed set** under a stated trial policy: three byte-exact round-trips per
+direction, with payloads sized for constant airtime (about a quarter second)
+rather than constant bytes, so the bar at 9600 is the same as the bar at 3 Mbaud.
+It is not a promise about rates the ladder skipped, about sustained throughput,
+about longer cables, or about other temperatures. The report says so in its own
+prose; that sentence is gated for presence by both expectation files.
+
+**`platform-refused` is not a wire fact.** The two refusal kinds are read off the
+error rather than its message: only a failed *syscall* carries an errno, so
+`raw_os_error().is_some()` means the ask was refused before any byte moved (the
+platform), and its absence means the ask was accepted and the clock landed
+elsewhere (the adapter). Both arms report the read-back beside the request, so the
+classification is corroborated by a number rather than resting on that rule alone.
+A Darwin ceiling of the platform kind says what that kernel's ask surface would
+accept — a different kernel may ask for more over the same cable.
+
+**Measured on the crossover rig (Linux 7.0.0-29, FT232R ↔ FT232R).** Every body
+rung from 9600 to **3000000** passes 3/3 in both directions with zero frame and
+overrun deltas; 4000000 is `adapter-refused`, and the refusal is worth knowing on
+its own account: `ftdi_sio` accepts the ask and reads back **9600**, four hundred
+times below the request, with no errno anywhere. An operator who configures 4
+Mbaud on this adapter today gets a 9600-baud port and no diagnostic. Refinement
+brackets the ceiling to [3000000, 3062500). The whole search costs about 22 s, so
+a Tier-3 doctor run goes from ~11.6 s to ~34 s; a passive run is unaffected,
+because P14 skips without `--port`.
+
+**One trap, recorded because it produced a wrong number first.** A trial that
+writes the whole payload and *then* reads reports a ceiling of 250000 baud on this
+rig: at 460800 and above the payload outruns the receiver's buffer while the
+sender is still writing, so the loss is the harness's and so is the number. P14
+polls both directions concurrently, which is what the daemon does (§5), and is the
+only shape whose failures belong to the wire.
 
 ## Kernel-of-record report (Linux 7.0.0-28-generic and -29-generic, x86_64)
 

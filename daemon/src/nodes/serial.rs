@@ -51,9 +51,9 @@ use serial2::{CharSize, FlowControl, Parity, SerialPort, Settings, StopBits};
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
-use crate::boundary::{self, BlockingReader, TaskSet};
+use crate::boundary::{BlockingReader, TaskSet};
 use crate::cell::CriticalCell;
-use crate::runtime::{self, READ_BUF, SharedFanOut};
+use crate::runtime::{self, READ_BUF, SharedFanOut, TargetwardInbox, TeardownLoss};
 use crate::tap::TapFeed;
 use serial_nexus_sys as sys;
 
@@ -254,6 +254,19 @@ pub struct SerialNode {
     /// Bytes drained from the targetward backlog and discarded on reconnect
     /// (§7.1 purge-on-reconnect). The one sanctioned targetward drop, counted.
     purged_reconnect: Arc<AtomicU64>,
+    /// The node's handle on its own targetward queue, and the tally of what teardown
+    /// destroyed there (§5, §15.50, notes §3.31/§3.55).
+    ///
+    /// A serial node is a *boundary* kind, but its host-facing targetward queue is the
+    /// same shape §15.50 charges on the interior kinds: the single arbitrated
+    /// `mpsc::Receiver` every writing origin on this endpoint feeds. Before this it
+    /// lived inside [`SuperviseCtx`] — i.e. inside the supervisor's future — so
+    /// `TaskSet::abort_all` dropped it with every chunk queued in it and no exit of the
+    /// writer ran to charge them. That is worse here than on a map, because the queue
+    /// a `waiting` serial node accumulates *is* the design's own answer to an absent
+    /// device (§5: backpressure the origins, never drop), so the deepest backlog in the
+    /// daemon was the one nothing counted.
+    teardown_loss: TeardownLoss,
     /// The supervisor task (drives the targetward writer and the reconnect poll).
     tasks: TaskSet,
 }
@@ -331,6 +344,7 @@ impl SerialNode {
             reader_slot: Rc::new(CriticalCell::new(BlockingReader::default())),
             discarded_unattached: Arc::new(AtomicU64::new(0)),
             purged_reconnect: Arc::new(AtomicU64::new(0)),
+            teardown_loss: TeardownLoss::default(),
             tasks: TaskSet::default(),
         }
     }
@@ -346,6 +360,11 @@ impl SerialNode {
         targetward: Option<mpsc::Receiver<Chunk>>,
         tap_feed: Option<TapFeed>,
     ) {
+        // The queue goes into the shared slot on its way into the supervisor, so the
+        // *node* keeps a handle on it (§15.50). Everything the supervisor does with it
+        // — the writer's `recv`, the purge's bounded drain — now goes through that
+        // slot, which is what makes `signal_stop`'s count possible at all.
+        let targetward = targetward.map(|rx| self.teardown_loss.watch(rx));
         let ctx = SuperviseCtx {
             name: self.name.clone(),
             device: self.device.clone(),
@@ -422,6 +441,13 @@ impl SerialNode {
                 "open": sh.port.is_some(),
                 "discarded_unattached": self.discarded_unattached.load(Ordering::Relaxed),
                 "purged_on_reconnect": self.purged_reconnect.load(Ordering::Relaxed),
+                // Reads `0` for the whole of this node's working life and moves exactly
+                // once, at `signal_stop` — so on a node you can still see in `state` it
+                // is always `0`, and the queue behind it is backlog rather than loss
+                // (§15.50). The figure that matters is the one the `remove-node` reply
+                // carries, because that is the only place a destroyed node's last loss
+                // can land.
+                "discarded_at_teardown": self.teardown_loss.bytes(),
                 "modem_lines": modem_lines,
                 "driver_counters": driver_counters,
             })
@@ -434,8 +460,21 @@ impl SerialNode {
     /// is deliberately kept, since its fd must outlive the reader (§7.1 fd-reuse).
     /// Teardown calls this on every node first, then pays the join cost once.
     pub fn signal_stop(&mut self) {
+        // Count before aborting, and in that order: `abort_all` is what drops the
+        // supervisor's future, and the targetward queue goes with it (§5, §15.50).
+        // Draining first also ends the writer *gracefully* — an emptied inbox answers
+        // `None`, which is `Step::WriterClosed` — so the abort is a backstop rather
+        // than the mechanism.
+        self.teardown_loss.drain();
         self.tasks.abort_all();
         self.reader_slot.with_mut(|slot| slot.signal_stop());
+    }
+
+    /// Targetward bytes this node destroyed at teardown, for the verb that removed it
+    /// to report (§5: the node is about to stop existing, so `state` cannot be the only
+    /// home for its last loss).
+    pub fn discarded_at_teardown(&self) -> u64 {
+        self.teardown_loss.bytes()
     }
 
     /// Stop the supervisor and the reader thread, then drop the port. The reader is
@@ -487,7 +526,11 @@ struct SuperviseCtx {
     resolver: Resolver,
     params: OpenParams,
     hostward: SharedFanOut,
-    targetward: Option<mpsc::Receiver<Chunk>>,
+    /// The host-facing targetward queue, reached through the node's shared slot rather
+    /// than owned here (§15.50): what the supervisor holds is a handle, so aborting it
+    /// no longer takes the queue with it. `None` only in unit tests and for an endpoint
+    /// with no targetward channel at all.
+    targetward: Option<TargetwardInbox>,
     /// The tap-feed mirror for this endpoint (§17): the reader mirrors each
     /// hostward chunk here while a tap or ring wants it. `None` only in unit tests.
     tap_feed: Option<TapFeed>,
@@ -629,7 +672,7 @@ async fn reopen(ctx: &mut SuperviseCtx, path: &std::path::Path) -> Option<Arc<No
 async fn active_step(
     port: &Rc<ExclusivePort>,
     lost: &Notify,
-    targetward: &mut Option<mpsc::Receiver<Chunk>>,
+    targetward: &mut Option<TargetwardInbox>,
 ) -> Step {
     match targetward {
         Some(rx) => {
@@ -662,19 +705,24 @@ async fn active_step(
 /// accumulated while the node was `waiting`; draining them with a counter is the
 /// one sanctioned targetward drop. Post-reconnect commands are kept.
 ///
-/// The bounded drain-then-yield rounds live in
-/// [`boundary::drain_to_quiescence`] — the leg's purge-on-reconnect (§7.4) needs
-/// the identical semantics, and re-deriving them per node is what §16.1 exists to
-/// stop. This runs while the node is still `waiting` (no reader/writer armed), so
+/// The bounded drain-then-yield rounds live on the shared inbox
+/// ([`TargetwardInbox::purge_to_quiescence`]) — the leg's purge-on-reconnect (§7.4)
+/// needs the identical semantics, and re-deriving them per node is what §16.1 exists
+/// to stop. This runs while the node is still `waiting` (no reader/writer armed), so
 /// nothing reaches the device during the drain.
+///
+/// It drains *through* the node's slot rather than borrowing the receiver out of it,
+/// which is what keeps this sanctioned drop and the teardown ledger from racing: a
+/// `remove-node` landing on one of the purge's yields still finds the queue where the
+/// node can count it (§15.50, notes §3.55).
 async fn purge_on_reconnect(ctx: &mut SuperviseCtx) {
     if !ctx.params.purge_on_reconnect {
         return;
     }
-    let Some(rx) = ctx.targetward.as_mut() else {
+    let Some(rx) = ctx.targetward.as_ref() else {
         return;
     };
-    let purged = boundary::drain_to_quiescence(rx).await;
+    let purged = rx.purge_to_quiescence().await;
     if purged > 0 {
         ctx.purged.fetch_add(purged, Ordering::Relaxed);
     }
@@ -1193,10 +1241,11 @@ fn map_flow(f: CfgFlow) -> FlowControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::TeardownDrain;
 
     /// A supervisor context whose only meaningful fields for `purge_on_reconnect`
     /// are `params`, `targetward`, and `purged`; the rest are inert placeholders.
-    fn test_ctx(targetward: Option<mpsc::Receiver<Chunk>>) -> SuperviseCtx {
+    fn test_ctx(targetward: Option<TargetwardInbox>) -> SuperviseCtx {
         SuperviseCtx {
             name: "test".into(),
             device: "raw:/dev/null".into(),
@@ -1232,9 +1281,14 @@ mod tests {
     }
 
     /// XC-PURGE-1 (wiring guard): the drain-to-quiescence *semantics* are tested
-    /// once, on the shared helper (`boundary::drain_to_quiescence`); what stays here
-    /// is that this node routes them correctly — the backlog is drained and the
+    /// once, on the shared inbox (`TargetwardInbox::purge_to_quiescence`); what stays
+    /// here is that this node routes them correctly — the backlog is drained and the
     /// count lands on `purged_on_reconnect` (§7.1).
+    ///
+    /// The emptiness check reads through the teardown ledger's own drain, which also
+    /// pins the two against each other: a purge that left the backlog in place would
+    /// make a later teardown charge those bytes as destroyed, and §5's counters would
+    /// then name one loss twice under two different words.
     #[test]
     fn purge_on_reconnect_drains_the_backlog_and_counts_it() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1246,15 +1300,12 @@ mod tests {
             tx.send(Chunk::copy_from_slice(b"AAA")).await.unwrap(); // 3 bytes
             tx.send(Chunk::copy_from_slice(b"BBBB")).await.unwrap(); // 4 bytes
 
-            let mut ctx = test_ctx(Some(rx));
+            let mut ctx = test_ctx(Some(TargetwardInbox::new(rx)));
             purge_on_reconnect(&mut ctx).await;
 
             assert_eq!(ctx.purged.load(Ordering::Relaxed), 3 + 4);
-            let mut rx = ctx.targetward.take().unwrap();
-            assert!(matches!(
-                rx.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ));
+            let rx = ctx.targetward.take().unwrap();
+            assert_eq!(rx.drain_and_count(), 0, "the purge left bytes behind");
             drop(tx);
         });
     }
@@ -1272,13 +1323,13 @@ mod tests {
             let (tx, rx) = mpsc::channel::<Chunk>(4);
             tx.send(Chunk::copy_from_slice(b"AAA")).await.unwrap();
 
-            let mut ctx = test_ctx(Some(rx));
+            let mut ctx = test_ctx(Some(TargetwardInbox::new(rx)));
             ctx.params.purge_on_reconnect = false;
             purge_on_reconnect(&mut ctx).await;
 
             assert_eq!(ctx.purged.load(Ordering::Relaxed), 0);
-            let mut rx = ctx.targetward.take().unwrap();
-            assert!(matches!(rx.try_recv(), Ok(c) if c.len() == 3));
+            let rx = ctx.targetward.take().unwrap();
+            assert_eq!(rx.drain_and_count(), 3, "the kept backlog went missing");
             drop(tx);
         });
     }
@@ -1717,8 +1768,8 @@ mod tests {
     /// against its own claim.
     ///
     /// The interleave is deterministic, not raced. `purge_on_reconnect` yields exactly
-    /// once for the single seeded backlog chunk (`boundary::drain_to_quiescence`: drain,
-    /// yield, drain nothing, stop), and that yield is `reopen`'s first await — so the
+    /// once for the single seeded backlog chunk (`TargetwardInbox::purge_to_quiescence`:
+    /// drain, yield, drain nothing, stop), and that yield is `reopen`'s first await — so the
     /// probe task's first poll lands inside the window by construction. It then does
     /// precisely what `SerialNode::teardown` does, `release_port`, and asks the question
     /// every third party asks.
@@ -1742,7 +1793,7 @@ mod tests {
             tx.send(Chunk::copy_from_slice(b"outage-era"))
                 .await
                 .unwrap();
-            let mut ctx = test_ctx(Some(rx));
+            let mut ctx = test_ctx(Some(TargetwardInbox::new(rx)));
             let shared = ctx.shared.clone();
             let path = pts.path.clone();
             let (probe_tx, probe_rx) = std::sync::mpsc::channel::<bool>();

@@ -28,7 +28,10 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde_json::json;
-use serial_nexus_itest::{Daemon, Sim, crossover_ports, sha256_hex, skip_no_rig, wait_until};
+use serial_nexus_itest::{
+    Daemon, Sim, attach_slave, crossover_ports, file_len, settled_while_open, sha256_hex,
+    skip_no_rig, wait_until,
+};
 
 /// Serializes the rig tests: each holds the two physical ports exclusively, so they must
 /// not run concurrently even though the default harness runs a binary's tests in parallel.
@@ -101,7 +104,24 @@ b = "inj1"
 
 /// Inject `size` (e.g. `"32KiB"`) seeded bytes into `inj`; they must arrive byte-exact at
 /// `rx_log` (which starts empty) across the physical wire. Returns the log length after.
+///
+/// **The arrival is observed while a client still holds the injector's pty**, which is
+/// the whole reason `witness` exists (notes §3.29 / §3.55, plan §3 rule 8). The
+/// one-shot `Sim::client` below closes its slave the moment its `write_all` returns —
+/// and `write_all` returns when the *kernel* accepted the last byte, not when the
+/// daemon read it, so up to a pty buffer's worth of this payload is still inside the
+/// pair at that instant. Reading `rx_log`'s length afterwards therefore asserted that
+/// the kernel retained those bytes across the slave's last close: true on Linux
+/// (doctor P13 `retains`), not promised anywhere, and measured false on Darwin
+/// (`waits-then-discards`). The harness's own fd on the same slave is what makes that
+/// close not be the last one — every kernel hangs its flush on the reference count
+/// reaching zero — so the wire is measured against a live session on every platform.
+///
+/// The witness is opened *before* the injector, not after: a pty node that has never
+/// seen a client is a different configuration from one that has, and the point is that
+/// the session is continuous from the first byte to the last observation.
 fn inject_verify(inj: &Path, rx_log: &Path, seed: &str, size: &str) -> u64 {
+    let mut witness = attach_slave(inj);
     let verdict = Sim::client(&[
         "--path",
         &inj.to_string_lossy(),
@@ -112,15 +132,23 @@ fn inject_verify(inj: &Path, rx_log: &Path, seed: &str, size: &str) -> u64 {
         "--timeout-ms",
         "60000",
     ]);
-    let sent_sha = verdict["sha256_sent"].as_str().expect("sha256_sent");
+    let sent_sha = verdict["sha256_sent"]
+        .as_str()
+        .expect("sha256_sent")
+        .to_owned();
     let n = verdict["sent"].as_u64().expect("sent") as usize;
     assert!(n > 0, "sim sent nothing: {verdict}");
-    let arrived = wait_until(Duration::from_secs(60), || {
-        std::fs::metadata(rx_log)
-            .map(|m| m.len() as usize >= n)
-            .unwrap_or(false)
-    });
-    let got = std::fs::metadata(rx_log).map(|m| m.len()).unwrap_or(0);
+    let arrived = settled_while_open(
+        &mut [&mut witness],
+        &format!("{} crossing the wire", rx_log.display()),
+        Duration::from_secs(60),
+        || file_len(rx_log) as usize >= n,
+    );
+    // The session ends here, and nowhere earlier: moving the observation above this
+    // line is the point of the borrow, and moving it below is `E0382`.
+    drop(witness);
+
+    let got = file_len(rx_log);
     assert!(
         arrived,
         "{}: only {got}/{n} B crossed the wire",
@@ -221,9 +249,19 @@ fn crossover_rig_data_plane_send_and_exclusivity() {
 /// daemon per baud (each Drop releases the ports). No TIOCGICOUNT needed: the check is a
 /// SHA-256 over captured log bytes, so it runs on macOS.
 ///
-/// Only rates fast enough to drain before the one-shot `Sim::client` injector closes its
-/// pty are reliable here; very slow rates (e.g. 9600) race that close and are covered by
-/// the daemon's own sim/unit tests, not this rig test.
+/// **Corrected 2026-08-05 (notes §3.55).** This comment used to read "only rates fast
+/// enough to drain before the one-shot `Sim::client` injector closes its pty are
+/// reliable here; very slow rates (e.g. 9600) race that close" — which named the wrong
+/// variable. Baud sets how *long* the residual takes to drain, but whether a residual
+/// survives at all is the kernel's last-close policy, and doctor P13 measures the two
+/// answers that exist: Linux 7.0.0-29 `retains` (so no rate ever raced it there, which
+/// is why the sentence was never falsified), Darwin 24.6.0 `waits-then-discards` with a
+/// ~600 ms wait for a blocking slave and an unconditional 29 µs discard for an
+/// `O_NONBLOCK` one. A slow rate is dangerous only in combination with a policy that
+/// discards; the rate alone is not the hazard, and treating it as one led every reader
+/// to reach for a faster rate instead of a live session. [`inject_verify`] now holds
+/// the session open across the arrival observation, so this test no longer depends on
+/// either variable — a slow rate here would cost wall clock, not bytes.
 #[test]
 fn crossover_rig_custom_baud_byte_exact() {
     let Some((p0, p1)) = crossover_ports() else {

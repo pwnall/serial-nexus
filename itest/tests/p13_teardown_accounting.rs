@@ -14,14 +14,31 @@
 //! Measured on the shipped daemon before the fix, one `remove-node --cascade` on a
 //! saturated map: **808 448 bytes in flight, 23 042 accounted, every node counter 0**.
 //!
-//! **Why these are device-free and deterministic.** A map whose *raw* (upstream) side
-//! is unattached parks its targetward pump inside `await_origin` — §5 forbids
-//! dropping targetward, so a detached edge must stall its writers rather than
-//! discard for them. Nothing drains the queue while it is parked, so a client that
-//! `send`s N bytes leaves exactly N bytes in flight, and the assertions are equalities
-//! rather than thresholds. The bytes go in through `send`, which is RPC-acked, so
-//! "in flight" is a fact the harness observed rather than a timing assumption. No
-//! serial device and no pts client is involved, so these run on every platform.
+//! **Why these are device-free and deterministic.** Each graph here puts a node's
+//! targetward pump in a state where §5 requires it to *stall* rather than drain:
+//!
+//! * a **map** whose *raw* (upstream) side is unattached parks inside `await_origin`
+//!   — §5 forbids dropping targetward, so a detached edge must stall its writers
+//!   rather than discard for them;
+//! * a **serial** node whose device is not present is `waiting`, and §7.1's whole
+//!   answer to an absent device is that its origins backpressure (the channel fills)
+//!   instead of losing their commands;
+//! * a **leg** whose peer has never connected has an unbound channel, and `next_send`
+//!   skips an unbound channel by design ("waiting: open but deliberately not
+//!   drained"), for the same reason.
+//!
+//! Nothing drains the queue in any of the three, so a client that `send`s N bytes
+//! leaves exactly N bytes in flight, and the assertions are equalities rather than
+//! thresholds. The bytes go in through `send`, which is RPC-acked, so "in flight" is a
+//! fact the harness observed rather than a timing assumption. No serial device and no
+//! pts client is involved, so these run on every platform.
+//!
+//! **The two boundary kinds arrived late, and that is the finding.** `serial` and
+//! `leg` were named in §15.50 as owning queues of the same shape and reporting nothing
+//! — deliberately, because a counter reading `0` while bytes are destroyed is worse
+//! than silence — and closed in notes §3.55. The serial case is the sharper of the
+//! two: the deepest backlog the daemon can accumulate is the one a `waiting` node
+//! builds *by design*, and it was the one nothing counted.
 
 use std::time::Duration;
 
@@ -50,7 +67,46 @@ b = "p0"
     )
 }
 
-/// Inject `lines` writes of `line` through the map's host-facing endpoint and return
+/// A serial node whose device is not present, so it comes up `waiting` and its
+/// targetward queue is never drained (§7.1: an absent device backpressures its origins,
+/// it does not lose their commands). No edge and no device — `waiting` is a legal load
+/// outcome (§15.8), which is what makes this device-free on every platform.
+///
+/// `purge_on_reconnect` is left at its default because there is no reconnect here: the
+/// device never appears, so the one sanctioned targetward drain never runs and every
+/// queued byte is teardown loss and nothing else.
+fn waiting_serial_graph(device: &std::path::Path) -> String {
+    format!(
+        r#"
+[[node]]
+type = "serial"
+name = "usb0"
+device = "{device}"
+"#,
+        device = device.display(),
+    )
+}
+
+/// A `faces = host` leg listening on a unix socket no peer ever dials, so its channel
+/// stays unbound and `next_send` deliberately does not drain it (§7.4). One channel,
+/// no edge, no device.
+fn peerless_leg_graph(sock: &std::path::Path) -> String {
+    format!(
+        r#"
+[[node]]
+type = "leg"
+name = "uplink"
+faces = "host"
+transport = "unix"
+role = "listen"
+address = "{sock}"
+channels = ["c0"]
+"#,
+        sock = sock.display(),
+    )
+}
+
+/// Inject `lines` writes of `line` through a host-facing endpoint and return
 /// the exact number of bytes now queued for its parked pump.
 ///
 /// `send` is used rather than a pty client on purpose: it is **RPC-acked**, so when
@@ -185,5 +241,183 @@ fn teardown_loss_is_not_folded_into_the_running_discard() {
         reply["discarded_at_teardown"].as_u64(),
         Some(queued),
         "the whole backlog is teardown loss, not running discard: {reply}"
+    );
+}
+
+// --- the two boundary kinds §15.50 named and notes §3.55 closed ------------------
+
+/// **The serial half of the defect.** A `waiting` serial node's targetward queue is
+/// the daemon's own answer to an absent device (§5/§7.1: backpressure the origins,
+/// never drop) — so it is the deepest backlog the daemon can legally hold, and until
+/// notes §3.55 `remove-node` destroyed it while answering `discarded_at_teardown: 0`.
+///
+/// Fail-first: with `TeardownLoss::drain()` removed from `SerialNode::signal_stop` the
+/// reply reads `discarded_at_teardown: 0` against a node that just destroyed 8 016
+/// bytes, which is the shipped silence this pins.
+#[test]
+fn remove_node_reports_the_targetward_bytes_a_waiting_serial_destroys() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    // A path inside the run dir that is never created: `resolve_current_path` finds
+    // nothing, so the node loads `waiting` rather than faulting the load (§15.8).
+    let absent = d.run().join("no-such-device");
+    rpc.load_toml(&waiting_serial_graph(&absent), false)
+        .expect("load the waiting-serial graph");
+    let before = rpc.node("usb0").expect("serial node");
+    assert_eq!(
+        before["status"].as_str(),
+        Some("waiting"),
+        "the device must be absent for the queue to accumulate: {before}"
+    );
+    assert_eq!(
+        before["open"].as_bool(),
+        Some(false),
+        "a node with an open port would drain the queue under the test: {before}"
+    );
+
+    let queued = inject(rpc, "usb0", &"z".repeat(1001), 8);
+
+    // Backlog, not loss: the node still exists and the device may still appear, in
+    // which case every one of these bytes is delivered (§7.1 faulted-and-wait).
+    let before = rpc.node("usb0").expect("serial node");
+    assert_eq!(
+        before["discarded_at_teardown"].as_u64(),
+        Some(0),
+        "queued bytes are backlog until the node is torn down: {before}"
+    );
+
+    let reply = rpc.remove_node("usb0", true).expect("remove-node");
+    assert_eq!(
+        reply["discarded_at_teardown"].as_u64(),
+        Some(queued),
+        "the removal must report every targetward byte it destroyed (§5): {reply}"
+    );
+}
+
+/// §5's conservation law for the serial node, as an equality over *reported* counters:
+/// every byte the client sent is either delivered to the device, purged by §6's one
+/// sanctioned drain, or named as destroyed.
+///
+/// Delivery is pinned to zero by a witness rather than by assumption — the node is
+/// `waiting` with `open: false` right up to the removal, and a node with no port has
+/// written nothing. That is what makes `accepted == delivered + purged + destroyed`
+/// checkable here at all: a serial node has no "bytes written to the device" counter,
+/// so the zero has to come from the port's own state.
+#[test]
+fn every_byte_sent_to_a_waiting_serial_is_accounted_across_the_removal() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let absent = d.run().join("no-such-device");
+    rpc.load_toml(&waiting_serial_graph(&absent), false)
+        .expect("load");
+    let queued = inject(rpc, "usb0", &"z".repeat(511), 5);
+
+    // The witness for "delivered == 0", taken while the node still exists.
+    let before = rpc.node("usb0").expect("serial node");
+    assert_eq!(
+        before["open"].as_bool(),
+        Some(false),
+        "the port opened under the test, so `delivered == 0` is no longer witnessed: \
+         {before}"
+    );
+    let purged_before = before["purged_on_reconnect"].as_u64().unwrap_or(0);
+    assert_eq!(
+        purged_before, 0,
+        "nothing may be purged without a reconnect: {before}"
+    );
+
+    let reply = rpc.remove_node("usb0", true).expect("remove-node");
+    let destroyed = reply["discarded_at_teardown"].as_u64().unwrap_or(0);
+    let purged = reply["purged_bytes"].as_u64().unwrap_or(0);
+
+    assert_eq!(
+        destroyed + purged + purged_before,
+        queued,
+        "conservation across the removal: destroyed {destroyed} + purged {purged} + \
+         purged-on-reconnect {purged_before} must equal the {queued} accepted, with \
+         delivery witnessed at zero by `open: false`. reply={reply}"
+    );
+}
+
+/// **The leg half of the defect.** A `faces = host` leg whose peer has never connected
+/// holds its channel unbound and deliberately does not drain it (§7.4) — so a peerless
+/// leg accumulates exactly the same shape of backlog a `waiting` serial does, and until
+/// notes §3.55 destroyed it in the same silence.
+///
+/// The per-channel figure is asserted as well as the node-level one, because §5 asks
+/// for loss that is *attributable*: a leg that reported one number for eight channels
+/// would tell an operator what was lost and not where.
+///
+/// Fail-first: with the `channel_teardown` drain removed from `LegNode::signal_stop`
+/// the reply reads `discarded_at_teardown: 0` against a leg that just destroyed 4 040
+/// bytes.
+#[test]
+fn remove_node_reports_the_targetward_bytes_a_peerless_leg_destroys() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let sock = d.run().join("uplink.sock");
+    rpc.load_toml(&peerless_leg_graph(&sock), false)
+        .expect("load the peerless-leg graph");
+    let before = rpc.node("uplink").expect("leg node");
+    assert_eq!(
+        before["channels"]["c0"]["binding"].as_str(),
+        Some("waiting"),
+        "the channel must be unbound for the queue to accumulate: {before}"
+    );
+
+    let queued = inject(rpc, "uplink/c0", &"z".repeat(504), 8);
+
+    let before = rpc.node("uplink").expect("leg node");
+    assert_eq!(
+        before["channels"]["c0"]["discarded_at_teardown"].as_u64(),
+        Some(0),
+        "queued bytes are backlog until the node is torn down: {before}"
+    );
+    assert_eq!(
+        before["discarded_at_teardown"].as_u64(),
+        Some(0),
+        "the node-level figure must agree with its channels: {before}"
+    );
+
+    let reply = rpc.remove_node("uplink", true).expect("remove-node");
+    assert_eq!(
+        reply["discarded_at_teardown"].as_u64(),
+        Some(queued),
+        "the removal must report every targetward byte it destroyed (§5): {reply}"
+    );
+}
+
+/// §5's conservation law for the leg, as an equality over *reported* counters and with
+/// no witness needed: a leg counts what it puts on the wire (`accepted_targetward`) and
+/// what §6's purge took (`purged_on_reconnect`), so the whole law is readable from
+/// `state` plus the reply.
+///
+/// This is the stricter of the two boundary conservation guards for exactly that
+/// reason, and it is the shape §9 asks for — the portable form coming out stricter,
+/// not weaker.
+#[test]
+fn every_byte_sent_to_a_peerless_leg_is_accounted_across_the_removal() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let sock = d.run().join("uplink.sock");
+    rpc.load_toml(&peerless_leg_graph(&sock), false)
+        .expect("load");
+    let queued = inject(rpc, "uplink/c0", &"z".repeat(255), 6);
+
+    let before = rpc.node("uplink").expect("leg node");
+    let ch = &before["channels"]["c0"];
+    let on_the_wire = ch["accepted_targetward"].as_u64().unwrap_or(0);
+    let purged_before = ch["purged_on_reconnect"].as_u64().unwrap_or(0);
+
+    let reply = rpc.remove_node("uplink", true).expect("remove-node");
+    let destroyed = reply["discarded_at_teardown"].as_u64().unwrap_or(0);
+    let purged = reply["purged_bytes"].as_u64().unwrap_or(0);
+
+    assert_eq!(
+        destroyed + purged + on_the_wire + purged_before,
+        queued,
+        "conservation across the removal: destroyed {destroyed} + purged {purged} + \
+         on-the-wire {on_the_wire} + purged-on-reconnect {purged_before} must equal \
+         the {queued} accepted. reply={reply} state={before}"
     );
 }

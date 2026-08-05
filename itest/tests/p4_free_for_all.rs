@@ -35,7 +35,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use serial_nexus_itest::{Daemon, bin, serial_pair_or_rig, skip_no_pair, wait_until};
+use serial_nexus_itest::{
+    Daemon, attach_slave, bin, observed_while_open, serial_pair_or_rig, skip_no_pair, wait_until,
+};
 
 /// Each writer sends `N`; the device must see `2N` (both writers got through).
 const N: usize = 16384;
@@ -171,6 +173,34 @@ b = "ptyb"
         "the sink never reported its port open, so the writers below would have raced it"
     );
 
+    // **Both pty sessions are held open by this process for the whole measurement**
+    // (notes §3.29 / §3.55, plan §3 rule 8), and that is the one change in this test
+    // that is a candidate repair rather than a tidy-up.
+    //
+    // The writers below exit the instant their `write_all` returns — which is when the
+    // *kernel* accepted the last byte, not when the daemon read it. Their exit was
+    // therefore the last close on each slave while up to a pty buffer's worth of the
+    // payload was still inside the pair, and `received == TOTAL` afterwards asserted
+    // that the kernel had retained it across that close. Linux does (doctor P13
+    // `retains`, `docs/doctor/linux-7.0-2026-08-05-tier3.json`) and this test passes 20
+    // of 20 over the crossover rig there; Darwin does not (`waits-then-discards`,
+    // `docs/doctor/macos-24.6.0-2026-08-05-tier3.json`) and this test fails 12 of 12
+    // over the same rig at the same commit, losing 5-31 bytes of 32768 — the exact
+    // magnitude a tail-of-the-buffer loss predicts (design §15.48, notes §3.51).
+    //
+    // **No root cause is claimed for that Darwin red** (AGENTS.md §9): every failing
+    // observation carried `timed_out: true`, so what was measured is "not recovered
+    // within 4x the committed deadline", a stall or a loss, not separated — and this
+    // repair cannot be tested on Darwin from here. What it does is remove the one
+    // hypothesis that is cheap to remove, and notes §3.55 pre-registers what the next
+    // Darwin run decides either way.
+    //
+    // These fds only hold the session open; they never read, and nothing arrives
+    // hostward here (the far end is a `--recv` sink that only reads), so there is no
+    // stream for an idle reader to perturb.
+    let mut session_a = attach_slave(&ta);
+    let mut session_b = attach_slave(&tb);
+
     // Both clients write concurrently; with no lock, BOTH streams are read targetward.
     // Spawned as children (not `Sim::client`, which blocks) so they run alongside the
     // sink and can be killed if a regression leaves one blocked.
@@ -182,7 +212,16 @@ b = "ptyb"
     // The 30s bound turns a regression into a clean timeout, never a hang; in the
     // healthy path 2N=32 KiB drains in well under a second on a pts and in ~3 s over
     // the rig's 115200 wire.
-    let sink_out = sink_child.wait_with_output().expect("await the sink");
+    let sink_out = observed_while_open(
+        &mut [&mut session_a, &mut session_b],
+        "the device's byte count on a free-for-all endpoint",
+        || sink_child.wait_with_output().expect("await the sink"),
+    );
+    // The sessions end here and nowhere earlier. Moving the observation below this
+    // line is `E0382`, which is the enforcement — not the comment above it.
+    drop(session_a);
+    drop(session_b);
+
     let verdict: Value = serde_json::from_slice(&sink_out.stdout).unwrap_or_else(|e| {
         panic!(
             "parse sink verdict: {e}; stdout={:?}",

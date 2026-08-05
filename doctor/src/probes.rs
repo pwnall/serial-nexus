@@ -341,11 +341,22 @@ fn apply_pty_baseline(master: &PtyMaster, pts: &str) -> anyhow::Result<bool> {
 /// fresh slave after the baseline therefore measures whatever the kernel reset it to,
 /// and nothing in the report said which that was.
 ///
-/// That is not a detail. Measured on Linux 7.0.0-29, filling a pty hostward with the
-/// same bytes: **raw** accepts ~13.8 KiB and every byte is recoverable by the peer;
-/// **cooked** accepts ~23.5 KiB and *none of it* is recoverable. Same kernel, same
-/// probe, opposite answers — so a depth reported without its mode is not a
-/// cross-kernel measurement, it is two measurements wearing one name.
+/// That is not a detail. Measured on Linux 7.0.0-29, filling a pty hostward with
+/// the same bytes, the two modes differ by an **order of magnitude in what the peer
+/// can recover**, and in opposite directions: raw accepts less and returns all of
+/// it, cooked accepts more and returns none. Same kernel, same probe, opposite
+/// answers — so a depth reported without its mode is not a cross-kernel
+/// measurement, it is two measurements wearing one name.
+///
+/// The relation is stated without figures on purpose. The pair this sentence used
+/// to quote (~13.8 KiB raw / ~23.5 KiB cooked) came from a session scratchpad and
+/// is backed by **no committed `docs/doctor/` artifact** — the raw half does not
+/// even agree with the committed Linux capture, which reads 13824–15360 bytes per
+/// direction (notes §3.34's filing; the artifact-backed figures live in design
+/// §15.46). `expectations/linux.jq`'s P10 paragraph is the model form: the
+/// relation, the kernel, no numbers. What is *proven* here is the relation itself,
+/// by `p10_recoverability_separates_a_deep_buffer_from_a_black_hole`, which
+/// asserts it numberlessly.
 fn termios_mode<Fd: AsFd>(fd: &Fd) -> &'static str {
     match tcgetattr(fd) {
         Ok(t) => {
@@ -3068,7 +3079,7 @@ pub fn p10_pty_buffer_depth() -> Probe {
             p.verdict(
                 status,
                 &format!(
-                    "This kernel's pty accepted {} byte(s) slave→master (**targetward** — a client typing, travelling toward the device, first pass ending in `{}`) and {} byte(s) master→slave (**hostward** — the node delivering device output to its client, ending in `{}`), reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. **Of those, {} and {} byte(s) were actually recoverable by the peer** ({} / {}): acceptance is not delivery, and the two are the same number only on a kernel that queues everything it takes. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands, so a one-chunk difference across kernels is noise; only an order-of-magnitude one is signal, **and only between runs whose `slave_termios_mode` agrees** — a cooked pty and a raw one give different depths on one kernel (measured on Linux 7.0.0-29: raw ~13.8 KiB fully recoverable, cooked ~23.5 KiB with nothing recoverable), so a mode mismatch explains a gap before any kernel difference does. The `recheck` block under each direction asks the second question the first cannot, at four drain sizes rather than one: after the peer is drained the pair is refilled from empty and handed back 512, 1, 128 and 900 bytes in turn, and then once from empty entirely. `ladder_reading.watermark_threshold_gt` and `_le` bracket the watermark in \"writable iff occupancy < T, then accept up to capacity\" — a rung that tops up floors T at its `occupancy_after_drain`, a rung that refuses caps it there. A null `_le` means no rung refused, which bounds T below capacity only down to the smallest rung probed and is **not** proof of a pure capacity; read `_gt` on such a run as the largest occupancy the ladder reached rather than as one the kernel accepted a write at, because on a pipeline kernel it moved under the top-up. `uniform_shortfall_bytes` names a reservation charged per fill episode; the from-empty rung (`drain_requested_bytes: null`) is the one whose top-up starts at occupancy 0, so a reservation charged at the empty→nonempty transition lands inside its number instead of behind it, and comparing its `topped_up_bytes` against the 4 KiB-chunked `refilled_from_empty_bytes` on the same rung says whether write size changes the accounting. The flat fields beside the ladder are the 512-byte rung alone, kept so older reports still diff, and `room_republished_minus_room_freed` there says whether the kernel gave back exactly the room a reader freed (a fixed queue capacity), or more (an asynchronous pipeline that advanced during the settle — Linux 7.0.0-29 reads +2048 or +9216, bimodal, never 0 across 20 samples), or less. `refill_reproduced_total` says whether the depth above is reproducible on the same pair at all; on Linux it usually is not. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}{}{}",
+                    "This kernel's pty accepted {} byte(s) slave→master (**targetward** — a client typing, travelling toward the device, first pass ending in `{}`) and {} byte(s) master→slave (**hostward** — the node delivering device output to its client, ending in `{}`), reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. **Of those, {} and {} byte(s) were actually recoverable by the peer** ({} / {}): acceptance is not delivery, and the two are the same number only on a kernel that queues everything it takes. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands, so a one-chunk difference across kernels is noise; only an order-of-magnitude one is signal, **and only between runs whose `slave_termios_mode` agrees** — a cooked pty and a raw one give different depths on one kernel, and in opposite directions — raw accepts less and returns all of it, cooked accepts more and returns none (measured on Linux 7.0.0-29) — so a mode mismatch explains a gap before any kernel difference does, and the `slave_termios_mode` cell beside each direction is what settles it. The `recheck` block under each direction asks the second question the first cannot, at four drain sizes rather than one: after the peer is drained the pair is refilled from empty and handed back 512, 1, 128 and 900 bytes in turn, and then once from empty entirely. `ladder_reading.watermark_threshold_gt` and `_le` bracket the watermark in \"writable iff occupancy < T, then accept up to capacity\" — a rung that tops up floors T at its `occupancy_after_drain`, a rung that refuses caps it there. A null `_le` means no rung refused, which bounds T below capacity only down to the smallest rung probed and is **not** proof of a pure capacity; read `_gt` on such a run as the largest occupancy the ladder reached rather than as one the kernel accepted a write at, because on a pipeline kernel it moved under the top-up. `uniform_shortfall_bytes` names a reservation charged per fill episode; the from-empty rung (`drain_requested_bytes: null`) is the one whose top-up starts at occupancy 0, so a reservation charged at the empty→nonempty transition lands inside its number instead of behind it, and comparing its `topped_up_bytes` against the 4 KiB-chunked `refilled_from_empty_bytes` on the same rung says whether write size changes the accounting. The flat fields beside the ladder are the 512-byte rung alone, kept so older reports still diff, and `room_republished_minus_room_freed` there says whether the kernel gave back exactly the room a reader freed (a fixed queue capacity), or more (an asynchronous pipeline that advanced during the settle — Linux 7.0.0-29 reads +2048 or +9216, bimodal, never 0 across 20 samples), or less. `refill_reproduced_total` says whether the depth above is reproducible on the same pair at all; on Linux it usually is not. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}{}{}",
                     targetward.bytes,
                     targetward.terminal,
                     hostward.bytes,
@@ -3730,27 +3741,29 @@ fn p5_is_uart(sp: &SerialPort) -> bool {
     sys::read_modem_bits(fd).is_ok() || sys::read_icounts(fd).is_ok()
 }
 
-/// Why [`p5_certify_port`] was not run for a port [`p5_is_uart`] rejected — and it
-/// is **not** the same sentence on both platforms, because the predicate does not
-/// mean the same thing on both.
+/// Why [`p5_certify_port`] was not run for a port [`p5_is_uart`] rejected.
 ///
-/// The predicate is `TIOCGICOUNT`, which is Linux-only (`serial-nexus-sys`'s non-Linux arm
-/// is a hard `ENOTSUP` stub). On Linux a port that answers it is a real driver and
-/// one that does not is the CI pts sim, so "not a UART" is exactly right. Off Linux
-/// it answers `false` for **every** port — a genuine FTDI adapter included — so the
-/// same words become a false statement about the operator's hardware. Measured
-/// 2026-07-28 on macOS 15.7.8 against two real FTDI adapters cross-wired as a null
-/// modem: P5 discovered the pair correctly in both directions and then reported both
-/// ports `skipped (not a UART)`.
+/// **One sentence on both platforms, and that is the repair.** The predicate used
+/// to be `TIOCGICOUNT` alone, which is Linux-only, so off Linux it answered
+/// `false` for every port — a genuine FTDI adapter included — and this constant
+/// carried a second, kernel-shaped spelling to keep the report from calling the
+/// operator's hardware a non-UART. §15.47 replaced the predicate with the
+/// disjunction `TIOCMGET || TIOCGICOUNT`, and a pts fails **both** on both
+/// kernels (checked), so the port-shaped answer is now true everywhere and the
+/// platform-shaped one is not: a Darwin adapter reaching this constant answered
+/// neither ioctl, which is a fact about that port and not about Darwin.
 ///
-/// A capability report may only claim what it measured (§15.17), and this is the
-/// third time that rule has had to be applied to P5's own prose — the other two are
-/// in AGENTS §2's 6.18 entry. What was measured here is "this kernel gives me no way
-/// to tell", so that is what it says.
-#[cfg(target_os = "linux")]
-const P5_UNCHARACTERIZED: &str = "not a UART";
-#[cfg(not(target_os = "linux"))]
-const P5_UNCHARACTERIZED: &str = "not characterizable here (TIOCGICOUNT is Linux-only)";
+/// The dated measurement that motivated the old wording is kept as history and
+/// labelled as such: on 2026-07-28, macOS 15.7.8 with two real FTDI adapters
+/// cross-wired, P5 discovered the pair in both directions and then skipped both
+/// ports' characterization. That was the pre-widening predicate. The committed
+/// `docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3.json` (`1a9a8fca1c36`) is
+/// the same rig after it, and both ports certify there — `custom_baud=true
+/// break=true` — with the pair reporting `rate_ladder=true`.
+///
+/// A capability report may only claim what it measured (§15.17); what is measured
+/// here is that this port answered neither `TIOCMGET` nor `TIOCGICOUNT`.
+const P5_UNCHARACTERIZED: &str = "not a UART (answered neither TIOCMGET nor TIOCGICOUNT)";
 
 /// Why a failed `icounter` item is not the rig's fault where `TIOCGICOUNT` does
 /// not exist — the mechanism P5's verdict owes the operator (§7).
@@ -3957,7 +3970,16 @@ const P5_OPEN_SETTLE: Duration = Duration::from_millis(150);
 /// deliberate baud mismatch that must corrupt the nonce and raise the frame-error
 /// counter — proving the error counters are observable. Returns the summary line
 /// plus the failures the verdict folds over (DOC-1b).
-fn p5_certify_pair(port_a: &Path, port_b: &Path) -> Certificate {
+///
+/// The second return value is the **rate ladder's** own verdict, hoisted out of
+/// the certificate because a second reader needs it and the certificate line is
+/// prose. P14 (§15.51) refuses to search for a ceiling over a pair whose ladder
+/// did not round-trip at 9600: a ceiling measured through a rig that corrupts
+/// bytes at the bottom of the range is a measurement of the wiring, not of the
+/// clocks. It is `false` on both early returns, where the ladder did not
+/// complete at all — "did not pass" and "did not run" are the same instruction
+/// to a probe that needs it to have passed.
+fn p5_certify_pair(port_a: &Path, port_b: &Path) -> (Certificate, bool) {
     // Rate ladder: reconfigure both ports to each rate and exchange a nonce.
     let rates = [9600u32, 115_200, CUSTOM_BAUD];
     let mut ladder_ok = true;
@@ -3966,7 +3988,10 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> Certificate {
             p5_open(port_a, baud, Parity::None),
             p5_open(port_b, baud, Parity::None),
         ) else {
-            return Certificate::unavailable("pair reopen failed", "pair_reopen");
+            return (
+                Certificate::unavailable("pair reopen failed", "pair_reopen"),
+                false,
+            );
         };
         std::thread::sleep(P5_OPEN_SETTLE); // let both adapters apply the new baud
         // §15.21 "all must round-trip": certify BOTH directions at each rate, not
@@ -3994,7 +4019,7 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> Certificate {
                 "mismatch_reopen",
             );
             cert.fail_if(!ladder_ok, "rate_ladder", true, None);
-            return cert;
+            return (cert, false);
         };
         std::thread::sleep(P5_OPEN_SETTLE); // settle both ends before the mismatch probe
         let before = sys::read_icounts(b.as_raw_fd())
@@ -4020,7 +4045,129 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> Certificate {
     // corrupt anything. The two early returns above never get here, and that is
     // the distinction: a certificate that bailed on a reopen transmitted nothing.
     cert.mismatch_transmitted = true;
-    cert
+    (cert, ladder_ok)
+}
+
+/// How long a driven modem line is given to reach the far port before it is read.
+/// A USB adapter's control transfer and the peer's `TIOCMGET` are separate round
+/// trips over the bus; without a pause the read races the write and a wired line
+/// reads unwired.
+const P5_MODEM_SETTLE: Duration = Duration::from_millis(60);
+
+/// **Handshake continuity across a verified pair — reported, never judged**
+/// (§15.52).
+///
+/// Every modem read in the certificate above happens with the peer port *closed*,
+/// so it cannot answer what the wire carries; this one holds both ports open and
+/// drives one end while reading the other. It exists because a hardware session
+/// measured the bench rig directly and found it to be a **5-wire crossover** —
+/// RTS↔CTS cross-wired in both directions, DTR moving nothing — where the tree had
+/// assumed the 3-wire link §5 names as the common case (notes §3.53 i). That was a
+/// capability the operator's own rig had and no report mentioned.
+///
+/// **The DTR arm is the in-probe negative control, not decoration.** On a rig where
+/// RTS→CTS crosses and DTR→DSR does not, a `read_cts` that returned a constant, and
+/// a rig with every line bridged to every other, both fail it — so the CTS reading
+/// cannot be satisfied by an instrument that is not looking. Both polarities are
+/// driven for the same reason at the level below: a line stuck high passes a
+/// one-polarity test.
+///
+/// It adds no certificate item and reaches no verdict. §15.21's rule about the
+/// modem map applies unchanged: **not wired is a valid answer**, a 3-wire rig is
+/// the design's own stated assumption, and an item that degraded every honest one
+/// would report the operator's cabling as a fault.
+fn p5_handshake(port_a: &Path, port_b: &Path) -> String {
+    let (Ok(a), Ok(b)) = (
+        p5_open(port_a, 115_200, Parity::None),
+        p5_open(port_b, 115_200, Parity::None),
+    ) else {
+        return "unavailable (pair would not reopen for the handshake read)".to_owned();
+    };
+    // Both ends at rest before anything is driven, so a level left over from the
+    // certificate's own opens cannot be read as a crossing.
+    for p in [&a, &b] {
+        let _ = p.set_rts(false);
+        let _ = p.set_dtr(false);
+    }
+    std::thread::sleep(P5_MODEM_SETTLE);
+
+    /// Drive `line` on `tx` to both levels and report whether `read` on `rx`
+    /// followed. `false` for a line that does not move, `?` for a read that
+    /// errored — which is a third answer and must not print as either of the
+    /// other two.
+    fn crosses(
+        set: impl Fn(bool) -> std::io::Result<()>,
+        read: impl Fn() -> std::io::Result<bool>,
+    ) -> String {
+        let mut seen = Vec::new();
+        for level in [true, false] {
+            if set(level).is_err() {
+                return "?".to_owned();
+            }
+            std::thread::sleep(P5_MODEM_SETTLE);
+            match read() {
+                Ok(v) => seen.push(v),
+                Err(_) => return "?".to_owned(),
+            }
+        }
+        let _ = set(false);
+        // Followed both levels, or followed neither. A line that reads `true` at
+        // both is stuck, not wired, and prints as `stuck-high`.
+        match (seen[0], seen[1]) {
+            (true, false) => "true".to_owned(),
+            (false, false) => "false".to_owned(),
+            (true, true) => "stuck-high".to_owned(),
+            (false, true) => "inverted".to_owned(),
+        }
+    }
+
+    let rts_ab = crosses(|v| a.set_rts(v), || b.read_cts());
+    let rts_ba = crosses(|v| b.set_rts(v), || a.read_cts());
+    let dtr_ab_dsr = crosses(|v| a.set_dtr(v), || b.read_dsr());
+    let dtr_ab_dcd = crosses(|v| a.set_dtr(v), || b.read_cd());
+    let dtr_ab_ri = crosses(|v| a.set_dtr(v), || b.read_ri());
+    let dtr_ba_dsr = crosses(|v| b.set_dtr(v), || a.read_dsr());
+    p5_handshake_line(
+        &rts_ab,
+        &rts_ba,
+        &dtr_ab_dsr,
+        &dtr_ab_dcd,
+        &dtr_ab_ri,
+        &dtr_ba_dsr,
+    )
+}
+
+/// The handshake line's shape, split out pure so the wiring vocabulary is
+/// testable without a bench — the reason [`p5_pair_certificate`] is split the same
+/// way. It classifies, it does not judge: every value it can produce is a
+/// legitimate rig.
+fn p5_handshake_line(
+    rts_ab: &str,
+    rts_ba: &str,
+    dtr_ab_dsr: &str,
+    dtr_ab_dcd: &str,
+    dtr_ab_ri: &str,
+    dtr_ba_dsr: &str,
+) -> String {
+    let both_rts = rts_ab == "true" && rts_ba == "true";
+    let any_dtr = [dtr_ab_dsr, dtr_ab_dcd, dtr_ab_ri, dtr_ba_dsr]
+        .iter()
+        .any(|v| **v == *"true");
+    // The name a reader wants first, then the cells it is computed from — so a
+    // half-crossed handshake is named rather than left to be spotted in six
+    // fields, exactly as discovery names a half-crossed data pair.
+    let shape = match (both_rts, rts_ab == "true" || rts_ba == "true", any_dtr) {
+        (true, _, true) => "wired: RTS/CTS both ways and at least one DTR line",
+        (true, _, false) => "5-wire crossover: RTS/CTS both ways, DTR moves nothing",
+        (false, true, _) => "HALF-CROSSED handshake: RTS/CTS carries one way only",
+        (false, false, true) => "DTR wired, RTS/CTS not",
+        (false, false, false) => "3-wire: no handshake lines carried",
+    };
+    format!(
+        "{shape} [rts_a_to_cts_b={rts_ab} rts_b_to_cts_a={rts_ba} \
+         dtr_a_to_dsr_b={dtr_ab_dsr} dtr_a_to_dcd_b={dtr_ab_dcd} \
+         dtr_a_to_ri_b={dtr_ab_ri} dtr_b_to_dsr_a={dtr_ba_dsr}]"
+    )
 }
 
 /// The pair half of [`p5_port_certificate`], pure for the same reason.
@@ -4077,6 +4224,41 @@ pub struct RigFacts {
     pub loopbacks: usize,
 }
 
+/// One cross-paired rig element, carried out of P5 by **path** rather than by
+/// count — the thing [`RigFacts`] deliberately does not hold.
+///
+/// `RigFacts` answers "what kind of rig is this" for a *verdict*; P14 (§15.51)
+/// has to actually transmit on the pair, so it needs the two ports themselves.
+/// Splitting it out rather than growing `RigFacts` keeps that type `Copy` and
+/// keeps the by-value threading through `p5_tier_scope`/`p5_verdict`/
+/// `p11_line_state` untouched — a `Vec` field there would have rewritten
+/// twenty-five call sites to buy nothing those readers use.
+///
+/// Both `both_uart` and `baseline_ok` are carried rather than recomputed,
+/// because recomputing either means reopening the ports and asking again, and
+/// the answer P14 must act on is the one *P5 measured* — the same rule
+/// [`RigFacts::mismatch_pairs`] exists for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPair {
+    pub a: PathBuf,
+    pub b: PathBuf,
+    /// Resolver identities (or raw paths), so a P14 row survives a renumbering
+    /// exactly as P5's observation rows do.
+    pub a_name: String,
+    pub b_name: String,
+    /// Whether **both** ports answered [`p5_is_uart`]. Discovery pairs a
+    /// software null modem perfectly well — `serial-nexus-sim nullmodem` reads
+    /// `discovered_pairs: 1` — so a probe that gates on the pair count alone
+    /// runs its ceiling search against a pts, where every rate "passes" because
+    /// there is no clock to miss, and reports a confident wire number with no
+    /// wire. This flag is what makes that arm skip instead.
+    pub both_uart: bool,
+    /// Whether the pair's rate ladder round-tripped in both directions at all
+    /// three of P5's rates — §15.51's "after the certificate's baseline
+    /// integrity has passed".
+    pub baseline_ok: bool,
+}
+
 impl RigFacts {
     /// §13's hardware tier, from what discovery found — **the topology, not the
     /// certificate**: **3** a cross-wired pair (independent clocks), **2** a
@@ -4096,7 +4278,10 @@ impl RigFacts {
     }
 }
 
-pub fn p5_rig(ports: &[PathBuf], resolver: &serial_nexus_core::Resolver) -> (Probe, RigFacts) {
+pub fn p5_rig(
+    ports: &[PathBuf],
+    resolver: &serial_nexus_core::Resolver,
+) -> (Probe, RigFacts, Vec<VerifiedPair>) {
     let mut p = Probe::new("P5", "rig discovery and certification", P5_QUESTION);
 
     // Open every port for discovery.
@@ -4127,6 +4312,7 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &serial_nexus_core::Resolver) -> (Pro
                 "Grant access (udev GROUP=plugdev, or dialout) and re-run with the rig's --ports.",
             ),
             RigFacts::default(),
+            Vec::new(),
         );
     }
 
@@ -4291,6 +4477,12 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &serial_nexus_core::Resolver) -> (Pro
     // block whenever a port will not reopen.
     let discovered_pairs = pairs.len();
     let mut mismatch_pairs = 0usize;
+    // Every pair discovery verified, carried out by path for P14 (§15.51) —
+    // *including* the ones that fail the UART gate or the ladder below. A probe
+    // that must skip needs to know the pair exists in order to say why it
+    // skipped; handing it only the pairs that already qualify would turn "this
+    // rig is a software null modem" into an indistinguishable silence.
+    let mut verified: Vec<VerifiedPair> = Vec::new();
     for (i, j) in pairs {
         let (Ok(a_uart), Ok(b_uart)) = (
             p5_open(&ports[i], 115_200, Parity::None).map(|sp| p5_is_uart(&sp)),
@@ -4323,19 +4515,38 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &serial_nexus_core::Resolver) -> (Pro
             );
             continue;
         };
+        let mut baseline_ok = false;
         if a_uart && b_uart {
             let subject = format!(
                 "{} ↔ {}",
                 p5_name(&ports[i], resolver),
                 p5_name(&ports[j], resolver)
             );
-            let cert = p5_certify_pair(&ports[i], &ports[j]);
+            let (cert, ladder_ok) = p5_certify_pair(&ports[i], &ports[j]);
+            baseline_ok = ladder_ok;
             if cert.mismatch_transmitted {
                 mismatch_pairs += 1;
             }
             p = p.observe(format!("{subject} cert").as_str(), cert.line);
             failures.extend(cert.failures.into_iter().map(|f| f.qualified(&subject)));
+            // §15.52 — handshake continuity, on its own key and folded into no
+            // verdict. It runs after the certificate so a pair that could not be
+            // characterized is not asked a second question it cannot answer
+            // either, and it is the only modem read in this probe taken with the
+            // peer port *open*, which is what makes it about the wire.
+            p = p.observe(
+                format!("{subject} handshake").as_str(),
+                p5_handshake(&ports[i], &ports[j]).as_str(),
+            );
         }
+        verified.push(VerifiedPair {
+            a: ports[i].clone(),
+            b: ports[j].clone(),
+            a_name: p5_name(&ports[i], resolver),
+            b_name: p5_name(&ports[j], resolver),
+            both_uart: a_uart && b_uart,
+            baseline_ok,
+        });
     }
 
     let facts = RigFacts {
@@ -4344,7 +4555,7 @@ pub fn p5_rig(ports: &[PathBuf], resolver: &serial_nexus_core::Resolver) -> (Pro
         loopbacks,
     };
     let (status, consequence) = p5_verdict(clean, any_uart, &failures, &hung_up, facts);
-    (p.verdict(status, &consequence), facts)
+    (p.verdict(status, &consequence), facts, verified)
 }
 
 /// The tier sentence: **what the certificate covers** — the topology discovery
@@ -4555,17 +4766,20 @@ fn p5_verdict(
             ),
         )
     } else {
-        // Two different reasons land here and they need different advice, for the
-        // reason `P5_UNCHARACTERIZED` documents: on Linux nothing answered
-        // TIOCGICOUNT, so these really are sims and a real adapter would certify;
-        // off Linux nothing *can* answer it, so telling the operator to attach real
-        // adapters is advice they may already have followed — measured 2026-07-28
-        // against two genuine FTDI adapters on macOS, which this arm then invited to
-        // be replaced with real ones.
-        #[cfg(target_os = "linux")]
-        let why = "characterization skipped on non-UART sims — the certificate populates on real adapters (§13, no-target doctrine)";
-        #[cfg(not(target_os = "linux"))]
-        let why = "characterization does not run on this platform at all — the UART predicate is TIOCGICOUNT, which is Linux-only, so no port certifies here however real it is. Discovery and pairing above are still measured; run the certificate on a Linux box (§13, best-effort tier)";
+        // **One sentence on both kernels, and the arm's subject is the port.**
+        // This used to be a `cfg` pair whose non-Linux half said "the UART
+        // predicate is TIOCGICOUNT, which is Linux-only, so no port certifies
+        // here however real it is … run the certificate on a Linux box". That
+        // was true of the predicate §15.47 replaced and is false of the one this
+        // build ships: `p5_is_uart` is `TIOCMGET || TIOCGICOUNT`, a pts fails
+        // both on both kernels, and the committed
+        // `docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3.json` shows the same
+        // FTDI pair certifying `rate_ladder=true` on Darwin. Reaching this arm
+        // means every named port answered *neither* ioctl, which is a statement
+        // about those ports and not about the kernel — so the advice is the same
+        // everywhere, and a Darwin operator is no longer told to go and find real
+        // adapters they are already holding.
+        let why = "characterization skipped — no named port answered the UART predicate (TIOCMGET or TIOCGICOUNT), which is what a pts sim looks like on every kernel. Discovery and pairing above are still measured, and the certificate populates on real adapters (§13, no-target doctrine; §15.47 for the portable predicate)";
         (
             Status::Supported,
             format!("Rig discovered and classified (above); {why}."),
@@ -4911,6 +5125,897 @@ fn p11_verdict(
             "Both line-state ioctls answer on {opened} of {named} named port(s): the driver counters (§5, §7.1) and the modem lines are readable, so serial state carries real error/overrun accounting rather than omitting it. Read the counts as a snapshot of a cumulative total, not as a measurement of this run — they count since the driver bound the device, {counters}. Across kernels, diff the ioctl *availability* and the field set; the absolute counts differ by construction."
         ),
     )
+}
+
+// ---------------------------------------------------------------------------
+// P14 — the maximum-rate search (§15.51). Opt-in behind --port exactly like
+// P3/P5/P11, and additionally gated on a cross-paired rig, because it transmits
+// for tens of seconds at rates a live target would not survive being handed.
+// ---------------------------------------------------------------------------
+
+/// P14's question, verbatim. One site today — P14 reports its own skip rather
+/// than needing a placeholder in `main` — but the const is here for the reason
+/// [`P3_QUESTION`]'s doc comment gives: the string feeds `probe_set`, so a
+/// second site that ever appears must be unable to word it differently.
+const P14_QUESTION: &str = "On a P5-verified cross-paired rig, what is the highest baud rate at which a seeded payload still round-trips byte-exact in both directions, and what stopped the search (§15.51)?";
+
+/// The ladder's **fixed body**: the standard rates, then the divisor-friendly
+/// family where real adapter clocks actually land.
+///
+/// Plain bisection is ruled out by two hardware facts (§15.51): achievable rates
+/// are quantized by each adapter's divisor model, so most of the integer range
+/// between two rungs consists of rates the hardware rounds to something else;
+/// and reliability is not guaranteed monotone in the requested rate. A ladder
+/// walks the points that exist.
+const P14_LADDER_BODY: [u32; 16] = [
+    9_600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800, 921_600, 1_000_000, 1_500_000,
+    2_000_000, 3_000_000, 4_000_000, 6_000_000, 8_000_000, 12_000_000,
+];
+
+/// The structural cap: the largest rate the configuration field can spell.
+///
+/// It is not a number invented here. `core/src/config.rs` range-checks a serial
+/// node's `baud` against `1 ..= u32::MAX`, so this is §15.34's stated maximum
+/// for the very attribute the operator sets — which is what makes a
+/// `structural-cap` answer mean "the instrument ran out", not "the wire did".
+const P14_MAX_BAUD: u32 = u32::MAX;
+
+/// Three byte-exact round-trips per direction, per §15.51's reliability bar.
+const P14_TRIALS_PER_DIRECTION: u32 = 3;
+
+/// At most four requested midpoints between the last reliable and the first
+/// unreliable rate. Bounded because refinement buys precision on a quantized
+/// axis, where past a few steps every midpoint lands on the same divisor.
+const P14_MAX_REFINEMENTS: u32 = 4;
+
+/// Target airtime per payload, so the reliability bar is the same at 9600 as at
+/// 3 Mbaud rather than shrinking with the rate as a constant byte count would.
+const P14_AIRTIME_MS: u64 = 250;
+
+/// 8N1 — one start bit, eight data, one stop — so a byte costs ten bit times.
+/// The divisor that turns a rate into a payload size.
+const P14_BITS_PER_BYTE: u64 = 10;
+
+/// Floor and cap on the payload. The floor keeps a very low rate from being
+/// judged on a handful of bytes; the cap bounds memory and the per-trial
+/// deadline, and above the rate where it binds the airtime shrinks — which the
+/// report says, rather than continuing to claim a constant.
+const P14_PAYLOAD_FLOOR: usize = 64;
+const P14_PAYLOAD_CAP: usize = 64 * 1024;
+
+/// The rate the search starts from, restores to, and re-proves on the way out —
+/// P5's own ladder rate, so the rig is left exactly as the certificate needs it.
+const P14_BASELINE_BAUD: u32 = 115_200;
+
+/// How many payload-lengths of slack the reader accepts before calling a trial
+/// corrupt rather than continuing to wait. A garbled leading byte shifts the
+/// payload without losing it, which is why the judgement is `contains_sub` over
+/// a slack window rather than a prefix comparison.
+const P14_READ_SLACK: usize = 64;
+
+/// A hard wall-clock stop on the whole search. The ladder is finite by
+/// construction, so this fires only on pathology — and when it does the search
+/// is **incomplete**, which the fold refuses to dress up as a measured ceiling.
+const P14_BUDGET: Duration = Duration::from_secs(180);
+
+/// What one rung's trials came to.
+///
+/// `Corrupt` and `TimedOut` are separated because a stall and a loss are
+/// different facts and §6's deadline discipline forbids reading one as the
+/// other — the same rule that makes the sim stamp `timed_out`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RungOutcome {
+    Passed,
+    Corrupt,
+    TimedOut,
+    /// The set call succeeded and the driver landed on a different rate. The
+    /// adapter's divisor model answered.
+    AdapterRefused,
+    /// The set call itself failed, with an errno. The platform's ask surface
+    /// answered, before any byte moved.
+    PlatformRefused,
+    /// The peer went away mid-search (EIO/ENXIO/ENODEV). Not a ceiling.
+    HungUp,
+}
+
+impl RungOutcome {
+    fn passed(self) -> bool {
+        matches!(self, RungOutcome::Passed)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            RungOutcome::Passed => "passed",
+            RungOutcome::Corrupt => "corrupt",
+            RungOutcome::TimedOut => "timed-out",
+            RungOutcome::AdapterRefused => "adapter-refused",
+            RungOutcome::PlatformRefused => "platform-refused",
+            RungOutcome::HungUp => "hung-up",
+        }
+    }
+}
+
+/// One entry of the search history: what was asked for, and what came back.
+///
+/// This is the whole input to both pure functions below, which is why it holds
+/// no port, no handle and no clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RateTrial {
+    requested: u32,
+    outcome: RungOutcome,
+}
+
+/// Why the search stopped — a reason, never a grade (§15.51).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CeilingKind {
+    /// A higher rate failed its trials, with the failure separated.
+    UnreliableCorrupt,
+    UnreliableTimedOut,
+    AdapterRefused,
+    PlatformRefused,
+    HungUp,
+    /// Every rate the 32-bit field can spell passed. The instrument's own limit,
+    /// and it says so instead of implying the wire's.
+    StructuralCap,
+}
+
+impl CeilingKind {
+    fn label(self) -> &'static str {
+        match self {
+            CeilingKind::UnreliableCorrupt => "unreliable-corrupt",
+            CeilingKind::UnreliableTimedOut => "unreliable-timed-out",
+            CeilingKind::AdapterRefused => "adapter-refused",
+            CeilingKind::PlatformRefused => "platform-refused",
+            CeilingKind::HungUp => "hung-up",
+            CeilingKind::StructuralCap => "structural-cap",
+        }
+    }
+
+    fn from_outcome(o: RungOutcome) -> Option<CeilingKind> {
+        match o {
+            RungOutcome::Passed => None,
+            RungOutcome::Corrupt => Some(CeilingKind::UnreliableCorrupt),
+            RungOutcome::TimedOut => Some(CeilingKind::UnreliableTimedOut),
+            RungOutcome::AdapterRefused => Some(CeilingKind::AdapterRefused),
+            RungOutcome::PlatformRefused => Some(CeilingKind::PlatformRefused),
+            RungOutcome::HungUp => Some(CeilingKind::HungUp),
+        }
+    }
+}
+
+/// Whether `rate` is a rung of the ladder itself — the fixed body, or a rung of
+/// the open end above it.
+///
+/// The open end is *computed*, not listed, which is what makes "the probe's own
+/// list is never the ceiling" true: it is `12_000_000 << k` for every `k` that
+/// fits, plus [`P14_MAX_BAUD`] itself as the final clamped step. Refinement
+/// midpoints are exactly the rates this returns `false` for, which is how
+/// [`p14_next_rate`] counts them without being told.
+fn p14_is_ladder_rate(rate: u32) -> bool {
+    if rate == P14_MAX_BAUD || P14_LADDER_BODY.contains(&rate) {
+        return true;
+    }
+    let top = P14_LADDER_BODY[P14_LADDER_BODY.len() - 1] as u64;
+    let mut r = top;
+    while r <= P14_MAX_BAUD as u64 {
+        if r == rate as u64 {
+            return true;
+        }
+        r *= 2;
+    }
+    false
+}
+
+/// The highest rate this history has seen round-trip byte-exact.
+///
+/// A `max` over **every** pass rather than a walk from the end, which is what
+/// makes a non-monotone history safe: a rung that failed below a passing higher
+/// one lowers nothing.
+fn p14_highest_pass(history: &[RateTrial]) -> Option<u32> {
+    history
+        .iter()
+        .filter(|t| t.outcome.passed())
+        .map(|t| t.requested)
+        .max()
+}
+
+/// The lowest failure that bounds `floor` from above — the other half of the
+/// bracket, and `None` when nothing above the floor has failed.
+fn p14_lowest_failure_above(history: &[RateTrial], floor: Option<u32>) -> Option<RateTrial> {
+    history
+        .iter()
+        .filter(|t| !t.outcome.passed())
+        .filter(|t| floor.is_none_or(|f| t.requested > f))
+        .min_by_key(|t| t.requested)
+        .copied()
+}
+
+/// **The next-rate decision — pure, and the half of P14 a bench cannot test.**
+///
+/// Phase 1 climbs while nothing above the floor has failed: the first
+/// unattempted body rung, then the open end, doubling from the body's top. The
+/// open end terminates *by construction* rather than by hope — the final
+/// doubling is clamped to [`P14_MAX_BAUD`], and once that has been attempted
+/// there is nothing left to propose, so this function can never return a rate a
+/// `u32` cannot hold.
+///
+/// Phase 2 refines: once some failure bounds the highest pass from above, it
+/// bisects that bracket, at most [`P14_MAX_REFINEMENTS`] times, stopping when
+/// the bracket is too narrow to hold a new rate. Refinements are counted as the
+/// attempted rates that are not ladder rungs, so the caller keeps no state the
+/// history does not already carry.
+///
+/// `None` means the search is over.
+fn p14_next_rate(history: &[RateTrial]) -> Option<u32> {
+    let floor = p14_highest_pass(history);
+    let bound = p14_lowest_failure_above(history, floor);
+
+    let Some(bound) = bound else {
+        // Phase 1 — climb.
+        for &rung in &P14_LADDER_BODY {
+            if !history.iter().any(|t| t.requested == rung) {
+                return Some(rung);
+            }
+        }
+        // The open end. `max` rather than `last`, so the proposal cannot go
+        // backwards if a history ever arrives out of order.
+        let highest = history.iter().map(|t| t.requested).max()?;
+        if highest == P14_MAX_BAUD {
+            return None;
+        }
+        let doubled = (highest as u64) * 2;
+        return Some(if doubled >= P14_MAX_BAUD as u64 {
+            P14_MAX_BAUD
+        } else {
+            doubled as u32
+        });
+    };
+
+    // Phase 2 — refine between the highest pass and the lowest failure above it.
+    let floor = floor?;
+    let refinements = history
+        .iter()
+        .filter(|t| !p14_is_ladder_rate(t.requested))
+        .count() as u32;
+    if refinements >= P14_MAX_REFINEMENTS {
+        return None;
+    }
+    if bound.requested.saturating_sub(floor) <= 1 {
+        return None;
+    }
+    let mid = floor + (bound.requested - floor) / 2;
+    if mid <= floor || mid >= bound.requested || history.iter().any(|t| t.requested == mid) {
+        return None;
+    }
+    Some(mid)
+}
+
+/// **The fold — the number, and its reason for stopping.**
+///
+/// `max_reliable_baud` is the highest rate that passed, over the whole history.
+/// The kind is read off the failure that bounds it from above; when no failure
+/// bounds it, the search either exhausted the ladder — which is exactly
+/// `structural-cap` — or stopped early, and the second case returns `None`
+/// rather than borrowing the first case's name. **The absence of a reason is
+/// not a fifth reason**: a truncated search must not be able to print the most
+/// impressive answer in the taxonomy, so the verdict degrades on `None`.
+fn p14_ceiling(history: &[RateTrial]) -> (Option<u32>, Option<CeilingKind>) {
+    let floor = p14_highest_pass(history);
+    match p14_lowest_failure_above(history, floor) {
+        Some(bound) => (floor, CeilingKind::from_outcome(bound.outcome)),
+        None if floor == Some(P14_MAX_BAUD) => (floor, Some(CeilingKind::StructuralCap)),
+        None => (floor, None),
+    }
+}
+
+/// The measured inputs P14's verdict is folded from. Copy, small, and holding
+/// no handle — the [`P12Facts`] shape, for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct P14Facts {
+    /// A port was named at all.
+    ports_named: bool,
+    /// Discovery verified a cross-paired rig.
+    pair_present: bool,
+    /// Both of that pair's ports answered [`p5_is_uart`].
+    both_uart: bool,
+    /// P5's rate ladder round-tripped on that pair — §15.51's precondition.
+    baseline_ok: bool,
+    max_reliable_baud: Option<u32>,
+    ceiling_kind: Option<CeilingKind>,
+    /// The way out: the baseline rate re-applied, and one round-trip re-proven
+    /// at it.
+    baseline_restored: bool,
+    baseline_reproved: bool,
+}
+
+/// **The verdict — and it never grades the number.**
+///
+/// `supported` whenever the measurement completed, whatever the ceiling: a rig
+/// that tops out at 115200 is slow, not broken, which is P13's rule that a probe
+/// reports rather than judges. `skipped` without an opted-in verified UART pair.
+/// `degraded` only where the question could not be *asked* — baseline integrity
+/// failed under it, the search did not complete, or the closing restore did not
+/// round-trip. Never `unsupported`: no answer here contradicts a design premise
+/// with no fallback, and the gate refuses that word (`expectations/*.jq`).
+fn p14_verdict(f: P14Facts) -> (Status, String) {
+    if !f.ports_named {
+        return (
+            Status::skipped("no --port named"),
+            "Re-run with both of the rig's --ports. P14 transmits at every rate it tries, so it is opt-in exactly as P3/P5/P11 are (§13, §15.51).".to_owned(),
+        );
+    }
+    if !f.pair_present {
+        return (
+            Status::skipped("no verified cross-paired rig"),
+            "The ceiling is a property of two independently clocked UARTs talking to each other; a dangling converter and a TX↔RX jumper share one clock and cannot answer it. Cross-wire two adapters and name both with --port (§13's Tier 3).".to_owned(),
+        );
+    }
+    if !f.both_uart {
+        return (
+            Status::skipped(P5_UNCHARACTERIZED),
+            "The pair discovery found carries bytes, but neither port answers the UART predicate, so there is no line rate to search for — a software null modem passes every rate because nothing clocks it. The plumbing above ran; the claim did not (§15.51).".to_owned(),
+        );
+    }
+    if !f.baseline_ok {
+        return (
+            Status::Degraded,
+            "P5's rate ladder did not round-trip on this pair, so a ceiling measured through it would be measuring the wiring rather than the clocks — the search was not run. Fix the rig until P5 certifies `rate_ladder=true`, then re-run (§15.21, §15.51).".to_owned(),
+        );
+    }
+    if f.max_reliable_baud.is_none() || f.ceiling_kind.is_none() {
+        return (
+            Status::Degraded,
+            "The search did not complete: no rate was established as reliable, or it stopped without a recorded reason (the rungs above say which). An incomplete search has no ceiling to report, and reporting one anyway is the failure this arm exists to prevent (§15.51).".to_owned(),
+        );
+    }
+    if !f.baseline_restored || !f.baseline_reproved {
+        return (
+            Status::Degraded,
+            format!(
+                "The ceiling was measured ({}), but the rig was not returned to its baseline rate with a proven round-trip (restored={}, re-proved={}) — so the number stands and the rig's state does not. Re-seat or re-open the pair and re-run P5 before any tiered item (§15.51).",
+                f.max_reliable_baud
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "none".into()),
+                f.baseline_restored,
+                f.baseline_reproved,
+            ),
+        );
+    }
+    let baud = f.max_reliable_baud.unwrap_or(0);
+    let kind = f.ceiling_kind.map(CeilingKind::label).unwrap_or("unknown");
+    let why = match f.ceiling_kind {
+        Some(CeilingKind::UnreliableCorrupt) => {
+            "the next rate transmitted and the bytes came back wrong — a loss, separated from a stall because they are different facts"
+        }
+        Some(CeilingKind::UnreliableTimedOut) => {
+            "the next rate transmitted and the bytes did not come back inside the deadline — a stall, separated from a loss because they are different facts"
+        }
+        Some(CeilingKind::AdapterRefused) => {
+            "the next rate was accepted by the ask and the driver landed somewhere else, which the requested-versus-actual cells above name; the adapter's divisor model is the limit"
+        }
+        Some(CeilingKind::PlatformRefused) => {
+            "the set call itself failed with an errno, so this is a fact about the platform's ask surface and **not** about the wire — a different kernel may ask for more over the same cable (§15.47)"
+        }
+        Some(CeilingKind::HungUp) => {
+            "a port's peer went away mid-search, so the search was bounded by the rig disappearing rather than by a rate"
+        }
+        Some(CeilingKind::StructuralCap) => {
+            "every rate the 32-bit configuration field can spell round-tripped, so this names the instrument's own limit and not the wire's"
+        }
+        None => "no reason was recorded",
+    };
+    (
+        Status::Supported,
+        format!(
+            "Maximum reliable rate {baud} baud on this pair; the search stopped because {why} (`ceiling_kind={kind}`). Configure a serial node above that rate and you are past what was measured here. Read the number as a **floor over the probed set** under the stated trial policy — {P14_TRIALS_PER_DIRECTION} byte-exact constant-airtime round-trips per direction — never as a promise about rates the ladder skipped, sustained throughput, longer cables, or other temperatures."
+        ),
+    )
+}
+
+/// The payload size for a rate: [`P14_AIRTIME_MS`] of airtime at 8N1, clamped.
+fn p14_payload_len(baud: u32) -> usize {
+    let bytes = (baud as u64 * P14_AIRTIME_MS) / (1000 * P14_BITS_PER_BYTE);
+    (bytes as usize).clamp(P14_PAYLOAD_FLOOR, P14_PAYLOAD_CAP)
+}
+
+/// A payload nobody can satisfy with a leftover. The head names the rate, the
+/// direction and the trial, so a stale buffer from the previous rung cannot
+/// match, and the tail is a cheap LCG so the bytes exercise every bit position
+/// rather than repeating a short cycle a divisor error might survive.
+fn p14_payload(baud: u32, dir: &str, trial: u32, len: usize) -> Vec<u8> {
+    let head = format!("\x02SNX-P14-{baud}-{dir}-{trial}\x03");
+    let mut v: Vec<u8> = Vec::with_capacity(len.max(head.len()));
+    v.extend_from_slice(head.as_bytes());
+    let mut x: u32 = baud ^ (trial.wrapping_mul(0x9E37_79B9)) ^ (dir.as_bytes()[0] as u32);
+    while v.len() < len {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        v.push((x >> 24) as u8);
+    }
+    v
+}
+
+/// Which surface refused, read off the error rather than off its message.
+///
+/// serial2 collapses two very different failures into one `Err`: a `tcsetattr`
+/// that the kernel rejected, and its own post-set verification finding the
+/// driver landed more than 2.5% from the ask. They are separable without
+/// matching on the crate's error *string* — which would be a promise the crate
+/// never made — because only the first carries an errno: the syscall wrapper
+/// builds its error from `last_os_error`, the verifier builds a bare
+/// `ErrorKind::Other`. So `raw_os_error().is_some()` means *the ask was refused
+/// before any byte moved* (the platform), and its absence means *the ask was
+/// accepted and the clock landed elsewhere* (the adapter). Both arms report the
+/// read-back beside the request, so the classification is corroborated by a
+/// number rather than resting on this rule alone (§15.46).
+fn p14_refusal(e: &std::io::Error) -> RungOutcome {
+    match e.raw_os_error() {
+        Some(_) => RungOutcome::PlatformRefused,
+        None => RungOutcome::AdapterRefused,
+    }
+}
+
+/// Ask one port for a rate and report what the driver is actually running.
+///
+/// The read-back happens on **both** paths, success and refusal alike: a
+/// refusal whose actual rate nobody read is a refusal nobody can explain, and
+/// §15.46 makes the instrument testify to its own configuration.
+fn p14_apply_rate(
+    sp: &mut SerialPort,
+    baud: u32,
+) -> (Option<RungOutcome>, Option<i32>, Option<u32>) {
+    let readback = |sp: &SerialPort| sp.get_configuration().and_then(|c| c.get_baud_rate()).ok();
+    let mut settings = match sp.get_configuration() {
+        Ok(s) => s,
+        Err(e) => return (Some(p14_refusal(&e)), e.raw_os_error(), None),
+    };
+    if let Err(e) = settings.set_baud_rate(baud) {
+        let (o, n) = (p14_refusal(&e), e.raw_os_error());
+        return (Some(o), n, readback(sp));
+    }
+    match sp.set_configuration(&settings) {
+        Ok(()) => (None, None, readback(sp)),
+        Err(e) => {
+            let (o, n) = (p14_refusal(&e), e.raw_os_error());
+            (Some(o), n, readback(sp))
+        }
+    }
+}
+
+/// Read whatever is already buffered and throw it away, so a rung's trial is
+/// judged on its own bytes. Bounded: a port that never goes quiet stops at the
+/// window rather than holding the search.
+fn p14_flush(sp: &SerialPort, window: Duration) {
+    let until = Instant::now() + window;
+    while Instant::now() < until {
+        match p5_read_result(sp) {
+            Ok(got) if got.is_empty() => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+/// What one direction's one trial came to.
+#[derive(Debug, Clone, Copy, Default)]
+struct TrialResult {
+    written: u64,
+    received: u64,
+    byte_exact: bool,
+    hung_up: bool,
+}
+
+/// One round trip, **writing and reading concurrently**.
+///
+/// The concurrency is not a refinement, it is the measurement. A
+/// write-the-whole-payload-then-read shape was tried first on the crossover rig
+/// and reported a ceiling of 250000 baud on hardware that is byte-exact to
+/// 3000000: at and above 460800 the payload outruns the receiver's buffer while
+/// the sender is still writing, so the loss is the harness's and the number is
+/// the harness's too. Polling both directions is what the daemon does (§5), and
+/// it is the only shape whose failures belong to the wire.
+fn p14_trial(tx: &SerialPort, rx: &SerialPort, payload: &[u8], deadline: Duration) -> TrialResult {
+    let start = Instant::now();
+    let mut sent = 0usize;
+    let mut got: Vec<u8> = Vec::with_capacity(payload.len() + P14_READ_SLACK);
+    let mut hung_up = false;
+    let ceiling = payload.len() + P14_READ_SLACK;
+    while start.elapsed() < deadline {
+        let mut pfds = Vec::with_capacity(2);
+        pfds.push(PollFd::new(rx.as_fd(), PollFlags::POLLIN));
+        if sent < payload.len() {
+            pfds.push(PollFd::new(tx.as_fd(), PollFlags::POLLOUT));
+        }
+        let _ = poll(&mut pfds, PollTimeout::from(20u16));
+        let readable = pfds[0].revents().unwrap_or(PollFlags::empty());
+        if readable.intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR) {
+            match p5_read_result(rx) {
+                Ok(chunk) => got.extend_from_slice(&chunk),
+                Err(e) => {
+                    if is_hangup(&e) {
+                        hung_up = true;
+                    }
+                    break;
+                }
+            }
+        }
+        if sent < payload.len()
+            && pfds
+                .get(1)
+                .and_then(|f| f.revents())
+                .is_some_and(|r| r.contains(PollFlags::POLLOUT))
+        {
+            match tx.write(&payload[sent..]) {
+                Ok(0) => {}
+                Ok(n) => sent += n,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    if is_hangup(&e) {
+                        hung_up = true;
+                    }
+                    break;
+                }
+            }
+        }
+        if got.len() >= payload.len() && contains_sub(&got, payload) {
+            break;
+        }
+        if got.len() >= ceiling {
+            break;
+        }
+    }
+    TrialResult {
+        written: sent as u64,
+        received: got.len() as u64,
+        byte_exact: contains_sub(&got, payload),
+        hung_up,
+    }
+}
+
+/// One direction of one rung: up to [`P14_TRIALS_PER_DIRECTION`] trials, short-
+/// circuiting on the first failure.
+///
+/// Three clean trials are what makes a rung reliable; one failure is already
+/// enough to make it not, so the remaining trials would buy nothing but time at
+/// the one rung that always costs the most. `trials_run` is reported beside
+/// `trials_passed` so the short circuit is visible rather than inferred.
+#[derive(Debug, Clone, Copy, Default)]
+struct DirectionResult {
+    measured: bool,
+    trials_run: u32,
+    trials_passed: u32,
+    bytes_sent: u64,
+    bytes_received: u64,
+    byte_exact: bool,
+    hung_up: bool,
+    elapsed_us: u64,
+}
+
+impl DirectionResult {
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            // A `0` that says what it means: an unmeasured direction and a
+            // direction that carried nothing are different facts (§15.49).
+            "measured": self.measured,
+            "trials_run": self.trials_run,
+            "trials_passed": self.trials_passed,
+            "bytes_sent": self.bytes_sent,
+            "bytes_received": self.bytes_received,
+            "byte_exact": self.byte_exact,
+            "hung_up": self.hung_up,
+            "elapsed_us": self.elapsed_us,
+        })
+    }
+}
+
+fn p14_direction(
+    tx: &SerialPort,
+    rx: &SerialPort,
+    baud: u32,
+    dir: &str,
+    payload_len: usize,
+    deadline: Duration,
+) -> DirectionResult {
+    let mut d = DirectionResult {
+        measured: true,
+        byte_exact: true,
+        ..Default::default()
+    };
+    let started = Instant::now();
+    for trial in 0..P14_TRIALS_PER_DIRECTION {
+        p14_flush(rx, Duration::from_millis(30));
+        let payload = p14_payload(baud, dir, trial, payload_len);
+        let r = p14_trial(tx, rx, &payload, deadline);
+        d.trials_run += 1;
+        d.bytes_sent += r.written;
+        d.bytes_received += r.received;
+        d.hung_up |= r.hung_up;
+        if r.byte_exact {
+            d.trials_passed += 1;
+        } else {
+            d.byte_exact = false;
+            break;
+        }
+    }
+    d.elapsed_us = started.elapsed().as_micros() as u64;
+    d
+}
+
+/// One measured rung, with everything the report prints about it.
+struct Rung14 {
+    requested: u32,
+    actual_a: Option<u32>,
+    actual_b: Option<u32>,
+    refusal_errno: Option<i32>,
+    phase: &'static str,
+    outcome: RungOutcome,
+    ab: DirectionResult,
+    ba: DirectionResult,
+    frame_delta: Option<u64>,
+    overrun_delta: Option<u64>,
+    parity_delta: Option<u64>,
+}
+
+impl Rung14 {
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "requested_baud": self.requested,
+            // `null`, never a sentinel: a rate nobody could read back is not a
+            // rate of zero, and the two must not print the same.
+            "actual_baud_a": self.actual_a,
+            "actual_baud_b": self.actual_b,
+            "refusal_errno": self.refusal_errno,
+            "phase": self.phase,
+            "outcome": self.outcome.label(),
+            "ab": self.ab.observations(),
+            "ba": self.ba.observations(),
+            // Linux-only (TIOCGICOUNT). `null` off Linux, with the mechanism
+            // named once at the probe level rather than repeated per rung — the
+            // §15.47 treatment: unmeasurable is data, not a bare zero.
+            "frame_delta": self.frame_delta,
+            "overrun_delta": self.overrun_delta,
+            "parity_delta": self.parity_delta,
+        })
+    }
+}
+
+/// Read the driver's input-error counters, where the kernel has them.
+fn p14_icounts(sp: &SerialPort) -> Option<(u64, u64, u64)> {
+    sys::read_icounts(sp.as_raw_fd())
+        .ok()
+        .map(|c| (c.frame as u64, c.overrun as u64, c.parity as u64))
+}
+
+/// Measure one rung: apply the rate to both ports, settle, and run both
+/// directions. A refused rate never reaches the trials — there is nothing to
+/// measure at a rate the hardware is not running.
+fn p14_measure_rung(
+    a: &mut SerialPort,
+    b: &mut SerialPort,
+    rate: u32,
+    phase: &'static str,
+) -> Rung14 {
+    let (refusal_a, errno_a, actual_a) = p14_apply_rate(a, rate);
+    let (refusal_b, errno_b, actual_b) = p14_apply_rate(b, rate);
+    let refusal = refusal_a.or(refusal_b);
+    let refusal_errno = errno_a.or(errno_b);
+    let mut rung = Rung14 {
+        requested: rate,
+        actual_a,
+        actual_b,
+        refusal_errno,
+        phase,
+        outcome: RungOutcome::Passed,
+        ab: DirectionResult::default(),
+        ba: DirectionResult::default(),
+        frame_delta: None,
+        overrun_delta: None,
+        parity_delta: None,
+    };
+    if let Some(o) = refusal {
+        rung.outcome = o;
+        return rung;
+    }
+    // §15.25's post-set settle, on both ends. Its absence was this project's one
+    // genuine hardware bug: an FTDI transmits the first bytes after a rate change
+    // at a transitional rate.
+    std::thread::sleep(P5_OPEN_SETTLE);
+
+    let payload_len = p14_payload_len(rate);
+    let airtime_us = (payload_len as u64 * P14_BITS_PER_BYTE * 1_000_000) / (rate.max(1) as u64);
+    let deadline = Duration::from_micros(airtime_us * 4) + Duration::from_millis(500);
+
+    let before = (p14_icounts(a), p14_icounts(b));
+    rung.ab = p14_direction(a, b, rate, "AB", payload_len, deadline);
+    rung.ba = p14_direction(b, a, rate, "BA", payload_len, deadline);
+    let after = (p14_icounts(a), p14_icounts(b));
+    if let (Some(a0), Some(b0), Some(a1), Some(b1)) = (before.0, before.1, after.0, after.1) {
+        rung.frame_delta = Some((a1.0 - a0.0) + (b1.0 - b0.0));
+        rung.overrun_delta = Some((a1.1 - a0.1) + (b1.1 - b0.1));
+        rung.parity_delta = Some((a1.2 - a0.2) + (b1.2 - b0.2));
+    }
+
+    rung.outcome = if rung.ab.hung_up || rung.ba.hung_up {
+        RungOutcome::HungUp
+    } else if rung.ab.byte_exact && rung.ba.byte_exact {
+        RungOutcome::Passed
+    } else {
+        // A short write is a transmit-side stall, not wire corruption — the
+        // conservative reading, with `bytes_sent` beside it so the two are
+        // separable in the artifact rather than only in this comment.
+        let short_write = rung.ab.bytes_sent < payload_len as u64
+            || (rung.ba.measured && rung.ba.bytes_sent == 0);
+        let starved = rung.ab.bytes_received < payload_len as u64
+            || (rung.ba.measured && rung.ba.bytes_received < payload_len as u64);
+        if short_write || starved {
+            RungOutcome::TimedOut
+        } else {
+            RungOutcome::Corrupt
+        }
+    };
+    rung
+}
+
+pub fn p14_max_rate(ports: &[PathBuf], pairs: &[VerifiedPair]) -> Probe {
+    let mut p = Probe::new("P14", "maximum reliable rate", P14_QUESTION);
+    let mut facts = P14Facts {
+        ports_named: !ports.is_empty(),
+        pair_present: !pairs.is_empty(),
+        both_uart: false,
+        baseline_ok: false,
+        max_reliable_baud: None,
+        ceiling_kind: None,
+        baseline_restored: false,
+        baseline_reproved: false,
+    };
+    p = p.observe("pairs_discovered", pairs.len() as u64);
+    // Stated on every path, including the ones that never measure a rate: a
+    // report has to say what the instrument's own limit is before its answer can
+    // be read against it (§15.34).
+    p = p.observe("structural_max_baud", P14_MAX_BAUD as u64);
+    p = p.observe("baseline_baud", P14_BASELINE_BAUD as u64);
+
+    let Some(pair) = pairs.iter().find(|p| p.both_uart) else {
+        let (status, consequence) = p14_verdict(facts);
+        if let Some(first) = pairs.first() {
+            p = p.observe(
+                "pair",
+                format!("{} ↔ {}", first.a_name, first.b_name).as_str(),
+            );
+        }
+        return p.verdict(status, &consequence);
+    };
+    facts.both_uart = true;
+    facts.baseline_ok = pair.baseline_ok;
+    p = p.observe(
+        "pair",
+        format!("{} ↔ {}", pair.a_name, pair.b_name).as_str(),
+    );
+    p = p.observe("baseline_integrity_from_p5", pair.baseline_ok);
+    p = p.observe("icounts_measurable", sys::ICOUNTS_SUPPORTED);
+    if !sys::ICOUNTS_SUPPORTED {
+        p = p.observe("icounts_unmeasurable_because", P5_WHY_NO_ICOUNTER);
+    }
+    if !pair.baseline_ok {
+        let (status, consequence) = p14_verdict(facts);
+        return p.verdict(status, &consequence);
+    }
+
+    // Open both ports once and change the rate in place. Reopening per rung
+    // would toggle DTR on every step — an auto-reset pulse per rate on the very
+    // boards §7.1 holds the port open to protect.
+    let (Ok(mut a), Ok(mut b)) = (
+        p5_open(&pair.a, P14_BASELINE_BAUD, Parity::None),
+        p5_open(&pair.b, P14_BASELINE_BAUD, Parity::None),
+    ) else {
+        p = p.observe("pair_open", "failed");
+        let (status, consequence) = p14_verdict(facts);
+        return p.verdict(status, &consequence);
+    };
+
+    let started = Instant::now();
+    let mut history: Vec<RateTrial> = Vec::new();
+    let mut rungs: Vec<serde_json::Value> = Vec::new();
+    let mut budget_exhausted = false;
+    while let Some(rate) = p14_next_rate(&history) {
+        let phase = if !p14_is_ladder_rate(rate) {
+            "refinement"
+        } else if P14_LADDER_BODY.contains(&rate) {
+            "body"
+        } else {
+            "open-end"
+        };
+        let rung = p14_measure_rung(&mut a, &mut b, rate, phase);
+        history.push(RateTrial {
+            requested: rate,
+            outcome: rung.outcome,
+        });
+        rungs.push(rung.observations());
+        if started.elapsed() > P14_BUDGET {
+            budget_exhausted = true;
+            break;
+        }
+    }
+    let search_elapsed_ms = started.elapsed().as_millis() as u64;
+
+    // The way out: restore the baseline rate and re-prove one round-trip at it,
+    // so the rig is left the way its own certificate needs it (§15.51).
+    let restored = p14_apply_rate(&mut a, P14_BASELINE_BAUD).0.is_none()
+        && p14_apply_rate(&mut b, P14_BASELINE_BAUD).0.is_none();
+    std::thread::sleep(P5_OPEN_SETTLE);
+    let reproved = restored && {
+        let len = p14_payload_len(P14_BASELINE_BAUD);
+        let deadline = Duration::from_millis(2000);
+        p14_flush(&b, Duration::from_millis(50));
+        let ab = p14_trial(
+            &a,
+            &b,
+            &p14_payload(P14_BASELINE_BAUD, "AB", 99, len),
+            deadline,
+        );
+        p14_flush(&a, Duration::from_millis(50));
+        let ba = p14_trial(
+            &b,
+            &a,
+            &p14_payload(P14_BASELINE_BAUD, "BA", 99, len),
+            deadline,
+        );
+        ab.byte_exact && ba.byte_exact
+    };
+
+    let (max_reliable, kind) = p14_ceiling(&history);
+    facts.max_reliable_baud = max_reliable;
+    facts.ceiling_kind = kind;
+    facts.baseline_restored = restored;
+    facts.baseline_reproved = reproved;
+
+    let bound = p14_lowest_failure_above(&history, max_reliable);
+    p = p
+        .observe(
+            "max_reliable_baud",
+            max_reliable.map(|b| serde_json::Value::from(b as u64)).unwrap_or(serde_json::Value::Null),
+        )
+        .observe(
+            "ceiling_kind",
+            kind.map(|k| serde_json::Value::from(k.label()))
+                .unwrap_or(serde_json::Value::Null),
+        )
+        .observe(
+            "first_unreliable_baud",
+            bound
+                .map(|t| serde_json::Value::from(t.requested as u64))
+                .unwrap_or(serde_json::Value::Null),
+        )
+        .observe(
+            "ceiling_is_a_floor_over",
+            "the rates this ladder probed, under this trial policy — three byte-exact constant-airtime round-trips per direction. It is not a promise about rates between rungs, about sustained throughput, about longer cables, or about other temperatures.",
+        )
+        .observe("ladder_body_rungs", P14_LADDER_BODY.len() as u64)
+        .observe(
+            "rungs_attempted",
+            history.len() as u64,
+        )
+        .observe(
+            "refinements_used",
+            history
+                .iter()
+                .filter(|t| !p14_is_ladder_rate(t.requested))
+                .count() as u64,
+        )
+        .observe("refinements_max", P14_MAX_REFINEMENTS as u64)
+        .observe("trials_per_direction", P14_TRIALS_PER_DIRECTION as u64)
+        .observe("airtime_ms", P14_AIRTIME_MS)
+        .observe("payload_floor_bytes", P14_PAYLOAD_FLOOR as u64)
+        .observe("payload_cap_bytes", P14_PAYLOAD_CAP as u64)
+        .observe("search_elapsed_ms", search_elapsed_ms)
+        .observe("search_budget_exhausted", budget_exhausted)
+        .observe("baseline_restored", restored)
+        .observe("baseline_reproved", reproved)
+        .observe("rungs", serde_json::Value::Array(rungs));
+
+    let (status, consequence) = p14_verdict(facts);
+    p.verdict(status, &consequence)
 }
 
 // ---------------------------------------------------------------------------
@@ -5500,21 +6605,68 @@ mod tests {
 
         let (status, why) = p5_verdict(true, false, &[], &[], RigFacts::default());
         assert_eq!(status.label(), "supported");
-        // *Why* nothing certified is platform-specific, because the UART predicate
-        // is (see `P5_UNCHARACTERIZED`): on Linux the ports really were sims; off
-        // Linux `TIOCGICOUNT` cannot answer for any port, real adapters included.
-        // Assert the arm this build ships — pinning the Linux wording everywhere is
-        // what failed this test on a Mac against code that had just become *more*
-        // accurate there.
-        #[cfg(target_os = "linux")]
-        assert!(why.contains("skipped on non-UART sims"), "{why}");
-        #[cfg(not(target_os = "linux"))]
-        assert!(why.contains("TIOCGICOUNT, which is Linux-only"), "{why}");
-        // Portable and the clause with teeth: whichever arm ran, an uncertified rig
-        // must not borrow the certified arm's opening. That sentence is what a
-        // tiered checklist run reads to decide it may start (§15.21), and P5's prose
-        // has now over-claimed three times (AGENTS §2's 6.18 entry has the other two).
+        // **Portable, and that is the whole point of this block.** The pair this
+        // replaced was a `cfg` fork: the Linux half pinned "skipped on non-UART
+        // sims" and the non-Linux half pinned "TIOCGICOUNT, which is Linux-only".
+        // The second one guarded the sentence that had gone false when §15.47
+        // widened the predicate to `TIOCMGET || TIOCGICOUNT` — and it *could not
+        // compile* on the platform of record, so the defect was unreachable from
+        // the box every developer sits at, and repairing the string reddened
+        // nothing here. That is AGENTS §9's proxy in space, sitting inside the
+        // guard for a defect that was itself a proxy in space.
+        //
+        // The portable form is stricter on Linux, which §9 names as the tell:
+        // the arm is now one sentence about the *ports* (they answered neither
+        // ioctl), so both of the false claims are refusable on both kernels.
+        assert!(
+            !why.contains("the UART predicate is TIOCGICOUNT"),
+            "the uncharacterized arm still calls the predicate Linux-only; \
+             `p5_is_uart` has been `TIOCMGET || TIOCGICOUNT` since §15.47, and a \
+             real FTDI pair certifies on Darwin — \
+             docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3.json: {why}"
+        );
+        assert!(
+            !why.contains("run the certificate on a Linux box"),
+            "the uncharacterized arm still sends a Darwin operator to another \
+             kernel for a certificate their own box now produces: {why}"
+        );
+        assert!(
+            why.contains("TIOCMGET"),
+            "the arm must name the predicate it actually applied, or the next \
+             widening drifts the same way: {why}"
+        );
+        assert!(why.contains("skipped"), "{why}");
+        // Whichever arm ran, an uncertified rig must not borrow the certified
+        // arm's opening. That sentence is what a tiered checklist run reads to
+        // decide it may start (§15.21), and P5's prose has now over-claimed three
+        // times (AGENTS §2's 6.18 entry has the other two).
         assert!(!why.contains("Rig discovered and certified"), "{why}");
+    }
+
+    /// The skip *reason* the arm above explains must name the same predicate the
+    /// arm does, on every kernel — one constant now, where there used to be two.
+    ///
+    /// This compiles and runs on both platforms, which the pair it replaces did
+    /// not: `P5_UNCHARACTERIZED` was `#[cfg]`-forked, so the false half was
+    /// invisible to every Linux run. Naming `TIOCMGET` is the greppable token
+    /// plan §18 item 1 asks each replacement sentence to carry.
+    #[test]
+    fn the_uncharacterized_reason_names_the_disjunction_not_one_ioctl() {
+        assert!(
+            P5_UNCHARACTERIZED.contains("TIOCMGET"),
+            "{P5_UNCHARACTERIZED}"
+        );
+        assert!(
+            P5_UNCHARACTERIZED.contains("TIOCGICOUNT"),
+            "both members of the disjunction, or the reason names half a \
+             predicate: {P5_UNCHARACTERIZED}"
+        );
+        assert!(
+            !P5_UNCHARACTERIZED.contains("Linux-only"),
+            "the reason a port was not characterized is a fact about the port, \
+             not about the kernel — a pts fails both ioctls on both kernels, and \
+             a real adapter answers TIOCMGET on both: {P5_UNCHARACTERIZED}"
+        );
     }
 
     /// **A Tier-1 certificate must say Tier 1.** §15.21 makes P5's certificate the
@@ -5840,10 +6992,92 @@ mod tests {
 
     /// The two constructors that feed the fold: a skipped characterization records
     /// no failure (the CI sim must stay green), while an unavailable one degrades.
+    /// **The handshake vocabulary names every shape, and judges none of them**
+    /// (§15.52).
+    ///
+    /// Two properties, and the second is the one that keeps the item honest. The
+    /// classifier must distinguish a 5-wire crossover from a 3-wire link from a
+    /// half-crossed handshake — otherwise the six cells beneath it are all a
+    /// reader has, and a half-crossed handshake is exactly the state discovery
+    /// already refuses to leave unnamed on the data pair. And **no shape may
+    /// produce a certificate failure**: a 3-wire rig is §5's own stated
+    /// assumption, so an item that degraded one would report the operator's
+    /// cabling choice as a fault and would move the verdict on every committed
+    /// artifact whose rig nobody has re-inspected.
+    #[test]
+    fn the_handshake_line_names_the_wiring_and_grades_none_of_it() {
+        // The bench rig, measured (notes §3.53 i): RTS/CTS both ways, DTR nothing.
+        let five_wire = p5_handshake_line("true", "true", "false", "false", "false", "false");
+        assert!(five_wire.starts_with("5-wire crossover"), "{five_wire}");
+        // The design's stated common case.
+        let three_wire = p5_handshake_line("false", "false", "false", "false", "false", "false");
+        assert!(three_wire.starts_with("3-wire"), "{three_wire}");
+        // The state worth naming: it carries one way, which is a wiring fault a
+        // reader would otherwise have to spot across six cells.
+        let half = p5_handshake_line("true", "false", "false", "false", "false", "false");
+        assert!(half.contains("HALF-CROSSED"), "{half}");
+        assert!(
+            p5_handshake_line("false", "true", "false", "false", "false", "false")
+                .contains("HALF-CROSSED"),
+            "the mirror direction must be named too"
+        );
+        // A rig that carries DTR as well, and one that carries only DTR.
+        assert!(
+            p5_handshake_line("true", "true", "true", "false", "false", "false")
+                .starts_with("wired:"),
+            "a fully wired rig must not be called a 5-wire crossover"
+        );
+        assert!(
+            p5_handshake_line("false", "false", "true", "false", "false", "false")
+                .starts_with("DTR wired"),
+        );
+        // Every shape must be distinguishable, or the classifier is a constant.
+        let shapes: std::collections::BTreeSet<String> = [
+            &five_wire,
+            &three_wire,
+            &half,
+            &p5_handshake_line("true", "true", "true", "false", "false", "false"),
+            &p5_handshake_line("false", "false", "true", "false", "false", "false"),
+        ]
+        .iter()
+        .map(|s| s.split(" [").next().unwrap_or_default().to_owned())
+        .collect();
+        assert_eq!(
+            shapes.len(),
+            5,
+            "two wiring shapes share a name: {shapes:?}"
+        );
+        // The six cells travel with the name, always — the name is a reading of
+        // them and a reader must be able to check it.
+        for line in [&five_wire, &three_wire, &half] {
+            for key in [
+                "rts_a_to_cts_b=",
+                "rts_b_to_cts_a=",
+                "dtr_a_to_dsr_b=",
+                "dtr_a_to_dcd_b=",
+                "dtr_a_to_ri_b=",
+                "dtr_b_to_dsr_a=",
+            ] {
+                assert!(line.contains(key), "{key} missing from {line}");
+            }
+        }
+        // **Reported, never judged**: the handshake reaches no `CertFailure`, so
+        // no shape can move P5's verdict. Asserted over the verdict itself rather
+        // than by inspecting the call site, because that is the property.
+        for line in [&five_wire, &three_wire, &half] {
+            let (status, _) = p5_verdict(true, true, &[], &[], paired());
+            assert_eq!(
+                status.label(),
+                "supported",
+                "a handshake reading moved the verdict: {line}"
+            );
+        }
+    }
+
     #[test]
     fn skipped_certificates_carry_no_failure_but_unavailable_ones_do() {
-        let skipped = Certificate::skipped("not a UART");
-        assert_eq!(skipped.line, "skipped (not a UART)");
+        let skipped = Certificate::skipped(P5_UNCHARACTERIZED);
+        assert_eq!(skipped.line, format!("skipped ({P5_UNCHARACTERIZED})"));
         assert!(skipped.failures.is_empty());
         assert_eq!(
             p5_verdict(true, false, &skipped.failures, &[], RigFacts::default())
@@ -6639,10 +7873,14 @@ mod tests {
     ///
     /// Filling hostward (master→slave) against a slave nobody reads: raw hands
     /// every accepted byte back, cooked hands back none of them — measured on
-    /// Linux 7.0.0-29 at ~13.8 KiB fully recoverable against ~23.5 KiB with
-    /// nothing recoverable. Before `bytes_recovered_by_peer` existed the two were
-    /// indistinguishable in the report, which is how a cooked-pty measurement
-    /// could be read as this kernel's buffer depth.
+    /// Linux 7.0.0-29, where cooked also *accepts* the larger number, so the two
+    /// modes disagree in both directions at once. Before `bytes_recovered_by_peer`
+    /// existed the two were indistinguishable in the report, which is how a
+    /// cooked-pty measurement could be read as this kernel's buffer depth. The
+    /// figures that used to sit in this sentence are withdrawn rather than
+    /// updated: they were a scratchpad pair no committed artifact backs (notes
+    /// §3.34), and this test is the reason dropping them costs nothing — it
+    /// proves the relation without them.
     ///
     /// Asserted as a *relation* between the two modes rather than against either
     /// figure: the depths move by a chunk run to run and differ by kernel, but a
@@ -6710,6 +7948,59 @@ mod tests {
         assert_eq!(fionread_trust(Some(5), 0), FionreadTrust::Overcounts);
         assert!(FionreadTrust::ContradictedEmpty.is_wrong());
         assert!(!FionreadTrust::Undercounts.is_wrong());
+    }
+
+    /// **The shipped P10 sentence may not quote a figure no artifact backs**
+    /// (plan §18 item 1, notes §3.34's filing).
+    ///
+    /// The pair this refuses — `~13.8 KiB` raw against `~23.5 KiB` cooked — came
+    /// from a session scratchpad, and the raw half does not agree with the
+    /// committed Linux capture, which reads 13824–15360 bytes per direction. It
+    /// rode in the **consequence string of every report this binary emits, on
+    /// every kernel**, which is the reason it was filed rather than swept during a
+    /// documentation pass: changing what a shipped report says is a decision, not
+    /// an edit.
+    ///
+    /// This guard exists because *nothing else asserts that string*. Neither
+    /// expectation file inspects consequence text, and neither digest can see it —
+    /// `probe_set` covers `(id, question)` and `field_set` covers observation leaf
+    /// paths, so a sentence rewrite moves neither (§15.44's named residual). So
+    /// dropping the figures would otherwise have reddened nothing, and a green
+    /// suite would have proven nothing.
+    ///
+    /// It asserts the *relation* survives, not just that the numbers went: a
+    /// repair that deleted the whole clause would leave a reader with no reason to
+    /// check `slave_termios_mode` before blaming a kernel, which is the sentence's
+    /// actual job.
+    #[test]
+    fn the_shipped_p10_consequence_quotes_no_uncommitted_figure() {
+        // The real probe, not a reconstruction: the string under test is the one
+        // the binary emits, so the guard runs the emitter. P10 is pty-only and
+        // passive, so it needs no port and no rig.
+        let probe = p10_pty_buffer_depth();
+        let why = &probe.consequence;
+        assert!(
+            !why.is_empty(),
+            "P10 emitted no consequence at all, so this guard is reading nothing"
+        );
+        for figure in ["13.8", "23.5"] {
+            assert!(
+                !why.contains(figure),
+                "the shipped P10 consequence still quotes {figure}, a scratchpad \
+                 number no `docs/doctor/` artifact backs (notes §3.34): {why}"
+            );
+        }
+        assert!(
+            why.contains("slave_termios_mode"),
+            "the consequence must still send the reader to the cell that settles \
+             a cross-kernel gap before they blame the kernel: {why}"
+        );
+        assert!(
+            why.contains("raw accepts less and returns all of it"),
+            "the mode relation itself must survive the figures being withdrawn — \
+             it is what the sentence is for, and it is proven numberlessly by \
+             `p10_recoverability_separates_a_deep_buffer_from_a_black_hole`: {why}"
+        );
     }
 
     /// The warning must fire on the Darwin reading, name the direction it applies
@@ -6884,5 +8175,484 @@ mod tests {
              P12's Linux `skipped` verdict and its consequence both say this \
              cannot happen."
         );
+    }
+
+    // -- P14: the maximum-rate search (§15.51) -------------------------------
+    //
+    // The whole point of splitting the decision and the fold out as pure
+    // functions is that a bench cannot test them: the rig answers one history,
+    // and every history that matters — a non-monotone ladder, a run that passes
+    // all the way to the 32-bit cap, a Darwin ask-ceiling — has to be
+    // *constructed*. That is the §15.47 pattern P5's verdict already uses, and
+    // it is what makes a guard here regression-proof against an edit made on a
+    // box whose hardware happens to stop at 3 Mbaud.
+
+    fn t(requested: u32, outcome: RungOutcome) -> RateTrial {
+        RateTrial { requested, outcome }
+    }
+
+    /// A `P14Facts` whose measurement completed cleanly, so each test can mutate
+    /// exactly the field it is about.
+    fn p14_good() -> P14Facts {
+        P14Facts {
+            ports_named: true,
+            pair_present: true,
+            both_uart: true,
+            baseline_ok: true,
+            max_reliable_baud: Some(3_000_000),
+            ceiling_kind: Some(CeilingKind::AdapterRefused),
+            baseline_restored: true,
+            baseline_reproved: true,
+        }
+    }
+
+    /// Every body rung passing, as the prefix of a longer constructed history.
+    fn p14_body_all_passed() -> Vec<RateTrial> {
+        P14_LADDER_BODY
+            .iter()
+            .map(|&r| t(r, RungOutcome::Passed))
+            .collect()
+    }
+
+    #[test]
+    fn p14_ladder_is_a_ladder_and_its_open_end_is_computed_not_listed() {
+        // The analogue of `p10_ladder_is_a_ladder`: a collapsed ladder — one
+        // rung, or a body whose entries are equal — satisfies every other test
+        // in this block while measuring nothing.
+        let mut sorted = P14_LADDER_BODY.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            P14_LADDER_BODY.len(),
+            "the fixed body has duplicate rungs"
+        );
+        assert!(
+            P14_LADDER_BODY.windows(2).all(|w| w[0] < w[1]),
+            "the fixed body must be strictly ascending, or the climb re-asks a rate"
+        );
+        // The open end is a *rule*, not a list: rungs the body never names must
+        // still be recognised as ladder rates, or every one of them would be
+        // counted as a refinement and the budget would close after four.
+        let top = P14_LADDER_BODY[P14_LADDER_BODY.len() - 1];
+        assert!(p14_is_ladder_rate(top));
+        assert!(p14_is_ladder_rate(top * 2));
+        assert!(p14_is_ladder_rate(top * 4));
+        assert!(p14_is_ladder_rate(P14_MAX_BAUD));
+        // And a midpoint is not one, which is what makes refinement countable.
+        assert!(!p14_is_ladder_rate(3_500_000));
+        assert!(!p14_is_ladder_rate(top + 1));
+    }
+
+    #[test]
+    fn p14_next_rate_climbs_the_body_then_doubles_and_terminates_at_the_structural_cap() {
+        // Walk an all-pass history to exhaustion. Three properties, and the
+        // third is the one plan §18 item 11 words as "the open end's termination
+        // proven by construction": the walk is finite, every proposal fits the
+        // field the operator configures, and the last one is that field's
+        // maximum rather than something below it.
+        let mut history: Vec<RateTrial> = Vec::new();
+        let mut proposed: Vec<u32> = Vec::new();
+        // A bound far above the real count (16 body + 9 open-end), so a
+        // non-terminating decision function fails this test instead of hanging
+        // the suite — a hang is not a red test, it is an unread one.
+        for _ in 0..1_000 {
+            match p14_next_rate(&history) {
+                Some(r) => {
+                    proposed.push(r);
+                    history.push(t(r, RungOutcome::Passed));
+                }
+                None => break,
+            }
+        }
+        assert!(
+            p14_next_rate(&history).is_none(),
+            "the climb did not terminate within 1000 proposals"
+        );
+        // **Strictly increasing, and that is the assertion — not `r <= P14_MAX_BAUD`,
+        // which clippy is right to call absurd.** The cap *is* `u32::MAX`, so a
+        // comparison against it in a `u32` is true by the type and proves nothing;
+        // writing it would have been a guard that could never fail, in the test whose
+        // whole subject is a bound. What an unclamped doubling actually produces is a
+        // **wrap**: `3_072_000_000 * 2` truncates to `1_849_032_704`, which is
+        // *smaller* than the rung before it. Monotonicity is therefore the property
+        // that catches it, and it is checkable in the type the field really has.
+        assert!(
+            proposed.windows(2).all(|w| w[0] < w[1]),
+            "the climb went backwards, which is what an unclamped doubling looks \
+             like after it wraps a u32: {proposed:?}"
+        );
+        assert_eq!(
+            proposed[..P14_LADDER_BODY.len()],
+            P14_LADDER_BODY,
+            "the fixed body must be climbed in order before the open end starts"
+        );
+        assert_eq!(
+            proposed.last().copied(),
+            Some(P14_MAX_BAUD),
+            "the final clamped step is what makes `structural-cap` mean \
+             'every rate the field can spell passed' rather than 'the doubling \
+             overflowed'"
+        );
+        // The open end really opened: more rungs than the body names, so the
+        // probe's own list is not the ceiling.
+        assert!(
+            proposed.len() > P14_LADDER_BODY.len(),
+            "the open end proposed nothing; the body would then be the ceiling"
+        );
+        // And the fold reads that history as the instrument's limit, not the
+        // wire's.
+        assert_eq!(
+            p14_ceiling(&history),
+            (Some(P14_MAX_BAUD), Some(CeilingKind::StructuralCap))
+        );
+    }
+
+    #[test]
+    fn p14_brackets_the_highest_pass_and_the_lowest_failure_above_it_even_when_the_ladder_is_not_monotone()
+     {
+        // §15.51's stated reason for a ladder rather than a bisection:
+        // reliability is not guaranteed monotone in the requested rate, because
+        // a rate with a poor divisor fit can fail below a cleaner-fitting higher
+        // one. A decision function that reads only the last two entries turns
+        // that into a ceiling four rungs too low.
+        // The body climbed as far as 3 M, with 1 M failing on the way — the poor
+        // divisor fit §15.51 names. The climb must not have stopped there, and
+        // the bracket must not remember it.
+        let top = P14_LADDER_BODY
+            .iter()
+            .position(|&r| r == 3_000_000)
+            .unwrap();
+        let mut history: Vec<RateTrial> = p14_body_all_passed()[..=top].to_vec();
+        let poor_fit = history
+            .iter_mut()
+            .find(|x| x.requested == 1_000_000)
+            .expect("1 M is a body rung");
+        poor_fit.outcome = RungOutcome::Corrupt;
+        // Nothing above the highest pass has failed, so the climb continues —
+        // the failure *below* 3 M bounds nothing.
+        assert_eq!(p14_next_rate(&history), Some(4_000_000));
+        assert_eq!(p14_ceiling(&history), (Some(3_000_000), None));
+
+        history.push(t(4_000_000, RungOutcome::AdapterRefused));
+        // Now there is a bracket, and it is (3 M, 4 M) — not (1 M, 2 M), which
+        // is what a walk from the end would have produced.
+        assert_eq!(p14_next_rate(&history), Some(3_500_000));
+        assert_eq!(
+            p14_ceiling(&history),
+            (Some(3_000_000), Some(CeilingKind::AdapterRefused)),
+            "the ceiling is the highest rate that passed, over the whole history"
+        );
+
+        // Bisection, and it stops at the budget rather than at a converged
+        // bracket — four midpoints on a quantized axis is where precision stops
+        // being bought.
+        for expected in [3_500_000u32, 3_250_000, 3_125_000, 3_062_500] {
+            let next = p14_next_rate(&history).expect("refinement stopped early");
+            assert_eq!(next, expected);
+            history.push(t(next, RungOutcome::AdapterRefused));
+        }
+        assert_eq!(
+            history
+                .iter()
+                .filter(|x| !p14_is_ladder_rate(x.requested))
+                .count() as u32,
+            P14_MAX_REFINEMENTS
+        );
+        assert_eq!(
+            p14_next_rate(&history),
+            None,
+            "refinement must stop at P14_MAX_REFINEMENTS midpoints"
+        );
+        assert_eq!(
+            p14_ceiling(&history),
+            (Some(3_000_000), Some(CeilingKind::AdapterRefused))
+        );
+    }
+
+    #[test]
+    fn p14_refinement_stops_when_the_bracket_can_hold_no_new_rate() {
+        // A bracket one apart has no interior. Without this the loop proposes
+        // the floor forever, which the budget would eventually stop — but by
+        // then the report carries four rungs that measured nothing.
+        let history = vec![
+            t(115_200, RungOutcome::Passed),
+            t(115_201, RungOutcome::Corrupt),
+        ];
+        assert_eq!(p14_next_rate(&history), None);
+        assert_eq!(
+            p14_ceiling(&history),
+            (Some(115_200), Some(CeilingKind::UnreliableCorrupt))
+        );
+    }
+
+    #[test]
+    fn p14_separates_a_stall_from_a_loss_and_an_ask_from_a_wire() {
+        // Four ceilings that must never be spelled the same way. `corrupt` and
+        // `timed_out` are §6's deadline discipline — a stall and a loss are
+        // different facts. `adapter-refused` and `platform-refused` are §15.47's
+        // — one is the silicon, the other is the ask.
+        for (outcome, kind) in [
+            (RungOutcome::Corrupt, CeilingKind::UnreliableCorrupt),
+            (RungOutcome::TimedOut, CeilingKind::UnreliableTimedOut),
+            (RungOutcome::AdapterRefused, CeilingKind::AdapterRefused),
+            (RungOutcome::PlatformRefused, CeilingKind::PlatformRefused),
+            (RungOutcome::HungUp, CeilingKind::HungUp),
+        ] {
+            let history = vec![t(115_200, RungOutcome::Passed), t(230_400, outcome)];
+            assert_eq!(
+                p14_ceiling(&history),
+                (Some(115_200), Some(kind)),
+                "{} must fold to {}",
+                outcome.label(),
+                kind.label()
+            );
+        }
+        let labels: std::collections::BTreeSet<&str> = [
+            CeilingKind::UnreliableCorrupt,
+            CeilingKind::UnreliableTimedOut,
+            CeilingKind::AdapterRefused,
+            CeilingKind::PlatformRefused,
+            CeilingKind::HungUp,
+            CeilingKind::StructuralCap,
+        ]
+        .iter()
+        .map(|k| k.label())
+        .collect();
+        assert_eq!(labels.len(), 6, "two ceiling kinds share a spelling");
+    }
+
+    #[test]
+    fn p14_a_darwin_ask_ceiling_is_a_fact_about_the_ask_and_never_about_the_wire() {
+        // The shape plan §18 item 11 names: a `platform-refused` at 230400,
+        // which is the rate Darwin's *named* termios constants stop at. This is
+        // the one ceiling kind whose consequence must not be readable as a
+        // statement about the cable — the same cable answers a higher number on
+        // a kernel that will ask for it, which is exactly what this tree's
+        // cross-kernel record is for (§7).
+        //
+        // It is a constructed-history test rather than a platform assertion on
+        // purpose: serial2 reaches Darwin's rate through IOSSIOSPEED rather than
+        // through the named constants, so hard-coding 230400 as a Darwin cap
+        // would print a platform fact this instrument never measured (§9's proxy
+        // in space).
+        let history = vec![
+            t(115_200, RungOutcome::Passed),
+            t(230_400, RungOutcome::PlatformRefused),
+        ];
+        let (max, kind) = p14_ceiling(&history);
+        assert_eq!(
+            (max, kind),
+            (Some(115_200), Some(CeilingKind::PlatformRefused))
+        );
+        let facts = P14Facts {
+            max_reliable_baud: max,
+            ceiling_kind: kind,
+            ..p14_good()
+        };
+        let (status, why) = p14_verdict(facts);
+        assert!(matches!(status, Status::Supported), "{}", status.label());
+        assert!(
+            why.contains("platform's ask surface"),
+            "the consequence must name the surface that refused: {why}"
+        );
+        assert!(
+            why.contains("**not** about the wire"),
+            "the consequence must deny the wire reading explicitly: {why}"
+        );
+        assert!(
+            why.contains("a different kernel may ask for more over the same cable"),
+            "the consequence must say what would change the answer: {why}"
+        );
+    }
+
+    #[test]
+    fn p14_reports_the_number_and_never_grades_it() {
+        // §15.51: `supported` whenever the measurement completes, whatever the
+        // number — a rig that tops out at 115200 is slow, not broken. The two
+        // ends of the plausible range must differ in *prose* and agree in
+        // *status*, which is the property a grading verdict breaks.
+        let slow = P14Facts {
+            max_reliable_baud: Some(115_200),
+            ..p14_good()
+        };
+        let fast = P14Facts {
+            max_reliable_baud: Some(12_000_000),
+            ..p14_good()
+        };
+        let (s_slow, why_slow) = p14_verdict(slow);
+        let (s_fast, why_fast) = p14_verdict(fast);
+        assert!(matches!(s_slow, Status::Supported), "{}", s_slow.label());
+        assert!(matches!(s_fast, Status::Supported), "{}", s_fast.label());
+        assert!(why_slow.contains("115200"), "{why_slow}");
+        assert!(why_fast.contains("12000000"), "{why_fast}");
+        assert_ne!(why_slow, why_fast, "the number must reach the prose");
+        // And the bound the report owes the reader travels with the number.
+        for why in [&why_slow, &why_fast] {
+            assert!(
+                why.contains("floor over the probed set"),
+                "the consequence must bound what the number licenses: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn p14_degrades_only_where_the_question_could_not_be_asked_and_never_reports_unsupported() {
+        // Skips first: not opted in, no rig, or a rig with no clock. The last is
+        // the software null modem, and it must skip rather than answer — every
+        // rate "passes" on a pts, which would print a confident wire number with
+        // no wire.
+        let cases: [(P14Facts, &str); 3] = [
+            (
+                P14Facts {
+                    ports_named: false,
+                    ..p14_good()
+                },
+                "no --port named",
+            ),
+            (
+                P14Facts {
+                    pair_present: false,
+                    ..p14_good()
+                },
+                "no verified cross-paired rig",
+            ),
+            (
+                P14Facts {
+                    both_uart: false,
+                    ..p14_good()
+                },
+                P5_UNCHARACTERIZED,
+            ),
+        ];
+        for (facts, reason) in cases {
+            let (status, _) = p14_verdict(facts);
+            match status {
+                Status::Skipped { reason: r } => assert_eq!(r, reason),
+                other => panic!("expected skipped({reason}), got {}", other.label()),
+            }
+        }
+
+        // Degrades: the question could not be asked, or the search left no
+        // answer, or the rig was not put back.
+        let degrades: [(P14Facts, &str); 4] = [
+            (
+                P14Facts {
+                    baseline_ok: false,
+                    ..p14_good()
+                },
+                "rate ladder did not round-trip",
+            ),
+            (
+                P14Facts {
+                    max_reliable_baud: None,
+                    ..p14_good()
+                },
+                "did not complete",
+            ),
+            (
+                // The truncated search. **The absence of a reason is not a
+                // fifth reason**: without this arm an incomplete search prints
+                // the most impressive answer in the taxonomy by default.
+                P14Facts {
+                    ceiling_kind: None,
+                    ..p14_good()
+                },
+                "did not complete",
+            ),
+            (
+                P14Facts {
+                    baseline_reproved: false,
+                    ..p14_good()
+                },
+                "not returned to its baseline rate",
+            ),
+        ];
+        for (facts, needle) in degrades {
+            let (status, why) = p14_verdict(facts);
+            assert!(
+                matches!(status, Status::Degraded),
+                "expected degraded, got {} — {why}",
+                status.label()
+            );
+            assert!(why.contains(needle), "{why}");
+        }
+
+        // And no input reaches `unsupported`. That word means a design premise
+        // is contradicted with no fallback, it is a live gate
+        // (`expectations/*.jq` require `.summary.unsupported == 0`), and no
+        // answer P14 can produce qualifies: a slow rig is slow.
+        for ports_named in [false, true] {
+            for pair_present in [false, true] {
+                for both_uart in [false, true] {
+                    for baseline_ok in [false, true] {
+                        for max in [None, Some(9_600u32), Some(P14_MAX_BAUD)] {
+                            for kind in [None, Some(CeilingKind::StructuralCap)] {
+                                for restored in [false, true] {
+                                    let f = P14Facts {
+                                        ports_named,
+                                        pair_present,
+                                        both_uart,
+                                        baseline_ok,
+                                        max_reliable_baud: max,
+                                        ceiling_kind: kind,
+                                        baseline_restored: restored,
+                                        baseline_reproved: restored,
+                                    };
+                                    assert!(
+                                        !p14_verdict(f).0.is_unsupported(),
+                                        "P14 reported unsupported for {f:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn p14_payload_is_constant_airtime_until_the_cap_binds_and_never_aliases() {
+        // The reliability bar must be the same at 9600 as at 3 Mbaud, or a
+        // higher rung is judged on a shorter test than a lower one and the
+        // ceiling is an artefact of the payload size.
+        for baud in [9_600u32, 115_200, 921_600, 2_000_000] {
+            let len = p14_payload_len(baud);
+            let airtime_ms = (len as u64 * P14_BITS_PER_BYTE * 1000) / baud as u64;
+            assert!(
+                airtime_ms.abs_diff(P14_AIRTIME_MS) <= 2,
+                "{baud} baud sizes {len} bytes = {airtime_ms} ms, not {P14_AIRTIME_MS} ms"
+            );
+        }
+        // Below the floor and above the cap the airtime is *not* constant, and
+        // that is deliberate and bounded — stated here so a later reader does
+        // not repair a property this test never claimed.
+        assert_eq!(p14_payload_len(1), P14_PAYLOAD_FLOOR);
+        assert_eq!(p14_payload_len(P14_MAX_BAUD), P14_PAYLOAD_CAP);
+
+        // A payload must not be satisfiable by the previous trial's leftovers:
+        // the rate, the direction and the trial index all reach the bytes.
+        let a = p14_payload(115_200, "AB", 0, 256);
+        assert_ne!(a, p14_payload(115_200, "AB", 1, 256), "trial index");
+        assert_ne!(a, p14_payload(115_200, "BA", 0, 256), "direction");
+        assert_ne!(a, p14_payload(230_400, "AB", 0, 256), "rate");
+        assert_eq!(a.len(), 256);
+    }
+
+    #[test]
+    fn p14_reads_the_refusing_surface_off_the_error_rather_than_its_message() {
+        // serial2 collapses a rejected `tcsetattr` and its own post-set
+        // verification into one `Err`. Only the first carries an errno, and that
+        // — not the crate's error string, which is not a contract — is what
+        // separates "the platform refused the ask" from "the adapter landed
+        // elsewhere". Measured on the crossover rig 2026-08-05: asking an FT232R
+        // for 4000000 on Linux 7.0.0-29 succeeds at the syscall and reads back
+        // **9600**, so the errno arm never fires there and the adapter arm is
+        // the one that must be right.
+        let syscall = std::io::Error::from_raw_os_error(libc::EINVAL);
+        assert_eq!(p14_refusal(&syscall), RungOutcome::PlatformRefused);
+        let verification = std::io::Error::other("failed to apply some or all settings");
+        assert_eq!(p14_refusal(&verification), RungOutcome::AdapterRefused);
     }
 }

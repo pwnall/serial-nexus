@@ -834,6 +834,40 @@ pub type EdgeInboxTx = mpsc::Sender<mpsc::Receiver<Chunk>>;
 /// draining the previous edge's tail.
 pub(crate) const EDGE_INBOX_CAP: usize = 4;
 
+/// What the teardown ledger needs to know about one queued item: how many bytes it
+/// would have delivered had the node lived.
+///
+/// A trait rather than a `Chunk`-only queue because not every §5-targetward queue in
+/// this daemon carries a bare `Chunk`. The leg's wire-fed targetward queue carries
+/// the per-chunk provenance tag 37-LEG-1 put on it (`Inbound { epoch, bytes }`), and
+/// §5's obligation is about the **bytes**, not about the envelope they ride in. One
+/// generic mechanism is what stops a second, hand-written drain growing beside this
+/// one the moment a queue's item type differs — which is exactly the re-derivation
+/// class §16.1 exists to forbid.
+pub(crate) trait TeardownBytes {
+    /// Bytes this queued item represents.
+    fn teardown_bytes(&self) -> u64;
+}
+
+impl TeardownBytes for Chunk {
+    fn teardown_bytes(&self) -> u64 {
+        self.len() as u64
+    }
+}
+
+/// The one thing [`TeardownLoss`] needs from an inbox, so it can hold queues of
+/// different item types in one list.
+///
+/// A node is not obliged to have a single item type — a `faces = target` leg watches
+/// `Inbound`-carrying queues while every other adopter watches `Chunk`-carrying ones
+/// — and the alternative to erasing the type here is one `TeardownLoss` field per
+/// item type on every node that has more than one, which is the same rule written
+/// twice.
+pub(crate) trait TeardownDrain {
+    /// Take the queue away and count everything that will never be delivered.
+    fn drain_and_count(&self) -> u64;
+}
+
 /// A host-facing endpoint's targetward receiver, held where the **node** can still
 /// reach it after handing it to a pump (§5, notes §3.31).
 ///
@@ -866,47 +900,143 @@ pub(crate) const EDGE_INBOX_CAP: usize = 4;
 /// Taking the receiver away is also how a pump is stopped *gracefully*: once the slot
 /// is empty [`Self::recv`] answers `None`, so the pump's `while let` ends by itself
 /// instead of being cut mid-flight.
-#[derive(Clone)]
-pub(crate) struct TargetwardInbox {
-    slot: Rc<CriticalCell<Option<mpsc::Receiver<Chunk>>>>,
+///
+/// **Why the queue never leaves the slot, not even for a purge.** §6's one sanctioned
+/// targetward drop — purge-on-reconnect (§7.1 serial, §7.4 leg) — is a *bounded
+/// rounds* drain that yields between rounds, and [`Self::purge_to_quiescence`] runs
+/// every round through `slot.with_mut` rather than lending the receiver out to a
+/// helper that would hold it across those yields. Lending is the shape that reads
+/// most naturally and it is wrong here: a `remove-node` landing on one of those
+/// yields would find an empty slot, charge `0`, abort the task, and the chunks a
+/// suspended sender had just pushed would die exactly the way notes §3.31's original
+/// defect killed them. The whole point of this type is that the node can reach the
+/// queue at the instant the operator asks, and a lend is a window in which it cannot.
+pub(crate) struct TargetwardInbox<T = Chunk> {
+    slot: Rc<CriticalCell<Option<mpsc::Receiver<T>>>>,
     /// Length of the chunk the pump currently has in its hands — taken out of the
     /// queue but not yet delivered or charged.
     ///
-    /// Cleared at the top of every [`Self::recv`], which is the one place a pump can
-    /// be in only when the previous chunk's fate is settled. A teardown that lands
-    /// while a chunk is mid-flight therefore still counts it, and the only inaccuracy
-    /// is the sliver between a successful delivery and the next `recv` — where this
-    /// over-reports by one chunk. That direction is deliberate and matches the
-    /// codec's residual rule: err toward reporting loss, never toward hiding it.
+    /// Cleared by [`Self::settle_held`], which every receive path calls at the one
+    /// place a pump can be in only when the previous chunk's fate is settled. A
+    /// teardown that lands while a chunk is mid-flight therefore still counts it, and
+    /// the only inaccuracy is the sliver between a successful delivery and the next
+    /// receive — where this over-reports by one chunk. That direction is deliberate
+    /// and matches the codec's residual rule: err toward reporting loss, never toward
+    /// hiding it.
     held: Rc<Cell<u64>>,
 }
 
-impl TargetwardInbox {
-    pub(crate) fn new(rx: mpsc::Receiver<Chunk>) -> Self {
+// Hand-written rather than `#[derive(Clone)]`: the derive would demand `T: Clone`,
+// which no queued item needs to be — everything this type shares is behind an `Rc`.
+impl<T> Clone for TargetwardInbox<T> {
+    fn clone(&self) -> Self {
+        TargetwardInbox {
+            slot: self.slot.clone(),
+            held: self.held.clone(),
+        }
+    }
+}
+
+impl<T: TeardownBytes> TargetwardInbox<T> {
+    pub(crate) fn new(rx: mpsc::Receiver<T>) -> Self {
         TargetwardInbox {
             slot: Rc::new(CriticalCell::new(Some(rx))),
             held: Rc::new(Cell::new(0)),
         }
     }
 
-    /// The pump's receive. `None` means the endpoint is finished — either its senders
-    /// are all gone, or [`Self::drain_and_count`] took the queue away at teardown.
-    pub(crate) async fn recv(&self) -> Option<Chunk> {
-        // The previous chunk has been dealt with by definition: a pump only reaches
-        // its next `recv` after disposing of the last one.
+    /// Declare that whatever this inbox last handed out has reached its fate, so a
+    /// teardown from here on must not charge it again.
+    ///
+    /// Separate from the receive itself because a **multiplexer** — the leg's
+    /// `next_send`, which round-robins one write half over N channel queues — settles
+    /// the previous chunk before polling *any* of its inboxes, not before polling the
+    /// one that produced it. Folding this into [`Self::poll_recv`] would leave the
+    /// producing inbox's `held` set for as long as its siblings kept the write half
+    /// busy, and the over-report would then be unbounded in time rather than the
+    /// one-chunk sliver above.
+    pub(crate) fn settle_held(&self) {
         self.held.set(0);
-        let chunk = std::future::poll_fn(|cx| {
-            self.slot.with_mut(|slot| match slot {
-                Some(rx) => rx.poll_recv(cx),
-                None => std::task::Poll::Ready(None),
-            })
-        })
-        .await;
-        self.held
-            .set(chunk.as_ref().map_or(0, |c| c.len() as u64) as u64);
-        chunk
     }
 
+    /// The pump's poll-side receive, for a caller that multiplexes several inboxes in
+    /// one `poll_fn` (the leg). Callers that await a single inbox want [`Self::recv`],
+    /// which settles the previous chunk for them.
+    ///
+    /// `Ready(None)` means the endpoint is finished — either its senders are all gone,
+    /// or [`TeardownDrain::drain_and_count`] took the queue away at teardown.
+    pub(crate) fn poll_recv(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<T>> {
+        // The borrow is taken and released inside this synchronous closure, so it
+        // cannot span an `.await` however the caller drives us (invariant 1 / §16.2).
+        let polled = self.slot.with_mut(|slot| match slot {
+            Some(rx) => rx.poll_recv(cx),
+            None => std::task::Poll::Ready(None),
+        });
+        if let std::task::Poll::Ready(Some(item)) = &polled {
+            self.held.set(item.teardown_bytes());
+        }
+        polled
+    }
+
+    /// The pump's receive. `None` means the endpoint is finished — either its senders
+    /// are all gone, or [`TeardownDrain::drain_and_count`] took the queue away at
+    /// teardown.
+    pub(crate) async fn recv(&self) -> Option<T> {
+        // The previous chunk has been dealt with by definition: a pump only reaches
+        // its next `recv` after disposing of the last one.
+        self.settle_held();
+        std::future::poll_fn(|cx| self.poll_recv(cx)).await
+    }
+
+    /// Drain to quiescence and return the bytes drained — §6's one **sanctioned**
+    /// targetward drop, purge-on-reconnect (§7.1 serial, §7.4 leg). The caller charges
+    /// the result to its own `purged_on_reconnect`; this counts nothing itself,
+    /// because these bytes are dropped on purpose and are not teardown loss.
+    ///
+    /// The rounds exist for the case a single `try_recv` pass misses, stated once in
+    /// [`PURGE_ROUNDS`]: an origin suspended *inside* `tx.send(chunk).await` behind the
+    /// full channel is holding one already-read outage-era chunk (§5) that only lands
+    /// after the caller yields, and firing it into a just-reopened — likely
+    /// power-cycled — device is the whole failure §6 forbids. So: drain, `yield_now`
+    /// to let every freed-permit sender resolve, drain again, bounded.
+    ///
+    /// Termination is by *whether an item was drained*, never by a byte-count delta: a
+    /// round that drains only zero-length chunks still made progress and must yield, or
+    /// a backpressured non-empty chunk queued behind those empties would be stranded.
+    /// The caller runs this while its boundary is quiescent (no reader/writer armed),
+    /// so nothing reaches the device during the drain.
+    pub(crate) async fn purge_to_quiescence(&self) -> u64 {
+        let mut purged = 0u64;
+        for _ in 0..PURGE_ROUNDS {
+            // One synchronous pass *through the slot* — see the type's doc for why the
+            // receiver is never lent out across the yield below.
+            let (bytes, drained_any) = self.slot.with_mut(|slot| {
+                let Some(rx) = slot.as_mut() else {
+                    return (0u64, false);
+                };
+                let mut bytes = 0u64;
+                let mut drained_any = false;
+                // `try_recv` errs on both Empty and Disconnected; a closed channel is
+                // the caller's next problem, not this drain's.
+                while let Ok(item) = rx.try_recv() {
+                    bytes += item.teardown_bytes();
+                    drained_any = true;
+                }
+                (bytes, drained_any)
+            });
+            purged += bytes;
+            if !drained_any {
+                // Nothing drained this pass: no origin was blocked behind the channel,
+                // so the pipeline is quiescent.
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        purged
+    }
+}
+
+impl<T: TeardownBytes> TeardownDrain for TargetwardInbox<T> {
     /// Take the queue away and count everything that will never be delivered: what is
     /// still buffered, plus the chunk the pump is holding.
     ///
@@ -918,21 +1048,33 @@ impl TargetwardInbox {
     /// than double-charging. `signal_stop` is called twice on the removal path
     /// (`teardown` re-runs it), which makes that a correctness requirement and not a
     /// nicety.
-    pub(crate) fn drain_and_count(&self) -> u64 {
+    fn drain_and_count(&self) -> u64 {
         let queued = self.slot.with_mut(|slot| {
             let mut rx = match slot.take() {
                 Some(rx) => rx,
                 None => return 0,
             };
             let mut bytes = 0u64;
-            while let Ok(chunk) = rx.try_recv() {
-                bytes += chunk.len() as u64;
+            while let Ok(item) = rx.try_recv() {
+                bytes += item.teardown_bytes();
             }
             bytes
         });
         queued + self.held.replace(0)
     }
 }
+
+/// How many drain+yield rounds [`TargetwardInbox::purge_to_quiescence`] runs at most.
+/// Bounded so a continuously-producing origin cannot hold the purge open
+/// indefinitely; three is ample for the finite in-flight set (one chunk per suspended
+/// sender).
+///
+/// This is the *only* statement of that policy in the daemon. It used to live in
+/// `boundary.rs` as `drain_to_quiescence(&mut Receiver<Chunk>)`, taking the receiver
+/// by exclusive reference; that form is gone rather than kept beside this one, because
+/// two spellings of one purge rule is the re-derivation class §16.1 forbids and is what
+/// notes §3.31 predicted when it scheduled this work (notes §3.55).
+const PURGE_ROUNDS: usize = 3;
 
 /// Every targetward queue one node owns, and the tally of what its teardown
 /// destroyed (§5, notes §3.31).
@@ -948,16 +1090,25 @@ impl TargetwardInbox {
 /// an emptied inbox answers `None` — so the abort is a backstop, not the mechanism.
 #[derive(Default)]
 pub(crate) struct TeardownLoss {
-    inboxes: Vec<TargetwardInbox>,
+    inboxes: Vec<Box<dyn TeardownDrain>>,
     bytes: Cell<u64>,
 }
 
 impl TeardownLoss {
     /// Wrap a targetward receiver on its way into a pump, keeping the node's handle
     /// on it. The returned inbox is what the pump receives from.
-    pub(crate) fn watch(&mut self, rx: mpsc::Receiver<Chunk>) -> TargetwardInbox {
+    ///
+    /// **Watching is what charges the queue**, which is why a node with a queue that
+    /// is *not* §5-targetward builds its inbox with [`TargetwardInbox::new`] instead:
+    /// a `faces = target` leg's per-channel relay carries hostward device data, whose
+    /// loss class is drop-and-count at the consuming boundary, and charging it here
+    /// would report hostward loss under a targetward name.
+    pub(crate) fn watch<T: TeardownBytes + 'static>(
+        &mut self,
+        rx: mpsc::Receiver<T>,
+    ) -> TargetwardInbox<T> {
         let inbox = TargetwardInbox::new(rx);
-        self.inboxes.push(inbox.clone());
+        self.inboxes.push(Box::new(inbox.clone()));
         inbox
     }
 
@@ -965,11 +1116,7 @@ impl TeardownLoss {
     /// the queues are empty afterwards, which matters because the removal path calls
     /// `signal_stop` twice (`teardown` re-runs it).
     pub(crate) fn drain(&self) {
-        let lost: u64 = self
-            .inboxes
-            .iter()
-            .map(TargetwardInbox::drain_and_count)
-            .sum();
+        let lost: u64 = self.inboxes.iter().map(|i| i.drain_and_count()).sum();
         if lost > 0 {
             self.bytes.set(self.bytes.get().saturating_add(lost));
         }
@@ -1730,6 +1877,127 @@ pub async fn write_all(fd: RawFd, mut data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- purge drain-to-quiescence (§6's one sanctioned targetward drop) --------
+    //
+    // XC-PURGE-1's three guards. They were written against `nodes/serial.rs`, moved to
+    // `boundary::drain_to_quiescence` when the loop became a shared helper, and moved
+    // here with it when the helper became `TargetwardInbox::purge_to_quiescence` so the
+    // purge and the §15.50 teardown ledger could share one queue (notes §3.55). The
+    // rule they pin has not changed across any of those moves, which is the point of
+    // moving them rather than rewriting them.
+
+    /// The drain must also collect a chunk an origin is blocked mid-`send` behind the
+    /// full channel — otherwise it fires into the reopened device on the first
+    /// post-reconnect `recv`. The count must stay exact.
+    #[test]
+    fn purge_to_quiescence_drains_a_backpressured_in_flight_chunk() {
+        // A current-thread runtime + LocalSet mirrors the daemon (single-threaded,
+        // cooperative): a producer blocked in `send().await` resolves only when the
+        // drain yields, which is exactly what the purge must do.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            // A capacity-2 channel, filled so a third send backpressures.
+            let (tx, rx) = mpsc::channel::<Chunk>(2);
+            let inbox = TargetwardInbox::new(rx);
+            tx.send(Chunk::copy_from_slice(b"AAA")).await.unwrap(); // 3 bytes
+            tx.send(Chunk::copy_from_slice(b"BBBB")).await.unwrap(); // 4 bytes
+            // A backpressured origin: suspended inside `send().await` holding one
+            // already-read, outage-era chunk (§5). Keep `tx` alive so the channel
+            // stays connected, as real origins persist across a reopen.
+            let tx2 = tx.clone();
+            let producer = tokio::task::spawn_local(async move {
+                tx2.send(Chunk::copy_from_slice(b"CCCCC")).await.unwrap(); // 5 bytes
+            });
+            tokio::task::yield_now().await; // let the producer reach its blocked send
+            assert!(!producer.is_finished(), "producer must be blocked in send");
+
+            let purged = inbox.purge_to_quiescence().await;
+
+            // The blocked send resolved and was drained+counted — not left to fire
+            // into the reopened device — and the count is exact.
+            assert!(producer.is_finished(), "blocked send must have resolved");
+            assert_eq!(purged, 3 + 4 + 5);
+            // Nothing outage-era remains for the writer to send. Read through the
+            // teardown ledger's own drain, which also pins the two against each other:
+            // a purge that left bytes behind would have a later teardown charge them as
+            // destroyed, and §5's counters would name one loss twice under two words.
+            assert_eq!(inbox.drain_and_count(), 0);
+            drop(tx);
+        });
+    }
+
+    /// Empty-chunk guard: the loop must terminate on whether a chunk was *drained*,
+    /// not on a byte-count delta — otherwise a round that drains only zero-length
+    /// chunks reads as "no progress", breaks without yielding, and strands a
+    /// backpressured non-empty chunk queued behind the empties (which then fires into
+    /// the reopened device).
+    #[test]
+    fn purge_to_quiescence_drains_past_empty_chunks() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (tx, rx) = mpsc::channel::<Chunk>(2);
+            let inbox = TargetwardInbox::new(rx);
+            tx.send(Chunk::new()).await.unwrap(); // 0 bytes
+            tx.send(Chunk::new()).await.unwrap(); // 0 bytes — now full
+            let tx2 = tx.clone();
+            let producer = tokio::task::spawn_local(async move {
+                tx2.send(Chunk::copy_from_slice(b"CCCCC")).await.unwrap(); // 5 bytes
+            });
+            tokio::task::yield_now().await;
+            assert!(!producer.is_finished(), "producer must be blocked in send");
+
+            let purged = inbox.purge_to_quiescence().await;
+
+            // The non-empty chunk behind the two empties resolved and was drained —
+            // not stranded to fire into the reopened device — and only its 5 bytes
+            // count (the empties contribute 0).
+            assert!(
+                producer.is_finished(),
+                "the send behind the empty chunks must have resolved"
+            );
+            assert_eq!(purged, 5);
+            assert_eq!(inbox.drain_and_count(), 0);
+            drop(tx);
+        });
+    }
+
+    #[tokio::test]
+    async fn purge_to_quiescence_on_an_empty_channel_purges_nothing() {
+        let (tx, rx) = mpsc::channel::<Chunk>(4);
+        let inbox = TargetwardInbox::new(rx);
+        assert_eq!(inbox.purge_to_quiescence().await, 0);
+        drop(tx);
+        // A disconnected channel is quiescent too, not an error.
+        assert_eq!(inbox.purge_to_quiescence().await, 0);
+    }
+
+    /// The purge and the teardown ledger share one queue, and the purge must leave it
+    /// *reachable* — the property that made the drain run through the slot rather than
+    /// borrow the receiver out of it (§15.50, notes §3.55).
+    ///
+    /// Fail-first for the shape this replaced: a `purge_to_quiescence` that did
+    /// `slot.take()`, awaited the drain and restored afterwards would answer `0` here,
+    /// because the take is what a concurrent `drain_and_count` would find.
+    #[tokio::test]
+    async fn a_purge_leaves_the_queue_where_a_teardown_can_still_count_it() {
+        let (tx, rx) = mpsc::channel::<Chunk>(4);
+        let inbox = TargetwardInbox::new(rx);
+        tx.send(Chunk::copy_from_slice(b"outage-era"))
+            .await
+            .unwrap();
+        assert_eq!(inbox.purge_to_quiescence().await, 10);
+        // Post-purge arrivals are *not* outage-era, so they are backlog the node still
+        // owes — and a teardown now must charge them rather than drop them.
+        tx.send(Chunk::copy_from_slice(b"fresh")).await.unwrap();
+        assert_eq!(inbox.drain_and_count(), 5);
+    }
 
     // --- fragmentation boundary (invariant 3's single shared helper) ------------
 
