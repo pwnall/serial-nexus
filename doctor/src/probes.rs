@@ -2047,17 +2047,37 @@ fn is_unsupported_errno(e: &anyhow::Error) -> bool {
 const P9_TIMEOUTS_MS: [u16; 4] = [0, 1, 5, 10];
 const P9_SAMPLES: usize = 16;
 
-/// Samples per reference shape, matched to P2's count so sample size is not one of
+/// Samples per reference cell, matched to P2's count so sample size is not one of
 /// the variables. See [`ZeroTimeoutRefs`].
 const P9_REF_SAMPLES: usize = 4096;
+
+/// The masks every reference cell is taken at, at both fd states.
+///
+/// **The empty mask is the point of this table.** A `poll` that requests
+/// *nothing* still receives POLLHUP on a hung-up fd, which is what makes "the mask
+/// is not a factor" a measurement rather than a citation of POSIX — and citing
+/// POSIX is exactly what §7 forbids when the observation is this cheap to take.
+/// The cell can see it because `serial_nexus_sys::poll_blocking` returns `revents`
+/// unmasked; a wrapper that intersected them with the requested `events` would
+/// have made this table vacuous, and [`an_unrequested_hangup_is_still_delivered`]
+/// is the guard that keeps it from becoming so.
+///
+/// The empty cell is also a **within-group order control**. It runs last at each
+/// fd state, so a monotone warmup would make it the cheapest cell in its group;
+/// notes §3.45 excluded warmup across probes, and this excludes it within one.
+const P9_REF_MASKS: [(&str, PollFlags); 3] = [
+    ("pollin", PollFlags::POLLIN),
+    ("pollhup", PollFlags::POLLHUP),
+    ("empty_mask", PollFlags::empty()),
+];
 
 /// What one requested timeout actually cost. Sampled in **nanoseconds** and
 /// reported in microseconds, plus `median_ns`: the 0 ms row is the cost of
 /// asking, which is sub-microsecond and would diff as a constant `0 µs` on every
 /// kernel — a number that cannot differ is not worth printing (P2 reports its
 /// zero-timeout poll in ns for the same reason).
-/// The 2x2 that decomposes "the cost of a zero-timeout poll" — a phrase two probes
-/// use for numbers that differ by an order of magnitude on one kernel.
+/// The **1x2** that decomposes "the cost of a zero-timeout poll" — a phrase two
+/// probes use for numbers that differ by an order of magnitude on one kernel.
 ///
 /// P2 reports `zero_timeout_poll_ns_median` and P9 reports `median_ns_for_0ms_request`,
 /// and they are **not the same measurement**: P2's fd is *hung up* and its mask is
@@ -2069,44 +2089,171 @@ const P9_REF_SAMPLES: usize = 4096;
 /// outlier nor a cold-start artifact, and sample count does not explain it either
 /// (n=16 and n=4096 medians agree on Linux).
 ///
-/// An order-of-magnitude disagreement between two probes naming the same operation
-/// is either a kernel property or an instrument error, and nothing in the set could
-/// tell which. So P9 reproduces P2's shape itself, in one pty, on one clock, varying
-/// one thing at a time. The next capture decomposes the gap instead of posing it.
+/// **This was built as a 2x2 and it is a 1x2, because the mask cannot vary
+/// anything.** POSIX delivers POLLHUP in `revents` whether or not it was requested,
+/// so at a fixed fd state both mask cells observe one kernel state. The 2026-08-05
+/// Darwin triple shows it: across fd state 7.46-10.12x, across mask 0.968-1.314x
+/// with the sign flipping between runs (notes §3.45 B). The isolated variable is
+/// **ready versus not-ready**, and "fd state" names how this probe *achieves* that
+/// rather than an independently confirmed cause.
 ///
-/// **Cost** is four times [`P9_REF_SAMPLES`] zero-timeout polls — microseconds on a
-/// kernel where the poll is cheap, and bounded by the very number being measured on
-/// one where it is not (~0.4 s at Darwin's captured 22 µs, the worst case).
+/// The mask cells stay, and a third — [`P9_REF_MASKS`]'s empty one — joins them,
+/// because "the mask does not matter" is a **result**, not a reason to stop
+/// measuring. Publishing it as a measured control is also the only form of it that
+/// survives a kernel which disagrees: a citation of POSIX would not (§7).
+///
+/// Two replica cells sit alongside, and they are why this probe no longer has to
+/// *name* the P2/P9 instrument offset: they reproduce P2's helper here, on one
+/// clock, varying the wrapper and then `O_NONBLOCK` one at a time.
+///
+/// **Cost** is six times [`P9_REF_SAMPLES`] zero-timeout polls plus two replica
+/// cells of the same size — a few milliseconds on a kernel where the poll is cheap,
+/// and bounded by the very number being measured on one where it is not (~0.4 s at
+/// Darwin's captured 16-22 µs unready cells, the worst case).
 struct ZeroTimeoutRefs {
-    /// P9's own shape at P2's sample count: slave open, POLLIN, never ready.
-    unready_pollin_ns: u64,
-    /// Isolates the mask with the fd state held unready.
-    unready_pollhup_ns: u64,
-    /// Isolates the fd state with the mask held at POLLIN.
-    ready_pollin_ns: u64,
-    /// **P2's shape verbatim**: hung-up master, POLLHUP, ready every pass.
-    ready_pollhup_ns: u64,
-    /// The contamination detector again, at the reference sample count.
-    ready_passes_on_unready_fd: u64,
+    /// Every cell, in execution order: the unready group, then the hung-up group.
+    cells: Vec<ZeroCell>,
+    /// **P2's instrument on P9's own fd.** The local [`hup`] helper — a `nix`
+    /// `PollFd` over a `BorrowedFd` with `nix`-typed `revents` parsing — on the same
+    /// hung-up `O_NONBLOCK` master the `ready_hungup_master_pollhup_ns` cell used.
+    /// Exactly one thing differs between the two numbers: the wrapper. That is the
+    /// residual notes §3.45 B could only name.
+    p2_instrument_same_fd_ns: u64,
+    /// The same helper on a fresh hung-up **blocking** master carrying the baseline
+    /// termios — P2's shape. Against the line above it isolates `O_NONBLOCK`, and
+    /// against `P2.zero_timeout_poll_ns_median` the only remaining differences are
+    /// the moment in the process at which it was taken and P2's `?` where this
+    /// collapses the `Result`.
+    p2_instrument_blocking_fd_ns: u64,
+    /// The contamination detector for the replica cells: a hung-up master must
+    /// report HUP on every pass, or they measured something else.
+    p2_instrument_ready_passes: u64,
 }
 
-/// Median nanoseconds for [`P9_REF_SAMPLES`] zero-timeout polls, and how many
-/// reported an event. Uses the shipped `poll_blocking` wrapper for the reason
-/// [`p9_poll_granularity`] gives: a difference the wrapper introduces is as real
-/// as one the kernel does.
-fn p9_zero_median(fd: RawFd, interest: PollFlags) -> (u64, u64) {
+/// One reference cell: [`P9_REF_SAMPLES`] zero-timeout polls at one fd state and one
+/// requested mask, plus what those polls actually saw.
+///
+/// `revents_seen` is the union across the cell, not a sample. It is what turns the
+/// mask from an asserted non-factor into a measured one: the `empty_mask` cell on a
+/// hung-up master reads `POLLHUP` here having requested nothing.
+struct ZeroCell {
+    /// `unready` or `ready_hungup`.
+    state: &'static str,
+    /// A key from [`P9_REF_MASKS`].
+    mask: &'static str,
+    median_ns: u64,
+    ready_passes: u64,
+    revents_seen: PollFlags,
+}
+
+impl ZeroCell {
+    /// The observation key this cell publishes under. **The four names this produces
+    /// for the POLLIN/POLLHUP cells are byte-identical to the ones the 2026-08-05
+    /// triples carry**, which is the whole reason the cells are named by formula
+    /// rather than restructured into a nested object (§16.13).
+    fn key(&self) -> String {
+        format!("{}_master_{}_ns", self.state, self.mask)
+    }
+}
+
+impl ZeroTimeoutRefs {
+    fn median(&self, state: &str, mask: &str) -> u64 {
+        self.cells
+            .iter()
+            .find(|c| c.state == state && c.mask == mask)
+            .map_or(0, |c| c.median_ns)
+    }
+
+    fn medians(&self, state: &str) -> Vec<u64> {
+        self.cells
+            .iter()
+            .filter(|c| c.state == state)
+            .map(|c| c.median_ns)
+            .collect()
+    }
+
+    fn keys(&self, state: &str) -> Vec<String> {
+        self.cells
+            .iter()
+            .filter(|c| c.state == state)
+            .map(ZeroCell::key)
+            .collect()
+    }
+
+    /// Passes on the *unready* group that reported an event. Must be 0 or the unready
+    /// cells measured a ready fd — the same detector the single-cell version carried,
+    /// summed over the group.
+    fn ready_passes_on_unready_fd(&self) -> u64 {
+        self.cells
+            .iter()
+            .filter(|c| c.state == "unready")
+            .map(|c| c.ready_passes)
+            .sum()
+    }
+}
+
+/// One [`ZeroCell`]: [`P9_REF_SAMPLES`] zero-timeout polls through the shipped
+/// `poll_blocking` wrapper, for the reason [`p9_poll_granularity`] gives — a
+/// difference the wrapper introduces is as real as one the kernel does.
+///
+/// `revents_seen` accumulates unconditionally rather than only on ready passes, so a
+/// cell that saw a bit once still reports it.
+fn p9_zero_cell(
+    fd: RawFd,
+    state: &'static str,
+    mask: &'static str,
+    interest: PollFlags,
+) -> ZeroCell {
     let mut samples = Vec::with_capacity(P9_REF_SAMPLES);
-    let mut ready = 0u64;
+    let mut ready_passes = 0u64;
+    let mut revents_seen = PollFlags::empty();
     for _ in 0..P9_REF_SAMPLES {
         let start = Instant::now();
         let revents = sys::poll_blocking(fd, interest, 0);
         samples.push(start.elapsed().as_nanos() as u64);
+        revents_seen |= revents;
         if !revents.is_empty() {
+            ready_passes += 1;
+        }
+    }
+    samples.sort_unstable();
+    ZeroCell {
+        state,
+        mask,
+        median_ns: samples[samples.len() / 2],
+        ready_passes,
+        revents_seen,
+    }
+}
+
+/// [`p9_zero_cell`]'s counterpart through **P2's instrument** — the local [`hup`]
+/// helper — so the offset between the two probes is measured here instead of argued
+/// about across them.
+///
+/// One difference against P2 remains and is not measurable from inside P9: P2's loop
+/// propagates the `Result` with `?` where this one collapses it with `unwrap_or`.
+/// Both branch on a `Result` per pass; neither allocates.
+fn p9_p2_instrument_median(master: &PtyMaster) -> (u64, u64) {
+    let mut samples = Vec::with_capacity(P9_REF_SAMPLES);
+    let mut ready = 0u64;
+    for _ in 0..P9_REF_SAMPLES {
+        let start = Instant::now();
+        let hungup = hup(master).unwrap_or(false);
+        samples.push(start.elapsed().as_nanos() as u64);
+        if hungup {
             ready += 1;
         }
     }
     samples.sort_unstable();
     (samples[samples.len() / 2], ready)
+}
+
+/// A ratio of two nanosecond medians in hundredths. Integer on purpose: a frozen
+/// artifact (§16.13) must not carry a float whose last digits diff as noise. A zero
+/// denominator reads 0 rather than panicking — an unmeasurable cell must not take
+/// the report down.
+fn ratio_x100(num: u64, den: u64) -> u64 {
+    num.saturating_mul(100).checked_div(den).unwrap_or(0)
 }
 
 struct Granularity {
@@ -2180,25 +2327,91 @@ pub fn p9_poll_granularity() -> Probe {
                 .observe("median_us_for_1ms_request", one_ms)
                 .observe("median_ns_for_0ms_request", zero)
                 .observe("ready_passes_total", contaminated);
-            // The 2x2 that decomposes the phrase "zero-timeout poll", which P2 and P9
+            // The 1x2 that decomposes the phrase "zero-timeout poll", which P2 and P9
             // both use for numbers that differ 8-11x on Darwin and agree on Linux.
-            p = p.observe(
-                "zero_timeout_by_fd_state_and_mask",
-                serde_json::json!({
-                    "samples_each": P9_REF_SAMPLES,
-                    "unready_master_pollin_ns": refs.unready_pollin_ns,
-                    "unready_master_pollhup_ns": refs.unready_pollhup_ns,
-                    "ready_hungup_master_pollin_ns": refs.ready_pollin_ns,
-                    "ready_hungup_master_pollhup_ns": refs.ready_pollhup_ns,
-                    "p2_reports_the_shape": "ready_hungup_master_pollhup_ns",
-                    "the_data_plane_parks_on": "unready_master_pollin_ns",
-                    "ready_passes_on_unready_fd": refs.ready_passes_on_unready_fd,
-                }),
-            );
+            // Built as a 2x2 and published as a 1x2: the mask cannot vary anything
+            // (see `ZeroTimeoutRefs`), so it is reported as a control. The four cell
+            // keys the 2026-08-05 triples carry are produced verbatim by
+            // `ZeroCell::key`; only the parent key changed.
+            let not_ready = refs.medians("unready");
+            let ready = refs.medians("ready_hungup");
+            let nr_min = not_ready.iter().copied().min().unwrap_or(0);
+            let nr_max = not_ready.iter().copied().max().unwrap_or(0);
+            let rd_min = ready.iter().copied().min().unwrap_or(0);
+            let rd_max = ready.iter().copied().max().unwrap_or(0);
+            let mut cells = serde_json::Map::new();
+            for c in &refs.cells {
+                let stem = c.key();
+                let stem = stem.trim_end_matches("_ns").to_owned();
+                cells.insert(c.key(), serde_json::json!(c.median_ns));
+                cells.insert(
+                    format!("{stem}_revents"),
+                    serde_json::json!(revents_label(c.revents_seen)),
+                );
+                cells.insert(
+                    format!("{stem}_ready_passes"),
+                    serde_json::json!(c.ready_passes),
+                );
+            }
+            let hangup_unrequested = refs
+                .cells
+                .iter()
+                .find(|c| c.state == "ready_hungup" && c.mask == "empty_mask")
+                .is_some_and(|c| {
+                    c.revents_seen.contains(PollFlags::POLLHUP)
+                        && c.ready_passes as usize == P9_REF_SAMPLES
+                });
+            let mut zero_by_state = serde_json::json!({
+                "shape": "1x2",
+                "isolated_variable": "ready-vs-not-ready",
+                "samples_each": P9_REF_SAMPLES,
+                "not_ready_cells": refs.keys("unready"),
+                "ready_cells": refs.keys("ready_hungup"),
+                "worst_case_separation_x100": ratio_x100(nr_min, rd_max),
+                // The mask is reported and is NOT a level of a factor. Kept because
+                // "it does not matter" is a result; published as a control because
+                // presenting it as an axis is what notes §3.45 B caught.
+                "mask_is_a_control_not_a_factor":
+                    "POSIX delivers POLLHUP in revents whether or not it was requested, so at a \
+                     fixed fd state every mask cell observes one kernel state and they are \
+                     replicates rather than levels. The empty-mask cell measures that instead of \
+                     citing it, and it runs last in each group, so it doubles as a within-group \
+                     warmup control.",
+                "hangup_delivered_to_a_mask_that_requested_nothing": hangup_unrequested,
+                "mask_spread_not_ready_x100": ratio_x100(nr_max, nr_min),
+                "mask_spread_ready_x100": ratio_x100(rd_max, rd_min),
+                // The P2/P9 offset, measured rather than named (notes §3.45 B named it).
+                "p2_instrument_same_fd_ns": refs.p2_instrument_same_fd_ns,
+                "p2_instrument_blocking_fd_ns": refs.p2_instrument_blocking_fd_ns,
+                "p2_instrument_ready_passes": refs.p2_instrument_ready_passes,
+                "wrapper_offset_x100": ratio_x100(
+                    refs.p2_instrument_same_fd_ns,
+                    refs.median("ready_hungup", "pollhup"),
+                ),
+                "nonblocking_offset_x100": ratio_x100(
+                    refs.p2_instrument_blocking_fd_ns,
+                    refs.p2_instrument_same_fd_ns,
+                ),
+                "headline_over_matched_cell_x100": ratio_x100(
+                    zero,
+                    refs.median("unready", "pollin"),
+                ),
+                "p2_reports_the_shape": "ready_hungup_master_pollhup_ns",
+                "p2_instrument_verbatim_is": "p2_instrument_blocking_fd_ns",
+                "headline_offset_is": "sample count and warmup only: median_ns_for_0ms_request is \
+                     n=16 taken cold, unready_master_pollin_ns is n=4096 on the same fd, same \
+                     mask, same wrapper",
+                "the_data_plane_parks_on": "unready_master_pollin_ns",
+                "ready_passes_on_unready_fd": refs.ready_passes_on_unready_fd(),
+            });
+            if let Some(obj) = zero_by_state.as_object_mut() {
+                obj.extend(cells);
+            }
+            p = p.observe("zero_timeout_by_fd_state", zero_by_state);
             p.verdict(
                 Status::Supported,
                 &format!(
-                    "A zero timeout costs {zero} ns median (the cost of asking) and a requested 1 ms costs {one_ms} µs median on this kernel — that is the floor §15.19's hybrid data plane was built around and the floor poll_ready's idle backoff steps against. 16 samples per timeout: enough to see the floor, not enough to characterize a tail. Diff these against the production kernel (6.18) before tuning any backoff step or timer against them.{}",
+                    "A zero timeout costs {zero} ns median (the cost of asking) and a requested 1 ms costs {one_ms} µs median on this kernel — that is the floor §15.19's hybrid data plane was built around and the floor poll_ready's idle backoff steps against. 16 samples per timeout: enough to see the floor, not enough to characterize a tail. `zero_timeout_by_fd_state` is a **1x2**, not a 2x2: the isolated variable is ready-versus-not-ready, and the mask cells are replicates, because a poll that requests nothing still receives POLLHUP (`hangup_delivered_to_a_mask_that_requested_nothing` says so on this kernel rather than citing POSIX). Read `worst_case_separation_x100` against `mask_spread_*_x100`: the finding survives only where the first exceeds the second. `median_ns_for_0ms_request` above is n=16 taken cold and is NOT comparable to P2's headline — `p2_instrument_blocking_fd_ns` is, and `wrapper_offset_x100` / `nonblocking_offset_x100` say how much of any residual is this probe's instrument rather than the kernel's. Diff these against the production kernel (6.18) before tuning any backoff step or timer against them.{}",
                     if contaminated > 0 {
                         format!(" NOTE: {contaminated} pass(es) returned early because the fd reported an event, so those samples measure readiness rather than the timeout — treat the affected rows as suspect.")
                     } else {
@@ -2251,25 +2464,48 @@ fn p9_inner() -> anyhow::Result<(Vec<Granularity>, ZeroTimeoutRefs)> {
             ready_passes,
         });
     }
-    // The reference 2x2, after the timeout rows so the slave is still open for
-    // them: a hung-up master returns instantly from every poll, which would
-    // measure nothing. Unready cells first, then the same two masks once the
-    // session is gone.
-    let (unready_pollin_ns, ready_passes_on_unready_fd) = p9_zero_median(fd, PollFlags::POLLIN);
-    let (unready_pollhup_ns, _) = p9_zero_median(fd, PollFlags::POLLHUP);
+    // The reference cells, after the timeout rows so the slave is still open for
+    // them: a hung-up master returns instantly from every poll, which would measure
+    // nothing. Unready group first, then the same masks once the session is gone —
+    // the fd state is the variable, and it moves exactly once here.
+    let mut cells = Vec::with_capacity(P9_REF_MASKS.len() * 2);
+    for (mask, interest) in P9_REF_MASKS {
+        cells.push(p9_zero_cell(fd, "unready", mask, interest));
+    }
     drop(slave);
     std::thread::sleep(PTY_SETTLE);
-    let (ready_pollin_ns, _) = p9_zero_median(fd, PollFlags::POLLIN);
-    let (ready_pollhup_ns, _) = p9_zero_median(fd, PollFlags::POLLHUP);
+    for (mask, interest) in P9_REF_MASKS {
+        cells.push(p9_zero_cell(fd, "ready_hungup", mask, interest));
+    }
+
+    // P2's instrument, twice, one variable at a time. First on **this** fd, which is
+    // `O_NONBLOCK`: against `ready_hungup_master_pollhup_ns` the only thing that
+    // differs is the wrapper.
+    let (p2_instrument_same_fd_ns, p2_instrument_ready_passes) = p9_p2_instrument_median(&master);
+    // Then on a fresh **blocking** master, which is P2's shape. A second pair is the
+    // only way to vary the file-status flag without disturbing the cells above, and
+    // it is cheap: one pty and one hangup.
+    let blocking = new_master()?;
+    let blocking_pts = sys::ptsname(&blocking)?;
+    apply_pty_baseline(&blocking, &blocking_pts)?;
+    {
+        let primed = open(
+            blocking_pts.as_str(),
+            OFlag::O_RDWR | OFlag::O_NOCTTY,
+            Mode::empty(),
+        )?;
+        drop(primed);
+    }
+    std::thread::sleep(PTY_SETTLE);
+    let (p2_instrument_blocking_fd_ns, _) = p9_p2_instrument_median(&blocking);
 
     Ok((
         rows,
         ZeroTimeoutRefs {
-            unready_pollin_ns,
-            unready_pollhup_ns,
-            ready_pollin_ns,
-            ready_pollhup_ns,
-            ready_passes_on_unready_fd,
+            cells,
+            p2_instrument_same_fd_ns,
+            p2_instrument_blocking_fd_ns,
+            p2_instrument_ready_passes,
         },
     ))
 }
@@ -2286,12 +2522,39 @@ fn p9_inner() -> anyhow::Result<(Vec<Granularity>, ZeroTimeoutRefs)> {
 const P10_CHUNK: usize = 4096;
 const P10_CEILING: u64 = 4 * 1024 * 1024;
 
-/// The recheck's partial drain (notes §3.44): how many bytes to hand back to the
-/// peer before asking the kernel for room again. Smaller than the smallest depth
-/// either kernel of record has ever reported (Darwin's 1022 is the floor), so the
-/// drain never empties the queue and the top-up measures *republished* room rather
-/// than a fresh fill.
-const P10_RECHECK_DRAIN: u64 = 512;
+/// The recheck's **drain ladder** (notes §3.52). Each rung refills the pair from
+/// empty, hands back exactly this many bytes, and asks the kernel for room again one
+/// byte at a time.
+///
+/// **One drain size is one bit of resolution, and 2026-08-05 proved it.** Under the
+/// model "writable iff occupancy < T, then accept up to capacity C", draining D from
+/// a full queue leaves occupancy C−D and the top-up accepts D iff `T > C−D`. Darwin's
+/// C is 1024/1022 and D was a hardcoded 512, so the single rung excluded only
+/// `T <= 512` and every larger threshold predicted the number that was observed. A
+/// ladder brackets T instead of assuming it: a rung that tops up puts a floor under
+/// T, a rung that refuses puts a ceiling on it.
+///
+/// **512 is first and must stay first.** It sees the pair in exactly the state the
+/// single-rung recheck saw — same call sequence, same history — so the flat
+/// `recheck` fields a committed artifact carries are still produced by the same
+/// experiment and stay diffable (§16.13). Everything after it runs against a pair
+/// with more fill/drain history, which is why each rung publishes its **own** refill
+/// and every bound is stated against that rather than a global capacity.
+///
+/// **1 is the sharp end.** Any watermark strictly below capacity predicts
+/// `topped_up == 0` after a one-byte drain, so this rung is the only one that can
+/// close the band to `T ∈ (C−1, C]` — and `T = C` *is* the capacity model, so there
+/// is nothing left below it to exclude.
+const P10_RECHECK_DRAINS: [u64; 4] = [512, 1, 128, 900];
+
+/// The rung the flat `recheck` fields are defined as. Named rather than spelled,
+/// because those fields' meaning is "the {`P10_RECHECK_DRAIN`}-byte rung" and a
+/// reader must be able to follow that from the constant to the ladder.
+///
+/// Smaller than the smallest depth either kernel of record has ever reported
+/// (Darwin's 1022 is the floor), so this rung's drain never empties the queue and
+/// its top-up measures *republished* room rather than a fresh fill.
+const P10_RECHECK_DRAIN: u64 = P10_RECHECK_DRAINS[0];
 
 /// The recheck's top-up is byte-granular — the whole point is the exact blocking
 /// point, not a 4096-quantized one — so it needs its own, much smaller backstop:
@@ -2324,22 +2587,190 @@ const P10_SETTLE: Duration = PTY_SETTLE;
 /// and it hands back *more* room than was freed because the pipeline advanced
 /// during the settle. Read a Darwin `room_republished_minus_room_freed` of 0
 /// against that, not against zero expectation.
+/// One rung of [`p10_recheck`]'s ladder.
 #[derive(Default)]
-struct Recheck {
+struct Rung {
+    /// What this rung asked its drain for. `None` is the **from-empty** rung: drain
+    /// everything, so the top-up starts at occupancy 0.
+    ///
+    /// That rung exists because the single-rung recheck could not produce it, and the
+    /// gap was structural rather than a matter of sample size: the top-up always
+    /// began at occupancy C−512 and never at 0, so a reservation charged at the
+    /// empty→nonempty transition was invisible **by construction** and the falsifier
+    /// attached to `room_republished_minus_room_freed` could not fire on that shape
+    /// at all. Here the transition is inside the measured number. It carries a second
+    /// finding for free: this rung fills byte-granularly where
+    /// `refilled_from_empty_bytes` fills in 4 KiB chunks, so the two together say
+    /// whether write size changes the accounting.
+    drain_requested: Option<u64>,
     /// What the same pair accepts when refilled from empty. Equal to `total()` on a
-    /// kernel whose bound is a fixed queue capacity; **not** equal on one whose
-    /// bound is a snapshot of asynchronous work.
+    /// kernel whose bound is a fixed queue capacity; **not** equal on one whose bound
+    /// is a snapshot of asynchronous work.
     refilled: u64,
     refill_writes: u64,
     refill_terminal: String,
-    /// What the partial drain actually took back — never assumed to be
-    /// [`P10_RECHECK_DRAIN`], because a kernel shallower than that would give less.
-    drained_again: u64,
+    /// What the drain actually took. Never assumed equal to `drain_requested`: a
+    /// queue shallower than the request gives less, and a cooked pty gives nothing at
+    /// all. A rung whose drain came up short is not the rung that was asked for, and
+    /// [`p10_ladder_reading`] must not read a bound out of it.
+    drained: u64,
     /// What the kernel then accepted, one byte at a time.
     topped_up: u64,
     topup_writes: u64,
     topup_terminal: String,
     topup_ceiling_hit: bool,
+}
+
+impl Rung {
+    /// The occupancy the top-up started from — this rung's own refill less its own
+    /// drain. Every watermark bound is stated against this and never against a global
+    /// capacity: on a kernel whose depth moves rung to rung (Linux measures 9728,
+    /// 11776 and 13824 refills within one ladder) the two are not the same number,
+    /// and using the wrong one would silently shift the bracket.
+    fn occupancy_after_drain(&self) -> i64 {
+        self.refilled as i64 - self.drained as i64
+    }
+
+    fn topped_up_minus_drained(&self) -> i64 {
+        self.topped_up as i64 - self.drained as i64
+    }
+
+    /// Does this rung constrain a watermark? Only a rung that asked for a partial
+    /// drain **and** actually got bytes back freed room whose republication says
+    /// anything. The from-empty rung is excluded because `T > 0` is vacuous, and a
+    /// zero-byte drain is excluded because it freed nothing — a bound read out of
+    /// either would be a verdict computed from a loop that never executed (§9), which
+    /// is the exact defect notes §3.48 filed against P4.
+    fn carries_a_watermark_bound(&self) -> bool {
+        self.drain_requested.is_some() && self.drained > 0
+    }
+
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "drain_requested_bytes": self.drain_requested,
+            "refilled_from_empty_bytes": self.refilled,
+            "refilled_from_empty_writes": self.refill_writes,
+            "refill_terminal_write": self.refill_terminal,
+            "drained_bytes": self.drained,
+            "drain_came_up_short": self
+                .drain_requested
+                .is_some_and(|d| self.drained < d),
+            "occupancy_after_drain_bytes": self.occupancy_after_drain(),
+            "topped_up_bytes": self.topped_up,
+            "topped_up_writes": self.topup_writes,
+            "topup_terminal_write": self.topup_terminal,
+            "topup_ceiling_hit": self.topup_ceiling_hit,
+            "topped_up_minus_drained": self.topped_up_minus_drained(),
+            "carries_a_watermark_bound": self.carries_a_watermark_bound(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct Recheck {
+    /// [`P10_RECHECK_DRAINS`] in order, then the from-empty rung.
+    rungs: Vec<Rung>,
+}
+
+impl Recheck {
+    /// The rung the flat `recheck` fields publish. `None` only if the ladder did not
+    /// run, which [`p10_ladder_is_a_ladder`] forbids.
+    fn legacy(&self) -> Option<&Rung> {
+        self.rungs
+            .iter()
+            .find(|r| r.drain_requested == Some(P10_RECHECK_DRAIN))
+    }
+}
+
+/// What the ladder **excludes**, stated as a bracket rather than as a verdict.
+///
+/// Model under test: "writable iff occupancy < T, then accept up to capacity". A rung
+/// that topped up proves the kernel called its `occupancy_after_drain` writable, so
+/// `T >` that occupancy; a rung that topped up nothing proves it called it
+/// unwritable, so `T <=` that occupancy. The pure-capacity reading is the special
+/// case `T = capacity`, which is what an empty refusing set leaves standing — and it
+/// leaves it standing only down to the *smallest drain actually probed*, which is why
+/// the ladder's smallest rung is one byte.
+///
+/// **The bounds are model-relative, and on a pipeline kernel `threshold_gt` is not an
+/// occupancy anyone should read on its own.** Where every rung tops up — Linux —
+/// `threshold_gt` is just the largest `refilled − drained` the ladder saw, an
+/// occupancy the top-up demonstrably did *not* meet, because the pipeline moved under
+/// it during the settle. It is a bound within the stated model, not a measurement of
+/// the queue.
+#[derive(Default)]
+struct LadderReading {
+    topping_up: usize,
+    refusing: usize,
+    /// `T >` this. `None` when no rung topped up, in which case nothing here is a
+    /// bound and the ladder met a kernel that refused every rung.
+    threshold_gt: Option<i64>,
+    /// `T <=` this. `None` when no rung refused: **no hysteresis was observed at any
+    /// drain size this ladder probed**, which is a bounded statement and not "there is
+    /// no watermark".
+    threshold_le: Option<i64>,
+    /// The common `drained − topped_up` shortfall, when every bound-carrying rung
+    /// shows the same positive one. That is the signature of a reservation charged per
+    /// fill episode, and it is a shape a single rung cannot display: at one drain size
+    /// a constant shortfall and a smaller capacity are the same number.
+    uniform_shortfall: Option<i64>,
+    /// How many rungs the two bounds were computed from. Exported so a reader can see
+    /// that a bracket came from rungs that ran, rather than having to trust it.
+    rungs_carrying_a_bound: usize,
+}
+
+impl LadderReading {
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "rungs_carrying_a_bound": self.rungs_carrying_a_bound,
+            "rungs_topping_up": self.topping_up,
+            "rungs_refusing": self.refusing,
+            "watermark_threshold_gt": self.threshold_gt,
+            "watermark_threshold_le": self.threshold_le,
+            "uniform_shortfall_bytes": self.uniform_shortfall,
+            "reading": "T is the watermark in `writable iff occupancy < T, then accept up to \
+                 capacity`. A null `watermark_threshold_le` means no rung refused, so no \
+                 hysteresis was seen at any drain size probed — bounded by the smallest rung, \
+                 not proof of a pure capacity. A null `watermark_threshold_gt` means no rung \
+                 topped up at all. Both are null when no rung freed any bytes, which is what a \
+                 cooked pty does; nothing is inferred from a rung that freed nothing. Where \
+                 `rungs_refusing` is 0 the `_gt` bound is the largest occupancy the ladder \
+                 happened to reach and NOT an occupancy the kernel was observed to accept a \
+                 write at — on a pipeline kernel it moved under the top-up.",
+        })
+    }
+}
+
+/// Fold the ladder into its bracket. Pure, so it is tested against synthetic rungs
+/// rather than against whatever kernel the test box happens to be (§9).
+fn p10_ladder_reading(rungs: &[Rung]) -> LadderReading {
+    let bounded: Vec<&Rung> = rungs
+        .iter()
+        .filter(|r| r.carries_a_watermark_bound())
+        .collect();
+    let mut out = LadderReading {
+        rungs_carrying_a_bound: bounded.len(),
+        ..LadderReading::default()
+    };
+    for r in &bounded {
+        let occ = r.occupancy_after_drain();
+        if r.topped_up > 0 {
+            out.topping_up += 1;
+            out.threshold_gt = Some(out.threshold_gt.map_or(occ, |m: i64| m.max(occ)));
+        } else {
+            out.refusing += 1;
+            out.threshold_le = Some(out.threshold_le.map_or(occ, |m: i64| m.min(occ)));
+        }
+    }
+    let shortfalls: Vec<i64> = bounded
+        .iter()
+        .map(|r| -r.topped_up_minus_drained())
+        .collect();
+    out.uniform_shortfall = match shortfalls.first() {
+        Some(&first) if first > 0 && shortfalls.iter().all(|&s| s == first) => Some(first),
+        _ => None,
+    };
+    out
 }
 
 /// What a `FIONREAD` reading is worth once a drain has said what was really there.
@@ -2521,6 +2952,14 @@ impl FillResult {
     }
 
     fn observations(&self) -> serde_json::Value {
+        // The flat `recheck` fields below are **the 512-byte rung** and nothing else.
+        // Unchanged in name, in value and in production order, because that rung runs
+        // first and sees the pair state the single-rung recheck saw — so a diff
+        // against the 2026-08-05 triples still compares one experiment to the same
+        // experiment (§16.13). Everything the ladder adds is a sibling.
+        let fallback = Rung::default();
+        let legacy = self.recheck.legacy().unwrap_or(&fallback);
+        let reading = p10_ladder_reading(&self.recheck.rungs);
         serde_json::json!({
             "bytes_accepted_before_eagain": self.bytes,
             "writes": self.writes,
@@ -2543,24 +2982,33 @@ impl FillResult {
             "bytes_recovered_by_peer": self.recovered,
             "bytes_unrecoverable": self.total().saturating_sub(self.recovered),
             "recheck": {
-                "refilled_from_empty_bytes": self.recheck.refilled,
-                "refilled_from_empty_writes": self.recheck.refill_writes,
-                "refill_terminal_write": self.recheck.refill_terminal,
-                "refill_reproduced_total": self.recheck.refilled == self.total(),
-                "drained_again_bytes": self.recheck.drained_again,
-                "topped_up_bytes": self.recheck.topped_up,
-                "topped_up_writes": self.recheck.topup_writes,
-                "topup_terminal_write": self.recheck.topup_terminal,
+                "refilled_from_empty_bytes": legacy.refilled,
+                "refilled_from_empty_writes": legacy.refill_writes,
+                "refill_terminal_write": legacy.refill_terminal,
+                "refill_reproduced_total": legacy.refilled == self.total(),
+                "drained_again_bytes": legacy.drained,
+                "topped_up_bytes": legacy.topped_up,
+                "topped_up_writes": legacy.topup_writes,
+                "topup_terminal_write": legacy.topup_terminal,
                 "topup_chunk_bytes": 1,
                 "topup_ceiling_bytes": P10_RECHECK_CEILING,
-                "topup_ceiling_hit": self.recheck.topup_ceiling_hit,
-                // The field the Darwin question turns on. Zero means the kernel
-                // republished exactly the room the reader freed, which is what a
-                // fixed queue capacity does; a negative number means a reservation
-                // is being charged per fill; Linux reads positive, because its
-                // asynchronous pipeline advanced during the settle.
-                "room_republished_minus_room_freed":
-                    self.recheck.topped_up as i64 - self.recheck.drained_again as i64,
+                "topup_ceiling_hit": legacy.topup_ceiling_hit,
+                // Zero means the kernel republished exactly the room the reader
+                // freed; positive means an asynchronous pipeline advanced during the
+                // settle; negative means a reservation. **At one drain size this
+                // field cannot tell a capacity from a watermark above that size, and
+                // cannot see a reservation charged at the empty→nonempty transition
+                // at all** — that is what the ladder below is for, and this field is
+                // now a summary of one rung rather than the answer.
+                "room_republished_minus_room_freed": legacy.topped_up_minus_drained(),
+                "flat_fields_are_the_rung_draining": P10_RECHECK_DRAIN,
+                "ladder": self
+                    .recheck
+                    .rungs
+                    .iter()
+                    .map(Rung::observations)
+                    .collect::<Vec<_>>(),
+                "ladder_reading": reading.observations(),
             },
         })
     }
@@ -2620,7 +3068,7 @@ pub fn p10_pty_buffer_depth() -> Probe {
             p.verdict(
                 status,
                 &format!(
-                    "This kernel's pty accepted {} byte(s) slave→master (**targetward** — a client typing, travelling toward the device, first pass ending in `{}`) and {} byte(s) master→slave (**hostward** — the node delivering device output to its client, ending in `{}`), reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. **Of those, {} and {} byte(s) were actually recoverable by the peer** ({} / {}): acceptance is not delivery, and the two are the same number only on a kernel that queues everything it takes. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands, so a one-chunk difference across kernels is noise; only an order-of-magnitude one is signal, **and only between runs whose `slave_termios_mode` agrees** — a cooked pty and a raw one give different depths on one kernel (measured on Linux 7.0.0-29: raw ~13.8 KiB fully recoverable, cooked ~23.5 KiB with nothing recoverable), so a mode mismatch explains a gap before any kernel difference does. The `recheck` block under each direction asks the second question the first cannot: after the peer is drained, the pair is refilled from empty and then handed back 512 bytes, and `room_republished_minus_room_freed` says whether the kernel gave back exactly the room a reader freed (a fixed queue capacity), or more (an asynchronous pipeline that advanced during the settle — Linux 7.0.0-29 reads +2048 or +9216, bimodal, never 0 across 20 samples), or less (a reservation charged per fill). `refill_reproduced_total` says whether the depth above is reproducible on the same pair at all; on Linux it usually is not. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}{}{}",
+                    "This kernel's pty accepted {} byte(s) slave→master (**targetward** — a client typing, travelling toward the device, first pass ending in `{}`) and {} byte(s) master→slave (**hostward** — the node delivering device output to its client, ending in `{}`), reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. **Of those, {} and {} byte(s) were actually recoverable by the peer** ({} / {}): acceptance is not delivery, and the two are the same number only on a kernel that queues everything it takes. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands, so a one-chunk difference across kernels is noise; only an order-of-magnitude one is signal, **and only between runs whose `slave_termios_mode` agrees** — a cooked pty and a raw one give different depths on one kernel (measured on Linux 7.0.0-29: raw ~13.8 KiB fully recoverable, cooked ~23.5 KiB with nothing recoverable), so a mode mismatch explains a gap before any kernel difference does. The `recheck` block under each direction asks the second question the first cannot, at four drain sizes rather than one: after the peer is drained the pair is refilled from empty and handed back 512, 1, 128 and 900 bytes in turn, and then once from empty entirely. `ladder_reading.watermark_threshold_gt` and `_le` bracket the watermark in \"writable iff occupancy < T, then accept up to capacity\" — a rung that tops up floors T at its `occupancy_after_drain`, a rung that refuses caps it there. A null `_le` means no rung refused, which bounds T below capacity only down to the smallest rung probed and is **not** proof of a pure capacity; read `_gt` on such a run as the largest occupancy the ladder reached rather than as one the kernel accepted a write at, because on a pipeline kernel it moved under the top-up. `uniform_shortfall_bytes` names a reservation charged per fill episode; the from-empty rung (`drain_requested_bytes: null`) is the one whose top-up starts at occupancy 0, so a reservation charged at the empty→nonempty transition lands inside its number instead of behind it, and comparing its `topped_up_bytes` against the 4 KiB-chunked `refilled_from_empty_bytes` on the same rung says whether write size changes the accounting. The flat fields beside the ladder are the 512-byte rung alone, kept so older reports still diff, and `room_republished_minus_room_freed` there says whether the kernel gave back exactly the room a reader freed (a fixed queue capacity), or more (an asynchronous pipeline that advanced during the settle — Linux 7.0.0-29 reads +2048 or +9216, bimodal, never 0 across 20 samples), or less. `refill_reproduced_total` says whether the depth above is reproducible on the same pair at all; on Linux it usually is not. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}{}{}",
                     targetward.bytes,
                     targetward.terminal,
                     hostward.bytes,
@@ -2800,25 +3248,48 @@ fn p10_drain_at_most(peer: RawFd, cap: u64) -> u64 {
     recovered
 }
 
-/// See [`Recheck`]. **Precondition: the peer is already drained** — the refill
-/// measures a fill from empty, and starting it against a full queue would report 0
-/// and say nothing.
+/// See [`Recheck`]. **Precondition: the peer is already drained** — every rung's
+/// refill measures a fill from empty, and starting one against a full queue would
+/// report 0 and say nothing.
+///
+/// Rungs run in [`P10_RECHECK_DRAINS`] order, then the from-empty rung. Each leaves
+/// the peer empty, so the next rung's refill is a refill from empty and not from
+/// whatever the last one left behind.
 fn p10_recheck(write_to: RawFd, peer: RawFd) -> Recheck {
+    let mut rungs = Vec::with_capacity(P10_RECHECK_DRAINS.len() + 1);
+    for drain in P10_RECHECK_DRAINS {
+        rungs.push(p10_recheck_rung(write_to, peer, Some(drain)));
+    }
+    rungs.push(p10_recheck_rung(write_to, peer, None));
+    Recheck { rungs }
+}
+
+/// One rung: refill from empty, hand back `drain_requested` bytes (or everything, for
+/// the from-empty rung), let the tty's asynchronous work run, then write **one byte
+/// at a time** until it blocks.
+///
+/// The call sequence is the single-rung recheck's, unchanged and in the same order —
+/// refill, drain, settle, byte-granular top-up, full drain. It is unchanged on
+/// purpose: the 512 rung runs first and must reproduce the committed artifacts'
+/// `recheck` block exactly, and an extra settle before the drain (which would be
+/// defensible on its own terms) would have moved every one of those numbers.
+fn p10_recheck_rung(write_to: RawFd, peer: RawFd, drain_requested: Option<u64>) -> Rung {
     let (refilled, refill_writes, refill_terminal, _) = p10_fill_pass(write_to, 0);
-    let drained_again = p10_drain_at_most(peer, P10_RECHECK_DRAIN);
-    // The same settle the second pass uses. On a kernel that moves bytes on an
-    // asynchronous work item, room appears only after it runs, so measuring before
-    // it does would report that kernel's scheduling rather than its bookkeeping.
+    let drained = p10_drain_at_most(peer, drain_requested.unwrap_or(P10_CEILING));
+    // The same settle the second fill pass uses. On a kernel that moves bytes on an
+    // asynchronous work item, room appears only after it runs, so measuring before it
+    // does would report that kernel's scheduling rather than its bookkeeping.
     std::thread::sleep(P10_SETTLE);
     let (topped_up, topup_writes, topup_terminal, topup_ceiling_hit) =
         p10_fill_pass_with(write_to, 0, 1, P10_RECHECK_CEILING);
-    // Leave the pair as this function found it.
+    // Leave the pair as this rung found it.
     let _ = p10_drain(peer);
-    Recheck {
+    Rung {
+        drain_requested,
         refilled,
         refill_writes,
         refill_terminal,
-        drained_again,
+        drained,
         topped_up,
         topup_writes,
         topup_terminal,
@@ -5954,6 +6425,10 @@ mod tests {
     /// take the amount it asked for, and the top-up has to find the room that drain
     /// freed. A recheck that ran in the wrong order reports plausible zeros.
     ///
+    /// Asserted against the **512-byte rung**, which is what the flat `recheck` fields
+    /// publish — the same experiment this test guarded before the ladder existed, and
+    /// still the first thing the ladder runs.
+    ///
     /// Deliberately does **not** assert the sign of
     /// `room_republished_minus_room_freed`. Linux measures a positive number and the
     /// Darwin pre-registration in notes §3.44 is 0; pinning either here would make the
@@ -5964,24 +6439,200 @@ mod tests {
     fn p10_recheck_measures_republished_room_rather_than_nothing() {
         let (m, s) = pty_pair_in_mode(true);
         let f = p10_fill(m.as_raw_fd(), s.as_raw_fd(), "raw");
+        let legacy = f
+            .recheck
+            .legacy()
+            .expect("no rung drained P10_RECHECK_DRAIN, so the flat `recheck` fields are zeros");
         assert!(
-            f.recheck.refilled > 0,
+            legacy.refilled > 0,
             "the recheck refilled 0 bytes into a peer that `recovered`'s drain had just \
              emptied — it ran before that drain, or not at all"
         );
-        let expected = f.recheck.refilled.min(P10_RECHECK_DRAIN);
+        let expected = legacy.refilled.min(P10_RECHECK_DRAIN);
         assert_eq!(
-            f.recheck.drained_again, expected,
+            legacy.drained, expected,
             "the recheck's partial drain took {} bytes where {expected} were available \
              to take, so the room it then measures was never freed",
-            f.recheck.drained_again
+            legacy.drained
         );
         assert!(
-            f.recheck.topped_up > 0,
+            legacy.topped_up > 0,
             "{} bytes were handed back to the peer and the kernel then accepted none of \
              them — the top-up pass did not run",
-            f.recheck.drained_again
+            legacy.drained
         );
+    }
+
+    /// **The ladder must be a ladder.** One drain size is one bit of resolution, which
+    /// is the defect this replaced; a ladder that collapses to a single size passes
+    /// every other test in this file while measuring exactly what the single rung did.
+    #[test]
+    fn p10_ladder_is_a_ladder() {
+        let (m, s) = pty_pair_in_mode(true);
+        let f = p10_fill(m.as_raw_fd(), s.as_raw_fd(), "raw");
+        assert_eq!(
+            f.recheck.rungs.len(),
+            P10_RECHECK_DRAINS.len() + 1,
+            "the ladder ran {} rung(s) where {} partial drains plus one from-empty rung \
+             were configured",
+            f.recheck.rungs.len(),
+            P10_RECHECK_DRAINS.len()
+        );
+        assert!(
+            f.recheck.legacy().is_some(),
+            "no rung drained {P10_RECHECK_DRAIN} bytes, so the flat `recheck` fields the \
+             committed artifacts carry are published from a default and every one of them \
+             reads 0"
+        );
+        let drained: std::collections::BTreeSet<u64> = f
+            .recheck
+            .rungs
+            .iter()
+            .filter(|r| r.drain_requested.is_some())
+            .map(|r| r.drained)
+            .collect();
+        assert!(
+            drained.len() >= 2,
+            "the ladder's partial rungs drained {drained:?} — {} distinct size(s), so it has \
+             the single-rung recheck's one bit of resolution and cannot bracket a watermark \
+             at all",
+            drained.len()
+        );
+        assert!(
+            f.recheck.rungs.iter().all(|r| r.refilled > 0),
+            "a rung refilled 0 bytes, so it ran against a peer the previous rung left full \
+             and its drain freed room that was never measured"
+        );
+    }
+
+    /// **A bracket must come from rungs that ran, and must point the right way.** The
+    /// arithmetic is easy to invert and the vacuity is easy to reintroduce, so both are
+    /// pinned against synthetic rungs rather than against whatever kernel this box is —
+    /// the direction of an inequality is not a kernel property and must not be tested
+    /// like one (§9).
+    ///
+    /// The bracket fixture carries **two** topping-up rungs and **two** refusing ones
+    /// on purpose. With one of each, `map_or(occ, max)` and `map_or(occ, min)` are
+    /// indistinguishable and an inverted bound passes — which is exactly how this
+    /// guard's first draft claimed a fail-first proof it did not have.
+    #[test]
+    fn p10_ladder_reading_brackets_the_watermark_and_never_reads_one_from_a_rung_that_froze() {
+        let rung = |drain: Option<u64>, refilled: u64, drained: u64, topped_up: u64| Rung {
+            drain_requested: drain,
+            refilled,
+            drained,
+            topped_up,
+            ..Rung::default()
+        };
+
+        // A watermark at some T with 896 < T <= 1022: the 512 and 128 rungs top up
+        // (occupancy 512 and 896), the 2 and 1 rungs do not (occupancy 1022, 1023).
+        let r = p10_ladder_reading(&[
+            rung(Some(512), 1024, 512, 512),
+            rung(Some(128), 1024, 128, 128),
+            rung(Some(2), 1024, 2, 0),
+            rung(Some(1), 1024, 1, 0),
+        ]);
+        assert_eq!(r.rungs_carrying_a_bound, 4);
+        assert_eq!((r.topping_up, r.refusing), (2, 2));
+        assert_eq!(
+            (r.threshold_gt, r.threshold_le),
+            (Some(896), Some(1022)),
+            "the floor under T is the LARGEST occupancy that topped up and the ceiling is \
+             the SMALLEST that refused; got gt={:?} le={:?}, which is a wider bracket than \
+             the rungs support and would read as 'T > 512' on a kernel that said more",
+            r.threshold_gt,
+            r.threshold_le
+        );
+
+        // A cooked pty: every drain takes nothing, so nothing is bounded. This is the
+        // shape notes §3.48 filed against P4 — a verdict from a loop that never ran.
+        let cooked = p10_ladder_reading(&[
+            rung(Some(512), 24064, 0, 0),
+            rung(Some(1), 24064, 0, 0),
+            rung(None, 24064, 0, 0),
+        ]);
+        assert_eq!(
+            (
+                cooked.rungs_carrying_a_bound,
+                cooked.threshold_gt,
+                cooked.threshold_le,
+                cooked.uniform_shortfall
+            ),
+            (0, None, None, None),
+            "a bracket was read out of rungs whose drains freed 0 bytes"
+        );
+
+        // The from-empty rung carries no watermark information: T > 0 is vacuous.
+        let from_empty_only = p10_ladder_reading(&[rung(None, 1024, 1024, 1024)]);
+        assert_eq!(from_empty_only.rungs_carrying_a_bound, 0);
+
+        // A uniform per-episode reservation is a shape one rung cannot show.
+        let reserved = p10_ladder_reading(&[
+            rung(Some(512), 1024, 512, 508),
+            rung(Some(128), 1024, 128, 124),
+        ]);
+        assert_eq!(reserved.uniform_shortfall, Some(4));
+        assert_eq!(
+            p10_ladder_reading(&[rung(Some(512), 1024, 512, 512)]).uniform_shortfall,
+            None
+        );
+    }
+
+    /// **"The mask does not matter" must be measured, not cited.** A control that
+    /// requests nothing is the only cell that can carry that claim; two cells that both
+    /// request a real bit cannot, which is how a degenerate axis was published as a
+    /// measured one.
+    #[test]
+    fn p9_reference_masks_include_one_that_requests_nothing() {
+        assert!(
+            P9_REF_MASKS.iter().any(|(_, m)| m.is_empty()),
+            "the reference masks are {:?} — with no mask that requests nothing, \
+             `hangup_delivered_to_a_mask_that_requested_nothing` is a citation of POSIX \
+             and not an observation of this kernel",
+            P9_REF_MASKS.map(|(n, _)| n)
+        );
+        let labels: std::collections::BTreeSet<&str> =
+            P9_REF_MASKS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            labels.len(),
+            P9_REF_MASKS.len(),
+            "two reference masks share a label, so their cells collide in the report"
+        );
+    }
+
+    /// The premise the 1x2 rests on, taken as a measurement on whatever kernel runs
+    /// this. `assert_ne!` pins the discrimination itself, so a cell stubbed to a
+    /// constant fails here even if both spellings drift.
+    ///
+    /// It also guards the wrapper: `poll_blocking` returns `revents` unmasked, and a
+    /// wrapper that intersected them with the requested `events` would make the
+    /// empty-mask cell read `none` on a hung-up fd and the whole control vacuous.
+    #[test]
+    fn an_unrequested_hangup_is_still_delivered() {
+        let master = new_master().expect("openpt");
+        let pts = sys::ptsname(&master).expect("ptsname");
+        let fd = master.as_raw_fd();
+        sys::set_nonblocking(fd).expect("nonblocking");
+        let slave =
+            open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty()).expect("slave");
+        std::thread::sleep(PTY_SETTLE);
+        let live = sys::poll_blocking(fd, PollFlags::empty(), 0);
+        drop(slave);
+        std::thread::sleep(PTY_SETTLE);
+        let hungup = sys::poll_blocking(fd, PollFlags::empty(), 0);
+        assert!(
+            live.is_empty(),
+            "a live master answered {} to a poll requesting nothing",
+            revents_label(live)
+        );
+        assert!(
+            hungup.contains(PollFlags::POLLHUP),
+            "a hung-up master answered {} to a poll requesting nothing, so on this kernel \
+             the mask DOES gate the hangup and P9's mask cells are a real axis after all",
+            revents_label(hungup)
+        );
+        assert_ne!(live, hungup);
     }
 
     /// **Acceptance is not delivery, and P10 could not see the difference.**

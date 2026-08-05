@@ -3057,7 +3057,7 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **762 passing, 0 failed, 4 ignored** across 114 test
+The current whole-suite figure is **766 passing, 0 failed, 4 ignored** across 114 test
 targets on Linux (2026-08-05: §3.51's cell-set digest added nine — three in `report.rs`, the four of the new `itest/tests/meta_doctor_artifacts.rs` target, and two in `expectation_gates.rs`; §3.49's three P5 guards plus its `serial_nexus_sys`
 `ICOUNTS_SUPPORTED` guard, added to two existing targets; §3.38's listener-barrier guard, §3.39's orphan-leash fixture and guard, §3.40's two baseline guards, and earlier the same day the three doctor guards of §3.34 and the kernel-naming fix— `termios_mode_tells_the_daemons_baseline_from_a_cooked_pty`,
 `p10_recoverability_separates_a_deep_buffer_from_a_black_hole` and
@@ -5459,7 +5459,7 @@ three shape trials, which on Linux used to be skipped by the early return and no
 the shape trials already ran, so the delta there is the windows alone.
 
 **Gates:** `cargo build --workspace --locked`; `cargo test --workspace --locked --no-fail-fast` —
-**744 → 762 passing / 0 failed / 4 ignored** across 114 test-result targets (measured at the end of the 2026-08-05 run with §3.49's four and §3.51's nine landed alongside), the +5 attributable here being this
+**744 → 766 passing / 0 failed / 4 ignored** across 114 test-result targets (measured at the end of the 2026-08-05 run with §3.49's four and §3.51's nine landed alongside), the +5 attributable here being this
 entry's guards on the existing `serial-nexus-doctor` target (all five run on Linux; three on macOS,
 since one is Linux-gated and one not-macOS-gated, both deliberately); `cargo fmt --all --check`;
 `cargo clippy --workspace --all-targets --locked -- -D warnings`;
@@ -5787,6 +5787,67 @@ and so have an empty field set; it is written here as a genuine boundary pair �
 `["P1.aP2.b"]` against `["P1.a", "P2.b"]`, which concatenate to the same bytes and are separated only
 by the length prefix. (2) The `--field-set` reader in the design carried a malformed push expression;
 it is written plainly.
+
+### 3.52 Two instruments repaired: a discriminator with one bit of resolution, and an axis that could not vary
+
+**Design:** §7 — an instrument that cannot separate two hypotheses must say so, not pick one.
+
+Both defects were introduced by §3.44's own experiments, one day old, and both were found by the
+Darwin capture they were built for. That is the experiments working: a pre-registered prediction
+came back confirmed *and* the confirmation turned out not to carry the inference attached to it.
+
+**A. P10's recheck was sampled at exactly one drain size.** `P10_RECHECK_DRAIN` was a hardcoded 512
+against a Darwin capacity of 1024 targetward / 1022 hostward, so D = C/2 exactly. Any watermark model
+— *writable iff occupancy < T, then accept up to C* — predicts `topped_up == 512` for **every** T >
+512, so the data excluded only T ≤ 512. Worse for the framing, a reservation charged only at the
+empty→nonempty transition is **invisible by construction**, because the top-up always starts from
+occupancy C−512 and never from empty: the pre-registered falsifier "a negative delta means a
+reservation" could not fire on that shape at all. The Darwin answer (`delta: 0`,
+`refill_reproduced_total: true`, 6 of 6) was therefore consistent with a capacity *and* with a whole
+family of watermarks, and §3.45 A said so rather than claiming the capacity.
+
+The recheck now walks a **ladder** of drain sizes — `[512, 1, 128, 900]`, with 512 first so
+`drained_again_bytes` and `topped_up_bytes` keep the meaning the committed artifacts recorded — plus
+a from-empty rung. A rung that *refuses* to top up bounds T from above; a rung that tops up bounds it
+from below; together they bracket a watermark instead of being consistent with all of them.
+
+**The reading is reported with its own limits, which is the point.** On Linux, 5 runs × 2 directions:
+`rungs_topping_up: 4`, `rungs_refusing: 0`, `watermark_threshold_le: null`. The emitted prose says
+what that does and does not mean — no rung refused, so **no hysteresis was seen at any drain size
+probed**, which is bounded by the smallest rung and *not* proof of a pure capacity; and where no rung
+refuses, the `_gt` bound is merely the largest occupancy the ladder happened to reach, **not an
+occupancy the kernel was observed to accept a write at**, because on a pipeline kernel it moved under
+the top-up. Nothing is inferred from a rung that freed nothing.
+
+**Linux is unmoved where it matters:** `room_republished_minus_room_freed` still reads bimodal
++2048 / +9216 and never 0 across 5 runs, and `refill_reproduced_total` is still false most runs.
+
+**B. P9's second axis could not vary.** POSIX delivers `POLLHUP` in `revents` whether or not it was
+requested, so at a fixed fd state every mask cell observes one kernel state: the cells are
+**replicates, not levels**. The 2×2 was a 1×2 wearing a 2×2's name, and the "mask spread" it reported
+(0.968–1.314x, sign-flipping between runs) was noise presented as a measurement.
+
+The observation is renamed `zero_timeout_by_fd_state`, carries `shape: "1x2"` and
+`isolated_variable: "ready-vs-not-ready"`, and **keeps the mask cells** — "the mask does not matter"
+is a result worth publishing. Better, it now *measures* that claim instead of citing the standard:
+an empty-mask cell records `hangup_delivered_to_a_mask_that_requested_nothing`, which reads **true**
+on Linux, and it runs last in each group so it doubles as a within-group warmup control.
+
+**And the residual P2/P9 headline gap is named as instrument, not kernel.**
+`headline_offset_is` states it in the report: `median_ns_for_0ms_request` is n=16 taken cold, while
+`unready_master_pollin_ns` is n=4096 on the same fd, same mask, same wrapper. A `p2_instrument_*`
+cell reproduces P2's shape verbatim inside P9, so the two numbers can be compared without a reader
+having to know they were never the same measurement.
+
+**Both additions move `field_set`, and that is correct** — the report carries more cells than it did,
+which is exactly what §15.44's second digest exists to announce. `probe_set` does not move: the
+questions are unchanged. A diff against the `-05b` Linux or `1a9a8fc` Darwin triples is still lawful
+on every cell those reports carry; the new cells simply have no counterpart there.
+
+**Pre-registered for the next Mac run (§7):** if Darwin's bound really is `TTYHOG`/`t_outq` capacity
+rather than a watermark, at least one ladder rung **refuses** and `watermark_threshold_le` comes back
+non-null, bracketing T against the `_gt` bound. If every rung tops up there as it does on Linux, the
+ladder has not separated the two on Darwin either, and the next step is a rung below 128.
 
 ---
 
