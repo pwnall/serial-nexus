@@ -3050,8 +3050,8 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **732 passing, 0 failed, 4 ignored** across 112 test
-targets on Linux (2026-08-05: the three doctor guards of §3.34 and the kernel-naming fix
+The current whole-suite figure is **737 passing, 0 failed, 4 ignored** across 112 test
+targets on Linux (2026-08-05: §3.38's listener-barrier guard, §3.39's orphan-leash fixture and guard, §3.40's two baseline guards, and earlier the same day the three doctor guards of §3.34 and the kernel-naming fix
 — `termios_mode_tells_the_daemons_baseline_from_a_cooked_pty`,
 `p10_recoverability_separates_a_deep_buffer_from_a_black_hole` and
 `the_os_name_survives_a_box_with_no_os_release_file` — on top of the 729 left by
@@ -4540,6 +4540,66 @@ than merely dying.
 sites outside `Daemon::start`. The five rig tests all go through `Daemon::start`, so the reported
 defect is closed; extending the leash further is a separate follow-up, not a requirement of this
 one.
+
+### 3.40 P6 and P7 measured a pty the daemon does not run — and two diagnoses this tree recorded are refuted
+
+**Design:** §7.2's baseline is the configuration the daemon runs a pty in; §9 forbids a measurement
+that stands in for the property it names.
+
+**Reality.** `apply_pty_baseline` sets the baseline before any slave exists. On a kernel that
+re-initialises pts termios when the momentary slave closes, that set is gone by the time the
+measured session runs, so P6 and P7 sampled whatever discipline the kernel left behind. The repair
+is P10's, applied to the fd that matters: re-assert on the **client's own slave**, which is exactly
+what `nodes/pty.rs` does on its rising presence edge.
+
+**It needed one thing P10 did not: a drain.** P10 counts bytes it writes itself, so its re-assert is
+invisible in its own numbers. P6 and P7 count *whatever is readable on the master*, and on a kernel
+that emits `TIOCPKT_IOCTL` for an EXTPROC `tcsetattr` the re-assert is itself readable. Measured on
+Linux 7.0.0-29: re-asserting **without** the drain moves P7's `a_open_close` from **0 → 1** and
+`c_open_write_close` from **2 → 3** — the probe counting its own footprint as the session's evidence,
+and inverting the one shape the §6 detach-release argument relies on leaving nothing behind. With the
+drain, all three shapes read exactly what they read before the repair (0/1/2), and P6's
+`after_last_close` block is byte-identical to the committed artifact. The footprint is *reported*
+(`baseline_packet_bytes_drained`), so that invariance is auditable in the JSON rather than asserted
+in a comment.
+
+**Two recorded diagnoses are refuted here, and §9 makes that as load-bearing as a confirmation.**
+
+1. **"Darwin's P7 zeros come from the lost baseline, so its `degraded` is false."** That was this
+   session's own working hypothesis and it is **wrong**. Planting the loss on Linux silences the
+   *termios* shape (`b`: 1 → 0) and leaves the *write* shape at 2 — and a fully cooked pair also
+   leaves it at 2, so a written byte is neither EXTPROC- nor ICANON-gated. Darwin reports
+   **`b == 0` and `c == 0`**. A lost discipline cannot produce that. What produces it is the
+   last-close flush P13 measures directly (`waits-then-discards`, `terminal_read: "eof"` in all
+   three P7 shapes). **P7's degrade on Darwin is genuine**, and no termios repair can move it. The
+   probe now says which cause it is looking at, in `silence_cause`.
+
+2. **"P2's `termios_settable_without_slave: false` means Darwin always takes the slave fallback."**
+   Also wrong, and refuted by the committed artifact rather than by argument: P6's
+   `handler_reset_applied: true` *is* `set_baseline(&master).is_ok()`, so `tcsetattr` through the
+   Darwin master succeeds. P2's flag is a conjunction, and its failing conjunct is EXTPROC
+   *retention*, not settability. The probe no longer infers this at all — `baseline_via_master`
+   reports which arm actually ran, and `handler_reset_extproc_retained` separates "the syscall was
+   accepted" from "the flag took", which is what stops `handler_reset_applied: true` sitting beside
+   `handler_reset_readable_bytes: 0` as an unexplained contradiction on Darwin.
+
+**What *is* false is the consequence P7's prose bolted onto its degrade.** It asserted that a
+collapsed termios-only session keeps its write lock "until the node is removed or another writer
+steals it". On the same Darwin box, **P12 reports `supported`** — all three shapes post a
+session-boundary edge, and `pty.rs`'s `SessionLatch` (§15.39) carries detach-release there. The
+sentence describes the pre-`SessionLatch` daemon and has been stale since. Every P7 degrade arm now
+points the reader at P12 instead of asserting a leak P7 cannot see.
+
+**Fail-first.** `arming_the_client_baseline_leaves_no_footprint_on_the_master` fails when the drain
+is removed: *"arming the client baseline left 1 byte(s) readable on the master (0x40)"*.
+`a_silent_write_shape_is_not_a_lost_line_discipline` pins the classifier across all four quadrants
+and asserts the discrimination itself, so a classifier collapsed to one answer fails even though
+every single-valued assertion would still hold.
+
+**Pre-registered for the next Mac run (§7):** P7 stays `degraded` with
+`silence_cause: "hangup-destroys-evidence"`, `extproc_retained_at_shape` reports what Darwin
+actually does with the flag, and `baseline_via_master` reads **true** — not the `false` this
+session assumed. If `baseline_via_master` comes back `false`, refutation 2 above is itself wrong.
 
 ---
 

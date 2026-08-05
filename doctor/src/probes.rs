@@ -310,13 +310,21 @@ fn set_baseline<Fd: AsFd>(fd: &Fd) -> nix::Result<()> {
 /// last close when the hangup itself is what is being measured** — the fallback
 /// opens a slave, which clears the hangup. Use [`set_baseline`] on the master
 /// directly there (that is what `handle_last_close` does).
-fn apply_pty_baseline(master: &PtyMaster, pts: &str) -> anyhow::Result<()> {
+/// Returns **which arm ran**: `true` if the master carried the baseline, `false` if
+/// the momentary-slave fallback was needed. Callers report it, because it is the
+/// measured form of a fact this file used to take from a `cfg` — and because the two
+/// facts it is easily confused with are independent of it and of each other. A master
+/// that accepts the baseline does not imply the pair still carries it when the client
+/// opens (a kernel that re-initialises pts termios at open resets it either way), and
+/// a `tcsetattr` that returns `Ok` does not imply EXTPROC was retained. So: report
+/// this, key nothing on it. See [`arm_client_baseline`].
+fn apply_pty_baseline(master: &PtyMaster, pts: &str) -> anyhow::Result<bool> {
     if set_baseline(&master).is_ok() {
-        return Ok(());
+        return Ok(true);
     }
     let slave = open(pts, OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
     set_baseline(&slave)?;
-    Ok(())
+    Ok(false)
 }
 
 /// Is this fd's line discipline the raw baseline the daemon runs, or a cooked one?
@@ -346,6 +354,99 @@ fn termios_mode<Fd: AsFd>(fd: &Fd) -> &'static str {
             if cooked { "cooked" } else { "raw" }
         }
         Err(_) => "unknown",
+    }
+}
+
+/// The pair's actual configuration at the moment a probe's measured session ran,
+/// and what putting it there cost on the master.
+struct ClientBaseline {
+    via_master: bool,
+    reasserted: bool,
+    mode: &'static str,
+    extproc: bool,
+    footprint_bytes: u64,
+}
+
+impl ClientBaseline {
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "baseline_via_master": self.via_master,
+            "reasserted_on_client_slave": self.reasserted,
+            "slave_termios_mode": self.mode,
+            "extproc_set_at_shape": self.extproc,
+            "baseline_packet_bytes_drained": self.footprint_bytes,
+        })
+    }
+}
+
+/// Put the pair into the daemon's §7.2 baseline **on the client slave this probe is
+/// about to measure**, then consume what that re-assert made readable on the master.
+///
+/// This is the P6/P7 analogue of the repair P10 carries, and it needs one thing P10
+/// did not: a drain. P10's re-assert is invisible in P10's numbers because P10 counts
+/// bytes it writes itself. P6 and P7 count *whatever is readable on the master*, so on
+/// a kernel that emits `TIOCPKT_IOCTL` for an EXTPROC `tcsetattr` the re-assert is
+/// itself readable, and re-asserting without draining makes the probe count its own
+/// footprint as the session's evidence. Measured on Linux 7.0.0-29 (byte-identical
+/// across 5 runs): re-asserting without a drain moves P7's `a_open_close` from **0
+/// bytes to 1** (`0x40`) and `c_open_write_close` from **2 to 3** — the first of those
+/// inverting the one shape the §6 argument relies on leaving *nothing* behind. With
+/// this drain all three shapes read exactly what they read before the repair (0/1/2).
+/// The footprint is *reported* rather than merely discarded, so that invariance is
+/// auditable in the JSON instead of asserted in a comment.
+///
+/// It is the same obligation `nodes/pty.rs` discharges after `handle_last_close` —
+/// consume what the handler's own termios reset left behind — arriving here for the
+/// same reason: a `tcsetattr` on this pair is loud, and a reader that does not account
+/// for its own noise reads it as the peer's.
+///
+/// Applied on every platform, never behind a `cfg` and never keyed on `via_master`.
+/// A repair that only ever executes off the platform of record is a §9 proxy in space,
+/// exercised nowhere it can be observed failing — and keying on the master arm would
+/// additionally be *wrong*, because a master that accepts the baseline does not imply
+/// the pair still carries it when the client opens. Those are two facts, not one.
+fn arm_client_baseline<Fd: AsFd>(
+    master_fd: RawFd,
+    slave: &Fd,
+    via_master: bool,
+    buf: &mut [u8],
+) -> ClientBaseline {
+    let reasserted = set_baseline(slave).is_ok();
+    std::thread::sleep(PTY_SETTLE);
+    let (footprint_bytes, _, _, _) = read_available(master_fd, buf, 64);
+    ClientBaseline {
+        via_master,
+        reasserted,
+        mode: termios_mode(slave),
+        extproc: extproc_set(slave),
+        footprint_bytes,
+    }
+}
+
+/// Did the kernel **retain** EXTPROC on this fd? A different question from "did
+/// `tcsetattr` succeed": a kernel may accept the flag and drop it, and that is exactly
+/// the shape that makes a `TIOCPKT_IOCTL`-based measurement silently unanswerable
+/// while every syscall in sight returns `Ok` (P1's `reassert_extproc_via_master`).
+fn extproc_set<Fd: AsFd>(fd: &Fd) -> bool {
+    tcgetattr(fd)
+        .map(|t| t.local_flags.contains(LocalFlags::EXTPROC))
+        .unwrap_or(false)
+}
+
+/// Why a P7 shape was silent — the two causes are different findings and only the
+/// first is repairable by a termios call. Measured discriminator (Linux 7.0.0-29):
+/// planting a baseline with no EXTPROC silences the termios shape and leaves the
+/// write shape at 2 bytes; a fully cooked pair also leaves it at 2. So a write shape
+/// that is *also* silent is not a line-discipline finding at all.
+fn p7_silence_cause(termios_bytes: u64, write_bytes: u64, extproc: bool) -> &'static str {
+    if termios_bytes > 0 {
+        "covered"
+    } else if write_bytes == 0 {
+        "hangup-destroys-evidence"
+    } else if !extproc {
+        "extproc-unavailable"
+    } else {
+        "latch-uncovered"
     }
 }
 
@@ -525,38 +626,63 @@ pub fn p6_last_close_readiness() -> Probe {
         "Once a pty's last slave fd closes, does the master keep asserting POLLIN with nothing to read (the shape that spins a close-triggered poll loop)?",
     );
     match p6_inner() {
-        Ok((after_close, reset_applied, after_reset)) => {
-            let spun = after_close.pollin_no_data;
-            // The second half, called out flat so a jq one-liner can read it: if the
-            // node's own last-close reset makes the master readable again, the drain
-            // that consumes that packet is load-bearing whatever the first half says.
-            let rearm = if reset_applied {
+        Ok(r) => {
+            let spun = r.after_close.pollin_no_data;
+            let rearm = if r.reset_applied && r.reset_extproc_retained {
                 format!(
                     " The node's own last-close termios reset then re-armed readability {} time(s) ({} byte(s)), so the drain in `pty.rs` that consumes that packet stays load-bearing regardless: without it the handler re-arms itself and the runaway returns by that route rather than through a stuck POLLIN.",
-                    after_reset.pollin, after_reset.bytes
+                    r.after_reset.pollin, r.after_reset.bytes
+                )
+            } else if r.reset_applied {
+                format!(
+                    " The node's own last-close termios reset was ACCEPTED through the master here, but this kernel did not retain EXTPROC afterwards (`handler_reset_extproc_retained: false`) — so the EXTPROC-gated `TIOCPKT_IOCTL` re-arm cannot fire at all, and the {} byte(s) read below say nothing about whether `pty.rs`'s drain is load-bearing. P1 is the probe for that mechanism, and §7.2 already runs poll-only where it is degraded. Read `handler_reset_applied: true` as \"the syscall was accepted\", never as \"the reset took effect\".",
+                    r.after_reset.bytes
                 )
             } else {
                 " The node's own last-close termios reset could not be applied through the master here (the §7.2 BSD arm), so its re-arm effect is unmeasured.".to_owned()
             };
+            // Which fd the *node* resets through is a code-path fact, not a kernel
+            // measurement, so it is reported as one. Where the two differ, this second
+            // block is measuring a reset the node does not perform on this platform:
+            // `handle_last_close` goes through `with_termios_fd`, which off Linux opens
+            // a momentary slave — and that open *clears the hangup*, which is why this
+            // probe must not imitate it (see `apply_pty_baseline`) and therefore why
+            // this block stays Linux-shaped wherever it is not Linux. `pty.rs` accounts
+            // for that open separately, discarding the session edge it posts.
+            let node_reset_path = if cfg!(target_os = "linux") {
+                "master"
+            } else {
+                "momentary-slave"
+            };
+            let discipline = format!(
+                " The client session was measured with the pair in `{}` and EXTPROC {} — the §7.2 baseline re-asserted on the client's own slave, having reached the pair {} at setup — so this reading is of the daemon's pty and not of whatever discipline the kernel left behind.",
+                r.client.mode,
+                if r.client.extproc { "set" } else { "**NOT set — this kernel does not retain it** (P1)" },
+                if r.client.via_master { "through the master" } else { "through the momentary-slave fallback" },
+            );
             let p = p
-                .observe("after_last_close", after_close.observations())
-                .observe("handler_reset_applied", reset_applied)
-                .observe("handler_reset_readable_bytes", after_reset.bytes)
-                .observe("after_handler_termios_reset", after_reset.observations());
+                .observe("after_last_close", r.after_close.observations())
+                .observe("client_session_baseline", r.client.observations())
+                .observe("handler_reset_applied", r.reset_applied)
+                .observe("handler_reset_extproc_retained", r.reset_extproc_retained)
+                .observe("handler_reset_path_probe", "master")
+                .observe("handler_reset_path_node", node_reset_path)
+                .observe("handler_reset_readable_bytes", r.after_reset.bytes)
+                .observe("after_handler_termios_reset", r.after_reset.observations());
             if spun == 0 {
                 p.verdict(
                     Status::Supported,
                     &format!(
-                        "POLLIN goes quiet after the last close on this kernel ({} passes, {} with POLLIN, none readable-with-nothing-to-read): an ungated `closed`-only last-close arm would NOT spin on the hangup alone here, so pty.rs's `saw_session` latch is not what holds the anti-spin argument up on this kernel.{rearm} This is a per-kernel reading — §13 forbids acting on it until the production kernel (6.18) reports the same numbers, so diff this block before simplifying anything.",
-                        after_close.passes, after_close.pollin
+                        "POLLIN goes quiet after the last close on this kernel ({} passes, {} with POLLIN, none readable-with-nothing-to-read): an ungated `closed`-only last-close arm would NOT spin on the hangup alone here, so pty.rs's `saw_session` latch is not what holds the anti-spin argument up on this kernel.{rearm} This is a per-kernel reading — §13 forbids acting on it until the production kernel (6.18) reports the same numbers, so diff this block before simplifying anything.{discipline}",
+                        r.after_close.passes, r.after_close.pollin
                     ),
                 )
             } else {
                 p.verdict(
                     Status::Degraded,
                     &format!(
-                        "The master keeps asserting POLLIN with nothing to read after the last close ({spun} of {} passes): an ungated `closed`-only arm WOULD re-fire every pass here — the 99%-CPU shape `b8d8ed8` records. pty.rs's `saw_session` latch (and the drain that consumes the handler's own control packet) is load-bearing on this kernel: do not simplify it.{rearm} The shipped code is correct as it stands; this is a warning about a pending simplification, not a fault.",
-                        after_close.passes
+                        "The master keeps asserting POLLIN with nothing to read after the last close ({spun} of {} passes): an ungated `closed`-only arm WOULD re-fire every pass here — the 99%-CPU shape `b8d8ed8` records. pty.rs's `saw_session` latch (and the drain that consumes the handler's own control packet) is load-bearing on this kernel: do not simplify it.{rearm} The shipped code is correct as it stands; this is a warning about a pending simplification, not a fault.{discipline}",
+                        r.after_close.passes
                     ),
                 )
             }
@@ -573,20 +699,37 @@ pub fn p6_last_close_readiness() -> Probe {
     }
 }
 
-fn p6_inner() -> anyhow::Result<(Readiness, bool, Readiness)> {
+struct P6Result {
+    after_close: Readiness,
+    client: ClientBaseline,
+    reset_applied: bool,
+    reset_extproc_retained: bool,
+    after_reset: Readiness,
+}
+
+fn p6_inner() -> anyhow::Result<P6Result> {
     let master = new_master()?;
     let pts = sys::ptsname(&master)?;
     let fd = master.as_raw_fd();
     // Non-blocking, packet mode, §7.2 baseline: the master exactly as the PTY node
     // holds it (`nodes/pty.rs`), so the readings describe that loop's fd.
     sys::set_nonblocking(fd)?;
-    apply_pty_baseline(&master, &pts)?;
+    let via_master = apply_pty_baseline(&master, &pts)?;
     sys::set_packet_mode(fd, true)?;
 
     let mut buf = [0u8; 4096];
-    // A client attaches; drain everything setup and attach left, so the sampling
-    // below measures the hangup and nothing else.
+    // A client attaches. Re-assert the §7.2 baseline on the fd that client holds — the
+    // daemon's rising-presence-edge re-assert — so the hangup sampled below is a hangup
+    // of the daemon's pty and not of whatever discipline the kernel left the pair in.
+    // Free here in a way it is not in P7: the drain that follows already exists for
+    // exactly this reason, so the packet the re-assert provokes is consumed by
+    // machinery that was already there. Measured on Linux 7.0.0-29: `after_last_close`
+    // is byte-identical with and without it (pollin 0, pollin-with-no-data 0, POLLHUP
+    // 64/64, terminal EIO), and so is `handler_reset_readable_bytes` (1).
     let slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+    let client = arm_client_baseline(fd, &slave, via_master, &mut buf);
+    // Drain everything setup, the attach and the re-assert left, so the sampling below
+    // measures the hangup and nothing else.
     std::thread::sleep(PTY_SETTLE);
     let _ = read_available(fd, &mut buf, 64);
 
@@ -603,9 +746,22 @@ fn p6_inner() -> anyhow::Result<(Readiness, bool, Readiness)> {
     // the load-bearing part. Applied through the master only — the slave fallback
     // would clear the very hangup being measured.
     let reset_applied = set_baseline(&master).is_ok();
+    // …and whether it *took*. `set_baseline` answering `Ok(())` says the syscall was
+    // accepted, not that the pair now carries EXTPROC — and EXTPROC is the whole
+    // mechanism this block is about, since a kernel that drops the flag emits no
+    // `TIOCPKT_IOCTL` at all. Reading it back is what stops `handler_reset_applied:
+    // true` sitting next to `handler_reset_readable_bytes: 0` as an unexplained
+    // contradiction (it does, on Darwin, in every committed artifact).
+    let reset_extproc_retained = extproc_set(&master);
     std::thread::sleep(PTY_SETTLE);
     let after_reset = sample_readiness(fd, P6_PASSES, P6_WINDOW);
-    Ok((after_close, reset_applied, after_reset))
+    Ok(P6Result {
+        after_close,
+        client,
+        reset_applied,
+        reset_extproc_retained,
+        after_reset,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -640,6 +796,7 @@ struct ShapeResult {
     reads: u64,
     leading_hex: Vec<String>,
     terminal: String,
+    baseline: ClientBaseline,
 }
 
 impl ShapeResult {
@@ -665,6 +822,11 @@ impl ShapeResult {
             "terminal_read": self.terminal,
             "ioctl_bit_set": self.ioctl_bit(),
             "data_packet_seen": self.data_packet(),
+            "baseline_via_master": self.baseline.via_master,
+            "reasserted_on_client_slave": self.baseline.reasserted,
+            "slave_termios_mode": self.baseline.mode,
+            "extproc_set_at_shape": self.baseline.extproc,
+            "baseline_packet_bytes_drained": self.baseline.footprint_bytes,
         })
     }
 }
@@ -726,33 +888,71 @@ pub fn p7_collapsed_session() -> Probe {
         .map(|(_, r)| r);
     let covered = termios.map(|r| r.bytes > 0).unwrap_or(false);
     let data_covered = wrote.map(|r| r.bytes > 0).unwrap_or(false);
+    // What the measurement ran *in*, promoted out of the per-shape blocks so a jq
+    // one-liner can gate on it the way P10's `slave_termios_mode` is gated on.
+    let extproc_at_shape = termios.map(|r| r.baseline.extproc).unwrap_or(false);
+    let raw_at_shape = termios.map(|r| r.baseline.mode == "raw").unwrap_or(false);
+    let cause = p7_silence_cause(
+        termios.map(|r| r.bytes).unwrap_or(0),
+        wrote.map(|r| r.bytes).unwrap_or(0),
+        extproc_at_shape,
+    );
+    let discipline = termios
+        .map(|r| {
+            format!(
+                " Measured with the pair in `{}`, EXTPROC {}, the §7.2 baseline re-asserted on the client's own slave ({}) and reaching the pair {} at setup; the re-assert's own {} byte(s) were drained before the session ran, so nothing below is the probe's own footprint.",
+                r.baseline.mode,
+                if r.baseline.extproc { "set" } else { "**NOT set — this kernel did not retain it**" },
+                if r.baseline.reasserted { "applied" } else { "REFUSED" },
+                if r.baseline.via_master { "through the master" } else { "through the momentary-slave fallback" },
+                r.baseline.footprint_bytes,
+            )
+        })
+        .unwrap_or_default();
     p = p
         .observe("latch_covers_termios_only_session", covered)
-        .observe("latch_covers_data_session", data_covered);
+        .observe("latch_covers_data_session", data_covered)
+        .observe("extproc_retained_at_shape", extproc_at_shape)
+        .observe(
+            "measured_in_daemon_baseline",
+            raw_at_shape && extproc_at_shape,
+        )
+        .observe("silence_cause", cause);
 
-    match (covered, termios) {
-        (true, Some(r)) => p.verdict(
+    match cause {
+        "covered" => p.verdict(
             Status::Supported,
             &format!(
-                "A collapsed termios-only session leaves {} byte(s) readable past the hangup (leading {}, ioctl bit {}): pty.rs's widened last-close latch arms on it, so an `stty`/health-check/scripted client that opens, reconfigures and closes inside one poll gap still runs detach-release (§6). Diff this against the production kernel (6.18) before trusting the coverage there.",
-                r.bytes,
-                r.leading_hex.join(" "),
-                r.ioctl_bit()
+                "A collapsed termios-only session leaves {} byte(s) readable past the hangup (leading {}, ioctl bit {}): pty.rs's widened last-close latch arms on it, so an `stty`/health-check/scripted client that opens, reconfigures and closes inside one poll gap still runs detach-release (§6). Diff this against the production kernel (6.18) before trusting the coverage there.{discipline}",
+                termios.map(|r| r.bytes).unwrap_or(0),
+                termios.map(|r| r.leading_hex.join(" ")).unwrap_or_default(),
+                termios.map(|r| r.ioctl_bit()).unwrap_or(false),
             ),
         ),
-        // Never `unsupported`: nothing in the design is contradicted — the write
-        // lock is still releasable by every observed session, and by a `steal`. What
-        // is lost is coverage of one realistic shape, which is a degradation with a
-        // concrete consequence, named here so it cannot be read as a nit.
+        // Both shapes silent. NOT a latch-coverage finding, and emphatically not a
+        // lost line discipline: a written byte is not EXTPROC-gated, and measured on
+        // Linux 7.0.0-29 it is not ICANON-gated either (a fully cooked pair still
+        // delivers its 2 bytes across the hangup). Both silent means the pair's queues
+        // do not survive the last close here.
+        "hangup-destroys-evidence" => p.verdict(
+            Status::Degraded,
+            &format!(
+                "NOTHING is readable on the master after the hangup for ANY of the three shapes on this kernel — not the termios-only session, and not the one that wrote a byte. That second fact is what makes this a different finding from a lost baseline: a written byte is not EXTPROC-gated (measured on Linux 7.0.0-29: planting a baseline with no EXTPROC silences the termios shape and leaves the write shape at 2 bytes; a fully cooked pair also leaves it at 2). Both silent means this kernel destroys the pair's queues at the last close — the disposition **P13** measures — so no termios repair can move these numbers and this is **not** evidence that §6 detach-release is broken here. On such a kernel the session boundary is carried as an *edge* rather than as readable state: read **P12** in this same report, which measures exactly that, before drawing any conclusion about the write lock (§15.39).{discipline}"
+            ),
+        ),
+        // The measurement could not ask its question: no EXTPROC means no
+        // TIOCPKT_IOCTL is possible at all, whatever the latch does.
+        "extproc-unavailable" => p.verdict(
+            Status::Degraded,
+            &format!(
+                "The termios-only session left nothing readable, but this kernel did not retain EXTPROC on the pair even after the baseline was re-asserted on the client's own slave — so the EXTPROC-gated `TIOCPKT_IOCTL` notification P1 probes cannot fire here at all. This is not evidence about the latch's coverage; it is evidence that this *mechanism* is absent, and §7.2 already runs poll-only wherever P1 is degraded. A session that wrote a byte does leave evidence here. Read **P12** for the mechanism that carries §6 detach-release on such a kernel.{discipline}"
+            ),
+        ),
+        // The original finding, now reached only when the premises actually hold.
         _ => p.verdict(
             Status::Degraded,
             &format!(
-                "A collapsed termios-only session leaves NOTHING readable on the master after the hangup on this kernel{}. pty.rs's last-close latch has nothing to arm on for that shape, so a client that opens, calls tcsetattr and closes inside one poll gap keeps its write lock until the node is removed or another writer steals it (§6 detach-release) — and it does so silently. Re-check `nodes/pty.rs`'s latch before relying on collapsed-session release here.",
-                if data_covered {
-                    ", though a session that wrote a byte does"
-                } else {
-                    ", and neither does one that wrote a byte"
-                }
+                "A collapsed termios-only session leaves NOTHING readable on the master after the hangup on this kernel, though a session that wrote a byte does — and the pair demonstrably carried the daemon's EXTPROC baseline when it ran, so this kernel retains data evidence past the hangup but not the ioctl packet. pty.rs's last-close latch has nothing to arm on for that shape via *this* mechanism; check **P12** in this report for whether the session-boundary edge covers it here (§15.39), and if it does not, a client that opens, calls tcsetattr and closes inside one poll gap keeps its write lock until the node is removed or another writer steals it (§6 detach-release), silently.{discipline}"
             ),
         ),
     }
@@ -763,7 +963,7 @@ fn p7_shape(shape: SessionShape) -> anyhow::Result<ShapeResult> {
     let pts = sys::ptsname(&master)?;
     let fd = master.as_raw_fd();
     sys::set_nonblocking(fd)?;
-    apply_pty_baseline(&master, &pts)?;
+    let via_master = apply_pty_baseline(&master, &pts)?;
     sys::set_packet_mode(fd, true)?;
 
     let mut buf = [0u8; 4096];
@@ -781,6 +981,20 @@ fn p7_shape(shape: SessionShape) -> anyhow::Result<ShapeResult> {
 
     // The measured session.
     let slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+    // The §7.2 baseline, re-asserted on the fd the client itself holds — the daemon's
+    // rising-presence-edge re-assert, and what makes an `stty`-shaped `tcsetattr` emit
+    // the packet this probe counts. `apply_pty_baseline` above set the baseline before
+    // any slave existed; on a kernel that re-initialises pts termios at open, that set
+    // is gone by the time this session runs, and shape `b` then measures a pair with no
+    // EXTPROC and reports "nothing readable" on a kernel that would plainly have left
+    // something — a false `degraded`, reproduced on Linux 7.0.0-29 by planting the loss
+    // (`b` falls 1 → 0 while `c` stays at 2, and this call restores it to 1).
+    //
+    // That asymmetry is also this report's diagnostic, and it is why the verdict below
+    // splits on it: `b == 0` with `c > 0` is a lost line discipline; `b == 0` with
+    // `c == 0` is a kernel that destroys the evidence at the hangup, which no termios
+    // call can repair and which P13 — not this probe — is the instrument for.
+    let baseline = arm_client_baseline(fd, &slave, via_master, &mut buf);
     match shape {
         SessionShape::OpenClose => {}
         SessionShape::Termios => {
@@ -807,6 +1021,7 @@ fn p7_shape(shape: SessionShape) -> anyhow::Result<ShapeResult> {
         reads,
         leading_hex,
         terminal,
+        baseline,
     })
 }
 
@@ -4207,6 +4422,15 @@ mod tests {
             reads: bytes.len() as u64,
             leading_hex: bytes.iter().map(|b| format!("0x{b:02x}")).collect(),
             terminal: "EIO".to_owned(),
+            // This test is about the hex classifier alone; the baseline block is
+            // inert here and set to what a healthy Linux pair reports.
+            baseline: ClientBaseline {
+                via_master: true,
+                reasserted: true,
+                mode: "raw",
+                extproc: true,
+                footprint_bytes: 0,
+            },
         };
         // 0x40 = TIOCPKT_IOCTL (a bare tcsetattr); 0x41 adds TIOCPKT_FLUSHREAD,
         // which is what `stty`'s flushing TCSETSW2/TCSETSF2 leaves.
@@ -4321,6 +4545,81 @@ mod tests {
         // And `unknown` remains reachable, so it still means "neither source
         // answered" rather than "this is a Mac".
         assert_eq!(distro_from(None, None), "unknown");
+    }
+
+    /// The re-assert must leave the master exactly as it found it.
+    ///
+    /// Fail-first: delete the `read_available` inside `arm_client_baseline` and this
+    /// fails on Linux 7.0.0-29 with `arming the client baseline left 1 byte(s) readable
+    /// on the master` — precisely the byte that would then be miscounted as the
+    /// collapsed session's evidence, turning P7's `a_open_close` from 0 into 1 and
+    /// inverting the one shape the §6 detach-release argument relies on leaving nothing
+    /// behind.
+    ///
+    /// Portable by construction: on a kernel that emits no packet for a `tcsetattr` the
+    /// footprint is 0 and this still asserts the property (nothing left over), so it is
+    /// not a Linux observable standing in for a portable one (§9).
+    #[test]
+    fn arming_the_client_baseline_leaves_no_footprint_on_the_master() {
+        let master = new_master().expect("openpt");
+        let pts = sys::ptsname(&master).expect("ptsname");
+        let fd = master.as_raw_fd();
+        sys::set_nonblocking(fd).expect("nonblocking");
+        let via_master = apply_pty_baseline(&master, &pts).expect("baseline");
+        sys::set_packet_mode(fd, true).expect("packet mode");
+        let mut buf = [0u8; 4096];
+        {
+            let prime =
+                open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty()).expect("prime");
+            std::thread::sleep(PTY_SETTLE);
+            let _ = read_available(fd, &mut buf, 64);
+            drop(prime);
+        }
+        std::thread::sleep(PTY_SETTLE);
+        let _ = read_available(fd, &mut buf, 64);
+
+        let slave =
+            open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty()).expect("client");
+        let armed = arm_client_baseline(fd, &slave, via_master, &mut buf);
+        let (left, _, lead, _) = read_available(fd, &mut buf, 64);
+        assert_eq!(
+            left,
+            0,
+            "arming the client baseline left {left} byte(s) readable on the master \
+             ({}); P6/P7 would count the probe's own tcsetattr as the session's \
+             evidence (it drained {} byte(s) of its own)",
+            lead.join(" "),
+            armed.footprint_bytes
+        );
+    }
+
+    /// **The two causes of a silent P7 shape are different findings, and only one of
+    /// them is a line-discipline problem.**
+    ///
+    /// This classifier is the whole reason P7's Darwin `degraded` can be read correctly.
+    /// Measured on Linux 7.0.0-29 by planting each condition in turn: a baseline with no
+    /// EXTPROC silences the *termios* shape (1 → 0) and leaves the *write* shape at 2,
+    /// and a fully cooked pair also leaves it at 2 — so a write shape that is **also**
+    /// silent cannot be a lost discipline, and no termios repair can move it.
+    #[test]
+    fn a_silent_write_shape_is_not_a_lost_line_discipline() {
+        // Lost baseline: the termios shape goes quiet, the write shape does not.
+        assert_eq!(p7_silence_cause(0, 2, false), "extproc-unavailable");
+        // The hangup destroyed everything — no termios call can repair this, and P13,
+        // not P7, is the instrument. This is the Darwin reading.
+        assert_eq!(p7_silence_cause(0, 0, false), "hangup-destroys-evidence");
+        assert_eq!(p7_silence_cause(0, 0, true), "hangup-destroys-evidence");
+        // The genuine latch-coverage finding: baseline intact, data survives, packet
+        // does not.
+        assert_eq!(p7_silence_cause(0, 2, true), "latch-uncovered");
+        assert_eq!(p7_silence_cause(1, 2, true), "covered");
+        // And the discrimination itself, so a classifier collapsed to one answer fails
+        // here rather than passing every single-valued assertion above.
+        assert_ne!(
+            p7_silence_cause(0, 2, false),
+            p7_silence_cause(0, 0, false),
+            "a lost discipline and a destructive hangup must not classify alike"
+        );
     }
 
     /// The detector behind P10's `slave_termios_mode`, planted in both spellings.
