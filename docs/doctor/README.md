@@ -24,6 +24,9 @@ anything built before 2026-07-28 — is not comparable with these.
 
 | File | Kernel / box | Binary | Probe set | Rig | Verdicts |
 |---|---|---|---|---|---|
+| [`linux-7.0-2026-08-05b-tier3.json`](linux-7.0-2026-08-05b-tier3.json) | 7.0.0-29-generic, Ubuntu 26.04 — the dev box. **The counterpart the next macOS capture diffs against**: same binary, and the first Linux report carrying every observation added on 2026-08-05 (P6/P7 baseline block, P13 `baseline_packet_bytes`, P10 `recheck`, P9's zero-timeout 2×2) | `4b78fffc4bf2` | **`a131e1f4b46d6c83`** | **Tier 3** — the cross-wired FT232R pair, and the first Linux run to certify it under the portable UART predicate (§3.42) | 22 supported · 0 degraded · 0 unsupported · 1 skipped |
+| [`linux-7.0-2026-08-05b-tier3-2.json`](linux-7.0-2026-08-05b-tier3-2.json) | ” — second sequential run | ” | ” | ” | ” |
+| [`linux-7.0-2026-08-05b-tier3-3.json`](linux-7.0-2026-08-05b-tier3-3.json) | ” — third sequential run | ” | ” | ” | ” |
 | [`linux-7.0-2026-08-05-tier3.json`](linux-7.0-2026-08-05-tier3.json) | 7.0.0-29-generic, Ubuntu 26.04 — the dev box | `71fc5a815852` | **`a131e1f4b46d6c83`** | **Tier 3** — the same cross-wired FT232R pair (`BH00L4KU` ↔ `BH00LL8O`) | 22 supported · 0 degraded · 0 unsupported · 1 skipped |
 | [`linux-7.0-2026-08-05-tier3-2.json`](linux-7.0-2026-08-05-tier3-2.json) | ” — second sequential run, same box, same idle state | ” | ” | ” | ” |
 | [`linux-7.0-2026-08-05-tier3-3.json`](linux-7.0-2026-08-05-tier3-3.json) | ” — third sequential run | ” | ” | ” | ” |
