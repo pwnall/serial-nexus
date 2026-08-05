@@ -34,6 +34,19 @@ passing). AGENTS §2's plan-§18 item count moved ten → eleven in the same com
 probe id will move `probe_set` when the implementation lands — deliberately, opening a
 new fingerprint era per §15.44's unequal-is-the-sound-direction rule.
 
+**Revised the same day (upper bound).** The first draft's ladder was a fixed list capped
+at 3 Mbaud, which builds the FT232R's limit into the instrument — the bench already
+carries 6 Mbaud adapters, and the same vendor's H-series parts advertise 12. The ladder
+now has a fixed body through the H-series divisor points (…3M, 4M, 6M, 8M, 12M) and an
+**open end** above it: the rate doubles until refusal, unreliability, or the 32-bit rate
+field's own cap, so the probe's list is never the ceiling and future hardware raises the
+answer without a probe change. Termination is by construction (a stated structural
+maximum per §15.34, reached in a handful of doublings, each one constant-airtime trial
+set), and the plan's validations gained the matching case: an all-pass constructed
+history must terminate at the cap with the decision function never proposing a rate
+above it. `ladder-exhausted` is renamed `structural-cap` and names the instrument's
+limit, never the wire's.
+
 ---
 
 ## THE v15 GENERATION — the record becomes the documents (2026-08-05 session)
