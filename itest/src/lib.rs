@@ -1319,6 +1319,28 @@ pub fn blessed_replug_helper() -> Result<PathBuf, String> {
         )
     })?;
     if json["cap_dac_override_effective"] == serde_json::Value::Bool(true) {
+        // Blessed — but is it the *current* helper? The capability check cannot
+        // tell: a copy blessed before an edit is fully functional and runs the old
+        // code, so a test would silently measure a helper that no longer exists in
+        // the tree. Warn rather than fail, because the comparison is over bytes and
+        // an ordinary relink changes them (measured: a `cargo test --workspace`
+        // that touched nothing in `replug/` still produced a different build id at
+        // byte 25) — failing on that would red the suite for a no-op. A warning
+        // puts the hazard in front of whoever edited the helper without costing
+        // anyone else a `sudo`.
+        let built = target_dir().join("serial-nexus-replug");
+        if let (Ok(a), Ok(b)) = (std::fs::read(&built), std::fs::read(&path))
+            && a != b
+        {
+            eprintln!(
+                "NOTE: {} differs from {} — if you edited the helper, re-run \
+                 `scripts/bless` or these tests are measuring the previously blessed \
+                 build. (An ordinary relink also changes these bytes, so this is a \
+                 warning, not a failure.)",
+                path.display(),
+                built.display()
+            );
+        }
         return Ok(path);
     }
     Err(format!(

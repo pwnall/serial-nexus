@@ -6683,9 +6683,9 @@ control and it runs everywhere, asserting an absence — if the test process cou
 write a root-owned sysfs attribute, every result in the file would be about a
 privileged daemon rather than the shipped one.
 
-**Suite.** 767 → **785 passing, 0 failed, 4 ignored** across 116 test-result targets
-(114 cargo targets), the +18 being `sys`'s five capability guards, `replug`'s ten
-unit guards, and the three in `p7_replug_hardware`. `.snx-bin` joins `SKIP_DIRS` in
+**Suite.** 767 → **786 passing, 0 failed, 4 ignored** across 116 test-result targets (785 before the renumbering test)
+(114 cargo targets), the +19 being `sys`'s five capability guards, `replug`'s ten
+unit guards, and the four in `p7_replug_hardware`. `.snx-bin` joins `SKIP_DIRS` in
 `meta_names.rs`.
 
 **The premise is confirmed, by measurement.** `CAP_DAC_OVERRIDE` alone is
@@ -6749,25 +6749,78 @@ build and already carries the capability, so re-running it prompts for nothing. 
 prefers `sudo` and falls back to `pkexec` when there is no terminal to prompt on,
 which is what let this session bless at all.
 
-**One flake observed, mechanism not established (§9).** The first full rig-attached
-run with `SNX_REPLUG_DEV` set failed two rig tests —
+**A whole-suite flake, unresolved, and stated at the strength the evidence
+supports (§9).** Two rig tests fail together inside full rig-attached runs:
 `p12_serial_exclusivity::a_break_straddled_by_a_replace_leaves_the_line_transmitting`
 ("the crossover rig is not carrying bytes; this test would prove nothing") and
-`serial_hardware::crossover_rig_custom_baud_byte_exact`, the latter after 67.7 s
-against its usual 10.4 s. **Do not read that as "the replug tests break the rig",
-because the evidence does not support it**: both binaries pass in isolation
-immediately afterwards, the direct sequence `p7_replug_hardware` → 
-`p12_serial_exclusivity` was run twice and passed both times, and two further full
-suite runs with replug enabled came back **785 / 0 / 4**. So the rate is one failing
-run in three, both failures inside it, on a box that had just been hammered with a
-dozen manual deauthorize/reauthorize cycles. Recorded rather than explained: the
-baseline before this work was five consecutive clean full runs, so the honest
-statement is that a new flake has been seen once in a lane that used to be clean,
-its trigger is unknown, and the next rig session should watch for it rather than
-assume it is gone.
+`serial_hardware::crossover_rig_custom_baud_byte_exact` (once at 67.7 s against a
+usual 10.4 s; once losing **64 bytes of 32768** on the wire). What is measured:
 
-**Open.** Linux only, by construction. Nothing here yet covers **two** adapters
-cycled together with reauthorization in reverse order, which is the sharpest form
-of the §12 claim — it deterministically forces the renumbering that a single-adapter
-replug does not produce, and `hold` already accepts repeated `--port` for it. The
-`by-path` topology identity is also untested against a real cycle.
+| observation | count |
+|---|---|
+| full rig-attached runs **with** `SNX_REPLUG*` set | 2 failing of 5 |
+| full rig-attached runs **before** this work existed | 0 failing of 5 |
+| the two binaries run **in isolation**, back to back | 0 failing of 5 each |
+| the direct `p7_replug_hardware` → `p12_serial_exclusivity` sequence | 0 failing of 2 |
+
+**It is the same two tests both times, which is not the shape of a random flake** —
+they are the two most timing-sensitive consumers of the physical wire. But the
+obvious story, "the replug tests disturb the rig", is **not supported**: in the
+second failing run `p12_serial_exclusivity` executed at log line 676 and
+`p7_replug_hardware` at 1073, so p12 failed *before* any replug test ran. The rig
+itself is healthy — ten isolated binary runs immediately afterwards were clean.
+
+So the honest statement is: a lane that was clean 5 of 5 now fails 2 of 5, the
+failures cluster on two specific tests, the rig hardware is not the cause, and the
+mechanism is **not established**. No root cause is claimed and none should be
+quoted from this entry. The next rig session should reproduce with
+`--test-threads=1` and with the replug tests excluded but their binary still built,
+which separates "the suite got longer" from "the replug tests did something".
+
+**The renumbering test landed, and it is the first measurement of §12's founding
+premise.** Design §1 rests on *"the same adapter does not always return as the same
+`/dev` path"*, and until now nothing exercised it: a single-adapter replug cannot,
+because Linux reuses the lowest free minor and the adapter comes back as the same
+`ttyUSB0` it left — a config keyed by *path* would have survived by luck.
+`identity_survives_a_replug_that_renumbers_the_tty` cycles **both** adapters in one
+`hold` and reauthorizes them in the opposite order, so the one back first takes the
+lower minor. Measured: `BH00LL8O` moves `ttyUSB0 ↔ ttyUSB1`, the daemon's
+`resolved_path` follows it, and `identity` is unchanged — with the config never
+touched. Three consecutive runs alternate cleanly (0→1, 1→0, 0→1).
+
+Two details that are the difference between a guard and a decoration:
+
+* **The order is chosen from the current state, not assumed.** Naming the ports in
+  a fixed order passes on a fresh box and then fails on its own second run, because
+  the adapter is already on the far minor and the "swap" moves nothing. The test
+  reads which adapter currently holds the lower tty and picks the order that moves
+  the one under test. That is why it is repeatable.
+* **Fail-first, run rather than argued.** Driving the helper with the *other* order
+  — the one that returns the adapter to the minor it already had — leaves
+  `ttyUSB1 → ttyUSB1`, which is exactly what the guard's `assert_ne` refuses. The
+  control was executed on the rig, not predicted.
+
+**A hazard the capability check cannot see, and where the warning belongs.** A copy
+blessed before an edit is perfectly functional and runs the *old* helper, so a test
+that only asks "are you blessed?" would silently measure code that no longer exists
+in the tree. `blessed_replug_helper()` therefore also compares the blessed copy with
+`target/<profile>/` and **warns** when they differ, naming `scripts/bless`. A
+warning rather than a failure, because the comparison is over bytes: a relink
+changes them with no source change (measured once during a `cargo test --workspace`
+that touched nothing in `replug/` — the build id at byte 25 moved), and reddening
+the suite for a no-op would be worse than the hazard. Cargo turns out to be
+reproducible for comment-only edits — `touch` plus a trailing-comment rebuild both
+produced byte-identical binaries — so the false-positive rate is lower than feared.
+Fail-first proof, run rather than argued: appending one byte to the built artifact
+makes the warning fire verbatim while the test still passes, and restoring it
+silences the warning again.
+
+**Open.** Linux only, by construction. The `by-path` topology identity is still
+untested against a real cycle: it is the one §12 fallback a sysfs
+deauthorize/reauthorize could prove directly, since the sysfs name `3-1` denotes the
+*port* and survives the cycle. Also worth knowing rather than discovering: after a
+renumbering run the two adapters have exchanged `/dev` names. by-id paths and
+identities are unaffected, so `SNX_REPLUG_DEV`/`_B` stay correct, but a
+`SNX_CROSSOVER_A=/dev/ttyUSB0` now names the opposite adapter — harmless on a
+symmetric crossover, and the test says so in its output rather than leaving it to be
+found.

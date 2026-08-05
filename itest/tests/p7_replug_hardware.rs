@@ -184,10 +184,30 @@ fn while_deauthorized<T>(
     dry_run: bool,
     while_down: impl FnOnce() -> T,
 ) -> (Value, Value, T) {
+    while_deauthorized_many(helper, &[port], dry_run, while_down)
+}
+
+/// [`while_deauthorized`] over several ports at once.
+///
+/// Order is the experiment: the helper deauthorizes in the order given and
+/// reauthorizes in reverse, so the port named **last** comes back first and takes
+/// the lowest free minor. That is what lets a caller force a renumbering instead of
+/// hoping for one.
+fn while_deauthorized_many<T>(
+    helper: &Path,
+    ports: &[&str],
+    dry_run: bool,
+    while_down: impl FnOnce() -> T,
+) -> (Value, Value, T) {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
-    let mut args = vec!["hold", "--port", port, "--max-ms", "20000"];
+    let mut args: Vec<&str> = vec!["hold"];
+    for port in ports {
+        args.push("--port");
+        args.push(port);
+    }
+    args.extend_from_slice(&["--max-ms", "20000"]);
     if dry_run {
         args.push("--dry-run");
     }
@@ -226,6 +246,25 @@ fn while_deauthorized<T>(
         "helper did not report the device up: {up}"
     );
     (down, up, observed)
+}
+
+/// The tty this port currently owns (`ttyUSB0`), or `None` while it is down.
+fn tty_of(port: &str) -> Option<String> {
+    let entries = std::fs::read_dir(format!("/sys/bus/usb/devices/{port}")).ok()?;
+    for iface in entries.flatten() {
+        if !iface.file_name().to_string_lossy().contains(':') {
+            continue;
+        }
+        if let Ok(kids) = std::fs::read_dir(iface.path()) {
+            for kid in kids.flatten() {
+                let name = kid.file_name().to_string_lossy().into_owned();
+                if name.starts_with("ttyUSB") {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Whether the port currently owns any tty, read straight from sysfs.
@@ -505,5 +544,172 @@ fn the_test_process_itself_holds_no_capability_to_write_sysfs() {
         std::io::ErrorKind::PermissionDenied,
         "unexpected error writing {}: {err}",
         any.display()
+    );
+}
+
+/// **The sharpest form of §12's claim, and the only place it is measured.**
+///
+/// Design §1's founding premise is that *"the same adapter does not always return
+/// as the same `/dev` path"*, and §12 exists to make configurations survive that.
+/// A single-adapter replug cannot demonstrate it: Linux reuses the lowest free
+/// minor, so the adapter comes back as the same `ttyUSB0` it left, and a config
+/// keyed by path would have survived by luck. Cycling **both** adapters and
+/// reauthorizing them in the opposite order forces the swap deterministically —
+/// the one back first takes the lower minor — so the node under test provably
+/// returns on a `/dev` path it did not leave on.
+///
+/// This is why `hold` takes repeated `--port`: the reauthorization order is the
+/// experiment, and both writes stay inside one process so a dying test cannot
+/// leave two adapters down.
+#[test]
+fn identity_survives_a_replug_that_renumbers_the_tty() {
+    let _claim = rig_guard();
+    let rig = match rig() {
+        Ok(r) => r,
+        Err(why) => {
+            skip_no_replug("identity_survives_a_replug_that_renumbers_the_tty", &why);
+            return;
+        }
+    };
+    let Ok(dev_b) = std::env::var("SNX_REPLUG_DEV_B") else {
+        skip_no_replug(
+            "identity_survives_a_replug_that_renumbers_the_tty",
+            "SNX_REPLUG_DEV_B is not set (this test needs both adapters to force a renumbering)",
+        );
+        return;
+    };
+    let by_id_b = PathBuf::from(&dev_b);
+    assert!(
+        dev_b.starts_with("/dev/serial/by-id/"),
+        "SNX_REPLUG_DEV_B={dev_b} is not a /dev/serial/by-id path"
+    );
+    let port_b = usb_port_of(&by_id_b)
+        .unwrap_or_else(|| panic!("SNX_REPLUG_DEV_B={dev_b} resolves to no sysfs USB port"));
+    assert_ne!(
+        rig.port, port_b,
+        "SNX_REPLUG_DEV and SNX_REPLUG_DEV_B name the same USB port ({}); the swap \
+         needs two distinct adapters",
+        rig.port
+    );
+
+    let tty_a_before = tty_of(&rig.port).expect("adapter A has a tty before the cycle");
+    let tty_b_before = tty_of(&port_b).expect("adapter B has a tty before the cycle");
+    assert_ne!(tty_a_before, tty_b_before, "both adapters claim one tty");
+
+    // The helper reauthorizes in the reverse of the order given, so whichever port
+    // is named *last* comes back first and takes the lower minor. Choose the order
+    // that moves A, rather than assuming A starts on the lower one — otherwise the
+    // test passes on a fresh box and fails on its own second run, which is the
+    // shape of bug this file exists to catch elsewhere.
+    let a_is_lower = tty_a_before < tty_b_before;
+    let order: [&str; 2] = if a_is_lower {
+        [rig.port.as_str(), port_b.as_str()] // B back first -> A takes the higher
+    } else {
+        [port_b.as_str(), rig.port.as_str()] // A back first -> A takes the lower
+    };
+
+    let run = TempRun::new();
+    let console = run.join("con");
+    let daemon = Daemon::start();
+    let rpc = daemon.rpc();
+    rpc.load_toml(&config(&rig.identity, &console), false)
+        .expect("load the replug config");
+    assert!(
+        rpc.wait_status("usb0", "active", Duration::from_secs(20)),
+        "serial node never came up: {:?}",
+        rpc.node("usb0")
+    );
+    let path_before = rpc.node("usb0").expect("node")["resolved_path"]
+        .as_str()
+        .expect("a resolved path before the swap")
+        .to_owned();
+
+    let (down, up, (both_gone, daemon_noticed)) =
+        while_deauthorized_many(&rig.helper, &order, false, || {
+            let gone = wait_until(Duration::from_secs(5), || {
+                !has_tty(&rig.port) && !has_tty(&port_b)
+            });
+            let noticed = wait_until(Duration::from_secs(10), || {
+                rpc.node_status("usb0") != "active"
+            });
+            (gone, noticed)
+        });
+    assert!(
+        both_gone,
+        "both adapters never went away: down={down} up={up}"
+    );
+    assert!(
+        daemon_noticed,
+        "the daemon never left `active`, so nothing below measures a replug: {up}"
+    );
+    assert!(
+        up["reauthorize_failures"]
+            .as_array()
+            .is_some_and(|f| f.is_empty()),
+        "the helper failed to reauthorize — an adapter may still be down: {up}"
+    );
+
+    // Both must come back before the daemon can resolve anything.
+    assert!(
+        wait_until(Duration::from_secs(15), || tty_of(&rig.port).is_some()
+            && tty_of(&port_b).is_some()),
+        "an adapter never produced a tty again"
+    );
+    let tty_a_after = tty_of(&rig.port).expect("adapter A has a tty after");
+
+    // **The measurement.** The adapter came back on a different /dev path.
+    assert_ne!(
+        tty_a_after, tty_a_before,
+        "the swap did not renumber adapter A ({tty_a_before} -> {tty_a_after}); the \
+         premise §12 rests on was not exercised, so the assertions below are vacuous"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(15), || std::fs::metadata(&rig.by_id)
+            .is_ok()),
+        "the by-id link never returned"
+    );
+    assert!(
+        rpc.wait_status("usb0", "active", Duration::from_secs(30)),
+        "node never healed onto its new path: {:?}",
+        rpc.node("usb0")
+    );
+    let healed = rpc.node("usb0").expect("node after heal");
+
+    // §12, stated exactly: the identity did not move, the path did, and the daemon
+    // followed the identity to the new path without the config being touched.
+    assert_eq!(
+        healed["identity"].as_str(),
+        Some(rig.identity.as_str()),
+        "identity changed across a renumbering replug: {healed}"
+    );
+    let path_after = healed["resolved_path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no resolved_path after the swap: {healed}"));
+    assert_ne!(
+        path_after, path_before,
+        "the daemon reports the same resolved_path across a swap that provably \
+         renumbered the adapter ({tty_a_before} -> {tty_a_after}): {healed}"
+    );
+    assert!(
+        path_after.ends_with(&tty_a_after),
+        "the daemon resolved {path_after} but the adapter is on {tty_a_after}: {healed}"
+    );
+    assert_eq!(
+        healed["open"],
+        Value::Bool(true),
+        "healed onto the new path but not open: {healed}"
+    );
+
+    eprintln!(
+        "renumbering replug measured: adapter A {} -> {}, daemon {} -> {}, identity {} \
+         unchanged; held {} ms",
+        tty_a_before, tty_a_after, path_before, path_after, rig.identity, up["held_ms"]
+    );
+    eprintln!(
+        "NOTE: the adapters have swapped /dev names. by-id paths and identities are \
+         unaffected; any SNX_CROSSOVER_A/_B set to /dev/ttyUSB* now name the opposite \
+         adapters (harmless on a symmetric crossover, but say so rather than surprise \
+         the next reader)."
     );
 }
