@@ -90,6 +90,18 @@ and (any(.probes[]; .id == "P7" and .status != "unsupported"))
 and (any(.probes[]; .id == "P8" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P9" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P10" and (.status == "supported" or .status == "skipped" or .status == "degraded")))
+# P10 carries an instrument check on its own FIONREAD reading, and THIS is the lane where
+# it fires: `peer_pending_input_bytes` answers 0 on a Darwin pty master with 1024 bytes
+# recoverable, 6 of 6 captures across two binaries (notes §3.45 iv / §3.50), so a bare `0`
+# there reads as "empty" and is not. What is gated is the PRESENCE of the cross-check, not
+# its answer — a kernel whose FIONREAD differs must REPORT, not fail (§7), which is also
+# why P10's status is deliberately left alone by that finding.
+and (all(.probes[]; . as $p | ($p.id != "P10") or ($p.status == "skipped") or
+      (["slave_to_master_targetward","master_to_slave_hostward"] | all(. as $d |
+         $p.observations | any(.key == $d
+            and (.value.peer_pending_input_trust | type == "string")
+            and (.value | has("peer_pending_input_bytes_at_drain"))
+            and (.value | has("writer_pending_input_bytes")))))))
 and (any(.probes[]; .id == "P11"))
 # P12 (session-boundary edge, §15.39) is the mechanism that carries §6's
 # detach-release on THIS platform — Darwin destroys the readable packet P7 measures
@@ -99,6 +111,20 @@ and (any(.probes[]; .id == "P11"))
 # silent regression a presence-only clause would wave through. Its numbers are the
 # point, like P6/P7's.
 and (any(.probes[]; .id == "P12" and (.status == "supported" or .status == "degraded")))
+# P12's anti-spin claim must arrive with its witness: six committed captures print
+# `idle_edges_in_200_passes: 0` with no elapsed time and no control, and a zero from a
+# latch that cannot post an edge is not a measurement (§9). On this lane the latch is the
+# live mechanism, so `control_session_edge` is the field that separates "quiet kernel"
+# from "inert instrument" — and P12's own `supported` arm now refuses to be reached
+# without it (notes §3.50). The `idle_windows` arm is the escape hatch for a box where the
+# windows could not run at all — an error that NAMES itself, which is what §7 asks.
+and (all(.probes[]; . as $p | ($p.id != "P12") or
+      ((($p.observations | any(.key == "control_session_edge"))
+        or ($p.observations | any(.key == "idle_windows")))
+       and (($p.observations | any(.key == "idle_window_paced"
+              and (.value.elapsed_us | type == "number")
+              and (.value.passes | type == "number")))
+        or ($p.observations | any(.key == "idle_windows"))))))
 # P13 (last-close disposition) is pty-only and portable, so it must measure here —
 # and macOS is the platform it was built for. The XNU reading behind this clause is
 # no longer a prediction: it was measured on Darwin 24.6.0 / macOS 15.7.8 and the

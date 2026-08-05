@@ -109,6 +109,16 @@ and (any(.probes[]; .id == "P7" and (.status == "supported" or .status == "degra
 and (any(.probes[]; .id == "P8" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P9" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P10" and (.status == "supported" or .status == "skipped" or .status == "degraded")))
+# P10 carries an instrument check on its own FIONREAD reading. `peer_pending_input_bytes`
+# answers 0 on a Darwin pty master with 1024 bytes recoverable (6 of 6 captures, notes
+# §3.45 iv / §3.50), so a bare `0` there reads as "empty" and is not. What is gated is the
+# PRESENCE of the cross-check, not its answer — the answer is the kernel's to give.
+and (all(.probes[]; . as $p | ($p.id != "P10") or ($p.status == "skipped") or
+      (["slave_to_master_targetward","master_to_slave_hostward"] | all(. as $d |
+         $p.observations | any(.key == $d
+            and (.value.peer_pending_input_trust | type == "string")
+            and (.value | has("peer_pending_input_bytes_at_drain"))
+            and (.value | has("writer_pending_input_bytes")))))))
 and (any(.probes[]; .id == "P11" and (.status == "supported" or .status == "degraded" or .status == "skipped")))
 # P12 (session-boundary edge, §15.39) is inert on Linux by design — the retained
 # `TIOCPKT_IOCTL` packet carries §6's detach-release here, which is P7's subject —
@@ -117,6 +127,20 @@ and (any(.probes[]; .id == "P11" and (.status == "supported" or .status == "degr
 # where it is the only mechanism. `supported` would mean a Linux kernel grew the
 # edge too, which is interesting and not a failure.
 and (any(.probes[]; .id == "P12" and .status != "unsupported"))
+# P12's anti-spin claim must arrive with its witness: six committed captures print
+# `idle_edges_in_200_passes: 0` with no elapsed time and no control, and a zero from a
+# latch that cannot post an edge is not a measurement (§9). The `idle_windows` arm is the
+# escape hatch for a box with no pty — an error that NAMES itself, which is what §7 asks.
+# Gated here as well as on macOS even though the latch is inert on Linux: the windows run
+# on both platforms, and a Linux report carrying `control_session_edge: false` beside a
+# full set of executed passes is the inert arm proving itself inert (notes §3.50).
+and (all(.probes[]; . as $p | ($p.id != "P12") or
+      ((($p.observations | any(.key == "control_session_edge"))
+        or ($p.observations | any(.key == "idle_windows")))
+       and (($p.observations | any(.key == "idle_window_paced"
+              and (.value.elapsed_us | type == "number")
+              and (.value.passes | type == "number")))
+        or ($p.observations | any(.key == "idle_windows"))))))
 # P13 (last-close disposition of unread client bytes) is presence-gated for the same
 # reason as P6/P7: all three of `retains` / `discards` / `waits-then-discards` are
 # legitimate kernel policies and the daemon is correct under each, so demanding a

@@ -1078,10 +1078,134 @@ fn p12_shape(shape: SessionShape) -> anyhow::Result<bool> {
     Ok(latch.took_edge())
 }
 
-/// The anti-spin half: how many edges does an **idle**, hung-up master post
-/// across `passes` reader-shaped passes? Anything but zero re-fires the last-close
-/// handler forever.
-fn p12_idle_edges(passes: u32) -> anyhow::Result<u64> {
+/// The daemon's own idle pty cadence (`serial_nexus_daemon::runtime::IDLE_POLL` is
+/// 5 ms; `ACTIVE_POLL` is 200 µs). The paced windows below run at exactly this
+/// interval, because "an idle master posts no edge" is a claim about the loop
+/// `nodes/pty.rs` actually runs, and a claim about 200 back-to-back syscalls is a
+/// different one. Both are kept, and the pair discriminates: an edge that appears
+/// only in the paced window is time-driven, one that appears only in the tight
+/// window is syscall-driven, and until now nothing here could tell those apart.
+const P12_PACED_PAUSE: Duration = Duration::from_millis(5);
+
+/// Passes per paced window — P6's count, so the two probes' windows are the same
+/// size and directly comparable (P6: 64 passes at 2 ms, 163 ms of wall clock).
+/// 64 × 5 ms measures 324816/324914/324476 µs on an idle Linux box, and there are
+/// two of them: ~0.65 s per doctor run, named because it is the whole cost of
+/// this fix.
+const P12_PACED_PASSES: u32 = 64;
+
+/// The historical tight window, unchanged in count and shape. It is what every
+/// committed `docs/doctor/` report's `idle_edges_in_200_passes` was measured with,
+/// and re-pacing it would silently redefine a field six artifacts already carry
+/// (§16.13). What it lacked was a wall clock: 200 passes over a hung-up master
+/// cost **98 µs** on Linux 7.0.0-29, which is why the witness below is reported in
+/// microseconds and not in P6's milliseconds — `elapsed_ms` here would print 0.
+const P12_TIGHT_PASSES: u32 = 200;
+
+/// How many paced passes the positive control gives the boundary this probe
+/// produced on purpose. Generous by design: on the kernel this mechanism exists
+/// for, the edge is posted by `close(2)` itself, so anything past the first pass
+/// is already a finding, and 16 × 5 ms = 80 ms is the outer bound on saying
+/// "the latch is deaf" rather than "the latch was slow".
+const P12_CONTROL_PASSES: u32 = 16;
+
+/// One window of reader-shaped passes and what the latch did during it.
+#[derive(Default)]
+struct EdgeWindow {
+    passes: u32,
+    edges: u64,
+    elapsed_us: u64,
+    pause_us: u64,
+    /// Passes where `poll(2)` reported anything at all, and how each pass's
+    /// `read(2)` ended. **The witness that the loop ran.** A window reporting zero
+    /// edges because it never executed is the vacuous verdict §9 names, and the
+    /// shipped probe could not tell that from a quiet kernel.
+    poll_event_passes: u32,
+    reads: BTreeMap<String, u32>,
+}
+
+impl EdgeWindow {
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "passes": self.passes,
+            "edges": self.edges,
+            "elapsed_us": self.elapsed_us,
+            "pass_pause_us": self.pause_us,
+            "poll_event_passes": self.poll_event_passes,
+            "read_outcomes": self.reads,
+        })
+    }
+}
+
+/// Run `passes` reader-shaped passes over `fd` and count what the latch posted.
+/// The pass body is `nodes/pty.rs`'s in its order — poll `POLLIN|POLLHUP`, read,
+/// then ask the latch — because that order's side effects are what could re-arm
+/// the knote, and a probe that asked the latch first would be measuring a
+/// sequence the daemon never performs.
+fn p12_window(fd: RawFd, latch: &sys::SessionLatch, passes: u32, pause: Duration) -> EdgeWindow {
+    let mut w = EdgeWindow {
+        pause_us: pause.as_micros() as u64,
+        ..EdgeWindow::default()
+    };
+    let mut buf = [0u8; 256];
+    let start = Instant::now();
+    for _ in 0..passes {
+        let re = sys::poll_ready(fd, PollFlags::POLLIN | PollFlags::POLLHUP);
+        w.passes += 1;
+        if !re.is_empty() {
+            w.poll_event_passes += 1;
+        }
+        let class = match sys::read_fd(fd, &mut buf) {
+            Ok(0) => "eof".to_owned(),
+            Ok(_) => "bytes".to_owned(),
+            Err(e) => read_class(&e),
+        };
+        *w.reads.entry(class).or_default() += 1;
+        if latch.took_edge() {
+            w.edges += 1;
+        }
+        if !pause.is_zero() {
+            std::thread::sleep(pause);
+        }
+    }
+    w.elapsed_us = start.elapsed().as_micros() as u64;
+    w
+}
+
+/// The anti-spin half, and the two controls that make its zero mean something.
+///
+/// All four run on **one** master through **one** latch, and that is the whole
+/// point: the three shape trials above each build their own pair and their own
+/// `SessionLatch`, so a latch that went deaf on *this* pair is invisible to them.
+/// `watch()` deliberately swallows the registration edge on a master that is
+/// already hung up, which is exactly the state the idle windows then measure — so
+/// "0 edges from an already-EOF knote" is a reading that a broken instrument and a
+/// quiet kernel produce identically, and only a boundary produced on purpose,
+/// afterwards, on the same latch, separates them.
+struct P12Idle {
+    /// The historical window, unchanged: 200 back-to-back passes.
+    tight: EdgeWindow,
+    /// The same question at the daemon's own idle cadence.
+    paced: EdgeWindow,
+    /// **Negative control.** The same window with a slave *open* — a client
+    /// present, no boundary. An edge here fires §6 detach-release mid-session and
+    /// hands away the write lock of a client that never left: the mirror image of
+    /// the spin, and nothing measured it.
+    live: EdgeWindow,
+    /// **Positive control, on the latch instance that produced the zeros above.**
+    control_edge: bool,
+    /// Which control pass took the edge (1 = the first), `None` if none did.
+    control_pass: Option<u32>,
+    /// Wall clock from the close to the edge (or to giving up).
+    control_us: u64,
+}
+
+/// See [`P12Idle`]. Sequencing is load-bearing and is stated here so an editor
+/// cannot reorder it silently: both idle windows run while nothing is attached,
+/// the live window runs with a slave open (and rule 2's `discard` after this
+/// process's own open), and the control runs last, because it ends the session
+/// and cannot be undone.
+fn p12_idle() -> anyhow::Result<P12Idle> {
     let master = new_master()?;
     let pts = sys::ptsname(&master)?;
     let fd = master.as_raw_fd();
@@ -1095,18 +1219,121 @@ fn p12_idle_edges(passes: u32) -> anyhow::Result<u64> {
     }
     std::thread::sleep(PTY_SETTLE);
     let latch = sys::SessionLatch::watch(fd)?;
+
+    let tight = p12_window(fd, &latch, P12_TIGHT_PASSES, Duration::ZERO);
+    let paced = p12_window(fd, &latch, P12_PACED_PASSES, P12_PACED_PAUSE);
+
+    // A client attaches. The open is this process's own doing, so `SessionLatch`
+    // rule 2 applies before anything is counted.
+    let slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+    std::thread::sleep(PTY_SETTLE);
+    latch.discard();
+    let live = p12_window(fd, &latch, P12_PACED_PASSES, P12_PACED_PAUSE);
+
+    // ...and leaves. This is the control: the same latch, the same master, a
+    // boundary this probe knows happened.
+    let closed_at = Instant::now();
+    drop(slave);
     let mut buf = [0u8; 256];
-    let mut edges = 0u64;
-    for _ in 0..passes {
-        // The reader's own shape: poll, read, then ask the latch — that sequence's
-        // side effects are what could re-arm the knote.
+    let mut control_pass = None;
+    for i in 1..=P12_CONTROL_PASSES {
         let _ = sys::poll_ready(fd, PollFlags::POLLIN | PollFlags::POLLHUP);
         let _ = sys::read_fd(fd, &mut buf);
         if latch.took_edge() {
-            edges += 1;
+            control_pass = Some(i);
+            break;
         }
+        std::thread::sleep(P12_PACED_PAUSE);
     }
-    Ok(edges)
+
+    Ok(P12Idle {
+        tight,
+        paced,
+        live,
+        control_edge: control_pass.is_some(),
+        control_pass,
+        control_us: closed_at.elapsed().as_micros() as u64,
+    })
+}
+
+/// The facts P12's verdict turns on, extracted so the decision is a pure function
+/// of numbers. This is the answer to a real constraint: the mechanism is inert on
+/// Linux, so the platform of record cannot produce a single row of this table —
+/// but it can, and now does, regression-test the decision made from it (§9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct P12Facts {
+    /// Did the termios-only shape post an edge? `None` = that trial errored.
+    termios_edge: Option<bool>,
+    /// Edges from a hung-up, unattached master. Anything but 0 is the spin.
+    idle_edges: u64,
+    /// Edges while a client was attached and idle. Anything but 0 releases a live
+    /// client's write lock.
+    live_session_edges: u64,
+    /// Did the same latch post the boundary this probe produced on purpose?
+    control_edge: bool,
+    /// Passes and wall clock the two idle windows actually covered.
+    idle_passes: u32,
+    idle_elapsed_us: u64,
+    /// `false` where the windows did not run at all.
+    measured: bool,
+}
+
+/// P12's verdict. Pure; touches no fd.
+fn p12_verdict(f: P12Facts) -> (Status, String) {
+    if !f.measured {
+        return (
+            Status::Degraded,
+            "The session-edge measurement did not complete, so which mechanism carries detach-release on this kernel is unknown. Read P7: if it reports readable evidence, the packet route is intact regardless (§6, §15.39).".to_owned(),
+        );
+    }
+    // The dangerous direction still gets said first: it releases a lock nobody's
+    // client took, on every pass.
+    if f.idle_edges > 0 {
+        return (
+            Status::Degraded,
+            format!(
+                "An idle, hung-up master posted {} session edge(s) across {} reader-shaped passes covering {} us of wall clock. That re-fires `pty.rs`'s last-close handler on a pair no client has touched — releasing a write lock the operator took, and burning the runtime thread doing it. `SessionLatch`'s discard sites (§15.39) or this kernel's `EV_CLEAR` semantics have changed; re-check both before trusting detach-release here.",
+                f.idle_edges, f.idle_passes, f.idle_elapsed_us
+            ),
+        );
+    }
+    if f.live_session_edges > 0 {
+        return (
+            Status::Degraded,
+            format!(
+                "A master with a client ATTACHED and idle posted {} session edge(s). `pty.rs` reads that edge as \"a client left\", so §6 detach-release fires mid-session and hands the write lock away under a client that never went anywhere. The idle-hangup count is 0, so this is not the spin shape but its mirror image, and nothing measured it before.",
+                f.live_session_edges
+            ),
+        );
+    }
+    if f.idle_passes == 0 || f.idle_elapsed_us == 0 {
+        return (
+            Status::Degraded,
+            "The anti-spin windows reported 0 edges over 0 passes, or across 0 us of wall clock. That is not evidence of anything: a loop that did not execute cannot observe an edge (§9). Read the window blocks above before reading any count here.".to_owned(),
+        );
+    }
+    if !f.control_edge {
+        return (
+            Status::Degraded,
+            format!(
+                "The anti-spin windows are silent AND SO IS THE INSTRUMENT. After {} passes over {} us reporting 0 edges, this probe closed a slave on the same master through the same latch, and the latch reported nothing for that boundary either. A zero from a latch that cannot post an edge says nothing about spin and nothing about §6 detach-release: read it as `unmeasured`, not as `quiet`. Read P7 beside this — if it is `supported`, the retained packet is carrying detach-release here regardless.",
+                f.idle_passes, f.idle_elapsed_us
+            ),
+        );
+    }
+    match f.termios_edge {
+        Some(true) => (Status::Supported, format!(
+            "A collapsed termios-only session posts a session-boundary edge; an idle hung-up master posts NONE across {} reader-shaped passes covering {} us of wall clock, one window of them paced at the daemon's own 5 ms `IDLE_POLL`; a master with a client attached and idle posts none either; and the same latch DID post the boundary this probe then produced on purpose, which is what makes those zeros a measurement rather than an inert instrument. `pty.rs`'s `saw_session` latch is armed by the edge where this kernel keeps no readable evidence, so detach-release covers the `stty`/health-check/scripted shape (§6, §15.39). This is the mechanism `p9_pty_collapse` asserts end to end here.",
+            f.idle_passes, f.idle_elapsed_us)),
+        Some(false) => (
+            Status::Degraded,
+            "A collapsed termios-only session posts NO session-boundary edge on this kernel, and the failure is specific rather than instrumental: the same mechanism did post the control boundary this probe produced on purpose. With P7 also reporting nothing readable, `pty.rs`'s last-close latch has neither mechanism to arm on, so a client that opens, calls tcsetattr and closes inside one poll gap keeps its write lock until the node is removed or another writer steals it (§6) — silently. Read P7 beside this: if *it* is `supported`, the packet is carrying detach-release here and this is only an unused second route.".to_owned(),
+        ),
+        None => (
+            Status::Degraded,
+            "The termios-only trial errored, so the shape §6 detach-release depends on is unmeasured here even though the anti-spin windows and the control both ran. Read P7: if it reports readable evidence, the packet route is intact regardless (§6, §15.39).".to_owned(),
+        ),
+    }
 }
 
 /// Does an edge latch on a pty master report a session that left nothing readable?
@@ -1120,29 +1347,28 @@ fn p12_idle_edges(passes: u32) -> anyhow::Result<u64> {
 /// write lock on every collapsed session, silently, which is precisely the failure
 /// P7's `degraded` arm describes and this probe's `degraded` arm inherits.
 ///
-/// Three things are reported and all three are load-bearing. Whether the
-/// **termios-only** shape posts an edge is the property `p9_pty_collapse` asserts
-/// end to end. Whether an **idle** master posts one is the anti-spin property: a
-/// non-zero count there means the last-close handler re-fires forever *and*
-/// releases a lock no client ever took, which is worse than the leak it fixes. And
-/// the **bare open/close** shape is reported because Darwin covers it where Linux
-/// does not — an asymmetry worth seeing in a diff rather than discovering.
+/// **Five things are reported and the last two are what make the first three
+/// readable.** Whether the **termios-only** shape posts an edge is the property
+/// `p9_pty_collapse` asserts end to end. Whether an **idle** master posts one is
+/// the anti-spin property: a non-zero count there means the last-close handler
+/// re-fires forever *and* releases a lock no client ever took, which is worse than
+/// the leak it fixes — and it is now asked twice, once back to back and once paced
+/// at the daemon's own 5 ms `IDLE_POLL`, each with the wall clock it covered. The
+/// **bare open/close** shape is reported because Darwin covers it where Linux does
+/// not — an asymmetry worth seeing in a diff rather than discovering. Then the two
+/// that were missing: a **negative control** (the same idle window with a client
+/// attached, where an edge would fire §6 detach-release mid-session), and a
+/// **positive control** — a slave opened and closed on the *same* master through
+/// the *same* latch, after the zeros above. Without it, "0 edges" is a reading a
+/// broken instrument and a quiet kernel produce identically, and `supported` off
+/// it is the vacuous verdict §9 names.
 pub fn p12_session_edge() -> Probe {
-    let p = Probe::new(
+    let mut p = Probe::new(
         "P12",
         "session-boundary edge on a pty master",
         "Does an edge latch report a collapsed client session that left nothing readable on the master, and does it stay silent while idle?",
     );
-    // The inert arm is not a failure: on Linux the retained packet is the
-    // mechanism and P7 measures it, so there is nothing here to be wrong.
-    if !cfg!(target_os = "macos") {
-        return p.verdict(
-            Status::skipped("serial-nexus-sys's SessionLatch is inert on this platform"),
-            "The session boundary is carried by the retained `TIOCPKT_IOCTL` packet here, which P7 measures — nothing is untested, only unmeasurable by this route (§15.39, §13).",
-        );
-    }
 
-    let mut p = p;
     let mut termios_edge = None;
     for shape in [
         SessionShape::OpenClose,
@@ -1165,37 +1391,66 @@ pub fn p12_session_edge() -> Probe {
         }
     }
 
-    let idle = p12_idle_edges(200);
-    p = p.observe(
-        "idle_edges_in_200_passes",
-        match &idle {
-            Ok(n) => serde_json::json!(n),
-            Err(e) => serde_json::json!(format!("probe error: {e}")),
-        },
-    );
+    let idle = p12_idle();
+    let facts = match &idle {
+        Ok(i) => {
+            p = p
+                // Unchanged key, unchanged loop, unchanged meaning: six committed
+                // artifacts carry it and a diff against them must stay lawful.
+                .observe("idle_edges_in_200_passes", i.tight.edges)
+                .observe("idle_window_tight", i.tight.observations())
+                .observe("idle_window_paced", i.paced.observations())
+                .observe("live_session_window", i.live.observations())
+                .observe("control_session_edge", i.control_edge)
+                .observe(
+                    "control_session_edge_pass",
+                    serde_json::json!(i.control_pass),
+                )
+                .observe("control_session_edge_us", i.control_us);
+            P12Facts {
+                termios_edge,
+                idle_edges: i.tight.edges + i.paced.edges,
+                live_session_edges: i.live.edges,
+                control_edge: i.control_edge,
+                idle_passes: i.tight.passes + i.paced.passes,
+                idle_elapsed_us: i.tight.elapsed_us + i.paced.elapsed_us,
+                measured: true,
+            }
+        }
+        Err(e) => {
+            p = p.observe("idle_windows", format!("probe error: {e}"));
+            P12Facts {
+                termios_edge,
+                idle_edges: 0,
+                live_session_edges: 0,
+                control_edge: false,
+                idle_passes: 0,
+                idle_elapsed_us: 0,
+                measured: false,
+            }
+        }
+    };
 
-    match (termios_edge, idle) {
-        (Some(true), Ok(0)) => p.verdict(
-            Status::Supported,
-            "A collapsed termios-only session posts a session-boundary edge and an idle hung-up master posts none in 200 reader-shaped passes: `pty.rs`'s `saw_session` latch is armed by the edge where this kernel keeps no readable evidence, so detach-release covers the `stty`/health-check/scripted shape (§6, §15.39). This is the mechanism `p9_pty_collapse` asserts end to end here.",
-        ),
-        // Any nonzero idle count is the dangerous direction and gets said first:
-        // it releases a lock nobody's client took, on every pass.
-        (_, Ok(n)) if n > 0 => p.verdict(
-            Status::Degraded,
+    // The inert arm is not a failure and its wording does not move — but it now
+    // reports the windows it ran, and that is deliberate. Where `SessionLatch` is
+    // inert, `control_session_edge: false` beside a full set of executed passes is
+    // the arm demonstrating itself inert on the one platform that can do so
+    // cheaply, which is the negative control the kernel that DEPENDS on this
+    // mechanism cannot provide for itself (§9). It also gives the Linux artifact a
+    // P12 subtree where it had a hole, which is what §7 asks of a cross-kernel
+    // instrument.
+    if !cfg!(target_os = "macos") {
+        return p.verdict(
+            Status::skipped("serial-nexus-sys's SessionLatch is inert on this platform"),
             &format!(
-                "An idle, hung-up master posted {n} session edge(s) in 200 passes. That re-fires `pty.rs`'s last-close handler on a pair no client has touched — releasing a write lock the operator took, and burning the runtime thread doing it. `SessionLatch`'s discard sites (§15.39) or this kernel's `EV_CLEAR` semantics have changed; re-check both before trusting detach-release here."
+                "The session boundary is carried by the retained `TIOCPKT_IOCTL` packet here, which P7 measures — nothing is untested, only unmeasurable by this route (§15.39, §13). The windows above ran anyway and are reported: `control_session_edge: {}` beside {} executed passes over {} us is this platform's inert arm proving itself inert, and a Linux report where that field read `true` would mean the latch had grown a second implementation nobody measured.",
+                facts.control_edge, facts.idle_passes, facts.idle_elapsed_us
             ),
-        ),
-        (Some(false), _) => p.verdict(
-            Status::Degraded,
-            "A collapsed termios-only session posts NO session-boundary edge on this kernel. With P7 also reporting nothing readable, `pty.rs`'s last-close latch has neither mechanism to arm on, so a client that opens, calls tcsetattr and closes inside one poll gap keeps its write lock until the node is removed or another writer steals it (§6) — silently. Read P7 beside this: if *it* is `supported`, the packet is carrying detach-release here and this is only an unused second route.",
-        ),
-        _ => p.verdict(
-            Status::Degraded,
-            "The session-edge measurement did not complete, so which mechanism carries detach-release on this kernel is unknown. Read P7: if it reports readable evidence, the packet route is intact regardless (§6, §15.39).",
-        ),
+        );
     }
+
+    let (status, consequence) = p12_verdict(facts);
+    p.verdict(status, &consequence)
 }
 
 // ---------------------------------------------------------------------------
@@ -2087,6 +2342,104 @@ struct Recheck {
     topup_ceiling_hit: bool,
 }
 
+/// What a `FIONREAD` reading is worth once a drain has said what was really there.
+///
+/// [`FillResult::peer_pending_input`] is the one field in this probe a reader can
+/// mistake for an *answer* — `0` looks like "the queue was empty" — and on a
+/// kernel of record it is wrong in exactly that direction: `docs/doctor/`'s six
+/// Darwin captures (`…-7ead470-tier3{,-2,-3}` and `…-1a9a8fc-tier3{,-2,-3}`) read
+/// `peer_pending_input_bytes: 0` beside `bytes_recovered_by_peer: 1024`
+/// targetward, byte-identical, across two binaries. So the report carries the
+/// classification instead of leaving it to be inferred (§7: name the observation),
+/// and it is **not** enough to compare against the depth: Linux answers correctly
+/// and still reads *less* than `recovered`, saturating at 4095 (the n_tty read
+/// buffer) with the whole 13824–15360 recoverable. Undercounting is a documented
+/// cap; claiming empty is a fault.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FionreadTrust {
+    /// The ioctl failed or is unimplemented: nothing to trust or distrust.
+    Unavailable,
+    /// The drain recovered nothing, so there is no reading to check against.
+    NothingToCheck,
+    /// `FIONREAD` matched what the drain then recovered, byte for byte.
+    Agrees,
+    /// `FIONREAD` reported some of what the drain recovered — a staging cap, not a
+    /// fault (Linux 7.0.0-29: 4095).
+    Undercounts,
+    /// `FIONREAD` reported MORE than the drain could recover.
+    Overcounts,
+    /// **It said empty and the very next `read(2)` returned bytes.** Taken with
+    /// both fills finished in `EAGAIN`, on this thread, with the drain as the next
+    /// statement and no writer anywhere — so no arrival-timing story explains it.
+    ContradictedEmpty,
+}
+
+impl FionreadTrust {
+    fn key(self) -> &'static str {
+        match self {
+            FionreadTrust::Unavailable => "unavailable",
+            FionreadTrust::NothingToCheck => "nothing-to-check",
+            FionreadTrust::Agrees => "agrees",
+            FionreadTrust::Undercounts => "undercounts",
+            FionreadTrust::Overcounts => "overcounts",
+            FionreadTrust::ContradictedEmpty => "contradicted-empty",
+        }
+    }
+
+    /// Where a reader must not take `peer_pending_input_bytes` at face value.
+    fn is_wrong(self) -> bool {
+        matches!(
+            self,
+            FionreadTrust::ContradictedEmpty | FionreadTrust::Overcounts
+        )
+    }
+}
+
+/// Pure and total, so the decision is testable on a kernel that cannot produce
+/// every row (§9). `Some(0)` with nothing recovered is `NothingToCheck` rather
+/// than `Agrees` on purpose: an empty queue agreeing with an empty reading is not
+/// evidence that the instrument works, and a gate reading `agrees` off it would
+/// pass vacuously.
+fn fionread_trust(at_drain: Option<u64>, recovered: u64) -> FionreadTrust {
+    match at_drain {
+        None => FionreadTrust::Unavailable,
+        Some(0) if recovered == 0 => FionreadTrust::NothingToCheck,
+        Some(0) => FionreadTrust::ContradictedEmpty,
+        Some(n) if n == recovered => FionreadTrust::Agrees,
+        Some(n) if n < recovered => FionreadTrust::Undercounts,
+        Some(_) => FionreadTrust::Overcounts,
+    }
+}
+
+/// One direction's instrument check, for [`p10_fionread_note`].
+struct FionreadCheck<'a> {
+    direction: &'a str,
+    at_drain: Option<u64>,
+    recovered: u64,
+    writer: Option<u64>,
+}
+
+/// The sentence P10 owes a reader when its own `FIONREAD` is provably wrong.
+/// Empty when every direction is sound, so a healthy report gains no prose.
+fn p10_fionread_note(checks: &[FionreadCheck<'_>]) -> String {
+    let mut out = String::new();
+    for c in checks {
+        let trust = fionread_trust(c.at_drain, c.recovered);
+        if !trust.is_wrong() {
+            continue;
+        }
+        out.push_str(&format!(
+            " **INSTRUMENT WARNING — `peer_pending_input_bytes` is provably wrong in the `{}` direction on this kernel and must not be read as an answer.** `FIONREAD` on the reading end reported **{}** byte(s) immediately before a drain that then recovered **{}**, with both fills finished in `EAGAIN` and no writer in between — so a `0` here does not mean \"the queue was empty\", it means the ioctl does not describe this fd's readable queue (`peer_pending_input_trust: {}`). `bytes_recovered_by_peer` is unaffected: it is a drain, not an ioctl, and it is the field to size anything against. The reading is reported rather than dropped because which kernels answer this ioctl correctly on a pty master, and in which direction, is itself the cross-kernel observation (§7) — Linux 7.0.0-29 answers exactly and saturates at 4095 (the n_tty read buffer) with the remainder still recoverable, and reads 0 on the *writing* fd in both directions. **Pre-registered so the next run settles the mechanism:** if a master's `FIONREAD` answers with the tty's *input* queue rather than its readable one, then `writer_pending_input_bytes` in the hostward direction — the master, which has nothing to read — comes back non-zero and equal to that direction's depth; it reads **{}** here, and a 0 there refutes that reading and leaves the mechanism open. Interpretable only with `slave_termios_mode: raw`, which this run reports: with ECHO on, a master legitimately has echoed bytes to read.",
+            c.direction,
+            c.at_drain.map(|n| n.to_string()).unwrap_or_else(|| "unavailable".to_owned()),
+            c.recovered,
+            trust.key(),
+            c.writer.map(|n| n.to_string()).unwrap_or_else(|| "unavailable".to_owned()),
+        ));
+    }
+    out
+}
+
 struct FillResult {
     bytes: u64,
     writes: u64,
@@ -2131,6 +2484,17 @@ struct FillResult {
     /// see yet (on Linux this caps at the ldisc read buffer, ~4 KiB, which is the
     /// number that explains the second pass).
     peer_pending_input: Option<u64>,
+    /// The **second** `FIONREAD` on the reading end, taken immediately before the
+    /// drain. The field above it is sampled mid-measurement, before the second
+    /// fill pass, so a disagreement there always has an innocent reading — bytes
+    /// arrived later. This one has none, and that is the entire reason it exists:
+    /// it is the sample a contradiction can be *proved* against.
+    peer_pending_input_at_drain: Option<u64>,
+    /// `FIONREAD` on the **written** fd, where a correct implementation reports 0
+    /// — measured `Some(0)` in both directions on Linux 7.0.0-29. The
+    /// discriminator for *why* a peer-side reading can be wrong; see
+    /// [`p10_fionread_note`]'s pre-registration.
+    writer_pending_input: Option<u64>,
     /// `TIOCOUTQ` on the written fd. **Reported, never judged** — a pty has no
     /// transmitter to drain and answers 0 on Linux 7.0 in every state; whether a
     /// given kernel accounts for a pty here at all is exactly the quiet
@@ -2170,6 +2534,10 @@ impl FillResult {
             "terminal_write": self.terminal,
             "terminal_write_after_settle": self.settled_terminal,
             "peer_pending_input_bytes": self.peer_pending_input,
+            "peer_pending_input_bytes_at_drain": self.peer_pending_input_at_drain,
+            "peer_pending_input_trust":
+                fionread_trust(self.peer_pending_input_at_drain, self.recovered).key(),
+            "writer_pending_input_bytes": self.writer_pending_input,
             "pending_output_bytes": self.pending_output,
             "slave_termios_mode": self.slave_mode,
             "bytes_recovered_by_peer": self.recovered,
@@ -2252,7 +2620,7 @@ pub fn p10_pty_buffer_depth() -> Probe {
             p.verdict(
                 status,
                 &format!(
-                    "This kernel's pty accepted {} byte(s) slave→master (**targetward** — a client typing, travelling toward the device, first pass ending in `{}`) and {} byte(s) master→slave (**hostward** — the node delivering device output to its client, ending in `{}`), reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. **Of those, {} and {} byte(s) were actually recoverable by the peer** ({} / {}): acceptance is not delivery, and the two are the same number only on a kernel that queues everything it takes. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands, so a one-chunk difference across kernels is noise; only an order-of-magnitude one is signal, **and only between runs whose `slave_termios_mode` agrees** — a cooked pty and a raw one give different depths on one kernel (measured on Linux 7.0.0-29: raw ~13.8 KiB fully recoverable, cooked ~23.5 KiB with nothing recoverable), so a mode mismatch explains a gap before any kernel difference does. The `recheck` block under each direction asks the second question the first cannot: after the peer is drained, the pair is refilled from empty and then handed back 512 bytes, and `room_republished_minus_room_freed` says whether the kernel gave back exactly the room a reader freed (a fixed queue capacity), or more (an asynchronous pipeline that advanced during the settle — Linux 7.0.0-29 reads +2048 or +9216, bimodal, never 0 across 20 samples), or less (a reservation charged per fill). `refill_reproduced_total` says whether the depth above is reproducible on the same pair at all; on Linux it usually is not. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}{}",
+                    "This kernel's pty accepted {} byte(s) slave→master (**targetward** — a client typing, travelling toward the device, first pass ending in `{}`) and {} byte(s) master→slave (**hostward** — the node delivering device output to its client, ending in `{}`), reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. **Of those, {} and {} byte(s) were actually recoverable by the peer** ({} / {}): acceptance is not delivery, and the two are the same number only on a kernel that queues everything it takes. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands, so a one-chunk difference across kernels is noise; only an order-of-magnitude one is signal, **and only between runs whose `slave_termios_mode` agrees** — a cooked pty and a raw one give different depths on one kernel (measured on Linux 7.0.0-29: raw ~13.8 KiB fully recoverable, cooked ~23.5 KiB with nothing recoverable), so a mode mismatch explains a gap before any kernel difference does. The `recheck` block under each direction asks the second question the first cannot: after the peer is drained, the pair is refilled from empty and then handed back 512 bytes, and `room_republished_minus_room_freed` says whether the kernel gave back exactly the room a reader freed (a fixed queue capacity), or more (an asynchronous pipeline that advanced during the settle — Linux 7.0.0-29 reads +2048 or +9216, bimodal, never 0 across 20 samples), or less (a reservation charged per fill). `refill_reproduced_total` says whether the depth above is reproducible on the same pair at all; on Linux it usually is not. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}{}{}",
                     targetward.bytes,
                     targetward.terminal,
                     hostward.bytes,
@@ -2272,7 +2640,21 @@ pub fn p10_pty_buffer_depth() -> Probe {
                         String::new()
                     } else {
                         format!(" DEGRADED: the measured slave was `{}` targetward and `{}` hostward, not the raw baseline the daemon runs (§7.2), so these depths are not the daemon's configuration and must not be diffed against a run that was raw.", targetward.slave_mode, hostward.slave_mode)
-                    }
+                    },
+                    p10_fionread_note(&[
+                        FionreadCheck {
+                            direction: "slave_to_master_targetward",
+                            at_drain: targetward.peer_pending_input_at_drain,
+                            recovered: targetward.recovered,
+                            writer: hostward.writer_pending_input,
+                        },
+                        FionreadCheck {
+                            direction: "master_to_slave_hostward",
+                            at_drain: hostward.peer_pending_input_at_drain,
+                            recovered: hostward.recovered,
+                            writer: hostward.writer_pending_input,
+                        },
+                    ]),
                 ),
             )
         }
@@ -2345,6 +2727,13 @@ fn p10_fill(write_to: RawFd, peer: RawFd, slave_mode: &'static str) -> FillResul
     std::thread::sleep(P10_SETTLE);
     let peer_pending_input = sys::pending_input_bytes(peer).ok().map(|n| n as u64);
     let pending_output = sys::pending_output_bytes(write_to).ok().map(|n| n as u64);
+    // Same instant as the two above, and worth its syscall because it is the
+    // DISCRIMINATOR for a wrong peer-side reading: on a correct implementation the
+    // writer's own readable queue is empty in both directions (Linux 7.0.0-29,
+    // `Some(0)` both ways). A kernel answering `FIONREAD` on a pty master out of
+    // the tty's *input* queue instead of its readable one reads that direction's
+    // depth here — on the fd that has nothing to read at all.
+    let writer_pending_input = sys::pending_input_bytes(write_to).ok().map(|n| n as u64);
     let (settled_bytes, settled_writes, settled_terminal, hit_b) = p10_fill_pass(write_to, bytes);
 
     // **The measurement this probe was missing.** Everything above counts what
@@ -2357,6 +2746,11 @@ fn p10_fill(write_to: RawFd, peer: RawFd, slave_mode: &'static str) -> FillResul
     // Runs last, after every other observation, because it is the one step that
     // changes the state it measures. Bounded by the same ceiling and reading a
     // non-blocking fd, so it can neither loop nor block.
+    //
+    // The reading that can be CHECKED — see `FillResult::peer_pending_input_at_drain`.
+    // Deliberately the statement immediately before the drain: nothing runs between
+    // the ioctl and the first `read(2)` it can be contradicted by.
+    let peer_pending_input_at_drain = sys::pending_input_bytes(peer).ok().map(|n| n as u64);
     let recovered = p10_drain(peer);
 
     // Everything above is final and the peer is now empty, which is both the
@@ -2373,6 +2767,8 @@ fn p10_fill(write_to: RawFd, peer: RawFd, slave_mode: &'static str) -> FillResul
         terminal,
         settled_terminal,
         peer_pending_input,
+        peer_pending_input_at_drain,
+        writer_pending_input,
         pending_output,
         slave_mode,
         recovered,
@@ -5630,6 +6026,212 @@ mod tests {
              no longer discriminates and the recoverability field is untested",
             cooked.recovered,
             cooked.total()
+        );
+    }
+
+    /// **The classification is the fix, so it is tested where the measurement
+    /// cannot be taken.** Every row below is a reading a committed
+    /// `docs/doctor/` artifact carries, including two this kernel cannot produce:
+    /// Darwin's targetward `0` beside 1024 recovered (6 of 6 runs across two
+    /// binaries) and its hostward exact 1022. §9's proxy-in-space rule cuts both
+    /// ways — a decision may not be *asserted* on a kernel it was not measured on,
+    /// but a pure function of measured numbers may and must be.
+    #[test]
+    fn fionread_trust_separates_a_documented_cap_from_a_contradicted_zero() {
+        // Linux 7.0.0-29, both directions, `linux-7.0-2026-08-05b-tier3*.json`.
+        assert_eq!(
+            fionread_trust(Some(4095), 15360),
+            FionreadTrust::Undercounts
+        );
+        assert_eq!(
+            fionread_trust(Some(4095), 13824),
+            FionreadTrust::Undercounts
+        );
+        // Darwin 24.6.0, `macos-24.6.0-2026-08-05-1a9a8fc-tier3*.json`.
+        assert_eq!(
+            fionread_trust(Some(0), 1024),
+            FionreadTrust::ContradictedEmpty
+        );
+        assert_eq!(fionread_trust(Some(1022), 1022), FionreadTrust::Agrees);
+        // The shapes no artifact carries yet, pinned so they cannot drift.
+        assert_eq!(fionread_trust(None, 1024), FionreadTrust::Unavailable);
+        assert_eq!(fionread_trust(Some(0), 0), FionreadTrust::NothingToCheck);
+        assert_eq!(fionread_trust(Some(5), 0), FionreadTrust::Overcounts);
+        assert!(FionreadTrust::ContradictedEmpty.is_wrong());
+        assert!(!FionreadTrust::Undercounts.is_wrong());
+    }
+
+    /// The warning must fire on the Darwin reading, name the direction it applies
+    /// to, and stay silent on a healthy one — a note that fired on Linux's 4095
+    /// would be an operator learning to ignore it.
+    #[test]
+    fn p10_fionread_note_fires_only_where_the_reading_is_contradicted() {
+        let healthy = [
+            FionreadCheck {
+                direction: "slave_to_master_targetward",
+                at_drain: Some(4095),
+                recovered: 15360,
+                writer: Some(0),
+            },
+            FionreadCheck {
+                direction: "master_to_slave_hostward",
+                at_drain: Some(4095),
+                recovered: 15360,
+                writer: Some(0),
+            },
+        ];
+        assert!(
+            p10_fionread_note(&healthy).is_empty(),
+            "Linux's 4095-of-15360 is the n_tty read-buffer cap, not a fault, and a \
+             warning there trains the reader to skip the one that matters"
+        );
+        let darwin = [
+            FionreadCheck {
+                direction: "slave_to_master_targetward",
+                at_drain: Some(0),
+                recovered: 1024,
+                writer: Some(0),
+            },
+            FionreadCheck {
+                direction: "master_to_slave_hostward",
+                at_drain: Some(1022),
+                recovered: 1022,
+                writer: Some(1022),
+            },
+        ];
+        let note = p10_fionread_note(&darwin);
+        assert!(
+            note.contains("slave_to_master_targetward"),
+            "the note must name the direction"
+        );
+        assert!(note.contains("1024") && note.contains("contradicted-empty"));
+        assert!(
+            note.contains("writer_pending_input_bytes"),
+            "the discriminator must be quoted"
+        );
+    }
+
+    /// **The calibration the Darwin finding rests on.** Linux-gated because it
+    /// asserts a kernel behaviour measured on Linux; running it where it was not
+    /// measured is the proxy §9 forbids, and on Darwin it would assert the very
+    /// defect being reported.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn p10_fionread_is_trustworthy_on_the_platform_of_record() {
+        for targetward in [true, false] {
+            let f = p10_fill_direction(targetward).expect("fill one direction");
+            let trust = fionread_trust(f.peer_pending_input_at_drain, f.recovered);
+            assert!(
+                matches!(trust, FionreadTrust::Agrees | FionreadTrust::Undercounts),
+                "FIONREAD on this Linux pty classified `{}` ({:?} readable at the drain, \
+                 {} recovered): either the at-drain sample moved after the drain, or the \
+                 platform of record has stopped answering this ioctl — and the Darwin \
+                 finding in notes §3.45 (iv) rests on Linux answering it correctly",
+                trust.key(),
+                f.peer_pending_input_at_drain,
+                f.recovered
+            );
+            assert_eq!(
+                f.writer_pending_input,
+                Some(0),
+                "the writing fd reported {:?} bytes readable on a raw pair; the \
+                 hostward-master pre-registration in the P10 consequence reads a \
+                 non-zero here as \"this kernel answers FIONREAD out of the tty input \
+                 queue\", so a non-zero on LINUX would invalidate that discriminator",
+                f.writer_pending_input
+            );
+        }
+    }
+
+    /// **The defect, as a table.** `supported` off a latch that never proved it
+    /// could post an edge is the vacuous verdict §9 names, and six committed
+    /// artifacts carry exactly that shape.
+    #[test]
+    fn p12_verdict_refuses_supported_from_an_unproven_latch() {
+        let good = P12Facts {
+            termios_edge: Some(true),
+            idle_edges: 0,
+            live_session_edges: 0,
+            control_edge: true,
+            idle_passes: 264,
+            idle_elapsed_us: 325_000,
+            measured: true,
+        };
+        assert!(matches!(p12_verdict(good).0, Status::Supported));
+        let (s, c) = p12_verdict(good);
+        assert!(
+            c.contains("325000 us"),
+            "the supported arm must quote its wall clock: {c}"
+        );
+        let _ = s;
+
+        let vacuous = P12Facts {
+            control_edge: false,
+            ..good
+        };
+        let (s, c) = p12_verdict(vacuous);
+        assert!(
+            matches!(s, Status::Degraded),
+            "P12 reported `supported` from a latch that posted no edge for a boundary \
+             this probe produced on purpose — that zero is an inert instrument, not a \
+             quiet kernel (notes §3.45 iii)"
+        );
+        assert!(c.contains("SO IS THE INSTRUMENT"));
+
+        let no_window = P12Facts {
+            idle_passes: 0,
+            idle_elapsed_us: 0,
+            ..good
+        };
+        assert!(matches!(p12_verdict(no_window).0, Status::Degraded));
+
+        let spin = P12Facts {
+            idle_edges: 3,
+            ..good
+        };
+        assert!(p12_verdict(spin).1.contains("re-fires"));
+
+        let mid_session = P12Facts {
+            live_session_edges: 1,
+            ..good
+        };
+        assert!(
+            p12_verdict(mid_session).1.contains("ATTACHED"),
+            "an edge with a client attached releases a live write lock and must be \
+             said in its own words, not folded into the idle count"
+        );
+
+        let unmeasured = P12Facts {
+            measured: false,
+            ..good
+        };
+        assert!(matches!(p12_verdict(unmeasured).0, Status::Degraded));
+    }
+
+    /// The windows must execute where the latch is inert — that is what makes a
+    /// Linux report's `control_session_edge: false` a negative control rather than
+    /// a missing field.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn p12_windows_execute_where_the_latch_is_inert() {
+        let i = p12_idle().expect("the windows run on any platform with a pty");
+        assert_eq!(i.tight.passes, P12_TIGHT_PASSES);
+        assert_eq!(i.paced.passes, P12_PACED_PASSES);
+        assert!(
+            i.paced.elapsed_us >= 200_000,
+            "the paced window covered {} us for {} passes at a {} us cadence — the \
+             pause is not being taken, and the wall-clock witness is the fix",
+            i.paced.elapsed_us,
+            i.paced.passes,
+            i.paced.pause_us
+        );
+        assert!(!i.tight.reads.is_empty() && !i.live.reads.is_empty());
+        assert!(
+            !i.control_edge,
+            "`SessionLatch` posted a session edge on a platform whose arm is \
+             documented inert (§15.39). That is a finding, not a test failure: \
+             P12's Linux `skipped` verdict and its consequence both say this \
+             cannot happen."
         );
     }
 }

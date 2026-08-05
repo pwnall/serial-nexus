@@ -3050,7 +3050,7 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **748 passing, 0 failed, 4 ignored** across 113 test
+The current whole-suite figure is **753 passing, 0 failed, 4 ignored** across 113 test
 targets on Linux (2026-08-05: §3.49's three P5 guards plus its `serial_nexus_sys`
 `ICOUNTS_SUPPORTED` guard, added to two existing targets; §3.38's listener-barrier guard, §3.39's orphan-leash fixture and guard, §3.40's two baseline guards, and earlier the same day the three doctor guards of §3.34 and the kernel-naming fix
 — `termios_mode_tells_the_daemons_baseline_from_a_cooked_pty`,
@@ -5099,9 +5099,19 @@ this is the platform its mechanism is load-bearing on (the status set `supported
 shares with P2 and P13) — exports **no wall-clock witness**: its anti-spin claim is
 `idle_edges_in_200_passes: 0` with no elapsed time and no live-master negative control, where P6
 reports `elapsed_ms: 163` over its 64 passes.
+<!-- ANNOTATION 2026-08-05 (§5): *Fixed in §3.50* — and the unit named here is the one thing that
+     could not be copied from P6. The tight window costs 134–175 us on Linux 7.0.0-29, so
+     `elapsed_ms` would have printed `0` and witnessed nothing; the witness is microseconds. §3.50
+     also adds the positive control this item did not ask for and the zero needs. -->
 (iv) `P10.slave_to_master_targetward.peer_pending_input_bytes` reads **0** beside
 `bytes_recovered_by_peer: 1024` in 3 of 3 runs, so FIONREAD on a Darwin ptmx master is
-direction-dependently wrong, and `0` there cannot be read as "empty". (v) Shipped P10 prose says
+direction-dependently wrong, and `0` there cannot be read as "empty".
+<!-- ANNOTATION 2026-08-05 (§5): *Fixed in §3.50*, and the tally is corrected: **6 of 6**, not 3 of
+     3. The same 0/1024 targetward and 1022/1022 hostward reading is byte-identical across
+     `macos-24.6.0-2026-08-05-7ead470-tier3{,-2,-3}.json` AND
+     `macos-24.6.0-2026-08-05-1a9a8fc-tier3{,-2,-3}.json` — two binaries, six captures, verified
+     field by field against the committed artifacts rather than recalled. -->
+(v) Shipped P10 prose says
 *"`refill_reproduced_total` … on Linux it usually is not"*, which the committed `-05b` triple reads
 as **3 of 6**. That is *not* filed as a defect: §3.44's 20-sample calibration records "reproduces
 `total()` once in 20", which supports the shipped sentence, and six samples do not overturn twenty.
@@ -5299,6 +5309,145 @@ the lane nobody is standing on.
 `canonical: 2` and a character-identical consequence; the Darwin shape, reproduced on Linux through
 the `--dev-root` seam, now reports `degraded` with `canonical: 0`, `unidentified: 4`, and each
 device's `raw:` identity named.
+
+### 3.50 P12's zero and P10's zero: two reported numbers that could not be read, and the witnesses that make them readable
+
+**Design:** §15.17 — a probe emits its raw measurements and names a differing kernel's observation.
+No amendment is owed; this brings P10 and P12 into compliance with it. Closes §3.45 (iii) and (iv).
+
+**Both defects are the same shape: a `0` printed with nothing beside it that says what the `0`
+means.** P12 printed `idle_edges_in_200_passes: 0` and concluded `supported` — with no elapsed time,
+no control, and no way to tell a quiet kernel from an instrument that could not have posted an edge
+at all. P10 printed `peer_pending_input_bytes: 0` beside `bytes_recovered_by_peer: 1024` and left the
+contradiction to be noticed by eye. Both fixes are additive: **no existing field moved**, and
+`idle_edges_in_200_passes` keeps its key, its 200-pass count and its unpaced shape precisely because
+six committed artifacts carry it (§16.13).
+
+**The witness had to be microseconds, and that is measured rather than styled.** P12's idle loop is
+untimed *and* unpaced. On Linux 7.0.0-29 the 200 back-to-back `poll`+`read` passes over a hung-up
+master cost **134 / 138 / 175 / 137 us** across four runs — a `elapsed_ms` field copied from P6 would
+have printed `0` on every one of them and taught a reader nothing. The proof is not an argument: with
+the paced window's pause forced to zero, 64 passes measured **33 us**. Darwin's zero-timeout poll on
+a hung-up master is 1458–2057 ns (§3.45 B), so the same loop is far under a millisecond there too.
+
+**A second window is paced at the daemon's own `IDLE_POLL` (5 ms), because that is the loop
+`nodes/pty.rs` runs.** "200 back-to-back syscalls post no edge" and "an idle master posts no edge at
+the cadence the daemon polls at" are different claims, and only the pair discriminates: an edge
+appearing only in the paced window is time-driven, one appearing only in the tight window is
+syscall-driven. 64 passes × 5 ms measures **326501 / 329049 / 325851 / 329361 us** here.
+
+**The zero needs a positive control on the same latch instance, and this is the load-bearing half.**
+The three shape trials each build their own pty and their own `SessionLatch`, so a latch that went
+deaf on the *idle* pair is invisible to them. `EV_CLEAR` on a master already hung up at `watch()`
+time — whose registration edge `watch()` deliberately swallows — is exactly the shape where "0 edges"
+could be *structurally guaranteed* rather than measured. So after the idle windows the probe opens
+and closes a slave on the **same master through the same latch** and asks again; if that boundary
+posts nothing, every zero above is an inert instrument and `p12_verdict` refuses `supported`, saying
+`unmeasured`, not `quiet`. A third window (slave open, idle) is the negative control: an edge *there*
+fires §6 detach-release mid-session and hands away the write lock of a client that never left — the
+mirror image of the spin, and nothing had measured it.
+
+**The decision is a pure function, because the platform of record cannot produce a single row of its
+input.** `SessionLatch` is inert on Linux, so no Linux run can exercise the Darwin verdict. `P12Facts`
+→ `p12_verdict` factors the judgement out of the fds, and `p12_verdict_refuses_supported_from_an_unproven_latch`
+regression-tests it here. §9's proxy-in-space rule cuts both ways: a decision may not be *asserted* on
+a kernel it was not measured on, but a pure function of measured numbers may and must be.
+
+**Linux runs the windows anyway, and reports them.** The `skipped` verdict and its wording do not
+move, but `control_session_edge: false` beside a full set of executed passes is the inert arm
+**proving itself inert** — the negative control the kernel that depends on this mechanism cannot
+provide for itself. A Linux report where that field read `true` would mean the latch had grown a
+second implementation nobody measured. Measured here: `idle_window_tight` 200/200 poll events, all
+`EIO`; `idle_window_paced` 64/64, all `EIO`; `live_session_window` 0 poll events, all `EAGAIN` (the
+attached-client shape, visibly different); `control_session_edge_us` 81505–82263.
+
+**P10: the field is wrong on one kernel, and its being wrong is the finding — so it is not deleted.**
+Verified against the artifacts rather than recalled: `peer_pending_input_bytes: 0` beside
+`bytes_recovered_by_peer: 1024` targetward, and `1022` beside `1022` hostward, byte-identical across
+**6 of 6** Darwin captures spanning two binaries (`…-7ead470-tier3{,-2,-3}` and
+`…-1a9a8fc-tier3{,-2,-3}`). §3.45 (iv) said 3 of 3; corrected there in place.
+
+**`pp < recovered` is NOT the fault signature.** Linux answers this ioctl correctly and still reads
+*less* than the drain recovers, saturating at **4095** (the n_tty read buffer) against 13824–15360
+recoverable, in 6 of 6 committed `-05b` observations and every run taken here. Undercounting is a
+documented staging cap; claiming **empty** is the fault. `fionread_trust` separates them —
+`agrees` / `undercounts` / `overcounts` / `contradicted-empty` / `nothing-to-check` / `unavailable` —
+and `Some(0)` with nothing recovered classifies `nothing-to-check` rather than `agrees` on purpose:
+an empty queue agreeing with an empty reading is not evidence the instrument works, and a gate
+reading `agrees` off it would pass vacuously.
+
+**The old sample could not prove a contradiction; the new one can.** `peer_pending_input` is taken
+mid-measurement, *before* the second fill pass, so a disagreement there always had an innocent
+reading — bytes arrived later. `peer_pending_input_bytes_at_drain` is taken as the statement
+**immediately before** `p10_drain`, with both fills finished in `EAGAIN` and no writer anywhere, so
+nothing runs between the ioctl and the first `read(2)` that can contradict it.
+
+**Two pre-registrations, so the next Darwin run settles the mechanism rather than restating it.**
+(1) `writer_pending_input_bytes` — `FIONREAD` on the *written* fd, which has nothing to read. Linux
+answers `Some(0)` in both directions in every run taken here. If a Darwin master answers out of the
+tty's **input** queue rather than its readable one, the hostward figure (the master's own reading)
+comes back non-zero and equal to that direction's depth; a `0` there **refutes** that reading and
+leaves the mechanism open. (2) The classification is interpretable only under
+`slave_termios_mode: raw`, which the probe already reports — with ECHO on, a master legitimately has
+echoed bytes to read.
+
+**P10's status is deliberately unchanged.** Its `degraded` arm means "the depth you are reading is
+another configuration's" (§3.34). Folding an auxiliary ioctl fault into that word would make Darwin
+permanently yellow, masking a real mode degradation later, and would lose the direction — a
+probe-level word cannot say *which* of the two blocks is affected, and only one is. §7's "name the
+observation" is met by a machine-readable field per direction plus an unmissable consequence
+sentence; the depth question the probe exists to answer was answered correctly.
+
+**Gates: presence, never answer.** Both expectation files require the three P10 keys in *both*
+directions and P12's control plus a numeric `idle_window_paced.elapsed_us`/`passes`, with a named-error
+hatch (`idle_windows`) for a box where the windows could not run. A kernel whose FIONREAD differs must
+**report**, not fail (§7). Ten cases were run rather than predicted: the live post-fix report is
+accepted; the committed pre-fix Linux artifact is rejected; deleting the trust key from **one**
+direction, deleting either new P10 key, reducing P12 to the bare `idle_edges_in_200_passes`, deleting
+`control_session_edge`, and deleting the paced `elapsed_us` are each rejected; the named-error hatch
+and a `skipped` P10 with no observations are each accepted. On the macOS lane the same three cases
+were run against a Darwin artifact — the pre-fix capture passes HEAD's `macos.jq` and is rejected by
+the new one, and a synthesized post-fix report carrying the finding's own values (`0`/1024
+targetward, `contradicted-empty`) is accepted.
+
+**Fail-first, six mutations, each red with the message it names (§9).** Deleting `p12_verdict`'s
+control arm makes the vacuous row report `supported` and reds
+*"P12 reported `supported` from a latch that posted no edge for a boundary this probe produced on
+purpose"*. Deleting its wall-clock arm greens the `no_window` row. Moving the at-drain sample to
+*after* the drain reds the Linux calibration with *"FIONREAD on this Linux pty classified
+`contradicted-empty` (Some(0) readable at the drain, 15360 recovered)"* — which is the proof that
+guard tests the **ordering** the contradiction claim rests on, not merely the ioctl's existence.
+Pointing the writer sample at the peer reds it with `Some(4095)` against `Some(0)`, naming the
+invalidated discriminator. Classifying `Some(0)` as `Agrees` reds the Darwin row; classifying the
+4095 cap as `ContradictedEmpty` reds the Linux row *and* the note guard with *"Linux's 4095-of-15360
+is the n_tty read-buffer cap, not a fault"* — proving the warning cannot be trained away by firing
+everywhere. Forcing the paced pause to zero reds the window guard at **33 us**, which is the
+microsecond decision restated as a failure.
+
+**The Linux output moved exactly where it was predicted to and nowhere else.** Comparing a pristine
+`df48bfc` binary against this one on the same box: **41 newly-present observation leaf paths, zero
+absent** (299 → 340) — six on P10 (three keys × two directions) and the rest a P12 subtree that was
+empty here. `probe_set` reads `a131e1f4b46d6c83` on both, which is §3.45's counterexample to
+"equal `probe_set` ⇒ field-by-field comparable", now created **deliberately** rather than found.
+One field that *looks* like a move is not one: `recheck.room_republished_minus_room_freed` read 9216
+in the first pre-change run and 2048 after, so it was measured on both binaries, four runs each,
+under the same load — both produce the documented 2048/9216 bimodal (pre: 2048 ×4, 9216 ×4; post:
+2048 ×7, 9216 ×1), and all six committed `-05b` observations read 2048. Scheduling, not the change
+(§8).
+
+**Cost, named because it is the whole price:** the doctor run goes **2.75 s → 3.74 s** on Linux
+(3 runs each, load 2.25) — two paced windows and a live one at 64 × 5 ms, an ≤80 ms control, and the
+three shape trials, which on Linux used to be skipped by the early return and now execute. On macOS
+the shape trials already ran, so the delta there is the windows alone.
+
+**Gates:** `cargo build --workspace --locked`; `cargo test --workspace --locked --no-fail-fast` —
+**744 → 753 passing / 0 failed / 4 ignored** across 113 test-result targets (measured with §3.49's four landed alongside), the +5 attributable here being this
+entry's guards on the existing `serial-nexus-doctor` target (all five run on Linux; three on macOS,
+since one is Linux-gated and one not-macOS-gated, both deliberately); `cargo fmt --all --check`;
+`cargo clippy --workspace --all-targets --locked -- -D warnings`;
+`serial-nexus-doctor --json | jq -e -f expectations/linux.jq` exits 0. macOS is unrun here — this was
+a Linux box, and the P12 probe body is unmeasurable on it by construction, which is exactly why the
+verdict was factored into a pure function.
 
 ---
 
