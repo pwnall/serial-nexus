@@ -386,14 +386,19 @@ const BANNED_CONTEXT: &[&str] = &["closed source", "closed repo", "known reposit
 /// these three files are precisely the ones a well-meaning edit would add a fourth
 /// mention to.
 const BAN_STATEMENTS: &[(&str, usize)] = &[
-    ("docs/35-design-claude-fable-v14.md", 3),
-    ("docs/36-implementation-plan-claude-fable-v14.md", 3),
+    ("docs/39-design-claude-fable-v15.md", 3),
+    ("docs/40-implementation-plan-claude-fable-v15.md", 3),
     ("AGENTS.md", 3),
-    // The archived operating manual carries the same §10 rule statement. It is under
-    // `docs/historical/`, which buys it nothing here — §15.41 outranks the frozen-history
-    // rule — but a rule still has to be able to name what it bans, in whatever generation
-    // states it.
+    // The archived operating manual and the superseded v14 pair carry the same rule
+    // statements. They are under `docs/historical/`, which buys them nothing here —
+    // §15.41 outranks the frozen-history rule — but a rule still has to be able to name
+    // what it bans, in whatever generation states it.
     ("docs/historical/34-claude-fable-agents.md", 3),
+    ("docs/historical/35-design-claude-fable-v14.md", 3),
+    (
+        "docs/historical/36-implementation-plan-claude-fable-v14.md",
+        3,
+    ),
 ];
 
 /// **§15.41's privacy rule, with no historical exemption.**

@@ -1,16 +1,95 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-07-30 (**phases 0-8 + simplification + extension + web-console + v10 + v11
+**As of:** 2026-08-05 (**phases 0-8 + simplification + extension + web-console + v10 + v11
 console-map + review-26 remediation + v12 graph-editing + v13 browser-UI automation +
 review-32 remediation tracks done**, plus the **v14 rename track** — every binary, crate
 and default path moved to the `serial-nexus-*` / `serial_nexus_*` family, design §15.40,
-plan §17, with the consumer-context scrub of §15.41 beside it — and the **review-37
-remediation**, all 82 findings dispositioned.)
+plan §17, with the consumer-context scrub of §15.41 beside it — the **review-37
+remediation**, all 82 findings dispositioned, the 2026-08-05 doctor/rig/replug sessions
+(§3.29–§3.54 below), and the **v15 documentation generation** (entry below).)
 **Branch:** `implementation` (off `main`).
-**Normative docs are now v14:** `docs/35-design-claude-fable-v14.md` (design) and
-`docs/36-implementation-plan-claude-fable-v14.md` (plan). v1–v13 docs, the reviews and their
-remediation ledgers are in `docs/historical/`. Section references (§) point at the v14
+**Normative docs are now v15:** `docs/39-design-claude-fable-v15.md` (design) and
+`docs/40-implementation-plan-claude-fable-v15.md` (plan). v1–v14 docs, the reviews and their
+remediation ledgers are in `docs/historical/`. Section references (§) point at the v15
 design.
+
+---
+
+## THE v15 GENERATION — the record becomes the documents (2026-08-05 session)
+
+**What landed.** A new normative pair: `docs/39-design-claude-fable-v15.md` +
+`docs/40-implementation-plan-claude-fable-v15.md`, with the v14 pair moved to
+`docs/historical/` and the two entry points (AGENTS.md §2, README's documentation index)
+bumped in the same commit, plus the one gate table that names the pair as ban-statement
+files (`itest/tests/meta_names.rs`, `BAN_STATEMENTS`) — which makes that table a *third*
+place that names the pair by filename, corrected in AGENTS §2's wording this session
+rather than left as a false "only two".
+
+**The alignment pass ran first, by construction.** The v12 and v13 generations were both
+rebased from stale bases and silently dropped rules the code still enforced; the standing
+first step (this file, "The document alignment pass") is a sentence-granular diff proving
+the new text is the old text plus only intended changes. v15 was produced by *starting
+from the v14 bytes* (`cp`, then targeted edits), so the diff is the intended change set by
+construction. The intended changes, exhaustively: (1) the review-37 `justify` annotations
+restated as primary text at their sources — §11's load/add-node asymmetry (37-CFG-1),
+§15.21's shipped-certificate scope (37-TOOL-3), §13's serial2 open-flags sentence
+(37-SER-3), §17's eviction-bounded pre-auth pool (37-WEBS-6), plan §3's shipped sim flag
+set and phase-6 item 5 (37-TOOL-6); (2) contract text the post-v14 record earned, folded
+into §4 (rule-2 misreading), §6 (synchronous grant-purge, reclaim-does-not-purge,
+per-chunk leg provenance), §7.2 (`prime_slave` named; the measured Darwin `TIOCPKT` byte),
+§7.3 (scan-failure and failed-rotation semantics), §7.4 (listen-role bind retry), §10
+(the `tap.closed` terminal lane; the pinned-write rule), §11 (`-32007`; the §15.42
+barrier cross-reference), §12 (the enumerated one-source doors; the measured replug
+premise), §15.44 (the committed passive/rig counterexample; the withdrawn 32/35 figures),
+§16 (addendum 16.14), and §17 (the refusal-observability/lingering-close contract with
+its measured numbers); (3) five new design entries, §15.46–§15.50 (instrument
+self-testimony; the portable certificate; the provider seam and last-hop physics; the
+zero-witness doctrine; the teardown ledger), each citing its §3 entries and artifacts;
+(4) plan §3's harness doctrine extended from seven rules to sixteen; (5) plan §18, the
+v15 work ledger — ten prioritized open items with validations, plus the
+evaluated-and-not-scheduled list; and (6) a stated citation-notation rule in both
+documents (bare §N = design, plan §N = plan; 37-WEBC-8's forty-site class). Every §3
+entry's recorded declines and refutations were carried, none silently reversed; the
+review-37 §3.23/§3.24 numbering follows the ledger's assignment (§3.23 = 37-TOOL-3,
+§3.24 = 37-CFG-1), the review's own body text notwithstanding.
+
+**What deliberately did not change.** Design §1–§9 architecture, every §15 entry's
+recorded history (annotations stay; nothing renumbered — §16.13's immutable-artifact rule
+is why §15.39 kept its number in v14 and the same rule binds here), the plan's executed
+phase records, and the withdrawn figures (32/35 stay withdrawn; the unbacked raw/cooked
+figure pair stays a plan-§18 repair item rather than being re-quoted).
+
+**The pair was adversarially verified before landing, and the verifiers earned their
+keep.** Four blind verifiers (sentence-granular diff of each document against its v14
+base; a fact-check of §15.46–§15.50 against the notes, artifacts, and source; a
+must-preserve/cross-reference sweep) confirmed no v14 rule was dropped — the v12/v13
+failure mode did not recur — and every recorded decline and refutation survived. They
+also found real defects in the drafts, all fixed before this entry: **two fused figures
+in the sections whose subject is figure discipline** (the §15.44 extension attached the
+124-leaf-path cross-commit movement to the passive/rig pair, which is 42 apart, all
+rig-only — recomputed; and §15.48 called 6.30 s / 0.55 s "roughly 15×", a fusion with the
+unrelated pty-depth ratio — it is ~11.5×, now "an order of magnitude"); **one superseded
+claim restated as current** (the draft said six sibling probes still take the baseline
+fallback and that P7 must never get the re-assert — §3.40/§3.41 had repaired P6/P7/P13
+and left P8/P9/P12 measured-not-to-need-it, P12 being the one whose shapes a re-assert
+would destroy); the `fionread_trust` set under-enumerated (six values, not four); a §7.2
+sentence claiming doctor P1's artifact names the `0x20` byte it does not carry; the §10
+`tap.closed` clause stating the unbounded lane as unconditional where the shipped fix
+rides the data queue when there is room; and — the finding with the longest shadow —
+**the new text violating the citation rule it had just promoted to primary text** (bare
+§9/§7/§5 for AGENTS.md doctrine in the new design entries, bare §3.NN for notes entries
+and bare §17/§18 for plan sections in the new plan text: 37-WEBC-8's class, reproduced by
+the generation that legislated against it, now respelled throughout the new text; the
+inherited v14 spellings in frozen §15 entries stay as they are). Plan §16 item 9's
+review-32-era pre-auth "reserve" description gained a supersession bracket pointing at
+37-WEBS-6 so the pair's two halves no longer disagree about the shipped mechanism. One
+process note at the same standard: the first full-suite run of this session was piped
+through `tail`, which both truncated the output and replaced cargo's exit status with
+tail's — the §6 filter rule violated in one pipe — and was discarded and re-run
+unfiltered: **786 passed, 0 failed, 4 ignored**, the recorded headline exactly. Gates at
+landing: build, full suite, fmt, clippy (workspace and minimal-daemon), deny, doctor
+`linux.jq`, and the meta-gates including `entry_point_design_and_plan_names_resolve`
+against the bumped entry points.
 
 ---
 
