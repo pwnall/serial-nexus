@@ -301,6 +301,23 @@ struct LegShared {
     /// and purging the chunk when the connection that delivered it is the one that
     /// went away (§6, 37-LEG-1 — see [`Inbound`]).
     disconnect_epoch: Cell<u64>,
+    /// Set once, by the supervisor, when the `listen` role's first bind attempt has
+    /// resolved — either way (§15.42). The `connect` role sets it on its first
+    /// supervisor turn, having no inbound artifact for anyone to race.
+    ///
+    /// This is what lets `load` and `add-node` decline to reply before the socket
+    /// their reply implies exists. Before it, the reply was a proxy in time (§9):
+    /// `start` only *spawns* this supervisor, so the address was created some
+    /// microseconds afterwards — a p50 of 14 µs on an idle Linux 7.0.0-29 box, and
+    /// lost to the caller in 40.5% of 1200 trials under an 8-way load (notes §3.38).
+    listen_attempted: Cell<bool>,
+    /// Woken when [`Self::listen_attempted`] is set. `notify_waiters` stores no
+    /// permit, so the flag — not the notification — is the state, and the wait loop
+    /// re-reads it. Correct without a lock because both sides live on the one
+    /// current-thread `LocalSet`: nothing can run between the loop's read of the flag
+    /// and its registration on the `Notified`, because neither of those is an
+    /// `.await`.
+    listen_attempt_notify: Notify,
 }
 
 impl LegShared {
@@ -318,6 +335,41 @@ impl LegShared {
             purge_on_reconnect,
             disconnect: Notify::new(),
             disconnect_epoch: Cell::new(0),
+            listen_attempted: Cell::new(false),
+            listen_attempt_notify: Notify::new(),
+        }
+    }
+
+    /// Record that the first bind attempt has resolved, and release anyone waiting.
+    /// Idempotent by design: the supervisor calls it on every turn of its loop and
+    /// only the first is a transition.
+    fn mark_listen_attempted(&self) {
+        if !self.listen_attempted.replace(true) {
+            self.listen_attempt_notify.notify_waiters();
+        }
+    }
+}
+
+/// A handle on one `role = "listen"` leg's **first bind attempt**, handed to the
+/// config verb that created the node so that verb's reply cannot precede the socket
+/// it implies (§15.42).
+///
+/// Attempt, not success. A refused bind resolves this too, having already faulted the
+/// node with the reason in `state` — §15.8 says an environmental failure changes state
+/// and never the reply, so waiting for success here would turn a faulted node into a
+/// failed `load`, which is that rule inverted.
+pub struct ListenBarrier(Rc<LegShared>);
+
+impl ListenBarrier {
+    /// Resolve when the leg's first bind attempt has finished, however it finished.
+    ///
+    /// The flag is read *before* awaiting, which is what makes this correct when the
+    /// attempt already happened while an earlier barrier in the same batch was being
+    /// awaited: `notify_waiters` wakes only waiters already registered, so a barrier
+    /// that arrives late must be able to see the state rather than the edge.
+    pub async fn wait(self) {
+        while !self.0.listen_attempted.get() {
+            self.0.listen_attempt_notify.notified().await;
         }
     }
 }
@@ -392,6 +444,17 @@ impl LegNode {
     /// host-facing maps (fan-out sinks + the arbitrated targetward receiver); a
     /// `faces = target` leg claims each channel's target-facing maps (the local
     /// hostward stream + a targetward sender and lock into the local graph).
+    /// The readiness handle for this leg's inbound artifact, or `None` if it has none
+    /// (§15.42). Call it *after* [`Self::start`]: before that the supervisor has not
+    /// been spawned and nothing will ever resolve it.
+    ///
+    /// Only the `listen` role gets one. The `connect` role's readiness is the *peer's*,
+    /// which no reply can promise and no caller should be made to wait for — blocking
+    /// `load` on a dial would make it as slow, and as unreliable, as the far end.
+    pub fn listen_barrier(&self) -> Option<ListenBarrier> {
+        (self.role == LegRole::Listen).then(|| ListenBarrier(self.shared.clone()))
+    }
+
     pub fn start(&mut self, wiring: &mut Wiring) {
         // The socket send source: the per-channel receivers the pump multiplexes
         // onto the wire. faces=host: the arbitrated targetward stream (host writers
@@ -733,6 +796,10 @@ async fn supervise(mut a: SuperviseArgs) {
                             reason: "no peer connected yet".to_owned(),
                         },
                     );
+                    // The config verb's reply is held until this line (§15.42): from
+                    // here on the address is accepting, so a caller that dials the
+                    // instant its reply lands cannot be told the socket is not there.
+                    a.shared.mark_listen_attempted();
                 }
                 Err(e) => {
                     set_status(
@@ -741,11 +808,19 @@ async fn supervise(mut a: SuperviseArgs) {
                             reason: format!("bind {:?}: {e}", a.address),
                         },
                     );
+                    // Release the config verb on a *failed* bind too. The node is
+                    // faulted with the reason in `state`, which is where §15.8 puts an
+                    // environmental failure; holding the reply here would stall `load`
+                    // for the whole backoff schedule of an address that may never bind.
+                    a.shared.mark_listen_attempted();
                     backoff.sleep().await;
                     continue;
                 }
             }
         }
+        // The `connect` role, and every turn after the first: nothing inbound for a
+        // caller to race, so nobody is kept waiting.
+        a.shared.mark_listen_attempted();
 
         // Establish a connection.
         let established = match &listener {

@@ -4438,6 +4438,63 @@ hardware that is already attached and already certified for it. Both are real ch
 harness covers on Darwin, and §7 forbids taking them on one box's evidence inside a session whose
 purpose was to validate that box.
 
+### 3.38 A config verb's reply preceded the listener it created — root-caused, and fixed in the product
+
+**Design:** §15.42, added for this. §9 forbids a guard — or a promise — that asserts a proxy in
+time for the property it stands for.
+
+**Reality.** `load` returned `{"loaded": N}` immediately after `node.start(&mut wiring)`, and a
+`role = "listen"` leg's `start` only `spawn_local`s its supervisor: `bind(2)` and `listen(2)` run
+inside that task, on the same current-thread `LocalSet`, microseconds later. So the reply announced
+a graph whose inbound address did not exist yet, and a caller that dialled the address it had just
+configured raced the daemon. **Nothing else was observable in the meantime**, which is what made it
+undiagnosable from the outside: `LegShared::new` initialises status to exactly the
+`Waiting { reason: "no peer connected yet" }` that a *successful* bind sets, so `state` could not
+distinguish a listening leg from an unbound one.
+
+**The two hypotheses were separated by measurement, not argument.** `docs/macos.md` recorded a
+located suspect and an explicitly un-eliminated competitor: ECONNREFUSED on a unix socket means
+either "no listener yet" or "accept backlog full", and 8-way concurrency is the condition for the
+second. They make opposite predictions, and both were tested on Linux 7.0.0-29:
+
+* The failure rate falls **monotonically with the delay between the reply and the first connect** —
+  40.5% at 0 µs, 0% at 5 ms, 200 trials per point, **one connection each**. That is the readiness
+  shape exactly.
+* A connection-count sweep against a *provably listening* leg reached **4097 simultaneous pending
+  connections** before the kernel refused, and refused with **EAGAIN, never ECONNREFUSED**.
+
+**The backlog hypothesis is dead**, and it is recorded as refuted rather than dropped (§9): a
+refuted diagnosis is as load-bearing as a confirmed one, and this one would otherwise be
+re-proposed every time the symptom returns under load.
+
+**Decision — the fix is product-side and structural.** The leg carries a one-shot flag plus a
+`Notify`; the supervisor sets it on its first turn *either way*; `load`/`add-node` collect the
+handles **inside** the state critical section and await them **after** the borrow is released, so a
+`RefCell` borrow structurally cannot cross the `.await` (invariant 1, §16.2). A 5 s bound caps the
+wait so a wedged node task can never make `load` unanswerable.
+
+**Attempt, not success.** A refused bind resolves the barrier too, having already faulted the node
+with its reason in `state`. §15.8 puts an environmental failure in the node's status and never in
+the verb's result; waiting for success would invert that rule and stall the caller for the whole
+backoff schedule of an address that may never bind.
+
+**`itest/tests/p6_hostility.rs` is deliberately unchanged**, and that is the point. A retry loop in
+the harness would have made the same symptom disappear while leaving every other consumer of the
+RPC racing — hiding a product defect behind a test-only workaround. Its three tests are now the
+defect's own regression coverage.
+
+**Fail-first, and deterministic rather than probabilistic.**
+`load_does_not_reply_before_its_listen_legs_are_accepting` *is* the executor: it dials with no
+`.await` between `dispatch("load")` resolving and the connect, which on a current-thread `LocalSet`
+denies the leg's spawned task any chance to run. Reverting only the `await_listen_barriers` call
+fails it every time — `dialling …/barrier.sock gave No such file or directory (os error 2)`, i.e.
+`bind(2)` was not even reached. Timing margin plays no part. With the fix, 24 concurrent
+`p6_hostility` runs (8-way × 3 rounds) are green on Linux.
+
+**Pre-registered prediction for the next Mac run (§7):** all three `p6_hostility` tests pass under
+8-way concurrency on Darwin, where the recorded rate was 1 in 40. If they still fail, this entry's
+root cause is wrong and the ECONNREFUSED has a third source neither hypothesis names.
+
 ---
 
 ## 4. Findings carried forward (from serial-nexus-doctor)

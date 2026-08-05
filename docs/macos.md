@@ -144,6 +144,30 @@ in its spawned task — i.e. §9's "proxy in time", a config-accepted reply stan
 listener's readiness. **That is a located suspect, not a root cause**: it has had no independent
 adversarial verification (§9) and no fail-first proof, so nothing here is fixed on the strength
 of it. Filed for a session that can do both.
+<!-- ANNOTATION 2026-08-05 (§5). ROOT-CAUSED AND FIXED IN THE PRODUCT. The suspect above was
+     correct and is now settled by measurement rather than by inspection; the competing
+     backlog hypothesis this page insisted on keeping alive is REFUTED, and the refutation is
+     recorded because §9 makes it as load-bearing as the confirmation.
+     THE MEASUREMENTS (Linux 7.0.0-29, 8 cores). Failure rate falls monotonically with the delay
+     between `load`'s reply and the first connect: 40.5% at 0 us, 0% at 5 ms, 200 trials per
+     point, ONE connection each — the readiness shape, and one a full backlog cannot produce.
+     Against a provably listening leg, a connection-count sweep reached 4097 simultaneous
+     pending connections before the kernel refused, and refused with EAGAIN, never
+     ECONNREFUSED. So backlog saturation cannot be the mechanism here at any concurrency.
+     THE CAUSE. `load` replies immediately after `node.start`, and a listen leg's `start` only
+     spawn_locals its supervisor — bind(2)/listen(2) run in that task afterwards. `state` could
+     not reveal the gap either: `LegShared::new` initialises to the same
+     `Waiting{"no peer connected yet"}` a successful bind sets.
+     THE FIX is product-side (design §15.42, notes §3.38): the verb holds its reply until every
+     listen leg it created has finished its first bind ATTEMPT. `p6_hostility` is deliberately
+     unchanged — a harness retry would have hidden the defect from every other consumer of the
+     RPC — so its three tests are now the regression coverage.
+     WHAT THIS DOES NOT SETTLE, and the reason it is stated rather than assumed: the fix was
+     measured on Linux. The Darwin failures on this page are explained by the same mechanism but
+     were not re-measured here. PRE-REGISTERED PREDICTION (§7): all three p6_hostility tests, and
+     the `wire_hostility_faults_cleanly_then_leg_heals` sibling recorded in 1186c74, pass under
+     8-way concurrency on the next Mac run. If any still fails, this root cause is wrong and the
+     ECONNREFUSED has a third source neither hypothesis names. -->
 <!-- ANNOTATION 2026-08-05 (§5). Still not root-caused, and still not fixed — but the record is
      sharpened by one verifiable observation, and one competing hypothesis is named so the next
      session does not have to rediscover it.

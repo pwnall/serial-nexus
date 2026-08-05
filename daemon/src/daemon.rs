@@ -33,6 +33,7 @@ use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::cell::CriticalCell;
 use crate::nodes::Node;
+use crate::nodes::leg::ListenBarrier;
 use crate::registry::Registry;
 use crate::runtime::SharedLock;
 
@@ -386,6 +387,37 @@ fn new_instance_nonce() -> u64 {
     h.finish()
 }
 
+/// How long a config verb will wait for the listeners it just created before replying
+/// anyway (§15.42).
+///
+/// A bound, not a budget. What it caps is two adjacent syscalls on a task that has
+/// already been spawned — measured at a p50 of 14 µs and a max of 65 µs on an idle
+/// Linux 7.0.0-29 box. It exists only so that a node task wedged by some future defect
+/// can never make `load` unanswerable: an RPC that never replies is worse than one
+/// that replies early, because the early reply at least leaves `state` readable.
+const LISTEN_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Hold a config verb's reply until every `role = "listen"` leg it created has finished
+/// its first bind *attempt* (§15.42).
+///
+/// **This function must be called with no critical-section borrow held** — that is the
+/// whole reason `load` and `add_node` bind their result out of the `with_mut` closure
+/// before calling it (§4/§16.2: a borrow never crosses an `.await`).
+///
+/// Attempt, not success: see [`ListenBarrier`]. Nothing here can fail, and nothing here
+/// can change the verb's result — a listener that refuses to bind is reported by the
+/// node's own status, exactly as it was before.
+async fn await_listen_barriers(barriers: impl IntoIterator<Item = ListenBarrier>) {
+    let all = async {
+        for b in barriers {
+            b.wait().await;
+        }
+    };
+    // An empty batch — every graph with no listen leg — polls Ready on the first poll
+    // and never yields, so verbs that create no listener pay nothing.
+    let _ = tokio::time::timeout(LISTEN_BARRIER_TIMEOUT, all).await;
+}
+
 impl Daemon {
     pub fn new(
         resolver: serial_nexus_core::Resolver,
@@ -482,9 +514,11 @@ impl Daemon {
             "load" => {
                 // `replace` (§11) is read before the params move into the config parse.
                 let replace = bool_param(&params, "replace")?.unwrap_or(false);
-                self.load(parse_config_param(params)?, replace)
+                // Awaited, not merely called: `load` holds its reply until the
+                // listeners it created exist (§15.42).
+                self.load(parse_config_param(params)?, replace).await
             }
-            "add-node" => self.add_node(params),
+            "add-node" => self.add_node(params).await,
             "remove-node" => self.remove_node(params),
             "connect" => self.connect(params),
             "disconnect" => self.disconnect(params),
@@ -578,7 +612,7 @@ impl Daemon {
     /// `replace`, is caught *before* the running graph is torn down, so a bad
     /// config never destroys a good one); environmental failures fault nodes
     /// without failing the load (§15.8).
-    fn load(&self, config: GraphConfig, replace: bool) -> Result<Value, RpcError> {
+    async fn load(&self, config: GraphConfig, replace: bool) -> Result<Value, RpcError> {
         // Full structural validation before anything is created or torn down (§4,
         // §11): duplicate node names plus the three graph rules and name checks.
         if let Some(err) = structural_errors(&config.validate()) {
@@ -599,7 +633,7 @@ impl Daemon {
             self.teardown_with(crate::tap::TapCloseReason::GraphReplaced);
         }
 
-        self.state.with_mut(|st| {
+        let (result, listeners) = self.state.with_mut(|st| {
             if !st.nodes.is_empty() {
                 return Err(RpcError::new(
                     app_errors::LOAD_NONEMPTY,
@@ -668,8 +702,15 @@ impl Daemon {
             for node in &mut st.nodes {
                 node.start(&mut wiring);
             }
-            Ok(json!({ "loaded": st.nodes.len() }))
-        })
+            // Collected inside the critical section and awaited outside it: the cell
+            // is not held across the `.await` below, and structurally cannot be (§4).
+            let listeners: Vec<ListenBarrier> =
+                st.nodes.iter().filter_map(Node::listen_barrier).collect();
+            Ok((json!({ "loaded": st.nodes.len() }), listeners))
+        })?;
+        // §15.42: the reply does not precede the listeners it promises.
+        await_listen_barriers(listeners).await;
+        Ok(result)
     }
 
     /// `add-node` (§10/§11): add one node to a running graph. The node arrives with
@@ -680,7 +721,7 @@ impl Daemon {
     /// back (§12): a raw-path/serial add requires the device present; an identity
     /// add never does. Validated against the same structural rules as `load`
     /// (§11) — a duplicate name or illegal identity creates nothing.
-    fn add_node(&self, params: Option<Value>) -> Result<Value, RpcError> {
+    async fn add_node(&self, params: Option<Value>) -> Result<Value, RpcError> {
         let node_val = params
             .as_ref()
             .and_then(|p| p.get("node"))
@@ -730,7 +771,7 @@ impl Daemon {
         // before touching the running graph.
         self.precheck_codecs(std::slice::from_ref(&node_cfg))?;
 
-        self.state.with_mut(|st| {
+        let (result, listener) = self.state.with_mut(|st| {
             // Validate the candidate graph (current + new node, edges unchanged) with
             // the same rules as `load` (§11): duplicate name, name/identity legality,
             // leg/codec config. Nothing is created on a structural error.
@@ -758,14 +799,19 @@ impl Daemon {
             st.absorb_wiring(&wiring);
             spawn_tap_hubs(st, &mut wiring);
             node.start(&mut wiring);
+            // Taken before the move into `st.nodes`, and awaited outside the borrow.
+            let listener = node.listen_barrier();
             st.nodes.push(node);
             st.config.nodes.push(node_cfg);
 
             let mut result = serde_json::Map::new();
             result.insert("added".into(), json!(node_name));
             result.append(&mut echo);
-            Ok(Value::Object(result))
-        })
+            Ok((Value::Object(result), listener))
+        })?;
+        // §15.42: `add-node` makes the same promise `load` does.
+        await_listen_barriers(listener).await;
+        Ok(result)
     }
 
     /// `remove-node [--cascade]` (§10/§11): remove one node. Refused while edges are
@@ -2469,6 +2515,65 @@ mod tests {
         let d = std::env::temp_dir().join(format!("snx-atomic-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// §15.42 / notes §3.38 — **a config verb's reply must not precede its listeners.**
+    ///
+    /// A `role = "listen"` leg's socket is created by a task `start` merely *spawns*,
+    /// so before the barrier the reply raced the bind: a caller dialling the configured
+    /// address the instant `load` returned got ENOENT (`bind(2)` not reached) or
+    /// ECONNREFUSED (`bind(2)` reached, `listen(2)` not). Measured at 40.5% of 1200
+    /// trials under an 8-way load on Linux 7.0.0-29, and observed as three
+    /// `p6_hostility` tests failing — on Darwin 24.6.0 and on Linux.
+    ///
+    /// The guard is **deterministic rather than probabilistic**, which is what makes it
+    /// a guard rather than a second flake: the test *is* the executor. The blocking
+    /// `std::os::unix::net::UnixStream::connect` below is issued after `dispatch("load")`
+    /// resolves with **no `.await` in between**, which on a current-thread `LocalSet`
+    /// denies the leg's spawned task any opportunity to run. Against the unfixed tree
+    /// the dial therefore fails every time; against the fixed tree it succeeds every
+    /// time. Timing margin plays no part.
+    #[test]
+    fn load_does_not_reply_before_its_listen_legs_are_accepting() {
+        let dir = scratch_dir();
+        let leg = dir.join("barrier.sock");
+        let daemon = Daemon::new(
+            serial_nexus_core::Resolver::new("/"),
+            None,
+            Rc::new(Registry::with_builtins()),
+        );
+        let cfg = json!({ "node": [{
+            "type": "leg",
+            "name": "downlink",
+            "faces": "host",
+            "transport": "unix",
+            "role": "listen",
+            "address": leg.to_str().expect("utf-8 scratch path"),
+            "channels": ["console"],
+        }]});
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            daemon
+                .dispatch("load", Some(json!({ "config": cfg, "replace": false })))
+                .await
+                .expect("load a one-leg graph");
+            std::os::unix::net::UnixStream::connect(&leg).unwrap_or_else(|e| {
+                panic!(
+                    "load replied before its listen leg was accepting: dialling {} gave \
+                     {e} (ENOENT = bind(2) not reached, ECONNREFUSED = listen(2) not \
+                     reached)",
+                    leg.display()
+                )
+            });
+            // Leave no LocalSet task running against `Rc` state (boundary.rs).
+            daemon.dispatch("teardown", None).await.expect("teardown");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// RUNTIME-1 regression: a `send` to a host endpoint whose targetward receiver

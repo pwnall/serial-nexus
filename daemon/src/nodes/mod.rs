@@ -169,6 +169,17 @@ impl Node {
         }
     }
 
+    /// The readiness handle for this node's inbound artifact, if it has one a caller
+    /// can race the daemon to create (§15.42). Only a `role = "listen"` leg does: it
+    /// is the one node kind whose `start` publishes an address that the reply to
+    /// `load` / `add-node` implicitly promises. Call it *after* [`Self::start`].
+    pub fn listen_barrier(&self) -> Option<crate::nodes::leg::ListenBarrier> {
+        match self {
+            Node::Leg(n) => n.listen_barrier(),
+            _ => None,
+        }
+    }
+
     /// An edge was just attached to this node's target-facing `endpoint` (§15.35).
     ///
     /// The channels themselves are already live — the daemon filled the endpoint's
