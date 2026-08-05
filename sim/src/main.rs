@@ -190,6 +190,21 @@ struct ClientArgs {
     /// race that made the initial burst outrun a not-yet-reading client.
     #[arg(long)]
     ready_file: Option<PathBuf>,
+    /// Handshake, one step earlier than `--ready-file`: create this file the instant
+    /// the port is **open and configured**, before a single byte is read.
+    ///
+    /// The two are different facts and a real UART makes the difference visible.
+    /// `--ready-file` proves the read loop is *draining*, which it can only prove once
+    /// bytes are already arriving — useless when the hazard is bytes arriving *before
+    /// anyone opened the far end*. **A USB-serial port that is not open does not
+    /// receive**: measured on an FT232R crossover at 115200, a reader that opens 0.2 s
+    /// late loses 2321 bytes and one that opens 0.5 s late loses 5800, against a wire
+    /// rate of 11520 B/s — the loss is exactly the airtime, linear in the delay. On a
+    /// pts null modem the same ordering is harmless, because a pts buffers whether or
+    /// not a reader is attached, which is why this went unnoticed until a converted
+    /// test met real silicon (notes §3.47).
+    #[arg(long)]
+    open_file: Option<PathBuf>,
     /// Read the hostward stream until it goes quiet (no bytes for `--quiet-ms`),
     /// counting every byte — the fully-draining reader for exact loss accounting.
     /// Combine with `--read-rate` to be a slow consumer. Does not send. Reading
@@ -911,6 +926,13 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
         }));
     }
     set_raw_baud(&file, a.set_baud)?;
+
+    // The port is open and configured: from here the driver receives. Signalled
+    // before any read, because the hazard this closes is a writer that starts while
+    // the far end is still closed — see `ClientArgs::open_file`.
+    if let Some(of) = a.open_file.as_deref() {
+        std::fs::File::create(of)?;
+    }
 
     // Receive-only modes: a fixed-size sink (`--recv`) or a fully-draining reader
     // (`--drain`). Neither sends; both keep the slave open until done.

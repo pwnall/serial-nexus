@@ -16,17 +16,26 @@
 //! the byte-counting sink. Self-skips when no serial device is available — the same
 //! self-skip discipline the bash hardware rig used (a skip is a valid verdict, §5).
 //!
-//! Loss-free by construction: every hop between the two PTY clients and the sink
-//! backpressures (targetward is never dropped, §5 invariant 3), so ordering of the
-//! writers vs. the sink cannot lose bytes — only block until drained. The writers are
-//! spawned as *killable* children so a regression (a blocked free-for-all writer) fails
-//! cleanly on the sink's bounded timeout with `received != 2N` instead of hanging.
+//! Loss-free by construction **up to the wire, and not past it**: every hop between the
+//! two PTY clients and the sink backpressures (targetward is never dropped, §5 invariant
+//! 3), so no queue inside the daemon can drop. This file used to conclude from that
+//! "ordering of the writers vs. the sink cannot lose bytes — only block until drained",
+//! and that conclusion is **false on real hardware**: the last hop is a UART with no
+//! flow control and no queue, so a byte clocked onto the wire while the far port is
+//! closed is simply gone. Measured on an FT232R crossover at 115200 — a sink opening
+//! 0.2 s late loses 2321 bytes, 0.5 s late loses 5800, against a wire rate of 11520
+//! B/s, with the daemon's `tx` counter reading a full 32768 every time (notes §3.47).
+//! The sink therefore opens **first** and the writers gate on its `--open-file`.
+//!
+//! The writers are spawned as *killable* children so a regression (a blocked
+//! free-for-all writer) fails cleanly on the sink's bounded timeout with
+//! `received != 2N` instead of hanging.
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use serial_nexus_itest::{Daemon, Sim, bin, serial_pair_or_rig, skip_no_pair, wait_until};
+use serial_nexus_itest::{Daemon, bin, serial_pair_or_rig, skip_no_pair, wait_until};
 
 /// Each writer sends `N`; the device must see `2N` (both writers got through).
 const N: usize = 16384;
@@ -122,27 +131,64 @@ b = "ptyb"
         rpc.node("usb0")
     );
 
+    // **The sink opens FIRST, and the writers wait for it.** On the sim null modem the
+    // ordering is invisible — a pts buffers whether or not a reader is attached — but
+    // on a real UART it is the whole test: a USB-serial port that is not open does not
+    // receive, so every byte that crosses the wire before the far end opens is gone,
+    // and the daemon's `tx` counter still says it sent them. Measured on an FT232R
+    // crossover at 115200 with the old ordering: a sink opening 0.2 s late lost 2321
+    // bytes and one opening 0.5 s late lost 5800, against a wire rate of 11520 B/s —
+    // the loss is exactly the airtime, linear in the delay, with `overrun`, `frame`
+    // and `buf_overrun` all zero. Even spawning them together lost 21-31 bytes to
+    // process start-up. With this gate: 0 bytes lost, and the driver's own rx counter
+    // matches tx exactly (notes §3.47).
+    //
+    // `--open-file` rather than `--ready-file`: the latter fires on the first byte
+    // *read*, which cannot be signalled before any byte is sent — the chicken and egg
+    // this ordering creates. Open is the earlier and, here, the load-bearing fact.
+    let total_s = TOTAL.to_string();
+    let opened = run.join("sink.open");
+    let sink_child = Command::new(bin("serial-nexus-sim"))
+        .arg("client")
+        .args([
+            "--path",
+            &sink,
+            "--recv",
+            &total_s,
+            "--set-baud",
+            "115200",
+            "--open-file",
+            &opened.to_string_lossy(),
+            "--timeout-ms",
+            "30000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the sink");
+    assert!(
+        wait_until(Duration::from_secs(10), || opened.exists()),
+        "the sink never reported its port open, so the writers below would have raced it"
+    );
+
     // Both clients write concurrently; with no lock, BOTH streams are read targetward.
     // Spawned as children (not `Sim::client`, which blocks) so they run alongside the
     // sink and can be killed if a regression leaves one blocked.
     let mut writer_a = spawn_writer(&ta_s, 1);
     let mut writer_b = spawn_writer(&tb_s, 2);
 
-    // The sink drains the far end: it must receive exactly 2N bytes — both writers got
-    // through. (Under the exclusive default with no lock, NEITHER writer may write, so
-    // it would receive 0.) The 30s bound turns a regression into a clean timeout,
-    // never a hang; in the healthy path 2N=32 KiB drains in well under a second.
-    let total_s = TOTAL.to_string();
-    let verdict = Sim::client(&[
-        "--path",
-        &sink,
-        "--recv",
-        &total_s,
-        "--set-baud",
-        "115200",
-        "--timeout-ms",
-        "30000",
-    ]);
+    // The sink must receive exactly 2N bytes — both writers got through. (Under the
+    // exclusive default with no lock, NEITHER writer may write, so it would receive 0.)
+    // The 30s bound turns a regression into a clean timeout, never a hang; in the
+    // healthy path 2N=32 KiB drains in well under a second on a pts and in ~3 s over
+    // the rig's 115200 wire.
+    let sink_out = sink_child.wait_with_output().expect("await the sink");
+    let verdict: Value = serde_json::from_slice(&sink_out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "parse sink verdict: {e}; stdout={:?}",
+            String::from_utf8_lossy(&sink_out.stdout)
+        )
+    });
 
     // Reap the writers. On success they have already exited (all their bytes drained);
     // on a regression one may still be blocked in `write_all`, so kill it so the test

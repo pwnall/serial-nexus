@@ -5168,6 +5168,69 @@ box's evidence; §3.43 overturned the decline on Linux measurements. The overtur
 here — the seam is still correct and its failure mode still names itself — but the record must say
 that the "6 of 7" figure is a **Linux** figure, and that on Darwin it is 5 of 6 with this one red.
 
+### 3.47 §3.46 root-caused: a USB-serial port that is not open does not receive
+
+**Design:** §9 — a guard must assert the property the product promises, never a proxy in time.
+
+§3.46 recorded `p4_free_for_all::free_for_all_endpoint_lets_concurrent_writers_both_reach_device`
+failing on the Darwin rig, 12 of 12, losing 5–31 bytes of 32768, with **mechanism not established
+and no root cause claimed**. It is established here, and it is not a Darwin property.
+
+**It reproduces on Linux.** Same test, same shape, on the FT232R crossover at 115200: **2 of 5
+failed**, losing 1–2 bytes, on an idle box (load 0.58). So §3.46's framing as a Darwin observation
+was too narrow — this is a property of the real-UART path on both kernels, and the Darwin run was
+simply the first place a converted test met real silicon.
+
+**The driver's own counters locate the loss below the daemon and below the sim.** On a failing rep,
+`TIOCGICOUNT` read **`tx_delta = 32768` on the transmitting port and `rx_delta = 32754` on the
+receiving one** — with `overrun`, `buf_overrun`, `frame` and `parity` all **0**. The daemon sent
+every byte; 14 never reached the far driver at all; nothing reported an error. The sim received
+exactly what the driver counted.
+
+**A single-writer control refuted the obvious hypothesis.** The harness's own doc comment warns that
+"a flow-control-less UART drops bytes under a raw high-volume read", which made the raw sink the
+prime suspect. One writer into one raw reader, no daemon, 32768 bytes at 115200: **10 of 10 clean,
+`tx_delta == rx_delta` every time.** The raw read is not lossy here. Recorded as a refutation
+because §9 makes it as load-bearing as the confirmation — and because that doc comment will attract
+the same guess again.
+
+**The mechanism is the test's ordering, and it is linear in the delay.** The control differed from
+the test in one respect: it opened the *sink* first. Re-running it the test's way — writer first,
+sink after a delay *d* — gives:
+
+| sink opens at | bytes lost | 11520 B/s predicts |
+|---|---|---|
+| +0.0 s (spawn latency only) | 21, 26, 27 | — |
+| +0.2 s | 2323, 2321, 2357 | 2304 |
+| +0.5 s | 5801, 5792, 5815 | 5760 |
+
+**The loss is exactly the airtime.** 115200 baud is 11520 bytes/s, and the deficit tracks *d* ×
+11520 across an order of magnitude. A USB-serial port that is not open does not receive: the driver
+submits no URBs, the adapter's small FIFO overflows, and the bytes are gone — counted as sent,
+never counted as received, with no error anywhere.
+
+**Why it was invisible until now.** On the sim null modem the same ordering is harmless, because a
+pts buffers whether or not a reader is attached. The test was written against that provider and its
+module doc concluded, from the daemon's own backpressure invariants, that *"ordering of the writers
+vs. the sink cannot lose bytes — only block until drained."* That conclusion is sound for every hop
+**inside** the daemon and false for the last one: a UART has no flow control and no queue. The
+comment is corrected rather than deleted, because the reasoning it records is exactly right up to
+the point where it stops being right.
+
+**Decision.** `serial-nexus-sim client` gains **`--open-file`**, a handshake one step earlier than
+the existing `--ready-file`: created the instant the port is open and configured, before any read.
+`--ready-file` cannot serve here — it fires on the first byte *read*, which cannot happen before a
+byte is sent, and the hazard is precisely bytes sent before the far end opens. The test opens the
+sink first, gates the writers on that file, and then collects the sink's verdict.
+
+**Measured after:** 8 of 8 green on the rig where the old ordering failed 2 of 5, `LOST = 0` in 5 of
+5 direct control reps, and the software null-modem path unchanged.
+
+**This is a harness-fidelity defect, not a product defect**, and the distinction is load-bearing: the
+daemon transmitted every byte it was given, on both kernels, in every failing run. What was wrong is
+that the test asserted a lossless wire while arranging for part of the transmission to happen before
+anyone was listening — §9's proxy in time, in a place no software double could expose.
+
 ---
 
 ## 4. Findings carried forward (from serial-nexus-doctor)
