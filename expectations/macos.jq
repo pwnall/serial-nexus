@@ -174,3 +174,12 @@ and (all(.probes[]; . as $p
 # Structure only — `commit` may read `unknown` off a tarball build.
 and (.build.probe_set | type == "string" and length > 0)
 and (.build.commit | type == "string" and length > 0)
+# The cell-set digest, same clause and same reason as `linux.jq`: `probe_set`
+# equality says the two runs asked the same questions, never that they carry the
+# same cells — and this lane is the one where that misread happened, four commits
+# printing one `a131e1f4b46d6c83` across five observation sets. Structure only:
+# the value is a property of the run (ports named, kernel, which histogram keys
+# were observed), and on Darwin it legitimately differs from every Linux run, so
+# pinning a value would redden a healthy box. Reports captured before 2026-08-05
+# fail it, which costs nothing — this file gates fresh `--json` output.
+and (.build.field_set | type == "string" and length == 16)

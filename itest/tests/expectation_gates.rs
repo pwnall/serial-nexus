@@ -178,6 +178,82 @@ fn the_p4_clause_rejects_a_certified_resolver_that_resolved_nothing() {
     );
 }
 
+/// The provenance half of the same discipline: a report that cannot say **which
+/// cells it carries** cannot be diffed cell by cell against one that can.
+///
+/// Note the disposition on absence is the **opposite** of the P4 clause's above, and
+/// deliberately so. `canonical` is a measurement, and rejecting a report that lacks it
+/// would make the gate an instrument-version detector. `field_set` is provenance — it
+/// sits with `commit` and `probe_set`, which this file has always required to be
+/// *present* — and its absence is exactly the state the field exists to name: unknown,
+/// which must never read as "equal". Nothing is lost, because these files gate live
+/// `--json` output and never `docs/doctor/*` (which every clause here would fail for
+/// the same reason: those artifacts predate the field).
+#[test]
+fn the_field_set_clause_rejects_a_report_that_cannot_say_which_cells_it_carries() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let expectation = platform_expectation();
+    let t = TmpTree::new("fieldset");
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--dev-root")
+        .arg(t.path())
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    assert!(
+        gate_accepts(&expectation, &report),
+        "{} rejected an honest report carrying its own field set: {}",
+        expectation.display(),
+        jq_filter(".build", &report)
+    );
+
+    // Spelling 1 — the field gone, which is every report captured before 2026-08-05
+    // and any future binary that drops it.
+    let stripped = jq_filter("del(.build.field_set)", &report);
+    assert!(
+        !gate_accepts(&expectation, &stripped),
+        "{} admitted a report with no field set — a reader has no machine-checkable \
+         way to know the two reports carry the same cells, which is the gap \
+         `probe_set` equality was being read as closing",
+        expectation.display()
+    );
+
+    // Spelling 2 — present but not a digest. The clause pins the *shape* (16 hex
+    // chars' worth of length) and never the value, because the value is a property of
+    // the run: naming ports, a different kernel, or a histogram key this box did not
+    // observe all move it on a perfectly healthy machine.
+    let truncated = jq_filter(r#".build.field_set = "abc""#, &report);
+    assert!(
+        !gate_accepts(&expectation, &truncated),
+        "{} admitted a field set that is not a 16-character digest",
+        expectation.display()
+    );
+}
+
+/// The proof above runs against one platform's file per box. This is what carries it
+/// to the other: the two gates must hold the *same* clause, byte for byte, so an edit
+/// to one that forgets the other fails here instead of silently reopening the hole on
+/// the lane nobody is standing on.
+#[test]
+fn both_expectation_files_carry_the_same_field_set_clause() {
+    let clause = r#"and (.build.field_set | type == "string" and length == 16)"#;
+    for name in ["expectations/linux.jq", "expectations/macos.jq"] {
+        let path = repo_root().join(name);
+        let text = std::fs::read_to_string(&path).expect("the expectation file is readable");
+        assert!(
+            text.contains(clause),
+            "{name} does not carry the field-set clause verbatim — the behavioural \
+             proof in this file runs on one platform's gate and reaches the other only \
+             through this identity"
+        );
+    }
+}
+
 /// The proof above runs against one platform's file per box. This is what carries it
 /// to the other: the two gates must hold the *same* clause, byte for byte, so an edit
 /// to one that forgets the other fails here instead of silently reopening the hole on

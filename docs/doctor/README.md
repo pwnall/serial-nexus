@@ -6,44 +6,66 @@ The artifacts behind every cross-kernel claim in `docs/serial-nexus-doctor.md`, 
 read field-for-field identical" a statement asserted in three documents with
 nothing in the repository to check it against. These files are that check.
 
-**Read the `Build` block first.** A cross-kernel diff is only meaningful between two
-reports whose **`probe set`** fingerprints are equal — that digest covers the
-deduplicated, sorted set of each probe's `(id, question)`, so equal fingerprints mean
-the two runs asked their kernels the same questions. Unequal means the instrument
-moved between the runs and a field-by-field comparison is reading two different
-instruments, whatever the numbers look like. Two omissions from the digest are
+**Read the `Build` block first, and read *both* digests.** `probe set` covers the
+deduplicated, sorted set of each probe's `(id, question)` **strings** — not the code
+that asks them, and not the fields they emit. **Only its unequal direction is a
+verdict:** unequal means the instrument moved and a field-by-field comparison is
+reading two different instruments, whatever the numbers look like. **Equal does not
+mean comparable**, and this directory holds the counterexample: `fa4b12d`, `71fc5a8`,
+`7ead470` and `4b78fff` all print `a131e1f4b46d6c83`, and the macOS observation set
+gains **65 newly-present leaf paths** between `7ead470` and `1a9a8fc` and **71**
+between `fa4b12d` and `1a9a8fc` — while between `fa4b12d` and `7ead470` only six paths
+appear and P10's hostward figure moves by a factor of **4104**. (`df48bfc` is a fifth
+commit printing the same digest: P4 gained four cells there — `canonical`,
+`topology_only`, `unidentified`, `sysfs_tty_listing` — measured on the dev box. Every
+count here is a recomputation from the committed artifacts, and they are **not** the
+32/35 an earlier commit message quoted, which no collapsing of the leaf paths
+reproduces — notes §3.51.) What answers "same cells?" is **`field set`**: a
+digest over the sorted, deduplicated set of scalar leaf paths under
+`.probes[].observations`, values excluded. Equal `field set` means every observation
+present in one report is present in the other, so the diff has no missing cells.
+Unequal means diff only the intersection — and it does not say *why* they differ, since
+a different kernel, a different port list and an unobserved histogram key all move it.
+**Neither digest can see a probe body that changed a number without changing a key.**
+Two omissions from `probe set` are
 deliberate and worth knowing here: the probe **title** (P3's carries the device path
 and P3 is emitted once per `--port`, so a two-port and a zero-port run of one binary
 would otherwise disagree — which is exactly the pair below) and the
 **measurements** (those are what a diff compares). Correcting a report's prose
 therefore does not invalidate an archived comparison. `commit` says which tree built
 the binary; `generated` is a UTC stamp. A report with **no** `probe set` at all —
-anything built before 2026-07-28 — is not comparable with these.
+anything built before 2026-07-28 — is not comparable with these. A report with no
+**`field set`** — anything built before 2026-08-05, which is every file indexed below —
+has an *unknown* cell set, and unknown is never "equal": the column below carries the
+recomputation (`serial-nexus-doctor --field-set <file>`), because the digest is a pure
+function of `.probes[].observations` and so is computable for artifacts captured before
+the field existed. That is what let this column be added without touching a frozen
+artifact (§16.13).
 
 ## Index
 
-| File | Kernel / box | Binary | Probe set | Rig | Verdicts |
-|---|---|---|---|---|---|
-| [`macos-24.6.0-2026-08-05-1a9a8fc-tier3.json`](macos-24.6.0-2026-08-05-1a9a8fc-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**. **The run that answered both pre-registered experiments of notes §3.44**, and the counterpart of the `-05b` Linux triple directly below: `1a9a8fca1c36` is `4b78fffc4bf2` plus a docs-only commit, so despite the different `commit` string these two triples are the **same binary** — checked with `git diff 4b78fff 1a9a8fc -- '*.rs' '*.toml'`, which is empty | `1a9a8fca1c36` | **`a131e1f4b46d6c83`** | **Tier-3 wiring, now partly certified** — the same cross-wired FT232R pair, `SNX_CROSSOVER=required`, proven on the wire the same session (4 passed, 32768 bytes byte-exact each way at 250000 baud) | 14 supported · 8 degraded · 0 unsupported · 3 skipped |
-| [`macos-24.6.0-2026-08-05-1a9a8fc-tier3-2.json`](macos-24.6.0-2026-08-05-1a9a8fc-tier3-2.json) | ” — second sequential run, same box, load 1.89–2.58 throughout | ” | ” | ” | ” |
-| [`macos-24.6.0-2026-08-05-1a9a8fc-tier3-3.json`](macos-24.6.0-2026-08-05-1a9a8fc-tier3-3.json) | ” — third sequential run | ” | ” | ” | ” |
-| [`linux-7.0-2026-08-05b-tier3.json`](linux-7.0-2026-08-05b-tier3.json) | 7.0.0-29-generic, Ubuntu 26.04 — the dev box. **The counterpart the next macOS capture diffs against**: same binary, and the first Linux report carrying every observation added on 2026-08-05 (P6/P7 baseline block, P13 `baseline_packet_bytes`, P10 `recheck`, P9's zero-timeout 2×2) | `4b78fffc4bf2` | **`a131e1f4b46d6c83`** | **Tier 3** — the cross-wired FT232R pair, and the first Linux run to certify it under the portable UART predicate (§3.42) | 22 supported · 0 degraded · 0 unsupported · 1 skipped |
-| [`linux-7.0-2026-08-05b-tier3-2.json`](linux-7.0-2026-08-05b-tier3-2.json) | ” — second sequential run | ” | ” | ” | ” |
-| [`linux-7.0-2026-08-05b-tier3-3.json`](linux-7.0-2026-08-05b-tier3-3.json) | ” — third sequential run | ” | ” | ” | ” |
-| [`linux-7.0-2026-08-05-tier3.json`](linux-7.0-2026-08-05-tier3.json) | 7.0.0-29-generic, Ubuntu 26.04 — the dev box | `71fc5a815852` | **`a131e1f4b46d6c83`** | **Tier 3** — the same cross-wired FT232R pair (`BH00L4KU` ↔ `BH00LL8O`) | 22 supported · 0 degraded · 0 unsupported · 1 skipped |
-| [`linux-7.0-2026-08-05-tier3-2.json`](linux-7.0-2026-08-05-tier3-2.json) | ” — second sequential run, same box, same idle state | ” | ” | ” | ” |
-| [`linux-7.0-2026-08-05-tier3-3.json`](linux-7.0-2026-08-05-tier3-3.json) | ” — third sequential run | ” | ” | ” | ” |
-| [`macos-24.6.0-2026-08-05-7ead470-tier3.json`](macos-24.6.0-2026-08-05-7ead470-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**. The first macOS report that names its own kernel: `kernel` reads `24.6.0` and `os` reads `Darwin 24.6.0 (x86_64)` from `uname(2)`, so this column now repeats the artifact rather than supplying what it could not say | `7ead470f594c` | **`a131e1f4b46d6c83`** | **Tier-3 wiring, uncertified** — the same cross-wired FT232R pair (`/dev/cu.usbserial-BH00L4KU` ↔ `BH00LL8O`) | 15 supported · 7 degraded · 0 unsupported · 3 skipped |
-| [`macos-24.6.0-2026-08-05-7ead470-tier3-2.json`](macos-24.6.0-2026-08-05-7ead470-tier3-2.json) | ” — second sequential run, same box, same idle state | ” | ” | ” | ” |
-| [`macos-24.6.0-2026-08-05-7ead470-tier3-3.json`](macos-24.6.0-2026-08-05-7ead470-tier3-3.json) | ” — third sequential run | ” | ” | ” | ” |
-| [`macos-24.6.0-2026-08-05-tier3.json`](macos-24.6.0-2026-08-05-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**; `kernel`/`os` read empty and `unknown`, so the version is recorded here by hand. **That gap is fixed in the binary as of `71fc5a815852`** — the fields come from `uname(2)` now, and the three rows above are that fix landing | `fa4b12d6f529` | **`a131e1f4b46d6c83`** | **Tier-3 wiring, uncertified** — the same cross-wired FT232R pair (`/dev/cu.usbserial-BH00L4KU` ↔ `BH00LL8O`) | 15 supported · 7 degraded · 0 unsupported · 3 skipped |
-| [`macos-24.6.0-2026-07-30-tier3.json`](macos-24.6.0-2026-07-30-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**; the report's own `kernel`/`os` fields read empty and `unknown`, which is the gap `uname(2)` closes as of `71fc5a815852` (`docs/macos.md` delta 5), so the version is recorded here instead | `a1029778fda9` | `01b257ece8c48470` | **Tier-3 wiring, uncertified** — the same cross-wired FT232R pair, as `/dev/cu.usbserial-BH00L4KU` ↔ `BH00LL8O` | 14 supported · 7 degraded · 0 unsupported · 3 skipped |
-| [`linux-7.0-2026-07-29-tier3-2.json`](linux-7.0-2026-07-29-tier3-2.json) | 7.0.0-28-generic, Ubuntu 26.04 — the dev box | `2e5874bbe090` | `01b257ece8c48470` | **Tier 3** — the same cross-wired FT232R pair (`BH00L4KU` ↔ `BH00LL8O`) | 21 supported · 0 degraded · 0 unsupported · 1 skipped |
-| [`linux-6.18-2026-07-29-tier3.md`](linux-6.18-2026-07-29-tier3.md) | 6.18.14-1rodete4-amd64, Debian rodete — **the production box** | `85699d66c5a5` | `01b257ece8c48470` | **Tier 3** — two FTDI FT232R cross-wired (`BH00LL8O` ↔ `BH00L4KU`) | 21 supported · 0 degraded · 0 unsupported · 1 skipped |
-| [`linux-7.0-2026-07-29-tier3.json`](linux-7.0-2026-07-29-tier3.json) | 7.0.0-28-generic, Ubuntu 26.04 — the dev box | `da290c616631` | `01b257ece8c48470` | **Tier 3** — the same cross-wired FT232R pair (`BH00L4KU` ↔ `BH00LL8O`), moved back | 21 supported · 0 degraded · 0 unsupported · 1 skipped |
-| [`linux-7.0-2026-07-29-passive-1.json`](linux-7.0-2026-07-29-passive-1.json) | 7.0.0-28-generic, Ubuntu 26.04 — the dev box | `85699d66c5a5` | `01b257ece8c48470` | none (passive; no adapter attached) | 13 supported · 0 degraded · 0 unsupported · 6 skipped |
-| [`linux-7.0-2026-07-29-passive-2.json`](linux-7.0-2026-07-29-passive-2.json) | ” | ” | ” | ” | ” |
-| [`linux-7.0-2026-07-29-passive-3.json`](linux-7.0-2026-07-29-passive-3.json) | ” | ” | ” | ” | ” |
+| File | Kernel / box | Binary | Probe set | Field set | Rig | Verdicts |
+|---|---|---|---|---|---|---|
+| [`macos-24.6.0-2026-08-05-1a9a8fc-tier3.json`](macos-24.6.0-2026-08-05-1a9a8fc-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**. **The run that answered both pre-registered experiments of notes §3.44**, and the counterpart of the `-05b` Linux triple directly below: `1a9a8fca1c36` is `4b78fffc4bf2` plus a docs-only commit, so despite the different `commit` string these two triples are the **same binary** — checked with `git diff 4b78fff 1a9a8fc -- '*.rs' '*.toml'`, which is empty | `1a9a8fca1c36` | **`a131e1f4b46d6c83`** | `0c303d4cb11e3893` | **Tier-3 wiring, now partly certified** — the same cross-wired FT232R pair, `SNX_CROSSOVER=required`, proven on the wire the same session (4 passed, 32768 bytes byte-exact each way at 250000 baud) | 14 supported · 8 degraded · 0 unsupported · 3 skipped |
+| [`macos-24.6.0-2026-08-05-1a9a8fc-tier3-2.json`](macos-24.6.0-2026-08-05-1a9a8fc-tier3-2.json) | ” — second sequential run, same box, load 1.89–2.58 throughout | ” | ” | ” | ” | ” |
+| [`macos-24.6.0-2026-08-05-1a9a8fc-tier3-3.json`](macos-24.6.0-2026-08-05-1a9a8fc-tier3-3.json) | ” — third sequential run | ” | ” | ” | ” | ” |
+| [`linux-7.0-2026-08-05b-tier3.json`](linux-7.0-2026-08-05b-tier3.json) | 7.0.0-29-generic, Ubuntu 26.04 — the dev box. **The counterpart the next macOS capture diffs against**: same binary, and the first Linux report carrying every observation added on 2026-08-05 (P6/P7 baseline block, P13 `baseline_packet_bytes`, P10 `recheck`, P9's zero-timeout 2×2) | `4b78fffc4bf2` | **`a131e1f4b46d6c83`** | `88585243dafb4747` | **Tier 3** — the cross-wired FT232R pair, and the first Linux run to certify it under the portable UART predicate (§3.42) | 22 supported · 0 degraded · 0 unsupported · 1 skipped |
+| [`linux-7.0-2026-08-05b-tier3-2.json`](linux-7.0-2026-08-05b-tier3-2.json) | ” — second sequential run | ” | ” | ” | ” | ” |
+| [`linux-7.0-2026-08-05b-tier3-3.json`](linux-7.0-2026-08-05b-tier3-3.json) | ” — third sequential run | ” | ” | ” | ” | ” |
+| [`linux-7.0-2026-08-05-tier3.json`](linux-7.0-2026-08-05-tier3.json) | 7.0.0-29-generic, Ubuntu 26.04 — the dev box | `71fc5a815852` | **`a131e1f4b46d6c83`** | `64410fea8995f068` | **Tier 3** — the same cross-wired FT232R pair (`BH00L4KU` ↔ `BH00LL8O`) | 22 supported · 0 degraded · 0 unsupported · 1 skipped |
+| [`linux-7.0-2026-08-05-tier3-2.json`](linux-7.0-2026-08-05-tier3-2.json) | ” — second sequential run, same box, same idle state | ” | ” | ” | ” | ” |
+| [`linux-7.0-2026-08-05-tier3-3.json`](linux-7.0-2026-08-05-tier3-3.json) | ” — third sequential run | ” | ” | ” | ” | ” |
+| [`macos-24.6.0-2026-08-05-7ead470-tier3.json`](macos-24.6.0-2026-08-05-7ead470-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**. The first macOS report that names its own kernel: `kernel` reads `24.6.0` and `os` reads `Darwin 24.6.0 (x86_64)` from `uname(2)`, so this column now repeats the artifact rather than supplying what it could not say | `7ead470f594c` | **`a131e1f4b46d6c83`** | `e0047234b499d0c7` | **Tier-3 wiring, uncertified** — the same cross-wired FT232R pair (`/dev/cu.usbserial-BH00L4KU` ↔ `BH00LL8O`) | 15 supported · 7 degraded · 0 unsupported · 3 skipped |
+| [`macos-24.6.0-2026-08-05-7ead470-tier3-2.json`](macos-24.6.0-2026-08-05-7ead470-tier3-2.json) | ” — second sequential run, same box, same idle state | ” | ” | ” | ” | ” |
+| [`macos-24.6.0-2026-08-05-7ead470-tier3-3.json`](macos-24.6.0-2026-08-05-7ead470-tier3-3.json) | ” — third sequential run | ” | ” | ” | ” | ” |
+| [`macos-24.6.0-2026-08-05-tier3.json`](macos-24.6.0-2026-08-05-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**; `kernel`/`os` read empty and `unknown`, so the version is recorded here by hand. **That gap is fixed in the binary as of `71fc5a815852`** — the fields come from `uname(2)` now, and the three rows above are that fix landing | `fa4b12d6f529` | **`a131e1f4b46d6c83`** | `36fd95f08831bb38` | **Tier-3 wiring, uncertified** — the same cross-wired FT232R pair (`/dev/cu.usbserial-BH00L4KU` ↔ `BH00LL8O`) | 15 supported · 7 degraded · 0 unsupported · 3 skipped |
+| [`macos-24.6.0-2026-07-30-tier3.json`](macos-24.6.0-2026-07-30-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**; the report's own `kernel`/`os` fields read empty and `unknown`, which is the gap `uname(2)` closes as of `71fc5a815852` (`docs/macos.md` delta 5), so the version is recorded here instead | `a1029778fda9` | `01b257ece8c48470` | `94a11ac201de6613` | **Tier-3 wiring, uncertified** — the same cross-wired FT232R pair, as `/dev/cu.usbserial-BH00L4KU` ↔ `BH00LL8O` | 14 supported · 7 degraded · 0 unsupported · 3 skipped |
+| [`linux-7.0-2026-07-29-tier3-2.json`](linux-7.0-2026-07-29-tier3-2.json) | 7.0.0-28-generic, Ubuntu 26.04 — the dev box | `2e5874bbe090` | `01b257ece8c48470` | `76c9b8b293728e8e` | **Tier 3** — the same cross-wired FT232R pair (`BH00L4KU` ↔ `BH00LL8O`) | 21 supported · 0 degraded · 0 unsupported · 1 skipped |
+| [`linux-6.18-2026-07-29-tier3.md`](linux-6.18-2026-07-29-tier3.md) | 6.18.14-1rodete4-amd64, Debian rodete — **the production box** | `85699d66c5a5` | `01b257ece8c48470` | **n/a** — Markdown, no `observations` array, so not computable: unknown, and unknown is not equal | **Tier 3** — two FTDI FT232R cross-wired (`BH00LL8O` ↔ `BH00L4KU`) | 21 supported · 0 degraded · 0 unsupported · 1 skipped |
+| [`linux-7.0-2026-07-29-tier3.json`](linux-7.0-2026-07-29-tier3.json) | 7.0.0-28-generic, Ubuntu 26.04 — the dev box | `da290c616631` | `01b257ece8c48470` | `76c9b8b293728e8e` | **Tier 3** — the same cross-wired FT232R pair (`BH00L4KU` ↔ `BH00LL8O`), moved back | 21 supported · 0 degraded · 0 unsupported · 1 skipped |
+| [`linux-7.0-2026-07-29-passive-1.json`](linux-7.0-2026-07-29-passive-1.json) | 7.0.0-28-generic, Ubuntu 26.04 — the dev box | `85699d66c5a5` | `01b257ece8c48470` | `9612da13d806026c` | none (passive; no adapter attached) | 13 supported · 0 degraded · 0 unsupported · 6 skipped |
+| [`linux-7.0-2026-07-29-passive-2.json`](linux-7.0-2026-07-29-passive-2.json) | ” | ” | ” | ” | ” | ” |
+| [`linux-7.0-2026-07-29-passive-3.json`](linux-7.0-2026-07-29-passive-3.json) | ” | ” | ” | ” | ” | ” |
 
 Files are named for the UTC day of their own `generated` stamp, which is why the
 7.0 runs read `2026-07-29` despite being taken on the evening of the 28th local.
@@ -135,6 +157,17 @@ the existing fields are final**, so reports taken either side of the change stay
 diffable on everything they share — which is why the fingerprint staying put is correct rather than
 merely convenient.
 
+<!-- ANNOTATION 2026-08-05 (§5). That last clause was the right call about `probe set` and the
+     wrong conclusion overall. `probe set` staying put is correct — the questions did not move — but
+     the sentence reads as though nothing needed to say the cells had moved, and the only thing that
+     did say so was this paragraph, written by hand under §3.34's standing rule, *because no field
+     could*. `field set` (added 2026-08-05, notes §3.51) now says it: the four commits named in this
+     section print one `a131e1f4b46d6c83` and five different `field set` values, and `df48bfc` makes
+     a fifth commit and a sixth value. The hand-announcement rule **stays**, and this paragraph with
+     it: the digest says *that* the cells moved, never *which* — for that, diff the leaf paths
+     (recipe under "Adding one"). -->
+
+
 **One caution the new pair does not remove.** A shared fingerprint certifies that two runs asked
 the same *questions*; it does not certify that they asked them of the same *configuration*. The
 P13-era macOS report was taken before P10 learned to re-assert its baseline on the slave it
@@ -188,7 +221,11 @@ figure differs by a factor of 4104 (4194304 -> 1022 — again a lower bound on t
 was never driven to a blocking point). That is a probe-versus-probe ratio on one box, not a
 cross-kernel one, and it is the strongest available demonstration of why `probe set` equality is
 necessary and not sufficient. The filename convention above exists to carry what the fingerprint
-cannot.
+cannot — and as of 2026-08-05 so does a second digest: this pair reads `36fd95f08831bb38` against
+`e0047234b499d0c7`, six leaf paths apart, which is the same fact stated by the instrument instead of
+by a filename. It is still not the whole fact: the 4104x is a *body* change, and no digest computed
+from a report can see one. `itest/tests/meta_doctor_artifacts.rs` freezes both halves of this pair
+so a later simplification of the digest cannot quietly erase the counterexample.
 
 Same binary, same commit, same fingerprint on both sides of the diff: the pre-P13 reports are
 comparable field by field, and `docs/serial-nexus-doctor.md` does the
@@ -211,6 +248,13 @@ on 6.18**. Every clause of that file is decidable by eye from this Markdown and 
 one holds — including the `.build.probe_set` / `.build.commit` clauses added on
 2026-07-28, which the older `fe1c52c`-vintage 6.18 artifact could not have answered —
 but inference is not execution. Closing it costs one `--json` capture on that box.
+<!-- ANNOTATION 2026-08-05 (§5). "Every clause holds" is now false for exactly one clause and
+     stated rather than quietly amended: `.build.field_set` (notes §3.51) is absent from this
+     Markdown, as it is from all nineteen JSON artifacts, because the field postdates every one of
+     them. Nothing about 6.18 is implicated — the clause gates fresh `--json` output, and the
+     capture that would close the gap above would carry the field. The sentence is left standing
+     because it is a record of what was inferred when it was written. -->
+
 (The gate *has* been executed against the 7.0 JSON here, which proves the HEAD probe
 set and HEAD `linux.jq` agree; what it cannot prove is anything about 6.18.)
 
@@ -243,7 +287,26 @@ cargo build --workspace --locked
 # With a rig, opt the ports in explicitly — this transmits, and a listed port could
 # be wired to live equipment (§15.17):
 ./target/debug/serial-nexus-doctor --port /dev/ttyUSB0 --port /dev/ttyUSB1 > docs/doctor/….md
+# The cell-set digest of any captured report, including ones taken before the field
+# existed (it is a pure function of .probes[].observations) — this is what computed the
+# `Field set` column above, with the artifacts untouched:
+./target/debug/serial-nexus-doctor --field-set docs/doctor/<file>.json
+# WHICH cells moved between two reports — the digest says only that they did:
+diff <(jq -r '[.probes[] as $p | $p.observations[] | $p.id + "." + .key] | sort | .[]' A.json) \
+     <(jq -r '[.probes[] as $p | $p.observations[] | $p.id + "." + .key] | sort | .[]' B.json)
 ```
+
+**What the first report carrying `field set` can and cannot be compared against.** Adding
+the field is itself an observation-shape change — of the `Build` block, not of any probe
+— so say it plainly rather than let a reader assume. Against **any later report**: by
+field equality, directly, with no repository access; that is the property the field
+exists to provide. Against the **nineteen frozen JSON artifacts**: only by recomputation,
+i.e. the comparison needs the tool — which is why the column above records it once.
+Against **`linux-6.18-2026-07-29-tier3.md`**: not at all; it is Markdown with no
+`observations` array, its digest is not computable, and its cell set is therefore
+unknown rather than equal. Nothing under `docs/doctor/` was edited to make room for the
+column (§16.13), and the digest of every artifact was computed *before* the field
+existed — which is exactly why those values could be published here at all.
 
 Prefer `--json` (it is what the gate consumes and what diffs cleanly); commit the
 Markdown when that is what the operator actually produced, as above, rather than

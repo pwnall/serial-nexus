@@ -781,7 +781,14 @@ and reddening a healthy box over that is the false negative P4's clause already 
 Guards: `report::tests::{the_utc_stamp_agrees_with_date_on_the_cases_that_break_naive_conversions,
 the_probe_set_fingerprint_moves_on_a_probe_rewrite_and_not_on_a_measurement,
 both_renderers_carry_the_build_identity_and_the_timestamp}`, and the gate itself was proved able to
-fail (`jq 'del(.build)'` and an emptied fingerprint are both rejected).
+fail (`jq 'del(.build)'` and an emptied fingerprint are both rejected). Joined 2026-08-05 by the
+cell-set digest and its guards (notes §3.51): `report::tests::{the_shared_encoder_is_byte_stable,
+the_field_set_moves_on_a_new_observation_key_and_not_on_a_measurement,
+the_two_field_set_paths_agree_on_a_real_report}`, the four in
+`itest/tests/meta_doctor_artifacts.rs`, and
+`expectation_gates::{the_field_set_clause_rejects_a_report_that_cannot_say_which_cells_it_carries,
+both_expectation_files_carry_the_same_field_set_clause}` — because **equality of this fingerprint
+never licensed a field-by-field diff**, and until then nothing said so.
 
 **Two report-text defects the run surfaced, both Tier-1 over-claims, both now fixed.** They were in
 the operator-facing report the README makes the first attachment on every bug report, and a Tier-1
@@ -3050,10 +3057,9 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **753 passing, 0 failed, 4 ignored** across 113 test
-targets on Linux (2026-08-05: §3.49's three P5 guards plus its `serial_nexus_sys`
-`ICOUNTS_SUPPORTED` guard, added to two existing targets; §3.38's listener-barrier guard, §3.39's orphan-leash fixture and guard, §3.40's two baseline guards, and earlier the same day the three doctor guards of §3.34 and the kernel-naming fix
-— `termios_mode_tells_the_daemons_baseline_from_a_cooked_pty`,
+The current whole-suite figure is **762 passing, 0 failed, 4 ignored** across 114 test
+targets on Linux (2026-08-05: §3.51's cell-set digest added nine — three in `report.rs`, the four of the new `itest/tests/meta_doctor_artifacts.rs` target, and two in `expectation_gates.rs`; §3.49's three P5 guards plus its `serial_nexus_sys`
+`ICOUNTS_SUPPORTED` guard, added to two existing targets; §3.38's listener-barrier guard, §3.39's orphan-leash fixture and guard, §3.40's two baseline guards, and earlier the same day the three doctor guards of §3.34 and the kernel-naming fix— `termios_mode_tells_the_daemons_baseline_from_a_cooked_pty`,
 `p10_recoverability_separates_a_deep_buffer_from_a_black_hole` and
 `the_os_name_survives_a_box_with_no_os_release_file` — on top of the 729 left by
 2026-08-04's P13 probe unit test, `p8_map`'s residual-forward guard and
@@ -5453,7 +5459,7 @@ three shape trials, which on Linux used to be skipped by the early return and no
 the shape trials already ran, so the delta there is the windows alone.
 
 **Gates:** `cargo build --workspace --locked`; `cargo test --workspace --locked --no-fail-fast` —
-**744 → 753 passing / 0 failed / 4 ignored** across 113 test-result targets (measured with §3.49's four landed alongside), the +5 attributable here being this
+**744 → 762 passing / 0 failed / 4 ignored** across 114 test-result targets (measured at the end of the 2026-08-05 run with §3.49's four and §3.51's nine landed alongside), the +5 attributable here being this
 entry's guards on the existing `serial-nexus-doctor` target (all five run on Linux; three on macOS,
 since one is Linux-gated and one not-macOS-gated, both deliberately); `cargo fmt --all --check`;
 `cargo clippy --workspace --all-targets --locked -- -D warnings`;
@@ -5579,6 +5585,208 @@ predicate became the `TIOCMGET || TIOCGICOUNT` disjunction: `p5_verdict`'s final
 paired test assertion, the `supported` bullet in `docs/serial-nexus-doctor.md`, and `docs/macos.md`
 around lines 707 and 889. They are adjacent to this change and out of its scope; the correction is
 owed and is recorded here rather than folded in quietly.
+
+---
+
+### 3.51 "Equal `probe_set` ⇒ comparable field by field" is false, and the tree holds the counterexample
+
+**Design:** §15.44 (new, amend-first per §5), §16.13.
+
+**The defect.** `docs/doctor/README.md` and `Build::probe_set`'s doc comment presented the `probe set`
+fingerprint as the check a reader runs before a field-by-field cross-kernel diff. It cannot be that
+check. The digest covers the deduplicated, sorted set of each probe's `(id, question)` **strings** —
+not the code that asks them, and not the cells they emit. The sound direction (unequal ⇒ not
+comparable) was stated correctly in the Markdown renderer; nothing anywhere said the converse is
+false, and the README's framing ("Read the Build block first", "only meaningful between two reports
+whose probe set fingerprints are equal") invited exactly the wrong reading.
+
+**The counterexample is committed, and this session recomputed every number in it** rather than
+re-quoting the earlier commit message. Method: scalar **leaf paths** under `.probes[].observations`,
+formed as `<probe id>.<observation key>[.nested…]`, arrays collapsed to one `[]` step, values
+excluded; extracted with an independent `jq` walker and cross-checked against the shipped
+`--field-set` implementation, which reproduces all nineteen stored digests below.
+
+| pair (both `probe_set = a131e1f4b46d6c83`) | leaf paths added | removed |
+|---|---|---|
+| macOS `7ead470` → `1a9a8fc` | **+65** | 0 |
+| macOS `fa4b12d` → `1a9a8fc` | **+71** | 0 |
+| macOS `fa4b12d` → `7ead470` | +6 | 0 |
+| Linux `71fc5a8` → `4b78fff` | +65 | 1 |
+
+**The 32/35 an earlier commit message quotes could not be reproduced under any collapsing tried, and
+must not be re-quoted.** Collapsing sibling repetitions (P10's two directions, P7/P13's three shapes)
+to `<probe id>.<leaf name>` gives 38 and 41, not 32 and 35. The *direction* of the claim is
+unaffected — the counterexample is bigger than was stated, not smaller — and `AGENTS.md` §2 is
+corrected in the same commit.
+
+**The pair that makes it more than bookkeeping** is the small one. `fa4b12d` → `7ead470` adds only
+six leaf paths (`bytes_recovered_by_peer`, `bytes_unrecoverable`, `slave_termios_mode` × 2
+directions) — and that is the pair whose P10 hostward figure moves 4194304 → 1022, a factor of 4104,
+under one unchanged digest. The tree's single most misleading measured pair sits inside the false
+reading.
+
+**A fifth instance landed while this was being written.** `df48bfc` (notes §3.48) added four P4
+cells — `canonical`, `topology_only`, `unidentified`, `sysfs_tty_listing` — with P4's question
+untouched, so the binary still prints `a131e1f4b46d6c83`. Measured on the dev box: a passive run at
+`4b78fff` carries 6 P4 leaf paths, the same run at `df48bfc` carries 10. The defect reproduces on the
+newest commit in the tree, which is why the fix is a field and not a prose correction.
+
+**The decision: narrow the prose *and* add a second digest. Folding the keys into `probe set` is
+declined, and the decline is measured** (§5 binds it against silent re-fixing).
+
+*(a) narrowing alone is necessary but not sufficient.* A new field does not repair a false sentence,
+so the prose is narrowed regardless. But narrowing alone retracts the field's headline value —
+`Build::probe_set`'s doc sells "in one glance and with no repository access", and the replacement
+rule ("compare commits") needs repository access and a source diff. A reader holding two JSON files,
+the exact scenario the `Build` block was invented for, would be left with no machine-checkable
+statement at all.
+
+*(c) folding observation keys into `probe_set` is refuted by measurement, not by argument.* In this
+tree some keys **are** the measurement: `P6.after_last_close.read_outcomes.EIO` (Linux) against
+`…read_outcomes.eof` (Darwin); `revents_seen.POLLHUP` against `revents_seen.POLLIN|POLLHUP`;
+`P8.slave_open_idle.epoll_flags_seen`, an empty histogram in the committed Linux runs whose key set is
+whatever the kernel returned. Others are device identities: `P11./dev/ttyUSB0.…`,
+`P5.usb:0403:6001:BH00L4KU:00 cert`, `P4.usb-FTDI_FT232R_USB_UART_BH00LL8O-if00-port0`. Consequences,
+measured at `df48bfc` on this box: naming two ports adds **19** leaf paths to one binary's output
+(two pty slaves; a rig adds more, since its device paths are themselves keys), and the same binary
+emits **72 Linux-only and 22 macOS-only** paths across the two kernels, over 213 shared. Folding keys
+in would therefore (i) make a passive and a rig run of one binary report themselves incomparable —
+the P3-title failure `probe_set_fingerprint`'s choice 1 exists to prevent, (ii) make every
+cross-kernel pair report itself incomparable — choice 3's failure, "the field being wrong in the
+direction nobody would notice", (iii) move `a131e1f4b46d6c83`, orphaning every committed artifact and
+the README index built on it, and (iv) destroy the one thing `probe_set` says truthfully.
+
+*(b) the second digest, as a **cell-set** digest with an exactly provable contract.* Not a second
+instrument-identity digest — that is unattainable from a report, and claiming it would re-commit this
+very defect one level up. `field_set` digests the sorted, deduplicated set of scalar leaf **paths**
+the report carries. Equal ⇒ the two reports carry exactly the same cells, so a field-by-field diff
+has no missing ones (true by construction, unlike `probe_set`'s implied claim). Unequal ⇒ the cell
+sets differ; restrict the diff to their intersection — and it cannot say *why* (binary moved,
+platform differs, hardware differs, a histogram key was not observed). **Equal still does not certify
+equal probe bodies**: a body change that alters a number without adding a key is invisible to it,
+exactly as it is to `probe_set`. That sentence is printed in all three places — the field's doc, the
+Markdown renderer, and the README — or the defect recurs one level up.
+
+**No exclusion list and no heuristic.** Device-identity keys and outcome-keyed histograms are
+*included*, and that is correct under the contract: if one run's P6 reports `read_outcomes.EIO` and
+the other `read_outcomes.eof`, a field-by-field diff genuinely has missing cells, and reading
+"EIO: 2 vs absent" as "Darwin returned zero EIOs" is a hazard the old rule silently permitted.
+
+**Two design decisions taken from measurement rather than taste.**
+
+1. **The scalar's JSON kind is excluded from the path.** Measured on the same-binary cross-kernel pair
+   (`linux-7.0-2026-08-05b-tier3.json` at `4b78fff` against `macos-24.6.0-2026-08-05-1a9a8fc-tier3.json`
+   at `1a9a8fc`, whose `*.rs`/`*.toml` diff is empty): **4 of 213** shared paths differ in kind, and all
+   four are measurements — `P10.master_to_slave_hostward.pending_output_bytes` and its targetward twin
+   read `number` where `TIOCOUTQ` answers and `null` where it does not, and
+   `P7.{b_open_tcsetattr_close,c_open_write_close}.leading_bytes_hex[]` is a populated string array on
+   Linux and empty on Darwin. A kind-sensitive digest would call two healthy runs of one binary
+   incomparable.
+2. **An empty array digests to the same path as a populated one** (`p[]` either way), for the same
+   reason. An **empty object** digests as the path itself (`P8.slave_open_idle.epoll_flags_seen`), so
+   an observation can never vanish from the shape entirely — the one case where a histogram's
+   emptiness does move the digest, and that is honest: the cells really are absent.
+
+**Measured, not assumed — the digest is not run-to-run noise.** Across all nineteen committed JSON
+artifacts, every group of sequential runs of one binary shares one value. These digests were computed
+**before the field existed**, which is what makes retroactive indexing lawful under §16.13: the
+README table gains a column, the frozen files are not touched.
+
+| artifact group | `probe_set` | `field_set` | leaf paths |
+|---|---|---|---|
+| `linux-7.0-2026-07-29-passive-{1,2,3}` | `01b257ece8c48470` | `9612da13d806026c` ×3 | 148 |
+| `linux-7.0-2026-07-29-tier3`, `-2` | `01b257ece8c48470` | `76c9b8b293728e8e` ×2 | 192 |
+| `macos-24.6.0-2026-07-30-tier3` | `01b257ece8c48470` | `94a11ac201de6613` | 141 |
+| `macos-24.6.0-2026-08-05-tier3` (`fa4b12d`) | **`a131e1f4b46d6c83`** | **`36fd95f08831bb38`** | 164 |
+| `macos-…-7ead470-tier3{,-2,-3}` | **`a131e1f4b46d6c83`** | **`e0047234b499d0c7`** ×3 | 170 |
+| `linux-7.0-2026-08-05-tier3{,-2,-3}` (`71fc5a8`) | **`a131e1f4b46d6c83`** | **`64410fea8995f068`** ×3 | 221 |
+| `macos-…-1a9a8fc-tier3{,-2,-3}` | **`a131e1f4b46d6c83`** | **`0c303d4cb11e3893`** ×3 | 235 |
+| `linux-7.0-2026-08-05b-tier3{,-2,-3}` (`4b78fff`) | **`a131e1f4b46d6c83`** | **`88585243dafb4747`** ×3 | 285 |
+| `linux-6.18-2026-07-29-tier3.md` | `01b257ece8c48470` | *not computable — Markdown, no `observations` array* | — |
+
+One `probe_set` value, **five** `field_set` values, and the two known-bad pairs both fire. The
+07-29 Tier-3 pair is two *different commits* with an equal `field_set`, so the field does not simply
+redden everything. §9's tell applies: the portable form comes out **stricter** on the platform of
+record, not weaker.
+
+**What the first report carrying the field can and cannot be compared against** — because adding it
+is itself an observation-shape change, of the `Build` block rather than of any probe. Against any
+later report: by field equality, directly, with no repository access; that is the property narrowing
+alone gives up. Against the nineteen frozen JSON artifacts: only by *recomputation*
+(`serial-nexus-doctor --field-set <file>`), i.e. the comparison needs the tool — which is why the
+README column records that recomputation once. Against `linux-6.18-2026-07-29-tier3.md`: not at all;
+its digest is not computable and its cell set is **unknown**, which is never "equal" — the same rule
+the README already applies to pre-2026-07-28 reports with no `probe set`.
+
+**The Linux output did not move except where predicted.** Before and after, on the dev box at
+`df48bfc`: the leaf-path set is **identical at 247 paths**, the environment block is byte-identical,
+and `.build` gains exactly `field_set` (plus the `-dirty` suffix an uncommitted tree stamps). The
+values that differ are P2's and P9's poll figures, P13's `close_microseconds`, P6's `elapsed_ms` and
+P10's depths — and two sequential runs of the *unchanged* binary move a superset of exactly those,
+so they are the run-to-run set `docs/doctor/README.md` already names, not an effect of this change.
+The box was not quiet (load 9.87 at build time, 2.83 later, 8 cores, sibling agents building), which
+is why nothing here rests on a timing figure (§8).
+
+**Guards, and the fail-first mutation each one answers** (§9 — every one executed against the fixed
+tree, message captured verbatim):
+
+* `report::tests::the_field_set_moves_on_a_new_observation_key_and_not_on_a_measurement` — the
+  discrimination, in six parts. **M1**, the mutation that matters most: make `field_paths` treat any
+  object as a leaf (a top-level-only digest). → *"P10 gained a nested `recheck` block and the field
+  set did not move — this is the 2026-08-05 defect verbatim"*, `left: "a528bc6947728b70"` equal to
+  `right`. A top-level-only digest passes every other assertion in the test and still misses P10's
+  `recheck`, P13's `slave_termios_mode` and P7's baseline block, because all three arrived *under*
+  existing keys. **M2**, push `"{id}.{key}={value}"` beside each path. → *"a measurement moved the
+  field set — every healthy pair of boxes would now report itself incomparable"*. **M3**, annotate
+  each scalar with its JSON kind. → *"null-vs-number moved the field set — a kind-sensitive digest
+  calls two healthy runs of one binary incomparable"*. M1 and M2 together are the discrimination the
+  field exists for; a change that passes only one of them is not the fix.
+* `report::tests::the_shared_encoder_is_byte_stable` — **M4**, delete the length prefix in
+  `fnv1a_delimited`. → *"probe_set digest changed — every value in docs/doctor/ and its README index
+  is now wrong"*, `left: "8ed97919f50e8cd0"` against `right: "ea5afd6873507ab9"`. The shared encoder
+  was factored out of `probe_set_fingerprint` so both digests use it; the byte stream is unchanged by
+  construction (flattening `(id, question)` pairs), and this pin is what proves it.
+* `report::tests::the_two_field_set_paths_agree_on_a_real_report` — **M6**, emit a constant instead of
+  the digest. → *"the emitted digest and the recomputed digest disagree — the README index of
+  docs/doctor/ is computed by the recompute path"*. It also fires under **M5** (below).
+* `meta_doctor_artifacts::equal_probe_sets_do_not_mean_equal_field_sets_and_the_tree_proves_it` —
+  **M5**, walk questions instead of observations in the recompute path. → *"7ead470 and 1a9a8fc carry
+  equal probe_set AND equal field_set — the committed counterexample stopped being visible"*. This is
+  the guard that catches a future "simplification" of the digest back onto the questions.
+* `meta_doctor_artifacts::a_fresh_report_carries_the_digest_its_own_recompute_produces` — fires under
+  M5 and M6, against live probe output rather than a fixture.
+* `meta_doctor_artifacts::the_field_set_does_not_move_between_sequential_runs_of_one_binary` — the
+  other half: five triples of sequential runs, each triple one digest.
+* `expectation_gates::the_field_set_clause_rejects_a_report_that_cannot_say_which_cells_it_carries`
+  and `…::both_expectation_files_carry_the_same_field_set_clause` — deleting the clause from
+  `expectations/linux.jq` fails both, the first with *"admitted a report with no field set"*. The
+  clause pins shape, never value: the value is a property of the run, so pinning it would redden a
+  healthy box.
+
+**A refuted prediction, recorded because §9 says it is as load-bearing as a confirmed one.** The
+design predicted that M4 (encoder drift) would also fail the artifact gate on
+`assert_eq!(probe_set(&old), "a131e1f4b46d6c83")`. It does **not**, measured: that helper reads a
+*stored* field out of a frozen JSON file, so no change to the encoder can move it. The gate was
+therefore given the assertion that can see it — a pinned `field_set` of one frozen artifact
+(`0c303d4cb11e3893`), which is recomputed on every run and is exactly the value the README publishes
+in a column no reader can otherwise check. With that in place M4 fails the artifact gate too, with
+*"the recomputed field set of a frozen artifact moved — the `field set` column of
+docs/doctor/README.md now publishes wrong digests"*.
+
+**Vacuity check** (§9 — a verdict from a loop that never executed is vacuous).
+`the_field_set_does_not_move_between_sequential_runs_of_one_binary` iterates hard-named artifact
+triples and would pass trivially if a file were renamed and the loop silently skipped it;
+`the_artifact_directory_still_holds_what_this_gate_indexes` is the floor that keeps it honest, and
+the floor was proved to fire by raising it to 99 — *"only 19 JSON artifacts found in docs/doctor
+(floor 99)"*, which names the count it counted. `field_set()` panics rather than returning an empty
+string when `--field-set` exits non-zero, so two failed recomputations cannot compare equal.
+
+**Two deviations from the design as drafted, both recorded rather than silent.** (1) The design's
+boundary case in assertion (6) compared `probe(…)`-built probes, which carry no observations at all
+and so have an empty field set; it is written here as a genuine boundary pair —
+`["P1.aP2.b"]` against `["P1.a", "P2.b"]`, which concatenate to the same bytes and are separated only
+by the length prefix. (2) The `--field-set` reader in the design carried a malformed push expression;
+it is written plainly.
 
 ---
 

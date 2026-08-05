@@ -140,7 +140,8 @@ impl EnvCheck {
 /// linux.jq`, whose stated job is proving the artifact "diffable field by field",
 /// had no clause that could see it.
 ///
-/// Two identifiers, because they answer different questions.
+/// Three identifiers, because they answer three different questions: *which
+/// tree*, *which questions*, and *which cells*.
 #[derive(Debug, Clone, Serialize)]
 pub struct Build {
     /// The git commit the binary was built from (`<short sha>` or
@@ -152,17 +153,48 @@ pub struct Build {
     /// A digest over the deduplicated, sorted set of every probe's
     /// `(id, question)` — see [`probe_set_fingerprint`] for why each of
     /// "deduplicated", "sorted" and the omission of the title is load-bearing.
-    /// Answers the question a diff actually needs —
-    /// **are these two artifacts comparable?** — in one glance and with no
-    /// repository access, which is what the commit alone cannot do. Equal
-    /// fingerprints mean the two runs asked the same questions of their kernels;
-    /// different ones mean the probe set moved and a field-by-field diff is
-    /// reading two different instruments.
+    /// Answers **did these two runs ask the same questions?** in one glance and
+    /// with no repository access, which is what the commit alone cannot do.
+    ///
+    /// **Only the unequal direction is a verdict.** Unequal means the probe set
+    /// moved and a field-by-field diff is reading two different instruments.
+    /// Equal means the two runs used the same question *text* — it does **not**
+    /// mean they measured the same way, and it does **not** mean the reports are
+    /// comparable field by field. The digest covers the question *strings*, not
+    /// the code that asks them: between `fa4b12d6f529` and `7ead470f594c` this
+    /// value held at `a131e1f4b46d6c83` while P10's hostward figure moved by a
+    /// factor of 4104, between `7ead470f594c` and `1a9a8fca1c36` it held while 65
+    /// observation leaf paths appeared, and at `df48bfcc4fac` it held again while
+    /// P4 gained four (`canonical`, `topology_only`, `unidentified`,
+    /// `sysfs_tty_listing`). [`Build::field_set`] is the field that sees that;
+    /// `docs/doctor/README.md` carries the counterexample.
     ///
     /// Not cryptographic and does not need to be: it detects drift, it does not
     /// resist an adversary, and a hash with that job must not drag a dependency
     /// through the licensing gate.
     pub probe_set: String,
+    /// A digest over the sorted, deduplicated set of **scalar leaf paths** this
+    /// report's observations actually carry — `<probe id>.<key>[.nested…]`, with
+    /// arrays collapsed to one `[]` step and every *value* excluded. See
+    /// [`field_set_fingerprint`].
+    ///
+    /// **Equal means the two reports carry exactly the same cells**, so a
+    /// field-by-field diff has no missing ones. That is provable rather than
+    /// implied, because the digest is computed from the very thing it certifies
+    /// — and it is the statement `probe_set` was being read as making and does
+    /// not make. Unequal means the cell sets differ and the diff must be
+    /// restricted to their intersection; it does *not* say why they differ
+    /// (binary, platform, attached hardware, or a histogram key this run did not
+    /// observe are all causes). **Equal still does not certify that the probe
+    /// bodies match**: a body change that moves a number without adding a key is
+    /// invisible here, exactly as it is to `probe_set`.
+    ///
+    /// Unlike `commit` and `probe_set` this is a property of the **run**, not of
+    /// the binary: naming two pty slaves adds 19 leaf paths to this binary's
+    /// output on this box, and the same binary emits 72 Linux-only and 22
+    /// macOS-only paths across the two kernels — both measured, and both honest,
+    /// because those diffs really are partial (notes §3.51).
+    pub field_set: String,
 }
 
 /// The whole report.
@@ -218,6 +250,7 @@ impl Report {
             // otherwise fail to compile rather than report what it does not know.
             commit: option_env!("SNX_BUILD_COMMIT").unwrap_or("unknown"),
             probe_set: probe_set_fingerprint(&probes),
+            field_set: field_set_fingerprint(&probes),
         };
         Report {
             tool: "serial-nexus-doctor",
@@ -261,10 +294,22 @@ impl Report {
         m.push_str(&format!("| commit | `{}` |\n", self.build.commit));
         m.push_str(&format!("| probe set | `{}` |\n", self.build.probe_set));
         m.push_str(&format!(
+            "| field set (this run) | `{}` |\n",
+            self.build.field_set
+        ));
+        m.push_str(&format!(
             "| generated | {} |\n",
             self.generated_utc.as_deref().unwrap_or("unknown")
         ));
-        m.push_str("\n**Diffing this against another kernel?** Compare `probe set` first — an unequal fingerprint means the two runs do not ask the same questions, and the numbers below are not comparable field by field (§13).\n\n");
+        m.push_str(
+            "\n**Diffing this against another kernel?** Compare both digests. An unequal `probe \
+             set` means the two runs do not ask the same questions and the numbers below are not \
+             comparable at all (§13). An **equal** `probe set` is not a green light: it digests \
+             the question *text*, not the code that asks it. `field set` is the one that answers \
+             \"same cells?\" — equal means every observation present in one report is present in \
+             the other, unequal means diff only their intersection. Neither digest can see a \
+             probe body that changed a number without changing a key.\n\n",
+        );
 
         m.push_str("## Environment\n\n");
         m.push_str("| Check | Value | Verdict |\n|---|---|---|\n");
@@ -337,20 +382,34 @@ impl Report {
 /// probe's question verbatim, which is what [`crate::probes::P3_QUESTION`] and
 /// [`crate::probes::P5_QUESTION`] exist for.
 ///
-/// FNV-1a over a length-delimited encoding. The delimiters are not decoration —
-/// concatenating raw fields lets an id's tail move into the next question with no
-/// change in the digest, which is the classic way a fingerprint quietly stops
-/// fingerprinting.
+/// FNV-1a over a length-delimited encoding ([`fnv1a_delimited`]).
+///
+/// **What it cannot do**, stated here because the report used to print the
+/// opposite: equality does not license a field-by-field diff. It digests the
+/// question *strings*, and a probe body can gain cells — or change what it
+/// measures — with its question untouched. [`field_set_fingerprint`] is the
+/// digest that sees that.
 fn probe_set_fingerprint(probes: &[Probe]) -> String {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut pairs: Vec<(&str, &str)> = probes
         .iter()
         .map(|p| (p.id.as_str(), p.question.as_str()))
         .collect();
     pairs.sort_unstable();
     pairs.dedup();
+    // Flattening to [id, question, id, question, …] reproduces the original
+    // encoder byte for byte, which is why `a131e1f4b46d6c83` survives this
+    // refactor — pinned by `the_shared_encoder_is_byte_stable`.
+    fnv1a_delimited(pairs.into_iter().flat_map(|(id, question)| [id, question]))
+}
 
+/// FNV-1a over a length-delimited encoding of `fields`, 16 lowercase hex chars.
+///
+/// The delimiters are not decoration — concatenating raw fields lets one field's
+/// tail move into the next with no change in the digest, which is the classic way
+/// a fingerprint quietly stops fingerprinting.
+fn fnv1a_delimited<'a>(fields: impl Iterator<Item = &'a str>) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut h = OFFSET;
     let mut eat = |bytes: &[u8]| {
         for b in bytes {
@@ -358,13 +417,117 @@ fn probe_set_fingerprint(probes: &[Probe]) -> String {
             h = h.wrapping_mul(PRIME);
         }
     };
-    for (id, question) in pairs {
-        for field in [id, question] {
-            eat(&(field.len() as u64).to_le_bytes());
-            eat(field.as_bytes());
-        }
+    for field in fields {
+        eat(&(field.len() as u64).to_le_bytes());
+        eat(field.as_bytes());
     }
     format!("{h:016x}")
+}
+
+/// Digest the **cells** this report carries (see [`Build::field_set`]).
+///
+/// Why this exists: `probe_set` digests each probe's `question` *string*, and a
+/// probe body can gain fields — or change what it measures — with the question
+/// untouched. On 2026-08-05 five commits printed one `probe_set` while the macOS
+/// observation set gained 65 leaf paths and P10's hostward figure moved 4104x.
+/// The standing workaround was prose in `docs/doctor/README.md` announcing each
+/// addition by hand; this field makes the announcement machine-checkable.
+///
+/// Four deliberate choices, each measured rather than assumed (§7):
+///
+/// 1. **Paths, never values.** Two healthy boxes differ in every measurement, so
+///    a value-sensitive digest reports every real pair as incomparable — the same
+///    trap [`probe_set_fingerprint`]'s choice 3 avoids.
+/// 2. **The scalar's JSON *kind* is excluded too.** Measured on the same-binary
+///    cross-kernel pair of 2026-08-05: 4 of 213 shared paths differ in kind, and
+///    all four are measurements — `P10.*.pending_output_bytes` reads a number
+///    where `TIOCOUTQ` answers and `null` where it does not, and
+///    `P7.*.leading_bytes_hex` is a populated array on one kernel and empty on
+///    the other. An empty array therefore digests to the same `…[]` path as a
+///    populated one.
+/// 3. **An empty object digests as the path itself**, so an observation can never
+///    vanish from the shape. `P8.slave_open_idle.epoll_flags_seen` is `{}` in the
+///    committed Linux runs; a populated one contributes
+///    `…epoll_flags_seen.EPOLLHUP` instead, and the digest moves. That is
+///    correct: those cells really are absent.
+/// 4. **Nothing is excluded by name.** Device-identity keys (`P11./dev/ttyUSB0.…`)
+///    and outcome-keyed histograms (`read_outcomes.EIO` vs `…eof`) are included,
+///    because a diff across them genuinely has missing cells. An exclusion list
+///    would be a hand-kept list in a gate, and would rot on the next probe that
+///    keys a map by what it observed.
+///
+/// Consequently this is a property of the **run**, not of the binary, and it is
+/// deliberately *not* a second instrument-identity digest: no digest computed
+/// from a report can be one.
+fn field_set_fingerprint(probes: &[Probe]) -> String {
+    field_set_core(probes.iter().flat_map(|p| {
+        p.observations
+            .iter()
+            .map(move |o| (p.id.as_str(), o.key.as_str(), &o.value))
+    }))
+}
+
+/// [`field_set_fingerprint`] over an already-captured report, so the frozen
+/// artifacts in `docs/doctor/` can be indexed without being edited (§16.13).
+///
+/// One core, two callers: the emitting path and this one must never drift, which
+/// `the_two_field_set_paths_agree_on_a_real_report` asserts by round-tripping a
+/// built report through `to_json`.
+///
+/// `None` on anything that is not a doctor report. Recursion depth is bounded by
+/// `serde_json`'s own 128-level parse limit, so a malformed input is rejected by
+/// the parser before [`field_paths`] ever sees it.
+pub fn field_set_of_report_json(report: &serde_json::Value) -> Option<String> {
+    let probes = report.get("probes")?.as_array()?;
+    let mut triples: Vec<(&str, &str, &serde_json::Value)> = Vec::new();
+    for p in probes {
+        let id = p.get("id")?.as_str()?;
+        let Some(observations) = p.get("observations") else {
+            continue;
+        };
+        for o in observations.as_array()? {
+            let key = o.get("key")?.as_str()?;
+            let value = o.get("value")?;
+            triples.push((id, key, value));
+        }
+    }
+    Some(field_set_core(triples.into_iter()))
+}
+
+fn field_set_core<'a, I>(observations: I) -> String
+where
+    I: Iterator<Item = (&'a str, &'a str, &'a serde_json::Value)>,
+{
+    let mut paths: Vec<String> = Vec::new();
+    for (id, key, value) in observations {
+        field_paths(&format!("{id}.{key}"), value, &mut paths);
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    fnv1a_delimited(paths.iter().map(String::as_str))
+}
+
+/// Every scalar leaf path under `value`, rooted at `prefix`.
+fn field_paths(prefix: &str, value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) if !map.is_empty() => {
+            for (k, v) in map {
+                field_paths(&format!("{prefix}.{k}"), v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let step = format!("{prefix}[]");
+            if items.is_empty() {
+                out.push(step);
+            } else {
+                for item in items {
+                    field_paths(&step, item, out);
+                }
+            }
+        }
+        // Scalars — and the empty object, whose path is its own leaf (choice 3).
+        _ => out.push(prefix.to_owned()),
+    }
 }
 
 /// Render a Unix millisecond timestamp as `YYYY-MM-DDTHH:MM:SSZ`.
@@ -634,10 +797,16 @@ mod tests {
             md.contains(&r.build.probe_set),
             "no probe-set fingerprint in Markdown:\n{md}"
         );
+        assert!(
+            md.contains(&r.build.field_set),
+            "no field-set digest in Markdown — the reader is back to one digest \
+             that cannot answer \"same cells?\":\n{md}"
+        );
 
         let v: serde_json::Value = serde_json::from_str(&r.to_json()).expect("json");
         assert_eq!(v["build"]["commit"], r.build.commit);
         assert_eq!(v["build"]["probe_set"], r.build.probe_set);
+        assert_eq!(v["build"]["field_set"], r.build.field_set);
         assert_eq!(v["generated_unix_ms"], 1_785_260_059_000u64);
         assert_eq!(v["generated_utc"], "2026-07-28T17:34:19Z");
 
@@ -646,5 +815,144 @@ mod tests {
         let undated = Report::new(None, vec![], vec![probe("P1", "t", "q")]);
         assert!(undated.to_markdown().contains("| generated | unknown |"));
         assert!(!undated.to_markdown().contains("1970-01-01"));
+    }
+
+    /// The refactor onto the shared encoder must not move a single committed
+    /// fingerprint: `docs/doctor/` holds 19 artifacts and a README index built on
+    /// `a131e1f4b46d6c83` and `01b257ece8c48470`, and §16.13 forbids editing them.
+    #[test]
+    fn the_shared_encoder_is_byte_stable() {
+        assert_eq!(
+            probe_set_fingerprint(&[probe("P4", "t", "q")]),
+            "ea5afd6873507ab9",
+            "probe_set digest changed — every value in docs/doctor/ and its README index is now wrong"
+        );
+    }
+
+    /// The whole point of the second digest is a discrimination, so both halves
+    /// are asserted: it moves when the instrument gains a cell, and holds still
+    /// when a measurement moves. The nested case is the 2026-08-05 defect
+    /// verbatim — P10's `recheck` block arrived *under* an existing top-level key,
+    /// so a top-level-only digest would not have seen it either.
+    #[test]
+    fn the_field_set_moves_on_a_new_observation_key_and_not_on_a_measurement() {
+        let dir = |recheck: bool, depth: i64| {
+            let mut o = serde_json::json!({
+                "total_bytes_accepted": depth,
+                "pending_output_bytes": depth,
+            });
+            if recheck {
+                o["recheck"] = serde_json::json!({ "topped_up_bytes": 512 });
+            }
+            o
+        };
+        let p10 = |recheck: bool, depth: i64| {
+            vec![
+                Probe::new("P10", "pty buffer depth", "How deep …?")
+                    .observe("slave_to_master_targetward", dir(recheck, depth)),
+            ]
+        };
+
+        // (1) A NESTED key gained — the defect.
+        assert_ne!(
+            field_set_fingerprint(&p10(false, 1024)),
+            field_set_fingerprint(&p10(true, 1024)),
+            "P10 gained a nested `recheck` block and the field set did not move — \
+             this is the 2026-08-05 defect verbatim"
+        );
+
+        // (2) A top-level observation gained — the `df48bfc` shape, where P4 grew
+        //     `canonical`/`topology_only`/`unidentified`/`sysfs_tty_listing` under
+        //     an unchanged question.
+        assert_ne!(
+            field_set_fingerprint(&[probe("P13", "t", "q")]),
+            field_set_fingerprint(&[
+                Probe::new("P13", "t", "q").observe("baseline_packet_bytes", 1)
+            ]),
+            "a new top-level observation did not move the field set"
+        );
+
+        // (3) Measurements must NOT move it — every scalar differs here, nested
+        //     ones included, and two healthy boxes differ in all of them.
+        assert_eq!(
+            field_set_fingerprint(&p10(true, 1024)),
+            field_set_fingerprint(&p10(true, 15360)),
+            "a measurement moved the field set — every healthy pair of boxes \
+             would now report itself incomparable"
+        );
+
+        // (4) Kind is excluded, and this case is measured, not hypothetical:
+        //     P10.pending_output_bytes reads a number where TIOCOUTQ answers and
+        //     null where it does not, on one binary across two kernels.
+        let with = |v: serde_json::Value| {
+            vec![Probe::new("P10", "t", "q").observe("pending_output_bytes", v)]
+        };
+        assert_eq!(
+            field_set_fingerprint(&with(serde_json::json!(4096))),
+            field_set_fingerprint(&with(serde_json::Value::Null)),
+            "null-vs-number moved the field set — a kind-sensitive digest calls \
+             two healthy runs of one binary incomparable"
+        );
+        // Same rule for an array that happened to be empty (P7.leading_bytes_hex).
+        assert_eq!(
+            field_set_fingerprint(&with(serde_json::json!([]))),
+            field_set_fingerprint(&with(serde_json::json!(["0d", "0a"]))),
+            "an empty array moved the field set"
+        );
+
+        // (5) Verdict, consequence, title and report order are not cells.
+        let quiet = vec![Probe::new("P6", "t", "q").observe("pollin_passes", 4)];
+        let busy = vec![
+            Probe::new("P6", "OTHER TITLE", "q")
+                .observe("pollin_passes", 9001)
+                .verdict(Status::Degraded, "different kernel"),
+        ];
+        assert_eq!(field_set_fingerprint(&quiet), field_set_fingerprint(&busy));
+
+        // (6) 16 hex, deterministic, and path boundaries are delimited. The
+        //     boundary pair is a genuine one: `["P1.aP2.b"]` and `["P1.a",
+        //     "P2.b"]` concatenate to the same bytes, so an encoder that dropped
+        //     the length prefix would digest two different cell sets alike. It
+        //     builds its probes directly because the `probe(…)` helper above
+        //     makes observation-free probes, whose field set is empty for every
+        //     input.
+        let f = field_set_fingerprint(&p10(true, 1024));
+        assert_eq!(f, field_set_fingerprint(&p10(true, 1024)));
+        assert_eq!(f.len(), 16);
+        assert!(f.chars().all(|c| c.is_ascii_hexdigit()), "{f}");
+        assert_ne!(
+            field_set_fingerprint(&[Probe::new("P1", "t", "q").observe("aP2.b", 1)]),
+            field_set_fingerprint(&[
+                Probe::new("P1", "t", "q").observe("a", 1),
+                Probe::new("P2", "t", "q2").observe("b", 1),
+            ]),
+            "a path boundary shift went undetected"
+        );
+    }
+
+    /// The emitting path and the recompute path must never drift — the README's
+    /// index of the frozen artifacts is computed by the second and compared
+    /// against the first.
+    #[test]
+    fn the_two_field_set_paths_agree_on_a_real_report() {
+        let probes = vec![
+            Probe::new("P7", "t", "q").observe(
+                "a_open_close",
+                serde_json::json!({"leading_bytes_hex": [], "read_outcomes": {"EIO": 2}}),
+            ),
+            Probe::new("P8", "t", "q").observe(
+                "slave_open_idle",
+                serde_json::json!({"epoll_flags_seen": {}}),
+            ),
+        ];
+        let report = Report::new(Some(0), Vec::new(), probes.clone());
+        let json: serde_json::Value =
+            serde_json::from_str(&report.to_json()).expect("report parses");
+        assert_eq!(
+            Some(report.build.field_set.clone()),
+            field_set_of_report_json(&json),
+            "the emitted digest and the recomputed digest disagree — the README \
+             index of docs/doctor/ is computed by the recompute path"
+        );
     }
 }

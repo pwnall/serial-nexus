@@ -171,3 +171,14 @@ and (all(.probes[]; . as $p
 # be the false negative this file's P4 clause already refuses to make.
 and (.build.probe_set | type == "string" and length > 0)
 and (.build.commit | type == "string" and length > 0)
+# The cell-set digest, and the half of the provenance `probe_set` cannot supply:
+# `probe_set` says the two runs asked the same questions, never that they carry the
+# same cells (four commits in `docs/doctor/` print one `a131e1f4b46d6c83` across
+# five observation sets). Structure only — its *value* is a property of the run
+# (which ports were named, which kernel, which histogram keys were observed), so
+# pinning it here would redden a healthy box. What the clause buys is that the
+# field cannot go missing: a report with no field set cannot be compared cell by
+# cell against one that has it, and an absent digest must read "unknown", never
+# "equal". Reports captured before 2026-08-05 fail it, which costs nothing — this
+# file gates fresh `--json` output, never `docs/doctor/*`.
+and (.build.field_set | type == "string" and length == 16)

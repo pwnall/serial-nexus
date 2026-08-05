@@ -47,6 +47,7 @@ before anything else:
 |---|---|
 | `commit` | Which tree the binary was built from — `<short sha>`, `<short sha>-dirty`, or `unknown` where git could not answer (a source tarball, a container without git, a `cargo package` staging tree). Override it with `SNX_BUILD_COMMIT=…` for a vendored or reproducible build. |
 | `probe set` | A 16-hex-char digest over the deduplicated, sorted set of every probe's **`(id, question)`** — *not* its title. **Equal fingerprints mean the two runs asked the same questions of their kernels**; unequal means the probe set moved and a field-by-field diff is reading two different instruments. The title is excluded on purpose: P3's embeds the device path and P3 is emitted once per `--port`, so folding it in would make a one-port box and a two-port box of the same binary disagree — printing "not comparable" over exactly the cross-kernel diff this field exists to underwrite. |
+| `field set` | A 16-hex-char digest over the sorted, deduplicated set of **scalar leaf paths** the run's observations carry — `<probe id>.<key>[.nested…]`, arrays collapsed to one `[]` step, values *and* JSON kind excluded. **Equal means the two reports carry exactly the same cells**, so a field-by-field diff has no missing ones — the statement `probe set` equality was being read as making and does not make. Unequal means the cell sets differ and the diff must be restricted to their intersection; it does not say *why* (a different kernel, a different `--port` list, or a histogram key this run did not observe all move it). Unlike the two fields above it is a property of the **run**, not of the binary. Recompute it for any captured report with `serial-nexus-doctor --field-set <report.json>`. |
 | `generated` | The run's UTC timestamp. |
 
 **What `probe_set` does not cover, stated because it bit (2026-08-05).** The digest is
@@ -60,6 +61,18 @@ report's own observations, because the fingerprint will not. The alternative —
 implementation into the digest — was not taken: it would report every prose fix and every
 refactor as "not comparable", which is the failure mode the title exclusion above already
 exists to avoid. The cost is that the reader is told, rather than the tool refusing.
+
+<!-- ANNOTATION 2026-08-05 (§5, notes §3.51). Half of that cost is now paid by the tool.
+     The paragraph above is correct about `probe_set` and correct that a *body* change is
+     structurally invisible to any digest computed from a report — but it left the reader
+     with prose as the only instrument, and prose is a §9 proxy for the property. The
+     `field set` row above answers the narrower question the tool *can* answer: did the two
+     reports carry the same cells? Five commits in `docs/doctor/` print
+     `a131e1f4b46d6c83` across six observation sets, and `field set` separates every one of
+     them. What survives unchanged: a body that moves a number without moving a key is
+     invisible to both digests, so the standing rule — say so in `docs/doctor/README.md` —
+     stays, and the digest says *that* the cells moved, never *which*. -->
+
 
 **The environment block names its own kernel, as of `71fc5a815852`.** `kernel` and `os`
 came from `/proc/sys/kernel/osrelease` and `/etc/os-release`, both Linux-only, so every
@@ -88,9 +101,12 @@ Linux 6.18 report came from a `fe1c52c`-vintage binary rather than HEAD, and the
 only reason anyone noticed was that its P4 section still carried the pre-`RES-2`
 *title*, read by eye after the fact — while `expectations/linux.jq`, whose stated
 job is proving the artifact "diffable field by field", had no clause that could
-see it. It has one now (`.build.probe_set`, `.build.commit`), asserting **presence**
-rather than a particular value: a build that genuinely cannot know its commit must
-not redden a healthy box, which is the same rule P4's clause already follows. The
+see it. It has one now (`.build.probe_set`, `.build.commit`, and since 2026-08-05
+`.build.field_set`), asserting **presence** rather than a particular value: a build
+that genuinely cannot know its commit must not redden a healthy box, which is the same
+rule P4's clause already follows. `field_set`'s clause pins the shape (a 16-character
+digest) and never the value, because the value legitimately differs between two healthy
+runs of one binary — name a port and it moves. The
 Markdown twin also carried no date at all before this, so a report committed beside
 a design note was datable only by its commit.
 

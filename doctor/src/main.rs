@@ -58,10 +58,45 @@ struct Cli {
     /// single flag selects a self-contained fixture. Defaults to `/`.
     #[arg(long, default_value = "/")]
     dev_root: PathBuf,
+    /// Recompute the observation **field-set** digest of an already-captured
+    /// report and print it, then exit. The digest is a pure function of
+    /// `.probes[].observations`, so it is computable for artifacts captured
+    /// before the field existed — which is the only way `docs/doctor/` can be
+    /// indexed without editing frozen output (§16.13).
+    #[arg(long = "field-set", value_name = "REPORT_JSON")]
+    field_set_of: Option<PathBuf>,
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    // The recompute arm runs before anything else and probes nothing: it reads a
+    // captured report and prints one digest, which is what lets a frozen artifact
+    // be indexed without being edited (§16.13).
+    if let Some(path) = &cli.field_set_of {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("{}: {e}", path.display());
+            std::process::exit(2);
+        });
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| {
+            eprintln!("{}: not JSON: {e}", path.display());
+            std::process::exit(2);
+        });
+        match report::field_set_of_report_json(&parsed) {
+            Some(f) => {
+                println!("{f}");
+                return;
+            }
+            None => {
+                eprintln!(
+                    "{}: not a doctor report (no .probes[].observations)",
+                    path.display()
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
     let sys_root = cli.dev_root.join("sys");
 
     let generated_unix_ms = SystemTime::now()
