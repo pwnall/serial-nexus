@@ -19,28 +19,48 @@ unsupported · 3 skipped**.
 
 | shape | `close_microseconds` | recovered | meaning |
 |---|---|---|---|
-| `a_no_reader_blocking_slave` | **601087** | 0 of 64 | the drain-wait runs to its timeout, then destroys |
-| `b_reader_drains_before_close` | 13 | **64 of 64** | a drained queue closes immediately — the daemon's case |
-| `c_no_reader_nonblocking_slave` | 28 | 0 of 64 | `O_NONBLOCK` takes the destructive branch at once |
+| `a_no_reader_blocking_slave` | **600104** | 0 of 64 | the drain-wait runs to its timeout, then destroys |
+| `b_reader_drains_before_close` | 23 | **64 of 64** | a drained queue closes immediately — the daemon's case |
+| `c_no_reader_nonblocking_slave` | 29 | 0 of 64 | `O_NONBLOCK` takes the destructive branch at once |
 
 Against Linux, which notes §3.30 records as `retains`, 7 µs, 64/64 — **not artifact-backed: no
 committed report in `docs/doctor/` contains a P13 block at all**, so treat the Linux column as a
 recorded measurement pending a HEAD-vintage Linux capture, not as a citation.
+<!-- ANNOTATION 2026-08-05 (§5). DISCHARGED. The HEAD-vintage Linux capture this paragraph waits
+     on was taken and committed: `docs/doctor/linux-7.0-2026-08-05-tier3.json` and two sequential
+     siblings, binary `71fc5a815852`, probe set `a131e1f4b46d6c83` — the SAME fingerprint as the
+     artifact this block is about, so the Linux column is now a citation and the pair is a lawful
+     field-by-field diff. The Linux figures read `retains`, `close_waits_for_reader: false`, 64/64
+     recovered in all three shapes, with the no-reader close at 20/10/13 µs across the three
+     captures. Read "7 µs" above as the scale it was always asserting, not as a reproducible digit:
+     the shape's close is a handful of microseconds and moves every run, which is precisely why the
+     policy classifier keys on the microsecond-vs-100-millisecond gap and never on the digit. -->
 
 **Why this is a confirmation and not a fit.** The block below derived, from XNU source alone,
 that `ptsclose` → `ttylclose` → `ttywflush` → `ttywait` waits up to `t_timeout` = 60 ticks
 (≈0.6 s at `hz` 100) before any destructive flush, and that `O_NONBLOCK` skips the wait. Both
 halves were written down *before* the probe ran here. `sysctl kern.clockrate` on this box reads
-`hz = 100, tick = 10000`, so the source reading predicts **600 000 µs** exactly; five independent
-captures measured 600115, 600249, 600363, 601087 and 601095 µs — the predicted timeout plus
-scheduling slop. Shape `c` is the controlled A/B on the single flag `ttylclose` branches on:
-same absence of a reader, `O_NONBLOCK` set, 28 µs instead of 601087. The mechanism is measured,
+`hz = 100, tick = 10000`, so the source reading predicts **600 000 µs** exactly; six independent
+captures measured 600104, 600115, 600249, 600363, 601087 and 601095 µs — the predicted timeout plus
+scheduling slop.
+<!-- ANNOTATION 2026-08-05 (§5). The list read "five … 600115, 600249, 600363, 601087 and 601095"
+     and the figures quoted elsewhere in this block were 601087 / 13 / 28. **None of those is the
+     committed artifact's**, which reads 600104 / 23 / 29 — so every sentence citing
+     `macos-24.6.0-2026-08-05-tier3.json` by name was quoting a *sibling* capture from the same
+     session. The scrollback figures were right about the mechanism and wrong about the provenance,
+     which is exactly the failure §16.13 exists to prevent: a committed report is the citable one
+     precisely so a reader can check the number, and here the check would have failed. Corrected
+     throughout to the artifact's own figures; the sixth capture added to this list is the committed
+     one. The reading is unaffected — 600104 µs is the same 60 ticks — and that is the point: the
+     defect was never in the physics, only in what could be verified. -->
+Shape `c` is the controlled A/B on the single flag `ttylclose` branches on:
+same absence of a reader, `O_NONBLOCK` set, 29 µs instead of 600104. The mechanism is measured,
 not inferred.
 
 **What this does *not* settle, kept separate on purpose:**
 
 - **It does not explain the 08-03/08-04 `p8_map` red.** No P13 ran on `macos-26-arm64`; this is
-  Darwin 24.6.0 / x86_64. And 601087 µs ≈ 60 ticks at `hz` 100 is itself an `hz`-dependent
+  Darwin 24.6.0 / x86_64. And 600104 µs ≈ 60 ticks at `hz` 100 is itself an `hz`-dependent
   quantity that nothing measured on the runner. The §7 limits recorded at the end of the next
   block apply to this artifact exactly as they applied to the P7 one.
 - **It does not measure the shape the failing test inhabits.** All three shapes decide the
@@ -67,6 +87,25 @@ not inferred.
 comparison is reading two different instruments — including against
 `macos-24.6.0-2026-07-30-tier3.json` from this same box. Restoring a lawful cross-kernel diff
 needs a fresh Linux capture at the HEAD fingerprint; that is **owed**.
+<!-- ANNOTATION 2026-08-05 (§5). DISCHARGED, and the paragraph above is left standing because it
+     was an accurate statement of the directory at the time. The owed capture landed the same day:
+     three sequential Linux Tier-3 runs at `71fc5a815852` carrying `a131e1f4b46d6c83`, so this
+     artifact now diffs field for field against a Linux sibling. What that diff shows, at an equal
+     fingerprint: P13 `retains` vs `waits-then-discards` (~40000x in `close_microseconds`); P9's
+     zero-timeout poll 170 ns vs 23122 ns.
+     **P10 is the exception, and it is the reason this annotation is not simply good news.** Its
+     Darwin block reads 1024 bytes targetward and 4194304 hostward against Linux's symmetric
+     11776-15360 — and that gap is NOT known to be a kernel difference. `apply_pty_baseline` sets
+     the baseline through a slave it immediately closes wherever the master is not a terminal
+     (which P2 measures as this platform's case), and Darwin resets slave termios at last close —
+     a fact `daemon/src/nodes/pty.rs` already states in its own non-Linux re-assert. P10 then
+     opened a fresh slave and never re-asserted, so its Darwin figures are very likely a COOKED
+     pty's, a configuration the daemon never runs. Measured on Linux, the mode is worth an order of
+     magnitude in recoverability: raw accepts ~13.8 KiB and returns all of it, cooked accepts
+     ~23.5 KiB and returns none. P10 now re-asserts on the slave it measures, reports
+     `slave_termios_mode`, reports `bytes_recovered_by_peer`, and degrades when the mode is not
+     raw. **Do not diff P10 across this pair until a macOS capture at the current binary reports
+     `slave_termios_mode: "raw"`.** That capture is the new owed item. -->
 
 **Whole-gate hardware validation, same tree (`fa4b12d`), rig attached.** `cargo test --workspace
 --locked --exclude serial-nexus-web --no-fail-fast`: **680 passing, 1 failing, 4 ignored** across
@@ -85,6 +124,24 @@ in its spawned task — i.e. §9's "proxy in time", a config-accepted reply stan
 listener's readiness. **That is a located suspect, not a root cause**: it has had no independent
 adversarial verification (§9) and no fail-first proof, so nothing here is fixed on the strength
 of it. Filed for a session that can do both.
+<!-- ANNOTATION 2026-08-05 (§5). Still not root-caused, and still not fixed — but the record is
+     sharpened by one verifiable observation, and one competing hypothesis is named so the next
+     session does not have to rediscover it.
+     SHARPER: `handshake_deadline_case` (itest/tests/p6_hostility.rs) goes from `load_toml`'s reply
+     straight into `run_wire`, with **no readiness wait of any kind** — not even the
+     `leg_sock.exists()` check its siblings use, which is itself only a proxy (the path exists once
+     `bind(2)` returns, which is before `listen(2)`). So this test is the *most* exposed of the
+     group, not a representative member of it, which fits a failure that needs contention to
+     appear. The in-tree remedy already exists and was applied elsewhere: `dial_leg`
+     (itest/tests/p6_binding.rs) retries `ConnectionRefused | NotFound` against a 10 s deadline.
+     COMPETING HYPOTHESIS, not eliminated: ECONNREFUSED on a unix socket also means a full accept
+     backlog, which 8-way concurrency is exactly the condition for. The errno alone does not
+     separate "not yet listening" from "listening and saturated", and the existing reasoning reads
+     it as though it does.
+     WHY NOTHING CHANGED HERE: no reproduction on Linux, so a fix would have no fail-first proof,
+     and §9's independent verifier cannot run against a tree that is moving. Patching the test to
+     wait would very likely make the symptom go away — which is precisely why it must not be done
+     without first establishing which of the two hypotheses it would be papering over. -->
 
 ## Update — 2026-08-04 CI triage (macos-26-arm64 runner; diagnosed and re-proved on Linux)
 
@@ -203,9 +260,9 @@ Two things this pass did **not** settle, recorded so the next one does not re-de
        pre-registered — it is evidence only if both halves survive). DISCHARGED. The doctor
        ran on the rig and the artifact is committed: `docs/doctor/macos-24.6.0-2026-08-05-tier3.json`
        (binary `fa4b12d6f529`, probe set `a131e1f4b46d6c83`). Measured `waits-then-discards`,
-       `close_waits_for_reader: true`, `close_microseconds` 601087 with 0 of 64 recovered —
-       "hundreds of thousands", as predicted — against 13 µs / 64-of-64 when the reader drains
-       first and 28 µs / 0-of-64 with `O_NONBLOCK`. See the 2026-08-04 Tier-3 rig block at the
+       `close_waits_for_reader: true`, `close_microseconds` 600104 with 0 of 64 recovered —
+       "hundreds of thousands", as predicted — against 23 µs / 64-of-64 when the reader drains
+       first and 29 µs / 0-of-64 with `O_NONBLOCK`. See the 2026-08-04 Tier-3 rig block at the
        top of this file, including what it does not settle. -->
 - **What the answer changed, and what it did not.** The 601 ms figure dissolves the
   near-always-red arithmetic in the first bullet (see the top block): the flush is the timeout arm
@@ -633,13 +690,45 @@ here for free, and the counter that names the discard has nothing to name. **ver
   `unknown`. Cosmetic — the report is still valid and copy-pasteable. Still true at
   `fa4b12d`, which is why the committed artifacts record the OS version in
   `docs/doctor/README.md`'s index row instead.
+  <!-- ANNOTATION 2026-08-05 (§5). FIXED at `71fc5a815852`. Both fields now come from
+       `uname(2)`, which is POSIX and answers on Darwin: `kernel` reads the release
+       (`24.6.0`) and `os` falls back to `Darwin 24.6.0 (x86_64)` where no
+       `/etc/os-release` publishes a `PRETTY_NAME`. `nodename` is deliberately not
+       read — it is the machine's hostname and nothing here needs it. "Cosmetic"
+       understated it: §16.13 says provenance is *recorded, never asserted*, and a
+       report that could not name its own kernel forced the one fact every
+       cross-kernel claim rests on to be typed in by hand beside the file. The
+       fallback arm is injectable (`distro_from`) so Darwin's path is exercised by
+       the Linux suite on every push rather than trusted until someone next opens a
+       Mac — a guard asserting only "the kernel field is non-empty" would have passed
+       on Linux throughout the four generations this was broken. The two committed
+       macOS artifacts still read empty: they are frozen records of what the tool
+       printed on their date (§16.13) and are not rewritten. The next macOS capture
+       fixes itself. -->
+- **The doctor's pty probes apply their baseline through a slave they immediately
+  close, and BSD does not carry that to the next open.** `apply_pty_baseline` tries the
+  master first and falls back to a momentary slave open — and on this platform the
+  master is not a terminal (P2's `termios_settable_without_slave: false`), so the
+  fallback is always the path taken. `nodes/pty.rs` already states, at its own non-Linux
+  re-assert, that such a set does not survive to the client's open; that is *why* the
+  node re-asserts on the rising presence edge. **P10 has been repaired** (it re-asserts
+  on the slave it measures and reports `slave_termios_mode`), because its output was
+  demonstrably wrong: its Darwin depths were a cooked pty's, and mode is worth an order
+  of magnitude — measured on Linux 7.0.0-29, raw accepts ~13.8 KiB hostward and returns
+  all of it while cooked accepts ~23.5 KiB and returns none. **Six siblings are not
+  repaired and this is deliberate**: P6, P7, P8, P9, P12 and P13 take the same fallback,
+  so their Darwin answers are not *known* to be measured on the daemon's configuration.
+  They are not thereby wrong — a readability question or a targetward write survives a
+  cooked discipline far better than a buffer *depth* does — but moving six cross-kernel
+  instruments at once with no Mac to re-measure on is the one-way decision on
+  single-kernel evidence §7 forbids. Re-measure here before touching them (notes §3.34).
 - **P13 (last-close disposition) is pty-only and portable, and macOS is the platform
   it was built for.** It never judges the policy — every policy is legitimate and the
   daemon is correct under each — so its verdict is `supported` whenever the
   measurement completes, and a `waits-then-discards` answer is not a degradation.
-  Measured here: `waits-then-discards`, `close_waits_for_reader: true`, 601087 µs with
-  0 of 64 recovered against no reader; 13 µs with 64 of 64 when the master drains
-  first; 28 µs with 0 of 64 for an `O_NONBLOCK` slave. Note the harness cost this
+  Measured here: `waits-then-discards`, `close_waits_for_reader: true`, 600104 µs with
+  0 of 64 recovered against no reader; 23 µs with 64 of 64 when the master drains
+  first; 29 µs with 0 of 64 for an `O_NONBLOCK` slave. Note the harness cost this
   implies: on Darwin every never-drained blocking close in a test pays up to 0.601 s of
   wall clock, so P13 itself is ~1.2 s slower here than on Linux (shapes a and c).
 

@@ -3050,9 +3050,13 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **729 passing, 0 failed, 4 ignored** across 112 test
-targets on Linux (2026-08-04: the P13 probe's unit test, `p8_map`'s residual-forward
-guard and `p13_teardown_accounting`'s three, on top of the 724 the review-37
+The current whole-suite figure is **732 passing, 0 failed, 4 ignored** across 112 test
+targets on Linux (2026-08-05: the three doctor guards of §3.34 and the kernel-naming fix
+— `termios_mode_tells_the_daemons_baseline_from_a_cooked_pty`,
+`p10_recoverability_separates_a_deep_buffer_from_a_black_hole` and
+`the_os_name_survives_a_box_with_no_os_release_file` — on top of the 729 left by
+2026-08-04's P13 probe unit test, `p8_map`'s residual-forward guard and
+`p13_teardown_accounting`'s three, themselves on top of the 724 the review-37
 remediation left on 2026-07-29); of those, one is the doc-tested
 twelve-line embedder `main` in `daemon/src/lib.rs`, which is the §15.26 entry surface
 proving it still compiles under the family names. On **macOS** the same tree is **715
@@ -3819,8 +3823,8 @@ drain inside ~0.6 s. That is a **reader stall**, a different defect class. `docs
 the probe that separates the two hypotheses.
 **Amended 2026-08-04: that source reading is now a measurement, and the *green* half is explained.**
 P13 on Darwin 24.6.0 reports `policy: waits-then-discards`, `close_waits_for_reader: true`, and
-601087 µs with 0 of 64 recovered against no reader — 60 ticks at the `hz = 100` this box reports —
-against 13 µs with 64 of 64 when the reader drains first and 28 µs with 0 of 64 for an `O_NONBLOCK`
+600104 µs with 0 of 64 recovered against no reader — 60 ticks at the `hz = 100` this box reports —
+against 23 µs with 64 of 64 when the reader drains first and 29 µs with 0 of 64 for an `O_NONBLOCK`
 slave, which measures the `ttylclose` branch as an A/B instead of inferring it
 (`docs/doctor/macos-24.6.0-2026-08-05-tier3.json`, binary `fa4b12d6f529`, probe set
 `a131e1f4b46d6c83`). Against the daemon's reader cadence (`ACTIVE_POLL` 200 µs doubling to
@@ -3951,18 +3955,28 @@ would make a kernel that changed its mind fail the lane instead of reporting the
 `docs/doctor/macos-24.6.0-2026-08-05-tier3.json` (binary `fa4b12d6f529`, probe set
 `a131e1f4b46d6c83`, `2026-08-05T00:22:48Z`, Tier 3 on the FT232R crossover) measures Darwin
 24.6.0 / macOS 15.7.8 x86_64 at **`waits-then-discards`, `close_waits_for_reader: true`**:
-shape `a_no_reader_blocking_slave` **601087 µs / 0 of 64**, shape `b_reader_drains_before_close`
-**13 µs / 64 of 64**, shape `c_no_reader_nonblocking_slave` **28 µs / 0 of 64**. The two kernels
+shape `a_no_reader_blocking_slave` **600104 µs / 0 of 64**, shape `b_reader_drains_before_close`
+**23 µs / 64 of 64**, shape `c_no_reader_nonblocking_slave` **29 µs / 0 of 64**. The two kernels
 differ by ~86000× in `close_microseconds`, which is exactly the separation this entry says the
 field exists to provide, and shape `c` makes the `O_NONBLOCK` branch an A/B measurement rather
 than an inference. The figure is stable: five captures on that box read 600115, 600249, 600363,
 601087 and 601095 µs, against `sysctl kern.clockrate` reporting `hz = 100, tick = 10000` — so
 XNU's `t_timeout` of 60 ticks predicts 600000 µs and the probe measures the predicted timeout
-plus scheduling slop. **Two asymmetries are recorded rather than smoothed.** The Linux figures
-above remain *not* artifact-backed: no committed report in `docs/doctor/` contains a P13 block,
-so a HEAD-vintage Linux capture is now the thing that is owed. And because P13 joined the probe
-set, the new artifact carries a fingerprint no other committed report shares, so it is
-field-by-field comparable with none of them — see `docs/doctor/README.md`.
+plus scheduling slop. **Both asymmetries this entry recorded are now discharged (2026-08-05).** They were: that the
+Linux figures were not artifact-backed, and that the macOS artifact shared its fingerprint with
+no committed report. Three sequential Linux Tier-3 captures at `71fc5a815852` — 
+`docs/doctor/linux-7.0-2026-08-05-tier3{,-2,-3}.json`, probe set `a131e1f4b46d6c83`, taken on the
+dev box with the FT232R crossover attached — close both: the Linux side is citable, and it carries
+the *same* fingerprint as the macOS report, making that pair the first lawful field-by-field
+cross-kernel diff of the P13 era. Linux reads `retains`, `close_waits_for_reader: false`, 64/64
+recovered in **all three** shapes, with the no-reader close at 20/10/13 µs across the three
+captures. The "7 µs" quoted above is within that shape's ordinary spread and was never a
+reproducible digit — which is the entry's own point: the classifier keys on the
+microseconds-versus-hundreds-of-milliseconds gap, and the two kernels differ by ~40000x on it.
+**One asymmetry replaces them, and it is P10's, not P13's.** A shared fingerprint certifies two
+runs asked the same questions; it does not certify they asked them of the same configuration. See
+§3.34 — the macOS P10 block predates the baseline repair and must not be diffed until a macOS
+capture reports `slave_termios_mode: "raw"`.
 **Disposition note (§5):** this measurement gets **no new numbered §3 entry**. It changed no
 implementation decision — `waits-then-discards` is one of the three policies this entry already
 declares legitimate — so it is an amendment to the entry that made the prediction, not a
@@ -4104,6 +4118,123 @@ short timeout because `say()` sets `className` and `textContent` in one call, so
 matches the class cannot still change — a long timeout there would only buy 20 s of waiting for a
 settled value. Browser gate re-run 3× locally under `SNX_WEB_UI=required`, green each time.
 
+### 3.34 P10 measured acceptance, not delivery — and off Linux it measured the wrong pty
+
+**Design:** §7 (and AGENTS.md §7) says a cross-kernel disagreement is settled by a probe that
+*measures*, and §13 says a differing kernel is `degraded` with the observation named. §7.2 fixes the
+configuration the daemon actually runs a pty in: the raw, echo-off, EXTPROC baseline.
+
+**Reality — two defects in one probe, found by diffing the first two reports that were lawfully
+comparable.** With `docs/doctor/linux-7.0-2026-08-05-tier3.json` and
+`macos-24.6.0-2026-08-05-tier3.json` both at probe set `a131e1f4b46d6c83`, P10 read 11776–15360
+bytes symmetric on Linux against **1024 targetward and 4194304 hostward** on Darwin — the latter
+`terminal_write: "ceiling"`, meaning it never answered EAGAIN at all and its "depth" is a lower
+bound the probe never reached. Read naively that is an order-of-magnitude cross-kernel gap, which
+P10's own consequence text calls signal rather than noise. It is neither.
+
+1. **Acceptance is not delivery, and P10 could not tell them apart.** Every field it reported
+   counted what `write(2)` took. A kernel that accepts 4 MiB and returns none of it scored
+   identically to one holding 4 MiB ready for its reader. The one field that gestured at
+   recoverability, `peer_pending_input_bytes`, is a `FIONREAD` best-effort that reads 0 for bytes
+   sitting in a queue no reader will ever be given. **The probe's own `/dev/null` self-test is the
+   proof it was blind**: a bottomless sink accepted the full ceiling and the test asserted only
+   that the fill *stopped*.
+2. **Off Linux it was not measuring the daemon's pty.** `apply_pty_baseline` applies the baseline
+   through the master where the master is a terminal, and otherwise through a slave it opens **and
+   immediately closes**. Darwin is the second case — P2 measures it as
+   `termios_settable_without_slave: false` — and Darwin resets slave termios at last close, a fact
+   `daemon/src/nodes/pty.rs` states in its own words at the non-Linux re-assert ("a momentary
+   daemon-side set does not survive to the client's open"), which is *why* the node re-asserts on
+   the client's rising presence edge. P10 then opened a fresh slave and never re-asserted. So its
+   Darwin figures are a **cooked** pty's — a configuration the daemon never runs. The tree already
+   knew the fallback does not survive; the probe relied on it anyway.
+
+**That the mode is worth an order of magnitude is measured, not argued, and measured on Linux** —
+the platform where it can be checked without a Mac. Filling hostward against a slave nobody reads:
+**raw accepts ~13.8 KiB and every byte is recoverable; cooked accepts ~23.5 KiB and none of it is.**
+Same kernel, same probe, opposite answers. So a depth reported without its line discipline is not a
+cross-kernel measurement, and a mode mismatch explains a gap before any kernel difference does.
+
+**Decision.** P10 re-asserts the baseline on **the slave it measures**, not the one
+`apply_pty_baseline` opened and closed; reports `slave_termios_mode`; reports
+`bytes_recovered_by_peer` and `bytes_unrecoverable` by draining the peer as its last step; names
+each direction's actual terminal condition instead of asserting "before answering EAGAIN" when the
+run ended at the ceiling; and **degrades** when the measured mode is not raw, because §13 says a run
+that could not ask its intended question reports that rather than a confident number. The re-assert
+is unconditional rather than `cfg(not(linux))`: a repair that only ever executes off the platform of
+record is a §9 proxy in space, exercised nowhere it can be observed failing. On Linux it is
+idempotent and the figures do not move — verified, 11776/15360 before and after.
+
+**`probe_set` does not move**, for the same reason as §3.32: the fingerprint covers ids and
+questions and neither changed. **That is a limitation here, not a reassurance**, and it is recorded
+as one: the instrument genuinely moved and the fingerprint cannot say so. `docs/doctor/README.md`
+carries the consequence — the macOS P10 block predates this repair, so that pair must not be diffed
+on P10 until a macOS capture at the current binary reports `slave_termios_mode: "raw"` on both
+directions. **A macOS capture is the new owed item.**
+
+**Not fixed here, and named so it is not mistaken for covered.** Six sibling probes take the same
+fallback — P6, P7, P8, P9, P12 and P13 all call `apply_pty_baseline` and then open a slave — so on
+Darwin each of them measures whatever the kernel reset the pair to. Their answers are not thereby
+wrong (P13's targetward write and P7's readability question survive a cooked discipline far better
+than a buffer *depth* does), but they are not known to be right either. Repairing six cross-kernel
+instruments in one pass, with no Mac to re-measure on, is exactly the one-way decision on
+single-kernel evidence §7 forbids: it would silently move every Darwin baseline in the directory.
+The fix here is confined to the probe whose output is demonstrably wrong, and the sibling exposure
+is filed rather than swept in.
+
+**Fail-first, both guards, each against the mutation it exists to catch.**
+`termios_mode_tells_the_daemons_baseline_from_a_cooked_pty` fails when `termios_mode` is collapsed
+to the constant `"raw"` (`assertion left == right failed`), and
+`p10_recoverability_separates_a_deep_buffer_from_a_black_hole` fails when the drain is reverted to
+the acceptance-only measurement (`a cooked pty returned everything it accepted (21504 of 21504), so
+this guard no longer discriminates`). Each mutation leaves the *other* guard green, so they
+discriminate independently rather than one firing on everything.
+
+### 3.35 A rig-gated test that never touched the hardware was indistinguishable from one that did
+
+**Design:** plan §3 rule 7 — a capability-gated test may self-skip, but a skip must never be
+readable as coverage. `SNX_WEB_UI=required` is the mechanism already in the tree for exactly this,
+turning every browser-gate skip into a hard failure so a box with `node` cannot report green for a
+gate that never ran.
+
+**Reality, measured on this box with the FT232R crossover physically attached and working:**
+
+```
+cargo test --test serial_hardware                          -> 4 passed, 0.00s   (all four printed SKIP)
+SNX_CROSSOVER_A=… SNX_CROSSOVER_B=… cargo test --test …    -> 4 passed, 10.39s  (all four drove the wire)
+```
+
+Same verdict line, same exit status, 1000x apart in wall clock. `crossover_ports` has an env-var
+arm and a `cfg(target_os = "macos")` scan of `/dev/cu.usbserial*`, and **no Linux arm at all** — so
+on a Linux rig every hardware-gated test self-skipped, and `docs/macos.md` had already recorded the
+asymmetry ("that asymmetry bites on Linux") without it being fixed. Five tests in two binaries:
+the four in `serial_hardware.rs` and `p12_serial_exclusivity`'s break-straddled-by-replace guard,
+which is the *only* place the break clause is tested against real silicon.
+
+**Decision — make the skip loud, not the detection clever.** The obvious fix, a symmetric Linux
+by-id auto-detect arm, is the wrong one and is deliberately **not** taken: two adapters being
+present is not two adapters being *cross-wired*, and a harness that opened whatever it found would
+transmit at 250000 baud and pulse DTR on equipment it never verified. That is precisely why
+`serial-nexus-doctor` is passive until a port is named with `--port` (§3), and a test harness has no
+license the diagnostic tool refuses itself. So:
+
+* **`SNX_CROSSOVER=required`** turns every rig self-skip into a hard failure, mirroring
+  `SNX_WEB_UI=required` rather than inventing a second mechanism for one problem. A box with the rig
+  can now *prove* its hardware coverage ran.
+* **The skip message names the candidates it can see** — the by-id nodes on Linux, the `cu.usbserial`
+  nodes on macOS — because the one box where the skip matters is the one with the hardware attached,
+  and an operator staring at two adapters should not need to already know which variables to export.
+  Reported, never auto-selected: naming the candidates is help, choosing them is the operator's.
+
+**Verified on the rig, all three states:** unset → skips naming both FTDI by-id paths;
+`SNX_CROSSOVER=required` with nothing named → all four fail with the fix in the message;
+required *and* named → `4 passed` in 10.36s, genuinely on the wire.
+
+**Left open deliberately.** The macOS auto-detect arm still opens and transmits on any two
+`cu.usbserial` nodes it finds. That is the same hazard this entry declines to introduce on Linux,
+and it is load-bearing for the documented macOS validation flow, so removing it is a doctrine
+decision rather than a cleanup — filed, not silently changed.
+
 ---
 
 ## 4. Findings carried forward (from serial-nexus-doctor)
@@ -4171,8 +4302,8 @@ Full report: `docs/serial-nexus-doctor.md`. Re-runnable per system with
 - **P13 last-close disposition of unread client bytes — measured on both platforms,
   and they disagree.** Linux 7.0.0-29 `retains`: 7 µs, 64/64 recovered. Darwin
   24.6.0 / macOS 15.7.8 `waits-then-discards`, `close_waits_for_reader: true`:
-  601087 µs and 0 of 64 with no reader, 13 µs and 64 of 64 when the master drains
-  first, 28 µs and 0 of 64 with `O_NONBLOCK` on the slave
+  600104 µs and 0 of 64 with no reader, 23 µs and 64 of 64 when the master drains
+  first, 29 µs and 0 of 64 with `O_NONBLOCK` on the slave
   (`docs/doctor/macos-24.6.0-2026-08-05-tier3.json`; the Linux side is recorded in
   §3.30 and is **not** yet artifact-backed). Two consequences. It is what licenses
   the `#[cfg(target_os = "linux")]` gate on `p8_map`'s
