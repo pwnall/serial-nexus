@@ -94,8 +94,7 @@ needs a fresh Linux capture at the HEAD fingerprint; that is **owed**.
      fingerprint: P13 `retains` vs `waits-then-discards` (~40000x in `close_microseconds`); P9's
      zero-timeout poll 170 ns vs 23122 ns.
      **P10 is the exception, and it is the reason this annotation is not simply good news.** Its
-     Darwin block reads 1024 bytes targetward and 4194304 hostward against Linux's symmetric
-     11776-15360 — and that gap is NOT known to be a kernel difference. `apply_pty_baseline` sets
+     Darwin block reads 1024 bytes targetward and 4194304 hostward against Linux's 11776-15360 — and that gap is NOT known to be a kernel difference. `apply_pty_baseline` sets
      the baseline through a slave it immediately closes wherever the master is not a terminal
      (which P2 measures as this platform's case), and Darwin resets slave termios at last close —
      a fact `daemon/src/nodes/pty.rs` already states in its own non-Linux re-assert. P10 then
@@ -125,7 +124,14 @@ needs a fresh Linux capture at the HEAD fingerprint; that is **owed**.
      even match the committed Linux figure of 15360 (= 15.0 KiB). See the annotation on notes
      §3.34; `expectations/linux.jq` is the correct form of that claim.
      UNEXPLAINED AND LEFT THAT WAY: Darwin accepts 1024 targetward but 1022 hostward, identical
-     across all three runs, where Linux is symmetric. No probe asks why. -->
+     across all three runs, where Linux varies. No probe asks why.
+     ANNOTATION 2026-08-05 (§5): "where Linux is symmetric" is WITHDRAWN — it is not supported.
+     Six runs of the shipped binary gave 13824 and 15360 independently PER DIRECTION, so Linux's
+     own within-run direction asymmetry (1536 bytes) is 768x Darwin's (2 bytes), and Darwin's
+     figures do not vary run to run at all. The probe's own doc comment on `settled_bytes` already
+     recorded that spread; the prose contradicted the code beside it. The contrast worth drawing is
+     the opposite one: Darwin is the reproducible side. P10's `recheck` block (notes §3.44) now asks
+     why. -->
 
 **Whole-gate hardware validation, same tree (`fa4b12d`), rig attached.** `cargo test --workspace
 --locked --exclude serial-nexus-web --no-fail-fast`: **680 passing, 1 failing, 4 ignored** across

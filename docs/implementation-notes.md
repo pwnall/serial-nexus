@@ -3050,7 +3050,7 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **738 passing, 0 failed, 4 ignored** across 112 test
+The current whole-suite figure is **739 passing, 0 failed, 4 ignored** across 112 test
 targets on Linux (2026-08-05: §3.38's listener-barrier guard, §3.39's orphan-leash fixture and guard, §3.40's two baseline guards, and earlier the same day the three doctor guards of §3.34 and the kernel-naming fix
 — `termios_mode_tells_the_daemons_baseline_from_a_cooked_pty`,
 `p10_recoverability_separates_a_deep_buffer_from_a_black_hole` and
@@ -4755,6 +4755,67 @@ software double is absent — Darwin — and it was measured here on Linux by fo
 mode is a red test that names its own cause, not a silent pass. **Pre-registered (§7):** on the next
 Mac run the six converted tests execute against the rig instead of skipping; if any goes red it will
 name the provider it used, and `p7_p5` continues to self-skip there as it always has.
+
+### 3.44 The two experiments that were designed and not built — now built, so one Mac run answers both
+
+**Design:** §7 — settle a kernel question by measuring it, not by reasoning about it from the other
+platform.
+
+Two questions were left open by §3.41 and §3.42 as *designed but unbuilt*. Both are Darwin
+questions, both are cheap, and leaving them unbuilt meant a Mac run would have to happen three
+times. They are built here, calibrated on Linux first, and their Darwin answers pre-registered with
+named falsifiers.
+
+**A. Is P10's depth a queue capacity or a per-fill allowance?** The two are indistinguishable in a
+single fill, and the difference is exactly what Darwin's 1024-targetward / 1022-hostward left open.
+A capacity republishes precisely the room a reader frees; an allowance charges its reservation
+again. So P10 now, **after every existing field is final and the peer is empty** — so no committed
+observation can move and old artifacts stay diffable (§16.13) — refills from empty, hands back 512
+bytes, lets the tty's asynchronous work run, and writes **one byte at a time** until it blocks.
+
+*Linux calibration, 20 samples, load 0.22, both directions:* `drained_again` is **512 in 20 of 20**;
+`room_republished_minus_room_freed` is **bimodal — +2048 or +9216, and never 0**; `refilled`
+reproduces `total()` once in 20. Linux answers "neither, exactly": its bound is a moving snapshot of
+an asynchronous pipeline, and it hands back *more* room than was freed because the pipeline advanced
+during the settle. **Pre-registered for Darwin:** `room_republished_minus_room_freed` reads **0** and
+`refill_reproduced_total` reads **true**, because a fixed `TTYHOG`/`t_outq` bound republishes exactly
+what is freed and reproduces exactly. A nonzero delta refutes the capacity reading; a negative one
+means a reservation, which nothing in the XNU source read predicts.
+
+**B. Why do P2 and P9 disagree 8–11× about "a zero-timeout poll" on Darwin and agree on Linux?**
+Because they are not the same measurement, and nothing in the set said so: P2's fd is **hung up**
+with a **POLLHUP-only** mask, so every pass returns ready; P9's has a slave open and asks **POLLIN**,
+so none does. P9 now reproduces P2's shape inside itself — one pty, one clock, one variable at a
+time — as a 2×2 over {unready, hung-up} × {POLLIN, POLLHUP} at P2's sample count.
+
+*Linux measurement, 4096 samples per cell:* **166 / 172 / 166 / 166 ns** — all four cells
+indistinguishable, which is what makes the Darwin gap a real finding rather than an artifact of the
+comparison. **Pre-registered for Darwin:** if `ready_hungup_master_pollhup_ns` lands near 2000 ns and
+`unready_master_pollin_ns` near 20000, the gap is the **fd state or the mask**, and the two probes
+were always measuring different things; if all four cells land together, the gap is *neither*, and
+the difference lives in something else P2 and P9 do not share — which would make it an instrument
+error worth chasing.
+
+**Three Darwin-only arms were forced on Linux before shipping, because §9 says a repair exercised
+nowhere it can be observed failing is a proxy in space.** Forcing `apply_pty_baseline`'s
+momentary-slave fallback: `baseline_via_master` reports `false` and **all four pty probes still read
+correctly**, because the client-slave re-assert compensates — which is the whole claim of §3.40.
+Forcing a baseline that does not retain EXTPROC: P7 reports `silence_cause: "extproc-unavailable"`
+with shape `b` at 0 and shape `c` still at **2**, reproducing end to end the discriminator that
+refuted the false-degrade hypothesis. Forcing a cooked pair: P10 and P13 both **degrade** and name
+the mode, and `linux.jq` still passes — a degraded report reports rather than reddens, which is what
+the gate change in §3.34 was for.
+
+**Fail-first.** Moving the recheck ahead of the drain that empties the peer fails
+`p10_recheck_measures_republished_room_rather_than_nothing` with *"the recheck refilled 0 bytes into
+a peer that `recovered`'s drain had just emptied"*. The guard deliberately does **not** assert the
+sign of `room_republished_minus_room_freed`: pinning Linux's answer would make it assert a prediction
+about a kernel this box is not. The prediction lives here, where being wrong is a record.
+
+**The fingerprint does not move, and that is correct here.** Both additions are new *observations*
+under unchanged questions, and both run after every existing field is final, so the committed
+artifacts stay field-by-field diffable. Per §3.34's standing rule, the instrument change is announced
+in `docs/doctor/README.md` instead, because the digest will not announce it.
 
 ---
 

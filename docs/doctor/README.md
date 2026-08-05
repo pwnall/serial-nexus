@@ -120,6 +120,15 @@ show a reader which differences are noise.
      rather than annotated in place because it described the *state of this directory*, which the
      table above already reports — a standing inventory, not a finding. -->
 
+**The probe bodies gained observations on 2026-08-05, and the fingerprint does not say so.**
+Announced here because §3.34's standing rule says it must be: the digest covers `(id, question)`,
+both unchanged. P6/P7 gained a baseline block (`silence_cause`, `extproc_retained_at_shape`,
+`baseline_via_master`, …), P13 gained `slave_termios_mode` and `baseline_packet_bytes`, P10 gained a
+`recheck` block, and P9 gained `zero_timeout_by_fd_state_and_mask`. **Every one of them runs after
+the existing fields are final**, so reports taken either side of the change stay field-by-field
+diffable on everything they share — which is why the fingerprint staying put is correct rather than
+merely convenient.
+
 **One caution the new pair does not remove.** A shared fingerprint certifies that two runs asked
 the same *questions*; it does not certify that they asked them of the same *configuration*. The
 P13-era macOS report was taken before P10 learned to re-assert its baseline on the slave it
@@ -161,7 +170,9 @@ reports `slave_termios_mode: "raw"` on both directions.
      caution stands wherever it is written and a sweep must not delete it along with this one.
      (2) A two-byte asymmetry nothing in the tree predicts: Darwin accepts 1024 targetward but
      **1022** hostward, from a single 4096-byte write in each direction, reproducible byte-identically
-     across all three runs. Linux is symmetric at 15360. It is recorded here as measured and
+     across all three runs. (ANNOTATION 2026-08-05: "Linux is symmetric at 15360" is withdrawn —
+     six runs gave 13824 and 15360 independently per direction, so Linux's within-run asymmetry is
+     768x Darwin's, and Darwin is the reproducible side. Notes §3.44.) It is recorded here as measured and
      unexplained rather than rounded away, because the next reader will otherwise take it for a
      transcription slip. -->
 

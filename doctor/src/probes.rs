@@ -1792,11 +1792,68 @@ fn is_unsupported_errno(e: &anyhow::Error) -> bool {
 const P9_TIMEOUTS_MS: [u16; 4] = [0, 1, 5, 10];
 const P9_SAMPLES: usize = 16;
 
+/// Samples per reference shape, matched to P2's count so sample size is not one of
+/// the variables. See [`ZeroTimeoutRefs`].
+const P9_REF_SAMPLES: usize = 4096;
+
 /// What one requested timeout actually cost. Sampled in **nanoseconds** and
 /// reported in microseconds, plus `median_ns`: the 0 ms row is the cost of
 /// asking, which is sub-microsecond and would diff as a constant `0 µs` on every
 /// kernel — a number that cannot differ is not worth printing (P2 reports its
 /// zero-timeout poll in ns for the same reason).
+/// The 2x2 that decomposes "the cost of a zero-timeout poll" — a phrase two probes
+/// use for numbers that differ by an order of magnitude on one kernel.
+///
+/// P2 reports `zero_timeout_poll_ns_median` and P9 reports `median_ns_for_0ms_request`,
+/// and they are **not the same measurement**: P2's fd is *hung up* and its mask is
+/// *POLLHUP only*, so every pass returns ready; P9's fd has a slave open and asks
+/// about *POLLIN*, so no pass ever does. On Linux 7.0.0-29 that distinction costs
+/// nothing (263 vs 195 ns in the committed captures). On Darwin 24.6.0 the two
+/// disagree **8-11x** across three captures — 2091/2102/2086 ns against
+/// 22832/22980/16098 ns — with tight per-sample distributions, so it is neither an
+/// outlier nor a cold-start artifact, and sample count does not explain it either
+/// (n=16 and n=4096 medians agree on Linux).
+///
+/// An order-of-magnitude disagreement between two probes naming the same operation
+/// is either a kernel property or an instrument error, and nothing in the set could
+/// tell which. So P9 reproduces P2's shape itself, in one pty, on one clock, varying
+/// one thing at a time. The next capture decomposes the gap instead of posing it.
+///
+/// **Cost** is four times [`P9_REF_SAMPLES`] zero-timeout polls — microseconds on a
+/// kernel where the poll is cheap, and bounded by the very number being measured on
+/// one where it is not (~0.4 s at Darwin's captured 22 µs, the worst case).
+struct ZeroTimeoutRefs {
+    /// P9's own shape at P2's sample count: slave open, POLLIN, never ready.
+    unready_pollin_ns: u64,
+    /// Isolates the mask with the fd state held unready.
+    unready_pollhup_ns: u64,
+    /// Isolates the fd state with the mask held at POLLIN.
+    ready_pollin_ns: u64,
+    /// **P2's shape verbatim**: hung-up master, POLLHUP, ready every pass.
+    ready_pollhup_ns: u64,
+    /// The contamination detector again, at the reference sample count.
+    ready_passes_on_unready_fd: u64,
+}
+
+/// Median nanoseconds for [`P9_REF_SAMPLES`] zero-timeout polls, and how many
+/// reported an event. Uses the shipped `poll_blocking` wrapper for the reason
+/// [`p9_poll_granularity`] gives: a difference the wrapper introduces is as real
+/// as one the kernel does.
+fn p9_zero_median(fd: RawFd, interest: PollFlags) -> (u64, u64) {
+    let mut samples = Vec::with_capacity(P9_REF_SAMPLES);
+    let mut ready = 0u64;
+    for _ in 0..P9_REF_SAMPLES {
+        let start = Instant::now();
+        let revents = sys::poll_blocking(fd, interest, 0);
+        samples.push(start.elapsed().as_nanos() as u64);
+        if !revents.is_empty() {
+            ready += 1;
+        }
+    }
+    samples.sort_unstable();
+    (samples[samples.len() / 2], ready)
+}
+
 struct Granularity {
     requested_ms: u16,
     min_ns: u64,
@@ -1849,7 +1906,7 @@ pub fn p9_poll_granularity() -> Probe {
         "For a never-ready tty fd, what does a requested poll(2) timeout of 0/1/5/10 ms actually cost (min/median/max, µs)?",
     );
     match p9_inner() {
-        Ok(rows) => {
+        Ok((rows, refs)) => {
             let mut p = p;
             let mut one_ms = 0u64;
             let mut contaminated = 0u64;
@@ -1868,6 +1925,21 @@ pub fn p9_poll_granularity() -> Probe {
                 .observe("median_us_for_1ms_request", one_ms)
                 .observe("median_ns_for_0ms_request", zero)
                 .observe("ready_passes_total", contaminated);
+            // The 2x2 that decomposes the phrase "zero-timeout poll", which P2 and P9
+            // both use for numbers that differ 8-11x on Darwin and agree on Linux.
+            p = p.observe(
+                "zero_timeout_by_fd_state_and_mask",
+                serde_json::json!({
+                    "samples_each": P9_REF_SAMPLES,
+                    "unready_master_pollin_ns": refs.unready_pollin_ns,
+                    "unready_master_pollhup_ns": refs.unready_pollhup_ns,
+                    "ready_hungup_master_pollin_ns": refs.ready_pollin_ns,
+                    "ready_hungup_master_pollhup_ns": refs.ready_pollhup_ns,
+                    "p2_reports_the_shape": "ready_hungup_master_pollhup_ns",
+                    "the_data_plane_parks_on": "unready_master_pollin_ns",
+                    "ready_passes_on_unready_fd": refs.ready_passes_on_unready_fd,
+                }),
+            );
             p.verdict(
                 Status::Supported,
                 &format!(
@@ -1890,7 +1962,7 @@ pub fn p9_poll_granularity() -> Probe {
     }
 }
 
-fn p9_inner() -> anyhow::Result<Vec<Granularity>> {
+fn p9_inner() -> anyhow::Result<(Vec<Granularity>, ZeroTimeoutRefs)> {
     let master = new_master()?;
     let pts = sys::ptsname(&master)?;
     let fd = master.as_raw_fd();
@@ -1898,7 +1970,7 @@ fn p9_inner() -> anyhow::Result<Vec<Granularity>> {
     apply_pty_baseline(&master, &pts)?;
     // The slave stays open for the whole measurement: a hung-up master reports
     // POLLHUP and every poll returns instantly, which would measure nothing.
-    let _slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+    let slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
     std::thread::sleep(PTY_SETTLE);
     let mut buf = [0u8; 4096];
     let _ = read_available(fd, &mut buf, 64);
@@ -1924,7 +1996,27 @@ fn p9_inner() -> anyhow::Result<Vec<Granularity>> {
             ready_passes,
         });
     }
-    Ok(rows)
+    // The reference 2x2, after the timeout rows so the slave is still open for
+    // them: a hung-up master returns instantly from every poll, which would
+    // measure nothing. Unready cells first, then the same two masks once the
+    // session is gone.
+    let (unready_pollin_ns, ready_passes_on_unready_fd) = p9_zero_median(fd, PollFlags::POLLIN);
+    let (unready_pollhup_ns, _) = p9_zero_median(fd, PollFlags::POLLHUP);
+    drop(slave);
+    std::thread::sleep(PTY_SETTLE);
+    let (ready_pollin_ns, _) = p9_zero_median(fd, PollFlags::POLLIN);
+    let (ready_pollhup_ns, _) = p9_zero_median(fd, PollFlags::POLLHUP);
+
+    Ok((
+        rows,
+        ZeroTimeoutRefs {
+            unready_pollin_ns,
+            unready_pollhup_ns,
+            ready_pollin_ns,
+            ready_pollhup_ns,
+            ready_passes_on_unready_fd,
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1939,12 +2031,62 @@ fn p9_inner() -> anyhow::Result<Vec<Granularity>> {
 const P10_CHUNK: usize = 4096;
 const P10_CEILING: u64 = 4 * 1024 * 1024;
 
+/// The recheck's partial drain (notes §3.44): how many bytes to hand back to the
+/// peer before asking the kernel for room again. Smaller than the smallest depth
+/// either kernel of record has ever reported (Darwin's 1022 is the floor), so the
+/// drain never empties the queue and the top-up measures *republished* room rather
+/// than a fresh fill.
+const P10_RECHECK_DRAIN: u64 = 512;
+
+/// The recheck's top-up is byte-granular — the whole point is the exact blocking
+/// point, not a 4096-quantized one — so it needs its own, much smaller backstop:
+/// 4 MiB of one-byte writes is four million syscalls.
+const P10_RECHECK_CEILING: u64 = 64 * 1024;
+
 /// How long to let the tty's asynchronous flip-buffer work run before the second
 /// fill pass. See [`FillResult::settled_bytes`] for why there is a second pass at
 /// all.
 const P10_SETTLE: Duration = PTY_SETTLE;
 
 /// What one direction of a pty accepted before it would have blocked.
+/// P10's second question, asked of the same pair once the first is answered:
+/// **is the number above a queue capacity, or a per-fill allowance?**
+///
+/// The two are indistinguishable in a single fill, and the difference is exactly
+/// what the 2026-08-05 Darwin capture left open — 1024 bytes targetward against
+/// 1022 hostward, byte-identical across three runs, with no probe asking why
+/// (`docs/doctor/macos-24.6.0-2026-08-05-7ead470-tier3{,-2,-3}.json`). A capacity
+/// bound republishes exactly the room a reader frees; a per-fill allowance charges
+/// its reservation again. So: drain the peer completely, refill from empty, hand
+/// back [`P10_RECHECK_DRAIN`] bytes, let the tty's asynchronous work run, and write
+/// **one byte at a time** until it blocks again.
+///
+/// **Calibrated on Linux before it was pre-registered for anywhere else**
+/// (7.0.0-29): `refilled` reproduces `total()` only about half the time — the
+/// flip-scheduling spread [`FillResult::settled_bytes`] documents — `drained_again`
+/// is reliably [`P10_RECHECK_DRAIN`], and `topped_up` exceeds it. Linux answers
+/// "neither, exactly": its bound is a moving snapshot of an asynchronous pipeline,
+/// and it hands back *more* room than was freed because the pipeline advanced
+/// during the settle. Read a Darwin `room_republished_minus_room_freed` of 0
+/// against that, not against zero expectation.
+#[derive(Default)]
+struct Recheck {
+    /// What the same pair accepts when refilled from empty. Equal to `total()` on a
+    /// kernel whose bound is a fixed queue capacity; **not** equal on one whose
+    /// bound is a snapshot of asynchronous work.
+    refilled: u64,
+    refill_writes: u64,
+    refill_terminal: String,
+    /// What the partial drain actually took back — never assumed to be
+    /// [`P10_RECHECK_DRAIN`], because a kernel shallower than that would give less.
+    drained_again: u64,
+    /// What the kernel then accepted, one byte at a time.
+    topped_up: u64,
+    topup_writes: u64,
+    topup_terminal: String,
+    topup_ceiling_hit: bool,
+}
+
 struct FillResult {
     bytes: u64,
     writes: u64,
@@ -2002,6 +2144,11 @@ struct FillResult {
     /// Bytes the peer could actually be given back, against `total()` accepted.
     /// The field that tells a deep buffer from a black hole.
     recovered: u64,
+    /// The capacity-versus-reservation recheck (notes §3.44). Runs **after** every
+    /// field above is final and after `recovered`'s drain has emptied the peer, so
+    /// no existing observation can move: an artifact taken before this landed and
+    /// one taken after stay field-by-field diffable (§16.13).
+    recheck: Recheck,
 }
 
 impl FillResult {
@@ -2027,6 +2174,26 @@ impl FillResult {
             "slave_termios_mode": self.slave_mode,
             "bytes_recovered_by_peer": self.recovered,
             "bytes_unrecoverable": self.total().saturating_sub(self.recovered),
+            "recheck": {
+                "refilled_from_empty_bytes": self.recheck.refilled,
+                "refilled_from_empty_writes": self.recheck.refill_writes,
+                "refill_terminal_write": self.recheck.refill_terminal,
+                "refill_reproduced_total": self.recheck.refilled == self.total(),
+                "drained_again_bytes": self.recheck.drained_again,
+                "topped_up_bytes": self.recheck.topped_up,
+                "topped_up_writes": self.recheck.topup_writes,
+                "topup_terminal_write": self.recheck.topup_terminal,
+                "topup_chunk_bytes": 1,
+                "topup_ceiling_bytes": P10_RECHECK_CEILING,
+                "topup_ceiling_hit": self.recheck.topup_ceiling_hit,
+                // The field the Darwin question turns on. Zero means the kernel
+                // republished exactly the room the reader freed, which is what a
+                // fixed queue capacity does; a negative number means a reservation
+                // is being charged per fill; Linux reads positive, because its
+                // asynchronous pipeline advanced during the settle.
+                "room_republished_minus_room_freed":
+                    self.recheck.topped_up as i64 - self.recheck.drained_again as i64,
+            },
         })
     }
 
@@ -2085,7 +2252,7 @@ pub fn p10_pty_buffer_depth() -> Probe {
             p.verdict(
                 status,
                 &format!(
-                    "This kernel's pty accepted {} byte(s) slave→master (**targetward** — a client typing, travelling toward the device, first pass ending in `{}`) and {} byte(s) master→slave (**hostward** — the node delivering device output to its client, ending in `{}`), reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. **Of those, {} and {} byte(s) were actually recoverable by the peer** ({} / {}): acceptance is not delivery, and the two are the same number only on a kernel that queues everything it takes. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands, so a one-chunk difference across kernels is noise; only an order-of-magnitude one is signal, **and only between runs whose `slave_termios_mode` agrees** — a cooked pty and a raw one give different depths on one kernel (measured on Linux 7.0.0-29: raw ~13.8 KiB fully recoverable, cooked ~23.5 KiB with nothing recoverable), so a mode mismatch explains a gap before any kernel difference does. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}{}",
+                    "This kernel's pty accepted {} byte(s) slave→master (**targetward** — a client typing, travelling toward the device, first pass ending in `{}`) and {} byte(s) master→slave (**hostward** — the node delivering device output to its client, ending in `{}`), reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. **Of those, {} and {} byte(s) were actually recoverable by the peer** ({} / {}): acceptance is not delivery, and the two are the same number only on a kernel that queues everything it takes. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands, so a one-chunk difference across kernels is noise; only an order-of-magnitude one is signal, **and only between runs whose `slave_termios_mode` agrees** — a cooked pty and a raw one give different depths on one kernel (measured on Linux 7.0.0-29: raw ~13.8 KiB fully recoverable, cooked ~23.5 KiB with nothing recoverable), so a mode mismatch explains a gap before any kernel difference does. The `recheck` block under each direction asks the second question the first cannot: after the peer is drained, the pair is refilled from empty and then handed back 512 bytes, and `room_republished_minus_room_freed` says whether the kernel gave back exactly the room a reader freed (a fixed queue capacity), or more (an asynchronous pipeline that advanced during the settle — Linux 7.0.0-29 reads +2048 or +9216, bimodal, never 0 across 20 samples), or less (a reservation charged per fill). `refill_reproduced_total` says whether the depth above is reproducible on the same pair at all; on Linux it usually is not. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}{}",
                     targetward.bytes,
                     targetward.terminal,
                     hostward.bytes,
@@ -2192,6 +2359,11 @@ fn p10_fill(write_to: RawFd, peer: RawFd, slave_mode: &'static str) -> FillResul
     // non-blocking fd, so it can neither loop nor block.
     let recovered = p10_drain(peer);
 
+    // Everything above is final and the peer is now empty, which is both the
+    // precondition the recheck needs and the reason it runs last: an observation
+    // that moved `bytes` or `recovered` would break the cross-report diff (§16.13).
+    let recheck = p10_recheck(write_to, peer);
+
     FillResult {
         bytes,
         writes,
@@ -2204,19 +2376,26 @@ fn p10_fill(write_to: RawFd, peer: RawFd, slave_mode: &'static str) -> FillResul
         pending_output,
         slave_mode,
         recovered,
+        recheck,
     }
 }
 
 /// Read the peer dry and count what came back. Non-blocking, so `EAGAIN` is the
 /// ordinary end of the drain rather than an error.
 fn p10_drain(peer: RawFd) -> u64 {
+    p10_drain_at_most(peer, P10_CEILING)
+}
+
+/// [`p10_drain`] with the cap named. The recheck needs a *partial* drain: handing
+/// back a known amount of room and asking for it again is the measurement.
+fn p10_drain_at_most(peer: RawFd, cap: u64) -> u64 {
     let mut buf = [0u8; 65536];
     let mut recovered = 0u64;
-    loop {
-        if recovered >= P10_CEILING {
-            break;
-        }
-        match sys::read_fd(peer, &mut buf) {
+    while recovered < cap {
+        let want = usize::try_from(cap - recovered)
+            .unwrap_or(buf.len())
+            .min(buf.len());
+        match sys::read_fd(peer, &mut buf[..want]) {
             Ok(0) => break,
             Ok(n) => recovered += n as u64,
             Err(_) => break,
@@ -2225,20 +2404,59 @@ fn p10_drain(peer: RawFd) -> u64 {
     recovered
 }
 
+/// See [`Recheck`]. **Precondition: the peer is already drained** — the refill
+/// measures a fill from empty, and starting it against a full queue would report 0
+/// and say nothing.
+fn p10_recheck(write_to: RawFd, peer: RawFd) -> Recheck {
+    let (refilled, refill_writes, refill_terminal, _) = p10_fill_pass(write_to, 0);
+    let drained_again = p10_drain_at_most(peer, P10_RECHECK_DRAIN);
+    // The same settle the second pass uses. On a kernel that moves bytes on an
+    // asynchronous work item, room appears only after it runs, so measuring before
+    // it does would report that kernel's scheduling rather than its bookkeeping.
+    std::thread::sleep(P10_SETTLE);
+    let (topped_up, topup_writes, topup_terminal, topup_ceiling_hit) =
+        p10_fill_pass_with(write_to, 0, 1, P10_RECHECK_CEILING);
+    // Leave the pair as this function found it.
+    let _ = p10_drain(peer);
+    Recheck {
+        refilled,
+        refill_writes,
+        refill_terminal,
+        drained_again,
+        topped_up,
+        topup_writes,
+        topup_terminal,
+        topup_ceiling_hit,
+    }
+}
+
 /// One bounded fill pass. `already` is what earlier passes wrote, so the 4 MiB
 /// ceiling bounds the *total* rather than each pass — the backstop has to hold
 /// across the whole probe or it is not a backstop.
 fn p10_fill_pass(write_to: RawFd, already: u64) -> (u64, u64, String, bool) {
-    let chunk = [b'A'; P10_CHUNK];
+    p10_fill_pass_with(write_to, already, P10_CHUNK, P10_CEILING)
+}
+
+/// [`p10_fill_pass`] with the write size and the backstop named. The recheck's
+/// top-up writes one byte at a time — it is measuring the exact blocking point, not
+/// a 4096-quantized one — and so needs its own, much smaller ceiling.
+fn p10_fill_pass_with(
+    write_to: RawFd,
+    already: u64,
+    chunk: usize,
+    ceiling: u64,
+) -> (u64, u64, String, bool) {
+    let buf = [b'A'; P10_CHUNK];
+    let chunk = &buf[..chunk.min(P10_CHUNK)];
     let mut bytes = 0u64;
     let mut writes = 0u64;
     let mut ceiling_hit = false;
     let terminal = loop {
-        if already + bytes >= P10_CEILING {
+        if already + bytes >= ceiling {
             ceiling_hit = true;
             break "ceiling".to_owned();
         }
-        match sys::write_fd(write_to, &chunk) {
+        match sys::write_fd(write_to, chunk) {
             // A short write is fine and expected at the boundary; a zero-length
             // one would loop forever, so it ends the fill and is named.
             Ok(0) => break "wrote_zero".to_owned(),
@@ -4739,6 +4957,41 @@ mod tests {
         assert_eq!(termios_mode(&s_raw), "raw");
         assert_eq!(termios_mode(&s_cooked), "cooked");
         assert_ne!(termios_mode(&s_raw), termios_mode(&s_cooked));
+    }
+
+    /// **The recheck must actually recheck.** Its three fields are only meaningful in
+    /// order: the refill has to start from an *empty* peer, the partial drain has to
+    /// take the amount it asked for, and the top-up has to find the room that drain
+    /// freed. A recheck that ran in the wrong order reports plausible zeros.
+    ///
+    /// Deliberately does **not** assert the sign of
+    /// `room_republished_minus_room_freed`. Linux measures a positive number and the
+    /// Darwin pre-registration in notes §3.44 is 0; pinning either here would make the
+    /// guard assert a prediction about a kernel this box is not — §9's proxy in space
+    /// in its purest form. The prediction lives in the notes, where being wrong is a
+    /// record.
+    #[test]
+    fn p10_recheck_measures_republished_room_rather_than_nothing() {
+        let (m, s) = pty_pair_in_mode(true);
+        let f = p10_fill(m.as_raw_fd(), s.as_raw_fd(), "raw");
+        assert!(
+            f.recheck.refilled > 0,
+            "the recheck refilled 0 bytes into a peer that `recovered`'s drain had just \
+             emptied — it ran before that drain, or not at all"
+        );
+        let expected = f.recheck.refilled.min(P10_RECHECK_DRAIN);
+        assert_eq!(
+            f.recheck.drained_again, expected,
+            "the recheck's partial drain took {} bytes where {expected} were available \
+             to take, so the room it then measures was never freed",
+            f.recheck.drained_again
+        );
+        assert!(
+            f.recheck.topped_up > 0,
+            "{} bytes were handed back to the peer and the kernel then accepted none of \
+             them — the top-up pass did not run",
+            f.recheck.drained_again
+        );
     }
 
     /// **Acceptance is not delivery, and P10 could not see the difference.**

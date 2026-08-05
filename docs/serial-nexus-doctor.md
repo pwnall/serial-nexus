@@ -350,7 +350,7 @@ could not name. The instruction "check `slave_termios_mode` agrees on both sides
 separates those two readings, and it is now a measured rule rather than a proposed one.
 
 **One field in that row is unexplained.** Darwin takes 1024 targetward but 1022 hostward, from a
-single 4096-byte write in each direction, reproducibly. Linux is symmetric. No probe currently asks
+single 4096-byte write in each direction, reproducibly, where Linux varies by direction and by run. No probe currently asks
 why, and this page does not guess (§7).
 
 **The same caution has not been discharged for P10's siblings, and that is not an oversight.**
