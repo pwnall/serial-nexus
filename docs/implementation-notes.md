@@ -3050,7 +3050,7 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **739 passing, 0 failed, 4 ignored** across 112 test
+The current whole-suite figure is **744 passing, 0 failed, 4 ignored** across 113 test
 targets on Linux (2026-08-05: §3.38's listener-barrier guard, §3.39's orphan-leash fixture and guard, §3.40's two baseline guards, and earlier the same day the three doctor guards of §3.34 and the kernel-naming fix
 — `termios_mode_tells_the_daemons_baseline_from_a_cooked_pty`,
 `p10_recoverability_separates_a_deep_buffer_from_a_black_hole` and
@@ -5230,6 +5230,64 @@ sink first, gates the writers on that file, and then collects the sink's verdict
 daemon transmitted every byte it was given, on both kernels, in every failing run. What was wrong is
 that the test asserted a lossless wire while arranging for part of the transmission to happen before
 anyone was listening — §9's proxy in time, in a place no software double could expose.
+
+### 3.48 P4 certified a resolver that had resolved nothing, and both gates admitted it
+
+**Design:** §9 — a verdict computed from a loop that never executed is vacuous.
+
+**Reality (notes §3.45 (ii), traced and reproduced).** `p4_resolver`'s `skipped` early return needs
+`adapters.is_empty() && candidates.is_empty()`. On Darwin `adapters` is empty (no `/dev/serial/by-id`)
+but `candidates` is 4 (the `cu.*` scan), so the early return does not fire, `for a in &adapters` runs
+**zero times**, `all_resolved` keeps its initialised `true`, and the probe reports **`supported`**
+with the consequence *"Resolver produces canonical identities; configs survive replug and cold
+start"* — plus a provenance sentence claiming identities *"came from the `<sys>/class/tty` listing"*
+on a box with no such listing and `sysfs_only: 0`. All three Darwin artifacts carry it byte-identical.
+
+**Not a macOS-only defect.** The same zero-iteration loop mis-verdicts a **Linux** box: a USB adapter
+with no serial number publishes no by-id link, so `adapters` is empty and P4 reports `supported` for
+a box whose only identity is `by-path:` — §12's documented instability, reported as if configs
+survived replug. The existing `Status::Degraded` arm was unreachable on the very box it was written
+for.
+
+**`degraded`, not `skipped`.** The resolver *ran*, over all four passive sources, and returned four
+candidates whose identities are `raw:`. The question was asked and answered negatively — that is not
+P8's "unmeasurable here". And the answer is not merely unproven but **false**: `docs/macos.md`
+records that a node configured with a `usb:` identity resolves to nothing and stays `waiting`
+forever, which is exactly what the `supported` consequence promises against. The report already says
+`degraded` for this same fact one section away, in `environment()`'s by-id check; one report must not
+answer one question two ways. `degraded` is also the durable signal — if the deferred IOKit backend
+lands, P4 flips to `supported` and says so, where a `skipped` would stay silent forever.
+
+**The RES-2 decline is preserved (§5).** Review 32 recorded that P4 *"stays `supported` in a no-udev
+environment by design"*. That case is unchanged: one sysfs-only USB device still gives `canonical: 1`
+and a byte-identical consequence. What is narrowed is only the case RES-2 never contemplated — a tree
+where **nothing at all** resolved.
+
+**Both expectation files gained the clause, and its absence arm is the interesting half.** A
+`supported` P4 whose `canonical` is 0 is rejected. A report that **omits** `canonical` **abstains**,
+and that is deliberate: every artifact in `docs/doctor/` predates the field, so failing on absence
+would turn a defect detector into an instrument-version detector — the gate would go red on 19 of 19
+committed reports, including ones taken hours earlier on a healthy box, and "linux.jq failed" would
+mean "your report is old" rather than anything about the resolver. That is §9's own complaint about a
+check that fails for a reason other than the property it names. The design as drafted rejected on
+absence; it was corrected here after measuring the blast radius.
+
+**So the "a current binary always states its population" half lives where it can be honest**:
+`p4_always_reports_its_population` in the probe's own tests, over both a resolving and a
+non-resolving fixture, where no archived report can satisfy or violate it.
+
+**Fail-first, three ways.** Deleting the `canonical` observation fails the probe guard
+(*"P4 reported no population for the `degraded` verdict"*). Planting `status: supported` on a
+zero-population report is rejected by both gates. Stripping `canonical` from a report and calling it
+`supported` must still be **accepted**, and the guard asserts that direction too — so a later
+tightening that fails the archive fails here first. A third guard pins the two gate files as carrying
+the clause byte-for-byte, so an edit to one that forgets the other cannot silently reopen the hole on
+the lane nobody is standing on.
+
+**Verified unchanged where it must be:** the real dev box still reports `supported` with
+`canonical: 2` and a character-identical consequence; the Darwin shape, reproduced on Linux through
+the `--dev-root` seam, now reports `degraded` with `canonical: 0`, `unidentified: 4`, and each
+device's `raw:` identity named.
 
 ---
 

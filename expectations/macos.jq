@@ -68,6 +68,22 @@ and (any(.probes[]; .id == "P1"))
 and (any(.probes[]; .id == "P2" and (.status == "supported" or .status == "degraded")))
 and (any(.probes[]; .id == "P3"))
 and (any(.probes[]; .id == "P4"))
+# The one P4 clause that is NOT lenient, and it is not a capability demand — it is a
+# well-formedness demand, of exactly the kind the clauses at the top of this file
+# make. A `supported` P4 asserts "Resolver produces canonical identities; configs
+# survive replug and cold start", and on this platform it asserted that off a loop
+# that ran zero times: `count: 0` with `status: supported` in all three of
+# `docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3{,-2,-3}.json` (notes §3.45 (ii)).
+# The status stays free — `degraded` is the honest answer here today, `supported`
+# becomes reachable if the deferred IOKit backend (§14) ever lands, and both must
+# pass — but the report may not claim the property while reporting a population of
+# zero. Identical to `expectations/linux.jq`'s clause, deliberately: the defect is a
+# report lying about itself, which is not a platform property.
+and (all(.probes[]; . as $p
+      | ($p.id != "P4")
+      or ($p.status != "supported")
+      or ((([$p.observations[] | select(.key == "canonical") | .value] | first) as $c
+           | $c == null or $c > 0))))
 and (any(.probes[]; .id == "P5"))
 and (any(.probes[]; .id == "P6" and .status != "unsupported"))
 and (any(.probes[]; .id == "P7" and .status != "unsupported"))

@@ -16,7 +16,16 @@
 #     the one thing nothing checked — a report that lost the P3 block entirely used to
 #     pass this file while its header claimed completeness against the 7.0 baseline
 #     (37-TOOL-5). `unsupported` is still refused, by the summary clause above.
-#   - P4 may be `supported` or `skipped` (skipped when no adapter is present).
+#   - P4 (device identity resolution) may be `supported`, `degraded` or `skipped`,
+#     and it carries a second clause below that the other probes do not need.
+#     `skipped` is an adapter-less box. `degraded` is reachable on Linux and was
+#     unreachable only by accident: an adapter with no serial number publishes no
+#     `/dev/serial/by-id` link at all, so the loop P4 judged from ran zero times and
+#     the probe reported `supported` for a box whose only identity is `by-path:` —
+#     §12's documented instability warning, reported as if configs survived replug.
+#     The `degraded` arm is what §12 always intended for that box; admitting it here
+#     is what lets the probe say so. It does not redden a lane — the exit code hinges
+#     on `unsupported`, and the summary clause above still refuses that.
 #   - P5 (rig discovery/certification) may be `supported`, `skipped` OR
 #     `degraded` — it is opt-in (transmits), so a run without --port skips; a run
 #     against a rig that is miswired, or whose certificate has an uncertified
@@ -67,7 +76,33 @@
 and (any(.probes[]; .id == "P2" and .status == "supported"))
 and (any(.probes[]; .id == "P1" and (.status == "supported" or .status == "degraded")))
 and (any(.probes[]; .id == "P3" and (.status == "supported" or .status == "degraded" or .status == "skipped")))
-and (any(.probes[]; .id == "P4" and (.status == "supported" or .status == "skipped")))
+and (any(.probes[]; .id == "P4" and (.status == "supported" or .status == "degraded" or .status == "skipped")))
+# **A `supported` P4 must have resolved at least one device.** The clause above is a
+# status clause and a status clause cannot see this: P4's `supported` consequence
+# asserts "Resolver produces canonical identities; configs survive replug and cold
+# start", and until 2026-08-05 that sentence came off a `for a in &adapters` loop
+# that ran zero times whenever udev published no by-id links — §9's vacuous pass,
+# caught on Darwin (`count: 0`, `status: supported`, notes §3.45 (ii)) and admitted
+# by this file, which is why the clause lives here and not only in the probe. The
+# Darwin shape is constructible on Linux through `--dev-root`, so this is a live
+# Linux clause, not a courtesy to another platform. `canonical` is the count of
+# devices the resolver produced a `usb:vid:pid:serial:iface` for.
+#
+# **A report that omits the key ABSTAINS rather than failing**, and the distinction is
+# not a softening. Every artifact in `docs/doctor/` predates the field, so failing on
+# absence turns a defect detector into an instrument-version detector: the gate would
+# go red on 19 of 19 committed reports, including ones taken hours earlier on a healthy
+# box, and an operator reading "linux.jq failed" would learn that the report is old
+# rather than anything about whether the resolver worked. That is §9's own complaint —
+# a check that fails for a reason other than the property it names. The requirement
+# that a *current* binary always states its population is a property of the probe, so
+# it is asserted where it can be asserted honestly: `p4_always_reports_its_population`
+# in `doctor/src/probes.rs`, which no archived report can satisfy or violate.
+and (all(.probes[]; . as $p
+      | ($p.id != "P4")
+      or ($p.status != "supported")
+      or ((([$p.observations[] | select(.key == "canonical") | .value] | first) as $c
+           | $c == null or $c > 0))))
 and (any(.probes[]; .id == "P5" and (.status == "supported" or .status == "skipped" or .status == "degraded")))
 and (any(.probes[]; .id == "P6" and (.status == "supported" or .status == "degraded")))
 and (any(.probes[]; .id == "P7" and (.status == "supported" or .status == "degraded")))

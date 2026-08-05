@@ -2506,17 +2506,57 @@ pub fn p4_resolver(dev_root: &Path, sys_root: &Path) -> Probe {
         .filter(|c| c.by_id.is_none() && c.kind == serial_nexus_core::DeviceKind::Usb)
         .collect();
     // Everything else with no by-id entry: a by-path-only adapter, or a BSD `cu.*`
-    // node. Counted, never judged — neither is a failure of identity resolution.
+    // node. Counted, never judged — neither is a failure of identity resolution *on
+    // its own*, and that decline stands unchanged — review 32's RES-2 recorded it
+    // in as many words ("It stays `supported` in a no-udev environment **by
+    // design**", `docs/implementation-notes.md`, "The resolver's second door, and
+    // the diagnostic that pointed away from it"), and §5 forbids silently
+    // re-fixing a recorded decline. What is narrowed below is only the case that
+    // decision never contemplated: a tree where nothing at all resolved.
     let other = candidates.iter().filter(|c| c.by_id.is_none()).count() - unnamed.len();
+    // **The population the verdict is actually computed over.** `for a in &adapters`
+    // is not one. Where udev published no by-id links it runs zero times, leaves
+    // `all_resolved` at its initialised `true`, and P4 then asserted "Resolver
+    // produces canonical identities; configs survive replug and cold start" off a
+    // loop that never executed — §9's vacuous pass. Darwin is exactly that tree:
+    // four `cu.*` candidates and `count: 0`, byte-identical across
+    // `docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3{,-2,-3}.json` (notes
+    // §3.45 (ii)). So is a Linux box whose only adapter is a serial-number-less
+    // clone reachable through `/dev/serial/by-path` alone — the plan's "no-serial"
+    // P4 case, which this probe could not report while it looked only at by-id.
+    // `canonical` counts devices for which the resolver *did* produce
+    // `usb:vid:pid:serial:iface`, over the deduplicated candidate union rather than
+    // over the by-id listing, and no arm may claim identity resolution works
+    // without at least one.
+    let of_kind =
+        |k: serial_nexus_core::DeviceKind| candidates.iter().filter(|c| c.kind == k).count();
+    let canonical = of_kind(serial_nexus_core::DeviceKind::Usb);
+    let topology_only = of_kind(serial_nexus_core::DeviceKind::ByPath);
+    let unidentified = of_kind(serial_nexus_core::DeviceKind::Raw);
+    // The resolver's *other* source, reported because it is what separates the two
+    // `canonical == 0` worlds — a kernel with no sysfs at all from a Linux box whose
+    // adapter simply has no serial number. §7 wants the observation named.
+    let sysfs_tty_listing = sys_root.join("class/tty").is_dir();
 
     let p = p
         .observe(
             "by_id_tree",
             if by_id_present { "present" } else { "absent" },
         )
+        .observe(
+            "sysfs_tty_listing",
+            if sysfs_tty_listing {
+                "present"
+            } else {
+                "absent"
+            },
+        )
         .observe("count", adapters.len() as u64)
         .observe("sysfs_only", unnamed.len() as u64)
-        .observe("other_candidates", other as u64);
+        .observe("other_candidates", other as u64)
+        .observe("canonical", canonical as u64)
+        .observe("topology_only", topology_only as u64)
+        .observe("unidentified", unidentified as u64);
 
     if adapters.is_empty() && candidates.is_empty() {
         return p.verdict(
@@ -2537,19 +2577,63 @@ pub fn p4_resolver(dev_root: &Path, sys_root: &Path) -> Probe {
     for c in &unnamed {
         p = p.observe(&c.path.display().to_string(), c.identity.clone());
     }
+    // Name the devices that resolved to something weaker than canonical, not just
+    // how many. The report is the diff artifact (§13), and an operator needs to know
+    // *which* node is the one whose identity will not survive a replug.
+    for c in candidates
+        .iter()
+        .filter(|c| c.kind != serial_nexus_core::DeviceKind::Usb)
+    {
+        p = p.observe(&c.path.display().to_string(), c.identity.clone());
+    }
 
     // The by-id tree's *absence* is reported on the environment check as `degraded`
     // with the observation named (§13), not here: this probe answers "does identity
-    // resolution work", and in that environment it does — through the sysfs listing,
-    // which is the same source capture reads. Naming it in the consequence keeps the
-    // operator informed without reddening a box the daemon is fine on; a `degraded`
-    // verdict here would also fail `expectations/linux.jq`, which admits only
-    // `supported` or `skipped` for P4.
-    let where_from = if by_id_present {
+    // resolution work", and in a no-udev Linux tree it does — through the sysfs
+    // listing, which is the same source capture reads. Naming it in the consequence
+    // keeps the operator informed without reddening a box the daemon is fine on.
+    //
+    // The sentence is now conditioned on `unnamed` as well as on the tree, because
+    // it asserts a *provenance*: it read "identities came from the <sys>/class/tty
+    // listing" on Darwin, which has no such listing and reported `sysfs_only: 0` —
+    // prose written for a Linux container, asserted about a BSD box (notes §3.45
+    // (ii)). Its precondition is a device that actually came from that listing.
+    let where_from = if by_id_present || unnamed.is_empty() {
         ""
     } else {
         " No /dev/serial/by-id tree here (no udev 60-serial.rules — a container's bare --device=…, a busybox-mdev image): identities came from the <sys>/class/tty listing, the same source capture reads (§12)."
     };
+    if canonical == 0 {
+        // Devices are visible and not one of them resolved to a canonical identity.
+        // §7 verbatim: an environment that differs is `degraded` with the observation
+        // named. Not `unsupported` — the `by-path:`/`raw:` forms are a working
+        // fallback the daemon binds through (§12), so no design premise is
+        // contradicted. Not `skipped` either, and that is the load-bearing half: the
+        // resolver *ran*, over all four of its passive sources, and answered; the
+        // question was asked and came back negative, so "untested here" would replace
+        // one false statement with another. The report already says `degraded` for
+        // this same fact one section away, on the `/dev/serial/by-id` environment
+        // check — one report must not answer one question two ways.
+        //
+        // A by-id link can outlive its device node, and `enumerate_ports` drops those,
+        // so the count of devices *seen* is the larger of the two lists.
+        let visible = candidates.len().max(adapters.len());
+        let why = if sysfs_tty_listing || by_id_present {
+            " The resolver's sources are readable here, so this is a device with no usable serial number — §12's by-path fallback — not a missing mechanism."
+        } else {
+            " Neither /dev/serial/by-id nor <sys>/class/tty exists here, so the resolver's Linux backend has no source at all: the BSD/macOS shape, where a cu.* raw path is the interim identity and a node configured with a usb: or by-path: identity resolves to nothing and stays `waiting` (§12, §13; the IOKit backend that would supply canonical identities off Linux is deferred, §14)."
+        };
+        return p.verdict(
+            Status::Degraded,
+            &format!(
+                "0 of {visible} visible serial device(s) resolve to a canonical usb:vid:pid:serial:iface identity ({topology_only} by-path only, {unidentified} raw path only): the identity a config would store here does NOT survive replug or renumbering, and carries the documented instability warning (§12).{why}"
+            ),
+        );
+    }
+    // `all_resolved` can still be vacuously `true` — a tree with sysfs-only devices
+    // has no by-id adapters to iterate — and that is now harmless: it can only
+    // *downgrade*. The `supported` claim rests on `canonical >= 1`, counted over the
+    // population above.
     if all_resolved {
         p.verdict(
             Status::Supported,
@@ -4192,6 +4276,139 @@ mod tests {
         );
     }
 
+    /// The defect notes §3.45 (ii) filed: a tree with serial devices the resolver
+    /// cannot name reported `supported` — "Resolver produces canonical identities;
+    /// configs survive replug and cold start" — from a `for a in &adapters` loop
+    /// that ran **zero** times, because the `skipped` early return needs
+    /// `adapters.is_empty() && candidates.is_empty()` and this tree has candidates.
+    /// §9 calls a verdict computed from a loop that never executed vacuous.
+    ///
+    /// The fixture is Darwin's shape reproduced on Linux through the `--dev-root`
+    /// seam (plan §3): four `cu.*` callout nodes, no by-id tree, no by-path tree, no
+    /// sysfs. It reproduces
+    /// `docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3{,-2,-3}.json`'s P4 block
+    /// observation for observation — `by_id_tree: absent`, `count: 0`,
+    /// `sysfs_only: 0`, `other_candidates: 4` — which is what makes it a test of the
+    /// platform's shape rather than of a Linux stand-in for it (§9, no proxy in
+    /// space).
+    ///
+    /// **Fail-first, against the unfixed tree:** status `supported`, and the
+    /// consequence carrying both false sentences. Four assertions below fail on it —
+    /// `canonical` is absent, the status is wrong, the certification claim is
+    /// present, and so is the `<sys>/class/tty` provenance on a tree that has no
+    /// such listing.
+    #[test]
+    fn a_tree_where_nothing_resolved_is_degraded_rather_than_certified() {
+        let t = TmpTree::new("noidentity");
+        for n in [
+            "cu.usbserial-BH00L4KU",
+            "cu.usbserial-BH00LL8O",
+            "cu.Bluetooth-Incoming-Port",
+            "cu.BLTH",
+        ] {
+            write_file(&t.path().join("dev").join(n), "");
+        }
+        let sys_root = t.path().join("sys");
+
+        let p = p4_resolver(t.path(), &sys_root);
+        assert_eq!(
+            p.status.label(),
+            "degraded",
+            "P4 certified a resolver that produced no identity at all — a verdict \
+             computed from a loop that never executed (§9): {p:#?}"
+        );
+        assert!(
+            !p.consequence
+                .contains("Resolver produces canonical identities"),
+            "the consequence claims the property the probe just failed to observe: {}",
+            p.consequence
+        );
+        assert!(
+            !p.consequence
+                .contains("identities came from the <sys>/class/tty listing"),
+            "false provenance: this tree has no <sys>/class/tty listing and \
+             sysfs_only reads 0: {}",
+            p.consequence
+        );
+        // §7 wants the observation named, and the operator-visible consequence is
+        // the one docs/macos.md records: a node configured with a usb: identity
+        // never resolves.
+        assert!(
+            p.consequence.contains("stays `waiting`") && p.consequence.contains("<sys>/class/tty"),
+            "the differing environment must be named, not implied: {}",
+            p.consequence
+        );
+        // The captured Darwin shape, observation for observation.
+        assert_eq!(observed(&p, "by_id_tree"), Some("absent".into()));
+        assert_eq!(observed(&p, "count"), Some(0.into()));
+        assert_eq!(observed(&p, "sysfs_only"), Some(0.into()));
+        assert_eq!(observed(&p, "other_candidates"), Some(4.into()));
+        // …and the population the verdict is computed over, which had no name.
+        assert_eq!(
+            observed(&p, "canonical"),
+            Some(0.into()),
+            "the verdict's population must be counted, never assumed: {p:#?}"
+        );
+        assert_eq!(observed(&p, "unidentified"), Some(4.into()));
+        assert_eq!(observed(&p, "sysfs_tty_listing"), Some("absent".into()));
+
+        // Which nodes, not just how many — the report is the diff artifact (§13).
+        assert_eq!(
+            observed(
+                &p,
+                &t.path()
+                    .join("dev/cu.usbserial-BH00L4KU")
+                    .display()
+                    .to_string()
+            ),
+            Some("raw:/dev/cu.usbserial-BH00L4KU".into()),
+            "{p:#?}"
+        );
+    }
+
+    /// The same defect on Linux, and the reason this is not a macOS-only fix: a USB
+    /// adapter whose EEPROM carries no serial number gets **no** `/dev/serial/by-id`
+    /// link, so `adapters` is empty, the loop runs zero times, and P4 reported
+    /// `supported` for a box whose only identity is `by-path:` — the plan's
+    /// "no-serial" P4 case, which the probe could not report while it looked only at
+    /// by-id. This is the `degraded` arm §12 always intended, finally reachable.
+    ///
+    /// **Fail-first:** `supported` against the unfixed tree.
+    #[test]
+    fn a_serial_numberless_adapter_reachable_only_by_path_degrades() {
+        let t = TmpTree::new("bypathonly");
+        write_file(&t.path().join("dev/ttyUSB0"), "");
+        let by_path = t.path().join("dev/serial/by-path");
+        std::fs::create_dir_all(&by_path).unwrap();
+        std::os::unix::fs::symlink(
+            "../../ttyUSB0",
+            by_path.join("pci-0000:00:14.0-usb-0:1:1.0"),
+        )
+        .unwrap();
+        // sysfs exists and is readable — this box is not macOS; it is an adapter
+        // with nothing to make a canonical identity out of.
+        std::fs::create_dir_all(t.path().join("sys/class/tty")).unwrap();
+        let sys_root = t.path().join("sys");
+
+        let p = p4_resolver(t.path(), &sys_root);
+        assert_eq!(
+            p.status.label(),
+            "degraded",
+            "P4 certified a box whose only identity is by-path — §12's documented \
+             instability warning, reported as if configs survived replug: {p:#?}"
+        );
+        assert_eq!(observed(&p, "canonical"), Some(0.into()));
+        assert_eq!(observed(&p, "topology_only"), Some(1.into()));
+        assert_eq!(observed(&p, "sysfs_tty_listing"), Some("present".into()));
+        assert!(
+            p.consequence.contains("no usable serial number")
+                && !p.consequence.contains("stays `waiting`"),
+            "a Linux box with a serial-numberless clone must not be told its kernel \
+             lacks the mechanism: {}",
+            p.consequence
+        );
+    }
+
     /// The udev-equipped box — this project's dev box and the 6.18 production target
     /// — must read exactly as it did: `supported`, one observation per by-id entry,
     /// and no by-id-absence sentence in the consequence. The RES-2 fix widened where
@@ -4942,6 +5159,54 @@ mod tests {
             p7_silence_cause(0, 0, false),
             "a lost discipline and a destructive hangup must not classify alike"
         );
+    }
+
+    /// **A current binary always states P4's population**, whatever the verdict.
+    ///
+    /// This is the half of the §3.45 (ii) fix that the expectation files deliberately
+    /// cannot carry. They must *abstain* when `canonical` is absent, because every
+    /// archived report predates the field and a gate that failed on absence would be
+    /// reporting the instrument's age rather than the resolver's behaviour. So the
+    /// requirement lives here, where it is about the probe rather than about a file on
+    /// disk, and where no archived report can satisfy or violate it.
+    ///
+    /// Fail-first: deleting the `canonical` observation from `p4_resolver` fails this
+    /// with `P4 reported no population for the supported verdict`, on both fixtures —
+    /// including the resolving one, so the guard cannot be satisfied by the degraded
+    /// path alone.
+    #[test]
+    fn p4_always_reports_its_population() {
+        // A tree where nothing resolves — Darwin's shape, and the degraded verdict.
+        let nothing = TmpTree::new("pop-none");
+        for n in ["cu.usbserial-A", "cu.usbserial-B"] {
+            std::fs::create_dir_all(nothing.path().join("dev")).unwrap();
+            std::fs::write(nothing.path().join("dev").join(n), b"").unwrap();
+        }
+        // …and one where they do, so the guard cannot be satisfied by the degraded
+        // path alone.
+        let resolving = TmpTree::new("pop-some");
+        unlinked_usb_device(resolving.path(), "ttyUSB0");
+        let by_id = resolving.path().join("dev/serial/by-id");
+        std::fs::create_dir_all(&by_id).unwrap();
+        std::os::unix::fs::symlink(
+            "../../ttyUSB0",
+            by_id.join("usb-FTDI_FT232R_USB_UART_UNIQ01-if00-port0"),
+        )
+        .unwrap();
+
+        for (name, root) in [
+            ("a tree where nothing resolves", nothing.path()),
+            ("a tree where devices resolve", resolving.path()),
+        ] {
+            let p = p4_resolver(root, &root.join("sys"));
+            assert!(
+                observed(&p, "canonical").is_some(),
+                "P4 reported no population for the `{}` verdict on {name}; the \
+                 expectation files abstain when this key is absent, so its absence \
+                 here is not caught anywhere else",
+                p.status.label()
+            );
+        }
     }
 
     /// The detector behind P10's `slave_termios_mode`, planted in both spellings.
