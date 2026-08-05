@@ -1356,11 +1356,22 @@ pub fn skip_no_replug(test: &str, why: &str) {
 pub fn usb_port_of(by_id_link: &Path) -> Option<String> {
     let tty = by_id_link.canonicalize().ok()?;
     let tty_name = tty.file_name()?.to_string_lossy().into_owned();
-    // `/sys/class/tty/ttyUSB0/device` -> `../../../3-1:1.0`; the port is the
-    // interface name up to the colon.
-    let device = std::fs::read_link(format!("/sys/class/tty/{tty_name}/device")).ok()?;
-    let interface = device.file_name()?.to_string_lossy().into_owned();
-    interface.split_once(':').map(|(port, _)| port.to_owned())
+    // Resolve `/sys/class/tty/<tty>/device` **fully** and walk up, rather than
+    // reading the one link and taking its name. Measured on 7.0.0-29: that link
+    // points at `../../../ttyUSB0` — the usb-serial port device, not the USB
+    // interface — so the obvious one-step form finds no colon and answers `None`
+    // for a perfectly healthy adapter. The canonical path is
+    // `/sys/devices/…/usb3/3-1/3-1:1.0/ttyUSB0`, and the first ancestor whose name
+    // carries a colon is the interface `3-1:1.0`, whose prefix is the port.
+    let resolved = std::fs::canonicalize(format!("/sys/class/tty/{tty_name}/device")).ok()?;
+    for ancestor in resolved.ancestors() {
+        if let Some(name) = ancestor.file_name()
+            && let Some((port, _)) = name.to_string_lossy().split_once(':')
+        {
+            return Some(port.to_owned());
+        }
+    }
+    None
 }
 
 #[cfg(test)]

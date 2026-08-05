@@ -6688,14 +6688,86 @@ privileged daemon rather than the shipped one.
 unit guards, and the three in `p7_replug_hardware`. `.snx-bin` joins `SKIP_DIRS` in
 `meta_names.rs`.
 
-**Open, and stated rather than left implicit.** The end-to-end replug had not been
-executed at the time this entry was written: the blessing needs one `sudo setcap`,
-which this session could not run. Everything up to that point is measured — the
-helper discovers both adapters, reads their identities, refuses every malformed
-port name, refuses a hub, refuses a non-sysfs lookalike, and reports
-`BLOCKED-ON-BLESS` (exit 2) rather than `NOT READY` — and the premise that
-`CAP_DAC_OVERRIDE` alone suffices for the `authorized` write is **inferred from the
-mode bits, not yet measured**. Record the answer here either way; a confirmed
-premise is as load-bearing as a refuted one (§9). Also open: this is Linux-only by
-construction, and nothing here covers two adapters cycled together to force a
-renumbering, which is the sharpest available form of the §12 claim.
+**The premise is confirmed, by measurement.** `CAP_DAC_OVERRIDE` alone is
+sufficient for the `authorized` write: blessed with exactly that one capability and
+nothing else, the helper deauthorizes and reauthorizes an FT232R with no `EACCES`
+and no `EPERM`. The mode bits really are the whole gate. Recorded here because §9
+says a confirmed premise is as load-bearing as a refuted one — and one *was*
+refuted, below.
+
+**`devnum` was the pre-registered discriminator and is refuted.** The reasoning was
+that a driver rebind leaves it alone while a real re-enumeration always changes it,
+so `devnum_before != devnum_after` would separate the two. Measured on 7.0.0-29 it
+does **not** move: an `authorized` 0→1 cycle unbinds and rebinds the configuration
+without destroying the `usb_device` object that owns the address, so the number
+survives. It reads `6 → 6` in every run. A physical unplug would change it; this
+operation does not.
+
+What the same trace showed instead, sampled every 50 ms through a live cycle:
+
+```
+12:32:54.29  tty=1 devnum=6 auth=1 node=yes
+12:32:54.83  tty=0 devnum=6 auth=0 node=no     <- the device is genuinely gone
+12:32:56.36  tty=1 devnum=6 auth=1 node=yes
+```
+
+The tty is destroyed and `/dev/ttyUSB0` disappears and returns — which is exactly
+the event the daemon experiences, and is therefore the honest discriminator. The
+guard asserts that disappearance, sampled by the **test**, and records `devnum`
+without asserting on it.
+
+**The second vacuity, caught the same way §3.50 catches them.** With the
+discriminator fixed the test passed in 1 ms of hold — the helper could take the
+device down and put it back before the daemon noticed anything, so "the node is
+`active` afterwards" proved nothing. The guard now also requires the daemon to
+**leave `active`** during the outage, and the hold lasts exactly as long as that
+takes. Measured, 3 runs: statuses seen while down are `["waiting"]`, the transition
+is observed in **2–3 ms**, and `resolved_path` returns as `/dev/ttyUSB0` both times.
+Two figures worth keeping: the daemon notices a real USB disconnect an order of
+magnitude faster than its own 200 ms `READ_POLL_TIMEOUT_MS` budget (a destroyed tty
+makes the read fail at once rather than waiting out a poll), and Linux reuses the
+lowest free minor, so an unchanged `ttyUSBn` is the normal outcome of a
+single-adapter replug — which is why the path is recorded and never asserted.
+
+**Iterating on a privileged test must not cost a `sudo`, and at first it did.** The
+helper was re-blessed twice during bring-up, both times because *measurement* code
+living inside the blessed binary had changed. That is the exact problem the project
+this pattern came from solves with a capability-conferring runner. The resolution
+here keeps the narrow grant and moves the volatile half out instead: the `hold`
+verb deauthorizes, waits for **stdin EOF**, and reauthorizes, so the caller owns the
+hold length and does all sampling unprivileged. `while_deauthorized()` in the test
+is the whole protocol — spawn, read the `down` line, measure, drop stdin, read the
+`up` line. The blessed binary now contains the two writes and nothing else, and has
+no reason to change; the experiment rebuilds freely. Crash safety is unchanged and
+in fact stronger: EOF fires however the caller dies, including `SIGKILL`, which is
+§15.43's leash used for the same reason in a second place.
+
+**`scripts/bless`** is the `just bless` analogue: build, install, one `setcap`,
+verify — `--debug` (default), `--release`, `--all`, `--verify`. It is idempotent and
+**skips the privileged step entirely** when the installed copy already matches the
+build and already carries the capability, so re-running it prompts for nothing. It
+prefers `sudo` and falls back to `pkexec` when there is no terminal to prompt on,
+which is what let this session bless at all.
+
+**One flake observed, mechanism not established (§9).** The first full rig-attached
+run with `SNX_REPLUG_DEV` set failed two rig tests —
+`p12_serial_exclusivity::a_break_straddled_by_a_replace_leaves_the_line_transmitting`
+("the crossover rig is not carrying bytes; this test would prove nothing") and
+`serial_hardware::crossover_rig_custom_baud_byte_exact`, the latter after 67.7 s
+against its usual 10.4 s. **Do not read that as "the replug tests break the rig",
+because the evidence does not support it**: both binaries pass in isolation
+immediately afterwards, the direct sequence `p7_replug_hardware` → 
+`p12_serial_exclusivity` was run twice and passed both times, and two further full
+suite runs with replug enabled came back **785 / 0 / 4**. So the rate is one failing
+run in three, both failures inside it, on a box that had just been hammered with a
+dozen manual deauthorize/reauthorize cycles. Recorded rather than explained: the
+baseline before this work was five consecutive clean full runs, so the honest
+statement is that a new flake has been seen once in a lane that used to be clean,
+its trigger is unknown, and the next rig session should watch for it rather than
+assume it is gone.
+
+**Open.** Linux only, by construction. Nothing here yet covers **two** adapters
+cycled together with reauthorization in reverse order, which is the sharpest form
+of the §12 claim — it deterministically forces the renumbering that a single-adapter
+replug does not produce, and `hold` already accepts repeated `--port` for it. The
+`by-path` topology identity is also untested against a real cycle.

@@ -108,6 +108,33 @@ enum Verb {
         #[arg(long)]
         json: bool,
     },
+    /// Deauthorize, then hold the device down until **stdin reaches EOF**, then
+    /// reauthorize. The verb tests use.
+    ///
+    /// `cycle` bakes the hold duration into this binary, which means every change
+    /// to how an experiment is timed or sampled is a change to a binary that must
+    /// then be re-blessed with a `sudo`. `hold` moves that decision out: the caller
+    /// keeps the device down for exactly as long as it wants by keeping the pipe
+    /// open, and does all of its own sampling — unprivileged, since reading sysfs
+    /// needs nothing. What stays in here is only the pair of writes.
+    ///
+    /// The leash is the same mechanism §15.43 chose for the daemon and for the same
+    /// reason: pipe EOF is POSIX, it fires on every way a caller can die including
+    /// `SIGKILL`, and it needs no cooperation from the thing being watched.
+    Hold {
+        /// USB port name, repeatable. Deauthorized in the order given and
+        /// reauthorized in reverse.
+        #[arg(long = "port", required = true)]
+        ports: Vec<String>,
+        /// Ceiling on the hold, in milliseconds, in case the caller never closes
+        /// stdin. Clamped to the same maximum `cycle` uses.
+        #[arg(long, default_value_t = 30_000)]
+        max_ms: u64,
+        /// Do everything except the two writes. The caller's own discriminator
+        /// must go quiet here, which is what makes it a discriminator.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Reauthorize a port. The repair verb for a run that died mid-cycle.
     Authorize {
         #[arg(long)]
@@ -168,6 +195,11 @@ fn main() {
             dry_run,
             json,
         } => cycle(&ports, hold_ms, dry_run, json, held),
+        Verb::Hold {
+            ports,
+            max_ms,
+            dry_run,
+        } => hold_until_eof(&ports, max_ms, dry_run, held),
         Verb::Authorize { port, json } => authorize(&port, json, held),
         Verb::Install { profile, verify } => install_verb(&profile, verify, held),
         Verb::Preflight { profile, json } => preflight(&profile, json, held),
@@ -379,9 +411,29 @@ fn cycle(names: &[String], hold_ms: u64, dry_run: bool, json: bool, held: CapSta
     // Hold, watching for a signal so a terminated helper still puts the hardware
     // back. This is the only sleep in the binary and it is the experiment's
     // variable, not a wait for something to become true.
+    //
+    // The hold is also the **only** window in which the disconnect is observable,
+    // which is why the discriminator is sampled here rather than inferred
+    // afterwards. `devnum` was the pre-registered discriminator and is **refuted**
+    // (notes §3.54): measured on Linux 7.0.0-29, an `authorized` 0→1 cycle does not
+    // change it, because deauthorization unbinds the configuration without
+    // destroying the `usb_device` object that owns the address. What *does* happen,
+    // measured in the same trace, is that the tty is destroyed and `/dev/ttyUSB*`
+    // disappears — which is precisely the event the daemon under test experiences.
+    // So the helper reports the disappearance it witnessed rather than a number it
+    // hoped would move.
     let mut cut_short = false;
-    let hold_until = Instant::now() + hold;
+    let mut vanished: Vec<bool> = vec![false; ports.len()];
+    let mut vanish_ms: Vec<Option<u64>> = vec![None; ports.len()];
+    let down_at = Instant::now();
+    let hold_until = down_at + hold;
     while Instant::now() < hold_until {
+        for (i, port) in ports.iter().enumerate() {
+            if !vanished[i] && sysfs::ttys(port).is_empty() {
+                vanished[i] = true;
+                vanish_ms[i] = Some(down_at.elapsed().as_millis() as u64);
+            }
+        }
         if caps::terminate_requested() || !caps::parent_is(parent) {
             cut_short = true;
             break;
@@ -418,10 +470,17 @@ fn cycle(names: &[String], hold_ms: u64, dry_run: bool, json: bool, held: CapSta
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+        let i = waits.len();
         waits.push(serde_json::json!({
             "port": port.name(),
             "tty_returned": back,
             "tty_wait_ms": began.elapsed().as_millis() as u64,
+            // The discriminator. True means this helper *witnessed* the device's
+            // tty go away — the disconnect the daemon under test experiences.
+            // False under `--dry-run` by construction, which is what makes the
+            // dry run a control rather than a claim.
+            "tty_vanished_during_hold": vanished[i],
+            "tty_vanished_after_ms": vanish_ms[i],
         }));
         if !back && !dry_run {
             return refuse(
@@ -455,6 +514,116 @@ fn cycle(names: &[String], hold_ms: u64, dry_run: bool, json: bool, held: CapSta
         );
     }
     if cut_short { exit::FAILED } else { exit::READY }
+}
+
+/// Down, hold until the caller closes stdin (or `max_ms`), up.
+///
+/// The whole privileged surface of a replug test, and deliberately the *entire*
+/// contribution of this binary to one: no sampling, no measurement, no experiment
+/// design. Those live in the caller, where changing them costs a rebuild and not a
+/// `sudo`.
+///
+/// Prints one JSON line when the device is down and one when it is back up, both
+/// flushed, so a caller can synchronise on them rather than sleeping.
+fn hold_until_eof(names: &[String], max_ms: u64, dry_run: bool, held: CapState) -> i32 {
+    use std::io::{BufRead, Write};
+
+    let mut ports = Vec::new();
+    for name in names {
+        match open_port(name) {
+            Ok(p) => ports.push(p),
+            Err(e) => return refuse(&e, false),
+        }
+    }
+    if !dry_run && let Some(code) = require_capability(held, false) {
+        return code;
+    }
+    let ceiling = Duration::from_millis(max_ms).min(MAX_HOLD);
+
+    let parent = std::os::unix::process::parent_id();
+    let _ = caps::catch_terminate();
+    let _ = caps::set_pdeathsig_term();
+    if !caps::parent_is(parent) {
+        return refuse(
+            "parent exited before the hold began; refusing to start",
+            false,
+        );
+    }
+
+    if !dry_run {
+        for port in &ports {
+            if let Err(e) = sysfs::set_authorized(port, false) {
+                for done in &ports {
+                    let _ = sysfs::set_authorized(done, true);
+                }
+                return refuse(&format!("writing authorized=0 on {port}: {e}"), false);
+            }
+        }
+    }
+    let down_at = Instant::now();
+    println!(
+        "{}",
+        serde_json::json!({
+            "state": "down",
+            "dry_run": dry_run,
+            "ports": ports.iter().map(|p| p.name()).collect::<Vec<_>>(),
+            "max_hold_ms": ceiling.as_millis() as u64,
+        })
+    );
+    let _ = std::io::stdout().flush();
+
+    // Wait for EOF on stdin. A caller that dies — for any reason, including
+    // SIGKILL — closes its end, so this returns and the device comes back. The
+    // ceiling covers a caller that lives but never closes.
+    let released_by = {
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        let mut reason = "stdin-eof";
+        loop {
+            if down_at.elapsed() >= ceiling {
+                reason = "max-ms";
+                break;
+            }
+            if caps::terminate_requested() || !caps::parent_is(parent) {
+                reason = "signal";
+                break;
+            }
+            // A short read with a deadline: `read_line` on a pipe blocks until the
+            // writer writes or closes, so the loop is driven by the reader thread
+            // below rather than by polling stdin directly.
+            line.clear();
+            match stdin.lock().read_line(&mut line) {
+                Ok(0) => break,    // EOF: the caller is done or gone
+                Ok(_) => continue, // a caller may write to keep it alive
+                Err(_) => break,
+            }
+        }
+        reason
+    };
+
+    let mut failures = Vec::new();
+    if !dry_run {
+        for port in ports.iter().rev() {
+            if let Err(e) = sysfs::set_authorized(port, true) {
+                failures.push(format!("{port}: {e}"));
+            }
+        }
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "state": "up",
+            "held_ms": down_at.elapsed().as_millis() as u64,
+            "released_by": released_by,
+            "reauthorize_failures": failures,
+        })
+    );
+    let _ = std::io::stdout().flush();
+    if failures.is_empty() {
+        exit::READY
+    } else {
+        exit::FAILED
+    }
 }
 
 fn install_verb(profile: &str, verify: bool, held: CapState) -> i32 {

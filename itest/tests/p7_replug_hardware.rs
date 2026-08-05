@@ -15,10 +15,24 @@
 //!
 //! These tests drive a genuine deauthorize/reauthorize of a real FTDI adapter
 //! through `serial-nexus-replug` (the one blessed binary, §15.45) and assert what
-//! the fixture cannot: that the **devnum changes** — the discriminator that
-//! separates a real re-enumeration from a driver rebind — while the **identity does
-//! not**, and that the daemon comes back open on whatever `/dev` path the kernel
-//! chose this time.
+//! the fixture cannot: that the helper **witnessed the tty be destroyed** while it
+//! held the device down, while the **identity did not move**, and that the daemon
+//! comes back open on whatever `/dev` path the kernel chose this time.
+//!
+//! # The discriminator, and the one that was refuted
+//!
+//! `devnum` was pre-registered as the discriminator, on the reasoning that a driver
+//! rebind leaves it alone while a real re-enumeration always changes it. **Measured
+//! on Linux 7.0.0-29, it does not change across an `authorized` 0→1 cycle** — the
+//! `usb_device` object that owns the address survives deauthorization, so only the
+//! configuration is unbound and rebound. It is recorded here, never asserted.
+//!
+//! What the same trace *did* show, sampled every 50 ms: the tty count under the
+//! interface goes 1 → 0 → 1 and `/dev/ttyUSB0` disappears and returns. That is
+//! precisely the event the daemon under test experiences, so the helper now reports
+//! the disappearance it witnessed during its own hold window
+//! (`tty_vanished_during_hold`), and that is what these tests assert on. Notes
+//! §3.54 carries the refutation.
 //!
 //! # Why the rig variable here is a by-id path
 //!
@@ -134,8 +148,8 @@ fn devnum(port: &str) -> Option<String> {
     sysfs_attr(port, "devnum")
 }
 
-/// Run the blessed helper, returning its JSON report. Panics with the helper's own
-/// diagnostics on failure — they name the port and the repair verb.
+/// Run the blessed helper for a one-shot verb (`status`, `authorize`), returning
+/// its JSON report.
 fn replug(helper: &Path, args: &[&str]) -> Value {
     let out = std::process::Command::new(helper)
         .args(args)
@@ -151,6 +165,84 @@ fn replug(helper: &Path, args: &[&str]) -> Value {
     );
     serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("helper printed unparseable JSON ({e}): {stdout:?}"))
+}
+
+/// Hold `port` deauthorized for as long as `while_down` runs, then bring it back.
+///
+/// **This is the shape that keeps the blessed binary still.** The helper's entire
+/// contribution is the two writes; the hold length, the sampling and the whole
+/// experiment live in `while_down`, here, unprivileged — so iterating on what a
+/// replug test measures costs a rebuild of the test and never a `sudo`. The device
+/// comes back when this function drops the child's stdin, and also if the test
+/// process dies at any point, because pipe EOF fires either way (§15.43's leash,
+/// same mechanism and same reason).
+///
+/// Returns the helper's `down` and `up` reports and whatever `while_down` produced.
+fn while_deauthorized<T>(
+    helper: &Path,
+    port: &str,
+    dry_run: bool,
+    while_down: impl FnOnce() -> T,
+) -> (Value, Value, T) {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let mut args = vec!["hold", "--port", port, "--max-ms", "20000"];
+    if dry_run {
+        args.push("--dry-run");
+    }
+    let mut child = Command::new(helper)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawning {} {args:?}: {e}", helper.display()));
+
+    let mut out = BufReader::new(child.stdout.take().expect("helper stdout is piped"));
+    let mut line = String::new();
+    out.read_line(&mut line)
+        .expect("read the helper's down line");
+    let down: Value = serde_json::from_str(line.trim()).unwrap_or_else(|e| {
+        let _ = child.kill();
+        panic!("helper's first line was not JSON ({e}): {line:?}")
+    });
+    assert_eq!(
+        down["state"], "down",
+        "helper did not report the device down: {down}"
+    );
+
+    let observed = while_down();
+
+    // EOF: the device comes back. Dropping stdin is the whole protocol.
+    drop(child.stdin.take());
+    line.clear();
+    out.read_line(&mut line).expect("read the helper's up line");
+    let up: Value = serde_json::from_str(line.trim())
+        .unwrap_or_else(|e| panic!("helper's second line was not JSON ({e}): {line:?}"));
+    let status = child.wait().expect("wait for the helper");
+    assert!(status.success(), "helper exited {status:?}: up report {up}");
+    assert_eq!(
+        up["state"], "up",
+        "helper did not report the device up: {up}"
+    );
+    (down, up, observed)
+}
+
+/// Whether the port currently owns any tty, read straight from sysfs.
+///
+/// Unprivileged, which is the point: the discriminator belongs to the test.
+fn has_tty(port: &str) -> bool {
+    std::fs::read_dir(format!("/sys/bus/usb/devices/{port}"))
+        .map(|entries| {
+            entries.flatten().any(|iface| {
+                iface.file_name().to_string_lossy().contains(':')
+                    && std::fs::read_dir(iface.path()).is_ok_and(|kids| {
+                        kids.flatten()
+                            .any(|k| k.file_name().to_string_lossy().starts_with("ttyUSB"))
+                    })
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// A daemon holding one free-for-all serial node addressed **by identity**, cross-wired
@@ -219,32 +311,67 @@ fn a_real_usb_reenumeration_heals_the_node_at_its_canonical_identity() {
     let node_before = rpc
         .node("usb0")
         .expect("node usb0 present before the replug");
-    let path_before = node_before["state_extra"]["resolved_path"].clone();
+    let path_before = node_before["resolved_path"].clone();
     assert!(
         path_before.is_string(),
         "no resolved_path before the replug: {node_before}"
     );
 
-    // The replug itself. One invocation, one process: the device is never left
-    // deauthorized by a test that dies, because the helper owns both writes.
-    let report = replug(
-        &rig.helper,
-        &["cycle", "--port", &rig.port, "--hold-ms", "1500", "--json"],
+    // The replug itself. The helper holds the device down only while the closure
+    // below runs, and everything measured in it is measured here, unprivileged.
+    let (down, up, (saw_tty_go, daemon_noticed, statuses)) =
+        while_deauthorized(&rig.helper, &rig.port, false, || {
+            // (D) The discriminator, sampled by the test: the tty really went away.
+            // `devnum` was the pre-registered discriminator and is refuted — it
+            // does not move across an `authorized` cycle on this kernel (module
+            // docs, notes §3.54) — so what is asserted is the disappearance, which
+            // is the event the daemon under test actually experiences.
+            let tty_gone = wait_until(Duration::from_secs(5), || !has_tty(&rig.port));
+
+            // (A) **And the daemon has to notice.** Without this the test is
+            // vacuous in the most ordinary way: the helper can take the device
+            // down and put it back inside a millisecond, the node never leaves
+            // `active`, and asserting that it is `active` afterwards proves
+            // nothing at all. Measured budget: the reader notices loss within
+            // ~200 ms (`READ_POLL_TIMEOUT_MS`) and rediscovery polls at ~1 s
+            // (`RECONNECT_POLL`), so the hold lasts exactly as long as it takes —
+            // which is the reason the hold length is decided here rather than
+            // baked into the blessed binary.
+            let mut seen: Vec<String> = Vec::new();
+            let noticed = wait_until(Duration::from_secs(10), || {
+                let status = rpc.node_status("usb0");
+                if !seen.contains(&status) {
+                    seen.push(status.clone());
+                }
+                status != "active"
+            });
+            (tty_gone, noticed, seen)
+        });
+    assert!(
+        saw_tty_go,
+        "the tty never disappeared while the device was deauthorized, so nothing \
+         below measures a replug. down={down} up={up}"
+    );
+    assert!(
+        daemon_noticed,
+        "the daemon never left `active` during a real outage, so `active` afterwards \
+         proves nothing — the node was never observed to fault. Statuses seen: \
+         {statuses:?}. down={down} up={up}"
+    );
+    assert!(
+        up["reauthorize_failures"]
+            .as_array()
+            .is_some_and(|f| f.is_empty()),
+        "the helper failed to reauthorize: {up}"
     );
     assert_eq!(
-        report["hold_cut_short_by_signal"],
-        Value::Bool(false),
-        "the hold was interrupted; the measurement is not the one intended: {report}"
+        up["released_by"], "stdin-eof",
+        "the hold ended for a reason other than the test finishing: {up}"
     );
 
-    // (D) The discriminator: the kernel really re-enumerated. Inequality only.
+    // Recorded, never asserted: `devnum` is stable across this operation on Linux
+    // 7.0.0-29 (the refuted pre-registered discriminator — see the module docs).
     let devnum_after = devnum(&rig.port).expect("devnum after");
-    assert_ne!(
-        devnum_before, devnum_after,
-        "devnum did not change across the cycle ({devnum_before} -> {devnum_after}) — \
-         this was not a re-enumeration, so nothing below measures a replug. \
-         Helper report: {report}"
-    );
 
     // The by-id link must come back before the daemon can possibly resolve it. Wait
     // on the link, never sleep for it: `metadata` follows the link, so a dangling
@@ -263,14 +390,13 @@ fn a_real_usb_reenumeration_heals_the_node_at_its_canonical_identity() {
         rpc.node("usb0")
     );
     let healed = rpc.node("usb0").expect("node usb0 present after the heal");
-    let extra = &healed["state_extra"];
     assert_eq!(
-        extra["open"],
+        healed["open"],
         Value::Bool(true),
         "healed but not open — `active` alone is the proxy the fixture test already \
          proves; §12 promises a resolved path at every open: {healed}"
     );
-    let resolved = extra["resolved_path"]
+    let resolved = healed["resolved_path"]
         .as_str()
         .unwrap_or_else(|| panic!("no resolved_path after heal: {healed}"));
     assert!(
@@ -294,9 +420,10 @@ fn a_real_usb_reenumeration_heals_the_node_at_its_canonical_identity() {
     // so an unchanged ttyUSBn here is a legitimate outcome. The property is that
     // the daemon does not care, which is B and C above.
     eprintln!(
-        "replug measured: devnum {devnum_before} -> {devnum_after}; path {path_before} -> \
-         {resolved:?}; tty wait {} ms",
-        report["waits"][0]["tty_wait_ms"]
+        "replug measured: devnum {devnum_before} -> {devnum_after} (stable by design on \
+         this kernel); path {path_before} -> {resolved:?}; statuses seen while down \
+         {statuses:?}; held {} ms, released by {}",
+        up["held_ms"], up["released_by"]
     );
 }
 
@@ -321,30 +448,22 @@ fn the_replug_discriminator_goes_quiet_when_no_write_happens() {
         }
     };
 
-    let before = devnum(&rig.port).expect("devnum before");
-    let report = replug(
-        &rig.helper,
-        &[
-            "cycle",
-            "--port",
-            &rig.port,
-            "--hold-ms",
-            "250",
-            "--dry-run",
-            "--json",
-        ],
-    );
+    let (down, up, saw_tty_go) = while_deauthorized(&rig.helper, &rig.port, true, || {
+        wait_until(Duration::from_secs(2), || !has_tty(&rig.port))
+    });
     assert_eq!(
-        report["dry_run"],
+        down["dry_run"],
         Value::Bool(true),
-        "the control did not run as a dry run: {report}"
+        "the control did not run as a dry run: {down}"
     );
-    let after = devnum(&rig.port).expect("devnum after");
-    assert_eq!(
-        before, after,
-        "devnum moved during a --dry-run cycle ({before} -> {after}): the helper \
-         wrote when it promised not to, so --dry-run is not a control"
+    // The whole point: the discriminator the real test asserts on must stay quiet
+    // here. If a dry run can make it fire, it is not measuring the write.
+    assert!(
+        !saw_tty_go,
+        "the tty vanished during a --dry-run hold: the helper wrote when it \
+         promised not to, so the control is not one. down={down} up={up}"
     );
+
     // And the adapter is still usable — a control that damages the rig is not one.
     assert_eq!(
         replug(&rig.helper, &["status", "--port", &rig.port, "--json"])["authorized"],

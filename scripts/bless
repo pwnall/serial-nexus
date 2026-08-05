@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Bless `serial-nexus-replug` so the privileged replug tests can run (design §15.45).
+#
+# One command a developer types in a terminal:
+#
+#     scripts/bless              # debug   (what `cargo test` uses)
+#     scripts/bless --release    # release
+#     scripts/bless --all        # both
+#     scripts/bless --verify     # report state, change nothing, ask for no password
+#
+# What it does per profile: build the helper, install a copy at
+# `.snx-bin/<profile>/` with mode 0700, apply `cap_dac_override+ep` with one
+# `sudo setcap`, and verify the result. It is idempotent and **skips the sudo
+# entirely** when the installed copy is already byte-identical to the build and
+# already carries the capability — so re-running it costs nothing and prompts for
+# nothing.
+#
+# Why a sudo at all, and why only here: `authorized` under /sys is root-owned, so
+# writing it needs CAP_DAC_OVERRIDE, and only root may grant a file capability.
+# Nothing else in this repository asks for privilege, and the helper itself never
+# invokes sudo — the privileged step is a command a human runs and can read first.
+#
+# No `-e`: each profile is attempted independently so one failure still reports the
+# other, and the exit code is computed at the end.
+set -uo pipefail
+
+cd "$(dirname "$0")/.." || exit 1
+repo="$PWD"
+
+profiles=()
+verify_only=0
+for arg in "$@"; do
+  case "$arg" in
+    --release) profiles+=("release") ;;
+    --debug)   profiles+=("debug") ;;
+    --all)     profiles+=("debug" "release") ;;
+    --verify)  verify_only=1 ;;
+    -h|--help)
+      sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "bless: unknown argument '$arg' (try --help)" >&2
+      exit 2
+      ;;
+  esac
+done
+[ ${#profiles[@]} -eq 0 ] && profiles=("debug")
+
+# `sudo` needs a terminal to prompt. In a GUI session without one — an editor's
+# embedded shell, an agent harness — `pkexec` asks through the polkit agent
+# instead. Prefer sudo when it can actually prompt, because it is what the tool's
+# own message tells you to run.
+run_privileged() {
+  if sudo -n true 2>/dev/null; then
+    sudo "$@"
+  elif [ -t 0 ] && [ -t 1 ]; then
+    sudo "$@"
+  elif command -v pkexec >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+    echo "bless: no terminal for sudo to prompt on; asking through pkexec" >&2
+    pkexec "$@"
+  else
+    echo "bless: this step needs root and there is no way to prompt here." >&2
+    echo "bless: run it yourself in a terminal:" >&2
+    echo "    sudo $*" >&2
+    return 1
+  fi
+}
+
+rc=0
+for profile in "${profiles[@]}"; do
+  echo "== ${profile} =="
+  built="$repo/target/$profile/serial-nexus-replug"
+  blessed="$repo/.snx-bin/$profile/serial-nexus-replug"
+
+  if [ "$verify_only" -eq 0 ]; then
+    flags=(--locked -p serial-nexus-replug)
+    [ "$profile" = "release" ] && flags+=(--release)
+    if ! cargo build "${flags[@]}"; then
+      echo "bless: ${profile}: build failed" >&2
+      rc=1
+      continue
+    fi
+  fi
+
+  if [ ! -x "$built" ]; then
+    echo "bless: ${profile}: $built is missing — build it first" >&2
+    rc=1
+    continue
+  fi
+
+  # Ask the tool, not the filesystem: `install --verify` compares the installed
+  # copy byte-for-byte against the build and re-reads mode and capability, so
+  # "already blessed" is a measurement rather than the presence of a stamp file.
+  if "$built" install --profile "$profile" --verify >/dev/null 2>&1; then
+    echo "bless: ${profile}: already blessed (build unchanged, mode 0700, +ep) — nothing to do"
+    continue
+  fi
+
+  if [ "$verify_only" -eq 1 ]; then
+    "$built" install --profile "$profile" --verify
+    rc=1
+    continue
+  fi
+
+  # Copy + chmod 0700. Unprivileged, and it strips any previous capability,
+  # which is the kernel's doing and is the point: a rewritten binary is never
+  # silently still blessed.
+  # Exit 2 here is BLOCKED-ON-BLESS and is the *expected* outcome: the copy
+  # landed and the capability is not on it yet, which is precisely what the next
+  # line fixes. Only a genuine failure (3, 70) means the copy did not happen.
+  "$built" install --profile "$profile" >/dev/null
+  case $? in
+    0 | 2) ;;
+    *)
+      echo "bless: ${profile}: install failed" >&2
+      rc=1
+      continue
+      ;;
+  esac
+
+  if ! run_privileged /usr/sbin/setcap cap_dac_override+ep "$blessed"; then
+    rc=1
+    continue
+  fi
+
+  if "$built" install --profile "$profile" --verify; then
+    echo "bless: ${profile}: ready"
+  else
+    echo "bless: ${profile}: still not blessed after setcap" >&2
+    rc=1
+  fi
+done
+
+if [ "$rc" -eq 0 ]; then
+  echo
+  echo "Run the privileged tests with:"
+  echo "    SNX_REPLUG=required SNX_REPLUG_DEV=/dev/serial/by-id/<your-adapter> \\"
+  echo "        cargo test -p serial-nexus-itest --test p7_replug_hardware"
+fi
+exit "$rc"
