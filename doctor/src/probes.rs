@@ -2522,9 +2522,43 @@ fn p5_name(port: &Path, resolver: &serial_nexus_core::Resolver) -> String {
     port.display().to_string()
 }
 
-/// Whether a fd is a real UART: a pts (the CI sim) fails `TIOCGICOUNT`.
+/// Whether this fd is a real UART — measured with an ioctl **every platform this
+/// project supports implements**, not with one only Linux does.
+///
+/// The property the certificate needs is "characterizing this port means
+/// something": a driver with a line, not the pts the CI doubles stand up (§15.21).
+/// The predicate used to be `TIOCGICOUNT` alone, which is that property *on Linux*
+/// and nothing at all anywhere else — `serial_nexus_sys`'s non-Linux arm is a hard
+/// `ENOTSUP` stub — so on Darwin it answered "not a UART" for two genuine FT232R
+/// adapters and the entire certificate, rate ladder included, never ran
+/// (`docs/doctor/macos-24.6.0-2026-08-05-7ead470-tier3.json`: both ports
+/// `cert: skipped`). That is §9's proxy in space exactly: a Linux-only observable
+/// standing in for a portable property, passing on the box it was written on.
+///
+/// `TIOCMGET` is the portable member, and **it is the only item in P3's whole
+/// vector that discriminates.** Measured 2026-08-05 on Linux 7.0.0-29 with an
+/// FT232R crossover attached: a pts accepts a custom baud *and reports 250000
+/// back*, accepts `TIOCEXCL`, and accepts `TIOCSBRK`/`TIOCCBRK` — so custom baud,
+/// exclusivity and break cannot be the predicate however UART-ish they read. It
+/// refuses `TIOCMGET` with `ENOTTY`, and both FT232R ports answer it. Off Linux the
+/// other half is already committed: P3 reports `modem_calls_ok: true` for both
+/// FT232R ports in all three 2026-08-05 macOS captures.
+///
+/// The Linux-only member stays in the **disjunction** rather than being replaced.
+/// That is what makes this non-regressive by construction: every port that
+/// certifies today answers `TIOCGICOUNT`, so it still certifies and no committed
+/// Linux artifact can move. A widening cannot lose a port; a replacement could, and
+/// §7 forbids that one-way decision on single-kernel evidence.
+///
+/// Read-only, deliberately: `TIOCMGET` asserts nothing on the line, where the
+/// `TIOCMSET` P3 also performs would drive an output, and this predicate runs over
+/// every port the operator named, which may be live equipment. The **values** are
+/// worthless here and are not consulted — both FT232R ports read
+/// `cts=false dsr=false dcd=false ri=false` on both kernels — only whether the
+/// driver answers at all.
 fn p5_is_uart(sp: &SerialPort) -> bool {
-    sys::read_icounts(sp.as_raw_fd()).is_ok()
+    let fd = sp.as_raw_fd();
+    sys::read_modem_bits(fd).is_ok() || sys::read_icounts(fd).is_ok()
 }
 
 /// Why [`p5_certify_port`] was not run for a port [`p5_is_uart`] rejected — and it

@@ -4652,6 +4652,62 @@ out sample count and cold start (all four cells 145–152 ns). Decomposing it pr
 reproduce P2's shape inside itself; that is a new measurement rather than a repair, and it is filed
 rather than smuggled into this change.
 
+### 3.42 P5's UART predicate was a Linux-only proxy, and the crossover rig could never certify off Linux
+
+**Design:** §15.21's certificate, and §9's rule against a proxy in space.
+
+**Reality.** `p5_is_uart` gated on `TIOCGICOUNT`. That is the property *on Linux* and nothing at all
+anywhere else — `serial_nexus_sys`'s non-Linux arm is a hard `ENOTSUP` stub — so on Darwin it
+answered "not a UART" for two genuine FT232R adapters and the **entire certificate, rate ladder
+included, never ran**. All three 2026-08-05 macOS captures read `cert: skipped` on both ports, on a
+rig that P3 certifies as fully functional and that moves 32768 bytes byte-exact each way at 250000
+baud. §9's proxy in space exactly: a Linux-only observable standing in for a portable property,
+passing forever on the box it was written on.
+
+**`TIOCMGET` is the portable member, and it is the only item in P3's whole vector that
+discriminates.** Measured on this box with the rig attached: a Linux **pts accepts a custom baud and
+reports 250000 back**, accepts `TIOCEXCL`, and accepts `TIOCSBRK`/`TIOCCBRK` — so custom baud,
+exclusivity and break cannot be the predicate however UART-ish they read. It refuses `TIOCMGET` with
+`ENOTTY` (the pty master too), and both FT232R ports answer it. The other half is already committed:
+P3 reports `modem_calls_ok: true` for both FTDI ports in every macOS capture.
+
+**Decision:** `read_modem_bits(fd).is_ok() || read_icounts(fd).is_ok()`. A **disjunction**, not a
+replacement — that is what makes it non-regressive by construction: every port that certifies today
+answers `TIOCGICOUNT`, so it still certifies and no committed Linux artifact can move. A widening
+cannot lose a port; a replacement could, and §7 forbids that one-way decision. Verified: the Linux
+Tier-3 certificate is unchanged, rate ladder and deliberate mismatch still run.
+
+Read-only, deliberately: `TIOCMGET` asserts nothing on the line where P3's `TIOCMSET` drives an
+output, and this predicate runs over every port the operator named — which may be live equipment
+(§3's passive-by-default rule). Only whether the driver answers is consulted, never the values.
+
+**No decline was on record.** 37-TOOL-3's *justify* covers the certificate's **contents** (parity
+mismatch, break reception, far-side modem), not the predicate's portability.
+
+**Pre-registered for the next Mac run (§7):** both FTDI ports certify, and P5 reports **Tier 3** with
+`rate_ladder=true`. If they still report `cert: skipped`, `TIOCMGET` does not discriminate on Darwin
+the way the committed `modem_calls_ok: true` implies and this entry is wrong.
+
+**Filed, not fixed — the 1024/1022 asymmetry now has a mechanism but not a measurement.** It is
+**not** a probe artifact: P10 never enables packet mode, and enabling `TIOCPKT` on Linux was measured
+to change the accepted counts in neither direction (it adds bytes to *recovery*, one type byte per
+master read — it can only ever add on the read side, never subtract on the write side). A read of
+XNU's `bsd/kern/tty_dev.c` explains both numbers exactly: `ptcwrite` guards every character insert
+with `(t_rawq.c_cc + t_canq.c_cc) >= TTYHOG - 2` and `bsd/sys/tty.h` sets `TTYHOG 1024`, giving
+hostward **1022**; `ttymalloc` allocates `t_outq` via `clalloc(&tp->t_outq, TTYCLSIZE /* 1024 */, 0)`,
+giving targetward **1024**. The same guard's second clause also explains the pre-repair
+`ceiling_hit: true` run, independently corroborating §3.34's *inferred* cooked-discipline claim. But
+that is a third-party source read, not a measurement of the operator's kernel, and §7 forbids
+promoting it to established prose. The discriminating experiment — refill-from-empty, partial-drain,
+byte-granular top-up, separating "queue capacity" from "per-fill allowance" — is designed and not
+built here.
+
+**And a correction this turned up: "Linux is symmetric at 15360/15360" is not supported.** Six runs
+of the shipped binary on this box gave 13824 and 15360 *independently per direction*, so Linux's own
+within-run direction asymmetry (1536 bytes) is **768×** Darwin's (2 bytes). Darwin's figures, by
+contrast, do not vary run to run at all. Any prose contrasting a "symmetric" Linux with an
+"asymmetric" Darwin has the comparison backwards.
+
 ---
 
 ## 4. Findings carried forward (from serial-nexus-doctor)
