@@ -568,6 +568,17 @@ pub fn daemon_answers(socket: &Path) -> bool {
 /// Killed and cleaned up on `Drop`.
 pub struct Daemon {
     child: Child,
+    /// The orphan leash (design §15.43): the write end of the daemon's stdin pipe,
+    /// held for this `Daemon`'s whole life and never written to.
+    ///
+    /// [`Drop`] is the *happy* path; this covers every unhappy one. A test process
+    /// killed by a signal, aborted, or killed as a process group by a runner executes
+    /// no `Drop` at all — but the kernel still closes this fd, the daemon reads EOF and
+    /// stops through its normal teardown. Without it such a process leaves a daemon
+    /// holding its control socket and every device its graph opened, and the *next*
+    /// run of any test wanting those devices fails on a `TIOCEXCL` whose cause is
+    /// nowhere in that run's output.
+    _leash: std::process::ChildStdin,
     rpc: Rpc,
     run: TempRun,
 }
@@ -587,17 +598,36 @@ impl Daemon {
     pub fn start_with_args(extra: &[&str]) -> Self {
         let run = TempRun::new();
         let socket = run.socket();
-        let child = Command::new(bin("serial-nexus-daemon"))
+        let mut child = Command::new(bin("serial-nexus-daemon"))
             .arg("--socket")
             .arg(&socket)
             .arg("--state-file")
             .arg(run.state_file())
+            // The leash: this daemon stops when the pipe below is closed, which the
+            // kernel does when this test process dies, however it dies (§15.43).
+            .arg("--exit-on-stdin-eof")
             .args(extra)
             .env("XDG_RUNTIME_DIR", run.path())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn serial-nexus-daemon");
+        let leash = child
+            .stdin
+            .take()
+            .expect("the daemon was spawned with a piped stdin");
+
+        // The guard is constructed *before* the readiness assertion, not after. A bare
+        // `std::process::Child` has no kill-on-drop — its `Drop` neither signals nor
+        // reaps — so the old order unwound past a running daemon on a readiness timeout
+        // and left it behind with nobody holding its pid.
+        let daemon = Daemon {
+            child,
+            _leash: leash,
+            rpc: Rpc::new(socket.clone()),
+            run,
+        };
         let ready = wait_until(Duration::from_secs(10), || {
             socket.exists() && daemon_answers(&socket)
         });
@@ -607,8 +637,7 @@ impl Daemon {
             socket.display(),
             socket.exists()
         );
-        let rpc = Rpc::new(socket);
-        Daemon { child, rpc, run }
+        daemon
     }
 
     pub fn rpc(&self) -> &Rpc {

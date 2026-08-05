@@ -49,6 +49,13 @@ struct Cli {
     /// only in extension (`a.sock` and `a.socket` derive the same state file).
     #[arg(long)]
     state_file: Option<PathBuf>,
+    /// Stop when stdin reaches EOF (§15.43). For a supervisor that spawns the daemon
+    /// with a pipe on stdin and holds the write end: the kernel closes that end however
+    /// the supervisor dies, so the daemon cannot outlive it — including a SIGKILL, where
+    /// none of the supervisor's own cleanup runs at all. Off by default: under a service
+    /// manager stdin is at EOF from the first instant.
+    #[arg(long)]
+    exit_on_stdin_eof: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -66,6 +73,7 @@ fn main() -> anyhow::Result<()> {
         socket_group: cli.socket_group,
         dev_root: cli.dev_root,
         state_file: cli.state_file,
+        exit_on_stdin_eof: cli.exit_on_stdin_eof,
     };
     // The built-in codec registry (§8/§15.26). An out-of-tree daemon replaces this
     // one line with `Registry::with_builtins().register("myproto", factory)?`.

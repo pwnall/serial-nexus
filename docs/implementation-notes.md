@@ -4495,6 +4495,52 @@ fails it every time — `dialling …/barrier.sock gave No such file or director
 8-way concurrency on Darwin, where the recorded rate was 1 in 40. If they still fail, this entry's
 root cause is wrong and the ECONNREFUSED has a third source neither hypothesis names.
 
+### 3.39 A daemon outlived the test process that spawned it, because `Drop` is the happy path
+
+**Design:** §15.43, added for this.
+
+**Reality.** Every daemon the harness starts was killed only by `Daemon::drop` — and `Drop` is
+exactly what does not run when a process dies without unwinding. A whole-gate Mac run lost **all
+five hardware-rig tests** to one leaked daemon still holding both FTDI ports; on the dev box, two
+further leaked daemons from earlier sessions were found still running, on sockets nothing would
+ever dial again. The symptom lands in the *next* run, as a `TIOCEXCL` refusal whose cause is
+nowhere in that run's output.
+
+**Two orphan paths, and only one of them needs a signal.** The first is the obvious one: SIGKILL,
+`abort`, a runner killing the process group. The second is signal-free and was found by reading:
+`Daemon::start_with_args` spawned the child and *then* asserted readiness, so a readiness timeout
+unwound past a bare `std::process::Child` — whose `Drop` neither kills nor reaps. Measured: a
+`sleep 600` child survived a `catch_unwind` panic and its parent's exit. The guard construction now
+precedes the assertion, which closes that one by ordering alone.
+
+**A refuted diagnosis, recorded because §9 makes it load-bearing.** The first explanation offered
+for the Mac failure was cross-binary contention over a rig guarded only by a process-local mutex.
+It is wrong: cargo runs test binaries strictly sequentially — sampled twelve times during a live
+run — so there is no cross-binary race to lose. The leak is the mechanism; its *trigger* on that
+run is still not established, and this entry does not claim it.
+
+**Decision — an orphan leash, and deliberately not the platform primitives.** The daemon gains an
+opt-in `--exit-on-stdin-eof`; the harness spawns it with `Stdio::piped()` and holds the write end
+for the `Daemon`'s whole life. The kernel closes that fd however the parent dies, and the daemon
+stops through its *normal* teardown — socket unlinked, claim released — rather than being killed.
+`PR_SET_PDEATHSIG` (Linux-only, thread-scoped) and kqueue `NOTE_EXIT` (Darwin-only, `unsafe`
+outside `serial_nexus_sys`) were both rejected: each is a repair that executes on only the platform
+where the defect did *not* bite, which is §9's proxy in space. Pipe EOF is POSIX and needs no `cfg`,
+so the Linux suite exercises the same code Darwin will.
+
+**Fail-first, and it reproduces the reported defect exactly.** `a_sigkilled_test_process_leaves_no_daemon`
+re-invokes this test binary as a fixture, waits for it to report its daemon's pid and socket,
+`kill -9`s it, and requires both to be gone. Removing only the `--exit-on-stdin-eof` argument from
+the harness fails it after the full 30 s wait: *"daemon 1644542 outlived the SIGKILLed test process
+that spawned it; it still holds /tmp/snx-it-1644540-0/serial-nexus-daemon.sock"*. The socket check
+is the half pid reuse cannot fool, and it is also evidence the daemon took the clean path rather
+than merely dying.
+
+**Not done, said rather than silently declined.** No leash on `Sim`, nor on the raw daemon spawn
+sites outside `Daemon::start`. The five rig tests all go through `Daemon::start`, so the reported
+defect is closed; extending the leash further is a separate follow-up, not a requirement of this
+one.
+
 ---
 
 ## 4. Findings carried forward (from serial-nexus-doctor)

@@ -114,6 +114,11 @@ pub struct RunOptions {
     /// `/run/serial-nexus-daemon.state.toml` — see [`resolve_state_file`]); an explicit path
     /// buys reboot durability.
     pub state_file: Option<PathBuf>,
+    /// Stop when stdin reaches EOF — for a supervisor that hands the daemon the read
+    /// end of a pipe it holds open (§15.43). `false` is the default and the only value
+    /// that is safe under a service manager, where stdin is at EOF from the first
+    /// instant.
+    pub exit_on_stdin_eof: bool,
 }
 
 impl Default for RunOptions {
@@ -127,6 +132,7 @@ impl Default for RunOptions {
             socket_group: None,
             dev_root: PathBuf::from("/"),
             state_file: None,
+            exit_on_stdin_eof: false,
         }
     }
 }
@@ -265,6 +271,15 @@ async fn serve(options: RunOptions, registry: Registry) -> anyhow::Result<()> {
 
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
+    // The orphan leash (§15.43). When the watch is off the sender is simply held here
+    // for the life of the loop, so its receiver never resolves and the `select!` arm
+    // never fires — one code path rather than a conditional arm.
+    let (_idle_tx, idle_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut orphaned = if options.exit_on_stdin_eof {
+        watch_stdin_eof()?
+    } else {
+        idle_rx
+    };
 
     loop {
         tokio::select! {
@@ -280,6 +295,13 @@ async fn serve(options: RunOptions, registry: Registry) -> anyhow::Result<()> {
             }
             _ = sigint.recv() => { tracing::info!("SIGINT"); break; }
             _ = sigterm.recv() => { tracing::info!("SIGTERM"); break; }
+            _ = &mut orphaned => {
+                tracing::info!(
+                    "stdin reached EOF under --exit-on-stdin-eof: the supervisor \
+                     holding the other end of the pipe is gone; stopping"
+                );
+                break;
+            }
         }
     }
 
@@ -447,6 +469,54 @@ fn resolve_state_file(override_path: Option<PathBuf>, socket_path: &Path) -> Pat
 /// (`ECONNREFUSED`), so anything slower is somebody answering, and the safe reading of
 /// an ambiguous answer is "not mine to unlink" — the leg's SEC-8 budget, applied to the
 /// control socket (SEAM-2).
+/// Watch stdin for EOF on a detached thread, resolving the returned receiver when it
+/// arrives — the daemon's half of the orphan leash (§15.43).
+///
+/// A supervisor that wants the daemon to die with it hands the daemon the read end of a
+/// pipe as stdin and holds the write end. The kernel closes that write end however the
+/// supervisor dies — a normal exit, a panic, `abort`, SIGKILL, a runner killing the
+/// process group — so an EOF here means "my supervisor is gone" and nothing else can
+/// produce it. That is also exactly why it is opt-in: under a service manager, or with
+/// `< /dev/null`, stdin is at EOF from the first instant.
+///
+/// Kernel-independent by construction (§7): pipe EOF is POSIX and behaves identically on
+/// Linux and Darwin, unlike `PR_SET_PDEATHSIG` (Linux only, and scoped to the *thread*
+/// that forked) or a kqueue `NOTE_EXIT` (Darwin only, and `unsafe` outside
+/// `serial_nexus_sys`). Nothing here is conditional on a target, so every platform the
+/// suite runs on exercises the same code.
+///
+/// A detached `std` thread rather than `tokio::io::stdin`: that parks an uncancellable
+/// task in the blocking pool, and runtime shutdown waits on the pool — a daemon stopping
+/// for any *other* reason would then hang at exit on a read that never completes. A
+/// thread blocked in `read(2)` costs one stack, no CPU, and is reclaimed by process exit.
+fn watch_stdin_eof() -> anyhow::Result<tokio::sync::oneshot::Receiver<()>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("stdin-eof-watch".to_owned())
+        .spawn(move || {
+            use std::io::Read;
+            let stdin = std::io::stdin();
+            let mut handle = stdin.lock();
+            let mut byte = [0u8; 1];
+            loop {
+                match handle.read(&mut byte) {
+                    // EOF: the far end of the pipe is closed.
+                    Ok(0) => break,
+                    // Anything written is noise, not a protocol: the only event this
+                    // watch reports is the close.
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // A stdin that cannot be read is as good as gone. Failing closed
+                    // here would leave precisely the orphan this exists to prevent.
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(());
+        })
+        .context("spawning the stdin EOF watch thread")?;
+    Ok(rx)
+}
+
 const SOCKET_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// One daemon's exclusive claim on one control-socket path, held from before the
