@@ -79,11 +79,19 @@ and (any(.probes[]; .id == "P4"))
 # pass — but the report may not claim the property while reporting a population of
 # zero. Identical to `expectations/linux.jq`'s clause, deliberately: the defect is a
 # report lying about itself, which is not a platform property.
+#
+# **This gate is only ever run against a LIVE report** — the lane pipes
+# `serial-nexus-doctor --json` straight into it (`.github/workflows/ci.yml`), and nothing
+# runs it over `docs/doctor/*.json`. So requiring the key costs nothing an operator will
+# meet: a capture they have just taken comes from the current binary and carries it. It
+# rejects only genuinely old artifacts, which nobody validates and which honestly cannot
+# answer the question. (The archive was never uniformly gate-clean anyway — six of the
+# nineteen committed reports predate P13 and fail on that clause regardless, one of them
+# a macOS capture.)
 and (all(.probes[]; . as $p
       | ($p.id != "P4")
       or ($p.status != "supported")
-      or ((([$p.observations[] | select(.key == "canonical") | .value] | first) as $c
-           | $c == null or $c > 0))))
+      or (((([$p.observations[] | select(.key == "canonical") | .value] | first) // -1)) > 0)))
 and (any(.probes[]; .id == "P5"))
 and (any(.probes[]; .id == "P6" and .status != "unsupported"))
 and (any(.probes[]; .id == "P7" and .status != "unsupported"))

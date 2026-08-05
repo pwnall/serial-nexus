@@ -45,6 +45,17 @@ so at creation Darwin *does* always take the momentary-slave fallback. §3.40 is
 (`cargo test --workspace --locked --exclude serial-nexus-web --no-fail-fast`), at load 3.2–3.3 with
 analysis agents running — so §8 disqualifies that run as a *flake-rate* sample, and the failure below
 was re-measured on a quiet box instead. `expectations/macos.jq` passes on all three captures.
+<!-- ANNOTATION 2026-08-05 (§5). True of the gate as it stood that day, and no longer true of
+     HEAD's — stated rather than corrected away, because the sentence is a record of what was run.
+     `macos.jq` has since gained clauses requiring observations these captures' binary did not emit
+     (P4's `canonical`, notes §3.48; P10's `peer_pending_input_trust` and P12's witness, §3.50), so
+     they now fail it. That is the intended direction: the gate is only ever run against a LIVE
+     report — the lane pipes `serial-nexus-doctor --json` into it and nothing runs it over
+     `docs/doctor/*.json` — so a capture taken today from today's binary carries the fields and
+     passes, and only genuinely old artifacts are rejected. Note the archive was never uniformly
+     gate-clean regardless: `macos-24.6.0-2026-07-30-tier3.json` has no P13 block at all and fails
+     on that clause independently of any of this. Read the sentence as "these captures satisfied
+     the gate of their own vintage", which is what it was asserting. -->
 
 **The `p6_hostility` flake this page records did not recur in this run** — no `Connection refused` /
 `os error 61` appears anywhere in the log — and **no rig-gated test self-skipped**, which

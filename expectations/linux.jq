@@ -86,23 +86,21 @@ and (any(.probes[]; .id == "P4" and (.status == "supported" or .status == "degra
 # by this file, which is why the clause lives here and not only in the probe. The
 # Darwin shape is constructible on Linux through `--dev-root`, so this is a live
 # Linux clause, not a courtesy to another platform. `canonical` is the count of
-# devices the resolver produced a `usb:vid:pid:serial:iface` for.
+# devices the resolver produced a `usb:vid:pid:serial:iface` for; a report that omits
+# the key fails too, because a report that cannot state the population cannot prove
+# the verdict was computed over one.
 #
-# **A report that omits the key ABSTAINS rather than failing**, and the distinction is
-# not a softening. Every artifact in `docs/doctor/` predates the field, so failing on
-# absence turns a defect detector into an instrument-version detector: the gate would
-# go red on 19 of 19 committed reports, including ones taken hours earlier on a healthy
-# box, and an operator reading "linux.jq failed" would learn that the report is old
-# rather than anything about whether the resolver worked. That is §9's own complaint —
-# a check that fails for a reason other than the property it names. The requirement
-# that a *current* binary always states its population is a property of the probe, so
-# it is asserted where it can be asserted honestly: `p4_always_reports_its_population`
-# in `doctor/src/probes.rs`, which no archived report can satisfy or violate.
+# **This gate is only ever run against a LIVE report** — CI pipes
+# `serial-nexus-doctor --json` straight into it (`.github/workflows/ci.yml`), and nothing
+# runs it over `docs/doctor/*.json`. So "strict" costs nothing an operator will meet: a
+# capture they have just taken comes from the current binary and carries the key. It
+# rejects only genuinely old artifacts, which nobody validates and which honestly cannot
+# answer the question. (The archive was never uniformly gate-clean anyway — six of the
+# nineteen committed reports predate P13 and fail on that clause regardless.)
 and (all(.probes[]; . as $p
       | ($p.id != "P4")
       or ($p.status != "supported")
-      or ((([$p.observations[] | select(.key == "canonical") | .value] | first) as $c
-           | $c == null or $c > 0))))
+      or (((([$p.observations[] | select(.key == "canonical") | .value] | first) // -1)) > 0)))
 and (any(.probes[]; .id == "P5" and (.status == "supported" or .status == "skipped" or .status == "degraded")))
 and (any(.probes[]; .id == "P6" and (.status == "supported" or .status == "degraded")))
 and (any(.probes[]; .id == "P7" and (.status == "supported" or .status == "degraded")))

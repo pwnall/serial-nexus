@@ -5284,14 +5284,26 @@ environment by design"*. That case is unchanged: one sysfs-only USB device still
 and a byte-identical consequence. What is narrowed is only the case RES-2 never contemplated — a tree
 where **nothing at all** resolved.
 
-**Both expectation files gained the clause, and its absence arm is the interesting half.** A
-`supported` P4 whose `canonical` is 0 is rejected. A report that **omits** `canonical` **abstains**,
-and that is deliberate: every artifact in `docs/doctor/` predates the field, so failing on absence
-would turn a defect detector into an instrument-version detector — the gate would go red on 19 of 19
-committed reports, including ones taken hours earlier on a healthy box, and "linux.jq failed" would
-mean "your report is old" rather than anything about the resolver. That is §9's own complaint about a
-check that fails for a reason other than the property it names. The design as drafted rejected on
-absence; it was corrected here after measuring the blast radius.
+**Both expectation files gained the clause, and it is strict: a `supported` P4 must state a
+population and that population must be non-zero.**
+<!-- ANNOTATION 2026-08-05 (§5). **This paragraph originally justified an ABSTAIN arm, on a premise
+     that is false, and the arm has been removed.** It read: "a report that omits `canonical`
+     abstains … every artifact in `docs/doctor/` predates the field, so failing on absence would
+     turn a defect detector into an instrument-version detector — the gate would go red on 19 of 19
+     committed reports."
+     The gate is never run over those reports. `.github/workflows/ci.yml` pipes a LIVE
+     `serial-nexus-doctor --json` into it on both lanes, and no test, script or job runs it over
+     `docs/doctor/*.json`. The 19-of-19 figure came from running it over the archive BY HAND while
+     checking this change — a self-inflicted failure, then treated as evidence about the gate.
+     Two further facts settle it. The one legitimate stored-file use is an operator validating a
+     capture they have just taken (`docs/macos.md` records exactly that), and such a capture comes
+     from the current binary, so it carries the key and strict costs it nothing. And the archive was
+     never uniformly gate-clean to begin with: six of the nineteen reports predate P13 and fail that
+     clause regardless, one of them a macOS capture — so "the gate passes the archive" was never a
+     property there was any point preserving.
+     Recorded rather than quietly rewritten because §9 makes a refuted premise as load-bearing as a
+     confirmed one, and because the same mistaken reasoning was about to be applied to the P10 and
+     P12 witness clauses of §3.50 before it was caught. Those are strict for the same reason. -->
 
 **So the "a current binary always states its population" half lives where it can be honest**:
 `p4_always_reports_its_population` in the probe's own tests, over both a resolving and a

@@ -160,24 +160,20 @@ fn the_p4_clause_rejects_a_certified_resolver_that_resolved_nothing() {
     );
 
     // Spelling 2 — the same claim from a report that does not carry the population at
-    // all, which is what every pre-2026-08-05 binary emitted. This one must be
-    // **ACCEPTED**, and that is the deliberate half of the clause rather than a hole
-    // in it: every artifact in `docs/doctor/` predates the field, so rejecting on
-    // absence turns a defect detector into an instrument-version detector — the gate
-    // would go red on reports taken hours earlier on a healthy box, and "linux.jq
-    // failed" would mean "your report is old" rather than anything about the resolver.
-    // The requirement that a *current* binary always states its population belongs to
-    // the probe, and is asserted there, where no archived report can satisfy or
-    // violate it.
-    let archived = jq_filter(
+    // all, which is what every pre-2026-08-05 binary emitted. Also rejected, and that is
+    // the deliberate half: this gate is only ever run against a LIVE report (CI pipes
+    // `--json` straight into it; nothing runs it over `docs/doctor/*.json`), so a report
+    // that cannot state its population is one no operator will meet — a capture just
+    // taken comes from the current binary and carries the key. Requiring it therefore
+    // costs nothing real and keeps the clause saying what it means.
+    let planted = jq_filter(
         r#"(.probes[] | select(.id=="P4") | .observations) |= map(select(.key != "canonical"))
            | (.probes[] | select(.id=="P4") | .status) = "supported""#,
         &report,
     );
     assert!(
-        gate_accepts(&expectation, &archived),
-        "{} rejected a report that predates the `canonical` observation; the clause \
-         must abstain on absence, not fail the archive",
+        !gate_accepts(&expectation, &planted),
+        "{} admitted a `supported` P4 with no `canonical` observation at all",
         expectation.display()
     );
 }
@@ -191,8 +187,7 @@ fn both_expectation_files_carry_the_same_p4_population_clause() {
     let clause = r#"and (all(.probes[]; . as $p
       | ($p.id != "P4")
       or ($p.status != "supported")
-      or ((([$p.observations[] | select(.key == "canonical") | .value] | first) as $c
-           | $c == null or $c > 0))))"#;
+      or (((([$p.observations[] | select(.key == "canonical") | .value] | first) // -1)) > 0)))"#;
     for name in ["expectations/linux.jq", "expectations/macos.jq"] {
         let path = repo_root().join(name);
         let text = std::fs::read_to_string(&path).expect("the expectation file is readable");
