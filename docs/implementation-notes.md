@@ -15,6 +15,27 @@ design.
 
 ---
 
+## P14, THE MAXIMUM-RATE SEARCH — amended first, per AGENTS.md §5 (2026-08-05 session)
+
+**What changed (docs only; no code).** Design §15.51 and plan §18 item 11 add a new
+opt-in doctor probe, P14: on a P5-verified cross-paired rig, a ladder climb (standard
+rates through 921600 plus the divisor-friendly 1M/1.5M/2M/3M family) with at most four
+bounded-refinement midpoints, three byte-exact constant-airtime round-trips per direction
+per rung, reporting `max_reliable_baud` plus `ceiling_kind` — never a grade (`supported`
+on any completed measurement; a rig that tops out at 115200 is slow, not broken). Plain
+bisection was rejected in the entry itself: achievable rates are divisor-quantized and
+reliability is not guaranteed monotone in the requested rate, so midpoints are bounded,
+read back requested-versus-actual, and the answer is stated as a floor over the probed
+set. The macOS termios ask-ceiling (230400) is carried as `platform-refused` — a fact
+about the ask, not the wire (§15.47's unmeasurable-as-data rule). Design §13's doctor
+inventory now names P14 beside the P5 certificate, and its kernel-contact sentence was
+corrected from "P6–P12" to "P6–P13" (a pre-existing stale enumeration, repaired in
+passing). AGENTS §2's plan-§18 item count moved ten → eleven in the same commit. A new
+probe id will move `probe_set` when the implementation lands — deliberately, opening a
+new fingerprint era per §15.44's unequal-is-the-sound-direction rule.
+
+---
+
 ## THE v15 GENERATION — the record becomes the documents (2026-08-05 session)
 
 **What landed.** A new normative pair: `docs/39-design-claude-fable-v15.md` +
