@@ -106,6 +106,26 @@ needs a fresh Linux capture at the HEAD fingerprint; that is **owed**.
      `slave_termios_mode`, reports `bytes_recovered_by_peer`, and degrades when the mode is not
      raw. **Do not diff P10 across this pair until a macOS capture at the current binary reports
      `slave_termios_mode: "raw"`.** That capture is the new owed item. -->
+<!-- ANNOTATION 2026-08-05 (§5), on the block above. **The owed capture landed and the prohibition
+     is lifted.** `docs/doctor/macos-24.6.0-2026-08-05-7ead470-tier3{,-2,-3}.json` report
+     `slave_termios_mode: "raw"` on both directions in all three runs, at probe set
+     `a131e1f4b46d6c83` and at probe code identical to the Linux captures' binary.
+     The diff the block above deferred now reads: Linux 15360 bytes accepted and fully recovered in
+     BOTH directions, against Darwin 1024 targetward and 1022 hostward, also fully recovered — a
+     factor of 15, with **Linux the deeper kernel**. The pre-repair Darwin hostward figure of
+     4194304 was not a depth at all: `ceiling_hit: true` means the fill stopped at P10's own 4 MiB
+     backstop and the blocking point was never observed, so it was a floor on a quantity that turns
+     out to be 1022.
+     TWO CORRECTIONS TO THE BLOCK'S OWN WORDING, both about confidence rather than fact. (1) "very
+     likely a COOKED pty's" is still the right hedge and must not be hardened now: the pre-repair
+     artifact carries no `slave_termios_mode` field, so it cannot testify to its own configuration.
+     What the tree can support is a single-variable source delta plus that report's P2
+     `termios_settable_without_slave: false`. (2) The "raw ~13.8 KiB / cooked ~23.5 KiB" pair quoted
+     here is a scratchpad measurement backed by no committed artifact, and the raw half does not
+     even match the committed Linux figure of 15360 (= 15.0 KiB). See the annotation on notes
+     §3.34; `expectations/linux.jq` is the correct form of that claim.
+     UNEXPLAINED AND LEFT THAT WAY: Darwin accepts 1024 targetward but 1022 hostward, identical
+     across all three runs, where Linux is symmetric. No probe asks why. -->
 
 **Whole-gate hardware validation, same tree (`fa4b12d`), rig attached.** `cargo test --workspace
 --locked --exclude serial-nexus-web --no-fail-fast`: **680 passing, 1 failing, 4 ignored** across
@@ -142,6 +162,86 @@ of it. Filed for a session that can do both.
      and §9's independent verifier cannot run against a tree that is moving. Patching the test to
      wait would very likely make the symptom go away — which is precisely why it must not be done
      without first establishing which of the two hypotheses it would be papering over. -->
+
+## Update — 2026-08-05 hardware validation at `7ead470`, rig attached
+
+Same box (MacBookPro15,1, Darwin 24.6.0 / macOS 15.7.8, x86_64, 12 cores), same cross-wired FT232R
+pair (`BH00L4KU` ↔ `BH00LL8O`), tree clean at `7ead470`.
+
+**The rig is proven on the wire, not merely detected.** With `SNX_CROSSOVER=required` and both
+ports named, `serial_hardware.rs` runs 4 passed in 15.46 s: 32768 bytes byte-exact in each
+direction at 250000 baud, a custom-baud round trip, a map node byte-exact both ways, and the signal
+verbs against the far end. Doctor P3 reports `custom_baud_ok`, `tiocexcl_refuses_second_open`,
+`modem_calls_ok` and `break_ok` true on **both** ports; P5 pairs them in both directions.
+`tiocgicount_supported` is false on both, which is why P5 certifies neither — see notes §3.36 on
+what "Tier 3" can and cannot mean here.
+
+**Whole gate: 684 passing, 0 failing, 4 ignored across 109 test binaries**
+(`cargo test --workspace --locked --exclude serial-nexus-web --no-fail-fast`), on the clean run.
+That is exactly the `fa4b12d` baseline recorded above **plus the three doctor guards** notes §3.34
+added — 681 tests run there, 684 here — and the arithmetic closes with nothing unaccounted for.
+`fmt`, workspace clippy, `cargo deny check licenses bans sources`, both meta-gates and
+`expectations/macos.jq` are green alongside it.
+
+**Two of the three whole-gate runs this session were not clean, and quoting only the third would
+be the §3.35 mistake in a different costume.** Run 1 lost all five rig tests to a leaked daemon
+(below); it also overlapped this session's analysis agents, so §8 disqualifies it as a flake-rate
+sample. Run 2 read **683 passing, 1 failing, 4 ignored**, the failure being the `p6_hostility`
+sibling described next. Run 3 read 684/0/4.
+
+**Two distinct causes, and they must not be averaged into one rate.** The `p6_hostility` failure
+appeared in 1 of the 3 runs; the daemon leak in 1 of 3, and in the one run taken under load it did
+not control for. Three runs support neither rate to a useful precision, and saying "one failure per
+two runs" would fuse a socket-readiness race with a process-lifetime leak that share nothing but a
+session. What the three runs do support: the gate reaches green on this box, it did so once out of
+three attempts, and both failure modes are recorded below with their evidence. The clean number is
+the right headline only because the other two runs are written down beside it; alone it would
+assert a stability this box has not demonstrated.
+
+**The one failure is a sibling of the flake already on this page, and that is the finding.** It is
+**`p6_hostility::wire_hostility_faults_cleanly_then_leg_heals`**, captured verbatim:
+`assertion left == right failed: sim did not report a clean refusal for ["--hello-version","999"]:
+{"error":"Connection refused (os error 61)","mode":"wire","pass":false,"tool":"serial-nexus-sim"}`.
+Different test, **same binary and same errno** as
+`a_trickling_peer_trips_the_handshake_deadline_and_the_leg_heals`. Read against the annotation
+above, this is corroboration for the located suspect rather than a second, separate mystery: that
+suspect — the window between `load`'s RPC reply and the leg's `UnixListener::bind` in its spawned
+task — is a property of the *binary's* setup path, not of one test's assertions, so a second test
+in the same binary hitting the same errno is what that hypothesis predicts. **It does not upgrade
+the suspect to a root cause.** The competing hypothesis recorded above (ECONNREFUSED on a unix
+socket also means a saturated accept backlog) is equally consistent with a second test failing, and
+this session ran no fail-first proof and no independent verifier. What changes is only the record's
+scope: naming one test made the entry narrower than the evidence.
+
+**A daemon outlived its test process and held the rig hostage — observed once, not reproduced.**
+In the first whole-gate run, all five rig-touching tests failed with
+`reopen /dev/cu.usbserial-BH00L4KU: Resource busy (os error 16)`. The cause was found still
+running: a `serial-nexus-daemon` reparented to `launchd` (**PPID 1**), holding fds on *both* FTDI
+ports, alive 4m41s and still alive after the suite exited. Its state file
+(`snx-it-<pid>-3/state.toml`: `port0`+`port1`+`inj0`+`inj1`+`rx0`+`rx1`) matches exactly one test
+file, `itest/tests/serial_hardware.rs`, and its temp dir was the only `snx-it-*` left on the box —
+every other test cleaned up. After killing it, a second whole-gate run on a quieter box produced
+**zero** leaked daemons, free ports, and all five rig tests passing; each of the eight
+rig-claiming binaries also passes in isolation with no leak. So: mechanism established (an orphaned
+daemon holds `TIOCEXCL` and every later opener gets EBUSY), origin narrowed to one file, trigger
+**not** established.
+
+<!-- REFUTED DIAGNOSIS, recorded per §9 because a refuted one is as load-bearing as a confirmed one.
+     The first hypothesis for the EBUSY cascade was cross-binary contention: eight test binaries
+     call `crossover_ports()`/`serial_pair()`, `itest/src/lib.rs` has no cross-process lock, and
+     `serial_hardware.rs`'s `static RIG: Mutex<()>` is process-local and therefore cannot serialize
+     across binaries. All of that is true and none of it is the explanation. **Cargo runs test
+     binaries strictly sequentially** — sampled 12 times during a live whole-gate run, one
+     `target/debug/deps/` binary running at every sample, advancing in order. With no two binaries
+     ever concurrent, there is no cross-binary race to lose; the process-local mutex is sufficient
+     for the concurrency that actually exists. The leak is the mechanism, and contention was a
+     plausible story that the measurement killed. -->
+
+**Load discipline, stated because it changes what the runs are worth (§8).** The first whole-gate
+run overlapped analysis agents this session had started; §8 forbids reading flake rates under
+uncontrolled load, so that run is evidence *for* the leak (which left a corpse to inspect) and
+evidence for nothing else. The doctor captures were taken before any of that, on an idle box —
+load 2.14 before, 1.48 after, three sequential runs at ~13.75 s each.
 
 ## Update — 2026-08-04 CI triage (macos-26-arm64 runner; diagnosed and re-proved on Linux)
 

@@ -69,8 +69,11 @@ by hand. §16.13 says provenance is *recorded, never asserted*. Both fields now 
 `uname(2)`: `kernel` is the release (`7.0.0-29-generic`, `24.6.0`) and `os` falls back to
 `<sysname> <release> (<machine>)` where no distribution publishes a `PRETTY_NAME`.
 `nodename` is deliberately not read — it is the machine's hostname and nothing here needs
-it. The two committed macOS artifacts still read empty: they are frozen records of what the
-tool printed on their date and are not rewritten.
+it. The two *older* committed macOS artifacts still read empty: they are frozen records of what
+the tool printed on their date and are not rewritten. **The fix has since been observed working
+on the platform it was written for**: `docs/doctor/macos-24.6.0-2026-08-05-7ead470-tier3{,-2,-3}.json`
+report `kernel: "24.6.0"` and `os: "Darwin 24.6.0 (x86_64)"` from `uname(2)`, so a macOS report
+now names its own kernel instead of needing the index to do it by hand.
 
 `probe_set` is the load-bearing one, because it answers the question a diff
 actually needs and answers it with no repository access — where a commit hash
@@ -321,6 +324,34 @@ Darwin block predates the baseline repair, so those depths were measured on a *c
 master is not a terminal, which P2's row above is exactly the measurement of, and BSD does not
 carry that to the next open. Do not diff P10 across this pair until a macOS capture at
 `71fc5a815852` or later reports `slave_termios_mode: "raw"` on both directions.
+
+<!-- ANNOTATION 2026-08-05 (§5). That capture landed —
+     `docs/doctor/macos-24.6.0-2026-08-05-7ead470-tier3{,-2,-3}.json`, `slave_termios_mode: "raw"`
+     on both directions in all three runs — so P10 takes its place in the table above, and the row
+     is the one added below. Two wording notes carried from the annotation on notes §3.34: the word
+     "cooked" in this paragraph is an inference (the pre-repair artifact has no
+     `slave_termios_mode` field to testify with), and the pre-repair hostward figure was never a
+     depth, because `ceiling_hit: true` means the fill never reached a blocking point. The
+     *sibling* caution in the next paragraph is NOT discharged and must not be swept with this
+     one. -->
+
+| | Linux 7.0.0-29 | Darwin 24.6.0 |
+|---|---|---|
+| **P10 depth, targetward** (`slave_termios_mode: raw` both sides) | 15360 accepted, 15360 recovered, 0 unrecoverable | 1024 accepted, 1024 recovered, 0 unrecoverable |
+| **P10 depth, hostward** | 15360 / 15360 / 0 | 1022 / 1022 / 0 |
+
+**Read that row as the kernel difference it now is.** Both sides report `raw`, both report
+`bytes_unrecoverable: 0` and `ceiling_hit: false`, both were produced by the same probe code, and
+neither moves run to run — Darwin's P10 block is byte-identical across its three captures, Linux's
+across its three. So the ~15x is signal by the probe's own stated rule, and **Linux is the deeper
+kernel**. Before the repair the same comparison read 4194304 hostward on Darwin and appeared to put
+Darwin >=273x *deeper*; that number was a floor at P10's 4 MiB backstop, in a discipline the report
+could not name. The instruction "check `slave_termios_mode` agrees on both sides first" is what
+separates those two readings, and it is now a measured rule rather than a proposed one.
+
+**One field in that row is unexplained.** Darwin takes 1024 targetward but 1022 hostward, from a
+single 4096-byte write in each direction, reproducibly. Linux is symmetric. No probe currently asks
+why, and this page does not guess (§7).
 
 **The same caution has not been discharged for P10's siblings, and that is not an oversight.**
 P6, P7, P9, P12 and P13 take the same fallback, so their Darwin rows above are not *known* to

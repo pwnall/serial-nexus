@@ -27,8 +27,11 @@ anything built before 2026-07-28 — is not comparable with these.
 | [`linux-7.0-2026-08-05-tier3.json`](linux-7.0-2026-08-05-tier3.json) | 7.0.0-29-generic, Ubuntu 26.04 — the dev box | `71fc5a815852` | **`a131e1f4b46d6c83`** | **Tier 3** — the same cross-wired FT232R pair (`BH00L4KU` ↔ `BH00LL8O`) | 22 supported · 0 degraded · 0 unsupported · 1 skipped |
 | [`linux-7.0-2026-08-05-tier3-2.json`](linux-7.0-2026-08-05-tier3-2.json) | ” — second sequential run, same box, same idle state | ” | ” | ” | ” |
 | [`linux-7.0-2026-08-05-tier3-3.json`](linux-7.0-2026-08-05-tier3-3.json) | ” — third sequential run | ” | ” | ” | ” |
-| [`macos-24.6.0-2026-08-05-tier3.json`](macos-24.6.0-2026-08-05-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**; `kernel`/`os` read empty and `unknown`, so the version is recorded here by hand. **That gap is fixed in the binary as of `71fc5a815852`** — the fields come from `uname(2)` now, and the next macOS capture will name its own kernel rather than needing this column to do it | `fa4b12d6f529` | **`a131e1f4b46d6c83`** | **Tier 3** — the same cross-wired FT232R pair (`/dev/cu.usbserial-BH00L4KU` ↔ `BH00LL8O`) | 15 supported · 7 degraded · 0 unsupported · 3 skipped |
-| [`macos-24.6.0-2026-07-30-tier3.json`](macos-24.6.0-2026-07-30-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**; the report's own `kernel`/`os` fields read empty and `unknown`, which is the gap `uname(2)` closes as of `71fc5a815852` (`docs/macos.md` delta 5), so the version is recorded here instead | `a1029778fda9` | `01b257ece8c48470` | **Tier 3** — the same cross-wired FT232R pair, as `/dev/cu.usbserial-BH00L4KU` ↔ `BH00LL8O` | 14 supported · 7 degraded · 0 unsupported · 3 skipped |
+| [`macos-24.6.0-2026-08-05-7ead470-tier3.json`](macos-24.6.0-2026-08-05-7ead470-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**. The first macOS report that names its own kernel: `kernel` reads `24.6.0` and `os` reads `Darwin 24.6.0 (x86_64)` from `uname(2)`, so this column now repeats the artifact rather than supplying what it could not say | `7ead470f594c` | **`a131e1f4b46d6c83`** | **Tier-3 wiring, uncertified** — the same cross-wired FT232R pair (`/dev/cu.usbserial-BH00L4KU` ↔ `BH00LL8O`) | 15 supported · 7 degraded · 0 unsupported · 3 skipped |
+| [`macos-24.6.0-2026-08-05-7ead470-tier3-2.json`](macos-24.6.0-2026-08-05-7ead470-tier3-2.json) | ” — second sequential run, same box, same idle state | ” | ” | ” | ” |
+| [`macos-24.6.0-2026-08-05-7ead470-tier3-3.json`](macos-24.6.0-2026-08-05-7ead470-tier3-3.json) | ” — third sequential run | ” | ” | ” | ” |
+| [`macos-24.6.0-2026-08-05-tier3.json`](macos-24.6.0-2026-08-05-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**; `kernel`/`os` read empty and `unknown`, so the version is recorded here by hand. **That gap is fixed in the binary as of `71fc5a815852`** — the fields come from `uname(2)` now, and the three rows above are that fix landing | `fa4b12d6f529` | **`a131e1f4b46d6c83`** | **Tier-3 wiring, uncertified** — the same cross-wired FT232R pair (`/dev/cu.usbserial-BH00L4KU` ↔ `BH00LL8O`) | 15 supported · 7 degraded · 0 unsupported · 3 skipped |
+| [`macos-24.6.0-2026-07-30-tier3.json`](macos-24.6.0-2026-07-30-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**; the report's own `kernel`/`os` fields read empty and `unknown`, which is the gap `uname(2)` closes as of `71fc5a815852` (`docs/macos.md` delta 5), so the version is recorded here instead | `a1029778fda9` | `01b257ece8c48470` | **Tier-3 wiring, uncertified** — the same cross-wired FT232R pair, as `/dev/cu.usbserial-BH00L4KU` ↔ `BH00LL8O` | 14 supported · 7 degraded · 0 unsupported · 3 skipped |
 | [`linux-7.0-2026-07-29-tier3-2.json`](linux-7.0-2026-07-29-tier3-2.json) | 7.0.0-28-generic, Ubuntu 26.04 — the dev box | `2e5874bbe090` | `01b257ece8c48470` | **Tier 3** — the same cross-wired FT232R pair (`BH00L4KU` ↔ `BH00LL8O`) | 21 supported · 0 degraded · 0 unsupported · 1 skipped |
 | [`linux-6.18-2026-07-29-tier3.md`](linux-6.18-2026-07-29-tier3.md) | 6.18.14-1rodete4-amd64, Debian rodete — **the production box** | `85699d66c5a5` | `01b257ece8c48470` | **Tier 3** — two FTDI FT232R cross-wired (`BH00LL8O` ↔ `BH00L4KU`) | 21 supported · 0 degraded · 0 unsupported · 1 skipped |
 | [`linux-7.0-2026-07-29-tier3.json`](linux-7.0-2026-07-29-tier3.json) | 7.0.0-28-generic, Ubuntu 26.04 — the dev box | `da290c616631` | `01b257ece8c48470` | **Tier 3** — the same cross-wired FT232R pair (`BH00L4KU` ↔ `BH00LL8O`), moved back | 21 supported · 0 degraded · 0 unsupported · 1 skipped |
@@ -38,19 +41,61 @@ anything built before 2026-07-28 — is not comparable with these.
 
 Files are named for the UTC day of their own `generated` stamp, which is why the
 7.0 runs read `2026-07-29` despite being taken on the evening of the 28th local.
+**A capture that shares a UTC day with an earlier capture from a different `commit`
+carries the short sha as an extra segment** — `macos-24.6.0-2026-08-05-7ead470-tier3`
+beside `macos-24.6.0-2026-08-05-tier3` — and the trailing `-2`/`-3` index is reserved
+for sequential runs of *one* binary in one session. The two conventions have to be
+kept apart because they mean opposite things: `-2` asserts "same instrument, run
+again, so a difference is noise", and that is exactly the claim a same-day capture
+from a *different* binary must not make. The 08-05 macOS pair is the case that forced
+the rule — same box, same rig, same kernel, same `probe_set` fingerprint, and a P10
+whose body changed between them, which is precisely the difference a fingerprint
+cannot see.
+
+**"Tier 3" in the Rig column means two different things either side of the Linux
+boundary, and the macOS rows say so.** P5 certifies a pair by characterizing each
+port, and its UART predicate is `TIOCGICOUNT` — a Linux-only ioctl. On Darwin every
+port therefore reports `cert: skipped (not characterizable here)`, the cross-pair
+rate-ladder and deliberate-mismatch line is absent from the report altogether, and
+the string `Tier 3` appears **nowhere in any macOS artifact** (it appears once in each
+Linux Tier-3 artifact, in P5's own consequence). What the macOS captures do measure is
+the *topology* — P5 pairs `BH00L4KU` ↔ `BH00LL8O` in both directions — which is
+Tier-3 wiring. `doctor/src/probes.rs` already carries the exact phrase for this state,
+"**Tier 3 wiring, uncertified**", and the rows above now use it rather than borrowing
+the Linux word. The wiring is independently corroborated on the harness side: with the
+rig attached, `itest`'s four `serial_hardware.rs` tests move 32768 bytes byte-exact in
+each direction at 250000 baud.
+<!-- ANNOTATION 2026-08-05 (§5). The macOS rows previously read "**Tier 3**", matching
+     the Linux rows and their own filenames. That was prose asserting a certificate the
+     artifact it indexes explicitly declines to issue — the §16.13 failure in its
+     mildest form, and the same shape as the P13-figures defect the 08-05 sweep
+     corrected. The filenames keep `tier3` because the *wiring* is Tier 3 and renaming
+     a committed artifact rewrites a record's identity; only the claim is corrected. -->
+
+## What "Tier 3" cannot mean on Darwin, and what these captures cost
+
+The 2026-08-05 macOS trio was taken on an otherwise idle box (load 2.14 before, 1.48
+after; 12 cores, no competing build), three sequential runs at ~13.75 s each. Three
+rather than one for the reason stated below for the Linux side — but with a result the
+Linux side does not have: **P10 does not move at all here.** All three runs are
+byte-identical across P10's entire observations array, so on Darwin the depth is
+deterministic, where the Linux figures needed three runs to show which differences were
+noise. The fields that do move run to run are P9's poll granularity, P13's
+`close_microseconds`, P6's `elapsed_ms` and P2's zero-timeout poll — timing only.
 
 **Four of these reports predate the §15.40 rename and still say so inside** — the 6.18
 Tier-3 report and the three 7.0 passive runs — because they are captured tool output:
 their `tool` field carries the binary's pre-rename name, and nothing in this directory is
 hand-edited to read more tidily. That is the whole point of committing them — an artifact
 edited after the fact is an assertion again, not a check — so the retired-name meta-gate
-exempts exactly those four by name, and `README.md` (this file) not at all. The **seven**
+exempts exactly those four by name, and `README.md` (this file) not at all. The **ten**
 remaining reports need no exemption — the two 07-29 7.0 Tier-3 runs, the three 08-05 7.0 Tier-3
-runs and both macOS Tier-3 runs:
+runs and all five macOS runs (the 07-30 capture, the 08-05 pre-repair capture, and the three
+08-05 `7ead470` captures):
 all were produced by post-rename binaries and carry the current name on their own, which is
 what "a future report will fix itself" looks like in practice.
 
-## The probe set moved on 2026-08-05, and this directory now holds two comparable families
+## The probe set moved on 2026-08-05, and this directory now holds three families, not two
 
 `macos-24.6.0-2026-08-05-tier3.json` carries probe set **`a131e1f4b46d6c83`**; the reports taken
 before it carry `01b257ece8c48470` and none of them contains a P13 block at all — P13 joined the
@@ -82,6 +127,51 @@ measures and to report `slave_termios_mode`, so its P10 block carries neither fi
 depths are not known to have been measured on the raw pty the daemon runs (`doctor/src/probes.rs`,
 `termios_mode`). Diff P10 across that pair only once a macOS capture at the current binary
 reports `slave_termios_mode: "raw"` on both directions.
+
+<!-- ANNOTATION 2026-08-05 (§5). **That capture landed and the caution above is discharged for
+     P10.** `macos-24.6.0-2026-08-05-7ead470-tier3{,-2,-3}.json` report `slave_termios_mode:
+     "raw"` on both directions in all three runs, at probe set `a131e1f4b46d6c83` — the same
+     fingerprint as `linux-7.0-2026-08-05-tier3{,-2,-3}.json`, and at probe code provably
+     identical to the binary that produced them (`git diff 71fc5a8..HEAD` touches only `AGENTS.md`
+     and `docs/`; neither side's build stamp carries the `-dirty` suffix `doctor/build.rs` would
+     have added). P10 may now be diffed across that pair, and the answer is below.
+
+     **What the diff says, and how badly the pre-repair reading misled.** Linux 7.0.0-29 accepts
+     and fully recovers **15360 bytes in both directions** (11776 first-pass + 3584 settled, 3
+     writes, `bytes_unrecoverable: 0`, identical across its three runs). Darwin 24.6.0 accepts and
+     fully recovers **1024 targetward and 1022 hostward** (1 write each, `ceiling_hit: false`,
+     `bytes_unrecoverable: 0`, identical across its three runs). That is 15.0x and 15.03x, with
+     **Linux the deeper kernel**. Read against the pre-repair macOS artifact the direction was
+     inverted: 4194304 hostward against Linux's 15360 made Darwin look >=273x deeper, and even that
+     was a floor, because `ceiling_hit: true` means the fill stopped at P10's own 4 MiB backstop
+     and the blocking point was never observed at all.
+
+     **The pre-repair run measured a pty outside the daemon's baseline — inferred, not measured,
+     and the distinction is the point.** The pre-repair artifact carries no `slave_termios_mode`
+     field, so it cannot say what discipline it was in; nothing in this directory can settle it
+     from the artifact alone. What supports the reading is a single-variable source delta — the
+     only functional change on P10's fill path between `fa4b12d6f529` and `71fc5a815852` is
+     `set_baseline(&slave)` on the slave the probe measures — together with that same report's own
+     P2 reading of `termios_settable_without_slave: false`, the condition under which
+     `apply_pty_baseline` takes its open-and-immediately-close path. Write it that way. "Darwin's
+     cooked pty accepts 4 MiB" is a sentence this directory cannot support.
+
+     **Two things the new trio does NOT discharge.** (1) The sibling exposure: P6, P7, P9, P12 and
+     P13 still take the `apply_pty_baseline` fallback, because only P10 learned to re-assert. That
+     caution stands wherever it is written and a sweep must not delete it along with this one.
+     (2) A two-byte asymmetry nothing in the tree predicts: Darwin accepts 1024 targetward but
+     **1022** hostward, from a single 4096-byte write in each direction, reproducible byte-identically
+     across all three runs. Linux is symmetric at 15360. It is recorded here as measured and
+     unexplained rather than rounded away, because the next reader will otherwise take it for a
+     transcription slip. -->
+
+**A fingerprint still cannot see a body change, and this pair is the proof.** Both 08-05 macOS
+captures carry `a131e1f4b46d6c83`; P10's *implementation* differs between them, and its hostward
+figure differs by a factor of 4104 (4194304 -> 1022 — again a lower bound on the numerator, which
+was never driven to a blocking point). That is a probe-versus-probe ratio on one box, not a
+cross-kernel one, and it is the strongest available demonstration of why `probe set` equality is
+necessary and not sufficient. The filename convention above exists to carry what the fingerprint
+cannot.
 
 Same binary, same commit, same fingerprint on both sides of the diff: the pre-P13 reports are
 comparable field by field, and `docs/serial-nexus-doctor.md` does the
@@ -131,7 +221,7 @@ one run of making. Sequential runs on a quiet box (load 0.44, no other load), al
 
 ```sh
 cargo build --workspace --locked
-./target/debug/serial-nexus-doctor --json > docs/doctor/<os>-<kver>-<yyyy-mm-dd>[-<rig>].json
+./target/debug/serial-nexus-doctor --json > docs/doctor/<os>-<kver>-<yyyy-mm-dd>[-<commit>][-<rig>][-N].json
 ./target/debug/serial-nexus-doctor --json | jq -e -f expectations/linux.jq   # or macos.jq
 # With a rig, opt the ports in explicitly — this transmits, and a listed port could
 # be wired to live equipment (§15.17):

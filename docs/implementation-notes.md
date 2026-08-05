@@ -3065,7 +3065,18 @@ passing, 0 failed, 4 ignored** across 102 binaries + 8 doc-test targets (2026-08
 `serial_hardware.rs` runs rather than self-skipping — all four rig tests executed); the
 shortfall against Linux is the Linux-only targets and the serial-device tests that self-skip
 where a pts is not a serial device, not failures. The binary count moved 101 → 102 with
-`p13_teardown_accounting`. Two notes on reading that run. The `test result:` lines number 112
+`p13_teardown_accounting`. **A second macOS figure landed on 2026-08-05 at `7ead470`, in a
+different scope, and the two must not be conflated:** `cargo test --workspace --locked
+--exclude serial-nexus-web --no-fail-fast` reads **684 passing, 0 failing, 4 ignored across 109
+test binaries** on a clean run, against the 680/1/4-across-109 baseline `docs/macos.md` records
+for `fa4b12d` in that same scope — 681 tests run there against 684 here, the +3 being exactly the
+three doctor guards of §3.34. No whole-workspace macOS run was taken at `7ead470`, so the 715
+figure above stands as the only one of its kind and is **not** superseded by 684. **That clean
+number is one of three runs and must be quoted with the other two:** a second read 683/1/4, failing
+`p6_hostility::wire_hostility_faults_cleanly_then_leg_heals` — a different test from the flake
+described just below, in the same binary and with the same `Connection refused (os error 61)`
+fingerprint, which widens that entry's scope without settling its cause — and a third lost all five
+rig-touching tests to an orphaned daemon holding both FTDI ports (`docs/macos.md`, 2026-08-05). Two notes on reading that run. The `test result:` lines number 112
 rather than 110, because `p8_external_codec` builds and runs the out-of-tree consumer template
 and its nested cargo emits two more. And the figure is a *clean* run only on the second pass:
 the first full run on this box hit one contention-dependent flake,
@@ -3977,6 +3988,18 @@ microseconds-versus-hundreds-of-milliseconds gap, and the two kernels differ by 
 runs asked the same questions; it does not certify they asked them of the same configuration. See
 §3.34 — the macOS P10 block predates the baseline repair and must not be diffed until a macOS
 capture reports `slave_termios_mode: "raw"`.
+<!-- ANNOTATION 2026-08-05 (§5). Discharged: `docs/doctor/macos-24.6.0-2026-08-05-7ead470-tier3{,-2,-3}.json`
+     report `raw` on both directions, and the P10 diff now reads ~15x with Linux the deeper kernel
+     (15360 both directions against 1024 targetward / 1022 hostward). See the annotations on §3.34.
+     One clause of this entry's neighbourhood was separately stale and is corrected there too: the
+     §4 P13 bullet's "the Linux side … is **not** yet artifact-backed" stopped being true at
+     `71fc5a815852`. -->
+<!-- ANNOTATION 2026-08-05 (§5). This entry's Linux P13 close figure is quoted as "7 µs" in the §4
+     bullet and in `expectations/macos.jq`; no committed capture contains it. The three artifacts
+     read 20/3/15, 10/13/15 and 13/2/19 µs for the (a)/(b)/(c) shapes. The gate file is corrected
+     (§3.36); the ~40000x ratio above survives it, since it is driven by Darwin's ~600 ms against
+     Linux's tens of microseconds either way. -->
+
 **Disposition note (§5):** this measurement gets **no new numbered §3 entry**. It changed no
 implementation decision — `waits-then-discards` is one of the three policies this entry already
 declares legitimate — so it is an amendment to the entry that made the prediction, not a
@@ -4172,6 +4195,98 @@ carries the consequence — the macOS P10 block predates this repair, so that pa
 on P10 until a macOS capture at the current binary reports `slave_termios_mode: "raw"` on both
 directions. **A macOS capture is the new owed item.**
 
+<!-- ANNOTATION 2026-08-05 (§5). **The owed capture landed and this entry's prediction held.**
+     `docs/doctor/macos-24.6.0-2026-08-05-7ead470-tier3{,-2,-3}.json`, taken on the Mac at
+     `7ead470f594c` with the FT232R crossover attached, report `slave_termios_mode: "raw"` on both
+     directions in all three runs. P10 may now be diffed across the pair.
+
+     **The answer, and it is not the one the pre-repair numbers implied.** At matching modes and
+     provably identical probe code, Linux 7.0.0-29 accepts and fully recovers 15360 bytes in each
+     direction; Darwin 24.6.0 accepts and fully recovers 1024 targetward and 1022 hostward. That is
+     15.0x / 15.03x with **Linux the deeper kernel** — the opposite direction from the pre-repair
+     reading, which put Darwin at >=273x deeper hostward against the same Linux artifact and was in
+     any case a floor, since `ceiling_hit: true` means the blocking point was never reached.
+
+     **Read the confidence labels, because they differ.** That Linux is ~15x deeper is *measured*
+     on both sides. That the pre-repair Darwin run was in a cooked discipline is *inferred*: the
+     pre-repair artifact carries no `slave_termios_mode`, so it cannot testify to its own
+     configuration. The inference rests on a single-variable source delta — the only functional
+     change on P10's fill path between `fa4b12d6f529` and `71fc5a815852` is `set_baseline(&slave)`
+     on the slave the probe measures — plus that report's own P2 `termios_settable_without_slave:
+     false`, which is the condition selecting `apply_pty_baseline`'s open-and-close path. This
+     entry's own body above states the raw-vs-cooked figures as measured on Linux, which they are;
+     what must not be written is a *Darwin* cooked figure, because no committed artifact holds one.
+
+     **Something moved that this entry did not predict.** Darwin accepts 1024 targetward but
+     **1022** hostward — a two-byte asymmetry, one 4096-byte write in each direction, identical
+     across all three runs, where Linux is symmetric. Nothing in the tree explains it and no probe
+     currently asks. Recorded as measured and unexplained; §7 says a probe measures rather than
+     assumes, and the honest state here is that this one has not been asked.
+
+     **P10 does not vary run to run on Darwin at all.** Its entire observations array is
+     byte-identical across the three captures, where the Linux depths needed three runs to separate
+     noise from signal. So the §4 P9/P10 bullet's "read a P10 delta as a scheduling artifact" is
+     doubly inapplicable here: the modes agree, and there is no run-to-run spread to attribute.
+     The annotation at that bullet is **satisfied, not outrun** — its ordering is mode ->
+     `bytes_recovered_by_peer` -> scheduling, and this pair clears the first two steps and hands a
+     surviving 15x to the third.
+
+     **Still open, and not discharged by any of the above:** the six sibling probes named below.
+     Only P10 learned to re-assert. -->
+<!-- ANNOTATION 2026-08-05 (§5), on the sibling paragraph that follows. Re-examined against the
+     source and the new captures, the six split three ways rather than standing as one block, and
+     the ranking matters because it says which repair is worth the risk:
+       * **P8 has no Darwin answer to be wrong** — it is `skipped` there with zero observations
+         (epoll is Linux-only), so it cannot be contaminated.
+       * **P9 carries its own contamination detector** — `ready_passes_total` is 0 in all three
+         runs, which is the probe certifying that its never-ready-fd precondition held.
+       * **P6's measured window is empty** in every capture on both kernels (`bytes_read: 0`), and
+         a cooked discipline acts only on data, so the verdict-bearing half is discipline-
+         independent. Inferred, not measured.
+       * **P13 and P7's write-a-byte shape are the direction the discipline provably does not
+         move**: across the same binary change that moved hostward acceptance 4194304 -> 1022 on
+         this box, every targetward P10 field is unchanged at 1024. That is a measured control for
+         exactly the direction those two probes write in.
+       * **P7's tcsetattr-only shape is the one genuinely compromised stimulus** — it is built from
+         ECHO and EXTPROC, the two flags a cooked reset destroys — but its Darwin answer is
+         independently corroborated by P1, which configures its own slave raw+EXTPROC and agrees
+         (`ioctl_packet_on_tcsetattr: false`).
+     **And the obvious repair is wrong for two of them.** Copying P10's `set_baseline(&slave)` into
+     P7 and P12 would overwrite the stimulus those probes exist to measure: a slave-side
+     `tcsetattr` *is* their input, not their setup. That is why this stays filed rather than swept,
+     and the reason is now sharper than "no Mac to measure on". -->
+<!-- ANNOTATION 2026-08-05 (§5), refuted diagnosis, recorded per §9. During this session it was
+     proposed that `apply_pty_baseline` never takes its fallback branch on Darwin at all — that
+     `set_baseline(&master)` returns Ok there and short-circuits at
+     `doctor/src/probes.rs:314`. **Refuted by measurement.** Had the master path succeeded, the
+     pre-repair Darwin P10 would have measured the same raw pty the post-repair one does and the
+     two would agree; they differ by a factor of 4104 hostward. The mechanism this entry states is
+     the one the artifacts support. -->
+
+<!-- ANNOTATION 2026-08-05 (§5). This entry's Linux raw/cooked pair — "raw accepts ~13.8 KiB and
+     every byte is recoverable; cooked accepts ~23.5 KiB and none of it is" — is **not backed by
+     any committed `docs/doctor/` artifact**, and neither is the same pair where it is repeated at
+     `doctor/src/probes.rs` (the `termios_mode` doc comment, the shipped P10 consequence string,
+     and the guard doc comment). No artifact in the directory carries a *cooked* P10 measurement at
+     all, and the raw half does not match the committed Linux figure either: those captures read
+     15360 bytes, which is 15.0 KiB, not ~13.8 KiB. The figures are a session-scratchpad
+     measurement — the class §7 and §16.13 forbid citing — and the shipped string asserts them in
+     every report, including Darwin reports that never took a Linux measurement. `expectations/
+     linux.jq` is the correct form and should be the model: it asserts the order of magnitude,
+     cites 7.0.0-29, and quotes no figures. The *relation* is properly guarded by
+     `p10_recoverability_separates_a_deep_buffer_from_a_black_hole`, which asserts raw-conserves /
+     cooked-does-not without either number, so the repair is to drop the two figures, not the
+     sentence. Filed here rather than swept: it touches the shipped binary's output, and changing
+     what every future report says is a decision to take deliberately, not inside a documentation
+     pass. -->
+
+<!-- ANNOTATION 2026-08-05 (§5). One further staleness this entry's neighbours carry: §3.30's
+     "the Linux side is recorded in §3.30 and is **not** yet artifact-backed" (and §4's P13 bullet
+     repeating it) was true when written and stopped being true at `71fc5a815852`, when
+     `docs/doctor/linux-7.0-2026-08-05-tier3{,-2,-3}.json` landed. The 08-05 sweep corrected five
+     documents and missed those two clauses. -->
+
+
 **Not fixed here, and named so it is not mistaken for covered.** Six sibling probes take the same
 fallback — P6, P7, P8, P9, P12 and P13 all call `apply_pty_baseline` and then open a slave — so on
 Darwin each of them measures whatever the kernel reset the pair to. Their answers are not thereby
@@ -4234,6 +4349,94 @@ required *and* named → `4 passed` in 10.36s, genuinely on the wire.
 `cu.usbserial` nodes it finds. That is the same hazard this entry declines to introduce on Linux,
 and it is load-bearing for the documented macOS validation flow, so removing it is a doctrine
 decision rather than a cleanup — filed, not silently changed.
+
+### 3.36 The sweep that corrected five documents did not reach the gate file, or the index
+
+**Design:** §16.13 and AGENTS.md §7 — a kernel claim in prose cites a committed `docs/doctor/`
+report by commit, fingerprint and date, never a terminal scrollback. §2 records that on 2026-08-05
+five documents were corrected for quoting Darwin P13 figures (`601087/13/28 µs`) that the artifact
+they name does not contain.
+
+**Reality — the sweep was scoped to prose, and two non-prose sites kept the defect.**
+
+1. **`expectations/macos.jq` (lines 79-91).** It quoted `a_no_reader_blocking_slave` at
+   `601087 us`, `b_reader_drains_before_close` at `13 us` and `c_no_reader_nonblocking_slave` at
+   `28 us`, and cited `docs/doctor/macos-24.6.0-2026-08-05-tier3.json` **by name** for them. That
+   artifact reads `600104` / `23` / `29`. It further asserted "Linux 7.0.0-29 reads `retains` at
+   7 us" with no artifact named at all; the three committed Linux captures read `20/3/15`,
+   `10/13/15` and `13/2/19`. `601087` appears in no committed report in the repository, and this
+   was its last surviving instance. **Severity, stated precisely so it is neither inflated nor
+   waved away:** the numbers sit in `#` comments, so no clause evaluated them and CI neither failed
+   nor could have failed on them. The defect is the attribution, not the gate. What makes it worth
+   an entry anyway is *who reads this file* — it is where a macOS CI maintainer goes to learn what
+   the lane expects, and §16.13 exists precisely so that a number attributed to a named report is
+   checkable. Here the check failed.
+2. **`docs/doctor/README.md`'s index.** Both macOS rows were labelled "**Tier 3**", matching the
+   Linux rows and the filenames. **The string `Tier 3` appears nowhere in any macOS artifact** — it
+   appears once in each Linux Tier-3 report, inside P5's own consequence. P5 certifies a pair by
+   characterizing each port and its UART predicate is `TIOCGICOUNT`, which is Linux-only, so on
+   Darwin every port reports `cert: skipped (not characterizable here)` and the cross-pair
+   rate-ladder line is absent from the report entirely. The rig genuinely *is* cross-wired — P5
+   pairs both directions, and `serial_hardware.rs` moves 32768 bytes byte-exact each way at 250000
+   baud over it — so what is true is the topology, not the certificate.
+
+**Decision.** Both corrected against the artifacts themselves. The macOS rows now read "**Tier-3
+wiring, uncertified**", which is not a new coinage: `doctor/src/probes.rs` already emits exactly
+that phrase for a cross-wired pair whose certificate did not complete, so the index now borrows the
+tool's own vocabulary instead of the Linux word. The **filenames keep `tier3`** — the wiring is
+Tier 3, and renaming a committed artifact rewrites a record's identity, which §16.13 forbids for
+the same reason it forbids editing one.
+
+**Why this recurs, and the shape to watch for.** Both sites are places where a *number or a label*
+was carried across from a session transcript into a file that is not prose and therefore did not
+look like a claim. A gate file reads as configuration; an index column reads as metadata. Neither
+is exempt, and a sweep that greps only `docs/*.md` will miss both again.
+
+### 3.37 A second skip class, larger than §3.35's, with no required-mode and no operator remedy
+
+**Design:** plan §3 rule 7, as restated by §3.35 — a capability-gated test may self-skip, but a
+skip must never be readable as coverage.
+
+**Reality, measured on the Mac with the crossover attached and `SNX_CROSSOVER=required` exported.**
+§3.35 fixed the *rig* gate. Beside it sits a second, larger gate that the fix does not touch:
+`serial_echo()` and `serial_pair()` (`itest/src/lib.rs`) are `#[cfg(target_os = "linux")]` and
+return `None` everywhere else. **64 `#[test]` functions across 38 test binaries** gate directly on
+them; the broader "no software serial device off Linux" family is ~78 tests across ~45 binaries,
+roughly 27% of `serial-nexus-itest`. The tree has exactly four required-mode call sites
+(`SNX_WEB_UI` ×2, `SNX_LICENSE_GATE`, `SNX_CROSSOVER`) and **none reaches this class.**
+
+*How those counts were taken, because a bare number here is exactly what §16.13 says must be
+checkable.* Every provider call site was attributed to its innermost enclosing `fn` with comments
+and string literals stripped first, then helper-to-test edges resolved — two tests reach a provider
+only through `p12_tap_replay`'s `ringless_window_gap`, and a per-`fn`-body scan alone would miss
+them. A naive `grep -rl 'serial_echo\|serial_pair' itest/tests/*.rs` returns **39** files rather
+than 38: the extra one is `p8_web_ui`, which calls a provider but self-skips behind the browser
+gate, not this one. Expect that off-by-one when re-deriving the figure.
+
+**The sharpest instance is not the count but two fix-it messages that cannot be acted on.**
+`p4_exclusivity::exclusive_write_lock_is_byte_exact` and
+`p4_send::send_is_atomic_locked_denies_then_steal_delivers_line_exactly_once` tell the operator to
+attach a crossover rig. On this box the rig **is** attached, `SNX_CROSSOVER=required` **is**
+exported, and both still self-skip and report green — because `serial_pair()` has no rig arm at
+all. An operator who does exactly what the message asks sees no change, which is worse than a skip
+that admits it is one.
+
+**Also inaccurate: the message itself.** "no serial device on this platform" is false on a box with
+two working FT232R ports — the fresh capture's P3 reports `custom_baud_ok`,
+`tiocexcl_refuses_second_open`, `modem_calls_ok` and `break_ok` true on both, and P5 pairs them.
+What is absent is a *software pty-backed double*, not a serial device.
+
+**Filed, not fixed, and the reason is that §3.35's mechanism does not transplant.** A
+`SNX_SERIAL_ECHO=required` would be permanently red on macOS, because the capability is genuinely
+absent there and no operator action can supply it — where `SNX_CROSSOVER=required` is satisfiable
+by plugging in hardware. On Linux the same flag would be unreachable, since `serial_echo()` cannot
+return `None` there. So a required-mode is the wrong instrument for this gate in both directions,
+and inventing one would produce a lane that fails for being macOS. The two defensible repairs are
+(a) correct the two fix-it messages so they stop promising a remedy that does nothing, and (b) give
+`serial_pair()` a rig arm so the tests that genuinely only need *two cross-wired ports* can use the
+hardware that is already attached and already certified for it. Both are real changes to what the
+harness covers on Darwin, and §7 forbids taking them on one box's evidence inside a session whose
+purpose was to validate that box.
 
 ---
 

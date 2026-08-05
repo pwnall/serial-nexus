@@ -40,6 +40,13 @@
 #     fails here, the probe must be able to SAY the number is unsound rather than be
 #     forced to `supported`. A `degraded` P10 on this lane means exactly that and
 #     should be read, not silenced (notes §3.34).
+#     ANNOTATION 2026-08-05 (§5): the re-assert has now been exercised on Darwin and
+#     it takes. `docs/doctor/macos-24.6.0-2026-08-05-7ead470-tier3{,-2,-3}.json`
+#     report `slave_termios_mode: "raw"` on both directions with P10 `supported` in
+#     all three runs, so the arm above stays as insurance rather than as the expected
+#     answer. Recorded because an expectation that was measured and held is as
+#     load-bearing as one that was refuted (§9) — the arm must not be read later as
+#     dead code merely because it has never fired.
 #   - P11 (real-port line-state ioctls) may be any status: it is opt-in behind
 #     --port (so the CI run skips), and on a named macOS port it is `degraded` by
 #     design, because TIOCGICOUNT is Linux-only and the serial node omits the
@@ -80,12 +87,25 @@ and (any(.probes[]; .id == "P12" and (.status == "supported" or .status == "degr
 # and macOS is the platform it was built for. The XNU reading behind this clause is
 # no longer a prediction: it was measured on Darwin 24.6.0 / macOS 15.7.8 and the
 # answer is `waits-then-discards`, `close_waits_for_reader` true, with
-# `a_no_reader_blocking_slave` at 601087 us and 0 of 64 recovered (`ttywait` running
-# to its 60-tick `t_timeout` at hz 100), `b_reader_drains_before_close` at 13 us and
-# 64 of 64, and `c_no_reader_nonblocking_slave` at 28 us and 0 of 64 — the O_NONBLOCK
+# `a_no_reader_blocking_slave` at 600104 us and 0 of 64 recovered (`ttywait` running
+# to its 60-tick `t_timeout` at hz 100), `b_reader_drains_before_close` at 23 us and
+# 64 of 64, and `c_no_reader_nonblocking_slave` at 29 us and 0 of 64 — the O_NONBLOCK
 # arm of the same `ttylclose` branch, measured as an A/B rather than inferred. See
 # `docs/doctor/macos-24.6.0-2026-08-05-tier3.json` (binary `fa4b12d6f529`, probe set
-# `a131e1f4b46d6c83`); Linux 7.0.0-29 reads `retains` at 7 us. The clause is
+# `a131e1f4b46d6c83`); Linux 7.0.0-29 reads `retains`, with the no-reader close at
+# 20/10/13 us across `docs/doctor/linux-7.0-2026-08-05-tier3{,-2,-3}.json` (binary
+# `71fc5a815852`, same probe set) and 64 of 64 recovered in all three shapes.
+# <!-- ANNOTATION 2026-08-05 (§5). The four figures above previously read 601087 /
+#      13 / 28 us for Darwin and "7 us" for Linux, all attributed to the artifacts
+#      named here. None of those numbers appears in any committed docs/doctor/
+#      report: the Darwin file reads 600104/23/29 and the three Linux files read
+#      20/3/15, 10/13/15 and 13/2/19. This is the same scrollback-for-artifact
+#      substitution (§16.13) that the 2026-08-05 sweep corrected in five documents
+#      and did not reach here, because this is a gate file rather than prose. The
+#      numbers live in `#` comments, so no clause evaluated them and CI never
+#      failed on them — the defect is the attribution, not the gate. Corrected
+#      2026-08-05 against the artifacts themselves. -->
+# The clause is
 # still presence-and-status only, deliberately: pinning the word would make a kernel
 # that changed its mind fail the lane instead of reporting the change, which is the
 # opposite of what this probe is for. Read the numbers, diff them, then decide.
