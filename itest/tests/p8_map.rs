@@ -49,7 +49,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use serial_nexus_itest::{
-    Daemon, Sim, Subscription, seeded_bytes, serial_echo, serial_pair, sha256_hex, wait_until,
+    Daemon, Sim, Subscription, seeded_bytes, serial_echo, serial_pair_or_rig, sha256_hex,
+    skip_no_pair, wait_until,
 };
 
 // ---- Independent oracles (reimplemented here, never serial_nexus_core::map) --------------
@@ -415,10 +416,8 @@ write_mode = "held"
 #[test]
 fn map_steal_to_bypass_speaks_mapped_then_raw() {
     // Needs a lossless serial null modem (Linux); skip elsewhere (§5).
-    let Some(pair) = serial_pair() else {
-        eprintln!(
-            "SKIP map_steal_to_bypass_speaks_mapped_then_raw: no serial device on this platform"
-        );
+    let Some(pair) = serial_pair_or_rig() else {
+        skip_no_pair("map_steal_to_bypass_speaks_mapped_then_raw");
         return;
     };
     let (end_a, end_b) = pair.ports();
@@ -557,10 +556,8 @@ fn map_raw_edge_defaults_to_held_and_maps_targetward_at_volume() {
     // write_mode must default to `held` (§7.8), not the generic on-demand — otherwise
     // the held-origin targetward pump parks forever. Also the plan §12.1 targetward
     // byte-exactness at volume, cross-checked against an independent oracle + counters.
-    let Some(pair) = serial_pair() else {
-        eprintln!(
-            "SKIP map_raw_edge_defaults_to_held_and_maps_targetward_at_volume: no serial device"
-        );
+    let Some(pair) = serial_pair_or_rig() else {
+        skip_no_pair("map_raw_edge_defaults_to_held_and_maps_targetward_at_volume");
         return;
     };
     let (end_a, end_b) = pair.ports();
@@ -694,8 +691,8 @@ fn map_deletion_emits_nothing_for_a_fully_deleted_chunk() {
     // §7.8 "deletion is intent, not loss". Verified deterministically: a fully-deleted
     // send followed by a surviving send leaves the device with ONLY the survivor's
     // bytes (an errant empty-chunk write would corrupt this exact comparison).
-    let Some(pair) = serial_pair() else {
-        eprintln!("SKIP map_deletion_emits_nothing_for_a_fully_deleted_chunk: no serial device");
+    let Some(pair) = serial_pair_or_rig() else {
+        skip_no_pair("map_deletion_emits_nothing_for_a_fully_deleted_chunk");
         return;
     };
     let (end_a, end_b) = pair.ports();

@@ -52,6 +52,54 @@ fn an_accepted_stream_still_opens() {
     );
 }
 
+/// The [`serial_pair_or_rig`] provider table (notes §3.43 repair (b)).
+///
+/// The seam it encodes is "software wins whenever it exists; the rig is a fallback for
+/// the platform where it does not" — and that is exactly the sentence a future
+/// simplification inverts. Checking it through the pure decision function is what makes
+/// the guard portable: the table is identical on a box with no hardware, where the
+/// provider itself can only ever return one of its arms.
+///
+/// Fail-first (2026-08-05): swapping the first two arms of `choose_pair_source` so a
+/// visible rig outranks the software double turns the third assertion red with
+/// `a visible rig must not displace the software double, Rig != Software`.
+#[test]
+fn the_pair_provider_prefers_software_and_falls_back_to_the_rig() {
+    use serial_nexus_itest::{PairChoice, choose_pair_source};
+
+    // No provider at all: the caller self-skips.
+    assert_eq!(
+        choose_pair_source(false, false, false),
+        PairChoice::Skip,
+        "no software double and no rig must be a skip"
+    );
+    // Off Linux with a rig attached — the case this repair exists for.
+    assert_eq!(
+        choose_pair_source(false, true, false),
+        PairChoice::Rig,
+        "with no software double, a visible rig must be used"
+    );
+    // On a box that has both — which is any Linux box with SNX_CROSSOVER_A/_B exported
+    // to run the rig suite. The rig must NOT be commandeered as a side effect.
+    assert_eq!(
+        choose_pair_source(true, true, false),
+        PairChoice::Software,
+        "a visible rig must not displace the software double"
+    );
+    // The forcing knob, so the fallback arm is exercisable where it is not the default.
+    assert_eq!(
+        choose_pair_source(true, true, true),
+        PairChoice::Rig,
+        "SNX_SERIAL_PAIR=rig must force the rig arm even where software exists"
+    );
+    // Forced with nothing to force onto: a hard failure, never a silent fallback.
+    assert_eq!(
+        choose_pair_source(true, false, true),
+        PairChoice::ForcedRigMissing,
+        "SNX_SERIAL_PAIR=rig with no rig must fail, not quietly run the software double"
+    );
+}
+
 /// A child killed and reaped on drop, so a panicking assertion in the parent test does
 /// not itself leak the fixture this file is about.
 struct KillOnDrop(Child);

@@ -18,7 +18,7 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use serial_nexus_itest::{Daemon, Sim, serial_pair, sha256_hex, wait_until};
+use serial_nexus_itest::{Daemon, Sim, serial_pair_or_rig, sha256_hex, skip_no_pair, wait_until};
 
 /// `AppError::Locked` (serial-nexus-rpc): `APP_ERROR_BASE (-32000) - 3`. A contended,
 /// un-waited `lock`/`send` is refused with this code (§6/§16.8).
@@ -49,12 +49,8 @@ fn origin_labels(lock: &Value) -> Vec<String> {
 
 #[test]
 fn send_is_atomic_locked_denies_then_steal_delivers_line_exactly_once() {
-    let Some(pair) = serial_pair() else {
-        eprintln!(
-            "SKIP send_is_atomic_locked_denies_then_steal_delivers_line_exactly_once: \
-             no serial device on this platform \
-             (attach a crossover rig, or run on Linux for the sim null-modem)"
-        );
+    let Some(pair) = serial_pair_or_rig() else {
+        skip_no_pair("send_is_atomic_locked_denies_then_steal_delivers_line_exactly_once");
         return;
     };
     let (port_a, port_b) = pair.ports();

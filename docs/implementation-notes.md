@@ -3050,7 +3050,7 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **737 passing, 0 failed, 4 ignored** across 112 test
+The current whole-suite figure is **738 passing, 0 failed, 4 ignored** across 112 test
 targets on Linux (2026-08-05: §3.38's listener-barrier guard, §3.39's orphan-leash fixture and guard, §3.40's two baseline guards, and earlier the same day the three doctor guards of §3.34 and the kernel-naming fix
 — `termios_mode_tells_the_daemons_baseline_from_a_cooked_pty`,
 `p10_recoverability_separates_a_deep_buffer_from_a_black_hole` and
@@ -4707,6 +4707,54 @@ of the shipped binary on this box gave 13824 and 15360 *independently per direct
 within-run direction asymmetry (1536 bytes) is **768×** Darwin's (2 bytes). Darwin's figures, by
 contrast, do not vary run to run at all. Any prose contrasting a "symmetric" Linux with an
 "asymmetric" Darwin has the comparison backwards.
+
+### 3.43 The second skip class, repaired — and this **overturns §3.37's recorded decline**
+
+**§5 requires this to be said in the first line, not discovered in a diff:** §3.37 filed two repairs
+and declined **both**, on the grounds that they were "real changes to what the harness covers on
+Darwin, and §7 forbids taking them on one box's evidence inside a session whose purpose was to
+validate that box." Both are taken here. The decline is overturned, not forgotten.
+
+**The new evidence §3.37 lacked is a measurement rather than an argument.** Its crux — "does a real
+crossover satisfy the `serial_pair()` contract?" — was unanswered. It is now answered per caller: on
+this box, with the crossover forced under a patched provider, **6 of the 7 `serial_pair()` tests pass
+byte-exact over the real FT232R wire** (3 reps each, plus 3 reps at default parallelism). The 7th,
+`p7_p5::p5_classifies_paired_dangling_and_loopback_ports`, fails **structurally and repeatably**:
+`serial-nexus-doctor` keys a real port by its `usb:0403:6001:BH00LL8O:00` identity and characterizes
+it as a UART, while the test asserts path keys and `skipped (not a UART)` — and it needs
+`serial_echo()`, which has no rig arm and gets none. So the answer is yes for six and *provably* no
+for one, which is what makes a seam correct rather than a gamble.
+
+**The seam is a second provider, not a swap.** `serial_pair_or_rig()` is opted into by six call
+sites; `p7_p5` keeps `serial_pair()`. **Software wins whenever it exists**, so Linux and CI are
+untouched and the rig is a fallback for the platform where the software double does not exist —
+never a preference. That ordering matters concretely: any Linux box with `SNX_CROSSOVER_A`/`_B`
+exported has both, and preferring the rig would silently move six tests onto hardware that
+`serial_hardware.rs` and `p12_serial_exclusivity` need and that costs wall clock (measured: 6.30 s
+against 0.55 s for one binary).
+
+**Repair (a) falls out of it.** One `skip_no_pair()` helper replaces four hand-written messages,
+drops the false *"no serial device on this platform"* — untrue on a box with two working FT232R
+ports — and names a remedy that now actually works. `SNX_CROSSOVER=required` covers it, because the
+skip is only reachable where the rig is the *only* provider.
+
+**The decision table is a pure function, and that is what makes the guard portable.**
+`choose_pair_source(software, rig, force_rig)` is checked by
+`the_pair_provider_prefers_software_and_falls_back_to_the_rig` on any box, hardware or not — where
+the provider itself can only ever return one arm. `SNX_SERIAL_PAIR=rig` forces the fallback so it is
+exercisable where it is not the default, and forcing it with **no** rig visible is a hard failure
+rather than a silent fallback to software — which would be §3.35's defect in a new place, an
+operator instruction that quietly does nothing.
+
+**Fail-first:** swapping the first two arms so a visible rig outranks the software double fails with
+*"a visible rig must not displace the software double"*. Verified both ways on this box: default
+(software) and `SNX_SERIAL_PAIR=rig` (hardware) both green across all four converted binaries.
+
+**The caveat, and why this is not an unqualified fix.** The fallback arm executes only where the
+software double is absent — Darwin — and it was measured here on Linux by forcing it. Its failure
+mode is a red test that names its own cause, not a silent pass. **Pre-registered (§7):** on the next
+Mac run the six converted tests execute against the rig instead of skipping; if any goes red it will
+name the provider it used, and `p7_p5` continues to self-skip there as it always has.
 
 ---
 

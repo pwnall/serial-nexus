@@ -36,6 +36,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -858,16 +859,7 @@ pub fn crossover_ports() -> Option<(String, String)> {
 /// is the one with the hardware attached: an operator staring at two adapters should
 /// not have to already know which variables to export.
 pub fn skip_no_rig(test: &str) {
-    let candidates = rig_candidates();
-    let seen = if candidates.is_empty() {
-        "no USB-serial adapters visible either".to_owned()
-    } else {
-        format!(
-            "visible now: {} — export SNX_CROSSOVER_A and SNX_CROSSOVER_B to two \
-             cross-wired ones",
-            candidates.join(", ")
-        )
-    };
+    let seen = rig_seen();
     assert!(
         std::env::var("SNX_CROSSOVER").as_deref() != Ok("required"),
         "SNX_CROSSOVER=required, but {test} found no rig ({seen}).\n\
@@ -997,13 +989,128 @@ impl Subscription {
 pub struct SerialPair {
     a: String,
     b: String,
-    _sim: Sim,
-    _run: TempRun,
+    source: PairSource,
+    /// `Some` for the software double (the sim and its dir die with the pair);
+    /// `None` for the rig, whose ports outlive every test.
+    _sim: Option<Sim>,
+    _run: Option<TempRun>,
+    /// `Some` for the rig: the process-wide claim on the two physical ports, released
+    /// when the pair drops. `None` for the software double, which is per-call.
+    _claim: Option<MutexGuard<'static, ()>>,
 }
 
 impl SerialPair {
     pub fn ports(&self) -> (&str, &str) {
         (&self.a, &self.b)
+    }
+
+    /// Which provider backed this pair. A test that reports what it exercised is the
+    /// difference between coverage and a claim about coverage (§9).
+    pub fn source(&self) -> PairSource {
+        self.source
+    }
+}
+
+/// Which provider backed a [`SerialPair`]. The two are **not** interchangeable — see
+/// [`serial_pair_or_rig`] for the contract a caller must satisfy to accept either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairSource {
+    /// A `serial-nexus-sim nullmodem`: two crossed pts, deterministic, no hardware,
+    /// runs in CI, and characterizes as "not a UART".
+    Software,
+    /// The operator's cross-wired adapters ([`crossover_ports`]): real UARTs, with
+    /// device identity, a baud rate that costs wall-clock, and no flow control.
+    Rig,
+}
+
+/// The provider decision, as a pure function of the three facts that decide it — so
+/// the table is checked without hardware (`itest/tests/harness_contract.rs`) rather
+/// than only on the one box that has a rig.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairChoice {
+    Software,
+    Rig,
+    /// Neither provider exists: the caller self-skips (via [`skip_no_pair`]).
+    Skip,
+    /// `SNX_SERIAL_PAIR=rig` was exported but no rig is visible. Running the software
+    /// double here would be §3.35's defect in a new place — an operator instruction
+    /// that silently does nothing — so this is a hard failure, not a fallback.
+    ForcedRigMissing,
+}
+
+/// Pick the provider. **Software wins whenever it exists**, and the rig is a fallback
+/// for the platform where the software double does not, never a preference:
+///
+/// * the sim null modem is deterministic, needs no hardware, and runs in CI;
+/// * on a box that has a rig, the rig is already claimed by `serial_hardware.rs` and
+///   `p12_serial_exclusivity.rs`, and those tests *need* it — these ones only need two
+///   cross-wired ports;
+/// * `SNX_CROSSOVER_A`/`_B` are exported on such a box precisely to run those tests, so
+///   preferring the rig here would silently move six tests onto hardware (and onto a
+///   ~15x slower wire) as a side effect of an unrelated export.
+///
+/// `SNX_SERIAL_PAIR=rig` forces the fallback arm on any platform. It exists so the arm
+/// can be exercised on the platform of record instead of shipping code that only ever
+/// runs elsewhere — §9's proxy-in-space rule applied to a provider.
+pub fn choose_pair_source(software: bool, rig: bool, force_rig: bool) -> PairChoice {
+    match (software, rig, force_rig) {
+        (_, true, true) => PairChoice::Rig,
+        (_, false, true) => PairChoice::ForcedRigMissing,
+        (true, _, false) => PairChoice::Software,
+        (false, true, false) => PairChoice::Rig,
+        (false, false, false) => PairChoice::Skip,
+    }
+}
+
+/// Whether the software null modem exists on this platform.
+///
+/// The one place the platform is spelled for provider selection; [`serial_pair`]'s own
+/// `#[cfg(target_os = "linux")]` is the other, and [`serial_pair_or_rig`] fails loudly
+/// rather than silently if the two ever disagree.
+pub fn software_pair_available() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// Serializes the physical ports across the tests of one binary. Process-local is
+/// enough and the reason is measured, not assumed: **cargo runs test binaries strictly
+/// sequentially** (sampled 12 times during a whole-gate run — `docs/macos.md`), so no
+/// two binaries are ever concurrent. Within one binary they are not: three `p8_map`
+/// rig tests running on the default thread pool failed 2 of 3 with "serial ends not
+/// active" until this existed (2026-08-05, `/dev/ttyUSB0`↔`/dev/ttyUSB1`).
+static RIG_CLAIM: Mutex<()> = Mutex::new(());
+
+/// Take the rig claim, recovering from a poisoned mutex exactly as `serial_hardware.rs`
+/// does: a panicking rig test must not cascade the rest into poison-panics.
+fn rig_claim() -> MutexGuard<'static, ()> {
+    RIG_CLAIM
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Discard anything still in flight on a physical port before handing it to a test.
+///
+/// The software double is built fresh per call and starts empty; the rig is shared
+/// state that the previous claimant may have left mid-stream, and every caller here
+/// asserts on an *exact* byte count or an exact checksum, where a stale byte is a
+/// failure with a misleading name. Non-blocking open, so a port with no carrier cannot
+/// hang the harness; best-effort by construction — a port that cannot be opened for
+/// draining is the test's problem to report, not this helper's.
+fn drain_stale(port: &str) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(port)
+    else {
+        return;
+    };
+    let mut buf = [0u8; 4096];
+    for _ in 0..64 {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(_) => break, // WouldBlock: the port is quiet
+        }
     }
 }
 
@@ -1031,12 +1138,130 @@ pub fn serial_pair() -> Option<SerialPair> {
         return Some(SerialPair {
             a: a.to_string_lossy().into_owned(),
             b: b.to_string_lossy().into_owned(),
-            _sim: sim,
-            _run: run,
+            source: PairSource::Software,
+            _sim: Some(sim),
+            _run: Some(run),
+            _claim: None,
         });
     }
     #[allow(unreachable_code)]
     None
+}
+
+/// A cross-wired pair from **either** provider — the software null modem where it
+/// exists, else the operator's rig — or `None` to **skip** (announce it with
+/// [`skip_no_pair`]).
+///
+/// **The contract a caller accepts by using this instead of [`serial_pair`].** The two
+/// ports may be real UARTs, so the test must hold only for what "two cross-wired ports"
+/// promises, and nothing a pts happens to also be:
+///
+/// * *no assumption that the ports are ptys.* `serial-nexus-doctor` keys a real port by
+///   its canonical `usb:vid:pid:serial:iface` identity, not by path, and characterizes
+///   it as a UART rather than "skipped (not a UART)". `p7_p5` asserts both of those the
+///   pts way and therefore stays on [`serial_pair`] — measured 2026-08-05: it fails on
+///   the rig with `no P5 observation keyed "/dev/ttyUSB0"`.
+/// * *volume within the measured envelope.* A UART has no flow control, so a raw
+///   high-volume reader can lose bytes. Measured on this rig (FT232R, Linux 7.0.0-29,
+///   load 0.5): a raw `serial-nexus-sim --recv` took 64 KiB at 115200 byte-exact 5 of 5
+///   and at 230400 3 of 3, and `p4_exclusivity` (64 KiB) and `p4_free_for_all` (32 KiB)
+///   pass over the wire. That is the envelope this contract covers; above it, read
+///   through the daemon's own reader into a `log` node, as `serial_hardware.rs` does.
+/// * *wall clock.* Bytes cost time at a baud rate: `p4_exclusivity` runs 0.08 s on the
+///   software double and 5.76 s on the rig. Timeouts must be generous enough for the
+///   wire, and every caller here already pins `baud = 115200` on both sides.
+/// * *exclusivity.* The two ports are one shared resource: the returned pair holds a
+///   process-wide claim for its lifetime, so rig-backed tests in one binary serialize.
+///
+/// Software wins whenever it exists; see [`choose_pair_source`] for why, and for
+/// `SNX_SERIAL_PAIR=rig`, which forces the rig arm so it can be exercised on a platform
+/// where the software double also exists.
+pub fn serial_pair_or_rig() -> Option<SerialPair> {
+    let rig = crossover_ports();
+    let force_rig = std::env::var("SNX_SERIAL_PAIR").as_deref() == Ok("rig");
+    // Decide before building: the software double costs a subprocess, and under
+    // `SNX_SERIAL_PAIR=rig` it must not be spawned only to be discarded.
+    match choose_pair_source(software_pair_available(), rig.is_some(), force_rig) {
+        PairChoice::Software => Some(serial_pair().expect(
+            "software_pair_available() says this platform has a null modem but \
+             serial_pair() returned None — the two spellings of the platform have \
+             drifted (a harness that disagrees with itself must fail loudly, §5)",
+        )),
+        PairChoice::Rig => {
+            let (a, b) = rig.expect("PairChoice::Rig is only chosen when a rig is visible");
+            let claim = rig_claim();
+            drain_stale(&a);
+            drain_stale(&b);
+            // Say which provider ran, for the same reason `skip_no_rig` names the ports:
+            // a green run that cannot be told from a different green run is §3.35's
+            // defect. Hardware and the software double have very different failure
+            // modes, and the first question about a red one is which was under it.
+            eprintln!(
+                "RIG: this test is running on the crossover rig ({a} <-> {b}), not the sim null modem"
+            );
+            Some(SerialPair {
+                a,
+                b,
+                source: PairSource::Rig,
+                _sim: None,
+                _run: None,
+                _claim: Some(claim),
+            })
+        }
+        PairChoice::Skip => None,
+        PairChoice::ForcedRigMissing => panic!(
+            "SNX_SERIAL_PAIR=rig, but no crossover rig is visible ({}).\n\
+             Falling back to the software null modem would be an operator instruction \
+             that silently does nothing — the defect SNX_CROSSOVER=required exists to \
+             prevent (§3.35).",
+            rig_seen()
+        ),
+    }
+}
+
+/// Announce a [`serial_pair_or_rig`] self-skip — and refuse to skip when the operator
+/// has said the rig must be exercised.
+///
+/// The message this replaces said "no serial device on this platform", which is false
+/// on a box with two working adapters, and told the operator to attach a crossover rig,
+/// which did nothing because [`serial_pair`] had no rig arm (notes §3.37). Both halves
+/// are now true: the remedy named is the one that works, and reaching this line means
+/// neither provider exists.
+///
+/// `SNX_CROSSOVER=required` covers this skip for the same reason it covers
+/// [`skip_no_rig`]'s: where this skip is reachable at all — a platform with no software
+/// double — the rig is the only provider, so a green skip on a box with the hardware
+/// attached is exactly the unexecuted coverage required-mode exists to catch. On Linux
+/// the skip is unreachable (the software double never fails), so required-mode neither
+/// fires nor needs to.
+pub fn skip_no_pair(test: &str) {
+    assert!(
+        std::env::var("SNX_CROSSOVER").as_deref() != Ok("required"),
+        "SNX_CROSSOVER=required, but {test} has no cross-wired pair: this platform has \
+         no software null modem and no rig is visible ({}).\n\
+         Required mode exists so a box with the hardware attached cannot report a green \
+         run for coverage that never executed.",
+        rig_seen()
+    );
+    eprintln!(
+        "SKIP {test}: no cross-wired serial pair — no software null modem on this \
+         platform (a pty is not a serial device off Linux) and no rig ({}).",
+        rig_seen()
+    );
+}
+
+/// The "what this box can see" clause shared by every rig-related message.
+fn rig_seen() -> String {
+    let candidates = rig_candidates();
+    if candidates.is_empty() {
+        "no USB-serial adapters visible either".to_owned()
+    } else {
+        format!(
+            "visible now: {} — export SNX_CROSSOVER_A and SNX_CROSSOVER_B to two \
+             cross-wired ones",
+            candidates.join(", ")
+        )
+    }
 }
 
 #[cfg(test)]

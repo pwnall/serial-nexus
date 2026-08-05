@@ -24,7 +24,7 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use serial_nexus_itest::{Daemon, Sim, serial_pair};
+use serial_nexus_itest::{Daemon, Sim, serial_pair_or_rig, skip_no_pair};
 
 /// `AppError::Locked` (serial-nexus-rpc): `APP_ERROR_BASE (-32000) - 3`. A contended,
 /// un-waited `lock`/`send` is refused with this code (§6/§16.8).
@@ -221,11 +221,8 @@ fn exclusive_lock_arbitration_and_detach_release() {
 /// sim sink checksums exactly what reached "hardware". Self-skips with no serial rig.
 #[test]
 fn exclusive_write_lock_is_byte_exact() {
-    let Some(pair) = serial_pair() else {
-        eprintln!(
-            "SKIP exclusive_write_lock_is_byte_exact: no serial device on this platform \
-             (attach a crossover rig, or run on Linux for the sim null-modem)"
-        );
+    let Some(pair) = serial_pair_or_rig() else {
+        skip_no_pair("exclusive_write_lock_is_byte_exact");
         return;
     };
     let (port_a, port_b) = pair.ports();

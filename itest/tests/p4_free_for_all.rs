@@ -26,7 +26,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use serial_nexus_itest::{Daemon, Sim, bin, serial_pair, wait_until};
+use serial_nexus_itest::{Daemon, Sim, bin, serial_pair_or_rig, skip_no_pair, wait_until};
 
 /// Each writer sends `N`; the device must see `2N` (both writers got through).
 const N: usize = 16384;
@@ -34,11 +34,8 @@ const TOTAL: usize = 2 * N;
 
 #[test]
 fn free_for_all_endpoint_lets_concurrent_writers_both_reach_device() {
-    let Some(pair) = serial_pair() else {
-        eprintln!(
-            "SKIP free_for_all_endpoint_lets_concurrent_writers_both_reach_device: \
-             no serial device on this platform"
-        );
+    let Some(pair) = serial_pair_or_rig() else {
+        skip_no_pair("free_for_all_endpoint_lets_concurrent_writers_both_reach_device");
         return;
     };
     // `dev` is the end the daemon's serial node owns; `sink` is the far, cross-wired
