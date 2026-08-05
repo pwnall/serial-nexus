@@ -33,7 +33,7 @@ listed port could be wired to live equipment.
 | **P7** | Evidence a collapsed client session leaves on the master: which session shapes (bare open/close, `tcsetattr`-only, one byte written) leave a readable packet, and whether the presence latch covers each. (§7.2's session-evidence rule, §15.36 F4) | `supported` → the latch's premise holds here. The `latch_covers_*` observations are the ones to compare across kernels; both read `true` on 7.0 and 6.18 alike, which retires this probe's named risk (a 6.18 that left nothing readable would have failed the widened latch silently). |
 | **P8** | epoll vs `read(2)` on a pty master: does epoll report the master readable while `read` returns EAGAIN — the busy-loop shape that put the data plane on `poll(2)`? Probed with **raw epoll**, never `AsyncFd`. (invariant 1, §15.18) | `supported` → invariant 1's premise measured, not assumed (`spin_ratio`, `busy_loop_reproduced`, `epoll_agrees_with_poll2`). |
 | **P9** | `poll(2)` timeout granularity: for a never-ready tty fd, what a requested 0/1/5/10 ms timeout actually costs (min/median/max µs, and the overshoot). (§15.19's timer floor) | `supported` → the adaptive backoff's constants have measured ground under them on this kernel. |
-| **P10** | pty buffer depth: how many bytes a pty accepts in each direction before it would block with nothing draining the far end. (§5 boundary policy, §15.19) | `supported` → the depth every backpressure argument in §5 rests on, in numbers. |
+| **P10** | pty buffer depth: how many bytes a pty accepts in each direction before it would block with nothing draining the far end, **how many of those a reader can actually get back**, and **which line discipline the measured slave was in**. (§5 boundary policy, §15.19) | `supported` → the depth every backpressure argument in §5 rests on, in numbers, measured on the raw baseline the daemon runs. `degraded` → the measured slave was **not** raw, so the depths are some other configuration's and must not be diffed against a run that was (the observation names the mode). `skipped` → the probe could not run. Read `bytes_recovered_by_peer` beside `total_bytes_accepted` and `slave_termios_mode` beside both: acceptance is not delivery, and a depth without its discipline is two measurements wearing one name (notes §3.34). |
 | **P11** | Real-port line-state counters: do `TIOCGICOUNT` (driver error/edge counters) and `TIOCMGET` (modem lines) answer on a real port, and what do they read? (§5, §7.1) | `supported` / `degraded` (counters absent — macOS has no `TIOCGICOUNT`) / `skipped` (no `--port`). **Opt-in for the same reason as P3/P5: opening a port toggles DTR.** Its consequence text reads P5's certified-pair count: the deliberate baud mismatch transmits only over a cross-wired pair, so on a rig without one P11 reports that the item did not run rather than offering it as the reason a `frame` count is nonzero. |
 | **P12** | Session-boundary **edge** on a pty master: does an edge latch report a collapsed client session that left *nothing readable*, and does it stay silent while idle? (§6 detach-release, §15.39) | **P7's sibling — read the two together.** They ask the same question of the two different mechanisms that can carry detach-release, and the answer differs by platform: Linux keeps a readable packet (P7's subject) and this is `skipped` there by design; Darwin destroys it at last close, so the *edge* is the only mechanism and this is what carries §6. `supported` → the termios-only shape posts an edge **and** an idle hung-up master posts none in 200 reader-shaped passes. `degraded` → either the shape posts nothing (read P7: if it is `supported`, the packet route is carrying it), or — the dangerous direction, reported first — an idle master posts edges, which re-fires the last-close handler on a pair no client touched and releases a lock the operator took. `idle_edges_in_200_passes` is the anti-spin number; `a_open_close_edge` is reported because Darwin covers a shape Linux deliberately does not. |
 | **P13** | Disposition of unread client bytes at a pts **last close**: when a client writes bytes the master has not read and then closes, does this kernel **retain** them, **discard** them, or **block the close** waiting for the reader? Three shapes — no reader, reader-drains-first, and a no-reader `O_NONBLOCK` slave (XNU's `ttylclose` branches on exactly that flag). (§5's accounting, §7.2's drain-before-close ordering, notes §3.29) | **P7/P12's third sibling, and the one that separates the two answers they cannot.** P7 asks what a collapsed session leaves *readable* against a master nobody drains — a yes/no that `discards` and `waits-then-discards` answer identically, because an undrained wait times out and looks exactly like a flush. `close_microseconds` tells them apart: microseconds means the kernel decided immediately, hundreds of milliseconds means it waited for a reader that never came. Always `supported` when it measures (a probe error `degrades`): every policy is legitimate and the daemon is correct under each. Measured `retains`, 20 µs, 64/64 recovered on Linux 7.0.0-29 (`docs/doctor/linux-7.0-2026-08-05-tier3.json`, binary `71fc5a815852`, probe set `a131e1f4b46d6c83`, 2026-08-05; the no-reader shape's close is a handful of microseconds run to run — 20, 10 and 13 across the three committed captures — so read the *scale*, microseconds, which is the quantity that separates the policies, not the digit), and **`waits-then-discards` on Darwin 24.6.0 / macOS 15.7.8** — `close_waits_for_reader: true`, 600104 µs with 0 of 64 recovered against no reader, 23 µs with 64 of 64 when the master drains first, and 29 µs with 0 of 64 for an `O_NONBLOCK` slave (`docs/doctor/macos-24.6.0-2026-08-05-tier3.json`, binary `fa4b12d6f529`, probe set `a131e1f4b46d6c83`, 2026-08-05). The `waits-then-*` arm is therefore measured, not hypothetical, and the two kernels differ by ~86000× in `close_microseconds` — which is the field that exists to separate them. Both cautions this row used to carry are **discharged**: the Linux figures are artifact-backed (three captures committed 2026-08-05) and both sides carry probe set `a131e1f4b46d6c83`, so this is a lawful field-by-field diff rather than a recorded reading. One caution replaces them, and it is narrower: a shared fingerprint certifies the two runs asked the same *questions*, not that they asked them of the same *configuration* — see P10's `slave_termios_mode`. The reason it exists: under `discards` a lost byte is a lost microsecond race, while under `waits-then-discards` it means a reader stalled for the *whole timeout* — a daemon-side event, not a kernel one — and `docs/macos.md` (2026-08-04) records a macOS CI failure whose competing readings differ on precisely that. |
@@ -48,6 +48,29 @@ before anything else:
 | `commit` | Which tree the binary was built from — `<short sha>`, `<short sha>-dirty`, or `unknown` where git could not answer (a source tarball, a container without git, a `cargo package` staging tree). Override it with `SNX_BUILD_COMMIT=…` for a vendored or reproducible build. |
 | `probe set` | A 16-hex-char digest over the deduplicated, sorted set of every probe's **`(id, question)`** — *not* its title. **Equal fingerprints mean the two runs asked the same questions of their kernels**; unequal means the probe set moved and a field-by-field diff is reading two different instruments. The title is excluded on purpose: P3's embeds the device path and P3 is emitted once per `--port`, so folding it in would make a one-port box and a two-port box of the same binary disagree — printing "not comparable" over exactly the cross-kernel diff this field exists to underwrite. |
 | `generated` | The run's UTC timestamp. |
+
+**What `probe_set` does not cover, stated because it bit (2026-08-05).** The digest is
+over `(id, question)`, so a change to a probe's *body* — what it configures, what it
+measures, what it reports — keeps the fingerprint identical. Equal fingerprints certify
+that two runs asked the same **questions**; they do not certify that the runs asked them
+of the same **configuration**. P10's baseline repair and its two new observations moved
+the instrument and left `a131e1f4b46d6c83` unchanged on both sides. So when a probe body
+changes without its question changing, say so in `docs/doctor/README.md` and in the
+report's own observations, because the fingerprint will not. The alternative — folding the
+implementation into the digest — was not taken: it would report every prose fix and every
+refactor as "not comparable", which is the failure mode the title exclusion above already
+exists to avoid. The cost is that the reader is told, rather than the tool refusing.
+
+**The environment block names its own kernel, as of `71fc5a815852`.** `kernel` and `os`
+came from `/proc/sys/kernel/osrelease` and `/etc/os-release`, both Linux-only, so every
+macOS report recorded `""` and `unknown` — and marked them `supported` — which forced the
+one fact every cross-kernel claim rests on to be typed into `docs/doctor/README.md`'s index
+by hand. §16.13 says provenance is *recorded, never asserted*. Both fields now come from
+`uname(2)`: `kernel` is the release (`7.0.0-29-generic`, `24.6.0`) and `os` falls back to
+`<sysname> <release> (<machine>)` where no distribution publishes a `PRETTY_NAME`.
+`nodename` is deliberately not read — it is the machine's hostname and nothing here needs
+it. The two committed macOS artifacts still read empty: they are frozen records of what the
+tool printed on their date and are not rewritten.
 
 `probe_set` is the load-bearing one, because it answers the question a diff
 actually needs and answers it with no repository access — where a commit hash
@@ -187,7 +210,7 @@ The negative-control ritual therefore means what it says: pull one wire, re-run
 P5, and the asymmetry is named at discovery *and* whatever it broke in the
 certificate is named in the verdict.
 
-## Kernel-of-record report (Linux 7.0.0-28-generic, x86_64)
+## Kernel-of-record report (Linux 7.0.0-28-generic and -29-generic, x86_64)
 
 ### P1–P4 as of 2026-07-19
 
@@ -260,6 +283,54 @@ a `Consequence` paragraph or a doc comment changes what an operator reads and le
 `(id, question)` alone, so archived artifacts stay comparable across such an edit —
 verified after the 2026-07-29 corrections below by rebuilding and re-running: still
 `01b257ece8c48470`.
+
+### All thirteen probes, 2026-08-05 — the current 7.0 baseline, and the first lawful P13-era diff
+
+**Tier 3, and it is the 7.0 run to read now.** `71fc5a815852` binary, probe set
+**`a131e1f4b46d6c83`**, committed as three sequential runs on an idle box:
+[`linux-7.0-2026-08-05-tier3.json`](doctor/linux-7.0-2026-08-05-tier3.json) and its `-2` /
+`-3` siblings. **22 supported · 0 degraded · 0 unsupported · 1 skipped** — 22 = 9
+environment rows + 13 of the 14 probe rows (thirteen probes, P3 running once per named
+port, so fourteen rows); the fourteenth is P12, inert on Linux by design (§15.39), and it
+remains the only non-supported row anywhere in the report. The same cross-wired FT232R pair
+(`usb:0403:6001:BH00L4KU:00` ↔ `usb:0403:6001:BH00LL8O:00`) is attached, so P5 certifies at
+**Tier 3** and P3/P11 have two real ports.
+
+**Why three runs and not one.** P10's depths move run to run as the tty's asynchronous flip
+work lands, and a single capture cannot show a reader which differences are noise. The three
+agree on everything that matters: `slave_termios_mode: "raw"` and every accepted byte
+recoverable in both directions, P13 `retains` with 64/64 in all three shapes, and the
+no-reader close at 20/10/13 µs — a spread that is itself the point, since the policy
+classifier keys on the microseconds-versus-hundreds-of-milliseconds gap and never on a digit.
+
+**This is the first pair in `docs/doctor/` that the directory's own comparability rule
+permits to be diffed field by field in the P13 era**, because it carries the same
+fingerprint as `macos-24.6.0-2026-08-05-tier3.json`. At that equal fingerprint:
+
+| | Linux 7.0.0-29 | Darwin 24.6.0 |
+|---|---|---|
+| P13 policy / no-reader close | `retains`, 20 µs, 64/64 | `waits-then-discards`, 600104 µs, 0/64 |
+| P9 zero-timeout poll, median | 170 ns | 23122 ns |
+| P6 after last close | `POLLHUP` only, `EIO`, 0 POLLIN passes | `POLLIN\|POLLHUP` 64/64, `eof` |
+| P7 collapsed session | 0 / 1 / 2 bytes readable | 0 / 0 / 0, `degraded` |
+| P2 master is a terminal | yes | no (`ENOTTY`) |
+
+**P10 is deliberately absent from that table, and the reason generalises.** Its committed
+Darwin block predates the baseline repair, so those depths were measured on a *cooked* pty —
+`apply_pty_baseline` sets the baseline through a slave it immediately closes wherever the
+master is not a terminal, which P2's row above is exactly the measurement of, and BSD does not
+carry that to the next open. Do not diff P10 across this pair until a macOS capture at
+`71fc5a815852` or later reports `slave_termios_mode: "raw"` on both directions.
+
+**The same caution has not been discharged for P10's siblings, and that is not an oversight.**
+P6, P7, P9, P12 and P13 take the same fallback, so their Darwin rows above are not *known* to
+have been measured on the daemon's line discipline either. They are not thereby wrong — a
+readability question or a targetward write survives a cooked discipline far better than a
+buffer *depth* does, and P8 never runs on Darwin at all — but "not obviously affected" is not
+"measured". P7 is the one to watch: its `degraded` arm is what `docs/macos.md` cites as an
+operator-visible macOS defect, and `set_baseline`'s own doc comment warns that measuring P7
+without EXTPROC in the baseline reports a false `degraded`. Settle it by measuring on a Mac
+(§7), not by reasoning from here (notes §3.34).
 
 ### All twelve probes, 2026-07-29 — the two 7.0 baselines that are in the tree
 

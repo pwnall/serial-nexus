@@ -4284,6 +4284,18 @@ Full report: `docs/serial-nexus-doctor.md`. Re-runnable per system with
   two kernels swapped flip-scheduling shapes, and three sequential 7.0 runs on an
   idle box produced all three first-pass values. Read a P10 delta as a scheduling
   artifact until several runs a side say otherwise.
+  <!-- ANNOTATION 2026-08-05 (§5). SCOPED, and read the scope before applying the rule above.
+       "Read a P10 delta as a scheduling artifact" was written about a Linux-vs-Linux pair and
+       holds there. It is the WRONG first instinct across an OS boundary, where a second and
+       larger cause outranks scheduling: the line discipline the probe measured. Until
+       `71fc5a815852` P10 did not re-assert the baseline on the slave it measured, so off Linux
+       — wherever the master is not a terminal, which P2 measures — it filled a COOKED pty. On
+       7.0.0-29 that is worth an order of magnitude in what a reader can recover (raw ~13.8 KiB
+       hostward, all of it recoverable; cooked ~23.5 KiB, none of it), which dwarfs the
+       flip-scheduling spread this bullet is about. So the ordering is now: check
+       `slave_termios_mode` agrees on both sides FIRST, then `bytes_recovered_by_peer`, and only
+       then reach for scheduling. A delta between two runs whose modes differ is not a kernel
+       delta at all. See §3.34. -->
 - **P11 line-state counters — supported.** Both ioctls answer on every named port
   on both kernels; absolute counts differ by construction. Since 2026-07-29 that
   is two ports on 6.18 and **none on 7.0**, the crossover pair having moved to the
