@@ -37,6 +37,10 @@ const SKIP_DIRS: &[&str] = &[
     "node_modules",
     "test-results",
     "playwright-report",
+    // The capability-blessed copy of `serial-nexus-replug` (design §15.45):
+    // gitignored build output, and a directory whose contents are a binary plus
+    // whatever `install` put beside it. Excluded for the same reason as `target`.
+    ".snx-bin",
 ];
 
 /// Is `dir` the root of a **nested checkout** — another worktree or clone living inside

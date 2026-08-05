@@ -6,6 +6,7 @@ members = [
     "core",
     "rpc",
     "sim",
+    "replug",
     "sys",
     "doctor",
     "daemon",

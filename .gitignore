@@ -17,3 +17,10 @@
 /.claude/scheduled_tasks.lock
 /.claude/settings.local.json
 __pycache__/
+
+# The capability-blessed copy of `serial-nexus-replug` (design §15.45). Installed by
+# `serial-nexus-replug install`, restricted to mode 0700, and blessed with
+# `cap_dac_override+ep` by one `sudo setcap`. Never committed: a capability-carrying
+# binary is machine state, the kernel strips the blessing on any rewrite anyway, and
+# each checkout must own its own copy rather than share one.
+/.snx-bin

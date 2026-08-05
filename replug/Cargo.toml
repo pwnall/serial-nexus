@@ -1,0 +1,22 @@
+[package]
+name = "serial-nexus-replug"
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "serial_nexus USB re-enumeration helper: deauthorize and reauthorize one named USB serial adapter, so the §12 identity promise can be tested against a real replug (design §15.45)."
+
+# The one binary in this workspace that is meant to carry a Linux file capability
+# (§15.45). Its dependency list is part of its security argument and is kept to
+# argument parsing, JSON, and the workspace's single unsafe-bearing crate — no new
+# crates.io dependency, so `cargo deny check licenses bans sources` does not move.
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+serde_json.workspace = true
+serial-nexus-sys.workspace = true

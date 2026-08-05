@@ -9,6 +9,12 @@
 
 #![allow(unsafe_code)]
 
+/// Capability inspection and process hardening for the privileged replug helper
+/// (design §15.45). Linux-only: file capabilities and `prctl(2)` are Linux
+/// concepts, and the helper the module supports does not build elsewhere.
+#[cfg(target_os = "linux")]
+pub mod caps;
+
 use nix::libc;
 use std::os::fd::RawFd;
 

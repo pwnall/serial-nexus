@@ -1085,6 +1085,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serial-nexus-replug"
+version = "0.3.0"
+dependencies = [
+ "clap",
+ "serde_json",
+ "serial-nexus-sys",
+]
+
+[[package]]
 name = "serial-nexus-rpc"
 version = "0.3.0"
 dependencies = [

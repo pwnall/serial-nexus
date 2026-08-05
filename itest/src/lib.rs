@@ -1267,6 +1267,102 @@ fn rig_seen() -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The USB replug capability (design §15.45).
+//
+// `serial-nexus-replug` is the one binary in this workspace meant to carry a Linux
+// file capability. Tests never hold `CAP_DAC_OVERRIDE` themselves: they shell out
+// to the blessed copy, which validates its own arguments against sysfs and performs
+// the two writes. These helpers locate that copy, prove it is actually blessed, and
+// translate a stable `/dev/serial/by-id` name into the sysfs port the helper takes.
+// ---------------------------------------------------------------------------
+
+/// The blessed-binary directory for the running profile: `<workspace>/.snx-bin/<profile>`.
+///
+/// Derived from `target/<profile>/` so a `--release` test finds the release copy,
+/// and gitignored so it is never committed.
+fn blessed_dir() -> PathBuf {
+    let target = target_dir();
+    let profile = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "debug".to_owned());
+    let root = target.parent().and_then(|p| p.parent()).unwrap_or(&target);
+    root.join(".snx-bin").join(profile)
+}
+
+/// The blessed `serial-nexus-replug`, or why it cannot be used.
+///
+/// **Proves the blessing rather than assuming it**: the file existing says nothing,
+/// because the kernel strips `security.capability` on every rewrite, so a copy left
+/// over from before a rebuild is present and powerless. This asks the binary itself
+/// — `capabilities --json` reports the effective bit it reads from its own
+/// `/proc/self/status` — which is the only answer that cannot be stale.
+pub fn blessed_replug_helper() -> Result<PathBuf, String> {
+    let path = blessed_dir().join("serial-nexus-replug");
+    if !path.exists() {
+        return Err(format!(
+            "{} is not installed — run `cargo build --workspace && \
+             ./target/debug/serial-nexus-replug install`, then the sudo command it prints",
+            path.display()
+        ));
+    }
+    let out = std::process::Command::new(&path)
+        .args(["capabilities", "--json"])
+        .output()
+        .map_err(|e| format!("running {}: {e}", path.display()))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let json: serde_json::Value = serde_json::from_str(text.trim()).map_err(|e| {
+        format!(
+            "{} printed unparseable JSON ({e}): {text:?}",
+            path.display()
+        )
+    })?;
+    if json["cap_dac_override_effective"] == serde_json::Value::Bool(true) {
+        return Ok(path);
+    }
+    Err(format!(
+        "{} is installed but not blessed ({}). Run:\n    sudo setcap cap_dac_override+ep {}",
+        path.display(),
+        text.trim(),
+        path.display()
+    ))
+}
+
+/// Announce a replug-gated test's self-skip, and refuse to skip when the operator
+/// has said the capability must be exercised.
+///
+/// Mirrors [`skip_no_rig`] deliberately rather than inventing a second mechanism:
+/// `SNX_REPLUG=required` is to this capability what `SNX_CROSSOVER=required` is to
+/// the wire. The reason is the same one §3.35 records — a green run for coverage
+/// that never executed is worse than a red one.
+pub fn skip_no_replug(test: &str, why: &str) {
+    assert!(
+        std::env::var("SNX_REPLUG").as_deref() != Ok("required"),
+        "SNX_REPLUG=required, but {test} cannot replug: {why}"
+    );
+    eprintln!("SKIP {test}: {why}");
+}
+
+/// The sysfs USB port name (`3-1`) backing a `/dev/serial/by-id` link, or `None`.
+///
+/// Unprivileged throughout, and it is the *test* that does this translation rather
+/// than the helper: keeping `/dev` names out of the capability-carrying binary is
+/// what lets its only device argument be a validated port name instead of a path.
+///
+/// The by-id link is the right input for a replug test for a reason the operation
+/// itself demonstrates: re-enumeration can hand the adapter a different `ttyUSBn`,
+/// so a `/dev/ttyUSB0` argument names something that may not survive the test.
+pub fn usb_port_of(by_id_link: &Path) -> Option<String> {
+    let tty = by_id_link.canonicalize().ok()?;
+    let tty_name = tty.file_name()?.to_string_lossy().into_owned();
+    // `/sys/class/tty/ttyUSB0/device` -> `../../../3-1:1.0`; the port is the
+    // interface name up to the colon.
+    let device = std::fs::read_link(format!("/sys/class/tty/{tty_name}/device")).ok()?;
+    let interface = device.file_name()?.to_string_lossy().into_owned();
+    interface.split_once(':').map(|(port, _)| port.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

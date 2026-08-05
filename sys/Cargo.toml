@@ -16,5 +16,5 @@ description = "serial_nexus low-level syscall wrappers: the one crate that carri
 workspace = true
 
 [dependencies]
-nix = { workspace = true, features = ["term", "poll", "ioctl"] }
+nix = { workspace = true, features = ["term", "poll", "ioctl", "process", "signal", "fs"] }
 libc.workspace = true

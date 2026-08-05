@@ -6605,3 +6605,97 @@ n=4096 control and the adjacent 1 ms row sit at baseline inside the same report,
 load *rose* while the number fell. It is an n=16 sample taken on the first sixteen `poll(2)` calls
 of a fresh process — cold start, with in-tree precedent in the 6.18 artifact's 1323 ns. Nothing
 was wrong; the field is simply not a figure to quote from a single early run.
+
+### 3.54 The replug capability: a privileged helper the repository carries
+
+**Design:** §15.45 (the whole entry). §9 — a guard asserts the property, never a
+proxy for it, and the tell that you found the real property is that the portable
+form comes out *stricter*.
+
+**What was missing.** P4 prints "configs survive replug and cold start" on success
+and §12 promises identity-to-path resolution "at every open and every
+faulted-and-wait recheck". The only replug coverage in the tree, `p7_replug.rs`,
+re-links a fixture sysfs tree under `--dev-root` and respawns a sim pty at a fixed
+path — the daemon heals, but the kernel never enumerates, `ftdi_sio` never unbinds,
+`/dev/serial/by-id` is never rebuilt and no `/dev` name ever changes. So the
+shipped sentence had no measurement behind it on any kernel.
+
+**What landed.** `replug/` → `serial-nexus-replug`, the one binary meant to carry a
+Linux file capability, plus `sys/src/caps.rs` (capability reading from
+`/proc/self/status`, `PR_SET_NO_NEW_PRIVS`, `PR_SET_PDEATHSIG`, the terminate
+handler, and the `fstatfs` sysfs check) and `itest/tests/p7_replug_hardware.rs`.
+The architecture argument — narrow helper, not a capability-conferring runner — is
+§15.45's; the short form is that `CAP_DAC_OVERRIDE` is root-equivalent for files and
+an ambient grant would reach every test target and every daemon, sim, node and
+Chromium they spawn, which would make the suite prove the daemon works *as root*.
+
+**Two departures from the pattern this was ported from, both deliberate.**
+
+1. **No `.blessed` stamp.** The sibling keys a content-hash stamp on the built
+   runner and re-blesses when it moves, with a documented defect (its M-BIN-2)
+   where a stamp plus an existence check reported "already blessed" for a copy that
+   had silently lost its caps. Here `inspect` compares the installed copy
+   **byte-for-byte** against `target/<profile>/` and *then* re-reads mode and caps,
+   so there is no third record that can disagree with the other two and that entire
+   failure class does not exist. Verified in passing this session: after a rebuild
+   the tool reported `Stale` without being told anything.
+2. **The confinement is a kernel question, not a path question.** The sibling
+   confines by `starts_with` under a `target/` derived from the runner's own
+   location, and its design says three separate times that this is defense in depth
+   rather than the boundary. Here the argument is not a path at all — it is a port
+   *name* accepted against a digits/`-`/`.` alphabet — and `fstatfs` must answer
+   `SYSFS_MAGIC` before any write. `sysfs_is_recognised_by_the_kernel_and_a_lookalike_path_is_not`
+   asserts the half that matters: a directory shaped exactly like a USB device dir,
+   on tmpfs, is refused.
+
+**The `ep` substring trap, carried over as a unit test.** `getcap` prints
+`<path> <caps>`, so a matcher that tests the whole line for `ep` is satisfied by a
+path containing those letters — and `target/debug/deps/...` does. Such a matcher
+reports a `+p`-only, un-raised binary as blessed, which is a skip that reads as a
+pass. `getcap_field` returns the capability text only, and
+`a_path_containing_the_flag_letters_does_not_read_as_blessed` plants the trap and
+asserts the line *does* contain `ep` while the field does not grant it.
+
+**The skip contract.** `SNX_REPLUG=required` turns the self-skip into a hard
+failure, mirroring `SNX_CROSSOVER=required` rather than inventing a second
+mechanism (§3.35). Both arms were run, not predicted: unblessed the three tests
+self-skip naming the exact `sudo setcap` line, and under `=required` two of the
+three fail with the same message. The capability is **proven, never assumed** —
+`blessed_replug_helper()` asks the binary to report the effective bit from its own
+`/proc/self/status`, because the kernel strips `security.capability` on every
+rewrite and a copy left from before a rebuild is present and powerless.
+
+**The rig variable is a by-id path, and that is not a style preference.**
+Re-enumeration can hand the adapter a different `ttyUSBn` — the premise §1 is built
+on — so `/dev/ttyUSB0` names something this very test can invalidate.
+`SNX_REPLUG_DEV` accepts only `/dev/serial/by-id/...` and hard-fails otherwise. The
+by-id → sysfs-port translation happens in the test, unprivileged, which is also what
+keeps `/dev` names out of the capability-carrying binary entirely.
+
+**The discriminator is `devnum`.** A driver unbind/bind leaves it alone; a real
+disconnect and re-enumeration always changes it. It is compared for **inequality
+only, never ordering** — it wraps at 127 per bus. `--dry-run` runs every check and
+every wait and performs neither write, and
+`the_replug_discriminator_goes_quiet_when_no_write_happens` executes that control in
+the suite: if `devnum` moves under a dry run the helper wrote when it promised not
+to. `the_test_process_itself_holds_no_capability_to_write_sysfs` is the other
+control and it runs everywhere, asserting an absence — if the test process could
+write a root-owned sysfs attribute, every result in the file would be about a
+privileged daemon rather than the shipped one.
+
+**Suite.** 767 → **785 passing, 0 failed, 4 ignored** across 116 test-result targets
+(114 cargo targets), the +18 being `sys`'s five capability guards, `replug`'s ten
+unit guards, and the three in `p7_replug_hardware`. `.snx-bin` joins `SKIP_DIRS` in
+`meta_names.rs`.
+
+**Open, and stated rather than left implicit.** The end-to-end replug had not been
+executed at the time this entry was written: the blessing needs one `sudo setcap`,
+which this session could not run. Everything up to that point is measured — the
+helper discovers both adapters, reads their identities, refuses every malformed
+port name, refuses a hub, refuses a non-sysfs lookalike, and reports
+`BLOCKED-ON-BLESS` (exit 2) rather than `NOT READY` — and the premise that
+`CAP_DAC_OVERRIDE` alone suffices for the `authorized` write is **inferred from the
+mode bits, not yet measured**. Record the answer here either way; a confirmed
+premise is as load-bearing as a refuted one (§9). Also open: this is Linux-only by
+construction, and nothing here covers two adapters cycled together to force a
+renumbering, which is the sharpest available form of the §12 claim.
