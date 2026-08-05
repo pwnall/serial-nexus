@@ -3057,8 +3057,11 @@ the unit/property tests *and* the whole `serial-nexus-itest` integration harness
 `cargo deny check licenses bans sources`. The per-phase counts this section used to quote
 (87 workspace tests, 42 bash checks) are dead numbers from before §16.11 folded
 `scripts/validate/**` into the harness; AGENTS.md §3 carries the exact current command block.
-The current whole-suite figure is **766 passing, 0 failed, 4 ignored** across 114 test
-targets on Linux (2026-08-05: §3.51's cell-set digest added nine — three in `report.rs`, the four of the new `itest/tests/meta_doctor_artifacts.rs` target, and two in `expectation_gates.rs`; §3.49's three P5 guards plus its `serial_nexus_sys`
+The current whole-suite figure is **767 passing, 0 failed, 4 ignored** across 114 test-result
+targets on Linux (766 at `f8315cc`; §3.53's own passive/rig digest gate is the +1) — 114 is the count of `test result:` lines, not of cargo targets, of which
+there are 112 (104 `Running` + 8 doc-test); two lines and two of the 766 come from the nested
+`cargo test -p acme-codec` that `p8_external_codec.rs` spawns, so the workspace's own named
+tests are 764 passed / 4 ignored / 0 failed (§3.53) — (2026-08-05: §3.51's cell-set digest added nine — three in `report.rs`, the four of the new `itest/tests/meta_doctor_artifacts.rs` target, and two in `expectation_gates.rs`; §3.49's three P5 guards plus its `serial_nexus_sys`
 `ICOUNTS_SUPPORTED` guard, added to two existing targets; §3.38's listener-barrier guard, §3.39's orphan-leash fixture and guard, §3.40's two baseline guards, and earlier the same day the three doctor guards of §3.34 and the kernel-naming fix— `termios_mode_tells_the_daemons_baseline_from_a_cooked_pty`,
 `p10_recoverability_separates_a_deep_buffer_from_a_black_hole` and
 `the_os_name_survives_a_box_with_no_os_release_file` — on top of the 729 left by
@@ -5454,7 +5457,9 @@ under the same load — both produce the documented 2048/9216 bimodal (pre: 2048
 (§8).
 
 **Cost, named because it is the whole price:** the doctor run goes **2.75 s → 3.74 s** on Linux
-(3 runs each, load 2.25) — two paced windows and a live one at 64 × 5 ms, an ≤80 ms control, and the
+(3 runs each, load 2.25) — *superseded: re-measured at `f8315cc` on an idle box the passive run is
+**3.94 s** (5 runs, spread 3.93–3.95) and a Tier-3 rig run is **11.6 s** (3 runs, 11.55–11.58), the
+extra 0.2 s passive being §3.52's ladder and P9 rework (§3.53)* — — two paced windows and a live one at 64 × 5 ms, an ≤80 ms control, and the
 three shape trials, which on Linux used to be skipped by the early return and now execute. On macOS
 the shape trials already ran, so the delta there is the windows alone.
 
@@ -6505,3 +6510,98 @@ ADR (nothing contradicted the design); the additions are all §13/§Phase-8 plan
     rather than the test being hostage to scheduling. Verified: **0 failures in 35
     runs under a fully CPU-saturated box (8 `yes` hogs on 8 cores) and under the
     fair ~4×CPU-load bar** — where the pre-fix test failed ~20-40%.
+
+### 3.53 The Mac-developed doctor commits, measured on Linux with the rig
+
+**Design:** §7 — no one-way decision on single-kernel evidence, and a kernel claim cites a
+committed artifact. §9 — a guard asserts the property, never a proxy.
+
+`df48bfc`, `6390940`, `50af61e`, `5c3e697`, `448f562`, `b21548d` and `f8315cc` were all
+developed on the Mac. No Linux run existed for any of them: the newest committed Linux
+artifact was `4b78fff`'s. This entry is that run, at `f8315cc`, on the dev box with the
+FT232R crossover attached — artifacts `docs/doctor/linux-7.0-2026-08-05-f8315cc-tier3{,-2,-3}.json`
+and `-passive-{1,2,3}.json`, probe set `a131e1f4b46d6c83`, field sets `3cb816e5b83dcf90`
+(rig) and `60a346baeeb0b3d9` (passive).
+
+**Every pre-registered Linux prediction held**, so the confirmatory half is stated once and
+briefly: P10 `rungs_refusing: 0`, `watermark_threshold_le: null`, `writer_pending_input_bytes: 0`,
+full recovery in both directions on a `raw` slave, `ceiling_hit: false`, the 512 rung first;
+P9 `shape: "1x2"` with `hangup_delivered_to_a_mask_that_requested_nothing: true` measured rather
+than cited; P12 `skipped` yet carrying ten observations, tight window **150 us** (recorded
+134–175) and paced **328540 us** (recorded 325851–329361); P13 `retains` with 64/64 in all three
+shapes and `baseline_packet_bytes: 1`; P5 byte-identical to `4b78fff`'s artifact and issuing the
+Tier-3 certificate over the wire with no `unmeasurable_here` anywhere; P4 `supported` with
+`canonical: 2`. The gate clause was proven to **reject**, not merely to pass: forcing
+`canonical: 0` under `status: supported` makes both `linux.jq` and `macos.jq` exit 1 while the
+unmodified report exits 0. `probe_set` did not move while **124 leaf paths did** (+116 / −8, P9's
+2x2 collapsing to a 1x2) — the blindness `field_set` was added for, now demonstrated on Linux.
+
+**The suite is not vacuous, and that was measured rather than assumed.** Run with
+`SNX_CROSSOVER=required` and both ports named, it is 766 / 0 / 4 at `f8315cc` (767 with this
+entry's own gate, below), and a second run under `--show-output` contains **zero** SKIP lines. The matcher was proved first: hiding `node` makes
+`p8_web_history` report `ok` *and* print `SKIP … node not found`, which is review 32's TESTR-6
+hazard reproduced on demand. So all 766 passes executed their property on this box.
+
+**Four results are new rather than confirmatory.**
+
+**(i) The rig is a five-wire crossover, and nothing in the tree knew it.** Driving RTS on either
+port raises CTS on the other; DTR moves no DSR, DCD or RI in either direction (`TIOCMSET`/
+`TIOCMGET`, both ends zeroed between trials). P5's `modem[...]` item lives in the single-adapter
+block and the pair block covers only `rate_ladder` and `deliberate_mismatch`, so nothing certifies
+the cross-pair handshake lines. Hardware flow control is therefore testable on this rig and
+untested — a capability gap, not a defect.
+
+**(ii) P10's top-up is drain-size independent on Linux, which refutes the ladder's own model.**
+Across 8 runs x 2 directions x 4 rungs, `topped_up_bytes` is 2560 (11 of 16) or 9728 (5 of 16)
+**regardless of whether 1 or 900 bytes were drained** — a 900x range in the input with no effect
+on the output. A queue matching `writable iff occupancy < T, then accept up to capacity` would
+re-admit what was freed; this one re-admits a fixed quantum. `room_republished_minus_room_freed`
+is the same number minus the 512 rung, which is why it reads bimodal 2048/9216. The ladder's
+summary fields do not surface this: `rungs_refusing`/`watermark_threshold_*` answer the watermark
+question, and on Linux they cannot — all four rungs are ≤6.5% of the ~15360-byte capacity, so no
+rung ever refuses and no bound is recoverable. **The discriminator that did fire is
+`topped_up_minus_drained`.** §3.52 fixed the one-drain-size defect for Darwin; on Linux the ladder
+is bounded by its largest rung instead, and that is now listed as open in AGENTS.md §2.
+
+**(iii) `p4_free_for_all` passes 20 of 20 over this wire**, against the 12-of-12 failures §3.46
+records on Darwin — same test, same rig hardware, same commit, box idle (load 0.26 → 0.09).
+Per §9 **no mechanism is claimed**; what the repetition buys is that the failure is
+kernel-specific rather than a test defect, which n=1 could not have said.
+
+**(iv) `baseline_via_master` is `true` in 8 of 8 on Linux**, the exact inverse of the `false` in
+12 of 12 that §3.40's falsifier produced on Darwin. §2 previously stated that `false` without a
+kernel qualifier; it is Darwin's answer, not the general one.
+
+**§3.43's "6 of 7" reproduces, and only because the rig was forced.** On Linux
+`choose_pair_source` picks the software null modem whenever it exists, so the whole-suite run
+never put those six callers on the wire — `p4_free_for_all` finished in 0.07 s. With
+`SNX_SERIAL_PAIR=rig` all six pass (0.07 s → 2.91 s, and `p4_exclusivity` 5.75 s against the
+5.76 s this file already records), and `p7_p5` is the deliberate seventh left on the software
+provider. Wire use is *directly observed* for three of the six — the two large-volume binaries by
+their 10.5x/41x wall-clock delta, and one `p8_map` caller by an `strace` showing `drain_stale`'s
+read-only opens of both ports followed by the daemon's `O_RDWR` opens — and follows for the other
+three from the single deterministic branch. The forced arm also has a working negative control:
+`SNX_SERIAL_PAIR=rig` with the ports unset panics naming the candidates rather than silently
+falling back, which is §3.35's rule holding in a second place.
+
+**The passive/rig pair is a new gate, because it is the first one the directory could carry.**
+§15.44 declined folding the observation keys into `probe_set` on the argument that it would make
+a passive and a rig run of *one binary* report themselves incomparable. That was an argument:
+`docs/doctor/` held no such pair, every capture in it being a rig run or from a different commit.
+The `f8315cc` triples are that pair, and
+`meta_doctor_artifacts::one_binary_run_passive_and_run_against_the_rig_shares_a_probe_set_but_not_a_field_set`
+asserts both halves — equal `probe_set`, unequal `field_set` — so the declination now rests on a
+committed measurement. It is the +1 in the suite count above.
+
+**Cost.** Passive doctor **3.94 s** (5 runs, 3.93–3.95), Tier-3 rig **11.6 s** (3 runs,
+11.55–11.58). §3.50's 3.74 s is superseded.
+
+**One reading corrected in flight, recorded because §9 says refuted diagnoses are load-bearing.**
+P9's `median_ns_for_0ms_request` read 1965 / 551 / 263 ns in the first rig triple and 166–285 ns
+in eight later ones, which looked like an instrument regression and was then attributed to box
+load. Both readings are wrong. The emitting code is byte-identical across `4b78fff..HEAD` (every
+`f8315cc` P9 addition is sequenced after the sampling loop, and P10 after P9), the co-located
+n=4096 control and the adjacent 1 ms row sit at baseline inside the same report, and the recorded
+load *rose* while the number fell. It is an n=16 sample taken on the first sixteen `poll(2)` calls
+of a fresh process — cold start, with in-tree precedent in the 6.18 artifact's 1323 ns. Nothing
+was wrong; the field is simply not a figure to quote from a single early run.

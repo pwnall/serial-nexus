@@ -35,7 +35,9 @@ would otherwise disagree — which is exactly the pair below) and the
 therefore does not invalidate an archived comparison. `commit` says which tree built
 the binary; `generated` is a UTC stamp. A report with **no** `probe set` at all —
 anything built before 2026-07-28 — is not comparable with these. A report with no
-**`field set`** — anything built before 2026-08-05, which is every file indexed below —
+**`field set`** — anything built before `b21548d`, which is every file indexed below
+except the six `f8315cc` rows at the top, the first captures to carry the digest they
+are indexed by —
 has an *unknown* cell set, and unknown is never "equal": the column below carries the
 recomputation (`serial-nexus-doctor --field-set <file>`), because the digest is a pure
 function of `.probes[].observations` and so is computable for artifacts captured before
@@ -46,6 +48,12 @@ artifact (§16.13).
 
 | File | Kernel / box | Binary | Probe set | Field set | Rig | Verdicts |
 |---|---|---|---|---|---|---|
+| [`linux-7.0-2026-08-05-f8315cc-tier3.json`](linux-7.0-2026-08-05-f8315cc-tier3.json) | 7.0.0-29-generic, Ubuntu 26.04 — the dev box. **The first Linux capture of the P9/P10/P12/P4/P5 repairs**, all five of which were developed on the Mac: `df48bfc`, `50af61e`, `5c3e697`, `448f562`, `b21548d`, `f8315cc` landed after the `-05b` triple below and no Linux run existed for any of them. Also the first report to carry `build.field_set` in the file rather than only in this column. Taken on a settled box (load 0.20–0.31); eight sequential runs were taken and the first three are committed — across all eight the P10 subtree is stable and only P9's cold n=16 headline and P13's `close_microseconds` move | `f8315cc54e3d` | **`a131e1f4b46d6c83`** | `3cb816e5b83dcf90` | **Tier 3** — the same cross-wired FT232R pair (`BH00L4KU` ↔ `BH00LL8O`), `rate_ladder=true deliberate_mismatch_observed=true`. **Measured this session and not by any probe: RTS↔CTS is cross-wired in both directions, DTR moves no DSR/DCD/RI — a 5-wire crossover, not the 3-wire one the tree assumes** | 22 supported · 0 degraded · 0 unsupported · 1 skipped |
+| [`linux-7.0-2026-08-05-f8315cc-tier3-2.json`](linux-7.0-2026-08-05-f8315cc-tier3-2.json) | ” — second sequential run | ” | ” | ” | ” | ” |
+| [`linux-7.0-2026-08-05-f8315cc-tier3-3.json`](linux-7.0-2026-08-05-f8315cc-tier3-3.json) | ” — third sequential run | ” | ” | ” | ” | ” |
+| [`linux-7.0-2026-08-05-f8315cc-passive-1.json`](linux-7.0-2026-08-05-f8315cc-passive-1.json) | ” — **the same binary as the three rows above, run with no `--port`.** This pair is the measured form of the §5 declination recorded below: one binary, one box, one probe set, and **two different field sets** (`3cb816e5b83dcf90` with the rig named, `60a346baeeb0b3d9` without), because naming two ports adds P3/P5/P11 cells. Folding the keys into `probe set` would make these two report themselves incomparable, which is why it was declined | `f8315cc54e3d` | **`a131e1f4b46d6c83`** | `60a346baeeb0b3d9` | none (passive; the adapters are attached but unnamed, so P3/P5/P11 skip) | 18 supported · 0 degraded · 0 unsupported · 4 skipped |
+| [`linux-7.0-2026-08-05-f8315cc-passive-2.json`](linux-7.0-2026-08-05-f8315cc-passive-2.json) | ” — second sequential run | ” | ” | ” | ” | ” |
+| [`linux-7.0-2026-08-05-f8315cc-passive-3.json`](linux-7.0-2026-08-05-f8315cc-passive-3.json) | ” — third sequential run | ” | ” | ” | ” | ” |
 | [`macos-24.6.0-2026-08-05-1a9a8fc-tier3.json`](macos-24.6.0-2026-08-05-1a9a8fc-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**. **The run that answered both pre-registered experiments of notes §3.44**, and the counterpart of the `-05b` Linux triple directly below: `1a9a8fca1c36` is `4b78fffc4bf2` plus a docs-only commit, so despite the different `commit` string these two triples are the **same binary** — checked with `git diff 4b78fff 1a9a8fc -- '*.rs' '*.toml'`, which is empty | `1a9a8fca1c36` | **`a131e1f4b46d6c83`** | `0c303d4cb11e3893` | **Tier-3 wiring, now partly certified** — the same cross-wired FT232R pair, `SNX_CROSSOVER=required`, proven on the wire the same session (4 passed, 32768 bytes byte-exact each way at 250000 baud) | 14 supported · 8 degraded · 0 unsupported · 3 skipped |
 | [`macos-24.6.0-2026-08-05-1a9a8fc-tier3-2.json`](macos-24.6.0-2026-08-05-1a9a8fc-tier3-2.json) | ” — second sequential run, same box, load 1.89–2.58 throughout | ” | ” | ” | ” | ” |
 | [`macos-24.6.0-2026-08-05-1a9a8fc-tier3-3.json`](macos-24.6.0-2026-08-05-1a9a8fc-tier3-3.json) | ” — third sequential run | ” | ” | ” | ” | ” |
@@ -78,7 +86,11 @@ again, so a difference is noise", and that is exactly the claim a same-day captu
 from a *different* binary must not make. The 08-05 macOS pair is the case that forced
 the rule — same box, same rig, same kernel, same `probe_set` fingerprint, and a P10
 whose body changed between them, which is precisely the difference a fingerprint
-cannot see.
+cannot see. **One triple in this directory predates the rule and does not follow it**:
+`linux-7.0-2026-08-05b-tier3` distinguishes itself from `linux-7.0-2026-08-05-tier3`
+with a day suffix rather than its sha (`4b78fffc4bf2`). It is not renamed, because
+renaming a committed artifact rewrites a record's identity; the `f8315cc` rows above
+are the first Linux capture to spell the convention as written.
 
 **"Tier 3" in the Rig column means two different things either side of the Linux
 boundary, and the macOS rows say so.** P5 certifies a pair by characterizing each
@@ -116,12 +128,25 @@ Tier-3 report and the three 7.0 passive runs — because they are captured tool 
 their `tool` field carries the binary's pre-rename name, and nothing in this directory is
 hand-edited to read more tidily. That is the whole point of committing them — an artifact
 edited after the fact is an assertion again, not a check — so the retired-name meta-gate
-exempts exactly those four by name, and `README.md` (this file) not at all. The **ten**
-remaining reports need no exemption — the two 07-29 7.0 Tier-3 runs, the three 08-05 7.0 Tier-3
-runs and all five macOS runs (the 07-30 capture, the 08-05 pre-repair capture, and the three
-08-05 `7ead470` captures):
+exempts exactly those four by name, and `README.md` (this file) not at all. The **twenty-two**
+remaining reports need no exemption — the two 07-29 7.0 Tier-3 runs, the three 08-05 7.0
+Tier-3 runs, the three `-05b` runs, the three `f8315cc` Tier-3 runs, the three `f8315cc`
+passive runs, and all eight macOS runs (the 07-30 capture, the 08-05 pre-repair capture, and
+the `7ead470` and `1a9a8fc` triples):
 all were produced by post-rename binaries and carry the current name on their own, which is
 what "a future report will fix itself" looks like in practice.
+<!-- ANNOTATION 2026-08-05 (§5). This count read **ten** and enumerated only the 07-29,
+     08-05 and macOS-through-`7ead470` reports — it was not bumped when the `-05b` and
+     `1a9a8fc` triples landed, so it undercounted by six before the `f8315cc` rows added
+     another six. Corrected to twenty-two against the directory rather than against the
+     previous sentence. -->
+
+**Two of these rows are a passive/rig pair from one binary**, which is new: `f8315cc`'s
+Tier-3 and passive triples share `commit`, box, kernel and `probe set` and differ in
+`field set` (`3cb816e5b83dcf90` against `60a346baeeb0b3d9`). That is the §5 declination
+below — folding the observation keys into `probe set` would make those two report
+themselves incomparable — held as committed evidence rather than as a prediction, and
+`itest/tests/meta_doctor_artifacts.rs` now gates on it.
 
 ## The probe set moved on 2026-08-05, and this directory now holds three families, not two
 

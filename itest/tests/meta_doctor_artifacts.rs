@@ -146,6 +146,16 @@ fn the_field_set_does_not_move_between_sequential_runs_of_one_binary() {
             "linux-7.0-2026-07-29-passive-2",
             "linux-7.0-2026-07-29-passive-3",
         ],
+        [
+            "linux-7.0-2026-08-05-f8315cc-tier3",
+            "linux-7.0-2026-08-05-f8315cc-tier3-2",
+            "linux-7.0-2026-08-05-f8315cc-tier3-3",
+        ],
+        [
+            "linux-7.0-2026-08-05-f8315cc-passive-1",
+            "linux-7.0-2026-08-05-f8315cc-passive-2",
+            "linux-7.0-2026-08-05-f8315cc-passive-3",
+        ],
     ] {
         let first = field_set(&d.join(format!("{}.json", group[0])));
         for name in &group[1..] {
@@ -159,6 +169,31 @@ fn the_field_set_does_not_move_between_sequential_runs_of_one_binary() {
             );
         }
     }
+}
+
+/// The §5 declination, measured instead of argued: folding the observation keys
+/// into `probe_set` would make a passive and a rig run of **one binary** report
+/// themselves incomparable. Until 2026-08-05 that was a prediction — the directory
+/// held no passive/rig pair from a single commit. It does now, and the two differ
+/// in `field_set` while agreeing in `probe_set`, which is exactly the split the
+/// two digests exist to keep apart.
+#[test]
+fn one_binary_run_passive_and_run_against_the_rig_shares_a_probe_set_but_not_a_field_set() {
+    let d = doctor_dir();
+    let rig = d.join("linux-7.0-2026-08-05-f8315cc-tier3.json");
+    let passive = d.join("linux-7.0-2026-08-05-f8315cc-passive-1.json");
+    assert_eq!(
+        probe_set(&rig),
+        probe_set(&passive),
+        "the pair is only a counterexample if the probe set agrees"
+    );
+    assert_ne!(
+        field_set(&rig),
+        field_set(&passive),
+        "naming two ports adds P3/P5/P11 cells, so these two cannot carry one \
+         field set — if they do, the digest stopped seeing the port-dependent \
+         observations and the §5 declination lost its evidence"
+    );
 }
 
 /// Emission path == recompute path, on real probe output rather than a fixture.

@@ -1169,7 +1169,10 @@ pub fn serial_pair() -> Option<SerialPair> {
 ///   through the daemon's own reader into a `log` node, as `serial_hardware.rs` does.
 /// * *wall clock.* Bytes cost time at a baud rate: `p4_exclusivity` runs 0.08 s on the
 ///   software double and 5.76 s on the rig. Timeouts must be generous enough for the
-///   wire, and every caller here already pins `baud = 115200` on both sides.
+///   wire. The three `p4_*` callers pin `baud = 115200` explicitly; the three in
+///   `p8_map` name no baud at all and inherit the same rate from `default_baud()`,
+///   so the effective rate is uniform but only half the callers state it — do not
+///   read this as "every caller pins it", which is what this line used to say.
 /// * *exclusivity.* The two ports are one shared resource: the returned pair holds a
 ///   process-wide claim for its lifetime, so rig-backed tests in one binary serialize.
 ///
