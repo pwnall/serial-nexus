@@ -39,12 +39,21 @@
 #     simplification is unsafe here" / "one session shape is uncovered", which is
 #     a warning to a future editor, not a broken box. They never skip (a probe
 #     error degrades, leaving the question open), so those two are the whole set.
-#   - P8 (epoll vs read(2)), P9 (poll timeout granularity) and P10 (pty buffer
-#     depth) may be `supported` OR `skipped` — never `degraded`, which is the real
-#     content of this clause. They are informational: the design is *justified* by
-#     P8's answer rather than dependent on it, and P9/P10 report numbers a tuning
-#     decision is made against. `skipped` covers a mechanism that does not exist
-#     (epoll off Linux) or a probe that could not run, with the reason attached.
+#   - P8 (epoll vs read(2)) and P9 (poll timeout granularity) may be `supported`
+#     OR `skipped` — never `degraded`, which is the real content of this clause.
+#     They are informational: the design is *justified* by P8's answer rather than
+#     dependent on it, and P9 reports numbers a tuning decision is made against.
+#     `skipped` covers a mechanism that does not exist (epoll off Linux) or a probe
+#     that could not run, with the reason attached.
+#   - P10 (pty buffer depth) additionally admits `degraded`, and that arm is not a
+#     loosening — it is the clause that stops the probe lying. A depth measured in
+#     the wrong line discipline is not this kernel's depth (raw and cooked differ
+#     by an order of magnitude in what a peer can recover, measured on 7.0.0-29),
+#     so P10 degrades when the slave it measured was not the daemon's raw baseline.
+#     Forbidding `degraded` here would force the one probe that knows its own
+#     measurement is unsound to report a confident number instead. On this platform
+#     the baseline always takes, so `supported` is still the expected answer and a
+#     `degraded` P10 on Linux is a real signal worth reading (notes §3.34).
 #   - P11 (real-port line-state ioctls) may be any of the three: it is opt-in
 #     behind --port like P3/P5, so the passive run that this gate normally makes
 #     `skipped`, and a port whose driver lacks TIOCGICOUNT is `degraded` by design
@@ -64,7 +73,7 @@ and (any(.probes[]; .id == "P6" and (.status == "supported" or .status == "degra
 and (any(.probes[]; .id == "P7" and (.status == "supported" or .status == "degraded")))
 and (any(.probes[]; .id == "P8" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P9" and (.status == "supported" or .status == "skipped")))
-and (any(.probes[]; .id == "P10" and (.status == "supported" or .status == "skipped")))
+and (any(.probes[]; .id == "P10" and (.status == "supported" or .status == "skipped" or .status == "degraded")))
 and (any(.probes[]; .id == "P11" and (.status == "supported" or .status == "degraded" or .status == "skipped")))
 # P12 (session-boundary edge, §15.39) is inert on Linux by design — the retained
 # `TIOCPKT_IOCTL` packet carries §6's detach-release here, which is P7's subject —

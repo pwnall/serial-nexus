@@ -809,6 +809,82 @@ pub fn crossover_ports() -> Option<(String, String)> {
     None
 }
 
+/// Announce a rig-gated test's self-skip — and refuse to skip at all when the
+/// operator has said the rig must be exercised.
+///
+/// **Why this exists.** Measured on a Linux box with the FT232R crossover physically
+/// attached and working: `cargo test --test serial_hardware` reported `4 passed` in
+/// **0.00s** with every test printing SKIP, against `4 passed` in **10.39s** with
+/// `SNX_CROSSOVER_A`/`_B` exported and every test genuinely driving the wire. A green
+/// run was hardware coverage that never executed, and nothing in the output
+/// distinguished the two — the exact failure mode a self-skip is otherwise safe
+/// against, and §9's theme in its plainest form.
+///
+/// `SNX_CROSSOVER=required` turns every rig self-skip into a hard failure, so a box
+/// that has the rig can *prove* its coverage ran rather than assert it. This mirrors
+/// `SNX_WEB_UI=required` exactly (plan §3 rule 7) rather than inventing a second
+/// mechanism for the same problem.
+///
+/// The message names the ports it can see, because the one box where the skip matters
+/// is the one with the hardware attached: an operator staring at two adapters should
+/// not have to already know which variables to export.
+pub fn skip_no_rig(test: &str) {
+    let candidates = rig_candidates();
+    let seen = if candidates.is_empty() {
+        "no USB-serial adapters visible either".to_owned()
+    } else {
+        format!(
+            "visible now: {} — export SNX_CROSSOVER_A and SNX_CROSSOVER_B to two \
+             cross-wired ones",
+            candidates.join(", ")
+        )
+    };
+    assert!(
+        std::env::var("SNX_CROSSOVER").as_deref() != Ok("required"),
+        "SNX_CROSSOVER=required, but {test} found no rig ({seen}).\n\
+         Required mode exists so a box with the hardware attached cannot report a \
+         green run for coverage that never executed."
+    );
+    eprintln!("SKIP {test}: no crossover rig ({seen})");
+}
+
+/// Serial-adapter device nodes visible on this box, for the skip message only.
+///
+/// **Reported, never auto-selected.** Two adapters being present is not two adapters
+/// being cross-wired, and a harness that opened whatever it found would transmit at
+/// 250000 baud and pulse DTR on equipment it never verified — which is the same reason
+/// `serial-nexus-doctor` is passive until a port is named with `--port`. Naming the
+/// candidates is help; choosing them is the operator's.
+fn rig_candidates() -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    // Linux: udev's stable names. Falls back to nothing rather than guessing at
+    // /dev/ttyUSB*, which enumerates non-adapter ttys on some boxes.
+    if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
+        found.extend(
+            entries
+                .flatten()
+                .map(|e| e.path().to_string_lossy().into_owned()),
+        );
+    }
+    // macOS: the call-out nodes.
+    if let Ok(entries) = std::fs::read_dir("/dev") {
+        found.extend(
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("cu.usbserial"))
+                        .unwrap_or(false)
+                })
+                .map(|p| p.to_string_lossy().into_owned()),
+        );
+    }
+    found.sort();
+    found
+}
+
 /// A streaming connection to the daemon (`subscribe`/`tap.open`), yielding id-less
 /// notification lines. Buffers across reads so a timeout never splits a line.
 pub struct Subscription {

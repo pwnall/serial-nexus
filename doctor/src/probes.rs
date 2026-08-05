@@ -319,6 +319,36 @@ fn apply_pty_baseline(master: &PtyMaster, pts: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Is this fd's line discipline the raw baseline the daemon runs, or a cooked one?
+///
+/// **Why a probe has to report this rather than assume it.** [`apply_pty_baseline`]
+/// applies the baseline through the master where the master is a terminal, and
+/// otherwise through a slave it opens *and immediately closes*. On a kernel where
+/// the master is not a terminal — Darwin, measured by P2's
+/// `termios_settable_without_slave: false` — that momentary set does not survive to
+/// the next open: `nodes/pty.rs` says so in its own words at the non-Linux re-assert
+/// ("the slave's termios resets to cooked when the last slave fd closes … a momentary
+/// daemon-side set does not survive to the client's open"), which is why the *node*
+/// re-asserts on the client's rising presence edge. Every probe here that opens a
+/// fresh slave after the baseline therefore measures whatever the kernel reset it to,
+/// and nothing in the report said which that was.
+///
+/// That is not a detail. Measured on Linux 7.0.0-29, filling a pty hostward with the
+/// same bytes: **raw** accepts ~13.8 KiB and every byte is recoverable by the peer;
+/// **cooked** accepts ~23.5 KiB and *none of it* is recoverable. Same kernel, same
+/// probe, opposite answers — so a depth reported without its mode is not a
+/// cross-kernel measurement, it is two measurements wearing one name.
+fn termios_mode<Fd: AsFd>(fd: &Fd) -> &'static str {
+    match tcgetattr(fd) {
+        Ok(t) => {
+            let cooked = t.local_flags.contains(LocalFlags::ICANON)
+                || t.local_flags.contains(LocalFlags::ECHO);
+            if cooked { "cooked" } else { "raw" }
+        }
+        Err(_) => "unknown",
+    }
+}
+
 /// Name a `revents` bitmask stably (`POLLIN|POLLHUP`), and name any bit this
 /// table does not know rather than dropping it — an unknown bit on the
 /// production kernel is exactly the kind of thing this report exists to surface.
@@ -1679,6 +1709,14 @@ struct FillResult {
     /// given kernel accounts for a pty here at all is exactly the quiet
     /// cross-kernel difference worth printing.
     pending_output: Option<u64>,
+    /// The line discipline the measured slave was actually in — `raw` (the daemon's
+    /// baseline), `cooked`, or `unknown`. A depth means nothing without it (see
+    /// [`termios_mode`]), and a report that omitted it could not say whether a
+    /// cross-kernel gap was the kernel or the probe's own configuration.
+    slave_mode: &'static str,
+    /// Bytes the peer could actually be given back, against `total()` accepted.
+    /// The field that tells a deep buffer from a black hole.
+    recovered: u64,
 }
 
 impl FillResult {
@@ -1701,7 +1739,15 @@ impl FillResult {
             "terminal_write_after_settle": self.settled_terminal,
             "peer_pending_input_bytes": self.peer_pending_input,
             "pending_output_bytes": self.pending_output,
+            "slave_termios_mode": self.slave_mode,
+            "bytes_recovered_by_peer": self.recovered,
+            "bytes_unrecoverable": self.total().saturating_sub(self.recovered),
         })
+    }
+
+    /// Did every accepted byte come back? The one-line read of the two fields above.
+    fn fully_recoverable(&self) -> bool {
+        self.recovered >= self.total()
     }
 }
 
@@ -1741,18 +1787,39 @@ pub fn p10_pty_buffer_depth() -> Probe {
             let p = p
                 .observe("slave_to_master_targetward", targetward.observations())
                 .observe("master_to_slave_hostward", hostward.observations());
+            // A depth measured in the wrong line discipline is not this kernel's
+            // depth (see `termios_mode`), so the mode decides the verdict: §7 says
+            // a run that could not ask the intended question reports `degraded`
+            // with the observation named, never a confident number.
+            let raw_both = targetward.slave_mode == "raw" && hostward.slave_mode == "raw";
+            let status = if raw_both {
+                Status::Supported
+            } else {
+                Status::Degraded
+            };
             p.verdict(
-                Status::Supported,
+                status,
                 &format!(
-                    "This kernel's pty accepts {} byte(s) slave→master (**targetward** — a client typing, travelling toward the device) and {} byte(s) master→slave (**hostward** — the node delivering device output to its client) before answering EAGAIN, reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands (three sequential 7.0 runs on an idle box measured 11776–15360 first-pass and 13824–15360 total, and 6.18 has produced two of those shapes across two runs), so across kernels a one-chunk difference is noise and only an order-of-magnitude one is signal. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}",
+                    "This kernel's pty accepted {} byte(s) slave→master (**targetward** — a client typing, travelling toward the device, first pass ending in `{}`) and {} byte(s) master→slave (**hostward** — the node delivering device output to its client, ending in `{}`), reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. **Of those, {} and {} byte(s) were actually recoverable by the peer** ({} / {}): acceptance is not delivery, and the two are the same number only on a kernel that queues everything it takes. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands, so a one-chunk difference across kernels is noise; only an order-of-magnitude one is signal, **and only between runs whose `slave_termios_mode` agrees** — a cooked pty and a raw one give different depths on one kernel (measured on Linux 7.0.0-29: raw ~13.8 KiB fully recoverable, cooked ~23.5 KiB with nothing recoverable), so a mode mismatch explains a gap before any kernel difference does. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}{}",
                     targetward.bytes,
+                    targetward.terminal,
                     hostward.bytes,
+                    hostward.terminal,
                     targetward.total(),
                     hostward.total(),
+                    targetward.recovered,
+                    hostward.recovered,
+                    if targetward.fully_recoverable() { "all of it" } else { "short" },
+                    if hostward.fully_recoverable() { "all of it" } else { "short" },
                     if targetward.ceiling_hit || hostward.ceiling_hit {
-                        format!(" NOTE: a direction hit the {P10_CEILING}-byte ceiling instead of EAGAIN, so its depth is a lower bound, not the depth.")
+                        format!(" NOTE: a direction hit the {P10_CEILING}-byte ceiling rather than ever answering EAGAIN, so its depth is a lower bound and this kernel's blocking point was not observed at all.")
                     } else {
                         String::new()
+                    },
+                    if raw_both {
+                        String::new()
+                    } else {
+                        format!(" DEGRADED: the measured slave was `{}` targetward and `{}` hostward, not the raw baseline the daemon runs (§7.2), so these depths are not the daemon's configuration and must not be diffed against a run that was raw.", targetward.slave_mode, hostward.slave_mode)
                     }
                 ),
             )
@@ -1785,6 +1852,17 @@ fn p10_fill_direction(targetward: bool) -> anyhow::Result<FillResult> {
     // Belt and braces: the open flag above already asks for it, and a blocking fd
     // here is the one way this probe could hang.
     sys::set_nonblocking(slave_fd)?;
+
+    // Re-assert the baseline on **the slave this probe actually measures**, not on
+    // the one `apply_pty_baseline` opened and closed above. Where the master is a
+    // terminal this is idempotent — the pair is already raw and the Linux figures do
+    // not move — and where it is not, this is the difference between measuring the
+    // daemon's pty and measuring a cooked one the daemon never runs (see
+    // [`termios_mode`]). Applied on every platform rather than behind a
+    // `cfg(not(linux))`: a repair that only ever executes off the platform of record
+    // is a §9 proxy in space, exercised nowhere it can be observed failing.
+    let _ = set_baseline(&slave);
+    let mode = termios_mode(&slave);
     std::thread::sleep(PTY_SETTLE);
 
     // Which fd is written decides which *graph* direction is being filled, and the
@@ -1803,10 +1881,10 @@ fn p10_fill_direction(targetward: bool) -> anyhow::Result<FillResult> {
     } else {
         (master_fd, slave_fd)
     };
-    Ok(p10_fill(write_to, peer))
+    Ok(p10_fill(write_to, peer, mode))
 }
 
-fn p10_fill(write_to: RawFd, peer: RawFd) -> FillResult {
+fn p10_fill(write_to: RawFd, peer: RawFd, slave_mode: &'static str) -> FillResult {
     // Pass one: what a writer hits right now.
     let (bytes, writes, terminal, hit_a) = p10_fill_pass(write_to, 0);
     // Let the tty's asynchronous flip work run, then sample where the bytes went
@@ -1816,6 +1894,19 @@ fn p10_fill(write_to: RawFd, peer: RawFd) -> FillResult {
     let peer_pending_input = sys::pending_input_bytes(peer).ok().map(|n| n as u64);
     let pending_output = sys::pending_output_bytes(write_to).ok().map(|n| n as u64);
     let (settled_bytes, settled_writes, settled_terminal, hit_b) = p10_fill_pass(write_to, bytes);
+
+    // **The measurement this probe was missing.** Everything above counts what
+    // `write(2)` *accepted*, which is not what a reader can *get*: a kernel that
+    // takes 4 MiB and hands back nothing scores identically to one holding 4 MiB
+    // ready. Draining the peer separates them, and it is the only field here that
+    // can — `peer_pending_input` is a `FIONREAD` best-effort and reads 0 for bytes
+    // sitting in a canonical queue that a reader will never be given.
+    //
+    // Runs last, after every other observation, because it is the one step that
+    // changes the state it measures. Bounded by the same ceiling and reading a
+    // non-blocking fd, so it can neither loop nor block.
+    let recovered = p10_drain(peer);
+
     FillResult {
         bytes,
         writes,
@@ -1826,7 +1917,27 @@ fn p10_fill(write_to: RawFd, peer: RawFd) -> FillResult {
         settled_terminal,
         peer_pending_input,
         pending_output,
+        slave_mode,
+        recovered,
     }
+}
+
+/// Read the peer dry and count what came back. Non-blocking, so `EAGAIN` is the
+/// ordinary end of the drain rather than an error.
+fn p10_drain(peer: RawFd) -> u64 {
+    let mut buf = [0u8; 65536];
+    let mut recovered = 0u64;
+    loop {
+        if recovered >= P10_CEILING {
+            break;
+        }
+        match sys::read_fd(peer, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => recovered += n as u64,
+            Err(_) => break,
+        }
+    }
+    recovered
 }
 
 /// One bounded fill pass. `already` is what earlier passes wrote, so the 4 MiB
@@ -3171,9 +3282,34 @@ fn p11_verdict(
 pub fn environment(dev_root: &Path, sys_root: &Path, named_ports: &[PathBuf]) -> Vec<EnvCheck> {
     let mut checks = Vec::new();
 
-    let kernel = read_trimmed(Path::new("/proc/sys/kernel/osrelease")).unwrap_or_default();
-    checks.push(EnvCheck::new("kernel", kernel, Status::Supported));
-    checks.push(EnvCheck::new("os", distro(), Status::Supported));
+    // **A report has to be able to name its own kernel.** §16.13 says provenance is
+    // *recorded, never asserted*, and this pair is the provenance every cross-kernel
+    // claim in the tree rests on. Read from `/proc/sys/kernel/osrelease` and
+    // `/etc/os-release`, both of which exist only on Linux, it recorded `kernel: ""`
+    // and `os: "unknown"` on every macOS run — and marked them `Supported` — so the
+    // Darwin version had to be typed into `docs/doctor/README.md` by hand beside the
+    // file. A hand-recorded field in an index is exactly the assertion committing
+    // artifacts exists to replace.
+    //
+    // `uname(2)` is POSIX and answers on both. `nodename` is deliberately **not**
+    // read: it is the machine's hostname, and nothing here needs it.
+    let uts = nix::sys::utsname::uname().ok();
+    let (kernel, kernel_status) = match &uts {
+        // `release` alone, which is what the Linux side has always printed
+        // (`7.0.0-29-generic`), so the field keeps its shape across the archive and a
+        // diff against a pre-2026-08-05 report reads normally. On Darwin it is the
+        // number the file names were carrying by hand: `24.6.0`.
+        Some(u) => (
+            u.release().to_string_lossy().into_owned(),
+            Status::Supported,
+        ),
+        None => (
+            "unknown — uname(2) did not answer".to_owned(),
+            Status::Degraded,
+        ),
+    };
+    checks.push(EnvCheck::new("kernel", kernel, kernel_status));
+    checks.push(EnvCheck::new("os", distro(uts.as_ref()), Status::Supported));
 
     // $XDG_RUNTIME_DIR — the non-root control-socket home (§10).
     match std::env::var("XDG_RUNTIME_DIR") {
@@ -3264,15 +3400,40 @@ pub fn environment(dev_root: &Path, sys_root: &Path, named_ports: &[PathBuf]) ->
     checks
 }
 
-fn distro() -> String {
-    if let Some(content) = read_trimmed(Path::new("/etc/os-release")) {
+/// The OS name a human reads first. `/etc/os-release`'s `PRETTY_NAME` where a
+/// distribution publishes one; otherwise what `uname(2)` can say, which on Darwin is
+/// `Darwin 24.6.0 (x86_64)` rather than the `unknown` this printed for four
+/// generations. Only `"unknown"` when neither source answers — a genuine gap rather
+/// than the platform's normal state.
+fn distro(uts: Option<&nix::sys::utsname::UtsName>) -> String {
+    distro_from(read_trimmed(Path::new("/etc/os-release")), uts)
+}
+
+/// The decision itself, with `/etc/os-release`'s content passed in rather than read.
+///
+/// Split out **so the off-Linux arm is testable from Linux**. A guard that only
+/// asserted "the kernel field is non-empty" would pass on the box it was written on
+/// and prove nothing about the platform the field was empty on for four generations —
+/// §9's proxy in space, in the exact place it did the damage. Handing the file's
+/// content in makes "no `/etc/os-release`" an ordinary input, so the Darwin path runs
+/// in the Linux suite on every push.
+fn distro_from(os_release: Option<String>, uts: Option<&nix::sys::utsname::UtsName>) -> String {
+    if let Some(content) = os_release {
         for line in content.lines() {
             if let Some(v) = line.strip_prefix("PRETTY_NAME=") {
                 return v.trim_matches('"').to_owned();
             }
         }
     }
-    "unknown".into()
+    match uts {
+        Some(u) => format!(
+            "{} {} ({})",
+            u.sysname().to_string_lossy(),
+            u.release().to_string_lossy(),
+            u.machine().to_string_lossy()
+        ),
+        None => "unknown".into(),
+    }
 }
 
 fn group_membership_check(group: &str) -> EnvCheck {
@@ -3977,10 +4138,16 @@ mod tests {
             Mode::empty(),
         )
         .expect("open /dev/null");
-        let r = p10_fill(sink.as_raw_fd(), sink.as_raw_fd());
+        let r = p10_fill(sink.as_raw_fd(), sink.as_raw_fd(), "raw");
         assert!(r.ceiling_hit, "fill did not stop: {}", r.terminal);
         assert_eq!(r.terminal, "ceiling");
         assert!(r.bytes >= P10_CEILING);
+        // A bottomless sink is also the limit case the recoverability field exists
+        // to name: /dev/null accepts everything and returns none of it, which is
+        // precisely the shape an acceptance-only measurement cannot tell from a
+        // 4 MiB buffer.
+        assert_eq!(r.recovered, 0);
+        assert!(r.total() > r.recovered);
         // The ceiling bounds the TOTAL, not each pass: the second pass must find
         // the budget already spent and stop immediately, or a two-pass fill would
         // write twice what the backstop promises.
@@ -4080,5 +4247,139 @@ mod tests {
         // And the Linux answer this tree measures, so a threshold edit that
         // reclassified the platform of record cannot land silently.
         assert_eq!(p13_policy(7, 64), "retains");
+    }
+
+    /// A pty pair whose slave is left in `mode`, returned as the two raw fds P10
+    /// fills. The `OwnedFd`s are returned alongside so the caller keeps them alive:
+    /// dropping either mid-measurement would close the pair under the fill.
+    fn pty_pair_in_mode(raw: bool) -> (PtyMaster, std::os::fd::OwnedFd) {
+        let master = new_master().expect("openpt");
+        let pts = sys::ptsname(&master).expect("ptsname");
+        sys::set_nonblocking(master.as_raw_fd()).expect("master nonblocking");
+        let slave = open(
+            pts.as_str(),
+            OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        )
+        .expect("open pts");
+        sys::set_nonblocking(slave.as_raw_fd()).expect("slave nonblocking");
+        if raw {
+            set_baseline(&slave).expect("raw baseline");
+        } else {
+            // The shape a BSD pty lands in when the baseline's momentary slave
+            // closes: canonical, echoing — what the daemon never runs.
+            let mut t = tcgetattr(&slave).expect("tcgetattr");
+            t.local_flags.insert(LocalFlags::ICANON | LocalFlags::ECHO);
+            tcsetattr(&slave, SetArg::TCSANOW, &t).expect("cooked");
+        }
+        (master, slave)
+    }
+
+    /// A report must be able to name its own kernel **on every platform it runs on**.
+    ///
+    /// The three arms are asserted separately because the one that was broken is the
+    /// one a Linux box never reaches: `/proc/sys/kernel/osrelease` and
+    /// `/etc/os-release` both exist here, so every Linux run looked healthy while
+    /// every macOS artifact in `docs/doctor/` recorded `kernel: ""` and
+    /// `os: "unknown"` — and marked them `Supported`. Passing the file content in is
+    /// what lets the no-`os-release` arm (Darwin's) run *in this suite*, rather than
+    /// being trusted until someone next opens a Mac.
+    #[test]
+    fn the_os_name_survives_a_box_with_no_os_release_file() {
+        let uts = nix::sys::utsname::uname().expect("uname(2) must answer on any POSIX box");
+
+        // uname's release is what the `kernel` field now reports. Non-empty here and
+        // non-empty on Darwin — the portable property, not a Linux observable.
+        assert!(
+            !uts.release().is_empty(),
+            "uname(2) gave an empty release, so `kernel` would be blank again"
+        );
+
+        // The Darwin arm, exercised on Linux: no os-release, so uname carries it.
+        let fallback = distro_from(None, Some(&uts));
+        assert_ne!(
+            fallback, "unknown",
+            "with no /etc/os-release the OS name fell back to `unknown` — the exact \
+             value every macOS artifact recorded"
+        );
+        assert!(
+            fallback.contains(&*uts.sysname().to_string_lossy())
+                && fallback.contains(&*uts.release().to_string_lossy()),
+            "the fallback must name the system and its release, got {fallback:?}"
+        );
+
+        // A distribution that publishes PRETTY_NAME still wins, so the Linux archive
+        // keeps reading exactly as it always has.
+        assert_eq!(
+            distro_from(
+                Some("ID=ubuntu\nPRETTY_NAME=\"Ubuntu 26.04 LTS\"\n".to_owned()),
+                Some(&uts)
+            ),
+            "Ubuntu 26.04 LTS"
+        );
+
+        // And `unknown` remains reachable, so it still means "neither source
+        // answered" rather than "this is a Mac".
+        assert_eq!(distro_from(None, None), "unknown");
+    }
+
+    /// The detector behind P10's `slave_termios_mode`, planted in both spellings.
+    ///
+    /// Both directions are asserted because a `termios_mode` stubbed to a constant
+    /// — the exact simplification this guards against — passes any single-valued
+    /// test. `assert_ne!` pins the discrimination itself, so a mutation that
+    /// collapses the two answers fails here even if both spellings drift.
+    #[test]
+    fn termios_mode_tells_the_daemons_baseline_from_a_cooked_pty() {
+        let (_m_raw, s_raw) = pty_pair_in_mode(true);
+        let (_m_cooked, s_cooked) = pty_pair_in_mode(false);
+        assert_eq!(termios_mode(&s_raw), "raw");
+        assert_eq!(termios_mode(&s_cooked), "cooked");
+        assert_ne!(termios_mode(&s_raw), termios_mode(&s_cooked));
+    }
+
+    /// **Acceptance is not delivery, and P10 could not see the difference.**
+    ///
+    /// Filling hostward (master→slave) against a slave nobody reads: raw hands
+    /// every accepted byte back, cooked hands back none of them — measured on
+    /// Linux 7.0.0-29 at ~13.8 KiB fully recoverable against ~23.5 KiB with
+    /// nothing recoverable. Before `bytes_recovered_by_peer` existed the two were
+    /// indistinguishable in the report, which is how a cooked-pty measurement
+    /// could be read as this kernel's buffer depth.
+    ///
+    /// Asserted as a *relation* between the two modes rather than against either
+    /// figure: the depths move by a chunk run to run and differ by kernel, but a
+    /// raw pty conserving what it took while a cooked one does not is the property
+    /// the field exists to report, and it holds wherever a pty has a line
+    /// discipline at all.
+    #[test]
+    fn p10_recoverability_separates_a_deep_buffer_from_a_black_hole() {
+        let (m_raw, s_raw) = pty_pair_in_mode(true);
+        let raw = p10_fill(m_raw.as_raw_fd(), s_raw.as_raw_fd(), "raw");
+        assert!(
+            raw.total() > 0,
+            "a raw pty accepted nothing hostward — the fill never ran"
+        );
+        assert_eq!(
+            raw.total() - raw.recovered,
+            0,
+            "a raw pty lost bytes it accepted: {} accepted, {} recovered",
+            raw.total(),
+            raw.recovered
+        );
+
+        let (m_cooked, s_cooked) = pty_pair_in_mode(false);
+        let cooked = p10_fill(m_cooked.as_raw_fd(), s_cooked.as_raw_fd(), "cooked");
+        assert!(
+            cooked.total() > 0,
+            "a cooked pty accepted nothing hostward — the fill never ran"
+        );
+        assert!(
+            cooked.total() > cooked.recovered,
+            "a cooked pty returned everything it accepted ({} of {}), so this guard \
+             no longer discriminates and the recoverability field is untested",
+            cooked.recovered,
+            cooked.total()
+        );
     }
 }

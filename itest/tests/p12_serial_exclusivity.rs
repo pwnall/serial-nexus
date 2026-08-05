@@ -48,7 +48,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use serial_nexus_itest::{
-    Daemon, Rpc, TempRun, bin, crossover_ports, daemon_answers, serial_echo, wait_until,
+    Daemon, Rpc, TempRun, bin, crossover_ports, daemon_answers, serial_echo, skip_no_rig,
+    wait_until,
 };
 
 /// The daemon's documented signal-verb ceiling (`Daemon::MAX_SIGNAL_MS`). Duplicated
@@ -406,10 +407,7 @@ arbitration = "free-for-all"
 #[test]
 fn a_break_straddled_by_a_replace_leaves_the_line_transmitting() {
     let Some((port_a, port_b)) = crossover_ports() else {
-        eprintln!(
-            "SKIP a_break_straddled_by_a_replace_leaves_the_line_transmitting: no crossover \
-             rig (set SNX_CROSSOVER_A/_B to two cross-wired adapters)"
-        );
+        skip_no_rig("a_break_straddled_by_a_replace_leaves_the_line_transmitting");
         return;
     };
     // Deliberately far longer than anything this test waits for: if the fix regresses to

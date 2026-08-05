@@ -32,6 +32,14 @@
 #     should measure here, but a probe error skips rather than failing the lane:
 #     both are informational numbers a tuning decision is read against, and macOS
 #     is not the tuning target.
+#   - P10 additionally admits `degraded`, and this platform is *why*. Its depths are
+#     only this kernel's depths if the pty was in the daemon's raw baseline, and off
+#     Linux that baseline is applied through a slave `apply_pty_baseline` immediately
+#     closes — which BSD does not carry to the next open. P10 now re-asserts on the
+#     slave it measures and reports `slave_termios_mode`; if that re-assert ever
+#     fails here, the probe must be able to SAY the number is unsound rather than be
+#     forced to `supported`. A `degraded` P10 on this lane means exactly that and
+#     should be read, not silenced (notes §3.34).
 #   - P11 (real-port line-state ioctls) may be any status: it is opt-in behind
 #     --port (so the CI run skips), and on a named macOS port it is `degraded` by
 #     design, because TIOCGICOUNT is Linux-only and the serial node omits the
@@ -58,7 +66,7 @@ and (any(.probes[]; .id == "P6" and .status != "unsupported"))
 and (any(.probes[]; .id == "P7" and .status != "unsupported"))
 and (any(.probes[]; .id == "P8" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P9" and (.status == "supported" or .status == "skipped")))
-and (any(.probes[]; .id == "P10" and (.status == "supported" or .status == "skipped")))
+and (any(.probes[]; .id == "P10" and (.status == "supported" or .status == "skipped" or .status == "degraded")))
 and (any(.probes[]; .id == "P11"))
 # P12 (session-boundary edge, §15.39) is the mechanism that carries §6's
 # detach-release on THIS platform — Darwin destroys the readable packet P7 measures
