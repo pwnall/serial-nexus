@@ -5,6 +5,87 @@ the one every mechanism is specified against; macOS is supported where plain
 POSIX carries the design, and degrades — never crashes, never silently misbehaves
 — everywhere the design leans on a Linux-only facility.
 
+## Update — 2026-08-04 Tier-3 rig pass (macOS 15.7.8 / Darwin 24.6.0, x86_64, real FTDI crossover): P13 answers the last-close question
+
+**The prediction the block below pre-registered came back positive, and it is now an artifact
+rather than a source reading.** `docs/doctor/macos-24.6.0-2026-08-05-tier3.json` (binary
+`fa4b12d6f529`, probe set `a131e1f4b46d6c83`; named for the UTC day of its own `generated`
+stamp, `2026-08-05T00:22:48Z`, taken on the evening of the 4th local — the directory's naming
+convention, not a different session). Tier 3 on the cross-wired FT232R pair
+`/dev/cu.usbserial-BH00L4KU` ↔ `BH00LL8O`. Verdicts: **15 supported · 7 degraded · 0
+unsupported · 3 skipped**.
+
+**P13 on Darwin 24.6.0 reads `waits-then-discards`, `close_waits_for_reader: true`:**
+
+| shape | `close_microseconds` | recovered | meaning |
+|---|---|---|---|
+| `a_no_reader_blocking_slave` | **601087** | 0 of 64 | the drain-wait runs to its timeout, then destroys |
+| `b_reader_drains_before_close` | 13 | **64 of 64** | a drained queue closes immediately — the daemon's case |
+| `c_no_reader_nonblocking_slave` | 28 | 0 of 64 | `O_NONBLOCK` takes the destructive branch at once |
+
+Against Linux, which notes §3.30 records as `retains`, 7 µs, 64/64 — **not artifact-backed: no
+committed report in `docs/doctor/` contains a P13 block at all**, so treat the Linux column as a
+recorded measurement pending a HEAD-vintage Linux capture, not as a citation.
+
+**Why this is a confirmation and not a fit.** The block below derived, from XNU source alone,
+that `ptsclose` → `ttylclose` → `ttywflush` → `ttywait` waits up to `t_timeout` = 60 ticks
+(≈0.6 s at `hz` 100) before any destructive flush, and that `O_NONBLOCK` skips the wait. Both
+halves were written down *before* the probe ran here. `sysctl kern.clockrate` on this box reads
+`hz = 100, tick = 10000`, so the source reading predicts **600 000 µs** exactly; five independent
+captures measured 600115, 600249, 600363, 601087 and 601095 µs — the predicted timeout plus
+scheduling slop. Shape `c` is the controlled A/B on the single flag `ttylclose` branches on:
+same absence of a reader, `O_NONBLOCK` set, 28 µs instead of 601087. The mechanism is measured,
+not inferred.
+
+**What this does *not* settle, kept separate on purpose:**
+
+- **It does not explain the 08-03/08-04 `p8_map` red.** No P13 ran on `macos-26-arm64`; this is
+  Darwin 24.6.0 / x86_64. And 601087 µs ≈ 60 ticks at `hz` 100 is itself an `hz`-dependent
+  quantity that nothing measured on the runner. The §7 limits recorded at the end of the next
+  block apply to this artifact exactly as they applied to the P7 one.
+- **It does not measure the shape the failing test inhabits.** All three shapes decide the
+  reader's fate *before* `close(2)`; none has a reader arriving *during* the close-wait. The
+  question "how long after the slave's `close(2)` may the master first read and still recover"
+  is still unbuilt, exactly as the last bullet of the next block says.
+- **It measures the targetward direction only** — bytes the slave wrote that the master has not
+  read (`t_outq`). It says nothing about the hostward/`FREAD` queue, so it must not be cited for
+  delta 3's control-packet claim or for `discarded_at_last_close` being structurally 0 here.
+- **What it does dissolve** is the arithmetic in the next block's first bullet. That bullet
+  reasons from "for a *quiescent* master the flush is unconditional here" and concludes the test
+  should have been *near-always red*, leaving 29 green runs as a paradox. The flush is not
+  unconditional: it is the timeout arm of a drain-wait, reached in ~0.6 s precisely *because*
+  P7's master is quiescent. Against the daemon's reader cadence (`ACTIVE_POLL` 200 µs doubling to
+  `IDLE_POLL` 5 ms, `runtime.rs`) a 601 ms window is ~120 idle-poll periods of slack, so 29/29
+  green is the *predicted* outcome. Destruction against a quiescent master stands as the
+  **outcome**; "unconditional" is refuted as the **mechanism**. The red still wants an
+  explanation, and it is now pinned to a ≥601 ms reader stall — a daemon-side event, a different
+  and more serious defect class than a lost microsecond race.
+
+**Comparability: this artifact diffs against nothing committed.** Every other report in
+`docs/doctor/` carries probe set `01b257ece8c48470` and none contains P13; this one carries
+`a131e1f4b46d6c83`. By that directory's own rule an unequal fingerprint means a field-by-field
+comparison is reading two different instruments — including against
+`macos-24.6.0-2026-07-30-tier3.json` from this same box. Restoring a lawful cross-kernel diff
+needs a fresh Linux capture at the HEAD fingerprint; that is **owed**.
+
+**Whole-gate hardware validation, same tree (`fa4b12d`), rig attached.** `cargo test --workspace
+--locked --exclude serial-nexus-web --no-fail-fast`: **680 passing, 1 failing, 4 ignored** across
+109 test binaries, with `fmt`, clippy, `cargo deny` and `expectations/macos.jq` green, and **all
+four `serial_hardware.rs` rig tests passing** on the physical crossover
+(`crossover_rig_data_plane_send_and_exclusivity`, `crossover_rig_signal_verbs`,
+`crossover_rig_custom_baud_byte_exact`, `crossover_rig_map_node_both_directions`) — the macOS
+auto-detect arm of `crossover_ports()` fires on exactly two `/dev/cu.usbserial-*` nodes, so these
+ran rather than self-skipping. The one failure is **`p6_hostility::a_trickling_peer_trips_the_handshake_deadline_and_the_leg_heals`**,
+captured verbatim: `assertion left == right failed … {"error":"Connection refused (os error 61)",
+"mode":"wire","pass":false,"tool":"serial-nexus-sim"}`. It is **contention-dependent and
+reproduced, not argued**: 0 failures in 20 serial runs, 1 in 40 under 8-way concurrency, same
+fingerprint. ECONNREFUSED rather than ENOENT means the socket path existed with nothing yet
+accepting, which points at the gap between `load`'s RPC reply and the leg's `UnixListener::bind`
+in its spawned task — i.e. §9's "proxy in time", a config-accepted reply standing in for a
+listener's readiness. **That is a located suspect, not a root cause**: it has had no independent
+adversarial verification (§9) and no fail-first proof, so nothing here is fixed on the strength
+of it. Filed for a session that can do both.
+
 ## Update — 2026-08-04 CI triage (macos-26-arm64 runner; diagnosed and re-proved on Linux)
 
 The nightly macOS lane went red on 08-03 and 08-04 on one target, `p8_map`'s
@@ -118,6 +199,19 @@ Two things this pass did **not** settle, recorded so the next one does not re-de
   the two hypotheses is live — because it is the one measurement `discards` and `waits-then-discards`
   do not share. **Run the doctor on a Mac and commit the artifact (§16.13); until then this remains
   open.** The paragraph below is what P13 was built to replace.
+  <!-- ANNOTATION 2026-08-04 (§5: the prediction above is left standing because it was
+       pre-registered — it is evidence only if both halves survive). DISCHARGED. The doctor
+       ran on the rig and the artifact is committed: `docs/doctor/macos-24.6.0-2026-08-05-tier3.json`
+       (binary `fa4b12d6f529`, probe set `a131e1f4b46d6c83`). Measured `waits-then-discards`,
+       `close_waits_for_reader: true`, `close_microseconds` 601087 with 0 of 64 recovered —
+       "hundreds of thousands", as predicted — against 13 µs / 64-of-64 when the reader drains
+       first and 28 µs / 0-of-64 with `O_NONBLOCK`. See the 2026-08-04 Tier-3 rig block at the
+       top of this file, including what it does not settle. -->
+- **What the answer changed, and what it did not.** The 601 ms figure dissolves the
+  near-always-red arithmetic in the first bullet (see the top block): the flush is the timeout arm
+  of a drain-wait, not an unconditional destruction, so 29/29 green is predicted rather than
+  paradoxical. It leaves the two §7 limits above untouched — different kernel, different
+  architecture — and it does not reach the shape the bullet below names.
 - **Why the existing set could not answer it.** P7 asks
   what a collapsed session leaves readable against a master nobody drains. The unmeasured question
   is the one this test actually asks: with a master being *actively drained* on the daemon's poll
@@ -135,6 +229,13 @@ crossover. The first committed macOS `serial-nexus-doctor` artifact came out of 
 `docs/doctor/macos-24.6.0-2026-07-30-tier3.json`, same `probe set` fingerprint as the Linux
 reports, so it diffs against them field for field. Until now every macOS claim on this page
 cited a scrollback, which §7 does not permit.
+<!-- ANNOTATION 2026-08-04 (§5: scoping a sentence that stayed true of its own subject while
+     the directory moved under it). "Same fingerprint as the Linux reports" remains correct for
+     THIS artifact — it and every report committed before 2026-08-05 carry `01b257ece8c48470`.
+     It is no longer true of `docs/doctor/` as a whole: the Tier-3 run at the top of this file
+     carries `a131e1f4b46d6c83`, because P13 joined the probe set. Do not read the sentence as
+     licensing a diff between the 07-30 artifact and the 08-05 one — they are two instruments. -->
+
 
 Two defects, **both in the harness, neither in the product**, and both invisible to CI's
 matrix for the same structural reason — the macOS lane runs a *subset* of the gates:
@@ -529,9 +630,22 @@ here for free, and the counter that names the discard has nothing to name. **ver
   the meaningful permission signal on macOS.
 - The `kernel` and `os` environment fields read Linux files
   (`/proc/sys/kernel/osrelease`, `/etc/os-release`); on macOS they render empty /
-  `unknown`. Cosmetic — the report is still valid and copy-pasteable.
+  `unknown`. Cosmetic — the report is still valid and copy-pasteable. Still true at
+  `fa4b12d`, which is why the committed artifacts record the OS version in
+  `docs/doctor/README.md`'s index row instead.
+- **P13 (last-close disposition) is pty-only and portable, and macOS is the platform
+  it was built for.** It never judges the policy — every policy is legitimate and the
+  daemon is correct under each — so its verdict is `supported` whenever the
+  measurement completes, and a `waits-then-discards` answer is not a degradation.
+  Measured here: `waits-then-discards`, `close_waits_for_reader: true`, 601087 µs with
+  0 of 64 recovered against no reader; 13 µs with 64 of 64 when the master drains
+  first; 28 µs with 0 of 64 for an `O_NONBLOCK` slave. Note the harness cost this
+  implies: on Darwin every never-drained blocking close in a test pays up to 0.601 s of
+  wall clock, so P13 itself is ~1.2 s slower here than on Linux (shapes a and c).
 
-**cross-checked** for the gating; the live verdicts **need a Mac.**
+**cross-checked** for the gating, and the live verdicts are now measured on the rig —
+`docs/doctor/macos-24.6.0-2026-08-05-tier3.json` (binary `fa4b12d6f529`, probe set
+`a131e1f4b46d6c83`, 2026-08-04 local / `2026-08-05T00:22:48Z`).
 
 ### 6. How to check on a Mac
 
@@ -560,7 +674,7 @@ expectations/linux.jq`. The macOS lane runs, and gates on, the
 `expectations/macos.jq` counterpart — the *looser* profile this page describes, and
 looser clause by clause rather than wholesale, because "nothing may report
 `unsupported`" stopped being the right shape once the probe set grew past P5. What
-it requires today: a well-formed report carrying all **twelve** probes, each with a
+it requires today: a well-formed report carrying all **thirteen** probes, each with a
 status; P2, P6 and P7 — the POSIX pty mechanisms — not `unsupported` (either verdict
 word is fine, and `degraded` is the *expected* macOS answer for P2, §7.2's BSD arm);
 P8 `supported` **or** `skipped`, because `epoll(7)` does not exist here, so it is
@@ -570,7 +684,10 @@ against a tuning target macOS is not; **P12 `supported` or `degraded`** — the 
 clause where this file is *stricter* than `linux.jq`, because the session-boundary
 edge is the mechanism that carries §6's detach-release here (§15.39) where Linux has
 the retained packet, so `skipped` is the expected Linux answer and would be a real
-failure on a Mac; and P1, P3, P4, P5 and P11 *any* status,
+failure on a Mac; **P13 `supported` or `degraded`**, presence-and-status only and
+deliberately never a required policy word — pinning `waits-then-discards` would make
+a kernel that changed its mind fail the lane instead of reporting the change, which
+is the opposite of what a kernel-diff probe is for; and P1, P3, P4, P5 and P11 *any* status,
 EXTPROC being unverified and the by-id and driver-counter mechanisms Linux-only. The
 `linux.jq` gate is the template it is modeled on, and the deltas this one tolerates
 are the ones this page enumerates.

@@ -3760,7 +3760,7 @@ mod tests {
         );
     }
 
-    /// P6..P12 may never report `unsupported`, on any box.
+    /// P6..P13 may never report `unsupported`, on any box.
     ///
     /// Each measures *which* of several legitimate kernel behaviours applies, and
     /// the shipped daemon is correct under all of them — so none can contradict a
@@ -3768,7 +3768,9 @@ mod tests {
     /// `expectations/linux.jq` requires `.summary.unsupported == 0` and
     /// `itest/tests/meta_gates.rs` asserts the doctor reports no unsupported
     /// capability, so a probe that reddened on a healthy box would fail CI. This
-    /// runs the real probes (about a second of ptys and polls) rather than reasoning
+    /// runs the real probes (about a second of ptys and polls on Linux, and roughly
+    /// 1.2 s more on Darwin, where P13's two no-reader shapes each pay `ttywait`'s
+    /// ~0.6 s `t_timeout`) rather than reasoning
     /// about the code, because the arm that would break the rule is one someone adds
     /// later. P11 is included with **no** ports, which is its default shape: a
     /// passive run must stay `skipped` and must never open anything.
@@ -3787,6 +3789,13 @@ mod tests {
             // (the latch is inert there, §15.39) and carries measurements where
             // it runs, so both assertions below apply to it unchanged.
             p12_session_edge(),
+            // P13 belongs here for the same reason as P12, and was missed when it
+            // landed: both expectation files gate it by name, so an `unsupported`
+            // P13 reddens both lanes. The measurements assertion matters more here
+            // than anywhere else — P13 never judges the policy (every policy is
+            // legitimate), so its verdict word carries no information at all and the
+            // observations are the entire content of the probe.
+            p13_last_close_disposition(),
         ] {
             assert!(
                 !p.status.is_unsupported(),

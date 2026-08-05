@@ -24,6 +24,7 @@ anything built before 2026-07-28 — is not comparable with these.
 
 | File | Kernel / box | Binary | Probe set | Rig | Verdicts |
 |---|---|---|---|---|---|
+| [`macos-24.6.0-2026-08-05-tier3.json`](macos-24.6.0-2026-08-05-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**; `kernel`/`os` still read empty and `unknown` (the same cosmetic gap), so the version is recorded here | `fa4b12d6f529` | **`a131e1f4b46d6c83`** | **Tier 3** — the same cross-wired FT232R pair (`/dev/cu.usbserial-BH00L4KU` ↔ `BH00LL8O`) | 15 supported · 7 degraded · 0 unsupported · 3 skipped |
 | [`macos-24.6.0-2026-07-30-tier3.json`](macos-24.6.0-2026-07-30-tier3.json) | Darwin 24.6.0 / macOS 15.7.8, x86_64 — **the Mac**; the report's own `kernel`/`os` fields read empty and `unknown`, which is the documented cosmetic gap (`docs/macos.md` delta 5), so the version is recorded here instead | `a1029778fda9` | `01b257ece8c48470` | **Tier 3** — the same cross-wired FT232R pair, as `/dev/cu.usbserial-BH00L4KU` ↔ `BH00LL8O` | 14 supported · 7 degraded · 0 unsupported · 3 skipped |
 | [`linux-7.0-2026-07-29-tier3-2.json`](linux-7.0-2026-07-29-tier3-2.json) | 7.0.0-28-generic, Ubuntu 26.04 — the dev box | `2e5874bbe090` | `01b257ece8c48470` | **Tier 3** — the same cross-wired FT232R pair (`BH00L4KU` ↔ `BH00LL8O`) | 21 supported · 0 degraded · 0 unsupported · 1 skipped |
 | [`linux-6.18-2026-07-29-tier3.md`](linux-6.18-2026-07-29-tier3.md) | 6.18.14-1rodete4-amd64, Debian rodete — **the production box** | `85699d66c5a5` | `01b257ece8c48470` | **Tier 3** — two FTDI FT232R cross-wired (`BH00LL8O` ↔ `BH00L4KU`) | 21 supported · 0 degraded · 0 unsupported · 1 skipped |
@@ -40,13 +41,28 @@ Tier-3 report and the three 7.0 passive runs — because they are captured tool 
 their `tool` field carries the binary's pre-rename name, and nothing in this directory is
 hand-edited to read more tidily. That is the whole point of committing them — an artifact
 edited after the fact is an assertion again, not a check — so the retired-name meta-gate
-exempts exactly those four by name, and `README.md` (this file) not at all. The **two**
-7.0 Tier-3 reports need no exemption: both were produced by post-rename binaries and
-carry the current name on their own, which is what "a future report will fix itself"
-looks like in practice.
+exempts exactly those four by name, and `README.md` (this file) not at all. The **four**
+remaining reports need no exemption — the two 7.0 Tier-3 runs and both macOS Tier-3 runs:
+all were produced by post-rename binaries and carry the current name on their own, which is
+what "a future report will fix itself" looks like in practice.
 
-Same binary, same commit, same fingerprint on both sides of the diff: these two
-kernels are comparable field by field, and `docs/serial-nexus-doctor.md` does the
+## The probe set moved on 2026-08-05, and the set is no longer one comparable family
+
+`macos-24.6.0-2026-08-05-tier3.json` carries probe set **`a131e1f4b46d6c83`**. Every other
+report here carries `01b257ece8c48470`, and none of them contains a P13 block at all — P13
+joined the probe set after they were taken. By this file's own rule that makes the 08-05
+report **not field-by-field comparable with anything else in this directory**, including
+`macos-24.6.0-2026-07-30-tier3.json` from the same box and the same rig. Read the difference
+between those two as the instrument moving, never as Darwin changing its mind: P10's direction
+keys were also renamed in the same window. A reader who wants a lawful cross-kernel diff at the
+current fingerprint needs a fresh Linux capture at `a131e1f4b46d6c83`; **that capture is owed
+and is not in this directory.** Until it lands, P13's Linux figures live in
+`docs/implementation-notes.md` §3.30 as a recorded measurement, not as a citable artifact — the
+asymmetry is stated here rather than smoothed over, because the whole point of the fingerprint
+is that it refuses a comparison instead of quietly permitting a wrong one.
+
+Same binary, same commit, same fingerprint on both sides of the diff: the pre-P13 reports are
+comparable field by field, and `docs/serial-nexus-doctor.md` does the
 comparison. The recorded pre-2026-07-28 baselines are **not** in this set and are
 not comparable to these — `doctor/src/probes.rs` moved 702 lines between
 `a2d3b96` and `85699d6` (P12 arrived, P4 and P5 were rewritten). Those older runs

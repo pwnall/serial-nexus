@@ -69,14 +69,28 @@ and (any(.probes[]; .id == "P11"))
 # point, like P6/P7's.
 and (any(.probes[]; .id == "P12" and (.status == "supported" or .status == "degraded")))
 # P13 (last-close disposition) is pty-only and portable, so it must measure here —
-# and macOS is the platform it was built for. Reading XNU, `ptsclose` calls
-# `ttylclose` -> `ttywflush` -> `ttywait` before any flush, so the expected answer
-# here is `waits-then-discards` with a `close_microseconds` in the hundreds of
-# thousands, against Linux's `retains` at single-digit microseconds. The clause is
+# and macOS is the platform it was built for. The XNU reading behind this clause is
+# no longer a prediction: it was measured on Darwin 24.6.0 / macOS 15.7.8 and the
+# answer is `waits-then-discards`, `close_waits_for_reader` true, with
+# `a_no_reader_blocking_slave` at 601087 us and 0 of 64 recovered (`ttywait` running
+# to its 60-tick `t_timeout` at hz 100), `b_reader_drains_before_close` at 13 us and
+# 64 of 64, and `c_no_reader_nonblocking_slave` at 28 us and 0 of 64 — the O_NONBLOCK
+# arm of the same `ttylclose` branch, measured as an A/B rather than inferred. See
+# `docs/doctor/macos-24.6.0-2026-08-05-tier3.json` (binary `fa4b12d6f529`, probe set
+# `a131e1f4b46d6c83`); Linux 7.0.0-29 reads `retains` at 7 us. The clause is
 # still presence-and-status only, deliberately: pinning the word would make a kernel
 # that changed its mind fail the lane instead of reporting the change, which is the
 # opposite of what this probe is for. Read the numbers, diff them, then decide.
 and (any(.probes[]; .id == "P13" and (.status == "supported" or .status == "degraded")))
+# ...and a probe that RAN must carry the numbers, which is the whole reason the
+# clauses above stay presence-and-status only. `linux.jq` has always asserted this;
+# macOS did not, so a P13 whose observations went empty reported `supported` and
+# sailed through the one lane whose answer is interesting. A verdict word cannot be
+# diffed. `skipped` is exempt (P8 here) — it did not run, so it owes nothing.
+and (all(.probes[]; . as $p
+      | ((["P6","P7","P8","P9","P10","P12","P13"] | index($p.id)) == null)
+      or ($p.status == "skipped")
+      or (($p.observations | length) > 0)))
 # Provenance, same as `linux.jq` and for the same reason: a report that cannot say
 # which build produced it makes every cross-platform claim rest on an accident.
 # Structure only — `commit` may read `unknown` off a tarball build.

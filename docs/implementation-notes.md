@@ -330,7 +330,7 @@ was briefly unable to invoke the doctor with `--port`; nothing failed, so nothin
 attributing, but the documented order was inverted and is recorded as such rather than
 tidied away. The certificate is committed as
 `docs/doctor/linux-7.0-2026-07-29-tier3-2.json` — binary `2e5874bbe090` (the remediation
-commit), probe set `01b257ece8c48470`, equal to every other artifact in that directory and
+commit), probe set `01b257ece8c48470`, equal to every *pre-P13* artifact in that directory and
 therefore diff-comparable with all of them — **21 · 0 · 0 · 1**, the one skip being P12,
 inert on Linux by design. P5 reports the pair crossed in *both* directions with
 `rate_ladder=true deliberate_mismatch_observed=true` on both ports, and it passes
@@ -3055,11 +3055,22 @@ targets on Linux (2026-08-04: the P13 probe's unit test, `p8_map`'s residual-for
 guard and `p13_teardown_accounting`'s three, on top of the 724 the review-37
 remediation left on 2026-07-29); of those, one is the doc-tested
 twelve-line embedder `main` in `daemon/src/lib.rs`, which is the §15.26 entry surface
-proving it still compiles under the family names. On **macOS** the same tree is **711
-passing, 0 failed, 4 ignored** across 101 binaries + 8 doc-test targets (2026-07-30, Darwin
-24.6.0 / 15.7.8, x86_64, with the FT232R crossover attached so `serial_hardware.rs` runs
-rather than self-skipping); the shortfall against Linux is the Linux-only targets and the
-serial-device tests that self-skip where a pts is not a serial device, not failures.
+proving it still compiles under the family names. On **macOS** the same tree is **715
+passing, 0 failed, 4 ignored** across 102 binaries + 8 doc-test targets (2026-08-04 at
+`fa4b12d`, Darwin 24.6.0 / 15.7.8, x86_64, with the FT232R crossover attached so
+`serial_hardware.rs` runs rather than self-skipping — all four rig tests executed); the
+shortfall against Linux is the Linux-only targets and the serial-device tests that self-skip
+where a pts is not a serial device, not failures. The binary count moved 101 → 102 with
+`p13_teardown_accounting`. Two notes on reading that run. The `test result:` lines number 112
+rather than 110, because `p8_external_codec` builds and runs the out-of-tree consumer template
+and its nested cargo emits two more. And the figure is a *clean* run only on the second pass:
+the first full run on this box hit one contention-dependent flake,
+`p6_hostility::a_trickling_peer_trips_the_handshake_deadline_and_the_leg_heals`, which failed 0
+of 20 times run serially and 1 of 40 under 8-way concurrency with the same `Connection refused
+(os error 61)` fingerprint. ECONNREFUSED rather than ENOENT places it in the window between
+`load`'s reply and the leg's `UnixListener::bind` in its spawned task — a §9 proxy-in-time
+suspect, **located but not root-caused**: no independent adversarial verification, no fail-first
+proof, and nothing fixed on its strength.
 
 **Hardware integration test (Tier-3, opt-in):** `itest/tests/serial_hardware.rs` — the
 end-to-end test on *real* silicon (design §13/§15.17/§15.21, plan §5), which replaced the
@@ -3107,7 +3118,7 @@ rig certifies, the `--json`/`jq` gate, and `cargo test` at all) is enumerated in
 | `serial-nexus-core` | graph model + validator (§4), data-plane deliver contracts + holdover (§5), lock state machine incl. `reclaim_held` (§6), config/state split (§15.8), **device-identity `resolver` (§12)** | done |
 | `serial-nexus-rpc` | JSON-RPC 2.0 wire types — the stable §15.16 surface | done |
 | `serial-nexus-sim` | test double: `pty`/`client`/`mux`/`envelope`/`exec-conformance`/`wire`/`tcp-proxy`/`nullmodem` modes (§3) | done |
-| `serial-nexus-doctor` | shipping capability checker: probes P1–P12 + env checks (§15.17) | done |
+| `serial-nexus-doctor` | shipping capability checker: probes P1–P13 + env checks (§15.17) | done |
 | `serial-nexus-daemon` | the daemon | control plane + node lifecycle + data plane + codecs + leg/wire done |
 | `serial-nexus-ctl` | the CLI (thin RPC client + `--json`) | `load [--replace]`/`add-node`/`remove-node [--cascade]`/`connect`/`disconnect`/`dump`/`state`/`info`/`ports`/`subscribe`/`tap`/`rotate`/`lock`/`unlock`/`send`/`send-break`/`set-modem`/`pulse-dtr`/`teardown`/`shutdown` |
 | `serial-nexus-web` | the web console's server half (§17): static assets, the split credential and token gate, TLS, the bounded WebSocket bridge that forwards an allowlist of RPC methods, plus a `wsclient` headless client for driving the browser-facing protocol without a browser | done |
@@ -3805,7 +3816,21 @@ if that wait fails or the fd is `O_NONBLOCK` — so for the blocking fd this tes
 Darwin outcome of the *old* ordering is green, matching 29/29, and a red means the reader did not
 drain inside ~0.6 s. That is a **reader stall**, a different defect class. `docs/macos.md`
 (2026-08-04) carries the source excerpt, the correction to this repo's standing mechanism claim, and
-the probe that separates the two hypotheses. The reorder below is justified as removing a latent
+the probe that separates the two hypotheses.
+**Amended 2026-08-04: that source reading is now a measurement, and the *green* half is explained.**
+P13 on Darwin 24.6.0 reports `policy: waits-then-discards`, `close_waits_for_reader: true`, and
+601087 µs with 0 of 64 recovered against no reader — 60 ticks at the `hz = 100` this box reports —
+against 13 µs with 64 of 64 when the reader drains first and 28 µs with 0 of 64 for an `O_NONBLOCK`
+slave, which measures the `ttylclose` branch as an A/B instead of inferring it
+(`docs/doctor/macos-24.6.0-2026-08-05-tier3.json`, binary `fa4b12d6f529`, probe set
+`a131e1f4b46d6c83`). Against the daemon's reader cadence (`ACTIVE_POLL` 200 µs doubling to
+`IDLE_POLL` 5 ms, `runtime.rs`) a 601 ms window is ~120 idle-poll periods of slack, so 29/29 green is
+the **predicted** outcome rather than the anomaly this paragraph treated it as. What stays unclaimed
+is the **red**: it is now pinned to a ≥601 ms reader stall, but no P13 ran on `macos-26-arm64`, that
+lane is a different kernel and architecture, and none of P13's three shapes covers a reader arriving
+*during* the close-wait — which is the shape the failing test actually inhabits. Also note the scope:
+P13 measures the targetward direction only, so it does not speak to the hostward/`FREAD` claims this
+entry and `docs/macos.md` delta 3 make about the control packet. The reorder below is justified as removing a latent
 proxy-in-time defect, **not** as a root-cause fix; it may also mask the stall signal, which is stated
 there in as many words. This is §9's "proxy in time" in its third dress, after the two
 `docs/macos.md` already records — its delta 4 (a Linux-only closure predicate) and its delta 6 (an
@@ -3921,8 +3946,27 @@ across all four quadrants including the pair that differs *only* in the close du
 that read the byte count alone would collapse them, which is the conflation the probe exists to undo.
 Both expectation files gained a presence-and-status clause (never a required word: pinning the answer
 would make a kernel that changed its mind fail the lane instead of reporting the change), and
-`macos.jq`'s structural count moved 12 → 13. **The macOS artifact is still owed** — until the doctor
-runs on a Mac and that report is committed, `docs/macos.md`'s open question stays open.
+`macos.jq`'s structural count moved 12 → 13.
+**The macOS artifact is no longer owed — it ran, and it answers the question.**
+`docs/doctor/macos-24.6.0-2026-08-05-tier3.json` (binary `fa4b12d6f529`, probe set
+`a131e1f4b46d6c83`, `2026-08-05T00:22:48Z`, Tier 3 on the FT232R crossover) measures Darwin
+24.6.0 / macOS 15.7.8 x86_64 at **`waits-then-discards`, `close_waits_for_reader: true`**:
+shape `a_no_reader_blocking_slave` **601087 µs / 0 of 64**, shape `b_reader_drains_before_close`
+**13 µs / 64 of 64**, shape `c_no_reader_nonblocking_slave` **28 µs / 0 of 64**. The two kernels
+differ by ~86000× in `close_microseconds`, which is exactly the separation this entry says the
+field exists to provide, and shape `c` makes the `O_NONBLOCK` branch an A/B measurement rather
+than an inference. The figure is stable: five captures on that box read 600115, 600249, 600363,
+601087 and 601095 µs, against `sysctl kern.clockrate` reporting `hz = 100, tick = 10000` — so
+XNU's `t_timeout` of 60 ticks predicts 600000 µs and the probe measures the predicted timeout
+plus scheduling slop. **Two asymmetries are recorded rather than smoothed.** The Linux figures
+above remain *not* artifact-backed: no committed report in `docs/doctor/` contains a P13 block,
+so a HEAD-vintage Linux capture is now the thing that is owed. And because P13 joined the probe
+set, the new artifact carries a fingerprint no other committed report shares, so it is
+field-by-field comparable with none of them — see `docs/doctor/README.md`.
+**Disposition note (§5):** this measurement gets **no new numbered §3 entry**. It changed no
+implementation decision — `waits-then-discards` is one of the three policies this entry already
+declares legitimate — so it is an amendment to the entry that made the prediction, not a
+deviation. Read the absence of a new number as deliberate.
 
 ### 3.31 An interior node's queued targetward bytes died uncounted at teardown — fixed
 
@@ -4118,7 +4162,28 @@ Full report: `docs/serial-nexus-doctor.md`. Re-runnable per system with
   (§15.39): Darwin destroys the retained packet at last close so the *edge* is the
   only mechanism there, while Linux keeps the packet, which is P7's subject. A
   Linux `skipped` is the expected answer and is not a gap; `expectations/macos.jq`
-  gates it tightly, `linux.jq` presence-only.
+  gates it tightly, `linux.jq` presence-only. **Scope note added 2026-08-04:** read
+  "Darwin destroys the retained packet at last close" as the *hostward control
+  packet* it is about — `ttywflush` flushes `FREAD` even on the drain-wait's success
+  path. It is not a blanket statement about last close, and P13 refutes the blanket
+  reading for the other direction: *targetward* bytes the slave wrote are preserved
+  for up to ~601 ms while the kernel waits for the master to drain.
+- **P13 last-close disposition of unread client bytes — measured on both platforms,
+  and they disagree.** Linux 7.0.0-29 `retains`: 7 µs, 64/64 recovered. Darwin
+  24.6.0 / macOS 15.7.8 `waits-then-discards`, `close_waits_for_reader: true`:
+  601087 µs and 0 of 64 with no reader, 13 µs and 64 of 64 when the master drains
+  first, 28 µs and 0 of 64 with `O_NONBLOCK` on the slave
+  (`docs/doctor/macos-24.6.0-2026-08-05-tier3.json`; the Linux side is recorded in
+  §3.30 and is **not** yet artifact-backed). Two consequences. It is what licenses
+  the `#[cfg(target_os = "linux")]` gate on `p8_map`'s
+  `a_closing_writers_residual_is_forwarded_not_purged` — the exclusion now has a
+  measurement on *both* sides rather than a platform prejudice on one. And it prices
+  §3.29's rule on Darwin: a post-close byte assertion against a blocking slave is not
+  a coin flip but a deadline, with ~601 ms of slack against a 200 µs–5 ms reader
+  cadence, so a red there means a reader stalled for the whole timeout — a
+  daemon-side defect, not a lost race. The one shape with no slack at all is
+  `O_NONBLOCK` on the slave (28 µs, unconditional), which is why §3.29's rule stays
+  absolute rather than becoming "safe on Darwin".
 
 ---
 
