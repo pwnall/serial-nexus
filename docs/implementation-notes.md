@@ -3071,7 +3071,16 @@ different scope, and the two must not be conflated:** `cargo test --workspace --
 test binaries** on a clean run, against the 680/1/4-across-109 baseline `docs/macos.md` records
 for `fa4b12d` in that same scope — 681 tests run there against 684 here, the +3 being exactly the
 three doctor guards of §3.34. No whole-workspace macOS run was taken at `7ead470`, so the 715
-figure above stands as the only one of its kind and is **not** superseded by 684. **That clean
+figure above stands as the only one of its kind and is **not** superseded by 684.
+**A third macOS figure landed on 2026-08-05 at `1a9a8fc`, in that same
+`--exclude serial-nexus-web --no-fail-fast` scope: 690 passing, 1 failing, 4 ignored across 109
+test binaries.** The +6 over 684 is new `#[test]`s from `45d50cb`, `88d0de5` and `4b78fff` with no
+new test binary; 690 + 1 = 691 tests run. **The one failure is
+`p4_free_for_all::free_for_all_endpoint_lets_concurrent_writers_both_reach_device`**, which is
+**not** the `p6_hostility` flake below — that flake did not recur in this run — and which
+reproduces 12 of 12 on an idle box. It is that test's first execution on Darwin (§3.46), so 690/1/4
+is the honest current figure and 684/0/4 is not stale so much as taken before the rig fallback made
+this test run at all. **That clean
 number is one of three runs and must be quoted with the other two:** a second read 683/1/4, failing
 `p6_hostility::wire_hostility_faults_cleanly_then_leg_heals` — a different test from the flake
 described just below, in the same binary and with the same `Connection refused (os error 61)`
@@ -4601,6 +4610,29 @@ every single-valued assertion would still hold.
 actually does with the flag, and `baseline_via_master` reads **true** — not the `false` this
 session assumed. If `baseline_via_master` comes back `false`, refutation 2 above is itself wrong.
 
+<!-- ANNOTATION 2026-08-05 (§5, amend-first: this entry is annotated, not rewritten).
+     THE FALSIFIER ABOVE FIRED, AND REFUTATION 2 OF THIS ENTRY IS ITSELF REFUTED.
+     Measured on the Mac at binary `1a9a8fca1c36`, probe set `a131e1f4b46d6c83`:
+     `baseline_via_master` reads **false** in 12 of 12 observations — P6's
+     `client_session_baseline` plus P7's three shapes, across three sequential runs,
+     byte-identical (`docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3{,-2,-3}.json`).
+     The other two clauses held: P7 is `degraded` with `silence_cause:
+     "hangup-destroys-evidence"`, discriminated from `"extproc-unavailable"` by shape
+     `c` reading 0 where Linux reads 2.
+
+     Refutation 2 read: "P2's `termios_settable_without_slave: false` means Darwin
+     always takes the slave fallback." — "Also wrong … `handler_reset_applied: true`
+     *is* `set_baseline(&master).is_ok()`, so `tcsetattr` through the Darwin master
+     succeeds." The premise is sound and the inference is not. `apply_pty_baseline`
+     and `handler_reset_applied` call the IDENTICAL `set_baseline(&master)` at two
+     different points in a pty's life, and Darwin answers **Err at creation** and **Ok
+     after the hangup** — which is why `baseline_via_master: false` sits beside
+     `handler_reset_applied: true` in every run. At creation, the moment `nodes/pty.rs`
+     actually runs `apply_pty_baseline` and the moment P2's field is about, Darwin
+     DOES always take the momentary-slave fallback. Recorded per §9: a refuted
+     diagnosis is as load-bearing as a confirmed one, and this one was recorded by
+     this tree against itself. Full reading in §3.45 C and C'. -->
+
 ### 3.41 P13 gets the baseline repair; P8, P9 and P12 are measured not to need it
 
 **Design:** §7.2's baseline, and §7's rule that a kernel question is settled by measuring.
@@ -4652,6 +4684,26 @@ out sample count and cold start (all four cells 145–152 ns). Decomposing it pr
 reproduce P2's shape inside itself; that is a new measurement rather than a repair, and it is filed
 rather than smuggled into this change.
 
+<!-- ANNOTATION 2026-08-05 (§5). FILED, THEN BUILT, THEN MEASURED — this paragraph is
+     discharged. §3.44 built the 2x2 and §3.45 B measured it on Darwin: the gap is the
+     **fd state**, 7.46-10.12x across fd state at fixed mask against 0.968-1.314x across
+     mask at fixed fd state, with Linux flat. Two corrections to this paragraph's own
+     numbers, both from the committed artifacts rather than from argument:
+
+       * "agreeing on Linux (195 vs 263 ns)" and "all four cells 145-152 ns" cite no
+         artifact. The committed `-05b` triple at the same binary reads P2 173/169/173,
+         P9 headline 267/302/263, and all four 2x2 cells at 258-260. §3.44 records the
+         same cells as 166/172/166/166. Three Linux readings of the same cells spanning
+         ~145-260 ns are unreconciled across this file; §16.13 makes the committed triple
+         the figure of record and the others scrollback.
+       * The Linux P2-vs-P9 *headline* ratio is not ~1.0 as "agreeing" implies — it is
+         1.52-1.79x, and §3.45 B attributes essentially all of it to instrument offset
+         (different poll wrapper, n=16 cold against n=4096). So the honest Linux statement
+         is "the four 2x2 cells agree", not "P2 and P9 agree".
+
+     What this paragraph got right and the measurement confirmed: P2 and P9 are not the
+     same measurement, and the fd state is the variable that matters. §3.45 B. -->
+
 ### 3.42 P5's UART predicate was a Linux-only proxy, and the crossover rig could never certify off Linux
 
 **Design:** §15.21's certificate, and §9's rule against a proxy in space.
@@ -4687,6 +4739,35 @@ mismatch, break reception, far-side modem), not the predicate's portability.
 **Pre-registered for the next Mac run (§7):** both FTDI ports certify, and P5 reports **Tier 3** with
 `rate_ladder=true`. If they still report `cert: skipped`, `TIOCMGET` does not discriminate on Darwin
 the way the committed `modem_calls_ok: true` implies and this entry is wrong.
+
+<!-- ANNOTATION 2026-08-05 (§5). HALF MET, and the half that failed is structural rather
+     than a kernel surprise. Measured at `1a9a8fca1c36`
+     (`docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3{,-2,-3}.json`): the entry's own
+     falsifier did NOT fire — neither port reports `cert: skipped` any more, both
+     certify, and the pair reports `rate_ladder=true`, so `TIOCMGET` does discriminate
+     on Darwin exactly as `modem_calls_ok: true` implied. What did not happen is the
+     tier: `grep -c "Tier [0-9]"` over the report is **0**, because `p5_verdict`'s
+     `!uncertified.is_empty()` arm returns before the tier-naming arm, and `icounter`
+     (both ports) plus `deliberate_mismatch` (the pair) are still uncertified. So P5's
+     status moved `supported` -> `degraded`, which is the honest direction: the old
+     `supported` was UNFALSIFIABLE on macOS — with `p5_is_uart` gated solely on
+     TIOCGICOUNT's ENOTSUP stub, `any_uart` was false and `failures` empty, and
+     `p5_verdict` reaches a hardcoded `Status::Supported` by its final `else` for every
+     possible macOS input. Zero items were evaluated before; five are now. Filed, not
+     fixed: the tier-naming arm is unreachable whenever anything is uncertified, and the
+     new consequence names the two uncertified items without saying they are
+     structurally unmeasurable on this kernel (the old text said "TIOCGICOUNT, which is
+     Linux-only"; the new text says neither). §7 wants the observation named. §3.45 E.
+
+     AND ON THIS ENTRY'S OTHER OPEN ITEM: the paragraph below beginning "Filed, not fixed
+     — the 1024/1022 asymmetry now has a mechanism but not a measurement" is superseded in
+     its second half. The measurement exists as of §3.45 A — P10's `recheck`, 6 of 6 on
+     Darwin — and it is CONSISTENT with the TTYHOG-2 / TTYCLSIZE two-queue source read
+     recorded below, but it cannot DISCRIMINATE that reading from a reservation charged at
+     the empty->nonempty transition, because the recheck's top-up never starts from empty.
+     So the accurate status is "has a measurement, but not a decisive one", and one extra
+     drain size in `p10_recheck` would settle it. -->
+
 
 **Filed, not fixed — the 1024/1022 asymmetry now has a mechanism but not a measurement.** It is
 **not** a probe artifact: P10 never enables packet mode, and enabling `TIOCPKT` on Linux was measured
@@ -4756,6 +4837,35 @@ mode is a red test that names its own cause, not a silent pass. **Pre-registered
 Mac run the six converted tests execute against the rig instead of skipping; if any goes red it will
 name the provider it used, and `p7_p5` continues to self-skip there as it always has.
 
+<!-- ANNOTATION 2026-08-05 (§5). THE PRE-REGISTRATION CAME TRUE IN THE FAILING DIRECTION,
+     and the safety property held exactly as written. On the Mac at `1a9a8fca1c36`,
+     `p4_free_for_all::free_for_all_endpoint_lets_concurrent_writers_both_reach_device`
+     executed against the rig and went RED, printing its provider first: "RIG: this test
+     is running on the crossover rig (...), not the sim null modem". Not a regression —
+     at `7ead470` it called `serial_pair()` and self-skipped with "no serial device on
+     this platform", so this is its first hardware execution anywhere.
+
+     Measured, not assumed (§8): on a quiet box, 12 of 12 reps failed at the committed
+     30 s deadline losing 5-31 bytes of 32768; raising ONLY the sink deadline to 120 s
+     gave one clean pass in 5.00 s and one failure that still lost 2 bytes after 122 s.
+     So a healthy run takes ~5 s against a 30 s budget. Precisely (§6 forbids the short
+     form, since every failing observation carries `timed_out: true` and the sim sets
+     that flag so a deadline is never read as a drop): what is measured is "not
+     recovered within 4x the committed deadline on a path where a healthy run finishes
+     in 5 s" — a stall or a loss, not separated here.
+     The same rig is byte-exact at 32768 bytes both ways in `serial_hardware.rs`, and the
+     other five `serial_pair_or_rig()` call sites (`p4_send`, `p4_exclusivity`, and three
+     in `p8_map`) all pass on it, so the wire and the single-writer path are sound and
+     what is left is two concurrent writers merging onto one free-for-all serial
+     endpoint. (`harness_contract` names the provider but is NOT a call site — its test
+     is a pure unit test of `choose_pair_source` that never opens a port.) MECHANISM NOT ESTABLISHED
+     and no root cause claimed (§9 would require an independent verifier; none ran).
+
+     Consequence for THIS entry: its "6 of the 7 pass byte-exact over the real wire" is a
+     LINUX figure, gathered by forcing an arm that is only the default on Darwin. On
+     Darwin it is 5 of 6. The overturn of §3.37 is not reversed — the seam still works and
+     still names itself — but the figure must not be quoted platform-free. §3.46. -->
+
 ### 3.44 The two experiments that were designed and not built — now built, so one Mac run answers both
 
 **Design:** §7 — settle a kernel question by measuring it, not by reasoning about it from the other
@@ -4816,6 +4926,247 @@ about a kernel this box is not. The prediction lives here, where being wrong is 
 under unchanged questions, and both run after every existing field is final, so the committed
 artifacts stay field-by-field diffable. Per §3.34's standing rule, the instrument change is announced
 in `docs/doctor/README.md` instead, because the digest will not announce it.
+
+### 3.45 The Mac run that answered §3.44 — both predictions held, one inference did not, and §3.40's own falsifier fired
+
+**Design:** §7 — settle a kernel question by measuring it.
+
+Artifacts: `docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3{,-2,-3}.json`, Darwin 24.6.0 /
+macOS 15.7.8 x86_64, binary `1a9a8fca1c36`, probe set `a131e1f4b46d6c83`, three sequential runs on a
+box at load 1.89–2.58 with the FT232R crossover attached and proven on the wire the same session.
+**These are the same binary as the `-05b` Linux triple** (`4b78fffc4bf2`): the intervening commit was
+docs-only, and `git diff 4b78fff 1a9a8fc -- '*.rs' '*.toml'` is empty. That is a stronger basis for
+the diff than the fingerprint gives, and it is stated here because the fingerprint cannot state it.
+
+**A. P10's depth is a capacity, not an allowance — the prediction held in 6 of 6, and the inference
+it was attached to is still underdetermined.** `room_republished_minus_room_freed` reads **0** and
+`refill_reproduced_total` reads **true** in all six Darwin observations (3 runs × 2 directions),
+exactly as pre-registered; neither named falsifier fired. `drained_again_bytes` 512 → `topped_up_bytes`
+512 in 512 one-byte writes, terminating in EAGAIN with `topup_ceiling_hit` false, and
+`refilled_from_empty_bytes` reproduces `total_bytes_accepted` exactly (1024 targetward, 1022
+hostward). Linux at the same binary reads delta **+2048 in 6 of 6**. **The whole P10 subtree is
+byte-identical across the three Darwin runs** (md5 ×3) where all three Linux subtrees differ — the
+determinism is itself the finding.
+
+*But the confirmation does not carry the inference attached to it, and that distinction is the
+point.* The discriminator was sampled at exactly one drain size, and `P10_RECHECK_DRAIN` is a
+hardcoded 512 against a Darwin capacity of 1024 targetward / 1022 hostward — so D is C/2 exactly
+targetward and D > C/2 (512 against 511) hostward, and either way **the experiment has one bit of
+resolution on this platform**. Any watermark model "writable iff occupancy < T, then accept up to C"
+predicts `topped_up == 512` for every T > 512; the data excludes only T ≤ 512. Worse for the
+original framing, **a reservation charged only at the empty→nonempty transition is invisible by
+construction** — the top-up always starts from occupancy C−512, never from empty — so the falsifier
+"a negative delta means a reservation" *cannot fire* on that shape at all. **Cost to settle: one
+extra drain size (128 and 900) in `p10_recheck`.**
+
+*This does not reopen the 1024/1022 asymmetry, and §3.42 should be read first.* That entry already
+carries an XNU source read explaining the two numbers as **two different queues** rather than one
+queue with a deficit: `ptcwrite` guards on `(t_rawq.c_cc + t_canq.c_cc) >= TTYHOG - 2` with
+`TTYHOG` 1024, giving 1022 hostward, while `ttymalloc` sizes `t_outq` at `TTYCLSIZE` 1024, giving
+1024 targetward. Under that reading 1022 *is* a capacity and no reservation is needed. What this run
+adds is that the recheck cannot **discriminate** the two-queue reading from a reservation reading,
+not that the two-queue reading is in doubt — and what remains owed is the same thing §3.42 said was
+owed: a measurement of the operator's kernel against that source read, which one extra drain size
+would supply. Recorded rather than fixed, because changing the probe now would move a field in
+the artifact this entry cites.
+
+**B. The P2/P9 zero-timeout gap is the fd state. §3.41's "undecomposed" is closed.** P9's 2×2, 4096
+samples per cell, medians in ns, three Darwin runs:
+
+| cell | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| hung-up + POLLHUP *(P2's shape verbatim)* | 1458 | 1650 | 1566 |
+| hung-up + POLLIN | 1711 | 2057 | 2057 |
+| unready + POLLHUP | 14540 | 15199 | 15852 |
+| unready + POLLIN *(what the data plane parks on)* | 16436 | 16470 | 15349 |
+
+Across fd state at fixed mask, all six pairs: 9.97, 9.61 / 9.21, 8.01 / 10.12, 7.46 — **7.46–10.12×**.
+Across mask at fixed fd state: **0.968–1.314×** — and in run 3 it moves in the *opposite* direction,
+so the mask is not even consistently signed. The largest hung-up cell (2057) and the smallest unready
+cell (14540) do not overlap, a 7.07× floor between the two groups' extremes. Linux, same binary, lands
+all four cells at **258–260 ns** with fd-state ratios of 0.996–1.004, which is what makes the Darwin
+gap a finding rather than an artifact of the comparison. The instrument reproduces itself: P9's
+hung-up/POLLHUP cell (1458/1650/1566) against P2's own headline (1733/2066/2084).
+
+*One Linux figure in this tree does not reconcile, and it is named rather than quietly dropped.*
+§3.44 records the Linux calibration of these same four cells as **166 / 172 / 166 / 166 ns**, also at
+4096 samples per cell; the committed `-05b` triple — the *same binary* this entry diffs against —
+reads **258–260**. The calibration cites no artifact, so §16.13 makes the committed triple the
+figure of record, and the 166 ns number should be read as scrollback from a differently-loaded run.
+Nothing in this entry's reasoning turns on which is right: both are flat across all four cells, and
+flatness is the only property the Darwin comparison uses.
+
+**Two corrections to how that result should be read, both from the adversarial verifier (§9).**
+First, **the mask axis is degenerate by construction** — POSIX returns POLLHUP in `revents`
+regardless of the requested mask, so on a hung-up master both mask cells return an event and on a
+live master neither does. The honest shape of the finding is a **1×2, not a 2×2**: on Darwin a
+zero-timeout poll that finds nothing ready costs ~15–16 µs and one that returns an event costs
+~1.5–2 µs. *Read the headline against that.* §3.44 B pre-registered the answer as "the fd state **or**
+the mask", and the mask arm was eliminated by POSIX semantics rather than by measurement — so the
+variable the data actually isolates is **ready versus not-ready**, and "fd state" names how the probe
+*achieves* that, not an independently confirmed cause. No shipped decision turns on the difference —
+the data plane parks on the not-ready cell either way — but the two are not the same claim. Second, and unflattering to the instrument: on **Linux** the fd-state factor is 1.000 ± 0.004, so
+**essentially 100% of the residual 1.52–1.79× P2/P9 headline disagreement there is instrument
+offset** — P2 uses the local `hup()` helper on a *blocking* master, P9 uses `sys::poll_blocking` on
+an `O_NONBLOCK` one, and P9's headline is n=16 taken cold against the 2×2's n=4096. *Two distinct
+quantities must not be fused here, and an earlier draft of this entry fused them.* The 1.52–1.79× is
+P9's **headline** (267/302/263, n=16) over P2's headline (173/169/173). A second ratio — P9's
+**hung-up/POLLHUP cell** (259 each run, n=4096) over P2's headline — reads 1.50–1.53× on Linux and
+0.75–0.84× on Darwin, and it is *that* one whose sign flips between platforms; the n=16-cold
+explanation belongs to the first and not to it. For the headline quantity Darwin reads 13.30/11.15/
+7.48×, the same direction as Linux, with no flip. The gap is real and the instrument is not clean;
+both belong in the record, and so does the distinction between the two ratios.
+
+*Order and warmup are excluded, and this is what rules out the "instrument artifact" arm.* P9's
+cells run in a fixed, uncounterbalanced order, so "later is cheaper" is a live rival within P9
+alone — but it dies on P2, which runs far earlier in the same process and reads the **cheap** value.
+The wall-clock sequence is cheap (P2, early) → expensive (P9 unready, middle) → cheap again (P9
+hung-up, late), and no monotone warmup produces a non-monotone sequence.
+
+**C. §3.40's pre-registration named a falsifier and the falsifier fired. Refutation 2 is itself
+refuted.** §3.40 reads verbatim: *"`baseline_via_master` reads **true** — not the `false` this
+session assumed. If `baseline_via_master` comes back `false`, refutation 2 above is itself wrong."*
+Measured: **`false` in 12 of 12 observations** (P6's `client_session_baseline` plus P7's three
+shapes, × three runs, byte-identical). The other two clauses of that pre-registration held — P7 is
+`degraded` with `silence_cause: "hangup-destroys-evidence"`, discriminated from
+`"extproc-unavailable"` by shape **c** reading 0 on Darwin where Linux reads 2, which is the §3.44
+discriminator firing correctly on the platform it was built for. §3.40 is annotated in place rather
+than rewritten (§5); the mechanism is in **C′** below.
+
+**C′. The mechanism, and it was in the capture all along.** `apply_pty_baseline` and
+`handler_reset_applied` call the *identical* `set_baseline(&master)` at two different points in a
+pty's life, and Darwin answers **Err at creation** and **Ok after the hangup** — `baseline_via_master:
+false` sits beside `handler_reset_applied: true` in every run. So at creation, which is the moment
+`nodes/pty.rs` actually runs `apply_pty_baseline` and the moment P2's
+`termios_settable_without_slave: false` is about, Darwin **does** always take the momentary-slave
+fallback — precisely what refutation 2 declared wrong. A virgin Darwin ptmx master is not settable;
+the same master after a slave has been opened and hung up is.
+
+**D. What was measured and held, recorded because §9 says a held expectation is as load-bearing as a
+refuted one.** P13's `baseline_packet_bytes` reads **1** in all three shapes on Darwin, same as
+Linux — the feared "~72" (XNU appending the termios struct) did **not** happen, so the P13 headline
+is not inverted. P13 otherwise reproduces at the new binary: `waits-then-discards`,
+`close_waits_for_reader` true, and the three shapes across the three runs at
+a=601084/600116/600340 µs (0 of 64 each), b=19/22/21 µs (64 of 64 each), c=28/28/27 µs (0 of 64
+each) — against the 600104/23/29 `expectations/macos.jq` records from the previous binary. P10's
+`slave_termios_mode` is `raw` on both directions in all three runs, so §3.34's re-assert continues to
+take on Darwin.
+
+**E. P5 now certifies on Darwin, and `supported` → `degraded` is the honest direction.** §3.42's
+predicate change lands. The pre-fix report's `supported` was vacuous in a precise, bounded sense:
+with `p5_is_uart` gated solely on TIOCGICOUNT, whose non-Linux arm is a hard ENOTSUP stub, `any_uart`
+was false and `failures` empty, so **no certificate item could ever fail on macOS** and `p5_verdict`
+fell through to a hardcoded `Status::Supported` by its final `else`. *The narrower claim is the true
+one, and an earlier draft of this entry overstated it:* discovery still runs on macOS regardless of
+`p5_is_uart`, so a **half-crossed** or **hung-up** rig would still have degraded the pre-fix P5, and
+a rig where no port opens still reported `skipped`. What was unreachable is a certificate failure —
+so on a *cleanly wired* macOS rig, which is this one, P5 always read `supported` whatever the
+hardware did. The post-fix report evaluates five items instead of zero and certifies
+`custom_baud=true`, `break=true` and — the only item carrying `integrity=true`, i.e. the only one
+that could have driven P5 to `unsupported` — **`rate_ladder=true`**, a 3-rate × 2-direction nonce
+exchange over the physical crossover. The modem map is **reported, never judged** (`probes.rs`
+says so in as many words) and reads `cts=false dsr=false dcd=false ri=false` on both ports, which is
+a 3-wire crossover having no modem lines to assert, not a result. Nothing that passed now fails; the set of
+items evaluated went from zero to five. **§3.42's pre-registration is half-met and the shortfall is
+structural:** ports certify and `rate_ladder` is true, but the report never names **Tier 3** —
+`grep -c "Tier [0-9]"` over it is **0**, because `p5_verdict`'s `!uncertified.is_empty()` arm returns
+before the tier-naming arm. Filed, not fixed.
+
+**Open, named, and not fixed here.** (i) The new P5 consequence lists `icounter` and
+`deliberate_mismatch` as uncertified without saying they are *structurally* unmeasurable on this
+kernel — the old text said "TIOCGICOUNT, which is Linux-only" and the new text says neither, so a
+Darwin operator could re-seat cables chasing something no Darwin box can produce. §7 wants the
+observation named, and the mechanism is now missing. (ii) **P4 is vacuous on Darwin and the Linux
+gate would admit the same shape**: `count: 0` with `status: supported`, because the `skipped` early
+return needs `adapters.is_empty() && candidates.is_empty()` and Darwin has 4 candidates, so
+`for a in &adapters` runs zero times, `all_resolved` keeps its initialised `true`, and the
+consequence asserts *"Resolver produces canonical identities; configs survive replug and cold
+start"* — a verdict computed from a loop that never executed (§9). It also asserts a false
+provenance (*"identities came from the `<sys>/class/tty` listing"* with count 0) in prose written for
+a Linux container. `linux.jq` admits `supported` here too. (iii) P12 — the one clause where `macos.jq` is **stricter than `linux.jq`**, because
+this is the platform its mechanism is load-bearing on (the status set `supported`-or-`degraded` it
+shares with P2 and P13) — exports **no wall-clock witness**: its anti-spin claim is
+`idle_edges_in_200_passes: 0` with no elapsed time and no live-master negative control, where P6
+reports `elapsed_ms: 163` over its 64 passes.
+(iv) `P10.slave_to_master_targetward.peer_pending_input_bytes` reads **0** beside
+`bytes_recovered_by_peer: 1024` in 3 of 3 runs, so FIONREAD on a Darwin ptmx master is
+direction-dependently wrong, and `0` there cannot be read as "empty". (v) Shipped P10 prose says
+*"`refill_reproduced_total` … on Linux it usually is not"*, which the committed `-05b` triple reads
+as **3 of 6**. That is *not* filed as a defect: §3.44's 20-sample calibration records "reproduces
+`total()` once in 20", which supports the shipped sentence, and six samples do not overturn twenty.
+It is recorded only so a later reader diffing the triple alone does not mistake 3-of-6 for a
+contradiction. Its `+2048 or +9216, bimodal` is likewise correctly scoped to "across 20 samples" and
+is not a §16.13 substitution — the committed triple's uniform +2048 is the small-sample view of it.
+
+**The comparability claim needs narrowing, and there is a committed counterexample.** `probe_set`
+digests only `(id, question)` pairs — observations are deliberately excluded — so the safe direction
+is the only sound one: an *unequal* fingerprint means two runs do not ask the same questions. The
+converse is false and this tree proves it: `fa4b12d`, `71fc5a8`, `7ead470` and `4b78fff` all print
+`a131e1f4b46d6c83` while observation fields were added across them (P9 gained
+`zero_timeout_by_fd_state_and_mask`, P10 gained `recheck`, macOS P6 went 4 → 8 observation keys and
+P7 5 → 8). Counted as newly-present scalar leaf paths under `.probes[].observations`, macOS alone
+gains **32** between `7ead470` and `1a9a8fc` and **35** between `fa4b12d` and `1a9a8fc` — all under
+one unchanged digest. Diffing this triple against the `-05b` triple is lawful because they are the **same
+binary**, not because the fingerprints match.
+
+### 3.46 §3.43's pre-registration came true in the failing direction: a converted test went red on the Darwin rig, and named its provider
+
+**Design:** §7 — no one-way decision on single-kernel evidence.
+
+§3.43 pre-registered: *"on the next Mac run the six converted tests execute against the rig instead
+of skipping; **if any goes red it will name the provider it used**, and `p7_p5` continues to
+self-skip there as it always has."* One did.
+
+**`p4_free_for_all::free_for_all_endpoint_lets_concurrent_writers_both_reach_device`**, captured
+verbatim: `assertion left == right failed: device received 32754 bytes, expected 32768 (a
+free-for-all writer was blocked): {"behavior":"recv","mode":"client","pass":false,"received":32754,
+"timed_out":true,"tool":"serial-nexus-sim"}` — preceded by its own first line of output, `RIG: this
+test is running on the crossover rig (/dev/cu.usbserial-BH00L4KU <-> /dev/cu.usbserial-BH00LL8O),
+not the sim null modem`. **The safety property §3.43 promised held exactly**: a red test that names
+the provider it used, never a silent pass.
+
+**This is not a regression from green.** At `7ead470` the test called `serial_pair()` and self-skipped
+on Darwin with *"no serial device on this platform"*; at HEAD it calls `serial_pair_or_rig()` and
+executes. This is the **first time it has ever run on this platform**, and it fails on first
+hardware execution.
+
+**It is not load, and it is not the deadline — both were measured rather than assumed (§8).** On a
+quiet box (load 1.0–1.5, no competing builds, no analysis agents), **12 of 12 reps failed** at the
+committed 30 s deadline, losing between **5 and 31 bytes** of 32768. Raising *only* the sink deadline
+to 120 s produced one clean pass **in 5.00 s** and one failure that still lost 2 bytes after 122 s.
+So a healthy run completes in ~5 s against a 30 s budget — the deadline was never tight.
+
+**What that licenses, stated exactly, because §6 forbids the shorter sentence.** Every failing
+observation carries `timed_out: true`, and §6's rule is that the sim marks `timed_out` *precisely so
+a deadline is never read as a drop*. So the measured claim is **"not recovered within 4× the
+committed deadline, on a path where a healthy run finishes in 5 s"** — not "lost". The distinction is
+not pedantry here: it is the difference between a data-plane loss and a stall, and this session did
+not separate them. **The rate is 1 clean run in 14, and the whole-gate failure is
+deliberately not in that denominator**: that run was taken at load 3.2–3.3 with analysis agents
+running, and §8 forbids reading a flake rate under uncontrolled load. It is a fifteenth observation
+of the same failure, not a fifteenth sample.
+
+**What the failure is narrowed to, and what it is not.** The same rig moves 32768 bytes byte-exact
+in both directions at 250000 baud in `serial_hardware.rs` (4 passed, same session, same ports), and
+the other five `serial_pair_or_rig()` call sites — `p4_send:52`, `p4_exclusivity:224` and
+`p8_map:419/559/694` — all passed in the whole-gate run. (`harness_contract` is **not** a call site,
+though it names the provider: its
+`the_pair_provider_prefers_software_and_falls_back_to_the_rig` is a pure unit test of
+`choose_pair_source` that never opens a port, so its green says nothing about the wire and must not
+be counted as hardware evidence.) So the wire, the adapters and the single-writer path are byte-exact,
+and what is left is **two concurrent writers merging onto one free-for-all serial endpoint**.
+**Mechanism is NOT established** and no root cause is claimed here: per §9 that would need an
+independent adversarial verifier, and none has run. The candidates that remain open are the
+free-for-all merge dropping tail bytes at the serial node, the Darwin USB-serial driver's tail
+behaviour, and the sim sink's read loop.
+
+**What this does to §3.43's substantive claim.** Its evidence — *"6 of the 7 `serial_pair()` tests
+pass byte-exact over the real FT232R wire"* — was gathered **on Linux by forcing the fallback**, and
+it does **not** transfer to Darwin, which is the only platform where that arm is the default rather
+than a forced one. §3.37 declined this change on exactly the grounds that §7 forbids taking it on one
+box's evidence; §3.43 overturned the decline on Linux measurements. The overturn is not reversed
+here — the seam is still correct and its failure mode still names itself — but the record must say
+that the "6 of 7" figure is a **Linux** figure, and that on Darwin it is 5 of 6 with this one red.
 
 ---
 

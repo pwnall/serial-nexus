@@ -5,6 +5,85 @@ the one every mechanism is specified against; macOS is supported where plain
 POSIX carries the design, and degrades — never crashes, never silently misbehaves
 — everywhere the design leans on a Linux-only facility.
 
+## Update — 2026-08-05 hardware validation at `1a9a8fc`: both §3.44 experiments answered, and one converted test goes red on the rig
+
+Same box (MacBookPro15,1, Darwin 24.6.0 / macOS 15.7.8, x86_64, 12 cores), same cross-wired FT232R
+pair (`BH00L4KU` ↔ `BH00LL8O`), tree clean at `1a9a8fc`. Full reading in notes §3.45 and §3.46.
+
+**The rig is proven on the wire first, then used.** `SNX_CROSSOVER=required` with both ports named:
+`serial_hardware.rs` 4 passed in 15.46 s, 32768 bytes byte-exact each way at 250000 baud. *That
+duration is genuinely re-measured this session and coincides with the `7ead470` figure recorded
+below to the hundredth of a second; it is not carried over.* Doctor
+captures were taken next, on a box at load 1.89–2.58 with no competing builds and before any
+analysis agents started (§8) — three sequential runs, `docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3{,-2,-3}.json`.
+
+**These captures and the `-05b` Linux triple are the same binary**, not merely the same fingerprint:
+`1a9a8fca1c36` is `4b78fffc4bf2` plus a docs-only commit, and `git diff 4b78fff 1a9a8fc -- '*.rs'
+'*.toml'` is empty. That matters because `probe_set` digests only `(id, question)` and cannot state
+it — four binaries in `docs/doctor/` print `a131e1f4b46d6c83` while macOS alone gains 32 newly-present
+observation leaf paths between `7ead470` and `1a9a8fc` (35 against `fa4b12d`) — all under one
+unchanged digest. So "equal fingerprint ⇒ field-by-field comparable" is false and this tree carries
+the counterexample; only the converse ("an *unequal* fingerprint means the runs ask different
+questions") is sound.
+
+**Both pre-registered experiments answered.** P10: `room_republished_minus_room_freed` **0** and
+`refill_reproduced_total` **true** in 6 of 6, against Linux's +2048 in 6 of 6 — Darwin republishes
+exactly the room freed. The entire P10 subtree is byte-identical across all three runs where all
+three Linux subtrees differ. *The inference is still underdetermined*: the drain is a hardcoded 512
+against a capacity of 1024/1022, so D = C/2 and the experiment has one bit of resolution here; a
+watermark model with any threshold > 512 predicts the same result, and a reservation charged only at
+the empty→nonempty transition is invisible by construction. P9: the zero-timeout gap is the **fd
+state**, 7.46–10.12× across fd state at fixed mask against 0.968–1.314× across mask at fixed fd
+state, with Linux flat at 258–260 ns. §3.41's "undecomposed" is closed.
+
+**A pre-registered falsifier fired.** §3.40 said *"If `baseline_via_master` comes back `false`,
+refutation 2 above is itself wrong."* It reads `false` in 12 of 12 observations. Darwin answers
+**Err** to `set_baseline(&master)` at pty creation and **Ok** to the identical call after the hangup,
+so at creation Darwin *does* always take the momentary-slave fallback. §3.40 is annotated in place.
+
+**Whole gate: 690 passing, 1 failing, 4 ignored across 109 test binaries**
+(`cargo test --workspace --locked --exclude serial-nexus-web --no-fail-fast`), at load 3.2–3.3 with
+analysis agents running — so §8 disqualifies that run as a *flake-rate* sample, and the failure below
+was re-measured on a quiet box instead. `expectations/macos.jq` passes on all three captures.
+
+**The `p6_hostility` flake this page records did not recur in this run** — no `Connection refused` /
+`os error 61` appears anywhere in the log — and **no rig-gated test self-skipped**, which
+`SNX_CROSSOVER=required` would have turned into a hard failure (§3.35). One clean run is not evidence
+that flake is gone; it is one sample, recorded so the count below is read against it.
+
+**The one failure is new, is not the `p6_hostility` flake on this page, and does not go away on an
+idle box.** `p4_free_for_all::free_for_all_endpoint_lets_concurrent_writers_both_reach_device`,
+verbatim: `device received 32754 bytes, expected 32768 (a free-for-all writer was blocked)`, with
+`timed_out: true`, and preceded by its own `RIG: this test is running on the crossover rig ... not
+the sim null modem`. On a quiet box **12 of 12 reps failed**, losing 5–31 bytes of 32768. Raising
+only the sink deadline to 120 s gave one clean pass **in 5.00 s** and one failure that still lost 2
+bytes after 122 s — so the 30 s budget was never tight. Say the rest precisely, because §6 forbids
+the short form: every failing observation carries `timed_out: true`, and the sim sets that flag so a
+deadline is never read as a drop. The measured claim is **"not recovered within 4× the committed
+deadline, on a path where a healthy run finishes in 5 s"** — a stall or a loss, not separated here.
+
+This is the first time that test has ever executed on Darwin: at `7ead470` it self-skipped with "no
+serial device on this platform", and §3.43's rig fallback is what makes it run. §3.43's safety
+property held exactly — a red test that names the provider it used. Its "6 of 7 pass byte-exact" is a
+**Linux** figure; on Darwin it is 5 of 6. **Mechanism not established, no root cause claimed:** the
+same rig is byte-exact under `serial_hardware.rs`, and the other five `serial_pair_or_rig()` call
+sites — `p4_send`, `p4_exclusivity` and three in `p8_map` — all pass on it, so what is left is two
+concurrent writers merging onto one free-for-all serial endpoint. (`harness_contract` names the
+provider but is not a call site: its test never opens a port.)
+
+**P5 now certifies here, and `supported` → `degraded` is the honest direction** (§3.42 landing). On
+the old predicate no certificate item could ever fail on macOS, so a *cleanly wired* rig always read
+`supported` whatever the hardware did — discovery still ran, so a half-crossed or hung-up rig would
+still have degraded — and zero certificate items were evaluated. It now evaluates five and certifies
+`custom_baud`, `break` and `rate_ladder=true` over the physical crossover, naming `icounter` and
+`deliberate_mismatch` as the two it cannot. The modem map is reported and never judged; it reads all
+four lines false, which is a 3-wire crossover having none to assert. The report still never prints **Tier 3**, because the
+`!uncertified.is_empty()` arm returns before the tier-naming arm.
+
+**P13 did not invert.** `baseline_packet_bytes` reads **1** in all three shapes, same as Linux — the
+feared ~72 (XNU appending the termios struct) did not happen. `waits-then-discards` reproduces at
+601084 / 19 / 28 µs against the 600104 / 23 / 29 recorded in `expectations/macos.jq`.
+
 ## Update — 2026-08-04 Tier-3 rig pass (macOS 15.7.8 / Darwin 24.6.0, x86_64, real FTDI crossover): P13 answers the last-close question
 
 **The prediction the block below pre-registered came back positive, and it is now an artifact
