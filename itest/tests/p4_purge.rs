@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use serial_nexus_itest::{
-    Daemon, Rpc, Sim, attach_slave, bin, observed_while_open, seeded_bytes, settled_while_open,
-    wait_until,
+    Daemon, Rpc, Sim, SlaveWitness, attach_slave, bin, observed_while_open, seeded_bytes,
+    settled_while_open, wait_until,
 };
 
 /// A locked-out writer's backlog. Fits the PTY kernel buffer (so `write_all` never
@@ -187,7 +187,7 @@ fn load_and_activate(rpc: &Rpc, tty_b: &Path, device: &Path) {
 /// kernel buffer, and hand the still-open slave back so the caller owns the detach.
 ///
 /// **Why the harness writes rather than a `serial-nexus-sim client --hold-ms`
-/// subprocess** (notes §3.55): the two checks that use this both need a *positive*
+/// subprocess** (notes §3.56): the two checks that use this both need a *positive*
 /// pre-close witness that `SB` bytes really are queued, and the only party that can
 /// give one is the writer. `write_all` returning `Ok(())` for a `SB`-byte slice is
 /// exactly that statement — the kernel accepted every one of them — and the sim
@@ -207,7 +207,7 @@ fn load_and_activate(rpc: &Rpc, tty_b: &Path, device: &Path) {
 /// *check* of that promise. A pair left in cooked mode would expand `0x0a` under
 /// `OPOST`/`ONLCR` and redden the exact-count assertion, which is the direction a
 /// guard is supposed to fail in.
-fn hold_a_locked_out_backlog(tty_b: &Path) -> std::fs::File {
+fn hold_a_locked_out_backlog(tty_b: &Path) -> SlaveWitness {
     let mut slave = attach_slave(tty_b);
     let payload = seeded_bytes(SEED_N, SB as usize);
     assert_eq!(
@@ -229,19 +229,35 @@ fn hold_a_locked_out_backlog(tty_b: &Path) -> std::fs::File {
 ///
 /// **This is one of the two deliberate exceptions to notes §3.29's rule**, and it is
 /// worth saying why in full, because the rule's whole point is that exceptions are
-/// argued rather than assumed (§3.55).
+/// argued rather than assumed (§3.56).
 ///
 /// The rule is *a byte counter is read while the client that fed it is still open*,
 /// because reading it afterwards asserts that the kernel retained the bytes across the
 /// slave's last close — which doctor P13 measures as `retains` on Linux 7.0.0-29
 /// (`docs/doctor/linux-7.0-2026-08-05-tier3.json`) and `waits-then-discards` on Darwin
 /// 24.6.0 (`docs/doctor/macos-24.6.0-2026-08-05-tier3.json`), so it is a kernel
-/// property and not a promise. Here the counter being read, `purged`, **comes into
-/// existence because of the close**: purge-on-detach is the close's own effect, and it
-/// reads 0 before it by construction. There is no ordering that observes it early;
-/// converting this guard would not strengthen it, it would delete it. That is the same
-/// shape as `p8_map`'s `a_closing_writers_residual_is_forwarded_not_purged`, and it is
-/// treated the same way — the test is Linux-gated (via [`skip_off_linux`], for the
+/// property and not a promise. Here it is **this increment's trigger** that is
+/// close-only: purge-on-detach fires *because of* the detach, so the one reading that
+/// names it cannot be taken before it. That is the exception, and it is narrower than
+/// the sentence that used to stand here.
+///
+/// **Corrected 2026-08-05 (notes §3.60), because the old wording was falsified twelve
+/// lines away.** It said the counter "comes into existence because of the close and
+/// reads 0 before it". The counter is `purged`, and the very next test in this file —
+/// [`pre_grant_backlog_is_purged_on_acquire_and_never_reaches_device`] — watches that
+/// same field reach `SB` **while its client is still open**, inside
+/// `settled_while_open`, because purge-on-*acquire* bumps it too. The field exists and
+/// moves mid-session; what is close-only is the *edge* this test is about. A guard that
+/// misstates which of the two it depends on is the kind of claim §5 says to argue
+/// rather than assume, and this one would have licensed the wrong simplification: that
+/// `purged` cannot be read early, when it demonstrably can.
+///
+/// **And "unconvertible" belongs to one assertion, not to the guard.** Everything below
+/// up to the detach is already taken with the session proven open — the three readings
+/// listed at the end of this comment. What cannot move above the close is the single
+/// post-close `purged == SB` assertion, because the increment it names has not happened
+/// yet. Same shape as `p8_map`'s `a_closing_writers_residual_is_forwarded_not_purged`,
+/// and treated the same way — the test is Linux-gated (via [`skip_off_linux`], for the
 /// software serial sink) on a kernel P13 has measured, and it does not move to a
 /// kernel it has not.
 ///
@@ -428,7 +444,7 @@ fn synchronous_grant_lets_a_post_grant_command_through_intact() {
 
     // The post-grant session, attached **after** the grant so the check's premise
     // ("no client attached at acquire time, so nothing to purge") is untouched, and
-    // held across the device's byte count (notes §3.29 / §3.55, plan §3 rule 8). The
+    // held across the device's byte count (notes §3.29 / §3.56, plan §3 rule 8). The
     // one-shot `Sim::client` below closes the moment its `write_all` returns, i.e.
     // when the kernel accepted the last byte rather than when the daemon read it, so
     // `received == SB` afterwards used to assert that the kernel had retained the tail

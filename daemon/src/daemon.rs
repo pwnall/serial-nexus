@@ -629,9 +629,35 @@ impl Daemon {
         // config is already validated, so this only fires for a config that will
         // load. `teardown` takes its own borrow, so run it before ours. Open taps
         // are told the graph was replaced, not that the daemon was torn down (§17).
-        if replace {
-            self.teardown_with(crate::tap::TapCloseReason::GraphReplaced);
-        }
+        //
+        // **The displaced graph's teardown loss is carried into this reply** (§5,
+        // §15.50 as annotated). `teardown_with` was called as a statement here, so the
+        // `discarded_at_teardown` it computes was dropped on the floor and `load`
+        // answered `{"loaded": N}` — measured at 12056 destroyed targetward bytes
+        // reported as nothing, against the identical graph torn down through the
+        // `teardown` verb, which reported all 8016 of them. §15.50 named the
+        // `remove-node` and `teardown` replies because those were the two verbs that
+        // destroyed nodes when it was written; `load --replace` is the third and it is
+        // the one whose loss is *largest*, since it destroys the entire graph, and it
+        // is also the only one an operator reaches for without the word "teardown" in
+        // front of them. A destroyed node's last loss can land nowhere else — `state`
+        // has nobody left to ask.
+        //
+        // `torn_down` rides along rather than being dropped as "not loss", because
+        // §15.50's own doctrine is that a `0` needs something beside it saying what the
+        // `0` means: `discarded_at_teardown: 0` next to `torn_down: 0` is "there was no
+        // graph", and next to `torn_down: 7` it is "seven nodes went and none of them
+        // owed a byte". Both are always present, `0` included, and on a `load` *without*
+        // `replace` they are the honest `0`/`0` of a verb that tore nothing down — a
+        // field that appears only sometimes is one a client learns to read as absent
+        // rather than as none.
+        let displaced = if replace {
+            self.teardown_with(crate::tap::TapCloseReason::GraphReplaced)
+        } else {
+            json!({ "torn_down": 0, "discarded_at_teardown": 0 })
+        };
+        let torn_down = displaced["torn_down"].as_u64().unwrap_or(0);
+        let discarded_at_teardown = displaced["discarded_at_teardown"].as_u64().unwrap_or(0);
 
         let (result, listeners) = self.state.with_mut(|st| {
             if !st.nodes.is_empty() {
@@ -706,7 +732,16 @@ impl Daemon {
             // is not held across the `.await` below, and structurally cannot be (§4).
             let listeners: Vec<ListenBarrier> =
                 st.nodes.iter().filter_map(Node::listen_barrier).collect();
-            Ok((json!({ "loaded": st.nodes.len() }), listeners))
+            Ok((
+                json!({
+                    "loaded": st.nodes.len(),
+                    // What `--replace` displaced on the way in, from the teardown this
+                    // verb composed rather than from a separate accounting (§5, §15.50).
+                    "torn_down": torn_down,
+                    "discarded_at_teardown": discarded_at_teardown,
+                }),
+                listeners,
+            ))
         })?;
         // §15.42: the reply does not precede the listeners it promises.
         await_listen_barriers(listeners).await;

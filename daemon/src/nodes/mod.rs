@@ -283,11 +283,26 @@ impl Node {
     /// `exec` needed: their queues also feed the purge-on-reconnect drain (§7.1, §7.4),
     /// so that helper moved onto the inbox — and it had to, because a helper holding
     /// the receiver across its own yields is a window in which the node cannot count
-    /// what a `remove-node` is about to destroy.
+    /// what a `remove-node` is about to destroy. Keeping the queue reachable turned out
+    /// to be necessary and not sufficient: the count had to stop crossing those yields
+    /// too (notes §3.59, `TargetwardInbox::purge_to_quiescence`).
+    ///
+    /// **`exec`'s answer is a floor; every other kind's is exact.** Its ledger watches
+    /// the host-facing per-channel queues, and a chunk that has already moved into the
+    /// node's *internal* merged queue (`src_tx`, which `pump_child` reads) is beyond the
+    /// handle's reach — so a torn-down exec can destroy more than it reports, never
+    /// less, which is the direction §5 requires of an inexact figure. That caveat is
+    /// stated here rather than only at `exec.rs` because this arm is where a caller
+    /// reading the enum learns what the number means, and the two structural `0`s below
+    /// are already spelled out for exactly the same reason.
     pub fn discarded_at_teardown(&self) -> u64 {
         match self {
             Node::Map(n) => n.discarded_at_teardown(),
             Node::Codec(n) => n.discarded_at_teardown(),
+            // A floor, not a total — see this method's doc. The remaining reach is the
+            // internal merge stage, and closing it needs no new mechanism (the inbox is
+            // generic over its item type since notes §3.55) but does need a guard that
+            // can *hold* a chunk in that stage, which no RPC ack can arrange.
             Node::Exec(n) => n.discarded_at_teardown(),
             Node::Serial(n) => n.discarded_at_teardown(),
             Node::Leg(n) => n.discarded_at_teardown(),

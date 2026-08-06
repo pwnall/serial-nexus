@@ -174,7 +174,7 @@ b = "ptyb"
     );
 
     // **Both pty sessions are held open by this process for the whole measurement**
-    // (notes §3.29 / §3.55, plan §3 rule 8), and that is the one change in this test
+    // (notes §3.29 / §3.56, plan §3 rule 8), and that is the one change in this test
     // that is a candidate repair rather than a tidy-up.
     //
     // The writers below exit the instant their `write_all` returns — which is when the
@@ -192,7 +192,7 @@ b = "ptyb"
     // observation carried `timed_out: true`, so what was measured is "not recovered
     // within 4x the committed deadline", a stall or a loss, not separated — and this
     // repair cannot be tested on Darwin from here. What it does is remove the one
-    // hypothesis that is cheap to remove, and notes §3.55 pre-registers what the next
+    // hypothesis that is cheap to remove, and notes §3.56 pre-registers what the next
     // Darwin run decides either way.
     //
     // These fds only hold the session open; they never read, and nothing arrives

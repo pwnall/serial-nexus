@@ -5426,6 +5426,15 @@ struct P14Facts {
     /// at it.
     baseline_restored: bool,
     baseline_reproved: bool,
+    /// Whether the wall-clock stop fired. **It reaches the verdict, and that was
+    /// a repair**: `P14_BUDGET`'s own comment promised "the fold refuses to dress
+    /// up an incomplete search as a measured ceiling", and the fold could not
+    /// see it. A budget that expired straight after a *failing* rung — with up
+    /// to four refinements still owed — left a bounded floor and a named kind, so
+    /// `p14_ceiling` answered and the verdict read `supported` over a search that
+    /// had stopped early. The `ceiling_kind.is_none()` arm only ever covered the
+    /// case where *no* failure bounds the floor.
+    search_budget_exhausted: bool,
 }
 
 /// **The verdict — and it never grades the number.**
@@ -5462,10 +5471,28 @@ fn p14_verdict(f: P14Facts) -> (Status, String) {
             "P5's rate ladder did not round-trip on this pair, so a ceiling measured through it would be measuring the wiring rather than the clocks — the search was not run. Fix the rig until P5 certifies `rate_ladder=true`, then re-run (§15.21, §15.51).".to_owned(),
         );
     }
+    if f.search_budget_exhausted {
+        return (
+            Status::Degraded,
+            "The search hit its wall-clock budget before the ladder was exhausted, so whatever floor the rungs above establish is a floor over an *interrupted* set of rates and not a ceiling. Re-run on a quieter box, or read the rungs directly (§15.51).".to_owned(),
+        );
+    }
     if f.max_reliable_baud.is_none() || f.ceiling_kind.is_none() {
         return (
             Status::Degraded,
             "The search did not complete: no rate was established as reliable, or it stopped without a recorded reason (the rungs above say which). An incomplete search has no ceiling to report, and reporting one anyway is the failure this arm exists to prevent (§15.51).".to_owned(),
+        );
+    }
+    if f.ceiling_kind == Some(CeilingKind::HungUp) {
+        // **`RungOutcome::HungUp`'s own doc says "Not a ceiling", and this arm is
+        // what makes that true of the code.** It used to fold to a `supported`
+        // ceiling like any other stop, so an adapter that vanished mid-search
+        // produced a confident number bounded by the rig leaving the bench.
+        // A vanished peer means the question could not be finished being asked,
+        // which is precisely what this probe's `degraded` is for.
+        return (
+            Status::Degraded,
+            "A port's peer went away mid-search (EIO/ENXIO/ENODEV), so the search was bounded by the rig disappearing rather than by a rate — whatever passed below is a floor over the rungs that ran before the disconnection, and not a ceiling. Re-seat the adapter and re-run (§15.51).".to_owned(),
         );
     }
     if !f.baseline_restored || !f.baseline_reproved {
@@ -5544,21 +5571,57 @@ fn p14_payload(baud: u32, dir: &str, trial: u32, len: usize) -> Vec<u8> {
 /// builds its error from `last_os_error`, the verifier builds a bare
 /// `ErrorKind::Other`. So `raw_os_error().is_some()` means *the ask was refused
 /// before any byte moved* (the platform), and its absence means *the ask was
-/// accepted and the clock landed elsewhere* (the adapter). Both arms report the
-/// read-back beside the request, so the classification is corroborated by a
-/// number rather than resting on this rule alone (§15.46).
+/// accepted and the clock landed elsewhere* (the adapter).
+///
+/// **What the read-back does and does not corroborate, measured rather than
+/// assumed.** An earlier version of this comment said the read-back corroborates
+/// the classification "by a number rather than resting on this rule alone". On
+/// the platform of record it does not: `ftdi_sio` reports back the rate it was
+/// *asked* for, so every rung from 115200 to 3000000 on the bench rig reads back
+/// exactly the request — including 2500000 and 2750000, which the adapter
+/// actually runs at ~1.9 Mbaud. The read-back therefore corroborates the
+/// `adapter-refused` arm, where the driver *does* answer with a different number
+/// (4000000 reads back 9600), and says nothing at all about a rate it accepted.
+/// The cell that speaks to the accepted rates is `achieved_baud_floor`, timed
+/// from the trials themselves.
 fn p14_refusal(e: &std::io::Error) -> RungOutcome {
+    // **A vanished peer is not a ceiling, and it used to print as one.** An
+    // adapter unplugged during a rate change answers `EIO`, which carries an
+    // errno, so the rule below would have called it `platform-refused` — and the
+    // verdict would then have told the operator that *this kernel's ask surface*
+    // stops here and a different kernel might ask for more over the same cable.
+    // The cable was gone. `is_hangup` is the predicate P5 already uses for
+    // exactly this distinction; consulting it first is the whole repair.
+    if is_hangup(e) {
+        return RungOutcome::HungUp;
+    }
     match e.raw_os_error() {
         Some(_) => RungOutcome::PlatformRefused,
+        // **Errno-less does not mean the adapter answered.** serial2's own
+        // post-set verification builds a bare `ErrorKind::Other`, which is the
+        // adapter case this rule was written for — but its `set_baud_rate`
+        // *fallback* arm, selected on every unix target that is neither
+        // Apple/BSD nor Linux, refuses an unlisted rate with an errno-less
+        // `InvalidInput` before any syscall is made. Calling that "the adapter's
+        // divisor model is the limit" would blame silicon that was never told
+        // the number. Neither of this project's two platforms takes that arm, so
+        // this clause is unreachable here and is written from serial2's source
+        // rather than from a measurement — which is why it is a *narrow* match on
+        // the kind rather than a broadening of the rule.
+        None if e.kind() == std::io::ErrorKind::InvalidInput => RungOutcome::PlatformRefused,
         None => RungOutcome::AdapterRefused,
     }
 }
 
-/// Ask one port for a rate and report what the driver is actually running.
+/// Ask one port for a rate and report what the driver **says** it is running.
 ///
-/// The read-back happens on **both** paths, success and refusal alike: a
-/// refusal whose actual rate nobody read is a refusal nobody can explain, and
-/// §15.46 makes the instrument testify to its own configuration.
+/// The read-back happens on **both** paths, success and refusal alike: a refusal
+/// whose actual rate nobody read is a refusal nobody can explain, and §15.46
+/// makes the instrument testify to its own configuration. But "says" is the
+/// operative word and the doc used to read "is actually running" — measured on
+/// the bench rig, `ftdi_sio` echoes the requested number for every rate it
+/// accepts, whether or not its divisor can produce it. The read-back is the
+/// driver's answer, which is a different thing from the wire's.
 fn p14_apply_rate(
     sp: &mut SerialPort,
     baud: u32,
@@ -5602,6 +5665,38 @@ struct TrialResult {
     received: u64,
     byte_exact: bool,
     hung_up: bool,
+    /// How long this trial's payload took to arrive, from the first write to the
+    /// moment the whole payload was matched. Only meaningful when `byte_exact`.
+    elapsed_us: u64,
+}
+
+impl TrialResult {
+    /// **Why this trial failed, decided here rather than inferred from sums.**
+    ///
+    /// The classification used to live in the caller and compare *totals over up
+    /// to three trials* against a *single* payload length — and because a
+    /// direction short-circuits on its first failure, an intermittent rung
+    /// failing on trial 2 or 3 (the shape a marginal rate actually produces) had
+    /// already banked one or two clean payloads. A total stall on trial 3 then
+    /// read `bytes_received == 2 x payload`, which is neither short nor starved,
+    /// and folded to `Corrupt`. The identical failure on trial 1 classified
+    /// correctly. §6 forbids reading a stall as a loss, and this is the shape
+    /// that was doing it.
+    fn failure(&self, payload_len: u64) -> Option<RungOutcome> {
+        if self.hung_up {
+            return Some(RungOutcome::HungUp);
+        }
+        if self.byte_exact {
+            return None;
+        }
+        // A short write is a transmit-side stall; too few bytes back is a
+        // receive-side one. Enough bytes, wrong bytes, is the only loss.
+        if self.written < payload_len || self.received < payload_len {
+            Some(RungOutcome::TimedOut)
+        } else {
+            Some(RungOutcome::Corrupt)
+        }
+    }
 }
 
 /// One round trip, **writing and reading concurrently**.
@@ -5665,11 +5760,13 @@ fn p14_trial(tx: &SerialPort, rx: &SerialPort, payload: &[u8], deadline: Duratio
             break;
         }
     }
+    let byte_exact = contains_sub(&got, payload);
     TrialResult {
         written: sent as u64,
         received: got.len() as u64,
-        byte_exact: contains_sub(&got, payload),
+        byte_exact,
         hung_up,
+        elapsed_us: start.elapsed().as_micros() as u64,
     }
 }
 
@@ -5690,6 +5787,28 @@ struct DirectionResult {
     byte_exact: bool,
     hung_up: bool,
     elapsed_us: u64,
+    /// The failing trial's own classification, `None` while every trial passed.
+    failure: Option<RungOutcome>,
+    /// **What the wire actually ran at, as a floor** — payload bits divided by
+    /// the fastest clean trial's wall clock, so poll and syscall overhead can
+    /// only push it *down*. `None` when no trial completed.
+    ///
+    /// It is here because the driver's read-back turned out not to answer this
+    /// question. Measured on an FT232R over the bench crossover: every rate from
+    /// 115200 to 3000000 reads back **exactly** what was asked, and the achieved
+    /// rate tracks it at a steady ~0.94 of the request (this instrument's
+    /// overhead) — **except at 2500000 and 2750000, where it collapses to 0.76
+    /// and 0.70, both landing at ~1.9 Mbaud**. The adapter is rounding to its
+    /// nearest supported divisor and `tcgetattr` is reporting the *requested*
+    /// number back. The bytes are still byte-exact, because both ends are
+    /// mis-set identically and therefore agree with each other.
+    ///
+    /// So `max_reliable_baud` is the highest rate that **round-trips when both
+    /// ends are asked for it**, which is what an operator configuring a port
+    /// gets — and it is not necessarily the rate on the wire. This cell is what
+    /// lets a reader see the difference instead of being told a number that
+    /// hides it (§15.46).
+    achieved_baud_floor: Option<u64>,
 }
 
 impl DirectionResult {
@@ -5705,6 +5824,8 @@ impl DirectionResult {
             "byte_exact": self.byte_exact,
             "hung_up": self.hung_up,
             "elapsed_us": self.elapsed_us,
+            "failure": self.failure.map(RungOutcome::label),
+            "achieved_baud_floor": self.achieved_baud_floor,
         })
     }
 }
@@ -5723,6 +5844,7 @@ fn p14_direction(
         ..Default::default()
     };
     let started = Instant::now();
+    let mut fastest_clean_us: Option<u64> = None;
     for trial in 0..P14_TRIALS_PER_DIRECTION {
         p14_flush(rx, Duration::from_millis(30));
         let payload = p14_payload(baud, dir, trial, payload_len);
@@ -5733,12 +5855,28 @@ fn p14_direction(
         d.hung_up |= r.hung_up;
         if r.byte_exact {
             d.trials_passed += 1;
+            fastest_clean_us = Some(match fastest_clean_us {
+                Some(best) => best.min(r.elapsed_us),
+                None => r.elapsed_us,
+            });
         } else {
             d.byte_exact = false;
+            // The failing trial classifies itself, while the payload it failed
+            // on is still in scope. The caller no longer has to reconstruct it
+            // from sums that a short circuit has already made ambiguous.
+            d.failure = r.failure(payload_len as u64);
             break;
         }
     }
     d.elapsed_us = started.elapsed().as_micros() as u64;
+    // A floor, not a rate: the fastest clean trial's wall clock includes this
+    // probe's own poll loop, so overhead can only make the number smaller than
+    // the wire's. Read a *large* gap from the request, not a small one — on the
+    // bench rig a healthy rung sits at ~0.94 of the ask and a rounded-down one at
+    // 0.70.
+    d.achieved_baud_floor = fastest_clean_us
+        .filter(|us| *us > 0)
+        .map(|us| (payload_len as u64 * P14_BITS_PER_BYTE * 1_000_000) / us);
     d
 }
 
@@ -5798,8 +5936,17 @@ fn p14_measure_rung(
 ) -> Rung14 {
     let (refusal_a, errno_a, actual_a) = p14_apply_rate(a, rate);
     let (refusal_b, errno_b, actual_b) = p14_apply_rate(b, rate);
-    let refusal = refusal_a.or(refusal_b);
-    let refusal_errno = errno_a.or(errno_b);
+    // **The outcome and its errno are taken from the same port.** They used to be
+    // two independent `or`s, so a rig whose port A was `adapter-refused` (no
+    // errno) and whose port B was `platform-refused` (errno) printed
+    // `outcome: "adapter-refused"` beside a non-null `refusal_errno` — precisely
+    // the pairing the discriminator declares impossible, in the artifact, for a
+    // reader to trip over. Plausible on a mixed-adapter rig.
+    let (refusal, refusal_errno) = match (refusal_a, refusal_b) {
+        (Some(o), _) => (Some(o), errno_a),
+        (None, Some(o)) => (Some(o), errno_b),
+        (None, None) => (None, None),
+    };
     let mut rung = Rung14 {
         requested: rate,
         actual_a,
@@ -5831,28 +5978,26 @@ fn p14_measure_rung(
     rung.ba = p14_direction(b, a, rate, "BA", payload_len, deadline);
     let after = (p14_icounts(a), p14_icounts(b));
     if let (Some(a0), Some(b0), Some(a1), Some(b1)) = (before.0, before.1, after.0, after.1) {
-        rung.frame_delta = Some((a1.0 - a0.0) + (b1.0 - b0.0));
-        rung.overrun_delta = Some((a1.1 - a0.1) + (b1.1 - b0.1));
-        rung.parity_delta = Some((a1.2 - a0.2) + (b1.2 - b0.2));
+        // Saturating, because the kernel's counters are `i32` and a driver that
+        // wrapped or reset one between the two reads would otherwise underflow a
+        // `u64` — a debug panic, or ~1.8e19 printed as a frame-error count in
+        // release. A counter that went backwards is not a negative number of
+        // errors; it is a measurement this rung cannot make, and `0` beside the
+        // byte counts is the honest floor.
+        rung.frame_delta = Some(a1.0.saturating_sub(a0.0) + b1.0.saturating_sub(b0.0));
+        rung.overrun_delta = Some(a1.1.saturating_sub(a0.1) + b1.1.saturating_sub(b0.1));
+        rung.parity_delta = Some(a1.2.saturating_sub(a0.2) + b1.2.saturating_sub(b0.2));
     }
 
-    rung.outcome = if rung.ab.hung_up || rung.ba.hung_up {
-        RungOutcome::HungUp
-    } else if rung.ab.byte_exact && rung.ba.byte_exact {
-        RungOutcome::Passed
-    } else {
-        // A short write is a transmit-side stall, not wire corruption — the
-        // conservative reading, with `bytes_sent` beside it so the two are
-        // separable in the artifact rather than only in this comment.
-        let short_write = rung.ab.bytes_sent < payload_len as u64
-            || (rung.ba.measured && rung.ba.bytes_sent == 0);
-        let starved = rung.ab.bytes_received < payload_len as u64
-            || (rung.ba.measured && rung.ba.bytes_received < payload_len as u64);
-        if short_write || starved {
-            RungOutcome::TimedOut
-        } else {
-            RungOutcome::Corrupt
-        }
+    // Each direction's failing trial has already classified itself against its
+    // own payload (see `TrialResult::failure`); the rung is the worse of the two.
+    // A hangup outranks everything — it means the rig left, not that a rate was
+    // reached.
+    rung.outcome = match (rung.ab.failure, rung.ba.failure) {
+        (Some(RungOutcome::HungUp), _) | (_, Some(RungOutcome::HungUp)) => RungOutcome::HungUp,
+        (Some(o), _) => o,
+        (None, Some(o)) => o,
+        (None, None) => RungOutcome::Passed,
     };
     rung
 }
@@ -5868,6 +6013,7 @@ pub fn p14_max_rate(ports: &[PathBuf], pairs: &[VerifiedPair]) -> Probe {
         ceiling_kind: None,
         baseline_restored: false,
         baseline_reproved: false,
+        search_budget_exhausted: false,
     };
     p = p.observe("pairs_discovered", pairs.len() as u64);
     // Stated on every path, including the ones that never measure a rate: a
@@ -5969,6 +6115,7 @@ pub fn p14_max_rate(ports: &[PathBuf], pairs: &[VerifiedPair]) -> Probe {
     facts.ceiling_kind = kind;
     facts.baseline_restored = restored;
     facts.baseline_reproved = reproved;
+    facts.search_budget_exhausted = budget_exhausted;
 
     let bound = p14_lowest_failure_above(&history, max_reliable);
     p = p
@@ -5989,7 +6136,11 @@ pub fn p14_max_rate(ports: &[PathBuf], pairs: &[VerifiedPair]) -> Probe {
         )
         .observe(
             "ceiling_is_a_floor_over",
-            "the rates this ladder probed, under this trial policy — three byte-exact constant-airtime round-trips per direction. It is not a promise about rates between rungs, about sustained throughput, about longer cables, or about other temperatures.",
+            "the rates this ladder probed, under this trial policy — three byte-exact constant-airtime round-trips per direction. It is not a promise about rates between rungs, about sustained throughput, about longer cables, or about other temperatures. **It is a REQUESTED rate, not necessarily the wire's**: an adapter may round the ask to its nearest divisor and report the request back unchanged, and the bytes still round-trip because both ends are mis-set identically. Read `achieved_baud_floor` under each direction beside it — a large gap there (the bench rig shows ~0.94 of the ask on a clean rung and 0.70 on a rounded one) means the number above is the number you configure, not the number on the wire.",
+        )
+        .observe(
+            "search_stops_at",
+            "the FIRST rung that fails, not the exhaustion of the ladder — so a rate above the reported ceiling was never tried unless refinement reached it, and this number is a floor for that reason too.",
         )
         .observe("ladder_body_rungs", P14_LADDER_BODY.len() as u64)
         .observe(
@@ -8203,6 +8354,7 @@ mod tests {
             ceiling_kind: Some(CeilingKind::AdapterRefused),
             baseline_restored: true,
             baseline_reproved: true,
+            search_budget_exhausted: false,
         }
     }
 
@@ -8502,6 +8654,17 @@ mod tests {
         // the software null modem, and it must skip rather than answer — every
         // rate "passes" on a pts, which would print a confident wire number with
         // no wire.
+        //
+        // **The two gates are not independent, and calling them so overstates
+        // the defence by one gate.** `p5_rig` computes `baseline_ok` only
+        // *inside* the `a_uart && b_uart` branch, so a pts fails the baseline
+        // gate **because** it failed the UART gate — one predicate read twice. A
+        // single false positive from `p5_is_uart` defeats both at once, and a
+        // pts would then sail through the rate ladder because nothing clocks it.
+        // The real protection is `p5_is_uart`, measured on Linux (a pts answers
+        // `ENOTTY` to both `TIOCMGET` and `TIOCGICOUNT`, on the slave and on the
+        // master) and unverified from this box on Darwin — which is the single
+        // point of failure for the claim, and is named rather than assumed.
         let cases: [(P14Facts, &str); 3] = [
             (
                 P14Facts {
@@ -8598,6 +8761,7 @@ mod tests {
                                         ceiling_kind: kind,
                                         baseline_restored: restored,
                                         baseline_reproved: restored,
+                                        search_budget_exhausted: false,
                                     };
                                     assert!(
                                         !p14_verdict(f).0.is_unsupported(),
@@ -8610,6 +8774,117 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **A stall on trial 2 or 3 is a stall, not a loss** (§6's deadline
+    /// discipline; the defect an adversarial pass measured).
+    ///
+    /// The classification used to live in the rung fold and compare *totals over
+    /// up to three trials* against a *single* payload length. Because a direction
+    /// short-circuits on its first failure, an intermittent rung failing on trial
+    /// 2 or 3 — which is the shape a marginal rate actually produces — had
+    /// already banked one or two clean payloads, so a total stall on trial 3 read
+    /// `received == 2 x payload`: neither short nor starved, therefore `Corrupt`.
+    /// The identical failure on trial 1 classified correctly. The bug was a
+    /// *sum* compared against a *unit*.
+    #[test]
+    fn a_trial_classifies_itself_and_a_late_stall_is_not_a_loss() {
+        const L: u64 = 1000;
+        let clean = TrialResult {
+            written: L,
+            received: L,
+            byte_exact: true,
+            hung_up: false,
+            elapsed_us: 1000,
+        };
+        assert_eq!(clean.failure(L), None);
+
+        // A total receive stall: everything written, nothing came back. This is
+        // the trial-3 shape, and it must read as a stall whatever earlier trials
+        // banked — which is exactly what a per-trial classification guarantees
+        // and a summed one could not.
+        let starved = TrialResult {
+            written: L,
+            received: 0,
+            byte_exact: false,
+            ..clean
+        };
+        assert_eq!(starved.failure(L), Some(RungOutcome::TimedOut));
+        // A transmit-side stall.
+        let short_write = TrialResult {
+            written: L / 2,
+            received: L / 2,
+            ..starved
+        };
+        assert_eq!(short_write.failure(L), Some(RungOutcome::TimedOut));
+        // Enough bytes, wrong bytes: the only shape that is a loss.
+        let corrupt = TrialResult {
+            written: L,
+            received: L + 8,
+            byte_exact: false,
+            hung_up: false,
+            elapsed_us: 1000,
+        };
+        assert_eq!(corrupt.failure(L), Some(RungOutcome::Corrupt));
+        // A hangup outranks both: the rig left, no rate was reached.
+        let gone = TrialResult {
+            hung_up: true,
+            ..corrupt
+        };
+        assert_eq!(gone.failure(L), Some(RungOutcome::HungUp));
+        // And the discriminator has teeth: the two failures that differ only in
+        // whether the bytes arrived must not fold to the same word.
+        assert_ne!(starved.failure(L), corrupt.failure(L));
+    }
+
+    /// **A vanished peer and an exhausted budget are not ceilings** — the two
+    /// arms an adversarial pass found reporting `supported` over a search that
+    /// had not finished asking its question.
+    #[test]
+    fn a_hangup_and_an_exhausted_budget_both_refuse_to_report_a_ceiling() {
+        // A rate change against an unplugged adapter answers EIO, which carries
+        // an errno — so the errno rule alone called it `platform-refused` and the
+        // verdict then told the operator that *this kernel's ask surface* stops
+        // here and another kernel might ask for more over the same cable. The
+        // cable was gone.
+        let eio = std::io::Error::from_raw_os_error(libc::EIO);
+        assert_eq!(p14_refusal(&eio), RungOutcome::HungUp);
+        for errno in [libc::ENXIO, libc::ENODEV] {
+            assert_eq!(
+                p14_refusal(&std::io::Error::from_raw_os_error(errno)),
+                RungOutcome::HungUp
+            );
+        }
+        // An errno-less `InvalidInput` is serial2's own pre-syscall refusal of an
+        // unlisted rate on the unix targets that are neither Apple/BSD nor Linux.
+        // Blaming the adapter's divisor model there names silicon that was never
+        // told the number.
+        assert_eq!(
+            p14_refusal(&std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsupported baud rate"
+            )),
+            RungOutcome::PlatformRefused
+        );
+
+        // The two verdict arms.
+        let (status, why) = p14_verdict(P14Facts {
+            ceiling_kind: Some(CeilingKind::HungUp),
+            ..p14_good()
+        });
+        assert!(matches!(status, Status::Degraded), "{}", status.label());
+        assert!(why.contains("went away mid-search"), "{why}");
+        assert!(why.contains("not a ceiling"), "{why}");
+
+        let (status, why) = p14_verdict(P14Facts {
+            search_budget_exhausted: true,
+            ..p14_good()
+        });
+        assert!(matches!(status, Status::Degraded), "{}", status.label());
+        assert!(why.contains("wall-clock budget"), "{why}");
+        // And the control: with the budget intact the same facts are supported,
+        // so the arm above is about the budget and not about something else.
+        assert!(matches!(p14_verdict(p14_good()).0, Status::Supported));
     }
 
     #[test]

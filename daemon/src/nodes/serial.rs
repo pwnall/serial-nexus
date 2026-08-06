@@ -715,6 +715,15 @@ async fn active_step(
 /// which is what keeps this sanctioned drop and the teardown ledger from racing: a
 /// `remove-node` landing on one of the purge's yields still finds the queue where the
 /// node can count it (§15.50, notes §3.55).
+///
+/// The counter goes *into* the drain rather than being charged from its return value,
+/// and that is the second half of the same race — the half the first fix missed (notes
+/// §3.59). Charging afterwards meant the round that had already emptied the queue held
+/// its tally in this future's stack frame, so a `remove-node` on one of the yields
+/// charged `0` at the ledger (the queue was drained) *and* `0` here (the frame was
+/// aborted): 8000 accepted bytes, nothing accounted, measured through this function.
+/// `ctx.purged` is an `Arc<AtomicU64>` the node owns, so a charge landing mid-purge
+/// outlives the abort by construction.
 async fn purge_on_reconnect(ctx: &mut SuperviseCtx) {
     if !ctx.params.purge_on_reconnect {
         return;
@@ -722,10 +731,11 @@ async fn purge_on_reconnect(ctx: &mut SuperviseCtx) {
     let Some(rx) = ctx.targetward.as_ref() else {
         return;
     };
-    let purged = rx.purge_to_quiescence().await;
-    if purged > 0 {
-        ctx.purged.fetch_add(purged, Ordering::Relaxed);
-    }
+    let purged = &ctx.purged;
+    rx.purge_to_quiescence(&|n| {
+        purged.fetch_add(n, Ordering::Relaxed);
+    })
+    .await;
 }
 
 /// Set the port non-blocking and spawn a fresh reader thread, recording its
@@ -1330,6 +1340,101 @@ mod tests {
             assert_eq!(ctx.purged.load(Ordering::Relaxed), 0);
             let rx = ctx.targetward.take().unwrap();
             assert_eq!(rx.drain_and_count(), 3, "the kept backlog went missing");
+            drop(tx);
+        });
+    }
+
+    /// **A teardown landing inside the reconnect purge must still account for every
+    /// byte** (§5 all-loss-is-visible, §15.50, notes §3.59). This is the production
+    /// half of the guard; the shared helper's half is
+    /// `runtime::tests::purge_to_quiescence_charges_each_round_before_it_yields`.
+    ///
+    /// The shape it pins is the one §15.50 was written against, rebuilt one layer up.
+    /// [`TargetwardInbox`] closed the *queue* half — the receiver stays in the node's
+    /// slot across the purge's yields, so a `remove-node` can always reach it — and the
+    /// first form of the purge then lost the bytes anyway, through the *count*: rounds
+    /// ran, emptied the queue, and accumulated their tally in this function's own stack
+    /// frame. A teardown on one of the yields therefore charged `0` at the ledger (the
+    /// queue really was empty by then) and `0` at `purged_on_reconnect` (`abort_all`
+    /// dropped the frame holding the tally). Both counters honest, both zero, 8000 bytes
+    /// gone.
+    ///
+    /// **The interleave is constructed, not raced.** `purge_to_quiescence` drains the
+    /// whole seeded backlog in round 1, charges, and parks on `yield_now`; round 2 would
+    /// find nothing and break. So the test's single `yield_now` puts the purge task at
+    /// precisely the one instant this defect exists at — and the probe then does exactly
+    /// what [`SerialNode::signal_stop`] does, in its order: `TeardownLoss::drain()`
+    /// first, `abort_all` second.
+    ///
+    /// The assertion is a **conservation equality**, not a bound on either counter.
+    /// §5's promise is that destroyed bytes are attributable; which of the two words
+    /// they land under — purged, because the drain reached them, or destroyed, because
+    /// the teardown did — is a scheduling detail this test deliberately does not
+    /// legislate. What it forbids is the sum being anything other than what the channel
+    /// accepted.
+    ///
+    /// Fail-first, executed with the shipped shape restored in place — accumulate the
+    /// bytes in a local, charge the counter once after the loop:
+    /// `a teardown inside the reconnect purge destroyed 8000 accepted targetward bytes
+    /// and accounted for 0: purged_on_reconnect=0, discarded_at_teardown=0 (§5)`,
+    /// `left: 0, right: 8000`. The bare reproduction that opened notes §3.59 printed the
+    /// same three zeros from the same fixture:
+    /// `PROBE SERIAL: accepted=8000 discarded_at_teardown=0 purged_on_reconnect=0 accounted=0`.
+    /// Every other purge guard in the tree stayed green through that revert, which is
+    /// why this one exists.
+    ///
+    /// 8000 is a fixture magnitude. In the field the queue holds `CHANNEL_CAP` chunks
+    /// and is *full* by construction — §7.1's whole answer to an absent device is to
+    /// backpressure the origins rather than drop their commands — so the backlog this
+    /// races with is the deepest one the daemon accumulates anywhere.
+    #[test]
+    fn a_teardown_inside_the_purge_accounts_for_the_backlog_it_drained() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            const ACCEPTED: u64 = 8000;
+            let (tx, rx) = mpsc::channel::<Chunk>(4);
+            for i in 0..4 {
+                tx.send(Chunk::copy_from_slice(&[b'A'; 2000]))
+                    .await
+                    .unwrap_or_else(|_| panic!("seeding the outage-era backlog, chunk {i}"));
+            }
+
+            // The queue goes in through the ledger, exactly as `SerialNode::start` does
+            // it. A bare `TargetwardInbox::new` here would be testing a queue no
+            // teardown watches, and the ledger's half of the sum would be 0 by
+            // construction rather than by measurement.
+            let mut loss = TeardownLoss::default();
+            let mut ctx = test_ctx(Some(loss.watch(rx)));
+            let purged = ctx.purged.clone();
+            let purging = tokio::task::spawn_local(async move {
+                purge_on_reconnect(&mut ctx).await;
+            });
+
+            tokio::task::yield_now().await;
+            assert!(
+                !purging.is_finished(),
+                "the purge ran to completion inside one poll, so the teardown below \
+                 lands after it rather than inside it and this guard proves nothing"
+            );
+
+            // `SerialNode::signal_stop`, in its order and for its stated reason: count
+            // first, because `abort_all` is what drops the future the queue lives in.
+            loss.drain();
+            purging.abort();
+
+            let purged = purged.load(Ordering::Relaxed);
+            let destroyed = loss.bytes();
+            assert_eq!(
+                purged + destroyed,
+                ACCEPTED,
+                "a teardown inside the reconnect purge destroyed {ACCEPTED} accepted \
+                 targetward bytes and accounted for {}: purged_on_reconnect={purged}, \
+                 discarded_at_teardown={destroyed} (§5)",
+                purged + destroyed
+            );
             drop(tx);
         });
     }

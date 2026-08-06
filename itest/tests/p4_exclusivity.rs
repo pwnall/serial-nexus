@@ -315,7 +315,7 @@ fn exclusive_write_lock_is_byte_exact() {
     });
 
     // The holder's pty session, opened by the harness and held across the sink's
-    // count — the §3.29 witness (notes §3.55, plan §3 rule 8).
+    // count — the §3.29 witness (notes §3.56, plan §3 rule 8).
     //
     // The one-shot `Sim::client` below returns when the *kernel* accepted its last
     // byte, not when the daemon read it, so its close used to land while up to a pty
@@ -356,7 +356,7 @@ fn exclusive_write_lock_is_byte_exact() {
     //    slower the box. `Sim`'s witness answers `try_wait`, so an expired hold is now
     //    a named failure. (The timer itself stays: the sim's slave is held by a
     //    subprocess this harness cannot leash without a sim-side stdin-EOF hold, which
-    //    is out of scope here and recorded in notes §3.55.)
+    //    is out of scope here and recorded in notes §3.56.)
     let sink = observed_while_open(
         &mut [&mut holder_session, &mut pb, &mut ps],
         "the device's byte count under an exclusive lock",

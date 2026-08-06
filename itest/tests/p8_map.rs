@@ -962,7 +962,7 @@ b = "console/raw"
 /// full "precisely what is and is not stronger" argument now live on
 /// [`serial_nexus_itest::settled_while_open`], because six further guards in this
 /// suite needed the same enforcement and a rule that lives in one test file is a rule
-/// the next test file re-derives (notes §3.55). Read it there before editing either
+/// the next test file re-derives (notes §3.56). Read it there before editing either
 /// side of this ordering.
 ///
 /// What stays local is the map's own predicate: the `never` arm counts
@@ -972,7 +972,7 @@ b = "console/raw"
 /// the daemon.
 fn settled_while_open(
     rpc: &serial_nexus_itest::Rpc,
-    client: &mut std::fs::File,
+    client: &mut serial_nexus_itest::SlaveWitness,
     write_mode: &str,
     typed: u64,
 ) -> bool {
@@ -1052,12 +1052,20 @@ b = "p0"
         // ordering is ours, not a subprocess's.
         rpc.lock("p0", false, false, None)
             .unwrap_or_else(|e| panic!("[{write_mode}] lock p0: {e:?}"));
-        let mut client = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOCTTY)
-            .open(&p0)
-            .unwrap_or_else(|e| panic!("[{write_mode}] open pty slave: {e}"));
+        // Opened here rather than through `attach_slave` because this fd is the client,
+        // not only the witness — the two are the same handle on purpose (a second fd on
+        // the same slave would change what `client_present` and the last close mean).
+        // `adopt_slave` records the path so the witness can prove the *far end* is still
+        // there and not merely that the descriptor is valid (notes §3.60).
+        let mut client = serial_nexus_itest::adopt_slave(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open(&p0)
+                .unwrap_or_else(|e| panic!("[{write_mode}] open pty slave: {e}")),
+            &p0,
+        );
         assert!(
             wait_until(Duration::from_secs(10), || {
                 rpc.node("p0")

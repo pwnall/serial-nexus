@@ -106,7 +106,7 @@ b = "inj1"
 /// `rx_log` (which starts empty) across the physical wire. Returns the log length after.
 ///
 /// **The arrival is observed while a client still holds the injector's pty**, which is
-/// the whole reason `witness` exists (notes §3.29 / §3.55, plan §3 rule 8). The
+/// the whole reason `witness` exists (notes §3.29 / §3.56, plan §3 rule 8). The
 /// one-shot `Sim::client` below closes its slave the moment its `write_all` returns —
 /// and `write_all` returns when the *kernel* accepted the last byte, not when the
 /// daemon read it, so up to a pty buffer's worth of this payload is still inside the
@@ -249,7 +249,7 @@ fn crossover_rig_data_plane_send_and_exclusivity() {
 /// daemon per baud (each Drop releases the ports). No TIOCGICOUNT needed: the check is a
 /// SHA-256 over captured log bytes, so it runs on macOS.
 ///
-/// **Corrected 2026-08-05 (notes §3.55).** This comment used to read "only rates fast
+/// **Corrected 2026-08-05 (notes §3.57).** This comment used to read "only rates fast
 /// enough to drain before the one-shot `Sim::client` injector closes its pty are
 /// reliable here; very slow rates (e.g. 9600) race that close" — which named the wrong
 /// variable. Baud sets how *long* the residual takes to drain, but whether a residual

@@ -482,6 +482,16 @@ impl ExecCodecNode {
 
     /// Targetward bytes this node destroyed at teardown (§5, notes §3.31). `0` until
     /// `signal_stop` has run, which is where the queues are drained and counted.
+    ///
+    /// **A floor, not a total — the one kind whose figure is** (§5, §15.50). The ledger
+    /// watches the host-facing per-channel queues; those forwarders push into `src_tx`,
+    /// a second *internal* merged queue `pump_child` reads, and a chunk already moved
+    /// into that stage is beyond this handle's reach. So a torn-down exec can destroy
+    /// more than it reports — never less, which is the direction §5 requires when a
+    /// figure has to be inexact. `state_extra` carries the same caveat at the wire
+    /// field, and `Node::discarded_at_teardown` carries it at the dispatch; it is
+    /// restated here because this is the method both of those call, and a reader who
+    /// arrives at it directly would otherwise take an exact number away.
     pub fn discarded_at_teardown(&self) -> u64 {
         self.teardown_loss.bytes()
     }

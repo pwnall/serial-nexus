@@ -765,16 +765,21 @@ impl Drop for Sim {
 /// The two implementations answer the same question with different syscalls, and both
 /// are cheap enough to run on every observation:
 ///
-/// * [`std::fs::File`] — an open fd answers `fstat`. Rust owns the descriptor, so the
-///   type system has already ruled out the interesting failure; the call is what keeps
-///   the parameter from being ornamental, so a later editor deleting the "unused"
-///   witness has to delete a syscall rather than a name.
+/// * [`SlaveWitness`] — a held pty (or serial) slave, proven by comparing the fd's
+///   device identity against a **fresh stat of the path it was opened through**. An
+///   `fstat` on the fd alone proves nothing here and used to be all this did; see
+///   [`SlaveWitness::prove_open`] for the measurement that retired it.
 /// * [`Sim`] — a subprocess is open while it has not exited, which
 ///   `Child::try_wait` answers without reaping a live child. This one is **not**
 ///   decorative: every `Sim` held open across an observation is held by a
 ///   `--hold-ms` timer, and a timer is §9's proxy in time. The check converts "the
 ///   hold might have expired under load" from a silent vacuous pass into a named
 ///   failure.
+///
+/// [`std::fs::File`] deliberately does **not** implement this trait. It cannot: a
+/// `File` does not remember the path it came from, so it cannot answer the only
+/// question worth asking, and an impl on it would let any of this suite's plain
+/// client fds be handed in as a witness that proves nothing (notes §3.60).
 pub trait OpenWitness {
     /// How this witness names itself in a failure message.
     fn label(&self) -> String;
@@ -782,14 +787,147 @@ pub trait OpenWitness {
     fn prove_open(&mut self) -> Result<(), String>;
 }
 
-impl OpenWitness for std::fs::File {
-    fn label(&self) -> String {
-        "the held pty slave".to_owned()
+/// A pty or serial slave held open as a witness, **carrying the path it was opened
+/// through** — because an fd on its own cannot answer whether the far end is still
+/// there.
+///
+/// Constructed by [`attach_slave`] (which opens it) or [`adopt_slave`] (which takes an
+/// fd the caller opened with its own flags). Both record the device identity at
+/// adoption so a failure can say what changed.
+///
+/// It forwards [`std::io::Read`] and [`std::io::Write`] to the underlying fd, because
+/// several callers *are* the client — `p4_purge` types a locked-out backlog through
+/// exactly this handle — and splitting "the writer" from "the witness" would put two
+/// fds on one slave and change what the tests measure.
+pub struct SlaveWitness {
+    file: std::fs::File,
+    path: PathBuf,
+    /// `(st_dev, st_ino, st_rdev)` at adoption — reported by a failure so the message
+    /// names the device that went away rather than only the one that is there now.
+    adopted_as: DeviceIdentity,
+}
+
+/// The identity of a device node: the filesystem it lives on, its inode there, and the
+/// `(major, minor)` of the device it names. All three come out of one `stat`, and all
+/// three are compared, because they fail independently — a repointed symlink usually
+/// moves `st_rdev`, while a devtmpfs node destroyed and recreated at the same
+/// `(major, minor)` (what a USB replug does, §12) moves only `st_ino`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeviceIdentity {
+    dev: u64,
+    ino: u64,
+    rdev: u64,
+}
+
+impl DeviceIdentity {
+    fn of(md: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: md.dev(),
+            ino: md.ino(),
+            rdev: md.rdev(),
+        }
     }
+}
+
+impl std::fmt::Display for DeviceIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `rdev` raw rather than decoded to `major:minor`. The decode is not the same
+        // arithmetic on Linux and Darwin, and a witness failure that printed a
+        // plausible-looking wrong pair on one of them would cost a reader more than the
+        // raw number does.
+        write!(f, "dev={} ino={} rdev={}", self.dev, self.ino, self.rdev)
+    }
+}
+
+impl OpenWitness for SlaveWitness {
+    fn label(&self) -> String {
+        format!("the held slave {}", self.path.display())
+    }
+
+    /// Prove the fd still names a device that is still there — and say precisely what
+    /// that does and does not establish, because the previous version of this function
+    /// established **nothing**.
+    ///
+    /// It was `self.metadata().map(|_| ())`, and that is a tautology. Measured on this
+    /// box (Linux 7.0.0-29) on a pty whose **master had already been closed**: `fstat`
+    /// on the slave fd returns `Ok` with `mode=020600` while the pair is gone. In safe
+    /// Rust the descriptor is guaranteed valid for the `File`'s lifetime, so the call
+    /// had no reachable failure at all; "proven live" reduced entirely to the
+    /// compile-time borrow, which is a real property (see [`settled_while_open`]) but
+    /// not the one the name claims.
+    ///
+    /// What is checked now, in the order a failure wants to read:
+    ///
+    /// 1. `fstat` on the held fd. Kept, so the witness parameter costs a syscall rather
+    ///    than a name — and stated plainly as the weak arm: it cannot fail here.
+    /// 2. `stat` on the **path the fd was opened through**. This is the load-bearing
+    ///    one, and it is where §9's tell shows up: it comes out *stricter* on the
+    ///    platform of record. Linux unlinks a pty slave's `/dev/pts/N` entry at the
+    ///    master's close, so a witness whose peer has gone away fails here with
+    ///    `ENOENT` — measured directly, same box: `fstat(fd)` `Ok(020600)` and
+    ///    `stat("/dev/pts/3")` `ENOENT`, simultaneously, on one closed pair.
+    /// 3. The two identities must agree. A `/dev/serial/by-id/…` or a node symlink that
+    ///    now resolves somewhere else is a *different device* behind the same name —
+    ///    exactly what §12's replug renumbering does to `ttyUSB0`/`ttyUSB1` — and the
+    ///    old check could not see it, since the fd is still perfectly valid.
+    ///
+    /// **The residual, stated rather than papered over.** This proves the path still
+    /// resolves to the device the fd holds. It does **not** prove the pty's *master* is
+    /// open on a kernel whose slave nodes are not per-allocation directory entries:
+    /// Darwin's `/dev/ttysNNN` are persistent devfs nodes, so step 2 is expected to stay
+    /// `Ok` there after a master close and the check degrades to step 1's tautology plus
+    /// the borrow. That is unmeasured here — this box is Linux — and it is why the
+    /// sentence says "expected" (§7: no one-way claim on single-kernel evidence). The
+    /// instrument that would close it portably is `poll(POLLHUP)` on the fd, and this
+    /// crate cannot issue it: `poll(2)` needs an `unsafe` call and `unsafe` lives only
+    /// in `serial_nexus_sys` (AGENTS.md invariant 3 / §16.3) — the same wall
+    /// `p12_pty_setup` records for `FIONREAD`. A doctor probe is the right home for it
+    /// if it is ever wanted (§7's P6–P11 pattern), not a `libc` call smuggled into the
+    /// harness.
     fn prove_open(&mut self) -> Result<(), String> {
-        self.metadata()
-            .map(|_| ())
-            .map_err(|e| format!("fstat on the held fd failed: {e}"))
+        let held = self
+            .file
+            .metadata()
+            .map_err(|e| format!("fstat on the held fd failed: {e}"))?;
+        let held = DeviceIdentity::of(&held);
+        let live = std::fs::metadata(&self.path).map_err(|e| {
+            format!(
+                "the fd is still open but {} no longer resolves to a device ({e}); \
+                 it was {held} when this witness was taken. On Linux the kernel \
+                 unlinks a pty slave's /dev/pts entry at the *master's* close, so this \
+                 is the far end having gone away underneath a descriptor that fstat \
+                 still answers",
+                self.path.display()
+            )
+        })?;
+        let live = DeviceIdentity::of(&live);
+        if live != held {
+            return Err(format!(
+                "{} no longer names the device this witness holds: the fd is {held} \
+                 (adopted as {}), the path now resolves to {live}. The descriptor is \
+                 valid and useless — something replaced the node underneath it (a \
+                 replaced pty node, or a replug renumbering a tty, §12)",
+                self.path.display(),
+                self.adopted_as
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl std::io::Read for SlaveWitness {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl std::io::Write for SlaveWitness {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
     }
 }
 
@@ -797,6 +935,30 @@ impl OpenWitness for Sim {
     fn label(&self) -> String {
         "the held serial-nexus-sim child".to_owned()
     }
+
+    /// A subprocess is open while it has not exited — **an approximation of the
+    /// property, not the property**, and the gap is measured rather than hoped at.
+    ///
+    /// What is wanted is "the sim's slave fd is open at the instant of this reading".
+    /// What is answered is "the sim's *process* has not been reaped yet". The sim closes
+    /// its port and *then* serializes and prints its verdict before exiting
+    /// (`sim/src/main.rs`: the mode function owns the port and returns a `Value`, which
+    /// `main` prints afterwards), so there is a window in which `try_wait` says `Ok(None)`
+    /// while the slave is already gone.
+    ///
+    /// Measured on this box (Linux 7.0.0-29, debug profile, load average 0.4), against
+    /// the shipped `serial-nexus-sim client`: the master saw the last slave close
+    /// **0.658–0.843 ms** before `waitpid(WNOHANG)` reported the child, 6 of 6, with the
+    /// instrument's own busy-poll granularity inside that figure — so it is an upper
+    /// bound on the window, not the window. Sub-millisecond, and the thing it replaced
+    /// was a bare `--hold-ms 20000` timer with no check at all, so this is four orders
+    /// of magnitude better than nothing and still not an identity. Do not write "proven
+    /// live at the instant of the read" about this witness; write what it is.
+    ///
+    /// It stays load-bearing anyway, and for a reason the approximation does not touch:
+    /// the failure it exists to catch is a `--hold-ms` that expired *seconds* ago under
+    /// load, turning a vacuous pass into a named failure. A 0.7 ms blind spot at the tail
+    /// does not blunt that.
     fn prove_open(&mut self) -> Result<(), String> {
         match self.child.try_wait() {
             Ok(None) => Ok(()),
@@ -821,14 +983,51 @@ impl OpenWitness for Sim {
 /// Panics on failure — a witness that could not be taken must fail loudly, never
 /// degrade the observation to the unwitnessed one it replaced (§5's anti-tautology
 /// rule).
-pub fn attach_slave(path: &Path) -> std::fs::File {
+pub fn attach_slave(path: &Path) -> SlaveWitness {
     use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(libc::O_NOCTTY)
         .open(path)
-        .unwrap_or_else(|e| panic!("open pty slave {} as a witness: {e}", path.display()))
+        .unwrap_or_else(|e| panic!("open pty slave {} as a witness: {e}", path.display()));
+    adopt_slave(file, path)
+}
+
+/// Adopt an fd the caller opened itself as a [`SlaveWitness`], recording `path` as the
+/// name it was opened through.
+///
+/// Exists because two callers need flags [`attach_slave`] deliberately does not offer —
+/// `p12_pty_setup` opens `O_NONBLOCK` so its CONC-1 arm can *detect* a daemon that
+/// stopped draining instead of deadlocking on it, and `p8_map` drives its own client
+/// through the same fd it witnesses.
+///
+/// The `path` argument is verified rather than trusted: the fd and the path must name
+/// the same device at adoption, or this panics. A caller that hands in the wrong path
+/// would otherwise get a witness that fails (or, worse, passes) for a reason having
+/// nothing to do with the test — the anti-tautology rule (§5) applied to the
+/// constructor, since every later check is a comparison against what is recorded here.
+pub fn adopt_slave(file: std::fs::File, path: &Path) -> SlaveWitness {
+    let held = file
+        .metadata()
+        .unwrap_or_else(|e| panic!("fstat the fd being adopted as a witness: {e}"));
+    let held = DeviceIdentity::of(&held);
+    let live = std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("stat {} while adopting a witness: {e}", path.display()));
+    let live = DeviceIdentity::of(&live);
+    assert_eq!(
+        held,
+        live,
+        "adopt_slave was handed a path that does not name the fd's device: the fd is \
+         {held}, {} is {live}. Every later proof compares against this pair, so a \
+         mismatched path here would make the witness answer about the wrong device",
+        path.display()
+    );
+    SlaveWitness {
+        file,
+        path: path.to_path_buf(),
+        adopted_as: held,
+    }
 }
 
 /// Wait for a byte counter to settle **while the client that produced those bytes is
@@ -841,6 +1040,17 @@ pub fn attach_slave(path: &Path) -> std::fs::File {
 /// client`). The ordering is a property the compiler checks, not a comment a future
 /// editor can step over — which matters because the previous shape of the first of
 /// these tests made it a comment, and the comment lost.
+///
+/// **What the compiler covers is *relocation*, not *rewriting*** — say the bound
+/// exactly, because two rewrites that defeat it both compile: re-calling
+/// [`attach_slave`] below the close and handing in the fresh handle (a witness on a
+/// pair the observation's bytes never went through), and moving the call down while
+/// dropping the dead witness from the slice and keeping a live sibling (the borrow is
+/// satisfied by whichever witness is still there, not by the one that matters). Neither
+/// is an accident; both are what an editor does when the borrow checker is in the way,
+/// which is precisely when this argument is worth reading. The compile error catches the
+/// cheap mistake — a moved line — and the only thing that catches the deliberate one is
+/// this paragraph and a reviewer.
 ///
 /// Why the ordering is load-bearing at all: reading the counter *after* the close
 /// asserts that the kernel retained bytes across the slave's last close, which no
@@ -1840,5 +2050,138 @@ mod tests {
             .write_all(b"<html>503 Service Unavailable</html>\n")
             .expect("write the garbage line");
         let _ = sub.next(Duration::from_secs(5));
+    }
+
+    // -----------------------------------------------------------------------------
+    // The witness's own guards (notes §3.60). `prove_open` was
+    // `self.metadata().map(|_| ())`, which in safe Rust has no reachable failure —
+    // these three are what make it a check instead of a name.
+    // -----------------------------------------------------------------------------
+
+    /// Two temp-dir symlinks and two character devices every Unix ships, so this runs
+    /// on every platform the suite does. `/dev/null` and `/dev/zero` are distinct
+    /// devices with distinct `st_rdev`, which is the whole discriminator.
+    fn link_to(dir: &Path, name: &str, target: &str) -> PathBuf {
+        let link = dir.join(name);
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(target, &link).expect("symlink");
+        link
+    }
+
+    /// **A witness whose path is repointed at a different device is refused**, though
+    /// its descriptor stays perfectly valid.
+    ///
+    /// This is the case an `fstat` on the fd cannot see and the reason the path is
+    /// carried at all: a node symlink that now resolves elsewhere is a *different
+    /// device* under the same name — what §12's replug renumbering does to
+    /// `ttyUSB0`/`ttyUSB1`, and what a replaced pty node does to a run-directory link.
+    /// The fd keeps answering; it just no longer refers to what the test named.
+    #[test]
+    fn a_witness_is_refused_once_its_path_names_a_different_device() {
+        let run = TempRun::new();
+        let link = link_to(run.path(), "dev", "/dev/null");
+        let mut w = attach_slave(&link);
+        w.prove_open()
+            .expect("a witness on an intact path proves open");
+
+        // The control that keeps this test honest: the fd is *still fine*. If this ever
+        // fails, the guard below is passing for the wrong reason and the finding this
+        // test encodes has changed.
+        assert!(
+            w.file.metadata().is_ok(),
+            "fstat on the held fd failed, so the assertion below would no longer be \
+             about the path at all"
+        );
+
+        link_to(run.path(), "dev", "/dev/zero");
+        let why = w
+            .prove_open()
+            .expect_err("a witness whose path now names /dev/zero must be refused");
+        assert!(
+            why.contains("no longer names the device this witness holds"),
+            "the refusal did not name the mechanism: {why}"
+        );
+
+        // …and the path disappearing entirely is the other arm, reported separately
+        // because a reader chasing it wants to know which of the two happened.
+        std::fs::remove_file(&link).expect("unlink");
+        let why = w
+            .prove_open()
+            .expect_err("a witness whose path is gone must be refused");
+        assert!(
+            why.contains("no longer resolves to a device"),
+            "the refusal did not name the mechanism: {why}"
+        );
+    }
+
+    /// **The measurement that retired the old `prove_open`, as a guard.**
+    ///
+    /// On a pty whose master has closed, `fstat` on the slave fd returns `Ok` — this
+    /// test asserts that, so the tautology is *recorded* rather than described — while
+    /// the kernel has unlinked the `/dev/pts` entry, so a fresh `stat` of the path
+    /// fails. The old witness was green on a dead pair; the new one is red.
+    ///
+    /// Linux-only, and that is §9's tell rather than a gap: this is the arm that comes
+    /// out **stricter** on the platform of record. Darwin's `/dev/ttysNNN` are
+    /// persistent devfs nodes, so the same construction is expected to leave the path
+    /// resolvable there — unmeasured, and stated as an expectation in
+    /// [`SlaveWitness::prove_open`]'s residual paragraph rather than asserted here.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_witness_on_a_pty_whose_master_closed_is_refused_though_fstat_still_answers() {
+        let Some(echo) = serial_echo() else {
+            panic!("serial_echo() is Some on Linux; a None here is a harness defect");
+        };
+        // Keep the run directory (and so the symlink) alive; drop only the sim, which
+        // is what closes the master. Dropping the whole `SerialEcho` would delete the
+        // link too, and the test would then prove that a deleted symlink is a deleted
+        // symlink instead of that a closed master destroys the device.
+        let SerialEcho {
+            device,
+            _sim: sim,
+            _run: run,
+        } = echo;
+        let target = std::fs::read_link(&device).expect("the sim's link points somewhere");
+        let mut w = attach_slave(&device);
+        w.prove_open().expect("a live sim pty proves open");
+
+        drop(sim);
+        assert!(
+            wait_until(Duration::from_secs(10), || !target.exists()),
+            "{} still exists after the sim died — the kernel did not unlink the pty \
+             slave at the master's close, which is the premise of this whole check",
+            target.display()
+        );
+
+        // The tautology, measured: the descriptor the old `prove_open` interrogated is
+        // still answering, on a pair that no longer exists.
+        use std::os::unix::fs::FileTypeExt;
+        let md = w
+            .file
+            .metadata()
+            .expect("fstat still answers on a slave whose master closed");
+        assert!(
+            md.file_type().is_char_device(),
+            "the held fd stopped being a character device, which the old check would \
+             also have missed"
+        );
+
+        let why = w
+            .prove_open()
+            .expect_err("a witness on a pty whose master closed must be refused");
+        assert!(
+            why.contains("no longer resolves to a device"),
+            "the refusal did not name the mechanism: {why}"
+        );
+        drop(run);
+    }
+
+    /// A path that does not name the fd's device is a harness defect, and it dies at
+    /// the constructor rather than three assertions later against the wrong device.
+    #[test]
+    #[should_panic(expected = "does not name the fd's device")]
+    fn adopting_a_witness_with_the_wrong_path_panics_at_the_constructor() {
+        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let _ = adopt_slave(null, Path::new("/dev/zero"));
     }
 }

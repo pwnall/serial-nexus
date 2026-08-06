@@ -7645,3 +7645,398 @@ capture failing names verbatim with no retries.
 
 **Owed, and it is one command:** `scripts/bless` (build + install + one `sudo
 setcap`), then the rig lane per AGENTS §3 with `SNX_REPLUG*` set.
+
+### 3.59 The purge that emptied the queue and then dropped the count: §15.50's own defect, one layer up
+
+**Found by an adversarial verification pass over notes §3.55, and reproduced through
+production code before anything was changed.** §3.55 closed the teardown ledger's two
+named siblings — `serial` and `leg` — by moving the purge-on-reconnect drain onto
+`TargetwardInbox` so the receiver would stay in the node's slot across the purge's
+yields. That reasoning was right and it was half the problem.
+
+**The measurement.** A `SuperviseCtx` built by `serial.rs`'s own `test_ctx`, a queue
+seeded with 8000 targetward bytes and handed in through `TeardownLoss::watch` exactly as
+`SerialNode::start` does it, `nodes::serial::purge_on_reconnect` spawned as a task, one
+`yield_now` to park it inside the drain, and then precisely what
+`SerialNode::signal_stop` does, in its order — `teardown_loss.drain()`, then
+`abort_all`:
+
+```
+PROBE SERIAL: accepted=8000 discarded_at_teardown=0 purged_on_reconnect=0 accounted=0
+```
+
+8000 accepted bytes destroyed with every counter reading zero. That is design §15.50's
+Problem paragraph verbatim — *"a saturated interior node destroyed its queued targetward
+bytes while answering `purged_bytes: 0` with every node counter at zero"* — reproduced
+**after** the fix, on the node the fix was written for.
+
+**Mechanism, and why keeping the queue reachable was not enough.**
+`purge_to_quiescence` ran bounded drain-then-yield rounds, accumulated the bytes in a
+`u64` local, and returned it; both callers charged their counter *after* the await
+completed (`serial.rs`'s `ctx.purged.fetch_add(purged, …)`, `leg.rs`'s
+`stat.purged_on_reconnect.add(purged)` per channel). So at a yield the bytes are in two
+places at once and neither of them is a counter: gone from the queue, and alive only in
+the purge future's stack frame. A teardown there asks both honest questions and gets two
+honest zeros — `drain_and_count` finds a queue the earlier rounds emptied, and
+`abort_all` drops the frame with the tally in it. The rule the type enforces is
+therefore **two-sided**, and only the pair is the invariant: *the queue never leaves the
+slot, and no byte that has left the queue crosses an `.await` uncharged.*
+
+**Magnitude is not incidental.** The backlog a `waiting` serial node holds is §7.1's own
+answer to an absent device — backpressure the origins, never drop their commands — so by
+the time a reconnect runs the purge, the channel is *full* by construction
+(`CHANNEL_CAP` chunks). The leg's exposure is N-fold: its loop purges `send_receivers`
+one channel at a time, so an abort mid-loop strands every channel already visited. And
+`purge_on_reconnect` defaults to `true`, so this is the default path, not a configured
+one.
+
+**Fix.** `purge_to_quiescence` takes its counter as an argument (`charge: &dyn Fn(u64)`)
+and returns nothing; each round charges the moment its bytes leave the queue, before the
+yield and before the loop's own `break`. Removing the return value is deliberate rather
+than tidy — the accumulated local *was* the defect, and leaving the shape available
+invites it back. The charge fires between `slot.with_mut` and the yield rather than
+inside the closure, and the two are equally safe for one stated reason: a teardown is
+synchronous (`daemon.rs` composes it inside one critical section) on a single-threaded
+runtime, so it can only interleave at an `.await`, and there is none between the drain
+and the charge. Outside is preferred because the sink is caller-supplied, and a future
+adopter whose counter lived behind the same `CriticalCell` would deadlock a borrow it
+never knew it was inside. **The yield was not touched**: it is what lets a sender
+suspended mid-`send` land one more chunk, which is why quiescence needs rounds at all
+(§6, DM-2/LEG-1).
+
+**Guards, and their executed fail-first.** Two, at two levels, because the leg drains
+through the same method and no fixture here builds a connected leg:
+`nodes::serial::tests::a_teardown_inside_the_purge_accounts_for_the_backlog_it_drained`
+(the production caller, asserting §5 conservation as an *equality* — deliberately not
+legislating which of the two words the bytes land under) and
+`runtime::tests::purge_to_quiescence_charges_each_round_before_it_yields` (the shared
+contract). With the fix reverted in place — accumulate the local, charge once after the
+loop — both go red and every pre-existing purge guard stays green, which is the point:
+nothing in the tree could see this.
+
+```
+assertion `left == right` failed: a teardown inside the reconnect purge destroyed 8000 accepted targetward bytes and accounted for 0: purged_on_reconnect=0, discarded_at_teardown=0 (§5)
+  left: 0
+ right: 8000
+
+assertion `left == right` failed: charged before the first yield: the bytes are out of the queue, so a teardown here finds nothing to charge and the tally must already be on a counter that outlives this task
+  left: 0
+ right: 7
+```
+
+**The interleave is constructed, not raced.** `purge_to_quiescence` drains the whole
+seeded backlog in round 1 and parks on `yield_now`; round 2 would find nothing and break.
+So a single `yield_now` in the test puts the purge at the one instant the defect exists
+at, and the guard asserts it is *there* (`!task.is_finished()`) rather than hoping — a
+purge that completed inside one poll would make the whole test vacuous, which is the
+§3.50 class of failure and is refused explicitly.
+
+**A third destroying verb, found in the same pass and fixed rather than declined.**
+`load --replace` composes teardown-then-load and called `teardown_with` as a *statement*,
+so the `{torn_down, discarded_at_teardown}` it computes was dropped and `load` answered
+`{"loaded": 1}`. Measured: 12056 destroyed targetward bytes reported as nothing, against
+8016 reported in full when the identical graph went through the `teardown` verb. Design
+§15.50 names only the `remove-node` and `teardown` replies, so this needed a decision and
+not a patch; it is **in scope**, annotated onto §15.50 rather than declined, for three
+reasons. `load --replace` destroys the *whole graph*, so its loss is the largest of the
+three verbs. It is the one an operator reaches for without the word "teardown" in front
+of them. And a destroyed node's last loss can land nowhere else — `state` has nobody left
+to ask — which is §15.50's own stated reason for putting the figure on a reply at all.
+`torn_down` rides along rather than being dropped as "not loss", because §15.49's lesson
+is that a `0` needs something beside it saying what the `0` means: `0` beside
+`torn_down: 0` is "there was no graph", `0` beside `torn_down: 7` is "seven nodes went
+and none owed a byte". Both are always present, `0` included, on a plain `load` too.
+Fail-first, with the statement-and-dropped-value shape restored and the daemon binary
+**rebuilt** (plan §3 rule 9 — `cargo test` does not rebuild a spawned binary):
+
+```
+assertion `left == right` failed: load --replace destroyed 8008 targetward bytes and reported none of them: {"loaded":1}
+  left: None
+ right: Some(8008)
+```
+
+`itest/tests/p13_teardown_accounting.rs::load_replace_reports_the_targetward_bytes_it_destroys`
+also pins the successor's ledger at `0` — the figure is loss, and loss quietly carried
+over would be *delivered* later instead — and asserts the always-present pair on the
+non-replace arm. The assertion order is deliberate: the headline check runs first so an
+unfixed daemon fails with the message that names the defect, not with the secondary one
+it also happens to break. **Owed to the lead:** `docs/rpc/configuration.md` is not in
+this session's allowed file set, so its `load` Result table and its `{"loaded": 1}`
+example still describe the old two-field-less reply.
+
+**A weakened guard, restored — and the weakening is the interesting part.** When §3.55
+moved XC-PURGE-1's three guards onto `TargetwardInbox`, two of them had their terminal
+`assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)))` **replaced** by
+`assert_eq!(inbox.drain_and_count(), 0)`. That is strictly weaker for exactly the residue
+those guards exist to forbid: a stranded `Chunk::new()` contributes `0` bytes, so it
+satisfies the byte count and fails the emptiness check — and one of the two *is* the
+empty-chunk guard, so the substitution was vacuous precisely where it mattered. Both
+assertions are made now, the stronger first, through a `peek_empty` helper that reads
+synchronously through the slot (assertion-only; no receiver is lent across an `.await`).
+The distinction is not left as prose: `a_stranded_zero_length_chunk_is_invisible_to_the_byte_count`
+proves the matcher, showing `drain_and_count() == 0` on a queue that holds a chunk while
+the restored check sees it — AGENTS §3's "a scanning gate proves its matcher as well as
+its walker", applied to an assertion.
+
+**Exec's floor, named at the two sites that had it and the two that did not.** It was
+stated at `docs/rpc/observation.md`, `configuration.md`, `lifecycle.md` and
+`exec.rs`'s `state_extra`, and absent from `ExecCodecNode::discarded_at_teardown` and
+from `Node::discarded_at_teardown` — the pointed omission, since that arm already spells
+out `pty`/`log`'s structural `0` and `serial`/`leg`'s adoption and skipped the one kind
+whose number is inexact. Both carry it now. Nothing about the figure changed; what
+changed is that a reader arriving at either method no longer takes an exact number away.
+
+**What is not claimed.** No production trace of this race firing in the field exists —
+it was found by construction and measured by construction, and the window is one
+scheduler slot wide. That is the wrong reason to leave it: §5's promise is not
+probabilistic, the window opens on the *default* configuration of every reconnect, and
+the loss it drops is the deepest backlog the daemon legally holds.
+
+### 3.60 The witness that proved nothing, the citations that pointed one section off, and an exception whose reason was falsified twelve lines away
+
+**Design:** §15.46 (the read-after-close rule), §15.41 (context hygiene, for the scan's
+scope). **Plan:** §3 rules 8, 9, 10; §18 item 6's follow-through. **Rules:** AGENTS §3
+(a scanning gate proves its matcher), §5 (anti-tautology), §7, §9.
+
+Five defects an adversarial pass found in §3.56's own work, repaired here. Four of them
+are the same shape: *a thing that reads as a proof and is not one*.
+
+#### 1. Thirteen citations, written by the commit whose subject was prose truth
+
+Every code comment §3.56's conversion produced cites **notes §3.55**. §3.55 is the
+teardown ledger; the conversion is §3.56 and the prose sweep it also carried is inside
+§3.57. Not one `.rs` file in the tree cited §3.56 at all. Corrected in
+`itest/tests/{serial_hardware,p4_purge,p4_free_for_all,p4_exclusivity,p6_outage,p8_map,p12_pty_setup}.rs`
+— twelve to §3.56, and `serial_hardware.rs`'s "Corrected 2026-08-05" note to §3.57,
+which is where that sweep lives.
+
+The mechanism is worth naming because it is not carelessness: the citing code and the
+notes entry were written in one pass, the number was taken from the last section that
+existed rather than from the one about to be appended, and every later citation copied
+the first. A citation is the one kind of comment a reader *follows*. A wrong one costs
+more than a vague one — it sends the next editor somewhere that argues something else,
+and arriving at a real section reads as confirmation.
+
+**The gate, and the exact bound on it.**
+`itest/tests/meta_names.rs::notes_citations_in_code_resolve_to_a_real_section` resolves
+every `§3.NN` in every `.rs` file in the tree against the `### 3.NN` headings of
+`docs/implementation-notes.md`, and fails on any that does not resolve. It shares the
+existing walker (so `target/`, `.snx-bin/` and nested checkouts are skipped once, for
+all three gates), plants the violation in every spelling it claims to cover — module
+doc, doc comment, line comment, block comment, **string literal** — and asserts the
+three shapes that must stay silent: a `.md` file, a file under a skipped build
+directory, and a file in a nested checkout.
+
+**It would not have caught the thirteen.** They resolved to §3.55, which exists. A
+scanner cannot tell a real section from the wrong real section without reading both for
+meaning, and the doc comment says so rather than implying a coverage it does not have.
+What it does catch is the adjacent class — a citation written *before* the section it
+names — which is how the wrong number gets picked in the first place, and which is not
+hypothetical: on its first run it fired on this session's own owed §3.60 citations, and
+for a few minutes on another session's §3.59 ones. The uncovered half is a reviewer's.
+
+Scope is `.rs` only. The documents cite each other constantly and historical entries
+must keep naming sections a later generation renumbered; a gate that swept them would
+need an allowlist per generation. **The scoping premise is checked, not asserted**: the
+scan reads the current design and plan and fails if either grows a `### 3.N` heading,
+because a bare `§3.N` would then be ambiguous and this gate would be resolving citations
+against the wrong document. Design §3 is *Concepts and terminology* and plan §3 is
+*Validation toolkit*; neither has numbered subsections today, and plan §3's rules are
+cited as `plan §3 rule 8` — a space, not a dot, which the matcher does not touch.
+
+#### 2. `File::prove_open` was a tautology, and the repair is stricter on the platform of record
+
+The witness half of §3.56 shipped `impl OpenWitness for std::fs::File` with
+`prove_open = self.metadata().map(|_| ())`. In safe Rust the descriptor is guaranteed
+valid for the `File`'s lifetime, so that call has **no reachable failure**. Five of the
+six converted sites used `File` witnesses only, so at those sites "proven live" reduced
+entirely to the compile-time borrow — a real property, but not the one the name claims.
+
+Measured on this box (Linux 7.0.0-29), on a pty whose **master had already been
+closed**: `fstat` on the slave fd returns `Ok` with `mode=020600`, while `stat` of the
+same slave's path returns `ENOENT`. The kernel unlinks `/dev/pts/N` at the master's
+close. The fd is valid and useless, and the old check was green on it.
+
+`attach_slave` now returns a `SlaveWitness` that **carries the path it was opened
+through**, and `prove_open` compares the fd's `(st_dev, st_ino, st_rdev)` against a
+fresh `stat` of that path. Three failures instead of none: the path stops resolving
+(the pty case above), the path resolves to a different device (a replaced node, or
+§12's replug renumbering `ttyUSB0`/`ttyUSB1` — the fd stays perfectly valid through
+it), or the fd's own `fstat` fails (kept, so the parameter costs a syscall rather than
+a name, and documented as the arm that cannot fire).
+
+**This is §9's tell**: the portable form came out *stricter* on the platform of record,
+not weaker. And the residual is stated rather than papered over — on a kernel whose
+slave nodes are not per-allocation directory entries (Darwin's `/dev/ttysNNN` are
+persistent devfs nodes) the path is expected to keep resolving after a master close, so
+the check degrades there to the borrow plus the tautology. **Expected, not measured**:
+this box is Linux (§7). The instrument that would close it portably is `poll(POLLHUP)`,
+and this crate cannot issue it — `unsafe` lives only in `serial_nexus_sys` (AGENTS
+invariant 3 / §16.3), the same wall `p12_pty_setup` already records for `FIONREAD`. A
+doctor probe is the right home for it if it is ever wanted, not a `libc` call smuggled
+into the harness.
+
+`impl OpenWitness for std::fs::File` is **removed**, not merely bypassed: a `File`
+cannot answer the question, and leaving the impl would let any plain client fd in this
+suite be handed in as a witness that proves nothing. The two sites that open with their
+own flags (`p12_pty_setup`'s `O_NONBLOCK` session A, `p8_map`'s client-and-witness-in-one
+fd) use `adopt_slave(file, path)`, which **verifies** the path names the fd's device at
+adoption and panics otherwise — the anti-tautology rule applied to the constructor,
+since every later check is a comparison against what it records.
+
+Three guards, fail-first proven by restoring the one-line tautology in place: both
+`a_witness_is_refused_once_its_path_names_a_different_device` and
+`a_witness_on_a_pty_whose_master_closed_is_refused_though_fstat_still_answers` go red
+with `must be refused: ()`. The second **asserts the tautology as a positive control** —
+`fstat` still answers, and the fd is still a character device, on a pair that no longer
+exists — so the finding is recorded in the suite rather than only in this paragraph.
+
+#### 3. `Sim::prove_open` is an approximation, and now says so
+
+`Child::try_wait` answers "the process has not been reaped", and what is wanted is "the
+sim's slave fd is open". The sim closes its port and *then* serializes and prints its
+verdict (`sim/src/main.rs`: the mode function owns the port and returns a `Value`, which
+`main` prints afterwards), so there is a window where `try_wait` reports the child alive
+and the slave is already gone.
+
+Measured against the shipped `serial-nexus-sim client` on this box (debug profile, load
+average 0.4): the master saw the last slave close **0.658–0.843 ms** before
+`waitpid(WNOHANG)` reported the child, **6 of 6**, with the instrument's own busy-poll
+granularity inside that figure — an upper bound on the window, not the window. The doc
+comment says that, with the number, instead of "proven live at the instant of the read".
+
+It stays load-bearing for a reason the approximation does not touch: the failure it
+exists to catch is a `--hold-ms` that expired *seconds* ago under load, turning a vacuous
+pass into a named failure. A sub-millisecond blind spot at the tail does not blunt that,
+and the thing it replaced was a bare 20 s timer with no check at all.
+
+#### 4. The borrow forbids relocation, not rewriting
+
+`settled_while_open`'s doc sold the witness borrow as the enforcement. It is, against the
+cheap mistake — a moved line — and two rewrites defeat it and compile: re-calling
+`attach_slave` below the close and handing in the fresh handle (a witness on a pair the
+observation's bytes never went through), and moving the call down while dropping the dead
+witness from the slice and keeping a live sibling. Both are what an editor does when the
+borrow checker is in the way, which is exactly when the argument is worth reading. The
+bound is now stated in the doc comment where the claim is made.
+
+#### 5. An exception whose stated reason was falsified twelve lines away
+
+`p4_purge`'s purge-on-detach check argued its exception with "the counter comes into
+existence *because* of the close and reads 0 before it". The counter is `purged`, and the
+**next test in the same file**, `pre_grant_backlog_is_purged_on_acquire_and_never_reaches_device`,
+watches that same field reach `SB` **while its client is still open**, inside
+`settled_while_open`, because purge-on-*acquire* bumps it too.
+
+What is close-only is **this increment's trigger**, not the counter. The distinction is
+not pedantry: the old wording licensed the wrong simplification — that `purged` cannot be
+read early, when it demonstrably can — and a future editor removing the pre-close
+readings on that authority would have deleted the guard's premise.
+
+"Structurally unconvertible" is softened in both exceptions, `p4_purge`'s and
+`p12_pty_setup`'s. Both guards already take pre-close observations under
+`settled_while_open`; what cannot move above the close is a single post-close
+*assertion*, because the edge that moves the number is the close. Saying "the guard is
+unconvertible" overstated it in the direction that discourages exactly the tightening
+§3.56 was for.
+
+### 3.61 P14's own adversarial pass: five defects, and a read-back that lies
+
+**Design:** §15.51. **Plan:** §18 item 11. **Rules:** AGENTS §9 (an independent
+verifier that has not read the diagnosis; record refuted diagnoses), §7 (measure,
+do not assume), plan §3 rules 9, 10, 14.
+
+The P14 that landed in §3.57 was handed to a verifier that had not read its
+reasoning, with instructions to **refute** rather than confirm. It refuted five
+things. All five are fixed, each with an executed fail-first proof. Recorded in
+full because a verification that finds nothing teaches nothing, and this one found
+the probe's most dangerous sentence.
+
+**(1) The read-back does not answer the question the doc said it answered — and
+this is the finding.** `p14_refusal`'s doc claimed the classification was
+"corroborated by a number rather than resting on this rule alone", and
+`p14_apply_rate`'s said it reported "what the driver is actually running". Both
+are false on the platform of record. Measured over the bench crossover, timing the
+payloads rather than trusting `tcgetattr`:
+
+| requested | reads back | achieved (timed) | ratio |
+|---|---|---|---|
+| 115200 | 115200 | 109740 | 0.95 |
+| 921600 | 921600 | 869963 | 0.94 |
+| 1500000 | 1500000 | 1414231 | 0.94 |
+| 2000000 | 2000000 | 1879497 | 0.94 |
+| **2500000** | **2500000** | **1903015** | **0.76** |
+| **2750000** | **2750000** | **1911323** | **0.70** |
+| 3000000 | 3000000 | 2795935 | 0.93 |
+
+A steady ~0.94 is this instrument's own overhead. The two outliers are not
+overhead: the FT232R is rounding both asks to its nearest supported divisor —
+2 Mbaud — and `ftdi_sio` is echoing the **requested** number back. The bytes still
+round-trip byte-exact, because both ends are mis-set *identically* and therefore
+agree with each other.
+
+So `max_reliable_baud` is **the highest rate that round-trips when both ends are
+asked for it**, which is exactly what an operator configuring a port gets — and it
+is not necessarily the rate on the wire. Each direction now carries
+`achieved_baud_floor`, timed from its fastest clean trial (a floor: this probe's
+poll loop can only push it down), and the report's own
+`ceiling_is_a_floor_over` sentence says the number is a *requested* rate and tells
+the reader to compare. The read-back keeps its job in the `adapter-refused` arm,
+where the driver really does answer with a different number — 4000000 reads back
+9600 — and is now documented as saying nothing about a rate it accepted.
+
+**(2) A vanished peer printed as a kernel fact.** An adapter unplugged during a
+rate change answers `EIO`, which carries an errno, so the discriminator called it
+`platform-refused` — and the verdict then told the operator that *this kernel's ask
+surface* stops here and a different kernel might ask for more over the same cable.
+The cable was gone. `is_hangup` is the predicate P5 already uses for exactly this
+distinction and `p14_refusal` never consulted it; it does now, and
+`CeilingKind::HungUp` **degrades** rather than reporting a ceiling — which is what
+`RungOutcome::HungUp`'s own doc comment ("Not a ceiling") had been asserting while
+the fold contradicted it.
+
+**(3) A stall on trial 2 or 3 was folded into a loss**, which §6 forbids. The
+classification lived in the rung fold and compared *totals over up to three trials*
+against a *single* payload length. Because a direction short-circuits on its first
+failure, an intermittent rung failing on trial 2 or 3 — the shape a marginal rate
+actually produces — had already banked one or two clean payloads, so a total stall
+on trial 3 read `received == 2 x payload`: neither short nor starved, therefore
+`Corrupt`. The identical failure on trial 1 classified correctly. The bug was a
+sum compared against a unit. `TrialResult::failure` now classifies each trial
+against its own payload, while that payload is still in scope.
+
+**(4) The wall-clock budget was reported and never folded.** `P14_BUDGET`'s comment
+promised "the fold refuses to dress up an incomplete search as a measured ceiling",
+and `p14_verdict` could not see the flag: a budget expiring straight after a
+*failing* rung, with up to four refinements still owed, left a bounded floor and a
+named kind, so the verdict read `supported` over a search that had stopped early.
+The `ceiling_kind.is_none()` arm only ever covered the case where *no* failure
+bounds the floor. `search_budget_exhausted` is a fact now and degrades.
+
+**(5) Two smaller ones.** `outcome` and `refusal_errno` were taken from two
+independent `or`s, so a mixed-adapter rig could print `adapter-refused` beside a
+non-null errno — the pairing the discriminator declares impossible, in the
+artifact, for a reader to trip over; they come from the same port now. And the
+counter deltas subtracted `i32` fields cast to `u64`, so a driver that reset a
+counter between the two reads would underflow (a debug panic, ~1.8e19 in release);
+they saturate.
+
+**Two claims the verifier corrected without finding a bug, and both are now stated
+in the code.** The non-monotone guard defends against a history **the probe cannot
+produce** — the climb stops at its first failure and a refinement rate is always
+below the failure that bracketed it, so the floor can never rise above a failure.
+What that guard actually protects is the *fold's totality*, which is what would let
+a future probe walk one rung past a failure without touching the pure core; the
+test says so now, so nobody reads its green as evidence that the search handles a
+non-monotone rig today. And the "two independent gates" keeping P14 off a software
+null modem are **one predicate read twice**: `baseline_ok` is computed only inside
+the `a_uart && b_uart` branch, so a pts fails the second gate *because* it failed
+the first. The real protection is `p5_is_uart`, measured here on Linux (a pts
+answers `ENOTTY` to both ioctls, on the slave and on the master) and unverified
+from this box on Darwin — which is the single point of failure, and is named
+rather than assumed.
+
+**Fail-first, executed, three reverts.** The `is_hangup` consultation removed, the
+per-trial classification collapsed back to "everything is a loss", and the budget
+arm short-circuited: each reddened its own guard, and the tree was restored green
+after each.

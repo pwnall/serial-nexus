@@ -957,16 +957,21 @@ fn drain_into(slave: &mut std::fs::File, sink: &mut Vec<u8>) {
 /// elsewhere; §5's platform rule).
 ///
 /// **This is the second of the two deliberate exceptions to notes §3.29's rule**
-/// (§3.55). That rule — *a byte counter is read while the client that fed it is still
+/// (§3.56). That rule — *a byte counter is read while the client that fed it is still
 /// open* — exists because reading one afterwards asserts that the kernel retained the
 /// bytes across the slave's last close, which doctor P13 measures rather than assumes
 /// (`retains` on Linux 7.0.0-29, `waits-then-discards` on Darwin 24.6.0). Here
 /// `discarded_at_last_close` **is** the last close's own product: it reads 0 for the
 /// whole of a session's life and moves exactly once, at the close this test performs.
-/// There is no earlier ordering that observes it, so converting this guard would
-/// delete it rather than strengthen it — the same shape as `p8_map`'s
-/// `a_closing_writers_residual_is_forwarded_not_purged` and `p4_purge`'s
-/// purge-on-detach check, and treated the same way.
+///
+/// What is unconvertible is that **one assertion**, not this guard — say it that way
+/// (notes §3.60), because the guard is already half-converted: the `unshed` reading
+/// below runs inside `settled_while_open` with session A proven open, and it is the
+/// premise the post-close number leans on. Only `discarded_at_last_close > 0` has to
+/// stay below the close, and it has to because the edge that moves it is the close.
+/// The same shape as `p8_map`'s `a_closing_writers_residual_is_forwarded_not_purged`
+/// and `p4_purge`'s purge-on-detach check — whose own version of this paragraph was
+/// wrong in a way this one is not, and §3.60 records which.
 ///
 /// It must **not** be ported to macOS whatever else is done with this class: on Darwin
 /// `discarded_at_last_close` is structurally always 0 (`docs/macos.md` §3), so the
@@ -1026,7 +1031,14 @@ fn a_fresh_console_session_does_not_inherit_the_previous_sessions_bytes() {
     );
 
     // --- Session A: attach, never read, and let the device fill the pair. ---
-    let mut a = attach(&console, true);
+    //
+    // Adopted as a witness (rather than left a bare `File`) so the pre-close reading
+    // below is proven against a slave whose *far end* is still there: an `fstat` on the
+    // fd answers `Ok` on a pair whose master has closed, and the path's `/dev/pts`
+    // entry is what does not (notes §3.60). `O_NONBLOCK` stays — this session must be
+    // able to detect a daemon that stopped draining rather than block on it — and the
+    // fd is still never read from, which is the property the witness below leans on.
+    let mut a = serial_nexus_itest::adopt_slave(attach(&console, true), &console);
     assert!(
         wait_until(Duration::from_secs(10), || client_present(rpc, "console")
             == Some(true)),
@@ -1068,7 +1080,7 @@ fn a_fresh_console_session_does_not_inherit_the_previous_sessions_bytes() {
     // is what the last close is about to charge.
     //
     // **What this does and does not license, because two earlier shapes of it were
-    // wrong and one was measured wrong** (notes §3.55). It licenses "nothing has been
+    // wrong and one was measured wrong** (notes §3.56). It licenses "nothing has been
     // lost yet", which is the premise `discarded_at_last_close > 0` needs and which
     // the message below no longer has to hedge about. It does **not** separate "queued
     // in the pair" from "delivered to a reader": both are absent from every counter

@@ -13,9 +13,12 @@
 //! * [`consumer_context_terms_appear_only_where_the_ban_is_stated`] — §15.41's privacy
 //!   rule, which explicitly outranks the frozen-history rule, so this one has **no**
 //!   historical exemption.
+//! * [`notes_citations_in_code_resolve_to_a_real_section`] — every implementation-notes
+//!   reference in a `.rs` file names a section that exists. Added after a commit whose
+//!   own subject was prose truth wrote thirteen citations one section off (notes §3.60).
 //!
-//! Why the two live together: they are the same mechanism (a whole-tree token scan with
-//! a justified allowlist) and they share the walker, so a bug in the walker fails both
+//! Why they live together: they are the same mechanism (a whole-tree scan with a
+//! justified scope) and they share the walker, so a bug in the walker fails all of them
 //! rather than being fixed once and forgotten once.
 
 use std::collections::BTreeMap;
@@ -491,4 +494,268 @@ fn consumer_context_terms_appear_only_where_the_ban_is_stated() {
              rule, but carries {seen}. Update the count deliberately or fix the prose."
         );
     }
+}
+
+// ---------------------------------------------------------------------------------
+// implementation-notes citations — every §3.NN in code names a section that exists
+// ---------------------------------------------------------------------------------
+
+/// The notes file every `§3.NN` in this tree refers to.
+const NOTES: &str = "docs/implementation-notes.md";
+
+/// Every `§3.NN` citation in `text`, as `(1-based line, section number)`.
+///
+/// **Why `§3.NN` is unambiguously a notes reference here**, which is the whole scoping
+/// question: the design's §3 (*Concepts and terminology*) and the plan's §3 (*Validation
+/// toolkit*) have no numbered subsections, so neither document can be cited in this
+/// shape. Plan §3's numbered rules are cited as `plan §3 rule 8` — a space, not a dot,
+/// which this matcher does not touch. The premise is not left as a comment:
+/// [`notes_citations_in_code_resolve_to_a_real_section`] asserts it against both
+/// documents, so a future generation that grows a `### 3.1` heading in either one turns
+/// this gate red rather than letting it resolve citations against the wrong file.
+///
+/// The scan is **text-level and deliberately so**: a stale citation inside a string
+/// literal is worse than one in a comment, because `doctor` prints several of them to an
+/// operator (`probes.rs` names notes §3.29 in a P13 status message). A scanner that only
+/// understood comments would exempt exactly the citations a human reads.
+fn notes_citations(text: &str) -> Vec<(usize, u32)> {
+    let mut out = Vec::new();
+    for (at, _) in text.match_indices("\u{a7}3.") {
+        let rest = &text[at + "\u{a7}3.".len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        // A maximal digit run, so `§3.1` and `§3.10` never collapse into each other.
+        let Ok(n) = digits.parse::<u32>() else {
+            continue;
+        };
+        out.push((text[..at].matches('\n').count() + 1, n));
+    }
+    out
+}
+
+/// The section numbers `docs/implementation-notes.md` actually defines, from its own
+/// `### 3.NN` headings — the file is the authority, never a list kept beside it.
+fn notes_sections(md: &str) -> std::collections::BTreeSet<u32> {
+    let mut out = std::collections::BTreeSet::new();
+    for line in md.lines() {
+        let Some(rest) = line.strip_prefix("### 3.") else {
+            continue;
+        };
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if let Ok(n) = digits.parse::<u32>() {
+            out.insert(n);
+        }
+    }
+    out
+}
+
+/// **Every implementation-notes citation in code names a section that exists.**
+///
+/// The defect this exists for is not hypothetical and not subtle: the commit that
+/// converted seven guards to the read-after-close rule cited **notes §3.55** in thirteen
+/// places, in six files, and §3.55 is a different entry — the teardown ledger. The
+/// conversion is §3.56 and the prose sweep it also carried is inside §3.57. Zero `.rs`
+/// files in the tree cited §3.56 at all. The commit's own subject was prose truth.
+///
+/// A citation is the one kind of comment a reader *follows*, so a wrong one costs more
+/// than a vague one: it sends the next editor to a section that argues something else,
+/// and it reads as confirmation. Nothing in the build could see it, because a number in
+/// a comment compiles.
+///
+/// **What this gate covers, and what it does not — stated first, because the honest
+/// answer is uncomfortable.** It catches a citation that resolves to *nothing*. The
+/// thirteen above resolved to §3.55, which **exists**, so this gate would not have
+/// caught them; a scanner cannot tell that a real section is the wrong real section
+/// without reading both for meaning. What it does catch is the adjacent class, and that
+/// class is not hypothetical either: a citation written *before* the section it names —
+/// which is how both of this defect's cousins arrived, since the wrong number was picked
+/// while the right one was still unwritten. It fired on exactly that during its own
+/// first run, on this session's own §3.60 citations and (in a window of a few minutes)
+/// on another session's §3.59 ones. The uncovered class is a reviewer's job and the
+/// discipline of writing the notes entry in the same commit as the code that cites it;
+/// this gate makes the second half mechanical.
+///
+/// Scope is `.rs` only, deliberately. The documents cite each other constantly and in
+/// several shapes (`§3.45 E`, `§3.31/§3.55`, historical entries that must keep naming
+/// sections a later generation renumbered), and a gate that swept them would either be
+/// noisy or need an allowlist per generation. Code has one shape and one meaning, and it
+/// is where the defect landed.
+///
+/// This file is **not** exempt from its own scan, unlike the two token gates above:
+/// their planted literals have to live here, and this one's does not — it is assembled
+/// at runtime from [`ABSENT`], so the scanner can walk this file like any other and a
+/// stale citation in this very comment would fail the gate.
+#[test]
+fn notes_citations_in_code_resolve_to_a_real_section() {
+    /// A section number the notes will never define, for planting. Kept as an integer
+    /// so no literal citation of it appears anywhere in this file's text.
+    const ABSENT: u32 = 99;
+
+    let root = repo_root();
+    let notes =
+        std::fs::read_to_string(root.join(NOTES)).unwrap_or_else(|e| panic!("read {NOTES}: {e}"));
+    let sections = notes_sections(&notes);
+
+    // 0. The scoping premise, checked rather than asserted in prose: no other normative
+    //    document defines a `3.N` subsection, so `§3.N` cannot mean anything but this
+    //    file. AGENTS §2 names the current pair; both are read here.
+    for doc in [
+        "docs/39-design-claude-fable-v15.md",
+        "docs/40-implementation-plan-claude-fable-v15.md",
+    ] {
+        let text =
+            std::fs::read_to_string(root.join(doc)).unwrap_or_else(|e| panic!("read {doc}: {e}"));
+        let clashes = notes_sections(&text);
+        assert!(
+            clashes.is_empty(),
+            "{doc} now defines section(s) {clashes:?} in the `3.N` shape, so a bare \
+             §3.N in code is ambiguous and this gate is resolving citations against \
+             the wrong document. Either that heading is a mistake, or every citation \
+             in the tree needs a document qualifier and this scan needs to read it."
+        );
+    }
+
+    // 1. Fail-first on the matcher, in every spelling it claims to cover (AGENTS §3),
+    //    and on the walker, through a nested directory. The absent section is formatted
+    //    rather than written, so this file carries no literal of it.
+    let scratch =
+        std::env::temp_dir().join(format!("snx-meta-notes-{}-{}", std::process::id(), line!()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(scratch.join("deep/deeper")).expect("create scratch");
+    let bogus = format!("\u{a7}3.{ABSENT}");
+    let live = format!(
+        "\u{a7}3.{}",
+        sections.iter().next().expect("the notes have sections")
+    );
+    std::fs::write(
+        scratch.join("deep/deeper/planted.rs"),
+        format!(
+            "//! Module doc citing {bogus}.\n\
+             /// Doc comment citing {bogus}.\n\
+             pub fn f() {{\n\
+             \x20   // Line comment citing {bogus}.\n\
+             \x20   panic!(\"an operator-visible message citing {bogus}\");\n\
+             }}\n\
+             /* block comment citing {bogus} */\n\
+             // …and one that resolves, which must NOT be reported: {live}\n"
+        ),
+    )
+    .expect("write planted file");
+    // Three shapes that must stay silent: a non-Rust file (out of scope), a file under a
+    // skipped build directory, and a file inside a nested checkout. A skip is a matcher
+    // too, and gets planted in every spelling it claims to cover.
+    std::fs::write(
+        scratch.join("deep/notes.md"),
+        format!("Prose citing {bogus}, which this gate does not scan.\n"),
+    )
+    .expect("write planted markdown");
+    std::fs::create_dir_all(scratch.join("target/debug")).expect("create scratch target");
+    std::fs::write(
+        scratch.join("target/debug/generated.rs"),
+        format!("// build output citing {bogus}\n"),
+    )
+    .expect("write planted build output");
+    std::fs::create_dir_all(scratch.join("wt")).expect("create scratch worktree");
+    std::fs::write(scratch.join("wt/.git"), "gitdir: /elsewhere\n").expect("write gitfile");
+    std::fs::write(
+        scratch.join("wt/copy.rs"),
+        format!("// another checkout citing {bogus}\n"),
+    )
+    .expect("write planted worktree file");
+
+    let mut planted: Vec<String> = Vec::new();
+    walk_text(&scratch, &scratch, &mut |rel, text| {
+        if !rel.ends_with(".rs") {
+            return;
+        }
+        for (line, n) in notes_citations(text) {
+            if !sections.contains(&n) {
+                planted.push(format!("{rel}:{line}"));
+            }
+        }
+    });
+    let _ = std::fs::remove_dir_all(&scratch);
+    assert_eq!(
+        planted,
+        vec![
+            "deep/deeper/planted.rs:1".to_owned(),
+            "deep/deeper/planted.rs:2".to_owned(),
+            "deep/deeper/planted.rs:4".to_owned(),
+            "deep/deeper/planted.rs:5".to_owned(),
+            "deep/deeper/planted.rs:7".to_owned(),
+        ],
+        "the matcher or the walker missed a spelling of a dangling citation, reported \
+         a resolvable one, or reached out of scope (a .md file, a build directory, or \
+         a nested checkout)"
+    );
+
+    // 2. …and the shapes that are NOT notes citations must stay silent, or this gate
+    //    becomes noise and gets deleted rather than fixed. Design and plan sections are
+    //    spelled the same way with different numbers, and plan §3's rules are cited with
+    //    a space where a notes section has a dot.
+    for benign in [
+        "design \u{a7}15.51 (P14)",
+        "plan \u{a7}18 item 11",
+        "AGENTS \u{a7}9's verification protocol",
+        "plan \u{a7}3 rule 8, and \u{a7}3 rule 13",
+        "\u{a7}7.2's baseline discipline",
+        "\u{a7}16.13 names the artifact",
+        "\u{a7}5's anti-tautology rule",
+        "version 3.14 of something",
+    ] {
+        assert!(
+            notes_citations(benign).is_empty(),
+            "{benign:?} was read as an implementation-notes citation"
+        );
+    }
+
+    // 3. The real scan.
+    let mut rs_files = 0usize;
+    let mut resolved = 0usize;
+    let mut offenders: Vec<String> = Vec::new();
+    walk_text(&root, &root, &mut |rel, text| {
+        if !rel.ends_with(".rs") {
+            return;
+        }
+        rs_files += 1;
+        for (line, n) in notes_citations(text) {
+            if sections.contains(&n) {
+                resolved += 1;
+            } else {
+                offenders.push(format!("{rel}:{line} -> \u{a7}3.{n}"));
+            }
+        }
+    });
+
+    assert!(
+        offenders.is_empty(),
+        "citations of implementation-notes sections that do not exist: {offenders:#?}\n\
+         {NOTES} defines 3.1..=3.{} today. A citation is followed, not skimmed: a wrong \
+         one sends the next editor to a section that argues something else and reads as \
+         confirmation. If the section is owed but unwritten, write it in the same commit \
+         — that is the case this gate was added for.",
+        sections.last().copied().unwrap_or(0)
+    );
+
+    // 4. Not vacuous, three ways: the notes were parsed, the tree was walked, and the
+    //    scan is looking at content that really does cite (a matcher that silently
+    //    stopped matching reports zero offenders just as loudly as a clean tree).
+    assert!(
+        sections.len() >= 50,
+        "only {} sections parsed out of {NOTES} — the heading shape changed and every \
+         citation below is being checked against almost nothing",
+        sections.len()
+    );
+    assert!(
+        rs_files >= 100,
+        "only {rs_files} .rs files walked — the walker has stopped seeing the tree"
+    );
+    assert!(
+        resolved >= 40,
+        "only {resolved} resolvable notes citations found in {rs_files} .rs files — this \
+         tree cites its notes constantly, so a number this low means the matcher stopped \
+         matching rather than that the comments stopped citing"
+    );
 }

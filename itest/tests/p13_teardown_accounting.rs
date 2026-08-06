@@ -421,3 +421,89 @@ fn every_byte_sent_to_a_peerless_leg_is_accounted_across_the_removal() {
          the {queued} accepted. reply={reply} state={before}"
     );
 }
+
+// --- the third destroying verb: `load --replace` ---------------------------------
+
+/// **`load --replace` is a teardown, and it must say what the teardown cost** (§5,
+/// §15.50 as annotated by notes §3.59).
+///
+/// §15.50 named the `remove-node` and `teardown` replies because those were the two
+/// verbs that destroyed nodes when it was written. `load --replace` is the third, and
+/// it is the one whose loss is *largest* — it destroys the entire graph, not one node —
+/// and the one an operator reaches for without the word "teardown" in front of them.
+/// It called `teardown_with` as a statement, so the `{torn_down, discarded_at_teardown}`
+/// it computed was dropped on the floor and the reply read `{"loaded": 1}`. A destroyed
+/// node's last loss can land nowhere else: `state` has nobody left to ask.
+///
+/// The graph is the `waiting` serial one for the reason its own guard gives — an absent
+/// device is §7.1's deepest legal backlog and the deterministic one — and the same
+/// config is loaded back over itself, because what is under test is the reply, not the
+/// difference between two configs.
+///
+/// Fail-first (the shipped shape restored — `self.teardown_with(…)` as a statement and
+/// `json!({ "loaded": st.nodes.len() })` as the reply):
+/// `load --replace destroyed 8008 targetward bytes and reported none of them:
+/// {"loaded":1}`.
+#[test]
+fn load_replace_reports_the_targetward_bytes_it_destroys() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let absent = d.run().join("no-such-device");
+    let cfg = waiting_serial_graph(&absent);
+
+    // Kept for the always-present check at the bottom. The order is deliberate: the
+    // headline assertion — the one the loss figure lives or dies on — is made first, so
+    // a run against an unfixed daemon fails with *that* message rather than with the
+    // secondary one it also happens to break.
+    let first = rpc
+        .load_toml(&cfg, false)
+        .expect("load the waiting-serial graph");
+
+    let before = rpc.node("usb0").expect("serial node");
+    assert_eq!(
+        before["status"].as_str(),
+        Some("waiting"),
+        "the device must be absent for the queue to accumulate: {before}"
+    );
+    let queued = inject(rpc, "usb0", &"z".repeat(1000), 8);
+
+    let reply = rpc.load_toml(&cfg, true).expect("load --replace");
+    assert_eq!(
+        reply["discarded_at_teardown"].as_u64(),
+        Some(queued),
+        "load --replace destroyed {queued} targetward bytes and reported none of them: \
+         {reply}"
+    );
+    assert_eq!(
+        reply["torn_down"].as_u64(),
+        Some(1),
+        "the loss figure needs the node count beside it to be readable — a `0` with \
+         nothing next to it is the defect notes §3.50 names: {reply}"
+    );
+    assert_eq!(
+        reply["loaded"].as_u64(),
+        Some(1),
+        "the replacement graph did not load: {reply}"
+    );
+
+    // The successor is a fresh node, not the old one with its backlog: the figure above
+    // is loss, and loss that was quietly carried over would be delivered later instead.
+    let after = rpc.node("usb0").expect("the replacement serial node");
+    assert_eq!(
+        after["discarded_at_teardown"].as_u64(),
+        Some(0),
+        "the replacement node inherited its predecessor's ledger: {after}"
+    );
+
+    // The always-present rule, on the arm that tore nothing down: a `load` without
+    // `replace` answers the honest `0`/`0` rather than omitting the fields, so a client
+    // never learns to read absent as none (§15.50).
+    assert_eq!(
+        (
+            first["torn_down"].as_u64(),
+            first["discarded_at_teardown"].as_u64()
+        ),
+        (Some(0), Some(0)),
+        "a non-replace load must still carry the pair, at zero: {first}"
+    );
+}

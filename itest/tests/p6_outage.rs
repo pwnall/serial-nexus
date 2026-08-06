@@ -332,7 +332,7 @@ write_mode = "on-demand"
     //    ignored (the bash's `|| true`).
     //
     //    **The console session outlives that client, deliberately** (notes §3.29 /
-    //    §3.55, plan §3 rule 8). The counter step 6 reads — `purged_on_reconnect` — is
+    //    §3.56, plan §3 rule 8). The counter step 6 reads — `purged_on_reconnect` — is
     //    produced by *these* bytes, and the one-shot client below closes its slave the
     //    instant its `write_all` returns, i.e. when the kernel accepted the last byte
     //    rather than when the daemon read it. Reading the counter afterwards therefore

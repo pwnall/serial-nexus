@@ -37,6 +37,8 @@ up faulted/waiting and heals on its own (§15.8).
 | Field | Type | Description |
 | --- | --- | --- |
 | `loaded` | integer | number of nodes instantiated |
+| `torn_down` | integer | nodes the `replace` displaced; `0` without `replace`. Always present |
+| `discarded_at_teardown` | integer | targetward bytes those nodes were still holding for consumers that went away with them, destroyed by the replace and counted (§5: loss is always visible); `0` without `replace`. Always present. **Read it beside `torn_down`**, which is why that row exists at all: `0`/`0` means there was no graph to displace, and `0`/`7` means seven nodes went and none of them owed a byte — a bare `0` cannot tell those apart (§15.49). Not summable with `purged_bytes`: they are different losses (see [`remove-node`](#remove-node)) |
 
 ### CLI
 
@@ -157,7 +159,9 @@ is omitted rather than sent as `[]`:
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"load","params":{"config":{"node":[{"type":"pty","name":"p","path":"/tmp/p"}]},"replace":false}}' \
     | nc -N -U "$SOCK" | jq .result
 {
-  "loaded": 1
+  "loaded": 1,
+  "torn_down": 0,
+  "discarded_at_teardown": 0
 }
 ```
 

@@ -1016,12 +1016,20 @@ async fn supervise(a: SuperviseArgs) {
         // purge rule cannot drift again; and because it drains *through* the node's slot
         // rather than borrowing the receiver out of it, a `remove-node` landing on one of
         // its yields still finds the queue where the node can count it (§15.50).
+        //
+        // The counter is handed *to* the drain rather than charged from a return value,
+        // which is the other half of the same race and was measured on the serial node's
+        // identical caller (notes §3.59): a tally accumulated in this future's frame dies
+        // with the frame when `abort_all` fires, and by then the rounds have already
+        // emptied the queue the ledger would otherwise have charged. The leg's exposure
+        // is per channel and therefore N-fold — every `send_receivers` entry the loop has
+        // already visited is a queue that is drained, and a tally that is not yet
+        // anywhere. `ChannelStat` lives on the node, not in this task, so a charge landing
+        // mid-purge survives the abort.
         if connected_before && a.shared.purge_on_reconnect && a.faces == Facing::Host {
             for (_ch, rx, stat) in &a.send_receivers {
-                let purged = rx.purge_to_quiescence().await;
-                if purged > 0 {
-                    stat.purged_on_reconnect.add(purged);
-                }
+                rx.purge_to_quiescence(&|n| stat.purged_on_reconnect.add(n))
+                    .await;
             }
         }
         connected_before = true;

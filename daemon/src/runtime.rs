@@ -911,6 +911,17 @@ pub(crate) trait TeardownDrain {
 /// suspended sender had just pushed would die exactly the way notes §3.31's original
 /// defect killed them. The whole point of this type is that the node can reach the
 /// queue at the instant the operator asks, and a lend is a window in which it cannot.
+///
+/// **Keeping the queue reachable is necessary and was not sufficient.** The first form
+/// of the purge kept the receiver in the slot and still lost the bytes, because it kept
+/// the *count* somewhere the node could not reach: an accumulated `u64` local returned
+/// to the caller after the last yield, i.e. inside the very future `abort_all` drops.
+/// A teardown on a yield then found a queue the earlier rounds had already emptied
+/// (`drain_and_count` → `0`) and killed the tally with the task (`purged_on_reconnect`
+/// → `0`). The rule this type actually enforces is therefore two-sided, and only the
+/// pair of them is the invariant: **the queue never leaves the slot, and no byte that
+/// has left the queue crosses an `.await` uncharged** ([`Self::purge_to_quiescence`]
+/// takes its counter as an argument for that reason, and returns nothing).
 pub(crate) struct TargetwardInbox<T = Chunk> {
     slot: Rc<CriticalCell<Option<mpsc::Receiver<T>>>>,
     /// Length of the chunk the pump currently has in its hands — taken out of the
@@ -988,10 +999,11 @@ impl<T: TeardownBytes> TargetwardInbox<T> {
         std::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
-    /// Drain to quiescence and return the bytes drained — §6's one **sanctioned**
-    /// targetward drop, purge-on-reconnect (§7.1 serial, §7.4 leg). The caller charges
-    /// the result to its own `purged_on_reconnect`; this counts nothing itself,
-    /// because these bytes are dropped on purpose and are not teardown loss.
+    /// Drain to quiescence, charging every round's bytes to `charge` **as they leave
+    /// the queue** — §6's one **sanctioned** targetward drop, purge-on-reconnect (§7.1
+    /// serial, §7.4 leg). The caller's sink is its own `purged_on_reconnect`; the
+    /// teardown ledger counts nothing here, because these bytes are dropped on purpose
+    /// and are not teardown loss.
     ///
     /// The rounds exist for the case a single `try_recv` pass misses, stated once in
     /// [`PURGE_ROUNDS`]: an origin suspended *inside* `tx.send(chunk).await` behind the
@@ -1005,8 +1017,31 @@ impl<T: TeardownBytes> TargetwardInbox<T> {
     /// a backpressured non-empty chunk queued behind those empties would be stranded.
     /// The caller runs this while its boundary is quiescent (no reader/writer armed),
     /// so nothing reaches the device during the drain.
-    pub(crate) async fn purge_to_quiescence(&self) -> u64 {
-        let mut purged = 0u64;
+    ///
+    /// **Why the count is pushed out per round instead of returned.** This used to
+    /// accumulate a `u64` local and return it, with both callers charging their counter
+    /// *after* the await completed. That is the §5 hole this whole type was built to
+    /// close, rebuilt one layer up and measured through the production caller: a
+    /// teardown landing on one of the `yield_now`s finds the queue **already emptied by
+    /// the rounds that ran** — so [`TeardownDrain::drain_and_count`] charges `0` — and
+    /// then `TaskSet::abort_all` drops the future carrying the accumulated local, so
+    /// `purged_on_reconnect` is never charged either. 8000 accepted targetward bytes,
+    /// every counter at zero, reproduced through `nodes::serial::purge_on_reconnect`
+    /// itself; the magnitude in the field is a whole outage-era backlog (§5 backpressure
+    /// means the queue is *full* by the time the device returns). Charging per round
+    /// makes the drain and its accounting one uninterruptible step: an abort at any
+    /// yield point loses nothing, because everything already out of the queue is already
+    /// on a counter that outlives this future.
+    ///
+    /// The charge fires *between* `slot.with_mut` and the yield rather than *inside* the
+    /// closure, and the two placements are equally safe for exactly one reason worth
+    /// stating: a teardown is synchronous (`daemon.rs` composes it inside one critical
+    /// section) and this daemon is single-threaded, so it can only interleave at an
+    /// `.await` — and there is none between the drain and the charge. Outside the
+    /// closure is preferred because the sink is caller-supplied: a future adopter whose
+    /// counter lived behind the same [`CriticalCell`] would deadlock a borrow it never
+    /// knew it was inside.
+    pub(crate) async fn purge_to_quiescence(&self, charge: &dyn Fn(u64)) {
         for _ in 0..PURGE_ROUNDS {
             // One synchronous pass *through the slot* — see the type's doc for why the
             // receiver is never lent out across the yield below.
@@ -1024,7 +1059,13 @@ impl<T: TeardownBytes> TargetwardInbox<T> {
                 }
                 (bytes, drained_any)
             });
-            purged += bytes;
+            if bytes > 0 {
+                // Before the yield, and before the `break` below — the round's bytes are
+                // out of the queue, so from here they must be on a counter no abort can
+                // reach. The `> 0` guard lives here rather than at the two call sites so
+                // "a purge of nothing touches nothing" is one statement, not two.
+                charge(bytes);
+            }
             if !drained_any {
                 // Nothing drained this pass: no origin was blocked behind the channel,
                 // so the pipeline is quiescent.
@@ -1032,7 +1073,6 @@ impl<T: TeardownBytes> TargetwardInbox<T> {
             }
             tokio::task::yield_now().await;
         }
-        purged
     }
 }
 
@@ -1886,6 +1926,74 @@ mod tests {
     // purge and the §15.50 teardown ledger could share one queue (notes §3.55). The
     // rule they pin has not changed across any of those moves, which is the point of
     // moving them rather than rewriting them.
+    //
+    // The *last* move did weaken two of them and it was caught in review (notes §3.59):
+    // the terminal `assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)))` became
+    // `assert_eq!(inbox.drain_and_count(), 0)`, which is strictly weaker for the case
+    // these guards are about — a stranded `Chunk::new()` contributes `0` bytes and so
+    // satisfies the byte count while failing the emptiness check — and one of the two
+    // is the empty-chunk guard itself. Both assertions are made now, the stronger one
+    // first, through [`peek_empty`].
+
+    /// The pre-move `try_recv` check, restored (notes §3.59). Strictly stronger than
+    /// `drain_and_count() == 0`: it distinguishes "the queue is empty" from "the queue
+    /// holds only zero-length chunks", and the guards below exist to tell those apart.
+    ///
+    /// This reaches through the slot synchronously — the field is private to this
+    /// module — rather than lending the receiver out, which is the one thing
+    /// [`TargetwardInbox`]'s own doc forbids. Assertion-only: it is not a shape any
+    /// production caller may copy.
+    fn peek_empty(inbox: &TargetwardInbox, what: &str) {
+        let got = peek(inbox);
+        assert!(
+            matches!(got, Err(mpsc::error::TryRecvError::Empty)),
+            "{what}: the purge left an item in the queue ({got:?}) — a zero-length \
+             chunk stranded here is invisible to `drain_and_count`, which is why this \
+             check and not only that one"
+        );
+    }
+
+    /// One synchronous `try_recv` through the slot, shared by [`peek_empty`] and the
+    /// matcher proof below.
+    fn peek(inbox: &TargetwardInbox) -> Result<Chunk, mpsc::error::TryRecvError> {
+        inbox.slot.with_mut(|slot| {
+            slot.as_mut()
+                .expect("the purge took the queue out of the slot and never put it back")
+                .try_recv()
+        })
+    }
+
+    /// Proof that [`peek_empty`] is not a redundant restatement of the byte count it was
+    /// briefly swapped for (notes §3.59; AGENTS.md §3 — a check proves its matcher, not
+    /// only its walker). One `Chunk::new()` left in the queue is a *stranded chunk*, the
+    /// exact residue XC-PURGE-1's empty-chunk guard exists to forbid, and the byte count
+    /// reads `0` for it — indistinguishably from an empty queue.
+    ///
+    /// Two inboxes rather than one, because `drain_and_count` takes the queue away and
+    /// `peek` consumes what it finds: asking both questions of one queue would answer
+    /// the second about a queue the first had already emptied.
+    #[test]
+    fn a_stranded_zero_length_chunk_is_invisible_to_the_byte_count() {
+        let (tx, rx) = mpsc::channel::<Chunk>(2);
+        let inbox = TargetwardInbox::new(rx);
+        tx.try_send(Chunk::new()).expect("seed the stranded chunk");
+        assert!(
+            peek(&inbox).is_ok(),
+            "the check the guards above use cannot see a stranded zero-length chunk, so \
+             restoring it bought nothing"
+        );
+
+        let (tx2, rx2) = mpsc::channel::<Chunk>(2);
+        let blind = TargetwardInbox::new(rx2);
+        tx2.try_send(Chunk::new()).expect("seed the stranded chunk");
+        assert_eq!(
+            blind.drain_and_count(),
+            0,
+            "the byte count grew a way to see a zero-length chunk, which would retire \
+             this distinction and the assertion it justifies"
+        );
+        drop((tx, tx2));
+    }
 
     /// The drain must also collect a chunk an origin is blocked mid-`send` behind the
     /// full channel — otherwise it fires into the reopened device on the first
@@ -1915,16 +2023,21 @@ mod tests {
             tokio::task::yield_now().await; // let the producer reach its blocked send
             assert!(!producer.is_finished(), "producer must be blocked in send");
 
-            let purged = inbox.purge_to_quiescence().await;
+            let purged = Cell::new(0u64);
+            inbox
+                .purge_to_quiescence(&|n| purged.set(purged.get() + n))
+                .await;
 
             // The blocked send resolved and was drained+counted — not left to fire
             // into the reopened device — and the count is exact.
             assert!(producer.is_finished(), "blocked send must have resolved");
-            assert_eq!(purged, 3 + 4 + 5);
-            // Nothing outage-era remains for the writer to send. Read through the
-            // teardown ledger's own drain, which also pins the two against each other:
-            // a purge that left bytes behind would have a later teardown charge them as
-            // destroyed, and §5's counters would name one loss twice under two words.
+            assert_eq!(purged.get(), 3 + 4 + 5);
+            // Nothing outage-era remains for the writer to send — asserted both ways
+            // (see `peek_empty`). The byte-count half also pins the purge against the
+            // teardown ledger: a purge that left bytes behind would have a later
+            // teardown charge them as destroyed, and §5's counters would then name one
+            // loss twice under two different words.
+            peek_empty(&inbox, "backpressured in-flight chunk");
             assert_eq!(inbox.drain_and_count(), 0);
             drop(tx);
         });
@@ -1953,7 +2066,10 @@ mod tests {
             tokio::task::yield_now().await;
             assert!(!producer.is_finished(), "producer must be blocked in send");
 
-            let purged = inbox.purge_to_quiescence().await;
+            let purged = Cell::new(0u64);
+            inbox
+                .purge_to_quiescence(&|n| purged.set(purged.get() + n))
+                .await;
 
             // The non-empty chunk behind the two empties resolved and was drained —
             // not stranded to fire into the reopened device — and only its 5 bytes
@@ -1962,7 +2078,11 @@ mod tests {
                 producer.is_finished(),
                 "the send behind the empty chunks must have resolved"
             );
-            assert_eq!(purged, 5);
+            assert_eq!(purged.get(), 5);
+            // This is *the* guard the weakened form defeated: everything this test
+            // strands is zero-length, so `drain_and_count() == 0` holds whether the
+            // empties were drained or left behind (notes §3.59).
+            peek_empty(&inbox, "empty chunks");
             assert_eq!(inbox.drain_and_count(), 0);
             drop(tx);
         });
@@ -1972,10 +2092,77 @@ mod tests {
     async fn purge_to_quiescence_on_an_empty_channel_purges_nothing() {
         let (tx, rx) = mpsc::channel::<Chunk>(4);
         let inbox = TargetwardInbox::new(rx);
-        assert_eq!(inbox.purge_to_quiescence().await, 0);
+        // The sink must not be *called* with 0 either: "a purge of nothing touches
+        // nothing" is the helper's own guard, so no caller has to repeat it.
+        let charges = Cell::new(0u32);
+        inbox
+            .purge_to_quiescence(&|_| charges.set(charges.get() + 1))
+            .await;
+        assert_eq!(charges.get(), 0);
         drop(tx);
         // A disconnected channel is quiescent too, not an error.
-        assert_eq!(inbox.purge_to_quiescence().await, 0);
+        inbox
+            .purge_to_quiescence(&|_| charges.set(charges.get() + 1))
+            .await;
+        assert_eq!(charges.get(), 0);
+    }
+
+    /// **The count must be on the caller's counter before the purge's first yield**, not
+    /// returned to the caller after its last one (notes §3.59, design §15.50).
+    ///
+    /// This is the helper-level half of that guard; the production-caller half is
+    /// `nodes::serial::tests::a_teardown_inside_the_purge_accounts_for_the_backlog_it_drained`.
+    /// It lives here as well as there because the *leg* drains through this same method
+    /// with a per-channel counter, and its exposure is N-fold — every `send_receivers`
+    /// entry the loop has already visited is a queue that is emptied and a tally that is
+    /// nowhere yet — so pinning the shared contract covers the caller no fixture here
+    /// builds.
+    ///
+    /// Fail-first, with the pre-§3.59 shape restored (accumulate a local, return it, let
+    /// the caller charge): `charged before the first yield: 0` against 7 drained bytes.
+    #[test]
+    fn purge_to_quiescence_charges_each_round_before_it_yields() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (tx, rx) = mpsc::channel::<Chunk>(2);
+            let inbox = TargetwardInbox::new(rx);
+            tx.send(Chunk::copy_from_slice(b"AAA")).await.unwrap(); // 3 bytes
+            tx.send(Chunk::copy_from_slice(b"BBBB")).await.unwrap(); // 4 bytes
+
+            // The purge runs in a task the test can abort, because an abort at a yield
+            // is exactly what teardown does to it (`TaskSet::abort_all`).
+            let purged = Rc::new(Cell::new(0u64));
+            let tally = purged.clone();
+            let draining = inbox.clone();
+            let task = tokio::task::spawn_local(async move {
+                draining
+                    .purge_to_quiescence(&|n| tally.set(tally.get() + n))
+                    .await;
+            });
+
+            // One yield hands the task its first poll: it drains both chunks (round 1),
+            // charges, and parks on `yield_now`. Round 2 would find nothing and break,
+            // so this is the only window in which the question can be asked at all.
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "the purge finished inside one poll, so the yield this guard needs \
+                 never happened and it proves nothing"
+            );
+            task.abort();
+
+            assert_eq!(
+                purged.get(),
+                3 + 4,
+                "charged before the first yield: the bytes are out of the queue, so a \
+                 teardown here finds nothing to charge and the tally must already be on \
+                 a counter that outlives this task"
+            );
+            drop(tx);
+        });
     }
 
     /// The purge and the teardown ledger share one queue, and the purge must leave it
@@ -1992,7 +2179,11 @@ mod tests {
         tx.send(Chunk::copy_from_slice(b"outage-era"))
             .await
             .unwrap();
-        assert_eq!(inbox.purge_to_quiescence().await, 10);
+        let purged = Cell::new(0u64);
+        inbox
+            .purge_to_quiescence(&|n| purged.set(purged.get() + n))
+            .await;
+        assert_eq!(purged.get(), 10);
         // Post-purge arrivals are *not* outage-era, so they are backlog the node still
         // owes — and a teardown now must charge them rather than drop them.
         tx.send(Chunk::copy_from_slice(b"fresh")).await.unwrap();
