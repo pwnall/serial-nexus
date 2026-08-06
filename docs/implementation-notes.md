@@ -8814,6 +8814,61 @@ and inferring the answer from the outgoing node's own successful open is an
 inference, not a measurement. Unobservable on Linux besides — this kernel honours
 the flag, so the refusal never fires here at all (§7).
 
+#### 6. §18 item 3 reproduced sharply: 3 of 4, one test, exactly 64 bytes, and a number that is a deadline
+
+The replug lane ran last (the blessing needs a human at a polkit dialog and arrived
+after the rest of this session's work), so it got its own measurements. **In
+isolation it is clean**: `SNX_REPLUG=required` with both adapters named, 4 passed in
+4.15 s, and it does real work — `["waiting"]` observed while the tty was destroyed,
+released by the `stdin-eof` leash, `devnum 9 → 9` (§3.54's refuted discriminator,
+refuted again), and §12's founding premise measured: adapter A moved
+`ttyUSB1 → ttyUSB0`, the daemon's `resolved_path` followed, `identity` unchanged.
+
+**In a full `cargo test --workspace` it reproduces §3.62's correlate, harder than the
+record.** This session, on an idle box (load 0.12–0.76 throughout):
+
+| lane | runs | failing |
+|---|---|---|
+| full suite, replug lane **green** | 4 | **3** |
+| full suite, replug lane **not enabled** | 6 | **0** |
+
+Running total across the three sessions that have measured it: **8 of 14 with, 0 of
+15 without.**
+
+**Three refinements, all new.**
+
+1. **The signature is sharper than "two timing-sensitive tests".** All three failures
+   were the *same* test, `crossover_rig_custom_baud_byte_exact`, *exactly* 64 bytes
+   short (32704 of 32768), in 71.95 / 71.94 / 71.95 s. §3.62 recorded that which of
+   `serial_hardware`'s tests draws it varies; here it did not vary at all.
+
+2. **71.95 s is a deadline, not a slow run**, and §3.54 read it the other way ("once
+   at 67.7 s against a usual 10.4 s"). `inject_verify`'s `settled_while_open` window
+   is 60 s and the test runs two directions: one completes normally and the other
+   waits the window out in full, which is where ~72 s comes from and why it
+   reproduces to 10 ms. A number that stable is the harness's own constant, and
+   reading it as a performance figure sends the next session after the wrong thing.
+
+3. **Two hypotheses are refuted by controls run *immediately* after the third
+   failure**, which is the part no previous session had. `serial_hardware` alone:
+   **6 of 6 in 14.59 s** — the rig is not damaged and the adapters are not wedged.
+   The whole suite with the replug lane simply not enabled: **834 passing, 0 failed**
+   — the box is not left in a bad state either. So the effect is scoped to the
+   `cargo test --workspace` invocation in which the replug lane ran, and does not
+   outlive it.
+
+**Say the failure precisely, because §6 forbids the short form.** What is measured is
+64 bytes *not recovered within 60 s* on one direction of a link whose other direction
+completed normally in the same run. That is a stall or a loss and **this session did
+not separate them**. **Mechanism not established and no root cause claimed** (§9).
+The `--test-threads=1` arm §3.62 used to refute H1 was not re-run here.
+
+**Consequence for the headline figure, stated rather than buried:** the documented
+rig lane of AGENTS §3 — which includes `SNX_REPLUG=required` — is **not** reliably
+green on this box. The 834/0/4 quoted above is the rig lane *without* the replug
+capability, reproduced across six runs; with it, this session saw 834/0/4 once and
+833/1/4 three times.
+
 **(b) P15's question cites §15.51, which is P14's section, and no design entry for
 P15 exists** — §5 says amend the design first, and that step was skipped. The
 citation is inside the `question` string, which is what `probe_set` digests, so
