@@ -191,6 +191,50 @@ pub fn set_packet_mode(fd: RawFd, on: bool) -> nix::Result<()> {
     Ok(())
 }
 
+/// Does this port's driver actually *honour* a `CRTSCTS` request, or accept it and
+/// discard it?
+///
+/// **One implementation, because two callers must not be able to disagree.** The
+/// daemon refuses a `flow = "rts-cts"` config at load time on a port that answers
+/// `false` here, and the doctor's P15 reports the same reading; if those two
+/// measured it separately, a report could say the port is fine while `load` rejects
+/// it, or worse the reverse.
+///
+/// The question is not answerable any other way. `tcsetattr` returns **success** on
+/// a driver that drops the flag — measured on Darwin 24.6.0 with an FT232R on
+/// Apple's `IOSerialFamily`, where the request is accepted and the read-back is
+/// clear — so only reading the termios back distinguishes honouring from
+/// discarding. `serial2` relies on the same read-back, which is why such a port
+/// faults a node with `failed to apply some or all settings` (notes §3.65 E).
+///
+/// Restores the termios it found before returning, on every path. `Ok(true)` where
+/// the flag reads back set, `Ok(false)` where the request was accepted and dropped,
+/// and `Err` where the port could not be opened or interrogated at all — which is
+/// **not** the same as "does not honour it" and callers must not collapse the two:
+/// an absent device is a wait, not a refusal.
+pub fn honours_rtscts(path: &std::path::Path) -> nix::Result<bool> {
+    use nix::sys::termios::{ControlFlags, SetArg, tcgetattr, tcsetattr};
+    // O_NONBLOCK so a port asserting flow control against us cannot block the open,
+    // and O_NOCTTY so interrogating a port never makes it this process's terminal.
+    let fd = nix::fcntl::open(
+        path,
+        nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY | nix::fcntl::OFlag::O_NONBLOCK,
+        nix::sys::stat::Mode::empty(),
+    )?;
+    let before = tcgetattr(&fd)?;
+    let mut want = before.clone();
+    want.control_flags |= ControlFlags::CRTSCTS;
+    // A driver that *refuses* is honest and is not what this is looking for; the
+    // reading that matters is the read-back either way, so a failed set is not an
+    // early return.
+    let _ = tcsetattr(&fd, SetArg::TCSANOW, &want);
+    let after = tcgetattr(&fd);
+    // Restore before reporting, so an error on the read-back cannot leave a real
+    // adapter reconfigured behind us.
+    let _ = tcsetattr(&fd, SetArg::TCSANOW, &before);
+    Ok(after?.control_flags.contains(ControlFlags::CRTSCTS))
+}
+
 /// Take or release exclusive access on a tty — `TIOCEXCL` so stray processes
 /// cannot share the serial port (§7.1); serial2 does not do this for us.
 pub fn set_exclusive(fd: RawFd, on: bool) -> nix::Result<()> {

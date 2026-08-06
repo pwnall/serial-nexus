@@ -16,6 +16,12 @@ serde_json.workspace = true
 toml.workspace = true
 sha2.workspace = true
 libc.workspace = true
+# The harness asks `sys` the same question the daemon's `load` asks, rather than
+# re-deriving it: `serial_hardware`'s rts-cts test asserts the load REFUSAL on a
+# driver that drops CRTSCTS, and it must branch on the predicate `load` consults or
+# the two could disagree about the same port (notes §3.67). A workspace-internal
+# crate already in the graph, so `cargo deny` does not move.
+serial-nexus-sys.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

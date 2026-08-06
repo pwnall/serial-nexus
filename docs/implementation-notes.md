@@ -8576,3 +8576,63 @@ name like `3-1`; the macOS arm is addressed by USB serial number, because that i
 IOKit offers and macOS has no bus path of that shape. Wiring the hardware replug test to this
 backend therefore needs a per-platform address in the harness, which is a change to a test's
 contract and is **not** made here.
+
+### 3.67 The flow-control decision: refuse at load, where the operator can act on it
+
+**Design:** §7 (a kernel that differs is reported, never silently approximated), §7.1 (an edge may
+ask for `rts-cts`), §9 (a guard asserts the property, never a proxy), §15.26 (structural pre-checks
+run before anything is created or torn down).
+
+§3.65 E filed the question and §3.65 E′ built the instrument. The decision is: **a config asking
+for hardware flow control on a port whose driver cannot honour it is refused at `load`**, rather
+than accepted and left to fault at open, and rather than degraded into a link running without the
+flow control it asked for.
+
+**Why not degrade, given §7 says a differing kernel degrades rather than fails.** Because the thing
+being degraded here is not an *observation* — it is the transport's contract. An `rts-cts` edge
+exists because the far end needs the line held; running it without flow control loses data under
+exactly the conditions it was configured to survive, and it does so silently. §7's rule is about
+not turning a kernel difference into an unexplained failure, and refusing with the measurement
+attached is not an unexplained failure. What §7 forbids is the version where the operator learns
+nothing, and that was the *old* behaviour: `serial2` verifies line settings by reading them back,
+so the driver's silent drop surfaced as `reopen …: failed to apply some or all settings` and a
+`faulted` node, some time after `load` had already returned success.
+
+**One predicate, because two callers must not be able to disagree.**
+`serial_nexus_sys::honours_rtscts` opens the port, requests `CRTSCTS`, reads the termios back,
+restores what it found, and answers. It is the *only* implementation: the daemon's pre-check
+consults it, the harness's rts-cts test branches on it, and doctor P15 now calls it **and requires
+its answer to match the read-back P15 took by hand**, reporting `shipped_predicate_agrees`. A
+`false` there is its own `degraded` arm, ranked above the finding itself — a report that calls a
+port fine while `load` refuses it, or the reverse, is worse than either verdict alone. On this rig
+it reads `true`.
+
+**Three states, and only one is a refusal.** `Ok(true)` honoured; `Ok(false)` accepted-and-dropped;
+`Err` could not be interrogated. Only the middle one refuses. An unreadable port is **not** a
+measured one (§9), and — separately — the pre-check does not run at all for a device path that does
+not exist, so an adapter that is merely unplugged is a `waiting` node exactly as before. Collapsing
+either of those into "does not honour it" would refuse configs on absent hardware.
+
+**Placed with `precheck_codecs`, for its reason.** `precheck_flow_control` runs in the same
+before-anything-is-created position, so a bad `--replace` config never destroys a good running
+graph on its way to failing. It is wired into `load` and `add-node`. The refusal is a *structural*
+error carrying `node`, `device`, `requested_flow_control` and `honoured_on_readback` as data, and
+its message names the remedy (`flow = "none"`, or an adapter whose driver implements RTS/CTS) and
+the doctor invocation that reports the same reading.
+
+**The open it performs toggles DTR, and that is not an extra toggle.** The check only runs where
+the config asked for `rts-cts` — which is exactly the node that was about to open the same port and
+apply the same settings a moment later.
+
+**The red test is now a green assertion of the new promise, which is stricter than the skip it
+could have been.** `rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes` branches on the
+shipped predicate: where the driver honours `CRTSCTS` (Linux) it runs the stall-and-recover
+assertions unchanged; where it does not (Darwin) it asserts that `load` is **refused**, that the
+refusal names both the flow control and the port, and that **nothing was created** on the way to
+failing. That is §9's tell that the portable form was found — the platform that cannot do the thing
+still has a promise to keep, and the test checks it rather than stepping around it. Measured: the
+Darwin arm passes and prints which arm it took.
+
+**Cost:** `serial-nexus-itest` gains a dependency on `serial-nexus-sys`, a workspace-internal crate
+already in the graph, so `cargo deny check licenses bans sources` does not move. The harness asks
+the shipped predicate rather than re-deriving it, for the same reason P15 does.

@@ -1080,6 +1080,7 @@ dependencies = [
  "serde_json",
  "serial-nexus-core",
  "serial-nexus-rpc",
+ "serial-nexus-sys",
  "sha2",
  "toml",
 ]

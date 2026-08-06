@@ -6184,6 +6184,12 @@ struct FlowReadback {
     cflag_after: u64,
     /// The whole point: `CRTSCTS` present in the read-back.
     honoured: bool,
+    /// Does `serial_nexus_sys::honours_rtscts` — the predicate the daemon's `load`
+    /// consults — agree with the reading beside it? `None` when that predicate could
+    /// not run (an unreadable port is not a disagreement). A `false` here means the
+    /// report and the daemon would answer differently about the same port, which is
+    /// worse than either answer.
+    shipped_predicate_agrees: Option<bool>,
     /// Set back to what it was, and checked. A probe that reconfigures a real
     /// port and cannot say it restored it is a probe nobody should run twice.
     restored: bool,
@@ -6198,6 +6204,7 @@ impl FlowReadback {
             "cflag_before_hex": format!("{:#x}", self.cflag_before),
             "cflag_after_hex": format!("{:#x}", self.cflag_after),
             "honoured_on_readback": self.honoured,
+            "shipped_predicate_agrees": self.shipped_predicate_agrees,
             "silently_dropped": self.tcsetattr_ok && !self.honoured,
             "baseline_restored": self.restored,
         })
@@ -6226,13 +6233,29 @@ fn p15_readback(path: &PathBuf) -> Result<FlowReadback, String> {
             .map(|t| t.control_flags == before.control_flags)
             .unwrap_or(false);
 
+    // **The daemon's refusal and this report must never disagree.** The daemon
+    // rejects a `flow = "rts-cts"` config at load time on a port that answers
+    // `false` to `sys::honours_rtscts`; if P15 measured the same thing by its own
+    // code path, a drift between the two would let a report call a port fine while
+    // `load` refuses it. So the shipped predicate is called here and its answer is
+    // required to match the one this probe just read by hand — an operator reading
+    // `honoured_on_readback` is reading the exact function `load` consults (notes
+    // §3.67).
+    let honoured = after.control_flags.contains(ControlFlags::CRTSCTS);
+    let shipped = serial_nexus_sys::honours_rtscts(path);
+    let agrees = match &shipped {
+        Ok(v) => Some(*v == honoured),
+        Err(_) => None,
+    };
+
     Ok(FlowReadback {
         port: path.display().to_string(),
         tcsetattr_ok: set.is_ok(),
         tcsetattr_error: set.err().map(|e| e.to_string()),
         cflag_before: before.control_flags.bits() as u64,
         cflag_after: after.control_flags.bits() as u64,
-        honoured: after.control_flags.contains(ControlFlags::CRTSCTS),
+        honoured,
+        shipped_predicate_agrees: agrees,
         restored,
     })
 }
@@ -6268,6 +6291,23 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
             format!(
                 "This probe could not restore the pre-existing termios on {}. Nothing below should be trusted and the port should be reopened before use — a reconfigured adapter is a worse outcome than an unanswered question.",
                 unrestored
+                    .iter()
+                    .map(|r| r.port.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+    let disagreeing: Vec<&FlowReadback> = rows
+        .iter()
+        .filter(|r| r.shipped_predicate_agrees == Some(false))
+        .collect();
+    if !disagreeing.is_empty() {
+        return (
+            Status::Degraded,
+            format!(
+                "**This report and the daemon would answer differently about {}.**                  `serial_nexus_sys::honours_rtscts` is the predicate `load` consults to                  refuse a `flow = \"rts-cts\"` config, and it disagreed with the read-back                  this probe took by hand on the same port. Neither reading can be trusted                  until they are reconciled: a report that calls a port fine while `load`                  refuses it — or the reverse — is worse than either verdict on its own.",
+                disagreeing
                     .iter()
                     .map(|r| r.port.as_str())
                     .collect::<Vec<_>>()
@@ -8486,6 +8526,7 @@ mod tests {
             cflag_before: 0x4b00,
             cflag_after: if honoured { 0x4b00 | 0x30000 } else { 0x4b00 },
             honoured,
+            shipped_predicate_agrees: Some(true),
             restored,
         }
     }

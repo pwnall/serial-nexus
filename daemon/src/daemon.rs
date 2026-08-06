@@ -564,6 +564,85 @@ impl Daemon {
     /// destroys a good running graph (§15.26, and this method's caller in `load`).
     /// An unknown codec's error carries `data.available` so tools discover
     /// capabilities; a known codec's schema error carries the codec's own message.
+    /// **Refuse a hardware-flow-control config the port's driver cannot honour, at
+    /// load, rather than faulting the node later.**
+    ///
+    /// `serial2` applies the line settings and verifies them by reading them back,
+    /// so a driver that accepts a `CRTSCTS` request and discards it does not produce
+    /// a degraded link — it produces `failed to apply some or all settings` and a
+    /// `faulted` node, some time after the operator's `load` returned success.
+    /// Measured on Darwin 24.6.0 with an FT232R on Apple's `IOSerialFamily`:
+    /// `tcsetattr` succeeds and `tcgetattr` reads the flag back clear, on both the
+    /// `cu.*` and `tty.*` nodes, while a pty on the same box honours it (notes
+    /// §3.65 E, doctor P15).
+    ///
+    /// **§7 says a differing kernel is reported, not silently approximated, and this
+    /// is the reporting.** Coming up without the flow control the config asked for
+    /// would be the silent approximation: a link that needed RTS/CTS would run
+    /// without it and lose data under exactly the conditions it was configured to
+    /// survive. So the config is refused — and refused *here*, in the same
+    /// before-anything-is-created position as [`Self::precheck_codecs`], so a bad
+    /// `--replace` never destroys a good running graph on its way to failing.
+    ///
+    /// **An absent device is not a refusal.** The check only runs for a node whose
+    /// device path exists; a port that is not plugged in yet is a `waiting` node, as
+    /// always, and an interrogation error is likewise not treated as "does not
+    /// honour it" — an unreadable port is not a measured one (§9).
+    ///
+    /// The open this performs toggles DTR, which the doctor is careful about. It is
+    /// not an *extra* toggle: the check only runs where the config asked for
+    /// `rts-cts`, which is exactly the node that was about to open the same port and
+    /// apply the same settings.
+    fn precheck_flow_control(
+        &self,
+        nodes: &[serial_nexus_core::config::NodeConfig],
+    ) -> Result<(), RpcError> {
+        use serial_nexus_core::config::FlowControl;
+        for nc in nodes {
+            let serial_nexus_core::config::NodeConfig::Serial {
+                name,
+                device,
+                flow_control,
+                ..
+            } = nc
+            else {
+                continue;
+            };
+            if *flow_control != FlowControl::RtsCts {
+                continue;
+            }
+            let path = std::path::Path::new(device);
+            if !path.exists() {
+                continue;
+            }
+            match serial_nexus_sys::honours_rtscts(path) {
+                // Honoured, or unmeasurable. Neither is a refusal.
+                Ok(true) | Err(_) => {}
+                Ok(false) => {
+                    return Err(structural_error(
+                        &format!(
+                            "node {name:?}: device {device} does not honour rts-cts flow \
+                             control — its driver accepts the request and reads the flag \
+                             back clear, so the link would run without the flow control \
+                             this config asks for. Refused here rather than faulting the \
+                             node at open. Use flow = \"none\" (or xon-xoff) for this port, \
+                             or attach an adapter whose driver implements RTS/CTS; \
+                             `serial-nexus-doctor --port {device}` reports the same reading \
+                             as P15."
+                        ),
+                        Some(json!({
+                            "node": name,
+                            "device": device,
+                            "requested_flow_control": "rts-cts",
+                            "honoured_on_readback": false,
+                        })),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn precheck_codecs(
         &self,
         nodes: &[serial_nexus_core::config::NodeConfig],
@@ -624,6 +703,10 @@ impl Daemon {
         // torn down, so a bad `--replace` config (unknown codec OR bad attributes)
         // never destroys a good graph.
         self.precheck_codecs(&config.nodes)?;
+        // Same position and the same reason: a port whose driver cannot honour the
+        // requested hardware flow control is refused before anything is created or
+        // torn down (notes §3.67).
+        self.precheck_flow_control(&config.nodes)?;
 
         // `--replace` clears the running graph first (teardown-then-load, §11). The
         // config is already validated, so this only fires for a config that will
@@ -805,6 +888,7 @@ impl Daemon {
         // Codec name + attribute schema are structural (§8/§11/§15.26): reject
         // before touching the running graph.
         self.precheck_codecs(std::slice::from_ref(&node_cfg))?;
+        self.precheck_flow_control(std::slice::from_ref(&node_cfg))?;
 
         let (result, listener) = self.state.with_mut(|st| {
             // Validate the candidate graph (current + new node, edges unchanged) with

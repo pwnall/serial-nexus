@@ -692,6 +692,57 @@ fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
     let _rig = rig_guard();
     eprintln!("crossover rig (rts-cts flow control): {p0} <-> {p1}");
 
+    // **On a driver that cannot honour RTS/CTS, the promise under test is a
+    // different one, and it is asserted rather than skipped.** `serial2` verifies
+    // line settings by reading them back, so a driver that accepts a `CRTSCTS`
+    // request and discards it used to surface as a `faulted` node some time after
+    // `load` had already returned success. The daemon now refuses such a config at
+    // load (notes §3.67), so this test asserts *that* here instead — which is a
+    // stricter check than a self-skip, and it is the §9 tell that the portable form
+    // was found: the platform that cannot do the thing still has a promise to keep.
+    //
+    // Measured on Darwin 24.6.0 with an FT232R on Apple's `IOSerialFamily`:
+    // `tcsetattr` succeeds and the flag reads back clear. Linux honours it, and
+    // takes the arm below.
+    if !serial_nexus_sys::honours_rtscts(std::path::Path::new(&p0)).unwrap_or(true) {
+        eprintln!("{p0}: driver does not honour rts-cts — asserting the load refusal instead");
+        let d = Daemon::start();
+        let run_dir = d.run().path().to_path_buf();
+        let inj0 = d.run().join("inj0");
+        let inj1 = d.run().join("inj1");
+        let err = d
+            .rpc()
+            .load_toml(
+                &flow_cfg(
+                    &p0,
+                    &p1,
+                    115_200,
+                    ("rts-cts", "none"),
+                    &run_dir,
+                    &inj0,
+                    &inj1,
+                ),
+                false,
+            )
+            .expect_err(
+                "a driver that drops CRTSCTS must make this config a REFUSAL at load, not a \
+                 node that faults later",
+            );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("rts-cts") && msg.contains(&p0),
+            "the refusal must name the flow control and the port, so the operator can act \
+             on it: {msg}"
+        );
+        // And the graph must not have been half-built on the way to failing.
+        assert!(
+            d.rpc().node("port0").is_none(),
+            "a refused load must create nothing: {:?}",
+            d.rpc().node("port0")
+        );
+        return;
+    }
+
     // A payload that comfortably exceeds one FTDI bulk packet, so "nothing arrived"
     // cannot be one packet still in flight, and small enough that the whole of it
     // fits the kernel's transmit buffer while the line is held — the point is that
