@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use serial_nexus_itest::{
     Daemon, Sim, attach_slave, crossover_ports, file_len, settled_while_open, sha256_hex,
     skip_no_rig, wait_until,
@@ -496,4 +496,364 @@ write_mode = "never"
         "hostward crlf fired for both CRs in the injected line: {node}"
     );
     eprintln!("map node byte-exact both directions over the physical crossover ✓");
+}
+
+// ---------------------------------------------------------------------------
+// Hardware flow control, end to end (plan §18 item 7, design §5, §15.52)
+// ---------------------------------------------------------------------------
+
+/// The rig config with a `flow_control` chosen per port.
+///
+/// Separate from [`null_modem_cfg`] rather than a parameter on it, because the two
+/// tests below need the two ports to differ: the port under test runs `rts-cts` so
+/// its kernel owns the handshake, and its peer runs `none` so **the test** owns
+/// RTS and can drive the far end's CTS deliberately. A rig with `rts-cts` on both
+/// sides cannot be stalled from a test at all — §5 has the daemon reading its port
+/// continuously and never idling, so the receiver's buffer never fills and its
+/// kernel never has a reason to drop RTS.
+fn flow_cfg(
+    p0: &str,
+    p1: &str,
+    baud: u32,
+    flow: (&str, &str),
+    dir: &Path,
+    inj0: &Path,
+    inj1: &Path,
+) -> String {
+    let (flow0, flow1) = flow;
+    null_modem_cfg(p0, p1, baud, dir, inj0, inj1)
+        .replace(
+            "name = \"port0\"",
+            &format!("name = \"port0\"\nflow_control = \"{flow0}\""),
+        )
+        .replace(
+            "name = \"port1\"",
+            &format!("name = \"port1\"\nflow_control = \"{flow1}\""),
+        )
+}
+
+/// Drive `rts` on `node` and return the far node's `modem_lines`, once the daemon
+/// has had a chance to re-read them.
+///
+/// The read goes through the daemon's **own state**, not through a raw ioctl the
+/// test issues: design §7.1 promises "current modem-line readings" as node state,
+/// and that promise is what a guard here must assert. An ioctl in the test would
+/// measure the wire while leaving the product's report unproven, which is §9's
+/// proxy in space (`serial_nexus_sys`'s reader is also unavailable to itest — the
+/// unsafe lives in one crate).
+fn drive_rts_read_far(rpc: &serial_nexus_itest::Rpc, node: &str, far: &str, rts: bool) -> Value {
+    rpc.call("set-modem", json!({ "node": node, "rts": rts }))
+        .unwrap_or_else(|e| panic!("set-modem rts={rts} on {node}: {e:?}"));
+    // A USB adapter's control transfer and the peer's TIOCMGET are separate round
+    // trips over the bus; without a pause the read races the write and a wired line
+    // reads unwired. The doctor's P5_MODEM_SETTLE is the same constant for the same
+    // reason.
+    std::thread::sleep(Duration::from_millis(120));
+    rpc.node(far).unwrap_or_else(|| panic!("{far} has state"))["modem_lines"].clone()
+}
+
+/// Whether this rig carries a hardware handshake, **measured** — the precondition
+/// the two tests below gate on, and the reason their skip is honest rather than a
+/// declaration. Returns the measurement either way so the skip can print it.
+fn handshake_measured(rpc: &serial_nexus_itest::Rpc) -> (bool, String) {
+    let hi = drive_rts_read_far(rpc, "port1", "port0", true);
+    let lo = drive_rts_read_far(rpc, "port1", "port0", false);
+    let carries = hi["cts"] == json!(true) && lo["cts"] == json!(false);
+    (
+        carries,
+        format!("port1 RTS high -> port0 {hi}, RTS low -> port0 {lo}"),
+    )
+}
+
+/// **RTS on one node moves CTS on the other, through the daemon's own state**
+/// (plan §18 item 7, design §7.1, §15.52).
+///
+/// The doctor measures this continuity too, and deliberately measures a different
+/// thing: P5's handshake block drives the lines port-to-port with no daemon in the
+/// path, because §13's boundary is that the doctor certifies the rig and never
+/// drives the daemon through it. This test is the other half — the same wire, read
+/// back through `state`'s `modem_lines`, which is the field §7.1 actually promises
+/// an operator. Neither subsumes the other: the doctor's arm would still pass if
+/// the daemon's state reporting were broken, and this one would still pass if the
+/// doctor's were.
+///
+/// **Both polarities, because a line stuck high passes a one-polarity test**, and
+/// **both directions**, because a half-crossed handshake is a real wiring state
+/// that a single direction cannot see — the same reason P5's discovery refuses to
+/// call a half-crossed data pair "paired".
+///
+/// The DTR arm is the **negative control** and it is not decoration: on this rig
+/// DTR moves no DSR, DCD or RI (measured, notes §3.53 i), so a `modem_lines` that
+/// returned constants, and a rig with every line bridged to every other, both fail
+/// it. Without it the CTS assertions could pass on an instrument that is not
+/// looking.
+#[test]
+fn crossover_rig_rts_crosses_to_the_far_ports_cts() {
+    let Some((p0, p1)) = crossover_ports() else {
+        skip_no_rig("crossover_rig_rts_crosses_to_the_far_ports_cts");
+        return;
+    };
+    let _rig = rig_guard();
+    eprintln!("crossover rig (handshake continuity): {p0} <-> {p1}");
+
+    // `flow_control` stays at its `none` default on both ports, so the *test* owns
+    // RTS. Under `rts-cts` the kernel owns it and a `set-modem` would be fighting
+    // the line discipline for control of the same pin.
+    let (d, _run_dir, _inj0, _inj1) = boot_rig(&p0, &p1, 115_200);
+    let rpc = d.rpc();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (carries, measured) = handshake_measured(rpc);
+    if !carries {
+        serial_nexus_itest::skip_no_rig_flow(
+            "crossover_rig_rts_crosses_to_the_far_ports_cts",
+            &measured,
+        );
+        return;
+    }
+    eprintln!("handshake: {measured}");
+
+    // Both directions, both polarities.
+    for (near, far) in [("port0", "port1"), ("port1", "port0")] {
+        let hi = drive_rts_read_far(rpc, near, far, true);
+        assert_eq!(
+            hi["cts"],
+            json!(true),
+            "{near} RTS high did not raise {far} CTS: {hi}"
+        );
+        let lo = drive_rts_read_far(rpc, near, far, false);
+        assert_eq!(
+            lo["cts"],
+            json!(false),
+            "{near} RTS low did not drop {far} CTS — a line stuck high passes a \
+             one-polarity test, which is why both are driven: {lo}"
+        );
+    }
+
+    // The negative control. DTR is a different pin on the same connector; on this
+    // rig it is not wired through, so a reader that answers from a cache, a
+    // constant, or a bridged connector fails here while passing above.
+    rpc.call("set-modem", json!({ "node": "port0", "dtr": false }))
+        .expect("set-modem dtr=false on port0");
+    std::thread::sleep(Duration::from_millis(120));
+    let before = rpc.node("port1").expect("port1 state")["modem_lines"].clone();
+    rpc.call("set-modem", json!({ "node": "port0", "dtr": true }))
+        .expect("set-modem dtr=true on port0");
+    std::thread::sleep(Duration::from_millis(120));
+    let after = rpc.node("port1").expect("port1 state")["modem_lines"].clone();
+    for line in ["dsr", "dcd", "ri"] {
+        assert_eq!(
+            before[line], after[line],
+            "driving port0 DTR moved port1 {line} ({} -> {}), which this rig is \
+             measured not to do (notes §3.53 i). Either the cabling is not what \
+             the record says, or `modem_lines` is not reading what it claims — \
+             and the CTS assertions above cannot be trusted until that is settled",
+            before[line], after[line]
+        );
+    }
+    eprintln!("negative control: port0 DTR moved none of port1's dsr/dcd/ri");
+}
+
+/// **`flow_control = "rts-cts"` stalls the writer instead of losing bytes**
+/// (plan §18 item 7, design §5's promise, §15.52).
+///
+/// §5 states it as a *transparency* claim: "If a port does have flow control
+/// configured … the kernel pausing transmission surfaces as Busy, so hardware flow
+/// control transparently extends across the graph to remote writers." The serde
+/// path for the attribute has been proven since it shipped; **the wire path had
+/// never been exercised by any test in this workspace**, which is the gap plan §18
+/// item 7 names and §15.52's measured precondition is what finally makes gateable.
+///
+/// The shape, and why it is this shape. The daemon reads its own port continuously
+/// and never idles (§5), so a receiver inside the graph can never fill its buffer
+/// and its kernel never has a reason to drop RTS — the obvious test, "stall the
+/// consumer and watch flow control engage", cannot be written against this design
+/// at all. So the stall is driven from the **peer's** side: port1 runs
+/// `flow_control = "none"`, which leaves its RTS pin under `set-modem`'s control,
+/// and dropping it takes port0's CTS low. port0 runs `rts-cts`, so its kernel sees
+/// CTS low and holds the line.
+///
+/// What is asserted is the pair of facts §5 promises together, since either alone
+/// is satisfiable by a bug: the bytes **do not arrive** while CTS is low (the
+/// stall is real, not a slow path), and they arrive **byte-exact** when it rises
+/// (the stall cost latency and not data). A transmitter that dropped them, and one
+/// that ignored CTS, fail different halves.
+///
+/// **The control arm runs every time and is the fail-first proof** (plan §3 rule
+/// 10). The identical scenario with port0 at `flow_control = "none"` must deliver
+/// the payload *while CTS is low* — so a green first half cannot be explained by a
+/// rig that was slow, a log that was buffered, or a send that never happened.
+#[test]
+fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
+    let Some((p0, p1)) = crossover_ports() else {
+        skip_no_rig("rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes");
+        return;
+    };
+    let _rig = rig_guard();
+    eprintln!("crossover rig (rts-cts flow control): {p0} <-> {p1}");
+
+    // A payload that comfortably exceeds one FTDI bulk packet, so "nothing arrived"
+    // cannot be one packet still in flight, and small enough that the whole of it
+    // fits the kernel's transmit buffer while the line is held — the point is that
+    // the *wire* stops, not that the daemon backs up.
+    const LINE: &str = "SNX-RTSCTS-STALL-PROBE-0123456789ABCDEF";
+
+    // ---- Arm 1: rts-cts on the transmitter. The line must hold.
+    let (d, run_dir, _i0, _i1) = {
+        let d = Daemon::start();
+        let (run_dir, inj0, inj1) = {
+            let run = d.run();
+            (run.path().to_path_buf(), run.join("inj0"), run.join("inj1"))
+        };
+        d.rpc()
+            .load_toml(
+                &flow_cfg(
+                    &p0,
+                    &p1,
+                    115_200,
+                    ("rts-cts", "none"),
+                    &run_dir,
+                    &inj0,
+                    &inj1,
+                ),
+                false,
+            )
+            .unwrap_or_else(|e| panic!("load rts-cts rig config: {e:?}"));
+        for port in ["port0", "port1"] {
+            assert!(
+                d.rpc().wait_status(port, "active", Duration::from_secs(20)),
+                "{port} not active under rts-cts: {:?}",
+                d.rpc().node(port)
+            );
+        }
+        (d, run_dir, inj0, inj1)
+    };
+    let rpc = d.rpc();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (carries, measured) = handshake_measured(rpc);
+    if !carries {
+        serial_nexus_itest::skip_no_rig_flow(
+            "rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes",
+            &measured,
+        );
+        return;
+    }
+    eprintln!("handshake: {measured}");
+
+    let rx1 = run_dir.join("rx1.log");
+    let baseline = std::fs::metadata(&rx1).map(|m| m.len()).unwrap_or(0);
+
+    // Hold the line: port1 drops RTS, so port0's CTS goes low.
+    drive_rts_read_far(rpc, "port1", "port0", false);
+    let held = rpc.node("port0").expect("port0 state")["modem_lines"].clone();
+    assert_eq!(
+        held["cts"],
+        json!(false),
+        "port0 CTS did not follow port1 RTS low, so nothing below tests flow \
+         control: {held}"
+    );
+
+    let sent = rpc
+        .send("port0", LINE, false, 5_000)
+        .expect("send into a CTS-held port must be accepted by the daemon, not refused");
+    eprintln!("sent while CTS low: {sent}");
+
+    // The stall is real: nothing crosses while the peer holds the line.
+    //
+    // **The window is 1.5 s against a measured 25 ms**, and the ratio is the
+    // point. Probed directly on this rig with the same graph and
+    // `flow_control = "none"` on the transmitter, the payload lands in the log
+    // **25 ms** after `send` returns while CTS is held low; with `rts-cts` it does
+    // not arrive in **6 s**. So a 1.5 s window is a 60x margin over the only
+    // behaviour that could produce a false green here, and widening it further
+    // would buy nothing but wall clock. The control arm below re-establishes the
+    // 25 ms figure on every run rather than trusting this comment.
+    std::thread::sleep(Duration::from_millis(1_500));
+    let during = std::fs::metadata(&rx1).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        during,
+        baseline,
+        "{} bytes crossed the wire while the peer held RTS low — the kernel \
+         transmitted through a CTS stop, so `flow_control = \"rts-cts\"` is not \
+         reaching the line (design §5)",
+        during - baseline
+    );
+
+    // Release it: the bytes arrive, and they arrive whole.
+    drive_rts_read_far(rpc, "port1", "port0", true);
+    let want = baseline + LINE.len() as u64 + 1; // `send` appends a newline
+    let arrived = serial_nexus_itest::wait_until(Duration::from_secs(10), || {
+        std::fs::metadata(&rx1).map(|m| m.len()).unwrap_or(0) >= want
+    });
+    let after = std::fs::metadata(&rx1).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        arrived,
+        "the payload never arrived after the peer raised RTS: {after} of {want} \
+         bytes. A stall that loses its payload is not backpressure, it is loss \
+         under another name (design §5: commands are delayed, never lost)"
+    );
+    let body = std::fs::read(&rx1).expect("read rx1.log");
+    assert!(
+        body.windows(LINE.len()).any(|w| w == LINE.as_bytes()),
+        "the payload arrived but not byte-exact — a stall must cost latency, not \
+         data: {:?}",
+        String::from_utf8_lossy(&body[baseline as usize..])
+    );
+    eprintln!(
+        "held {} B for 1.5 s, then delivered byte-exact",
+        want - baseline
+    );
+    drop(d);
+
+    // ---- Arm 2, the control: the same scenario with flow control OFF must NOT
+    // stall. Without this, arm 1 is satisfiable by a rig that was simply slow, a
+    // log that had not been flushed, or a `send` that never reached the port.
+    let d2 = Daemon::start();
+    let (run_dir2, inj0b, inj1b) = {
+        let run = d2.run();
+        (run.path().to_path_buf(), run.join("inj0"), run.join("inj1"))
+    };
+    d2.rpc()
+        .load_toml(
+            &flow_cfg(
+                &p0,
+                &p1,
+                115_200,
+                ("none", "none"),
+                &run_dir2,
+                &inj0b,
+                &inj1b,
+            ),
+            false,
+        )
+        .unwrap_or_else(|e| panic!("load control rig config: {e:?}"));
+    for port in ["port0", "port1"] {
+        assert!(
+            d2.rpc()
+                .wait_status(port, "active", Duration::from_secs(20)),
+            "{port} not active in the control arm"
+        );
+    }
+    let rpc2 = d2.rpc();
+    std::thread::sleep(Duration::from_millis(300));
+    let rx1b = run_dir2.join("rx1.log");
+    let base2 = std::fs::metadata(&rx1b).map(|m| m.len()).unwrap_or(0);
+
+    drive_rts_read_far(rpc2, "port1", "port0", false);
+    rpc2.send("port0", LINE, false, 5_000)
+        .expect("send in the control arm");
+    let want2 = base2 + LINE.len() as u64 + 1;
+    let crossed = serial_nexus_itest::wait_until(Duration::from_secs(5), || {
+        std::fs::metadata(&rx1b).map(|m| m.len()).unwrap_or(0) >= want2
+    });
+    // Put the line back before asserting, so a red here cannot leave the rig held.
+    drive_rts_read_far(rpc2, "port1", "port0", true);
+    assert!(
+        crossed,
+        "the control arm did not deliver with flow control OFF and RTS low — so \
+         arm 1's stall proves nothing about `rts-cts`, and something else on this \
+         rig is holding the line"
+    );
+    eprintln!("control: flow_control=none delivered through the same CTS-low state");
 }

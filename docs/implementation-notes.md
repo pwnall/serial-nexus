@@ -8110,3 +8110,74 @@ immediately, no down time — against one with the normal hold. Same binary coun
 same suite length, same test names; only the USB cycle differs. That is the
 experiment §3.58 proposed before any of this was measured, and it is now the only
 one left worth running.
+
+### 3.63 Hardware flow control, end to end — and a fail-first proof that never applied
+
+**Design:** §5's transparency promise, §15.52 (the measured precondition).
+**Plan:** §18 item 7, the half §15.52 explicitly left open. **Rules:** plan §3
+rules 10, 11; AGENTS §9.
+
+**What was missing.** `flow_control = "rts-cts"` is a shipped configuration
+attribute. Its serde path has been proven since it shipped — spellings, kebab
+canonicalization, the proptest strategy, the CFG-1 validation guard — and **no test
+in this workspace had ever opened a port with it**. §5 states the promise as
+transparency: "the kernel pausing transmission surfaces as Busy, so hardware flow
+control transparently extends across the graph to remote writers." That sentence
+had a config path and no wire path.
+
+**Why the obvious test cannot be written.** The natural shape is "stall the
+consumer and watch flow control engage" — and it is unwritable against this design.
+§5 has the daemon reading its own port *continuously and never idling*, so a
+receiver inside the graph can never fill its buffer and its kernel never has a
+reason to drop RTS. The stall has to come from outside the graph.
+
+**The shape that works.** The peer runs `flow_control = "none"`, which leaves its
+RTS pin under `set-modem`'s control, so the *test* owns it; the port under test runs
+`rts-cts`, so its kernel watches CTS. Dropping the peer's RTS takes the transmitter's
+CTS low through the 5-wire crossover §15.52 measured, and the kernel holds the line.
+
+**Measured on the rig, and the numbers are the reason the guard is not vacuous:**
+
+| transmitter | CTS held low | payload appears |
+|---|---|---|
+| `flow_control = "none"` | yes | **25 ms** |
+| `flow_control = "rts-cts"` | yes | **never** (6 s window) |
+| either | released | immediately |
+
+So the mechanism is real, and a 1.5 s stall window is a **60x margin** over the only
+behaviour that could produce a false green. Two facts are asserted together, because
+either alone is satisfiable by a bug: the bytes do not arrive while CTS is low (the
+stall is real, not a slow path), and they arrive **byte-exact** when it rises (the
+stall cost latency, not data — §5's "commands are delayed, never lost"). The control
+arm runs every time and re-establishes the 25 ms figure rather than trusting the
+table above.
+
+**A second test, and it is not the doctor's.** `crossover_rig_rts_crosses_to_the_far_ports_cts`
+asserts continuity through the daemon's own `state` — the `modem_lines` field §7.1
+promises an operator — with both polarities and both directions. P5's handshake block
+(§15.52) measures the same wire port-to-port with no daemon in the path, because §13's
+boundary is that the doctor certifies the rig and never drives the daemon through it.
+**Neither subsumes the other**: the doctor's arm would still pass if the daemon's state
+reporting were broken, and this one would still pass if the doctor's were. The DTR arm
+is the negative control, unchanged in purpose from §15.52's.
+
+**A fourth `required` spelling, and the first with a measured precondition.**
+`SNX_RIG_FLOW=required`. The other three ask whether a *thing* is present — a rig, a
+blessed helper, `curl`. This one asks whether the rig that is present carries RTS↔CTS,
+which is the operator's cabling; §5's stated assumption is the **3-wire** link, so a
+bench that answers no is legitimate and `SNX_CROSSOVER=required` deliberately does not
+redden it. The measurement is taken first and printed in the skip, so a reader never
+guesses which bench they have. Both arms run: forced 3-wire, the tests skip green
+without the variable and fail naming the measurement with it.
+
+**The fail-first proof that never applied, recorded because it is the failure mode a
+fail-first proof is supposed to have.** The first attempt mutated the transmitter to
+`flow_control = "none"` with a `sed` whose pattern assumed the call site was on one
+line. `rustfmt` had wrapped it. The `sed` matched nothing, the unmutated test ran, it
+passed — and that pass reads *exactly* like "the mutation did not redden the guard",
+which would have been a defect finding about the guard rather than about the
+experiment. It was caught only because the result was implausible: the same
+configuration passed in one arm and failed in another. Redone with the replacement
+count asserted before the run, the mutation reddens with its own message verbatim.
+**A mutation whose application is not verified is not a control**, and `sed` over
+formatted Rust is where that bites.

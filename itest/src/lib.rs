@@ -1875,6 +1875,35 @@ pub fn usb_port_of(by_id_link: &Path) -> Option<String> {
     None
 }
 
+/// Announce a hardware-flow-control test's self-skip — and refuse to skip when the
+/// operator has said the capability must be exercised.
+///
+/// **A fourth instance of one mechanism, and the first whose precondition is
+/// *measured* rather than declared** (plan §3 rule 11, §18 item 7, design §15.52).
+/// The other three ask whether a *thing* is present: a crossover rig, a blessed
+/// replug helper, `curl`. This one asks whether the rig that is present carries
+/// RTS↔CTS, which is a property of the operator's cabling and not of their
+/// checkout — and §5's stated design assumption is the **3-wire** link, so a rig
+/// that answers no is a legitimate rig and not a fault. The measurement is taken
+/// first and printed in the skip, so a reader never has to guess which of the two
+/// they have; the doctor reports the same fact independently in P5's handshake
+/// block.
+///
+/// `SNX_CROSSOVER=required` deliberately does **not** redden this: the rig is
+/// present, the capability is not, and conflating the two would make an honest
+/// 3-wire bench unable to run the rig lane at all. `SNX_RIG_FLOW=required` is the
+/// separate word for "this bench is 5-wire and I want that proven".
+pub fn skip_no_rig_flow(test: &str, measured: &str) {
+    assert!(
+        std::env::var("SNX_RIG_FLOW").as_deref() != Ok("required"),
+        "SNX_RIG_FLOW=required, but {test} found no hardware handshake: {measured}.\n\
+         Required mode exists so a 5-wire bench cannot report a green run for the \
+         one capability that only a 5-wire bench can exercise (§15.52, plan §3 \
+         rule 11). Cross-wire RTS↔CTS, or unset SNX_RIG_FLOW."
+    );
+    eprintln!("SKIP {test}: the rig carries no RTS/CTS handshake — {measured}");
+}
+
 /// Announce the TLS round-trip's self-skip — and refuse to skip when the operator
 /// has said the tier must be exercised.
 ///
