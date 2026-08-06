@@ -208,6 +208,16 @@ fn main() {
     // as the reason a `frame` count is nonzero.
     probe_list.push(probes::p11_line_state(&cli.ports, rig));
 
+    // P15 — does a named port honour a requested flow-control mode? Opt-in behind
+    // `--port` like P3/P5/P11, and placed here rather than beside P11 because it
+    // **configures**: P11's contract is that it opens with the port's settings
+    // unchanged, and this question cannot be asked without changing them. It runs
+    // after P11 so P11 still sees the port as the operator left it, and before P14
+    // because P14 re-proves its own baseline anyway and must stay last for the
+    // wall-clock reason below. Two `tcsetattr` calls per port, so it costs nothing
+    // against P14's rate ladder (notes §3.65 E).
+    probe_list.push(probes::p15_flow_control_readback(&cli.ports));
+
     // P14 — the maximum-rate search (§15.51). **Last, and that is a rule rather
     // than a habit.** The ordering note above P6/P7 says nothing may be inserted
     // ahead of P5 because the passive probes are wall-clock timed; P14 is by far

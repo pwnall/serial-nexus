@@ -44,7 +44,7 @@ use nix::fcntl::{OFlag, open};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::pty::{PtyMaster, grantpt, posix_openpt, unlockpt};
 use nix::sys::stat::Mode;
-use nix::sys::termios::{LocalFlags, SetArg, cfmakeraw, tcgetattr, tcsetattr};
+use nix::sys::termios::{ControlFlags, LocalFlags, SetArg, cfmakeraw, tcgetattr, tcsetattr};
 use serial2::{CharSize, FlowControl, Parity, SerialPort, Settings, StopBits};
 
 use crate::report::{EnvCheck, Probe, Status};
@@ -6173,6 +6173,175 @@ fn p14_measure_rung(
     rung
 }
 
+/// One port's answer to "did the flow-control mode I asked for actually take?".
+struct FlowReadback {
+    port: String,
+    /// Did `tcsetattr` report success? A driver that *refuses* is not the
+    /// interesting case — it is honest. The interesting one accepts and drops.
+    tcsetattr_ok: bool,
+    tcsetattr_error: Option<String>,
+    cflag_before: u64,
+    cflag_after: u64,
+    /// The whole point: `CRTSCTS` present in the read-back.
+    honoured: bool,
+    /// Set back to what it was, and checked. A probe that reconfigures a real
+    /// port and cannot say it restored it is a probe nobody should run twice.
+    restored: bool,
+}
+
+impl FlowReadback {
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "requested": "rts-cts (CRTSCTS)",
+            "tcsetattr_ok": self.tcsetattr_ok,
+            "tcsetattr_error": self.tcsetattr_error,
+            "cflag_before_hex": format!("{:#x}", self.cflag_before),
+            "cflag_after_hex": format!("{:#x}", self.cflag_after),
+            "honoured_on_readback": self.honoured,
+            "silently_dropped": self.tcsetattr_ok && !self.honoured,
+            "baseline_restored": self.restored,
+        })
+    }
+}
+
+/// Ask one port for `CRTSCTS` and read it back, then put it back as it was.
+fn p15_readback(path: &PathBuf) -> Result<FlowReadback, String> {
+    let fd = open(
+        path,
+        OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|e| format!("open: {e}"))?;
+    let before = tcgetattr(&fd).map_err(|e| format!("tcgetattr: {e}"))?;
+    let mut want = before.clone();
+    want.control_flags |= ControlFlags::CRTSCTS;
+
+    let set = tcsetattr(&fd, SetArg::TCSANOW, &want);
+    let after = tcgetattr(&fd).map_err(|e| format!("tcgetattr after: {e}"))?;
+
+    // Restore before reporting anything, so an early return cannot leave a real
+    // adapter reconfigured behind us.
+    let restored = tcsetattr(&fd, SetArg::TCSANOW, &before).is_ok()
+        && tcgetattr(&fd)
+            .map(|t| t.control_flags == before.control_flags)
+            .unwrap_or(false);
+
+    Ok(FlowReadback {
+        port: path.display().to_string(),
+        tcsetattr_ok: set.is_ok(),
+        tcsetattr_error: set.err().map(|e| e.to_string()),
+        cflag_before: before.control_flags.bits() as u64,
+        cflag_after: after.control_flags.bits() as u64,
+        honoured: after.control_flags.contains(ControlFlags::CRTSCTS),
+        restored,
+    })
+}
+
+/// Fold the per-port readings into a verdict. Pure, so both readings are tested
+/// against each other rather than against whichever kernel is in front of you
+/// (§9) — the arm that does not run here is the one a single-kernel session
+/// cannot exercise.
+fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Status, String) {
+    if named == 0 {
+        return (
+            Status::skipped("no --port named"),
+            "Re-run with `--port /dev/ttyUSB0` to ask whether this driver honours a requested flow-control mode (a dangling converter is enough — no target device, §13).".to_owned(),
+        );
+    }
+    if rows.is_empty() {
+        return (
+            Status::skipped("no port could be opened"),
+            format!(
+                "No named port could be opened or configured ({}). Grant access and re-run with `--port`.",
+                errors.join("; ")
+            ),
+        );
+    }
+    let dropped: Vec<&FlowReadback> = rows
+        .iter()
+        .filter(|r| r.tcsetattr_ok && !r.honoured)
+        .collect();
+    let unrestored: Vec<&FlowReadback> = rows.iter().filter(|r| !r.restored).collect();
+    if !unrestored.is_empty() {
+        return (
+            Status::Degraded,
+            format!(
+                "This probe could not restore the pre-existing termios on {}. Nothing below should be trusted and the port should be reopened before use — a reconfigured adapter is a worse outcome than an unanswered question.",
+                unrestored
+                    .iter()
+                    .map(|r| r.port.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+    if dropped.is_empty() {
+        return (
+            Status::Supported,
+            format!(
+                "Every named port ({}) honoured `CRTSCTS` on read-back, so a `flow = \"rts-cts\"` edge configures here and the driver agrees it did. `serial2` verifies settings by reading them back, so this is exactly the check the serial node's open performs.",
+                rows.len()
+            ),
+        );
+    }
+    (
+        Status::Degraded,
+        format!(
+            "**{} named port(s) ACCEPTED a `CRTSCTS` request and then reported it clear** ({}). `tcsetattr` returned success and `tcgetattr` read the flag back unset, so the driver neither honours the mode nor refuses it — and because `serial2` verifies by read-back, the serial node's open fails with `failed to apply some or all settings` and the node goes `faulted`, not `degraded`. That is the shape §7 says a differing kernel must not be given: the observation belongs in a report, and whether a `rts-cts` edge should degrade with this named or keep faulting is a design question this probe exists to inform, not to answer. Measured on Darwin 24.6.0 / macOS 15.7.8 with an FT232R on Apple's IOSerialFamily driver: `CCTS_OFLOW` alone, `CRTS_IFLOW` alone, both together, a blocking open and the `/dev/tty.*` node all behave identically, while a **pty on the same box honours the flag** — so it is the serial driver and not the tty layer. The wire is not the suspect either: RTS↔CTS crossing is independently proven on that rig.",
+            dropped.len(),
+            dropped
+                .iter()
+                .map(|r| r.port.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+}
+
+/// **P15 — does a named port honour a requested flow-control mode, or accept the
+/// request and drop it?**
+///
+/// §7.1 lets an edge ask for `rts-cts`, and the serial node applies it through
+/// `serial2`, which **verifies by read-back**: it sets the termios, reads it back,
+/// and errors when the two disagree. So a driver that silently ignores the request
+/// does not produce a degraded link — it produces `failed to apply some or all
+/// settings` and a `faulted` node. That failure mode was found by a harness test
+/// on Darwin (notes §3.65 E) and had no instrument behind it; this is the
+/// instrument, so the fault-versus-degrade decision is made against a committed
+/// artifact rather than a red test (§7).
+///
+/// **Why not an observation on P11.** P11 states its own contract — it opens with
+/// the port's current settings unchanged and "inspects, it does not configure" —
+/// and this question cannot be asked without configuring. A new question takes a
+/// new id (the append-only rule above P13), which moves `probe_set` into a new era
+/// deliberately, exactly as P14 did.
+///
+/// Opt-in behind `--port` like P3/P5/P11/P14, and it restores the termios it
+/// found, checked rather than assumed.
+pub fn p15_flow_control_readback(ports: &[PathBuf]) -> Probe {
+    let mut p = Probe::new(
+        "P15",
+        "real-port flow-control honouring",
+        "Does a named port honour a requested hardware flow-control mode (CRTSCTS) on read-back, or accept the request and silently drop it (§7.1, §15.51)?",
+    );
+    let mut rows: Vec<FlowReadback> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for port in ports {
+        match p15_readback(port) {
+            Ok(r) => rows.push(r),
+            Err(e) => errors.push(format!("{}: {e}", port.display())),
+        }
+    }
+    for r in &rows {
+        p = p.observe(&r.port, r.observations());
+    }
+    if !errors.is_empty() {
+        p = p.observe("unreadable_ports", serde_json::json!(errors));
+    }
+    let (status, consequence) = p15_verdict(ports.len(), &rows, &errors);
+    p.verdict(status, &consequence)
+}
+
 pub fn p14_max_rate(ports: &[PathBuf], pairs: &[VerifiedPair]) -> Probe {
     let mut p = Probe::new("P14", "maximum reliable rate", P14_QUESTION);
     let mut facts = P14Facts {
@@ -8307,6 +8476,73 @@ mod tests {
                  cells that requested something"
             );
         }
+    }
+
+    fn flow_row(port: &str, ok: bool, honoured: bool, restored: bool) -> FlowReadback {
+        FlowReadback {
+            port: port.to_owned(),
+            tcsetattr_ok: ok,
+            tcsetattr_error: None,
+            cflag_before: 0x4b00,
+            cflag_after: if honoured { 0x4b00 | 0x30000 } else { 0x4b00 },
+            honoured,
+            restored,
+        }
+    }
+
+    /// **Both arms ship; only one runs per kernel.** Linux honours `CRTSCTS` and
+    /// Darwin drops it, so on either box alone half of this function is unreachable
+    /// — which is exactly the shape §9 says to test purely rather than against
+    /// whatever is plugged in. The silently-dropped arm is the one the probe exists
+    /// for, and it must be `degraded` and never `unsupported`: a differing kernel is
+    /// an observation, not a contradiction of the design (§7).
+    #[test]
+    fn p15_separates_a_dropped_request_from_an_honoured_one() {
+        let honoured = [flow_row("/dev/ttyUSB0", true, true, true)];
+        let (s, c) = p15_verdict(1, &honoured, &[]);
+        assert!(matches!(s, Status::Supported));
+        assert!(c.contains("honoured"));
+
+        let dropped = [flow_row("/dev/cu.usbserial-A", true, false, true)];
+        let (s, c) = p15_verdict(1, &dropped, &[]);
+        assert!(
+            matches!(s, Status::Degraded),
+            "a dropped request must degrade"
+        );
+        assert!(
+            c.contains("/dev/cu.usbserial-A"),
+            "the consequence must name the port that dropped it: {c}"
+        );
+
+        // A driver that REFUSES is honest, and must not be confused with one that
+        // accepts and drops: `silently_dropped` is false, so the fleet is clean.
+        let refused = [flow_row("/dev/ttyUSB0", false, false, true)];
+        assert!(matches!(p15_verdict(1, &refused, &[]).0, Status::Supported));
+    }
+
+    /// A probe that reconfigures a real adapter and cannot say it put it back must
+    /// say *that* before it says anything else — the unrestored arm outranks even
+    /// the finding the probe exists to report.
+    #[test]
+    fn p15_reports_a_failed_restore_ahead_of_its_own_finding() {
+        let rows = [flow_row("/dev/cu.usbserial-A", true, false, false)];
+        let (s, c) = p15_verdict(1, &rows, &[]);
+        assert!(matches!(s, Status::Degraded));
+        assert!(
+            c.contains("could not restore"),
+            "the restore failure must lead, not the CRTSCTS finding: {c}"
+        );
+    }
+
+    /// No `--port` is a skip, not a verdict — the same opt-in shape as P3/P5/P11,
+    /// and a loop that did not run may not produce a status (§9, notes §3.48).
+    #[test]
+    fn p15_skips_rather_than_certifying_a_port_list_it_never_had() {
+        assert!(matches!(p15_verdict(0, &[], &[]).0, Status::Skipped { .. }));
+        assert!(matches!(
+            p15_verdict(2, &[], &["boom".to_owned()]).0,
+            Status::Skipped { .. }
+        ));
     }
 
     /// The two readings of the mask column, checked against each other rather than

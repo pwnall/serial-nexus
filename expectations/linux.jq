@@ -159,6 +159,18 @@ and (all(.probes[]; . as $p | ($p.id != "P10") or ($p.status == "skipped") or
             and (.value.recheck.ladder_reading | has("watermark_threshold_gt"))
             and (.value.recheck.ladder_reading | has("watermark_threshold_le")))))))
 and (any(.probes[]; .id == "P11" and (.status == "supported" or .status == "degraded" or .status == "skipped")))
+# P15 (flow-control honouring, notes §3.65 E). Identical to `expectations/macos.jq`'s
+# clause, deliberately: the defect it instruments was found on Darwin, where the driver
+# accepts a CRTSCTS request and reads the flag back clear, and a gate that only ran
+# where the flag IS honoured could never catch that. Presence of the per-port reading
+# and of the restore; the answer stays free (§7). The passive run has no `--port`, so
+# the probe skips and the clause is silent.
+and (any(.probes[]; .id == "P15"))
+and (all(.probes[]; . as $p | ($p.id != "P15") or ($p.status | startswith("skipped")) or
+      ($p.observations | any((.value | type == "object")
+         and (.value.honoured_on_readback | type == "boolean")
+         and (.value.tcsetattr_ok | type == "boolean")
+         and (.value.baseline_restored | type == "boolean")))))
 # P12 (session-boundary edge, §15.39) is inert on Linux by design — the retained
 # `TIOCPKT_IOCTL` packet carries §6's detach-release here, which is P7's subject —
 # so `skipped` is the *expected* answer and the clause is presence-only. It is

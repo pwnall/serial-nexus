@@ -8,8 +8,8 @@
 # well-formed report and that the portable mechanisms did not regress, while letting
 # the Linux-only probes skip/degrade/report unsupported without failing CI:
 #
-#   - The report is structurally sound: a summary object and all fourteen probes
-#     (P1..P14) present, each carrying a status. (`>= 14` rather than `== 14`
+#   - The report is structurally sound: a summary object and all fifteen probes
+#     (P1..P15) present, each carrying a status. (`>= 15` rather than `== 15`
 #     because P3 emits one probe per --port.)
 #   - P2 (PTY presence, POLLHUP) is POSIX — it must NOT be `unsupported`
 #     (`supported` or `degraded` while unverified on a given macOS runner is fine).
@@ -62,7 +62,7 @@
 # Evaluates to `true` (exit 0) only when every clause below holds.
 
 (.summary != null)
-and (.probes | length >= 14)
+and (.probes | length >= 15)
 and (all(.probes[]; .status != null))
 and (any(.probes[]; .id == "P1"))
 and (any(.probes[]; .id == "P2" and (.status == "supported" or .status == "degraded")))
@@ -153,6 +153,20 @@ and (all(.probes[]; . as $p | ($p.id != "P10") or ($p.status == "skipped") or
             and (.value.recheck.ladder_reading | has("watermark_threshold_gt"))
             and (.value.recheck.ladder_reading | has("watermark_threshold_le")))))))
 and (any(.probes[]; .id == "P11"))
+# P15 (flow-control honouring, notes §3.65 E) may be any status, and this lane is the
+# one where it is expected to be `degraded`: Apple's IOSerialFamily driver accepts a
+# CRTSCTS request and reads the flag back clear, so an `rts-cts` edge faults the node
+# here. What is gated is that the probe SAYS so per port — the reading and the
+# restore, never the answer, because "this driver honours it" and "this driver drops
+# it" are both legitimate kernel facts (§7). `baseline_restored` is required because a
+# probe that reconfigures a real adapter and cannot say it put it back is worse than
+# one that never ran.
+and (any(.probes[]; .id == "P15"))
+and (all(.probes[]; . as $p | ($p.id != "P15") or ($p.status | startswith("skipped")) or
+      ($p.observations | any((.value | type == "object")
+         and (.value.honoured_on_readback | type == "boolean")
+         and (.value.tcsetattr_ok | type == "boolean")
+         and (.value.baseline_restored | type == "boolean")))))
 # P12 (session-boundary edge, §15.39) is the mechanism that carries §6's
 # detach-release on THIS platform — Darwin destroys the readable packet P7 measures
 # — so unlike every clause above it, macOS is where P12 is load-bearing and Linux is

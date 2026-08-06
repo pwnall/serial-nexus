@@ -8290,11 +8290,9 @@ step is exactly that command.** `serial-nexus-replug` is an unconditional worksp
 module is `#[cfg(target_os = "linux")]`. The intent is already written down one file away — sys's
 own comment says the module is "Linux-only … and the helper the module supports does not build
 elsewhere" — so what is missing is not the decision but its enforcement. `cargo build --workspace
---exclude serial-nexus-replug` is clean, which locates the break precisely. Left **unfixed and
-filed** rather than patched around: the choice between a non-Linux `main` stub, per-target
-dependencies, and excluding the crate in the macOS lane is a design call (§5), and the reason it
-went unnoticed is worth more than the patch — the replug commits landed after the last macOS run,
-and nothing between them and this session executed a build off Linux.
+--exclude serial-nexus-replug` is clean, which locates the break precisely. The reason it went unnoticed is worth more than the patch: the replug
+commits landed after the last macOS run, and nothing between them and this session executed a
+build off Linux. **Fixed** (see A′ below, which also answers whether a macOS equivalent exists).
 
 **B. P9's mask premise, refuted on the kernel that has to live with it.** `f8315cc` collapsed
 P9's reference table to a `1x2` on the premise that POSIX delivers `POLLHUP` whether or not it was
@@ -8378,13 +8376,12 @@ kext loaded. The adapter's RTS/CTS *wiring* is fine and independently proven on 
 `crossover_rig_rts_crosses_to_the_far_ports_cts` passes, driving RTS on either port raises CTS on
 the other.
 
-Left **unfixed and filed**, with the product question stated rather than answered: §7 says a
-kernel that differs is `degraded` with the observation named, never a hard failure, and today a
-`rts-cts` config **faults the node** on Darwin. Whether the daemon should degrade with the
-observation named, or keep faulting because silently running a flow-controlled link without flow
-control is worse, is a design decision (§5) and not one to settle from the test that noticed it.
-The idiomatic instrument for it already has a shape: a doctor probe that measures whether a named
-port honours `CRTSCTS` on read-back, exactly as P10 measures what a pty accepts.
+The product question is stated rather than answered: §7 says a kernel that differs is
+`degraded` with the observation named, never a hard failure, and today a `rts-cts` config **faults
+the node** on Darwin. Whether the daemon should degrade with the observation named, or keep
+faulting because silently running a flow-controlled link without flow control is worse, is a
+design decision (§5) and not one to settle from the test that noticed it. **What this session did
+build is the instrument that decision needs — see E′ below.**
 
 **F. One failure was contention, not a defect, and it is recorded so it is not re-filed.**
 `crossover_rig_map_node_both_directions` fails when `serial_hardware` runs its tests in parallel
@@ -8420,3 +8417,73 @@ shape differs 0-of-64 against 64-of-64. So the witness fd **normalises two oppos
 dispositions to one reading**. That is notes §3.56's argument in its measured form: the seven
 guards it converted do not depend on which disposition the kernel has, which is exactly what a
 portable guard needs and what C above found the *guard* was not yet saying.
+
+**A′ (same session) — the build break is fixed, and the macOS equivalent was investigated rather
+than assumed away.** `replug/src/{main,install,sysfs}.rs` become
+`replug/src/main.rs` (a platform dispatcher) plus `replug/src/linux/{mod,install,sysfs}.rs`
+reached through `#[cfg(target_os = "linux")] #[path = "linux/mod.rs"] mod platform;`. Off Linux
+the binary refuses in one place with exit **2** — the Linux binary's "refused" code, so a harness
+that shells out gets a verdict rather than an ambiguity — and `cargo build --workspace --locked`
+now succeeds on macOS, so the documented gate scope no longer needs a second exclusion. The
+restructure was **cross-checked, not eyeballed**: `cargo check --target x86_64-unknown-linux-gnu
+--workspace --exclude serial-nexus-web --all-targets` is clean, which covers every Linux-only path
+this session edited, and `--exclude serial-nexus-web` there is `ring`'s C build script wanting a
+Linux cross-compiler, not a defect (`cargo tree -i ring` names `serial-nexus-web` as the only
+consumer).
+
+**A macOS equivalent exists, and the measurement is the design input.** IOUSBLib's
+`USBDeviceReEnumerate` is reachable through the `IOCFPlugInTypes` handle the FT232R already
+advertises in the IORegistry. Measured on Darwin 24.6.0 / macOS 15.7.8 against `BH00L4KU`:
+`USBDeviceOpen` then `USBDeviceReEnumerate` both return `kIOReturnSuccess`, the target's
+`sessionID` moves `26843088327954` → `26857977258534` **while an untouched second adapter's
+(`BH00LL8O`) does not**, and `/dev/cu.usbserial-BH00L4KU` returns at the same path. That control is
+what makes it a re-enumeration of *the named device* rather than a bus-wide event.
+
+**It is a partial equivalent, and both differences are measured rather than argued.** First, it
+needs **no privilege** — the open above succeeded at `euid=501`, where the whole Linux helper
+exists to carry `CAP_DAC_OVERRIDE` for one sysfs write — so `capabilities`, `install` and
+`preflight` are Linux concepts with nothing to port, and §15.45's security argument does not
+transfer. Second, and the reason a backend is not a drop-in: Linux's mechanism is **two-step and
+holdable** (deauthorize, wait `--hold-ms`, authorize) while `USBDeviceReEnumerate` is **atomic**.
+The outage it produces measured **40, 41 and 42 ms** across three trials at 2 ms sampling, and
+nothing in the API lengthens it. So `cycle --hold-ms` cannot be honoured off Linux and `hold`
+cannot be implemented at all; what a macOS backend can offer is the replug *event*, not a
+controllable outage.
+
+Landing that backend is therefore a **design amendment** (§15.45 is written around a privileged
+Linux helper), not a patch, and it is left for one: this session stops at the boundary where the
+crate builds everywhere and the refusal carries the measurement. Recorded here so the next session
+does not re-derive it — the expensive part was establishing that the primitive exists, is
+unprivileged, and is 41 ms wide.
+
+**E′ (same session) — P15, so the flow-control question is decided against an artifact.**
+A new probe rather than an observation on P11, for a reason P11 states about itself: it opens with
+the port's settings **unchanged** and "inspects, it does not configure", and this question cannot
+be asked without configuring. A new question takes a new id under the append-only rule, so
+`probe_set` moves to a new era (`94d64d8bbacf1174` → `82a8e2198e54626a`) — the same deliberate,
+sound direction P14 took, and it means the `42eac2a`/`3d850cf` cross-kernel pair remains the pair
+for *its* era rather than being silently compared across the boundary.
+
+P15 asks each `--port` for `CRTSCTS`, reads it back, and puts the termios back as it found it.
+Per port it reports `tcsetattr_ok`, `honoured_on_readback`, `silently_dropped`, the before/after
+`cflag`, and `baseline_restored` — that last one required by both gate files, because a probe that
+reconfigures a real adapter and cannot say it restored it is worse than one that never ran. On the
+Darwin rig it reads `degraded` with `silently_dropped: true` on both ports, `tcsetattr_ok: true`,
+`cflag` unchanged at `0x4b00` either side, and `baseline_restored: true`.
+
+**The verdict distinguishes three cases, and only one of them is the defect.** A driver that
+*refuses* the request is honest and reads `supported`; a driver that honours it reads `supported`;
+only accept-then-drop degrades. That distinction is tested purely, both arms, because Linux
+honours the flag and Darwin drops it — so on either box alone half the function is unreachable,
+which is exactly the shape §9 says not to leave to whichever kernel is plugged in. A failed
+restore outranks the finding itself and is reported first.
+
+Both gate files require the per-port reading and the restore by **presence and type, never
+answer**: flipping `honoured_on_readback` to `true` keeps the gate green, because "this driver
+honours it" and "this driver drops it" are both legitimate kernel facts (§7). Proven by mutation
+against a live report — removing P15, the reading, or the restore each reds the gate; flipping the
+answer does not — and the passive path was checked too, where P15 skips and both gates stay green.
+
+**What P15 does not do is answer the design question**, and that is deliberate. `rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes`
+is still red on Darwin, and it should stay red until the fault-versus-degrade decision is made,
+because a green suite would be the wrong summary of a platform that cannot do what the config asks.
