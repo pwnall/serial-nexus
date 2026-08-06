@@ -8876,3 +8876,129 @@ correcting it moves the era a second time and orphans the three macOS artifacts
 committed under `82a8e2198e54626a` before any Linux counterpart exists. Recorded
 rather than silently corrected, because which of those two costs to pay is a
 decision about the comparability discipline, not a typo fix.
+
+### 3.69 An out-of-tree report against `reader_thread`: two proposals refuted by measurement, one real gap
+
+**Design:** §7 (measure the kernel, do not infer it from a harness failure; a kernel
+claim cites a committed report). **Rules:** AGENTS §9, §10 (capabilities, never
+consumers).
+
+A change report arrived against `reader_thread`, written at `85699d6` — 69 commits
+back, and before the rename track, so it names a directory that no longer exists. The
+function is **unchanged** since, so the report is about current behaviour rather than
+something already fixed. It proposed three things and said plainly that none of them
+was the fix for the problem being chased. Two are refuted here and the third is real.
+
+**(1) Adding `POLLERR` to the request mask: a no-op, measured twice.** POSIX delivers
+`POLLERR`, `POLLHUP` and `POLLNVAL` in `revents` whether or not they were requested,
+and this tree does not have to cite that — doctor P9 measures it: on Linux
+`hangup_delivered_to_a_mask_that_requested_nothing` is `true` and a poll requesting
+*nothing* reads back `POLLHUP`. Measured again directly for this report, on a real
+FT232R unplugged through the replug helper while an fd was held: the existing
+`POLLIN|POLLHUP` mask reads back **`POLLIN|POLLHUP|POLLERR`**, 3 of 3, both fd
+flavours, 1.2–2.0 ms after the sysfs write, and `read` then answers EOF — so the
+existing arm handles a real unplug, and `POLLERR` is already visible without being
+asked for. Darwin is the one kernel that gates the hangup on the mask (P9: an empty
+mask reads `none` there), and the mask in question is not empty; its own artifact
+reads `POLLIN|POLLHUP` for the same fd state.
+
+**(2) Draining on `POLLHUP`: the code already does, whenever there is anything to
+drain.** The concern is exact — `reader_thread` drains only under `POLLIN` and gives
+up under a bare `POLLHUP`, so it would lose trailing bytes if a kernel reported the
+hangup *without* `POLLIN` while data was queued. It does not. Measured on Linux: a
+hung-up pty master with 64 and with 4000 bytes still queued reads `POLLIN|POLLHUP`,
+3 of 3 each, and yields every byte; the real unplug above reads all three flags and
+then EOF. Darwin's committed P9 artifact reads `POLLIN|POLLHUP` for a hung-up master
+under a `POLLIN`-requesting poll. So the bare-`POLLHUP` arm is reached only when
+there is nothing left, and the one shape that would break it — a *canonical* tty
+withholding `POLLIN` until a line completes — the daemon never runs, because it puts
+every port in raw mode (P10 re-asserts that and reports `slave_termios_mode`).
+
+**This is the "clarify it" case, and the clarification is a test, not only a
+comment.** The arm reads as though it might drop data; a careful reader suspected it
+did. `a_hangup_with_bytes_still_queued_reports_pollin_so_the_reader_drains_it` pins
+the premise at three payload sizes, and carries the anti-vacuity control that makes
+it worth having: it asserts `POLLHUP` **is** present, so a version that forgot to
+close the slave — or a kernel that deferred the hangup past the poll — fails instead
+of sailing through on `POLLIN` alone. Proven by removing the close: the control
+fires, naming exactly that. Neither P9 nor P13 covers this: P13 measures whether the
+bytes survive a last close and P9 measures poll's latency by fd state, but neither
+puts *data* behind a hangup and asks what poll advertises.
+
+**(3) The swallowed `errno` is a real gap, and it is now reported.** `Err(_) =>` threw
+the error away, `lost` is a payload-free `Notify`, and the supervisor printed
+`device <name> lost` — the same sentence for an unplugged adapter, a driver `EIO`,
+and a peer that closed. That is precisely what §7 says a report must not do. A
+`LossCause` word travels from whichever half noticed to the `Waiting { reason }` the
+operator reads, distinguishing EOF, a read `errno`, and a failed targetward write;
+it is cleared when a reader is armed, so a second outage cannot inherit the first
+one's cause. Reported through the status rather than a log line **because this module
+deliberately has no logging** — `tracing::` appears zero times in it — and the status
+is what `ctl state` shows. The report's suggestion was `tracing::warn!`; the gap it
+identified is real and the idiomatic surface here is a different one.
+
+### 3.70 The replug-lane flake, root-caused: a re-enumerated FT232R eats its first packet
+
+**Design:** §7. **Plan:** §18 item 3. **Rules:** AGENTS §6 (say a deadline precisely),
+§8 (measure the box; do not trust a broken instrument), §9 (fail-first; record refuted
+diagnoses).
+
+§3.62 correlated this with the replug lane executing and named no mechanism. It has
+one now, established below the daemon, and the fix is proven against a reproducer that
+fails 9 of 11 unfixed.
+
+**A reproducer, two minutes instead of eight.** `cargo test -p serial-nexus-itest
+--test p7_replug_hardware --test serial_hardware` reproduces it **5 of 5** — which
+**refutes §3.54's "the direct replug→rig sequence is 0 of 2"**, a figure taken at
+n=2 against an event with a ~70% rate.
+
+**The instrument was wrong first, and that is worth recording.** An early attempt read
+the tty→USB-port mapping with a `sed` that took the wrong path component, so a series
+of unplug measurements deauthorized the adapter that was *not* being watched and
+concluded that a real unplug reports nothing at all. The tell was a control that had
+been added for a different reason (`down during window=False`); without it the wrong
+reading would have gone into this entry. `serial-nexus-replug status` is the
+authority for that mapping — `ttyUSB0` is on `3-3` and `ttyUSB1` on `3-1` on this box,
+the reverse of what the `sed` said.
+
+**The mechanism, measured at the stall through the daemon's own state RPC.** The
+kernel's `TIOCGICOUNT` reads `tx 32768` on the sending port and `rx 32704` on the
+receiving one, with `frame`, `overrun`, `parity`, `buf_overrun` and `brk` all **0**;
+every daemon-side counter — `discarded_unattached`, `dropped_bytes`, `queued_bytes`,
+`purged_on_reconnect`, `write_errors` — reads **0**, and every node is `active`. **The
+daemon lost nothing**; the bytes never reached the receiving driver, and no error was
+counted for them.
+
+**And they are the *first* 64.** A failing capture is byte-identical to a good one at
+the same seed from offset 64 — `bad == good[64..]` is **true** and `bad ==
+good[..-64]` is **false**. Exactly one 64-byte USB bulk packet, at the head of the
+first traffic to cross after a re-enumeration.
+
+**Two hypotheses refuted along the way.** *Settling time*: gaps of 2 s and 5 s between
+the replug and the measurement still failed 3 of 3, so it is not a device that needs
+to quiesce. *The custom rate*: `crossover_rig_data_plane_send_and_exclusivity` at
+115200 fails identically 2 of 4 when it runs first, so 250000 is not implicated —
+what matters is being **first**. In a six-test run under `--test-threads=1` only the
+first test ever failed; every later one is protected by the traffic its predecessor
+already pushed. Idle time does not help and traffic does.
+
+**The fix is a primer, and it is §3.47's shape.** `prime_the_wire_once` pushes 1 KiB
+each way through a throwaway graph and waits for it to arrive before any measured test
+boots — *prove the far end is really receiving before you start counting*, rather than
+assume the link is live because both nodes report `active`. Once per process, because
+the loss is once per enumeration and a test binary cannot replug its own adapters. Its
+own daemon, logs and run dir go away with it, so no primed byte can land in a capture
+under test. The 500 ms settle in `crossover_rig_custom_baud_byte_exact` is for a
+different FTDI quirk (garbled bytes right after `open`+`set_baud`, P5_OPEN_SETTLE) and
+does not cover this one.
+
+**Fail-first, executed:** the reproducer fails **9 of 11** on the unfixed tree and
+**0 of 8** with the primer, and the binary's runtime collapses from 72–129 s (a 60 s
+`settled_while_open` deadline waited out in full) to a flat 14.74 s.
+
+**What this does not claim.** Why the adapter drops that packet is not established —
+whether it is the FT232R's receive path, `ftdi_sio`'s first URB after bind, or the
+bus — and no root cause is claimed there (§9). What is established is where the bytes
+are *not* lost: the daemon is faultless, by its own counters and the kernel's, and
+this was never a product defect. The primer makes the rig tests measure the property
+they promise rather than the state of an adapter that was re-enumerated a moment ago.

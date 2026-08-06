@@ -35,7 +35,7 @@ use std::cell::Cell;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use nix::poll::PollFlags;
@@ -367,6 +367,7 @@ impl SerialNode {
         let targetward = targetward.map(|rx| self.teardown_loss.watch(rx));
         let ctx = SuperviseCtx {
             name: self.name.clone(),
+            loss_cause: Arc::new(LossCause::new()),
             device: self.device.clone(),
             resolver: self.resolver.clone(),
             params: self.params,
@@ -538,6 +539,8 @@ struct SuperviseCtx {
     reader_slot: Rc<CriticalCell<BlockingReader>>,
     discarded: Arc<AtomicU64>,
     purged: Arc<AtomicU64>,
+    /// Why the current reader (or writer) gave up, for the `Waiting` reason.
+    loss_cause: Arc<LossCause>,
 }
 
 /// One step of the Active loop: drive the targetward writer and watch for loss.
@@ -575,7 +578,7 @@ async fn supervise(mut ctx: SuperviseCtx) {
                         continue;
                     }
                 };
-                match active_step(&port, notify, &mut ctx.targetward).await {
+                match active_step(&port, notify, &mut ctx.targetward, &ctx.loss_cause).await {
                     Step::Continue => {}
                     Step::WriterClosed => {
                         // No more targetward; keep the reader running (hostward
@@ -584,7 +587,8 @@ async fn supervise(mut ctx: SuperviseCtx) {
                     }
                     Step::Lost => {
                         stop_join_reader(&ctx.reader_slot);
-                        set_waiting(&ctx, format!("device {} lost", ctx.device));
+                        let why = ctx.loss_cause.take();
+                        set_waiting(&ctx, format!("device {} lost: {why}", ctx.device));
                         lost = None;
                     }
                 }
@@ -667,12 +671,70 @@ async fn reopen(ctx: &mut SuperviseCtx, path: &std::path::Path) -> Option<Arc<No
     }
 }
 
+/// Why the device was lost, carried from whichever half noticed to the supervisor
+/// that reports it.
+///
+/// **The `lost` signal is a bare [`Notify`] with no payload**, so before this the
+/// `errno` that ended the reader was discarded at `Err(_) =>` and the operator saw
+/// only `device <name> lost` — the same sentence for an unplugged adapter, a driver
+/// `EIO`, and a peer that simply closed. That is the one thing §7 says a report must
+/// not do. Reported through the node's `Waiting { reason }` rather than a log line,
+/// because this module deliberately has no logging and the status is what `ctl state`
+/// shows.
+///
+/// An `AtomicI32` rather than a mutex around a `String`: the reader is a real thread
+/// and the supervisor is on the runtime, so the cheapest correct channel is a word,
+/// and this file already keeps its cross-thread counters as atomics.
+#[derive(Debug)]
+struct LossCause(AtomicI32);
+
+impl LossCause {
+    /// Nothing recorded — a reader that stopped for `stop`, or a loss whose cause
+    /// nobody stamped. Distinct from every real cause so it can be named as unknown
+    /// rather than guessed at.
+    const UNSET: i32 = 0;
+    /// `read` returned 0. The peer closed; on a real unplug the kernel reports this
+    /// alongside `POLLIN|POLLHUP|POLLERR` (notes §3.69).
+    const EOF: i32 = -1;
+    /// A targetward `write` failed. Recorded separately because it means the *writer*
+    /// noticed first, which points at a different half of the link than a read error.
+    const WRITE_FAILED: i32 = -2;
+
+    fn new() -> Self {
+        LossCause(AtomicI32::new(Self::UNSET))
+    }
+
+    /// Stamp a cause. First writer wins: the reader and the writer can both notice
+    /// the same unplug, and the first to see it is the one with the useful errno.
+    fn set(&self, cause: i32) {
+        let _ = self
+            .0
+            .compare_exchange(Self::UNSET, cause, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    fn set_errno(&self, e: &std::io::Error) {
+        self.set(e.raw_os_error().unwrap_or(Self::UNSET));
+    }
+
+    /// Read and clear, so the next outage on the same node cannot inherit this one's
+    /// cause. Called once per transition to `Waiting`.
+    fn take(&self) -> String {
+        match self.0.swap(Self::UNSET, Ordering::Relaxed) {
+            Self::UNSET => "cause not recorded".to_owned(),
+            Self::EOF => "read returned EOF (device closed)".to_owned(),
+            Self::WRITE_FAILED => "targetward write failed".to_owned(),
+            errno => format!("read failed: {}", std::io::Error::from_raw_os_error(errno)),
+        }
+    }
+}
+
 /// Drive one targetward chunk to the port, or wait for loss (§7.1/§5). Returns as
 /// soon as either fires so the supervisor can react promptly.
 async fn active_step(
     port: &Rc<ExclusivePort>,
     lost: &Notify,
     targetward: &mut Option<TargetwardInbox>,
+    cause: &LossCause,
 ) -> Step {
     match targetward {
         Some(rx) => {
@@ -681,7 +743,9 @@ async fn active_step(
                 _ = lost.notified() => Step::Lost,
                 got = rx.recv() => match got {
                     Some(chunk) => {
-                        if runtime::write_all(port.as_raw_fd(), &chunk).await.is_err() {
+                        if let Err(e) = runtime::write_all(port.as_raw_fd(), &chunk).await {
+                            cause.set_errno(&e);
+                            cause.set(LossCause::WRITE_FAILED);
                             Step::Lost
                         } else {
                             Step::Continue
@@ -747,12 +811,16 @@ fn arm_reader(port: &Rc<ExclusivePort>, ctx: &SuperviseCtx) -> std::io::Result<A
     let hostward = ctx.hostward.clone();
     let discarded = ctx.discarded.clone();
     let tap_feed = ctx.tap_feed.clone();
+    // Clear any cause left by the *previous* outage before the new reader can stamp
+    // one, or a second loss with no recorded cause would report the first one's.
+    let cause = ctx.loss_cause.clone();
+    let _ = cause.take();
     // The boundary-supervisor library owns the stop flag, the loss `Notify`, and
     // the join handle (§16.1 loss-notify + join-then-transition); we supply the
     // node-specific reader body.
     ctx.reader_slot.with_mut(|slot| {
         slot.arm(format!("serial-rx-{}", ctx.name), move |stop, lost| {
-            reader_thread(fd, hostward, tap_feed, discarded, stop, lost)
+            reader_thread(fd, hostward, tap_feed, discarded, stop, lost, cause)
         })?;
         Ok(slot.lost())
     })
@@ -824,9 +892,20 @@ fn reader_thread(
     discarded_unattached: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     lost: Arc<Notify>,
+    cause: Arc<LossCause>,
 ) {
     let mut buf = vec![0u8; READ_BUF];
     while !stop.load(Ordering::Relaxed) {
+        // **`POLLERR` is deliberately absent from the request mask, and adding it
+        // would change nothing** (notes §3.69). POSIX delivers `POLLERR`, `POLLHUP`
+        // and `POLLNVAL` in `revents` whether or not they were requested, and this
+        // tree measures it rather than citing it: doctor P9 reports
+        // `hangup_delivered_to_a_mask_that_requested_nothing: true` on Linux, where
+        // a poll requesting *nothing* still read `POLLHUP`. A real FT232R unplug
+        // measured here returns `POLLIN|POLLHUP|POLLERR` to this very mask, 3 of 3,
+        // 1.2–2.0 ms after the write to sysfs. Darwin is the one kernel that gates
+        // the hangup on the mask (P9: an empty mask reads `none` there) — and the
+        // mask below is not empty, and its own artifact reads `POLLIN|POLLHUP`.
         let re = sys::poll_blocking(
             fd,
             PollFlags::POLLIN | PollFlags::POLLHUP,
@@ -836,6 +915,7 @@ fn reader_thread(
             loop {
                 match sys::read_fd(fd, &mut buf) {
                     Ok(0) => {
+                        cause.set(LossCause::EOF);
                         lost.notify_one(); // device closed
                         return;
                     }
@@ -887,13 +967,34 @@ fn reader_thread(
                         hostward.broadcast(&chunk, &*discarded_unattached);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => {
+                    Err(e) => {
+                        // The errno is the whole diagnosis and used to be dropped
+                        // here, leaving the operator `device <name> lost` and nothing
+                        // else (notes §3.69).
+                        cause.set_errno(&e);
                         lost.notify_one();
                         return;
                     }
                 }
             }
         } else if re.contains(PollFlags::POLLHUP) {
+            // **A bare `POLLHUP` means there is nothing left to drain, so giving up
+            // here loses no bytes** — measured, because the arm reads as though it
+            // might (notes §3.69). Whenever readable data survives a hangup the
+            // kernel reports `POLLIN` *alongside* `POLLHUP` and the arm above drains
+            // it to EOF: on Linux a hung-up pty master with 64 and with 4000 bytes
+            // buffered reads `POLLIN|POLLHUP`, 3 of 3 each, and yields every byte;
+            // a real unplug reads `POLLIN|POLLHUP|POLLERR` and then EOF. Darwin's own
+            // P9 artifact reads `POLLIN|POLLHUP` for the same fd state. P13 measures
+            // the other half — whether the bytes exist at all across a last close —
+            // and answers `retains` on Linux, `waits-then-discards` on Darwin, which
+            // is a disposition no drain here could change.
+            //
+            // The one shape that would break this is a *canonical* tty holding a
+            // partial line, where `n_tty_poll` withholds `POLLIN` until the line is
+            // complete. The daemon never runs one: it puts every port in raw mode,
+            // which doctor P10 re-asserts and reports as `slave_termios_mode`.
+            cause.set(LossCause::EOF);
             lost.notify_one(); // device gone
             return;
         }
@@ -1258,6 +1359,7 @@ mod tests {
     fn test_ctx(targetward: Option<TargetwardInbox>) -> SuperviseCtx {
         SuperviseCtx {
             name: "test".into(),
+            loss_cause: Arc::new(LossCause::new()),
             device: "raw:/dev/null".into(),
             resolver: Resolver::new("/"),
             params: OpenParams {
@@ -1472,6 +1574,7 @@ mod tests {
                 discarded_thread,
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(Notify::new()),
+                Arc::new(LossCause::new()),
             );
         })
         .join()
@@ -1516,6 +1619,7 @@ mod tests {
                 discarded_thread,
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(Notify::new()),
+                Arc::new(LossCause::new()),
             );
         })
         .join()
@@ -1544,6 +1648,90 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    /// **The premise the bare-`POLLHUP` arm rests on: a hangup that still has
+    /// readable bytes reports `POLLIN` too** (notes §3.69).
+    ///
+    /// `reader_thread` drains only under `POLLIN` and gives up under a bare
+    /// `POLLHUP`, so it loses trailing bytes exactly if a kernel can report the
+    /// hangup *without* `POLLIN` while data is still queued. An out-of-tree report
+    /// read the code and reasonably suspected it did. This pins the answer instead
+    /// of arguing it, and it is the assumption's only in-tree check — P13 measures
+    /// whether the bytes survive a last close, and P9 measures poll's latency by fd
+    /// state, but neither puts *data* behind a hangup and asks what poll advertises.
+    ///
+    /// Linux-gated because it is a statement about this kernel's `n_tty_poll`; the
+    /// comment at the arm records Darwin's counterpart from its committed artifact.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_hangup_with_bytes_still_queued_reports_pollin_so_the_reader_drains_it() {
+        use std::os::fd::AsRawFd;
+        // Two sizes: one under any plausible internal threshold, one over a page, so
+        // a pass cannot be an artefact of the payload fitting somewhere special.
+        for len in [1usize, 64, 4000] {
+            let master =
+                nix::pty::posix_openpt(nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY)
+                    .expect("posix_openpt");
+            nix::pty::grantpt(&master).expect("grantpt");
+            nix::pty::unlockpt(&master).expect("unlockpt");
+            let slave_path = sys::ptsname(&master).expect("ptsname");
+            let slave = nix::fcntl::open(
+                std::path::Path::new(&slave_path),
+                nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY,
+                nix::sys::stat::Mode::empty(),
+            )
+            .expect("open slave");
+
+            let payload = vec![b'x'; len];
+            nix::unistd::write(&slave, &payload).expect("write");
+            // Wait for the line discipline to hand the bytes to the master, so the
+            // hangup below cannot race ahead of data that never arrived.
+            let fd = master.as_raw_fd();
+            let mut ready = false;
+            for _ in 0..400 {
+                if sys::poll_blocking(fd, PollFlags::POLLIN, 5).contains(PollFlags::POLLIN) {
+                    ready = true;
+                    break;
+                }
+            }
+            assert!(ready, "{len} B never became readable on the master");
+
+            drop(slave); // the hangup, with every byte still queued
+
+            let re = sys::poll_blocking(fd, PollFlags::POLLIN | PollFlags::POLLHUP, 200);
+            // **The anti-vacuity control, and it is the whole reason this is a test
+            // and not a comment.** Without it, a version that forgot to close the
+            // slave — or a kernel that defers the hangup past this poll — would sail
+            // through on `POLLIN` alone and prove nothing about hangups at all.
+            assert!(
+                re.contains(PollFlags::POLLHUP),
+                "{len} B: no POLLHUP in {re:?}, so this observation is not about a \
+                 hangup and the POLLIN below would prove nothing"
+            );
+            assert!(
+                re.contains(PollFlags::POLLIN),
+                "{len} B queued behind a hangup and poll reported {re:?} without POLLIN — \
+                 `reader_thread`'s bare-POLLHUP arm would return and drop them"
+            );
+
+            // And the bytes really are all there, so the drain the arm above performs
+            // is not merely reached but sufficient.
+            let mut got = 0usize;
+            let mut buf = vec![0u8; 8192];
+            while got < len {
+                match sys::read_fd(fd, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => got += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("read after hangup: {e}"),
+                }
+            }
+            assert_eq!(
+                got, len,
+                "{len} B queued, {got} B recoverable after the hangup"
+            );
+        }
+    }
+
     fn pts_fixture() -> PtsFixture {
         use nix::fcntl::OFlag;
         use nix::pty::{grantpt, posix_openpt, unlockpt};

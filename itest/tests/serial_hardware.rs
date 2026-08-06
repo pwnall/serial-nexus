@@ -164,10 +164,86 @@ fn inject_verify(inj: &Path, rx_log: &Path, seed: &str, size: &str) -> u64 {
     got
 }
 
-/// Boot a daemon on the rig at `baud` and wait for both ports active. Returns the daemon
-/// (keep it alive; drop releases the ports and reaps the child) plus owned paths for the
-/// `run` dir and the two injector ptys.
+/// **Absorb the packet a freshly re-enumerated FT232R swallows, once per process**
+/// (notes §3.70, plan §18 item 3).
+///
+/// A USB re-enumeration makes the receiving adapter drop the **first 64 bytes** —
+/// exactly one bulk packet — of the first traffic that crosses afterwards. Measured
+/// below the daemon and attributed there rather than guessed at: at the stall the
+/// kernel's own `TIOCGICOUNT` reads `tx 32768` on the sender and `rx 32704` on the
+/// receiver with `frame`/`overrun`/`parity`/`buf_overrun` all zero, while every
+/// daemon-side counter (`discarded_unattached`, `dropped_bytes`, `queued_bytes`,
+/// `purged_on_reconnect`) reads 0. The bytes never reached the receiving driver, and
+/// the missing ones are the **first** 64: a failing capture is byte-identical to a
+/// good one from offset 64 (`bad == good[64..]`), which is what makes this a lost
+/// leading packet rather than a truncation or a stall.
+///
+/// **Idle time does not fix it and traffic does**, which is why this is a primer and
+/// not a `sleep`: gaps of 2 s and 5 s between the replug and the measurement still
+/// failed 3 of 3, while in a six-test run only the *first* test ever failed — every
+/// later one is protected by the traffic its predecessor already pushed. The 500 ms
+/// settle in `crossover_rig_custom_baud_byte_exact` is for a different FTDI quirk
+/// (garbled bytes right after `open`+`set_baud`, P5_OPEN_SETTLE) and does not cover
+/// this one.
+///
+/// This is the same shape as §3.47's `--open-file` handshake: **prove the far end is
+/// really receiving before you start counting**, rather than assume the link is live
+/// because both nodes report `active`. Once per process because the loss is once per
+/// enumeration, and a test binary cannot replug its own adapters — the replug lane is
+/// a different binary that has already finished.
+fn prime_the_wire_once(p0: &str, p1: &str) {
+    static PRIMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    PRIMED.get_or_init(|| {
+        let (d, run_dir, inj0, inj1) = boot_rig_raw(p0, p1, 115_200);
+        // 1 KiB each way: comfortably more than the one packet that may be eaten, so
+        // "something arrived" stays a usable signal even when the loss fires.
+        for (inj, log) in [(&inj0, "rx1.log"), (&inj1, "rx0.log")] {
+            let _ = Sim::client(&[
+                "--path",
+                &inj.to_string_lossy(),
+                "--send",
+                "seeded:1KiB",
+                "--seed",
+                "9001",
+                "--timeout-ms",
+                "5000",
+            ]);
+            let path = run_dir.join(log);
+            assert!(
+                serial_nexus_itest::wait_until(Duration::from_secs(15), || file_len(&path) > 0),
+                "priming {p0} <-> {p1}: nothing reached {}, so the rig is not carrying \
+                 bytes at all and every measurement below would be meaningless",
+                path.display()
+            );
+        }
+        // The primer's own graph, logs and run dir go away with it; the measured tests
+        // each boot their own, so no primed byte can land in a capture under test.
+        drop(d);
+    });
+}
+
+/// Boot a daemon on the rig at `baud` and wait for both ports active, priming the
+/// link first (see [`prime_the_wire_once`]). Returns the daemon (keep it alive; drop
+/// releases the ports and reaps the child) plus owned paths for the `run` dir and the
+/// two injector ptys.
 fn boot_rig(
+    p0: &str,
+    p1: &str,
+    baud: u32,
+) -> (
+    Daemon,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    prime_the_wire_once(p0, p1);
+    boot_rig_raw(p0, p1, baud)
+}
+
+/// [`boot_rig`] without the priming, so the primer itself can use it without
+/// recursing. Nothing else should call this: a measurement that skips the prime is
+/// the flake.
+fn boot_rig_raw(
     p0: &str,
     p1: &str,
     baud: u32,
@@ -380,6 +456,10 @@ fn crossover_rig_map_node_both_directions() {
     };
     let _rig = rig_guard();
     eprintln!("crossover rig (map node): {p0} <-> {p1}");
+    // This test builds its own graph rather than going through `boot_rig`, so it has
+    // to ask for the priming itself — it carries bulk data and was one of the three
+    // observed losing the post-replug packet (notes §3.70).
+    prime_the_wire_once(&p0, &p1);
 
     let d = Daemon::start();
     let rpc = d.rpc();
