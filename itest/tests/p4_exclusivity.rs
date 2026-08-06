@@ -298,9 +298,23 @@ fn exclusive_write_lock_is_byte_exact() {
     });
     assert!(present, "locked-out writer never became present");
 
-    // A sink on the far end (port B) records exactly what reached "hardware". Start
-    // it draining before the holder sends so the crossover buffer never overflows.
+    // A sink on the far end (port B) records exactly what reached "hardware". Start it
+    // draining before the holder sends so the crossover buffer never overflows — and
+    // **wait until its port is actually open**, which spawning the thread does not
+    // establish. On the sim null modem the difference is invisible, because a pts
+    // buffers whether or not a reader is attached; on a real UART it is the whole
+    // test, since a USB-serial port that is not open does not receive and every byte
+    // clocked onto the wire before it opens is gone — measured at 21-31 bytes for
+    // process start-up alone, and linear in any added delay (notes §3.47).
+    //
+    // `--open-file`, not `--ready-file`: the latter fires on the first byte *read*,
+    // which cannot happen before a byte is sent, and the hazard is bytes sent before
+    // the far end opens. This is the same repair §3.47 made in `p4_free_for_all`; it
+    // was not applied to this sibling then, and the 2026-08-05 Darwin rig run is where
+    // that showed (notes §3.65).
     let port_b_owned = port_b.to_string();
+    let opened = run.join("sink.open");
+    let opened_arg = opened.to_string_lossy().into_owned();
     let sink = std::thread::spawn(move || {
         Sim::client(&[
             "--path",
@@ -309,10 +323,16 @@ fn exclusive_write_lock_is_byte_exact() {
             "65536",
             "--set-baud",
             "115200",
+            "--open-file",
+            opened_arg.as_str(),
             "--timeout-ms",
             "30000",
         ])
     });
+    assert!(
+        serial_nexus_itest::wait_until(Duration::from_secs(10), || opened.exists()),
+        "sink never reported its port open, so any send now would race the wire"
+    );
 
     // The holder's pty session, opened by the harness and held across the sink's
     // count — the §3.29 witness (notes §3.56, plan §3 rule 8).

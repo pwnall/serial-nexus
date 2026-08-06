@@ -110,6 +110,21 @@ and (any(.probes[]; .id == "P6" and .status != "unsupported"))
 and (any(.probes[]; .id == "P7" and .status != "unsupported"))
 and (any(.probes[]; .id == "P8" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P9" and (.status == "supported" or .status == "skipped")))
+# P9's mask column must MEASURE its own framing, and this lane is where that stopped being
+# theoretical: Darwin does not deliver POLLHUP to a mask that requested nothing, so the
+# `shape` and the rationale §3.52 hardcoded from POSIX were printed beside a field reading
+# `false` (notes §3.65). Gated: the measurement is present, and the report names which
+# separation and which mask-spread figures go with it — the pair must be present so the two
+# can never be read from different cell sets. The ANSWER stays free: either kernel reading
+# is legitimate, and a kernel that gates the hangup is `degraded`-worthy at most, never a
+# gate failure (§7).
+and (all(.probes[]; . as $p | ($p.id != "P9") or ($p.status == "skipped") or
+      ($p.observations | any(.key == "zero_timeout_by_fd_state"
+         and (.value.hangup_delivered_to_a_mask_that_requested_nothing | type == "boolean")
+         and (.value.shape | type == "string")
+         and (.value.mask_role | type == "string")
+         and (.value.read_the_separation_from | type == "string")
+         and (.value.read_the_mask_spread_from | type == "string")))))
 and (any(.probes[]; .id == "P10" and (.status == "supported" or .status == "skipped" or .status == "degraded")))
 # P10 carries an instrument check on its own FIONREAD reading, and THIS is the lane where
 # it fires: `peer_pending_input_bytes` answers 0 on a Darwin pty master with 1024 bytes
@@ -123,6 +138,20 @@ and (all(.probes[]; . as $p | ($p.id != "P10") or ($p.status == "skipped") or
             and (.value.peer_pending_input_trust | type == "string")
             and (.value | has("peer_pending_input_bytes_at_drain"))
             and (.value | has("writer_pending_input_bytes")))))))
+# P10's recheck must be a LADDER, and this clause exists because the gate could not tell
+# the difference. `f8315cc` replaced a one-rung recheck — which could not separate a
+# capacity from any watermark above the single drain size it sampled — with a multi-rung
+# one, and neither expectation file was touched: deleting `recheck` outright, emptying
+# `ladder`, or handing back exactly the one rung the commit exists to replace all left
+# both gates green (notes §3.65). Cardinality, not answer: a kernel is free to refuse
+# every rung or none, but a report may not claim a bracket it computed from one point.
+and (all(.probes[]; . as $p | ($p.id != "P10") or ($p.status == "skipped") or
+      (["slave_to_master_targetward","master_to_slave_hostward"] | all(. as $d |
+         $p.observations | any(.key == $d
+            and ((.value.recheck.ladder | type == "array") and (.value.recheck.ladder | length >= 2))
+            and (.value.recheck.ladder_reading | has("rungs_carrying_a_bound"))
+            and (.value.recheck.ladder_reading | has("watermark_threshold_gt"))
+            and (.value.recheck.ladder_reading | has("watermark_threshold_le")))))))
 and (any(.probes[]; .id == "P11"))
 # P12 (session-boundary edge, §15.39) is the mechanism that carries §6's
 # detach-release on THIS platform — Darwin destroys the readable packet P7 measures

@@ -119,6 +119,20 @@ and (any(.probes[]; .id == "P6" and (.status == "supported" or .status == "degra
 and (any(.probes[]; .id == "P7" and (.status == "supported" or .status == "degraded")))
 and (any(.probes[]; .id == "P8" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P9" and (.status == "supported" or .status == "skipped")))
+# P9's mask column must MEASURE its own framing. Identical to `expectations/macos.jq`'s
+# clause: §3.52 hardcoded `shape` and the "replicates, not levels" rationale from POSIX,
+# and Darwin then printed both beside a field reading `false` (notes §3.65). This kernel
+# answers `true` and so reads as a 1x2 — which is exactly why the clause belongs here too,
+# since a gate that only runs where the premise holds cannot catch the premise failing.
+# Presence of the measurement and of the pair naming which figures go together; the answer
+# stays free (§7).
+and (all(.probes[]; . as $p | ($p.id != "P9") or ($p.status == "skipped") or
+      ($p.observations | any(.key == "zero_timeout_by_fd_state"
+         and (.value.hangup_delivered_to_a_mask_that_requested_nothing | type == "boolean")
+         and (.value.shape | type == "string")
+         and (.value.mask_role | type == "string")
+         and (.value.read_the_separation_from | type == "string")
+         and (.value.read_the_mask_spread_from | type == "string")))))
 and (any(.probes[]; .id == "P10" and (.status == "supported" or .status == "skipped" or .status == "degraded")))
 # P10 carries an instrument check on its own FIONREAD reading. `peer_pending_input_bytes`
 # answers 0 on a Darwin pty master with 1024 bytes recoverable (6 of 6 captures, notes
@@ -130,6 +144,20 @@ and (all(.probes[]; . as $p | ($p.id != "P10") or ($p.status == "skipped") or
             and (.value.peer_pending_input_trust | type == "string")
             and (.value | has("peer_pending_input_bytes_at_drain"))
             and (.value | has("writer_pending_input_bytes")))))))
+# P10's recheck must be a LADDER. Identical to `expectations/macos.jq`'s clause,
+# deliberately: `f8315cc` replaced a one-rung recheck — which could not separate a capacity
+# from any watermark above its single drain size — with a multi-rung one, and neither
+# expectation file was touched, so deleting `recheck`, emptying `ladder`, or handing back
+# exactly the one rung the commit exists to replace all left both gates green (notes
+# §3.65). Cardinality, not answer: this kernel refuses no rung and that is a legitimate
+# reading; what may not happen is a bracket reported from a single point.
+and (all(.probes[]; . as $p | ($p.id != "P10") or ($p.status == "skipped") or
+      (["slave_to_master_targetward","master_to_slave_hostward"] | all(. as $d |
+         $p.observations | any(.key == $d
+            and ((.value.recheck.ladder | type == "array") and (.value.recheck.ladder | length >= 2))
+            and (.value.recheck.ladder_reading | has("rungs_carrying_a_bound"))
+            and (.value.recheck.ladder_reading | has("watermark_threshold_gt"))
+            and (.value.recheck.ladder_reading | has("watermark_threshold_le")))))))
 and (any(.probes[]; .id == "P11" and (.status == "supported" or .status == "degraded" or .status == "skipped")))
 # P12 (session-boundary edge, §15.39) is inert on Linux by design — the retained
 # `TIOCPKT_IOCTL` packet carries §6's detach-release here, which is P7's subject —

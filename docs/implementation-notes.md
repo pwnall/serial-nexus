@@ -8269,3 +8269,132 @@ Either the open item is misstated or the mechanism is the reverse of the obvious
 reading, and changing a probe on a mechanism this session does not understand is how
 a measurement becomes wrong rather than absent. Left open, with the reasoning
 recorded (§5).
+
+### 3.65 The Darwin run of the P14 era: three guards that asserted Linux's answer, and two platform gaps
+
+**Design:** §7 — no one-way decision on single-kernel evidence; a kernel that differs is
+`degraded` with the observation named. §9 — a guard asserts the property, never a proxy for it
+in space.
+
+`main` reached `60b9d0f` with nineteen commits since `f8315cc`, all developed and measured on
+Linux: P14, the replug capability, hardware flow control, the v15 document generation, and P13's
+fourth shape. This entry is the Darwin run of that tree, on macOS 15.7.8 / Darwin 24.6.0 x86_64
+with the FT232R crossover attached and `SNX_CROSSOVER=required`. **Four tests failed and the
+workspace did not build.** Three of the four were the same defect wearing different clothes — a
+guard that pins the platform of record's *answer* instead of the property — and the fourth plus
+the build break are genuine platform gaps.
+
+**A. `cargo build --workspace --locked` does not build on macOS, and the macOS CI lane's first
+step is exactly that command.** `serial-nexus-replug` is an unconditional workspace member whose
+`main.rs` opens with `use serial_nexus_sys::caps::{self, CAP_DAC_OVERRIDE, CapState}`, and that
+module is `#[cfg(target_os = "linux")]`. The intent is already written down one file away — sys's
+own comment says the module is "Linux-only … and the helper the module supports does not build
+elsewhere" — so what is missing is not the decision but its enforcement. `cargo build --workspace
+--exclude serial-nexus-replug` is clean, which locates the break precisely. Left **unfixed and
+filed** rather than patched around: the choice between a non-Linux `main` stub, per-target
+dependencies, and excluding the crate in the macOS lane is a design call (§5), and the reason it
+went unnoticed is worth more than the patch — the replug commits landed after the last macOS run,
+and nothing between them and this session executed a build off Linux.
+
+**B. P9's mask premise, refuted on the kernel that has to live with it.** `f8315cc` collapsed
+P9's reference table to a `1x2` on the premise that POSIX delivers `POLLHUP` whether or not it was
+requested, so the mask cells are replicates. Darwin does not: an empty mask on a hung-up master
+returns `revents: none` at ~14000 ns while a `POLLHUP`-requesting poll on the *same fd through the
+same wrapper* returns `POLLHUP` at ~1270 ns, and `serial_nexus_sys::poll_blocking` returns
+`revents` unmasked, which is the property the probe's own comment says would make the cell vacuous
+if violated. `an_unrequested_hangup_is_still_delivered` failed **5 of 5**, deterministically,
+printing the message its author wrote for exactly this case. The report meanwhile asserted the
+refuted premise in three unconditional places — `shape: "1x2"`, the `mask_is_a_control_not_a_factor`
+rationale, and a consequence sentence claiming the field "says so on this kernel" — printed
+byte-identically beside that field reading `false`.
+
+Repaired by deriving the framing from the measurement: `p9_mask_axis` is pure and returns the
+shape, the `mask_role` prose, and **which** separation and mask-spread figures belong together;
+the observation gains `worst_case_separation_requesting_masks_x100`,
+`mask_spread_{not_,}ready_requesting_x100`, `read_the_separation_from` and
+`read_the_mask_spread_from`. The guard now asserts the portable property and carries the control
+that makes an empty reading interpretable at all: whatever the empty mask says, a mask that
+*asked* must see the hangup, or the fd never hung up and nothing below measures a mask. A second
+pure test exercises both arms, so the reading that does not run on the box in front of you is
+still tested.
+
+**And the repair reverses the first reading of the data, which is why it is worth the fields.**
+Folding the empty-mask cell into the ready group makes Darwin read ~1.0x by fd state against a
+mask spread of ~8-11x, failing P9's own survival criterion and looking like a cross-kernel
+contradiction. Among the cells that *requested* something Darwin separates **7.02-9.92x by fd
+state against 1.09-1.12x by mask** — the shape Linux reports (7.46-10.12x against 0.968-1.314x).
+The empty mask is a third *kernel state*, not a third mask level. §3.41's "undecomposed" is closed
+on both kernels, **agreeing**.
+
+**C. P13's fourth shape asserted `retains` as a precondition, and Darwin discards.** §3.64 added
+`d_no_reader_second_fd_held` and a guard whose *second* assertion was deliberately portable
+("something differs" rather than "the terminal differs"). Its *first* was not: it asserted the
+bare no-reader shape recovers the whole payload, which is what a **retaining** kernel does. Darwin
+`waits-then-discards` and recovers 0 of 64, so `the_last_close_reference_count_shape_is_not_inert_here`
+failed on the one platform whose §3.56 conversions the witness fd was bought for — with a message
+that anticipated it exactly ("if this kernel does not, the reading below changes").
+
+**The measurement is the good news, and it is stronger than the guard was asking for.** On Darwin
+24.6.0: `a_no_reader_blocking_slave` recovers **0 of 64** with a 600060 us close and terminal
+`eof`; `d_no_reader_second_fd_held` recovers **64 of 64** with a 12 us close and terminal
+`EAGAIN`. So holding a second fd across the writer's close does not merely change a cell here — it
+**recovers every byte that would otherwise be lost**, and collapses the close from 600 ms to 12
+us. On Linux the witness only moves the terminal, because the bytes were never at risk. §3.56's
+argument is therefore not just intact off Linux; it is load-bearing there and it works.
+
+The guard now reads the disposition off the bare shape and asserts the consequence belonging to
+it, which on a discarding kernel is **stricter** rather than weaker: the witness must recover the
+whole payload, not merely differ. That is §9's tell that the portable form was found — it comes
+out harder on the platform of record, not softer.
+
+**D. §3.47's repair had a second unfixed sibling, and the Darwin rig is where it showed.**
+`p4_exclusivity::exclusive_write_lock_is_byte_exact` spawns its sink in a thread and lets the
+holder send immediately, under a comment stating the ordering intent it does not implement.
+§3.47 established the mechanism in `p4_free_for_all` — a USB-serial port that is not open does not
+receive, so every byte clocked onto the wire before the far end opens is gone, 21-31 bytes for
+process start-up alone — and fixed it there with a `--open-file` handshake. This sibling never got
+it. The same `--open-file` gate applied here: **3 of 3 fail unfixed at 32.2 s, 3 of 3 pass fixed
+at 8.5 s**, and the 32.2 s is itself the evidence — the sink blocks to its own 30 s timeout waiting
+for bytes that were never going to arrive, which outlives the held child's 20 s hold and trips
+§3.56's `observed_while_open` witness. So on `main` the symptom had *moved* (the failure now names
+the closed-slave hazard rather than a short byte count) while the cause had not.
+
+**E. Hardware flow control is unavailable on this platform, and the driver says so only by
+read-back.** `rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes` (plan §18 item 7,
+`ebf9c52`) fails on Darwin: the node goes `faulted` with `reopen …: failed to apply some or all
+settings`, which is `serial2`'s verification error — it sets the termios, reads it back, and finds
+the request absent.
+
+Measured below the daemon, because §7 wants the kernel measured rather than inferred from a
+harness failure. Opening `/dev/cu.usbserial-BH00L4KU` directly and setting `CRTSCTS`: `tcsetattr`
+returns **success** and `tcgetattr` reads the flag back **clear**, every time. The obvious
+alternatives are refuted rather than argued — `CCTS_OFLOW` alone, `CRTS_IFLOW` alone, both
+together, a blocking open, and the `/dev/tty.*` dial-in node instead of the `/dev/cu.*` callout
+node all behave identically (the `cu`-bypasses-modem-control hypothesis is the one that looked
+most likely and is dead). The **control** localises it: a *pty* slave on the same box accepts
+`CRTSCTS` and reads it back set. So this is not macOS's tty layer — it is the serial driver, and
+`ioreg` names it: Apple's own `IOSerialFamily` / `com.apple.driver.driverkit.serial`, with no FTDI
+kext loaded. The adapter's RTS/CTS *wiring* is fine and independently proven on this same rig —
+`crossover_rig_rts_crosses_to_the_far_ports_cts` passes, driving RTS on either port raises CTS on
+the other.
+
+Left **unfixed and filed**, with the product question stated rather than answered: §7 says a
+kernel that differs is `degraded` with the observation named, never a hard failure, and today a
+`rts-cts` config **faults the node** on Darwin. Whether the daemon should degrade with the
+observation named, or keep faulting because silently running a flow-controlled link without flow
+control is worse, is a design decision (§5) and not one to settle from the test that noticed it.
+The idiomatic instrument for it already has a shape: a doctor probe that measures whether a named
+port honours `CRTSCTS` on read-back, exactly as P10 measures what a pty accepts.
+
+**F. One failure was contention, not a defect, and it is recorded so it is not re-filed.**
+`crossover_rig_map_node_both_directions` fails when `serial_hardware` runs its tests in parallel
+and passes with `--test-threads=1` — the binary's six tests now share two physical ports, and the
+`rts-cts` test above faults one of them mid-run. The rig tests were four when that binary was last
+green here and are six now.
+
+**The gate on this box, and what it is scoped to.** 759 passing, 2 failed, 4 ignored, zero SKIP
+lines, `--no-fail-fast`, `--exclude serial-nexus-web --exclude serial-nexus-replug`; the two
+failures are E above and the citation gate that this entry closes. Before the three repairs it was
+756 / 4 / 4. Keep the `--exclude serial-nexus-replug` visible when quoting the figure: it is not
+the documented macOS scope, it is A above, and the number is smaller than it looks by however many
+tests that crate carries on Linux.

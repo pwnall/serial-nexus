@@ -2251,6 +2251,19 @@ impl ZeroTimeoutRefs {
             .collect()
     }
 
+    /// The same medians with the empty-mask cell dropped. On a kernel that gates the
+    /// hangup on the requested mask, that cell is not a replicate of the others — it
+    /// observes a *different* kernel answer (`none` where they see `POLLHUP`), so
+    /// including it in an fd-state contrast compares two states that were never both
+    /// reached. Darwin: keeping it reads 1.01x, dropping it reads ~11x (notes §3.53).
+    fn medians_requesting(&self, state: &str) -> Vec<u64> {
+        self.cells
+            .iter()
+            .filter(|c| c.state == state && c.mask != "empty_mask")
+            .map(|c| c.median_ns)
+            .collect()
+    }
+
     fn keys(&self, state: &str) -> Vec<String> {
         self.cells
             .iter()
@@ -2333,6 +2346,71 @@ fn p9_p2_instrument_median(master: &PtyMaster) -> (u64, u64) {
 /// the report down.
 fn ratio_x100(num: u64, den: u64) -> u64 {
     num.saturating_mul(100).checked_div(den).unwrap_or(0)
+}
+
+/// How the mask column must be read on *this* kernel — derived from the
+/// measurement, never asserted.
+///
+/// §3.52 collapsed this table to a 1x2 on the premise that POSIX delivers `POLLHUP`
+/// in `revents` whether or not it was requested, so at a fixed fd state the mask
+/// cells observe one kernel state and are replicates. That premise held on the only
+/// kernel it was ever run against. **Darwin 24.6.0 refutes it**: an empty mask on a
+/// hung-up master returns `revents: none` while `POLLHUP`-requesting cells on the
+/// same fd through the same wrapper return `POLLHUP` — so the mask is a real level
+/// there and the collapse is invalid (notes §3.53).
+///
+/// Emitting a fixed `shape` and a fixed rationale beside a field that contradicts
+/// both is the defect this exists to prevent, and it is the same defect §3.52
+/// repaired on P10's drain axis: one level of a parameter, mistaken for the
+/// parameter not mattering.
+struct P9MaskAxis {
+    shape: &'static str,
+    role: &'static str,
+    /// Which separation figure the survival criterion must be read against. Where
+    /// the mask gates the hangup, the empty-mask "ready" cell is not ready at all,
+    /// so folding it into the fd-state contrast understates it by an order of
+    /// magnitude — ~1.0x against ~10x on Darwin, where the requesting-mask cells
+    /// separate cleanly.
+    separation_field: &'static str,
+    /// The mask-spread figures the separation must be read against. They must come
+    /// from the same cell set as `separation_field`: comparing a cleaned separation
+    /// against an uncleaned spread is how the Darwin reading first looked like a
+    /// disagreement with Linux when it is not one.
+    spread_fields: &'static str,
+}
+
+/// Pure, so the two readings are tested against each other rather than against
+/// whichever kernel the test box happens to be (§9).
+fn p9_mask_axis(hangup_delivered_unrequested: bool) -> P9MaskAxis {
+    if hangup_delivered_unrequested {
+        P9MaskAxis {
+            shape: "1x2",
+            role: "measured: a poll requesting nothing still received POLLHUP on this kernel, so at \
+                   a fixed fd state every mask cell observed one kernel state — the cells are \
+                   replicates, not levels, and the table is a 1x2. The empty-mask cell measures \
+                   that rather than citing POSIX, and it runs last in each group, so it doubles \
+                   as a within-group warmup control.",
+            separation_field: "worst_case_separation_x100",
+            spread_fields: "mask_spread_not_ready_x100 / mask_spread_ready_x100",
+        }
+    } else {
+        P9MaskAxis {
+            shape: "2x3",
+            role: "measured: a poll requesting nothing received NOTHING on a master that a \
+                   POLLHUP-requesting poll on the same fd reported hung up, so this kernel gates \
+                   the hangup on the requested mask and the mask cells are LEVELS, not \
+                   replicates. The table does not collapse here. **This is not a disagreement \
+                   with the kernels that do deliver it — it is a third state, and reading it as \
+                   a mask level is what makes it look like one.** Compare only the \
+                   `*_requesting_*` figures: the empty-mask cell is never made ready here, so \
+                   folding it into the ready group collapses the fd-state contrast to ~1x, and \
+                   dropping it recovers the same shape a delivering kernel reports — fd state \
+                   dominating (~10x) with the mask not mattering (~1.1x) among the cells that \
+                   asked for something.",
+            separation_field: "worst_case_separation_requesting_masks_x100",
+            spread_fields: "mask_spread_not_ready_requesting_x100 / mask_spread_ready_requesting_x100",
+        }
+    }
 }
 
 struct Granularity {
@@ -2418,6 +2496,15 @@ pub fn p9_poll_granularity() -> Probe {
             let nr_max = not_ready.iter().copied().max().unwrap_or(0);
             let rd_min = ready.iter().copied().min().unwrap_or(0);
             let rd_max = ready.iter().copied().max().unwrap_or(0);
+            // The same contrast over the cells that actually requested something. Equal
+            // to the above on a kernel where the empty mask is a replicate; the only
+            // honest figure on one where it is a level.
+            let nr_req = refs.medians_requesting("unready");
+            let rd_req = refs.medians_requesting("ready_hungup");
+            let nr_req_min = nr_req.iter().copied().min().unwrap_or(0);
+            let nr_req_max = nr_req.iter().copied().max().unwrap_or(0);
+            let rd_req_min = rd_req.iter().copied().min().unwrap_or(0);
+            let rd_req_max = rd_req.iter().copied().max().unwrap_or(0);
             let mut cells = serde_json::Map::new();
             for c in &refs.cells {
                 let stem = c.key();
@@ -2440,25 +2527,38 @@ pub fn p9_poll_granularity() -> Probe {
                     c.revents_seen.contains(PollFlags::POLLHUP)
                         && c.ready_passes as usize == P9_REF_SAMPLES
                 });
+            // Derived from the measurement immediately above, never asserted: on a
+            // kernel that gates the hangup on the requested mask this is a 2x3 and the
+            // empty-mask cell is a level (notes §3.53).
+            let axis = p9_mask_axis(hangup_unrequested);
             let mut zero_by_state = serde_json::json!({
-                "shape": "1x2",
+                "shape": axis.shape,
                 "isolated_variable": "ready-vs-not-ready",
                 "samples_each": P9_REF_SAMPLES,
                 "not_ready_cells": refs.keys("unready"),
                 "ready_cells": refs.keys("ready_hungup"),
                 "worst_case_separation_x100": ratio_x100(nr_min, rd_max),
-                // The mask is reported and is NOT a level of a factor. Kept because
-                // "it does not matter" is a result; published as a control because
-                // presenting it as an axis is what notes §3.45 B caught.
-                "mask_is_a_control_not_a_factor":
-                    "POSIX delivers POLLHUP in revents whether or not it was requested, so at a \
-                     fixed fd state every mask cell observes one kernel state and they are \
-                     replicates rather than levels. The empty-mask cell measures that instead of \
-                     citing it, and it runs last in each group, so it doubles as a within-group \
-                     warmup control.",
+                "worst_case_separation_requesting_masks_x100": ratio_x100(nr_req_min, rd_req_max),
+                "read_the_separation_from": axis.separation_field,
+                "read_the_mask_spread_from": axis.spread_fields,
+                // Whether the mask is a control or a level is now the report's answer
+                // rather than its premise. Kept under a name that does not assert one:
+                // "it does not matter" is a result, and so is "it does".
+                "mask_role": axis.role,
                 "hangup_delivered_to_a_mask_that_requested_nothing": hangup_unrequested,
                 "mask_spread_not_ready_x100": ratio_x100(nr_max, nr_min),
                 "mask_spread_ready_x100": ratio_x100(rd_max, rd_min),
+                // The same spreads with the empty mask dropped. On a kernel where it is
+                // a replicate these equal the two above; where it is a level, the pair
+                // completes the decomposition — and on Darwin it is what recovers the
+                // Linux conclusion. There, `mask_spread_ready_x100` reads ~8x purely
+                // because the empty-mask cell is in it, while among masks that actually
+                // requested something the mask does not matter (~1x) and the fd state
+                // does (~7x): the same shape Linux reports, once the empty mask is read
+                // as its own kernel state rather than as a third level of the mask
+                // (notes §3.53).
+                "mask_spread_not_ready_requesting_x100": ratio_x100(nr_req_max, nr_req_min),
+                "mask_spread_ready_requesting_x100": ratio_x100(rd_req_max, rd_req_min),
                 // The P2/P9 offset, measured rather than named (notes §3.45 B named it).
                 "p2_instrument_same_fd_ns": refs.p2_instrument_same_fd_ns,
                 "p2_instrument_blocking_fd_ns": refs.p2_instrument_blocking_fd_ns,
@@ -2490,12 +2590,15 @@ pub fn p9_poll_granularity() -> Probe {
             p.verdict(
                 Status::Supported,
                 &format!(
-                    "A zero timeout costs {zero} ns median (the cost of asking) and a requested 1 ms costs {one_ms} µs median on this kernel — that is the floor §15.19's hybrid data plane was built around and the floor poll_ready's idle backoff steps against. 16 samples per timeout: enough to see the floor, not enough to characterize a tail. `zero_timeout_by_fd_state` is a **1x2**, not a 2x2: the isolated variable is ready-versus-not-ready, and the mask cells are replicates, because a poll that requests nothing still receives POLLHUP (`hangup_delivered_to_a_mask_that_requested_nothing` says so on this kernel rather than citing POSIX). Read `worst_case_separation_x100` against `mask_spread_*_x100`: the finding survives only where the first exceeds the second. `median_ns_for_0ms_request` above is n=16 taken cold and is NOT comparable to P2's headline — `p2_instrument_blocking_fd_ns` is, and `wrapper_offset_x100` / `nonblocking_offset_x100` say how much of any residual is this probe's instrument rather than the kernel's. Diff these against the production kernel (6.18) before tuning any backoff step or timer against them.{}",
+                    "A zero timeout costs {zero} ns median (the cost of asking) and a requested 1 ms costs {one_ms} µs median on this kernel — that is the floor §15.19's hybrid data plane was built around and the floor poll_ready's idle backoff steps against. 16 samples per timeout: enough to see the floor, not enough to characterize a tail. `zero_timeout_by_fd_state` is a **{shape}** here: the isolated variable is ready-versus-not-ready, and whether the mask column is a control or a second axis is decided by `hangup_delivered_to_a_mask_that_requested_nothing`, which this kernel answers **{hangup_unrequested}** — see `mask_role`. Read `{separation}` against `{spread}`: the finding survives only where the first exceeds the second, and the two must come from the SAME cell set — `read_the_separation_from` and `read_the_mask_spread_from` name the matching pair, because comparing a figure that drops the empty-mask cell against one that keeps it is not a comparison. `median_ns_for_0ms_request` above is n=16 taken cold and is NOT comparable to P2's headline — `p2_instrument_blocking_fd_ns` is, and `wrapper_offset_x100` / `nonblocking_offset_x100` say how much of any residual is this probe's instrument rather than the kernel's. Diff these against the production kernel (6.18) before tuning any backoff step or timer against them.{}",
                     if contaminated > 0 {
                         format!(" NOTE: {contaminated} pass(es) returned early because the fd reported an event, so those samples measure readiness rather than the timeout — treat the affected rows as suspect.")
                     } else {
                         String::new()
-                    }
+                    },
+                    shape = axis.shape,
+                    separation = axis.separation_field,
+                    spread = axis.spread_fields,
                 ),
             )
         }
@@ -7681,21 +7784,41 @@ mod tests {
     /// the discriminator — measured 7.0.0-29: `EIO` when the writer's close is the
     /// last one, `EAGAIN` while the witness is held, because the hangup itself is
     /// deferred to the reference-count edge. A kernel that discards at last close
-    /// would move the byte counts instead. Asserting "something differs" rather
-    /// than "the terminal differs" is what keeps this portable, and it is still a
-    /// real assertion: an implementation that opened no second fd would move
-    /// nothing at all.
+    /// moves the byte counts instead. Asserting "something differs" rather than
+    /// "the terminal differs" is what keeps this portable, and it is still a real
+    /// assertion: an implementation that opened no second fd would move nothing at
+    /// all.
+    ///
+    /// **The precondition below used to be Linux's answer, asserted as everyone's**
+    /// (notes §3.65). `bare` recovering the whole payload is what a *retaining*
+    /// kernel does; Darwin `waits-then-discards` and recovers **0 of 64**, so the
+    /// guard failed on the one platform whose §3.56 conversions the witness was
+    /// bought for. It now reads the disposition off the bare shape and asserts the
+    /// consequence that belongs to it — and on a discarding kernel that consequence
+    /// is **stricter**, not weaker: the witness must recover what would otherwise
+    /// be lost, all of it. Measured on Darwin 24.6.0: `bare` 0 of 64 with a 600060
+    /// us close, `held` **64 of 64** with a 12 us close and `EAGAIN`. So §3.56's
+    /// argument is not merely intact off Linux, it is load-bearing there and does
+    /// the work — on Linux the witness only moves the terminal, because the bytes
+    /// were never at risk.
     #[test]
     fn the_last_close_reference_count_shape_is_not_inert_here() {
         let bare = p13_shape(CloseShape::NoReader).expect("the no-reader shape runs");
         let held = p13_shape(CloseShape::NoReaderSecondFdHeld).expect("the held-fd shape runs");
-        assert_eq!(
-            bare.bytes_before + bare.bytes_after,
-            P13_PAYLOAD as u64,
-            "the platform of record retains a departed writer's bytes; if this \
-             kernel does not, the reading below changes and so does notes §3.56's \
-             argument"
-        );
+        let bare_bytes = bare.bytes_before + bare.bytes_after;
+        let held_bytes = held.bytes_before + held.bytes_after;
+        if bare_bytes < P13_PAYLOAD as u64 {
+            // A discarding kernel. The witness exists precisely to stop this, so
+            // "something differs" is far too weak here: the bytes must come back.
+            assert_eq!(
+                held_bytes, P13_PAYLOAD as u64,
+                "this kernel discards a departed writer's bytes at last close \
+                 (bare recovered {bare_bytes} of {P13_PAYLOAD}), and holding a second fd \
+                 across that close recovered {held_bytes} rather than all {P13_PAYLOAD}. \
+                 A witness fd is then NOT the last-close edge here, and the seven guards \
+                 notes §3.56 converted are resting on an argument this box does not support"
+            );
+        }
         let bytes_differ =
             (bare.bytes_before + bare.bytes_after) != (held.bytes_before + held.bytes_after);
         let terminal_differs = bare.terminal != held.terminal;
@@ -8129,7 +8252,7 @@ mod tests {
     /// wrapper that intersected them with the requested `events` would make the
     /// empty-mask cell read `none` on a hung-up fd and the whole control vacuous.
     #[test]
-    fn an_unrequested_hangup_is_still_delivered() {
+    fn an_unrequested_hangup_is_measured_and_the_framing_follows_it() {
         let master = new_master().expect("openpt");
         let pts = sys::ptsname(&master).expect("ptsname");
         let fd = master.as_raw_fd();
@@ -8140,19 +8263,92 @@ mod tests {
         let live = sys::poll_blocking(fd, PollFlags::empty(), 0);
         drop(slave);
         std::thread::sleep(PTY_SETTLE);
-        let hungup = sys::poll_blocking(fd, PollFlags::empty(), 0);
+        let hungup_empty = sys::poll_blocking(fd, PollFlags::empty(), 0);
+        // The control that makes the empty-mask reading interpretable: whatever the
+        // empty mask says, a mask that ASKED must see the hangup. Without this, an
+        // empty `hungup_empty` is equally explained by "the mask gated it" and by
+        // "the fd never hung up", and the probe would attribute a setup failure to
+        // the kernel.
+        let hungup_asked = sys::poll_blocking(fd, PollFlags::POLLHUP, 0);
         assert!(
             live.is_empty(),
             "a live master answered {} to a poll requesting nothing",
             revents_label(live)
         );
         assert!(
-            hungup.contains(PollFlags::POLLHUP),
-            "a hung-up master answered {} to a poll requesting nothing, so on this kernel \
-             the mask DOES gate the hangup and P9's mask cells are a real axis after all",
-            revents_label(hungup)
+            hungup_asked.contains(PollFlags::POLLHUP),
+            "the slave was closed and a POLLHUP-requesting poll still answered {} — the fd did \
+             not hang up, so nothing below measures a mask",
+            revents_label(hungup_asked)
         );
-        assert_ne!(live, hungup);
+
+        // This is the portable property, and it is the one the report actually
+        // promises: the framing is DERIVED from the measurement. Asserting POSIX
+        // here instead is what made this guard red on Darwin while the report went
+        // on printing `shape: "1x2"` beside a field reading false (notes §3.53).
+        let delivered_unrequested = hungup_empty.contains(PollFlags::POLLHUP);
+        let axis = p9_mask_axis(delivered_unrequested);
+        if delivered_unrequested {
+            assert_eq!(axis.shape, "1x2");
+            assert_eq!(axis.separation_field, "worst_case_separation_x100");
+            assert_ne!(
+                live, hungup_empty,
+                "the empty mask is a replicate here, so it must still discriminate fd state"
+            );
+        } else {
+            assert_eq!(
+                axis.shape, "2x3",
+                "this kernel gates the hangup on the requested mask, so the mask cells are \
+                 levels and the table must not be published as a 1x2"
+            );
+            assert_eq!(
+                axis.separation_field, "worst_case_separation_requesting_masks_x100",
+                "with the empty mask a level, the fd-state contrast must be read from the \
+                 cells that requested something"
+            );
+        }
+    }
+
+    /// The two readings of the mask column, checked against each other rather than
+    /// against this box (§9). Both arms ship; only one runs per kernel, and the one
+    /// that does not run is exactly the one a single-kernel session cannot test.
+    #[test]
+    fn the_mask_axis_framing_is_derived_from_the_measurement_both_ways() {
+        let replicate = p9_mask_axis(true);
+        let level = p9_mask_axis(false);
+        assert_eq!(replicate.shape, "1x2");
+        assert_eq!(level.shape, "2x3");
+        assert_ne!(
+            replicate.separation_field, level.separation_field,
+            "if both readings name the same separation figure, the 2x3 arm silently \
+             reports a contrast contaminated by a cell the kernel never made ready"
+        );
+        // The pairing is the whole point: a cleaned separation read against an
+        // uncleaned spread is what made Darwin's 9.92x-vs-1.12x first read as a
+        // failure of the survival criterion (notes §3.53).
+        assert_ne!(replicate.spread_fields, level.spread_fields);
+        for a in [&replicate, &level] {
+            let cleaned = a.separation_field.contains("requesting");
+            assert_eq!(
+                cleaned,
+                a.spread_fields.contains("requesting"),
+                "separation `{}` and spread `{}` come from different cell sets",
+                a.separation_field,
+                a.spread_fields
+            );
+        }
+        assert!(
+            replicate.role.contains("replicates") && level.role.contains("LEVELS"),
+            "each arm must SAY which reading it is; a reader diffing two kernels' \
+             reports needs the prose to move with the number"
+        );
+        for a in [&replicate, &level] {
+            assert!(
+                a.role.starts_with("measured:"),
+                "the rationale must present itself as an observation, never as a \
+                 citation of POSIX — that premise is what notes §3.53 caught"
+            );
+        }
     }
 
     /// **Acceptance is not delivery, and P10 could not see the difference.**
