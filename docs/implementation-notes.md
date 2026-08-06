@@ -8398,3 +8398,25 @@ failures are E above and the citation gate that this entry closes. Before the th
 756 / 4 / 4. Keep the `--exclude serial-nexus-replug` visible when quoting the figure: it is not
 the documented macOS scope, it is A above, and the number is smaller than it looks by however many
 tests that crate carries on Linux.
+
+**Addendum (same session): the P14-era Darwin triple.** `docs/doctor/macos-24.6.0-2026-08-05-42eac2a-tier3{,-2,-3}.json`,
+taken at `42eac2a` from a clean tree, `probe_set 94d64d8bbacf1174` — the same digest as the
+`3d850cf` Linux triple, so that era now has a lawful cross-kernel diff and the counterpart the
+6.18 visit was prepared against exists on a second kernel. Three sequential runs, load 1.30–2.12,
+one `field_set` (`da21ac7678aeebaa`) across all three, all three passing `expectations/macos.jq`.
+A Tier-3 run costs **50.1 s** here against Linux's 35.0 s, essentially all of it P14.
+
+**P14's first Darwin reading agrees on the number and disagrees on the cause.**
+`max_reliable_baud: 3000000` and `first_unreliable_baud: 3062500`, identical to Linux and
+identical across all three runs — but `ceiling_kind` reads **`platform-refused`** here against
+**`adapter-refused`** there. The same physical limit, attributed to different layers by the two
+kernels. That is the distinction §15.51 built the field for, and it is the first time the two
+readings have existed side by side.
+
+**P13's fourth shape agrees across kernels while the policy disagrees, which is the point.**
+`d_no_reader_second_fd_held` reads `bytes_recovered_total: 64` with terminal `EAGAIN` on *both*
+kernels, while `policy` is `waits-then-discards` on Darwin and `retains` on Linux, and the bare
+shape differs 0-of-64 against 64-of-64. So the witness fd **normalises two opposite last-close
+dispositions to one reading**. That is notes §3.56's argument in its measured form: the seven
+guards it converted do not depend on which disposition the kernel has, which is exactly what a
+portable guard needs and what C above found the *guard* was not yet saying.
