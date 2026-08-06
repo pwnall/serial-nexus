@@ -6224,14 +6224,21 @@ fn p15_readback(path: &PathBuf) -> Result<FlowReadback, String> {
     want.control_flags |= ControlFlags::CRTSCTS;
 
     let set = tcsetattr(&fd, SetArg::TCSANOW, &want);
-    let after = tcgetattr(&fd).map_err(|e| format!("tcgetattr after: {e}"))?;
+    let after = tcgetattr(&fd);
 
-    // Restore before reporting anything, so an early return cannot leave a real
-    // adapter reconfigured behind us.
-    let restored = tcsetattr(&fd, SetArg::TCSANOW, &before).is_ok()
+    // **Restore before inspecting the read-back, not after** (notes §3.68). The
+    // read-back used to carry a `?`, which returns *between* the set and the
+    // restore: on a kernel that honours the flag that leaves a real adapter with
+    // `CRTSCTS` asserted, and the probe then reports `skipped (no port could be
+    // opened)` — no `baseline_restored` cell in the JSON at all, so both gate
+    // files' restore clause is exempted by the skip. The one error path that could
+    // strand a port was the one path that emitted nothing about it.
+    let restored_after_own_write = tcsetattr(&fd, SetArg::TCSANOW, &before).is_ok()
         && tcgetattr(&fd)
             .map(|t| t.control_flags == before.control_flags)
             .unwrap_or(false);
+
+    let after = after.map_err(|e| format!("tcgetattr after: {e}"))?;
 
     // **The daemon's refusal and this report must never disagree.** The daemon
     // rejects a `flow = "rts-cts"` config at load time on a port that answers
@@ -6247,6 +6254,19 @@ fn p15_readback(path: &PathBuf) -> Result<FlowReadback, String> {
         Ok(v) => Some(*v == honoured),
         Err(_) => None,
     };
+
+    // **`honours_rtscts` is the probe's *last* write to this port, so the baseline
+    // has to be re-read after it** (notes §3.68). It opens the same tty a second
+    // time, sets `CRTSCTS`, and restores — and it cannot verify its own restore,
+    // because it closes the fd it would need to re-read through. Deciding
+    // `baseline_restored` before that call published a `true` about a port whose
+    // final reconfiguration nothing had checked, on the one kernel where the write
+    // takes effect. This fd is still open, so the re-read costs one `tcgetattr`
+    // and makes the field describe the port as this probe actually leaves it.
+    let restored = restored_after_own_write
+        && tcgetattr(&fd)
+            .map(|t| t.control_flags == before.control_flags)
+            .unwrap_or(false);
 
     Ok(FlowReadback {
         port: path.display().to_string(),
@@ -8573,6 +8593,54 @@ mod tests {
             c.contains("could not restore"),
             "the restore failure must lead, not the CRTSCTS finding: {c}"
         );
+    }
+
+    /// **The arm ranked above the probe's own finding, executed** (notes §3.68).
+    ///
+    /// `shipped_predicate_agrees: Some(false)` says this report and the daemon
+    /// would answer differently about one port — a report that calls a port fine
+    /// while `load` refuses it is worse than either verdict alone, which is why it
+    /// outranks the dropped-request finding. Nothing constructed that value before,
+    /// so the branch and *both* of its rank relationships were unexecuted: a future
+    /// edit reordering the three arms was caught by nothing. The two orderings are
+    /// asserted here in the only way that pins them — against rows that would
+    /// otherwise select the neighbouring arm.
+    #[test]
+    fn p15_ranks_a_daemon_disagreement_below_a_failed_restore_and_above_its_own_finding() {
+        let disagreeing = |port: &str, honoured: bool, restored: bool| FlowReadback {
+            shipped_predicate_agrees: Some(false),
+            ..flow_row(port, true, honoured, restored)
+        };
+
+        // Above the dropped-request finding: this row is *also* silently dropping,
+        // so if the ranking were the other way round the CRTSCTS text would win.
+        let (s, c) = p15_verdict(1, &[disagreeing("/dev/ttyUSB0", false, true)], &[]);
+        assert!(matches!(s, Status::Degraded));
+        assert!(
+            c.contains("answer differently") && c.contains("/dev/ttyUSB0"),
+            "a daemon disagreement must lead over the dropped-request finding, and \
+             must name the port: {c}"
+        );
+
+        // Below a failed restore: this row disagrees *and* was left reconfigured,
+        // and a reconfigured adapter is the worse outcome of the two.
+        let (s, c) = p15_verdict(1, &[disagreeing("/dev/ttyUSB0", false, false)], &[]);
+        assert!(matches!(s, Status::Degraded));
+        assert!(
+            c.contains("could not restore"),
+            "a failed restore must still outrank a daemon disagreement: {c}"
+        );
+
+        // And agreement on a clean port is not a finding at all — the arm must not
+        // fire on `None` (the predicate could not run), which is not a disagreement.
+        let unmeasured = FlowReadback {
+            shipped_predicate_agrees: None,
+            ..flow_row("/dev/ttyUSB0", true, true, true)
+        };
+        assert!(matches!(
+            p15_verdict(1, &[unmeasured], &[]).0,
+            Status::Supported
+        ));
     }
 
     /// No `--port` is a skip, not a verdict — the same opt-in shape as P3/P5/P11,

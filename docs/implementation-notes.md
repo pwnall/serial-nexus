@@ -8636,3 +8636,188 @@ Darwin arm passes and prints which arm it took.
 **Cost:** `serial-nexus-itest` gains a dependency on `serial-nexus-sys`, a workspace-internal crate
 already in the graph, so `cargo deny check licenses bans sources` does not move. The harness asks
 the shipped predicate rather than re-deriving it, for the same reason P15 does.
+
+### 3.68 The Linux run of the P15 era: a refusal that was dead code, and a toggle the comment denied
+
+**Design:** §7 (a kernel claim cites a committed report; no one-way decision on
+single-kernel evidence), §7.1, §12 (identity, not path), §15.26 (structural
+pre-checks before anything is created). **Rules:** AGENTS §9 (assert the promise,
+never a proxy; fail-first proof; record refuted diagnoses), §5, §8.
+
+`main` reached `17c6e87` with five commits developed and measured on macOS only:
+the replug platform split, the macOS USB backend, doctor P15, and §3.67's
+`load`-time flow-control refusal. This entry is the Linux run of that tree, on
+7.0.0-29-generic with the FT232R crossover attached, load 0.39–0.9 throughout.
+
+**Everything green first, so the defects below are read against a working tree.**
+`cargo build --workspace --locked`, `fmt`, both clippy lanes, `cargo deny`, the
+passive doctor against `expectations/linux.jq`, and the Playwright lane under
+`SNX_WEB_UI=required` (`p8_web_ui` in 24.5 s of real browser time — a skip would
+have failed) all pass. The suite reads **830 passing, 0 failed, 4 ignored across 116
+test-result lines**, against §2's last recorded 826. **The delta is not re-derived
+here, deliberately**: the obvious reconstruction does not close (`ebf9c52` added two
+tests, not one, so a naive 826 + 2 + 3 overshoots by one), and 826 was measured
+several commits before this tree on a box this session cannot re-run. What *is*
+verified is the part that can be: the five Mac commits move the tree's
+`#[test]`/`#[tokio::test]` count 834 → 842, of which 3 are P15's doctor guards and 5
+are macOS-only and do not compile here — so +3 on Linux. The 830 is a measurement;
+treat the 826 as the older measurement it is rather than an addend.
+
+**P15's `supported` arm executes for the first time on any kernel.** Linux honours
+`CRTSCTS`: `honoured_on_readback: true`, `silently_dropped: false`,
+`shipped_predicate_agrees: true` on both ports, `cflag` moving `0x10021cb2` →
+`0x90021cb2` — a delta of exactly `CRTSCTS`. Darwin reads `0x4b00` → `0x4b00` and
+`honoured: false`. So the probe's three-way discrimination is now measured on both
+arms rather than tested purely on one, and the `rts-cts` harness test takes the
+**stall-and-recover** arm here against the **refusal** arm there. **This also
+discharges a §7 debt the previous session left**: AGENTS §2 and §3.65 E′/§3.67
+asserted "Linux honours the flag" as measured fact with no Linux artifact behind
+it — `grep -l '"P15"' docs/doctor/*.json` returned only the three macOS files.
+
+**One bound on the cross-kernel pair, and `field_set` is what says so.** The macOS
+triple is at `acb5162`, which predates `shipped_predicate_agrees` (added by
+`17c6e87`), so the two carry the same `probe_set` `82a8e2198e54626a` and *different*
+`field_set`. Equal `probe_set` is not comparability — §15.44's second digest exists
+for exactly this, and this is its first cross-kernel instance. The macOS lane owes a
+capture at this tree before the P15 era has a same-binary pair.
+
+#### 1. `precheck_flow_control` was dead code on every path the daemon itself writes
+
+**The defect.** The check read `Path::new(device).exists()`. But `device` is "an
+identity in resolver form *or* a raw `/dev` path", and the identity form is not
+merely permitted — it is **produced**: `add_node` rewrites the operator's input to
+the canonical identity (`daemon.rs`, `*device = resolved.identity.clone()`)
+*immediately before* calling the pre-check. `capture_for_dev` can only return
+`usb:…`, `by-path:…` or `raw:…`, none of which is ever an existing file. So the
+refusal §3.67 announced was **100% dead on `add-node`**, dead on every `load` of a
+`dump`ed config, and dead on every `startup_load` replay of the persisted state
+file. It was live only for a hand-written literal path handed straight to `load` —
+which is the one shape its own guard exercised, so the guard was a §9 proxy and
+could not see it. Found by an adversarial review that had not read §3.67's
+reasoning; three independent lenses raised it and the verifier could not kill it.
+
+**The fix is the resolver, for §3.67's own stated reason.** `flow_precheck_target`
+now calls `Resolver::resolve_current_path` — the *same* call `nodes/serial.rs` makes
+to open the port. §3.67 argued there must be one flow-control predicate because two
+callers must not be able to disagree about the *answer*; the same argument applies
+to the *question*, and the pre-check and the open must not be able to disagree about
+which device they are talking about. `None` still means "do not ask", and it still
+covers an absent adapter, which stays a `waiting` node rather than a refusal.
+
+**It also closes a second finding for free**: the old form bypassed `--dev-root`, so
+a fixture-rooted daemon could have opened and reconfigured a real adapter outside
+the tree it was pointed at. One verifier refuted that as unreachable today (no
+`--dev-root` caller in the tree uses a literal path *and* `rts-cts`); the resolution
+moots it either way, which is the better outcome than a reachability argument.
+
+**Fail-first, executed.** `the_flow_pre_check_resolves_the_device_rather_than_treating_it_as_a_path`
+reddens on "an rts-cts node whose identity resolves must be interrogated" against
+the pre-fix expression restored in place. It carries its own control — it asserts
+`Path::new("raw:/dev/null").exists()` is **false**, the pre-fix predicate's answer —
+so a future reader can see why the naive form was dead rather than take it on trust.
+It pins the daemon's half of the decision (which port gets asked) because that half
+is kernel-independent; the platform's half stays with the harness test, which is the
+only place both arms can be exercised.
+
+#### 2. "It is not an *extra* toggle" was false, and the rig can measure it
+
+The pre-check's doc argued its open was free because the node was about to open the
+same port anyway. It is not: `honours_rtscts` performs a *complete*
+open→configure→restore→close cycle that finishes before the node's open begins, and
+on Linux the last close of a tty with `HUPCL` lowers DTR and RTS.
+
+**Measured with `TIOCGICOUNT` on the far port** — the kernel's own CTS interrupt
+counter, because the pulse is ~0.7 ms and a 0.5 ms poll loop misses it (it did, and
+that inconclusive reading is recorded here so the instrument choice is not
+re-litigated). The rig cross-wires RTS↔CTS, so the far port's CTS count is an exact
+readout of the near port's RTS line.
+
+| config | pre-check | CTS edges at the far port |
+|---|---|---|
+| `flow = "none"` | enabled | 0, 0, 1 |
+| `flow = "rts-cts"` | enabled | **2, 2, 2** |
+| `flow = "rts-cts"` | **disabled in place** | 0, 0, 0 |
+| `honours_rtscts` alone, no daemon | — | 2, 2, 3 |
+| no-op control | — | 0, 0 |
+
+The third row is the one that matters: it **refutes the confound**. Enabling
+`CRTSCTS` puts RTS under kernel control, which could have produced the edges by
+itself — with the pre-check disabled and everything else identical, it produces
+none. All 2 edges are the pre-check's.
+
+**What is not measured:** DTR. The rig leaves it unwired (§3.53 (i)), so the DTR
+half rests on the same kernel call path (`tty_port_lower_dtr_rts` moves both) and is
+*inferred*, not observed. Said here rather than folded into the measured claim (§9).
+
+**The cost is stated where the decision is, and the fix above widened it**:
+identity-form configs now reach the check, so they now pay the pulse too. A board
+that auto-resets on DTR takes one extra reset per `load`, per `add-node`, and per
+`startup_load` replay. Bounded (only nodes that asked for `rts-cts`) and it buys a
+refusal the operator can act on. Removing it means asking from inside the node's own
+open, which is past the point where "nothing is created" holds — a design question
+(§5), filed, not patched here.
+
+#### 3. Two holes in P15's `baseline_restored`, the field its own verdict ranks first
+
+Both are the same shape: the field claims the port was put back, and the probe's
+last write to that port is outside what the field describes.
+
+**(i) The restore was decided before the last write.** `restored` was computed, and
+*then* `sys::honours_rtscts` was called — which opens the same tty again, sets
+`CRTSCTS`, and restores with the result discarded. It structurally cannot verify
+itself: it closes the fd it would need to re-read through. On Linux the flag is
+genuinely honoured, so that write really does assert hardware flow control on the
+adapter. P15's own fd is still open, so the fix is one `tcgetattr` after the call.
+
+**(ii) The read-back `?` returned between the set and the restore.** A failed
+`tcgetattr after` left a real adapter with `CRTSCTS` asserted and then reported
+`skipped (no port could be opened)` — the most reassuring word in the vocabulary,
+and one that **exempts both gate files' restore clause**, so the single error path
+that could strand a port was the one path that emitted nothing about it. The restore
+now runs before the read-back is inspected.
+
+Verified externally rather than by reading: after a Tier-3 run both ports read
+`-crtscts` under `stty`.
+
+#### 4. Two guards the generation shipped without
+
+**`shipped_predicate_agrees`'s degrade arm had zero coverage.** Nothing constructed
+`Some(false)`, so the branch the notes rank *above the probe's own finding* was
+unexecuted, and both of its rank relationships with it. `p15_ranks_a_daemon_disagreement_below_a_failed_restore_and_above_its_own_finding`
+asserts them against rows that would otherwise select the neighbouring arm, plus
+that `None` (the predicate could not run) is not a disagreement. Fail-first proven by
+neutering the arm's filter.
+
+**P15's expectation clauses had no in-tree guard**, unlike the `field_set`, P4, P14
+and handshake clauses beside them — and they are the easiest kind to lose, because
+CI runs the doctor **passively**, so P15 reports `skipped`, the antecedent is false,
+and neither automated lane ever evaluates the clause. Deleting it left `cargo test`
+and both gates green. Two guards now, on the handshake clause's pattern: verbatim
+identity across both files, and a synthetic antecedent proving each required cell
+reddens the gate when absent *or null*, that an `unreadable_ports`-only observation
+does not satisfy it, and — deliberately — that flipping `honoured_on_readback` does
+**not** redden it, because either kernel reading is a legitimate fact (§7). Both
+fail-first proven by deleting the clause.
+
+#### 5. Filed, not fixed — two items with the mechanism named
+
+**(a) `load --replace` on a port the running graph holds defeats the pre-check.** It
+runs before the teardown, deliberately, so a bad `--replace` cannot destroy a good
+graph. But at that moment the outgoing node still holds the port under `TIOCEXCL`,
+so the pre-check's own `open(2)` is refused, `Err` maps to "unmeasurable, not a
+refusal", and the check cannot fire in the one scenario its placement was justified
+by. The premise is proven in-tree, not assumed: `nodes/serial.rs`'s Linux-gated
+`third_party_open` guard asserts exactly that a second open of a daemon-held port
+fails. **Not patched**, because both repairs are worse than the gap until a decision
+is taken: re-checking after teardown means a refusal *has* destroyed the good graph,
+and inferring the answer from the outgoing node's own successful open is an
+inference, not a measurement. Unobservable on Linux besides — this kernel honours
+the flag, so the refusal never fires here at all (§7).
+
+**(b) P15's question cites §15.51, which is P14's section, and no design entry for
+P15 exists** — §5 says amend the design first, and that step was skipped. The
+citation is inside the `question` string, which is what `probe_set` digests, so
+correcting it moves the era a second time and orphans the three macOS artifacts
+committed under `82a8e2198e54626a` before any Linux counterpart exists. Recorded
+rather than silently corrected, because which of those two costs to pay is a
+decision about the comparability discipline, not a typo fix.

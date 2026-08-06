@@ -418,6 +418,60 @@ async fn await_listen_barriers(barriers: impl IntoIterator<Item = ListenBarrier>
     let _ = tokio::time::timeout(LISTEN_BARRIER_TIMEOUT, all).await;
 }
 
+/// A node the flow-control pre-check must interrogate, and the port to ask.
+struct FlowPrecheckTarget<'a> {
+    name: &'a str,
+    /// The configured spelling, for the operator-facing message. Not a path.
+    device: &'a str,
+    /// The port behind `device` *right now*, resolved exactly as the node's own
+    /// open resolves it.
+    path: std::path::PathBuf,
+}
+
+/// Which port, if any, [`Daemon::precheck_flow_control`] must ask about this node.
+///
+/// **Split out because this is the half of the pre-check a kernel-independent test
+/// can pin.** Whether a driver honours `CRTSCTS` is the platform's answer and only a
+/// differing kernel can exercise both arms of it (notes §3.67); but *which port gets
+/// asked* is this daemon's own decision, it is the same on every kernel, and getting
+/// it wrong is what made the check dead code on the entire `add-node` path
+/// (notes §3.68).
+///
+/// The `device` field is "an identity in resolver form **or** a raw `/dev` path"
+/// (`core::config`), and the identity form is not merely permitted but *produced*:
+/// [`Daemon::add_node`] rewrites the operator's input to the canonical identity
+/// before any pre-check runs, `dump` emits that, and the state file persists it for
+/// `startup_load` to replay. So treating the string as a path skipped the check for
+/// every node the daemon had ever canonicalized — which is all of them.
+///
+/// `None` means "do not ask", and it covers three cases that must not be collapsed:
+/// a node that is not serial, a node that did not request `rts-cts`, and a device
+/// that resolves to nothing **right now** — the last being an absent adapter, which
+/// §12 promises is a `waiting` node rather than a refusal.
+fn flow_precheck_target<'a>(
+    resolver: &serial_nexus_core::Resolver,
+    nc: &'a serial_nexus_core::config::NodeConfig,
+) -> Option<FlowPrecheckTarget<'a>> {
+    use serial_nexus_core::config::{FlowControl, NodeConfig};
+    let NodeConfig::Serial {
+        name,
+        device,
+        flow_control,
+        ..
+    } = nc
+    else {
+        return None;
+    };
+    if *flow_control != FlowControl::RtsCts {
+        return None;
+    }
+    Some(FlowPrecheckTarget {
+        name,
+        device,
+        path: resolver.resolve_current_path(device)?,
+    })
+}
+
 impl Daemon {
     pub fn new(
         resolver: serial_nexus_core::Resolver,
@@ -554,16 +608,6 @@ impl Daemon {
         result
     }
 
-    /// Structural pre-check for every codec node's *name and attribute schema*
-    /// (§8/§11/§15.26). Codec attributes are opaque to `GraphConfig::validate`, so
-    /// this validates them here — **purely** (a codec factory / `exec::parse_attributes`
-    /// only constructs and checks; no fds, no tasks) and **before** anything is
-    /// created or torn down. That makes both an unknown codec name *and* a bad
-    /// attribute table structural, nothing created, and — critically — caught
-    /// before a `--replace` teardown, so a structurally-invalid config never
-    /// destroys a good running graph (§15.26, and this method's caller in `load`).
-    /// An unknown codec's error carries `data.available` so tools discover
-    /// capabilities; a known codec's schema error carries the codec's own message.
     /// **Refuse a hardware-flow-control config the port's driver cannot honour, at
     /// load, rather than faulting the node later.**
     ///
@@ -585,54 +629,84 @@ impl Daemon {
     /// `--replace` never destroys a good running graph on its way to failing.
     ///
     /// **An absent device is not a refusal.** The check only runs for a node whose
-    /// device path exists; a port that is not plugged in yet is a `waiting` node, as
-    /// always, and an interrogation error is likewise not treated as "does not
-    /// honour it" — an unreadable port is not a measured one (§9).
+    /// device resolves to a port that is present right now; a port that is not
+    /// plugged in yet is a `waiting` node, as always, and an interrogation error is
+    /// likewise not treated as "does not honour it" — an unreadable port is not a
+    /// measured one (§9).
     ///
-    /// The open this performs toggles DTR, which the doctor is careful about. It is
-    /// not an *extra* toggle: the check only runs where the config asked for
-    /// `rts-cts`, which is exactly the node that was about to open the same port and
-    /// apply the same settings.
+    /// **The device is resolved, never used as a path** (notes §3.68). The `device`
+    /// field is "an identity in resolver form *or* a raw `/dev` path"
+    /// (`core::config`), and [`Daemon::add_node`] *rewrites* it to the canonical
+    /// identity before this runs, so a check that did `Path::new(device).exists()`
+    /// saw `usb:0403:6001:BH00LL8O:00` — never an existing file — and skipped
+    /// unconditionally on the whole `add-node` path, on every `load` of a `dump`ed
+    /// config, and on every `startup_load` replay of the persisted state file. The
+    /// resolution here is [`Resolver::resolve_current_path`], which is the *same*
+    /// call [`crate::nodes::serial`] makes to open the port, for the same reason
+    /// §3.67 gives for there being one flow-control predicate: the pre-check and the
+    /// open must not be able to disagree about which device they are talking about,
+    /// any more than about what it answered.
+    ///
+    /// **It costs a real extra line toggle, and that is measured rather than argued
+    /// away** (notes §3.68). This comment used to say the open was "not an *extra*
+    /// toggle" because the node was about to open the same port anyway. That is
+    /// false: [`serial_nexus_sys::honours_rtscts`] performs a *complete*
+    /// open→configure→restore→close cycle that finishes before the node's own open
+    /// begins, and on Linux the last close of a tty whose termios has `HUPCL` lowers
+    /// DTR and RTS (`tty_port_shutdown` → `tty_port_lower_dtr_rts`).
+    ///
+    /// Measured on the bench crossover, counting the far port's CTS interrupts with
+    /// `TIOCGICOUNT` — an exact kernel counter, not a sampled line, because the pulse
+    /// is ~0.7 ms and a poll loop misses it. A `load` of a `flow = "rts-cts"` node
+    /// moves the far CTS **2, 2, 2** times against **0, 0, 1** for the identical
+    /// config at `flow = "none"`; with this pre-check disabled in place the same
+    /// `rts-cts` load moves it **0, 0, 0**, so the edges are this open's and not the
+    /// node's `CRTSCTS` (which moves no line by itself). RTS is what the rig can
+    /// observe — it cross-wires RTS↔CTS and leaves DTR unwired — so the DTR half is
+    /// the same kernel call path and is *not* independently measured here (§9).
+    ///
+    /// **The cost, stated where the decision is.** A board that auto-resets on DTR
+    /// takes one extra reset per `load`, per `add-node`, and per `startup_load`
+    /// replay of a persisted config — and fixing the resolution above *widened* that,
+    /// because identity-form configs now reach the check where before they silently
+    /// skipped it. It is bounded (only nodes that asked for `rts-cts`) and it buys a
+    /// refusal the operator can act on instead of a node that faults later. Removing
+    /// it means asking the question from inside the node's own open, which is after
+    /// the point where "nothing is created" still holds — a design question, not a
+    /// patch (§5).
     fn precheck_flow_control(
         &self,
         nodes: &[serial_nexus_core::config::NodeConfig],
     ) -> Result<(), RpcError> {
-        use serial_nexus_core::config::FlowControl;
         for nc in nodes {
-            let serial_nexus_core::config::NodeConfig::Serial {
-                name,
-                device,
-                flow_control,
-                ..
-            } = nc
+            let Some(FlowPrecheckTarget { name, device, path }) =
+                flow_precheck_target(&self.resolver, nc)
             else {
                 continue;
             };
-            if *flow_control != FlowControl::RtsCts {
-                continue;
-            }
-            let path = std::path::Path::new(device);
-            if !path.exists() {
-                continue;
-            }
-            match serial_nexus_sys::honours_rtscts(path) {
+            match serial_nexus_sys::honours_rtscts(&path) {
                 // Honoured, or unmeasurable. Neither is a refusal.
                 Ok(true) | Err(_) => {}
                 Ok(false) => {
+                    let shown = path.display();
                     return Err(structural_error(
                         &format!(
-                            "node {name:?}: device {device} does not honour rts-cts flow \
-                             control — its driver accepts the request and reads the flag \
-                             back clear, so the link would run without the flow control \
-                             this config asks for. Refused here rather than faulting the \
-                             node at open. Use flow = \"none\" (or xon-xoff) for this port, \
-                             or attach an adapter whose driver implements RTS/CTS; \
-                             `serial-nexus-doctor --port {device}` reports the same reading \
-                             as P15."
+                            "node {name:?}: device {device} (currently {shown}) does not \
+                             honour rts-cts flow control — its driver accepts the request \
+                             and reads the flag back clear, so the link would run without \
+                             the flow control this config asks for. Refused here rather \
+                             than faulting the node at open. Use flow = \"none\" (or \
+                             xon-xoff) for this port, or attach an adapter whose driver \
+                             implements RTS/CTS; `serial-nexus-doctor --port {shown}` \
+                             reports the same reading as P15."
                         ),
                         Some(json!({
                             "node": name,
                             "device": device,
+                            // The path actually interrogated. It is not always the
+                            // `device` string — §12 configs name an identity, and the
+                            // port behind it renumbers across a replug.
+                            "resolved_path": shown.to_string(),
                             "requested_flow_control": "rts-cts",
                             "honoured_on_readback": false,
                         })),
@@ -643,6 +717,16 @@ impl Daemon {
         Ok(())
     }
 
+    /// Structural pre-check for every codec node's *name and attribute schema*
+    /// (§8/§11/§15.26). Codec attributes are opaque to `GraphConfig::validate`, so
+    /// this validates them here — **purely** (a codec factory / `exec::parse_attributes`
+    /// only constructs and checks; no fds, no tasks) and **before** anything is
+    /// created or torn down. That makes both an unknown codec name *and* a bad
+    /// attribute table structural, nothing created, and — critically — caught
+    /// before a `--replace` teardown, so a structurally-invalid config never
+    /// destroys a good running graph (§15.26, and this method's caller in `load`).
+    /// An unknown codec's error carries `data.available` so tools discover
+    /// capabilities; a known codec's schema error carries the codec's own message.
     fn precheck_codecs(
         &self,
         nodes: &[serial_nexus_core::config::NodeConfig],
@@ -2634,6 +2718,82 @@ mod tests {
         let d = std::env::temp_dir().join(format!("snx-atomic-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// One serial node, spelled the way an operator or `dump` would.
+    fn serial_node(device: &str, flow: &str) -> serial_nexus_core::config::NodeConfig {
+        let cfg: serial_nexus_core::config::GraphConfig = toml::from_str(&format!(
+            "[[node]]\ntype = \"serial\"\nname = \"port0\"\n\
+             device = \"{device}\"\nbaud = 115200\nflow_control = \"{flow}\"\n"
+        ))
+        .expect("parse");
+        cfg.nodes.into_iter().next().expect("one node")
+    }
+
+    /// **notes §3.68 — the flow-control pre-check must *resolve* the device, because
+    /// the daemon itself rewrites it out of path form.**
+    ///
+    /// `add_node` replaces the operator's input with the resolver's canonical
+    /// identity before any pre-check runs (§12), `dump` emits that form, and the
+    /// state file persists it for `startup_load` to replay. A pre-check that asked
+    /// `Path::new(device).exists()` therefore saw `usb:…`/`by-path:…`/`raw:…` —
+    /// never an existing file — and skipped **every** node the daemon had
+    /// canonicalized, which is all of them. §3.67's refusal was live only for a
+    /// hand-written literal path handed straight to `load`, and that is the one
+    /// shape its own guard exercised.
+    ///
+    /// This asserts the daemon's half of the decision — *which port gets asked* —
+    /// because that half is the same on every kernel. Whether the driver honours the
+    /// flag is the platform's answer and only a differing kernel exercises both arms
+    /// of it, which is why `rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes`
+    /// carries that half and this carries this one.
+    #[test]
+    fn the_flow_pre_check_resolves_the_device_rather_than_treating_it_as_a_path() {
+        let r = serial_nexus_core::Resolver::new("/");
+
+        // The identity form, which is what the daemon stores. `/dev/null` stands in
+        // for a port only as a file that exists and is not a directory — the
+        // resolver's whole test for a literal device node — so this pins the
+        // resolution, not any tty behaviour.
+        let node = serial_node("raw:/dev/null", "rts-cts");
+
+        // **The fail-first control, asserted rather than described.** This is the
+        // pre-fix predicate, and it answers "no such file" for the very string the
+        // daemon writes into its own config. A guard that only checked the fixed
+        // path would pass just as well against the dead version.
+        assert!(
+            !std::path::Path::new("raw:/dev/null").exists(),
+            "the identity form is not a filesystem path — if this ever becomes true \
+             the control below stops discriminating"
+        );
+
+        let target = flow_precheck_target(&r, &node)
+            .expect("an rts-cts node whose identity resolves must be interrogated");
+        assert_eq!(
+            target.path,
+            std::path::PathBuf::from("/dev/null"),
+            "the pre-check must ask about the port the node will open, not the \
+             configured spelling"
+        );
+        assert_eq!(
+            target.device, "raw:/dev/null",
+            "the message keeps the spelling"
+        );
+
+        // An absent device is a `waiting` node, never a refusal (§12): a usb identity
+        // that binds nothing must yield no target at all rather than a missing-file
+        // interrogation.
+        assert!(
+            flow_precheck_target(&r, &serial_node("usb:0403:6001:NOSUCH:00", "rts-cts")).is_none(),
+            "an absent adapter must not be interrogated — it comes up waiting"
+        );
+
+        // And the check stays scoped to the mode that asked for it: no open, and so
+        // no DTR toggle, for a node that never requested rts-cts.
+        assert!(
+            flow_precheck_target(&r, &serial_node("raw:/dev/null", "none")).is_none(),
+            "only an rts-cts config may cause the pre-check to open a port"
+        );
     }
 
     /// §15.42 / notes §3.38 — **a config verb's reply must not precede its listeners.**

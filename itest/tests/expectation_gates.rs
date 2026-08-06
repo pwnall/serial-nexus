@@ -780,3 +780,121 @@ fn the_p14_presence_clause_admits_a_degraded_report_that_carries_null_cells() {
         expectation.display()
     );
 }
+
+/// The clause-identity guard for P15's flow-control clause (notes §3.65 E′, §3.68).
+///
+/// Both files must carry it *verbatim* for the same reason the handshake clause
+/// must: the defect P15 instruments was found on Darwin, and a clause that lived
+/// only in the lane where the flag is honoured could never have caught it.
+#[test]
+fn both_expectation_files_carry_the_same_flow_control_clause() {
+    let clause = r#"and (any(.probes[]; .id == "P15"))
+and (all(.probes[]; . as $p | ($p.id != "P15") or ($p.status | startswith("skipped")) or
+      ($p.observations | any((.value | type == "object")
+         and (.value.honoured_on_readback | type == "boolean")
+         and (.value.tcsetattr_ok | type == "boolean")
+         and (.value.baseline_restored | type == "boolean")))))"#;
+    for name in ["expectations/linux.jq", "expectations/macos.jq"] {
+        let path = repo_root().join(name);
+        let text = std::fs::read_to_string(&path).expect("the expectation file is readable");
+        assert!(
+            text.contains(clause),
+            "{name} does not carry the P15 flow-control clause verbatim — the reading \
+             it requires is the one the daemon's `load` refusal consults (notes §3.67), \
+             so the two lanes must demand the same cells"
+        );
+    }
+}
+
+/// **P15's clause has teeth, proven against planted violations** (plan §3 rule 10,
+/// notes §3.68).
+///
+/// This clause was the one addition of its generation with no in-tree guard, and it
+/// is the shape that hides best: CI runs the doctor **passively**, so P15 reports
+/// `skipped`, the antecedent is false, and the clause is never evaluated on either
+/// automated lane. Deleting it — or dropping `baseline_restored` from the emitter —
+/// left `cargo test` and both CI gates green. So the antecedent is built
+/// synthetically here, exactly as the handshake guard does, and the four cases that
+/// matter are asserted on a box with no adapters.
+///
+/// The answer stays free on purpose (§7): a kernel that honours `CRTSCTS` and one
+/// that drops it are both legitimate facts, so flipping `honoured_on_readback` must
+/// *not* redden the gate. That is asserted too — a clause that pinned the answer
+/// would have failed on Darwin the moment it was written.
+#[test]
+fn the_flow_control_clause_rejects_a_reading_that_cannot_say_what_it_measured() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let expectation = platform_expectation();
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    let p15 = |body: &str| {
+        jq_filter(
+            &format!(
+                r#"(.probes[] | select(.id=="P15")) |= (.status = "supported" | del(.reason) | .observations = {body})"#
+            ),
+            &report,
+        )
+    };
+    const FULL: &str = r#"[{"key":"/dev/ttyUSB0","value":{"honoured_on_readback":true,"tcsetattr_ok":true,"baseline_restored":true}}]"#;
+
+    // The honest shape must be ACCEPTED, or every rejection below proves nothing
+    // about this clause and everything about some other one.
+    assert!(
+        gate_accepts(&expectation, &p15(FULL)),
+        "{} refused a complete P15 reading — the rejections below would be vacuous",
+        expectation.display()
+    );
+
+    // **The answer is free.** A driver that drops the flag is a fact, not a gate
+    // failure (§7); this is the whole reason the clause checks type and not value.
+    let dropped = FULL.replace(
+        r#""honoured_on_readback":true"#,
+        r#""honoured_on_readback":false"#,
+    );
+    assert!(
+        gate_accepts(&expectation, &p15(&dropped)),
+        "{} reddened on a kernel that drops CRTSCTS — that is Darwin's honest \
+         reading and §7 says it is an observation, never a gate failure",
+        expectation.display()
+    );
+
+    // Each required cell, deleted in turn, must be REJECTED. `baseline_restored`
+    // is the one the verdict ranks above its own finding: a probe that reconfigures
+    // a real adapter and cannot say it put it back is worse than one that never ran.
+    for key in ["honoured_on_readback", "tcsetattr_ok", "baseline_restored"] {
+        let holed = FULL.replace(&format!(r#""{key}":true"#), r#""unrelated":true"#);
+        assert!(
+            !gate_accepts(&expectation, &p15(&holed)),
+            "{} admitted a P15 reading with `{key}` absent",
+            expectation.display()
+        );
+        // Present-but-null is the shape a half-written emitter produces, and the
+        // clause must not accept it either: `has()` would, `type ==` does not.
+        let nulled = FULL.replace(&format!(r#""{key}":true"#), &format!(r#""{key}":null"#));
+        assert!(
+            !gate_accepts(&expectation, &p15(&nulled)),
+            "{} admitted a P15 reading whose `{key}` is null",
+            expectation.display()
+        );
+    }
+
+    // A probe reporting *only* its unreadable ports carries no reading at all. The
+    // clause must not be satisfied by that array-valued observation — the `(.value
+    // | type == "object")` conjunct is what stops it.
+    assert!(
+        !gate_accepts(
+            &expectation,
+            &p15(r#"[{"key":"unreadable_ports","value":["/dev/ttyUSB0: open: EBUSY"]}]"#)
+        ),
+        "{} admitted a `supported` P15 that measured nothing and only listed the \
+         ports it could not open",
+        expectation.display()
+    );
+}
