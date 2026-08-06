@@ -8181,3 +8181,91 @@ configuration passed in one arm and failed in another. Redone with the replaceme
 count asserted before the run, the mutation reddens with its own message verbatim.
 **A mutation whose application is not verified is not a control**, and `sed` over
 formatted Rust is where that bites.
+
+### 3.64 Making the 6.18 visit worth taking: a gate hole I shipped, and the reference count nothing measured
+
+**Plan:** §18 item 8 (the owed 6.18 visit), item 7's remainder. **Design:** §7,
+§13, §15.44, §15.51. **Rules:** plan §3 rules 9, 10, 14; AGENTS §7, §9.
+
+The production kernel is 6.18 and this box is 7.0. One visit is available and it
+cannot be iterated on, so the doctor was audited against a single question: *what
+would that visit come home without?* Four things landed as a result, and one of
+them is a defect this session shipped three commits earlier.
+
+**(1) The P14 gate clause rejected a legitimate `degraded` report — verified by
+running the gate, not predicted.** `expectations/*.jq` exempts `skipped` and
+requires `max_reliable_baud`, `ceiling_kind` and `ceiling_is_a_floor_over`
+otherwise. Two of `p14_verdict`'s six `degraded` arms return **before** the
+observation block — a pair whose P5 rate ladder did not round-trip, and a pair that
+would not reopen — so they produced a `degraded` verdict carrying none of those
+cells, and the gate refused it. **A rig whose cable seated a millimetre differently
+after the drive would have turned the first ever executed 6.18 jq gate red for a
+reason that is not a defect**, which is precisely what the `degraded` arm exists to
+prevent.
+
+The cells are now stamped up front on every path, `null` where the search did not
+run — admissible by design, because the clause tests `has` and never a type or a
+value. **Two guards, because the hole needed both halves.** The one in
+`expectation_gates.rs` proves the *clause* admits the shape and that the repair did
+not loosen it (the same `degraded` with the cells gone is still refused); the one in
+`probes.rs` proves the *probe* produces it, and is the half that reddens when the
+stamp is removed — reaching the arm with no hardware, via a `VerifiedPair` whose
+`baseline_ok` is false. The original matcher proof missed this because it planted
+only against `supported` and against the honest *passive* report. **`degraded` was a
+third spelling, and it is the one a real rig produces** (plan §3 rule 10: plant the
+violation in every spelling the clause claims to cover).
+
+**(2) The last-close reference count is measured now, and it was measured by
+nothing.** notes §3.56 converted seven guards to hold a harness-opened slave fd
+across the observation, on the argument that *every kernel attaches its close-time
+work to the **last** close*. P13 had exactly three shapes and **every one used a
+single slave fd**, so none of them could see a reference count at all. The
+architecture of an entire harness rule rested on two kernels' source read by eye.
+
+`d_no_reader_second_fd_held` holds a second fd on the same pts across the writer's
+close and releases it only after the master has drained. On Linux 7.0.0-29 it is
+**not inert**, and the discriminator is not the one that was expected: the byte
+counts agree (64 of 64 either way — Linux retains), and the **terminal read** moves,
+`EIO` with one fd against `EAGAIN` with the witness held. The hangup itself is
+deferred to the reference-count edge. On a kernel that discards at last close the
+byte counts must move instead, which is what a Darwin or 6.18 run will show.
+
+The guard asserts *something* differs rather than *which* cell — that is what keeps
+it portable, and it is still a real assertion, because an implementation that opened
+no second fd moves nothing. Fail-first: releasing the witness **before** the drain
+instead of after collapses the shape into `a_no_reader_blocking_slave` and reddens it
+with `same bytes (64 vs 64), same terminal (EIO vs EIO)`. That mutation is stronger
+than "never open the witness", because it tests the semantic property — held
+*across* the observation — rather than the existence of an fd.
+
+**(3) A tripwire is documented as a finding rather than softened.**
+`p10_fionread_is_trustworthy_on_the_platform_of_record` is Linux-gated, calibrated
+on 7.0.0-29, and will run on 6.18 — where its own name refers to a kernel the design
+calls the platform of record and every figure behind it was measured elsewhere. It
+is **not** relaxed. §7's "a differing kernel is `degraded` with the observation
+named" is discharged by the *probe*, which reports `peer_pending_input_trust` as data
+and degrades properly; a test's job is to be loud. Its doc now says what a red there
+invalidates — exactly one thing, notes §3.45 (iv)'s reading of Darwin's
+`contradicted-empty` as a Darwin fault rather than a general one — and what it does
+not: no shipped behaviour, since the daemon never consumes the field.
+
+**(4) The protocol is written down**, in `docs/serial-nexus-doctor.md`. The last
+6.18 capture was Markdown, so its field set is *not computable* and it is two
+fingerprint eras behind; it is diffable against nothing this visit will produce. The
+section covers what to do before leaving (commit, or every artifact stamps `-dirty`
+and the same-binary claim becomes unprovable; take the counterpart triples at the
+same commit; warm both cargo caches, because `p8_external_codec` shells out to a
+second lock graph with no skip path), what to run there, and — the part that is easy
+to get backwards — that `SNX_CROSSOVER_A`/`_B` take plain `/dev/tty*` paths while
+`SNX_REPLUG_DEV` takes a by-id path and hard-fails on anything else.
+
+**One thing the audit proposed and this session declined**, recorded so it is not
+mistaken for an oversight: extending P10's drain ladder with a rung above capacity.
+The named open item is that no watermark bound is recoverable, and the ladder's
+smallest rung already drains **one byte**, leaving the highest occupancy the
+instrument can produce — a *larger* drain leaves a *lower* occupancy and is therefore
+even more likely to be accepted, so it cannot produce the refusal the bound needs.
+Either the open item is misstated or the mechanism is the reverse of the obvious
+reading, and changing a probe on a mechanism this session does not understand is how
+a measurement becomes wrong rather than absent. Left open, with the reasoning
+recorded (§5).

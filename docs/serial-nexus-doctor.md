@@ -305,6 +305,82 @@ sender is still writing, so the loss is the harness's and so is the number. P14
 polls both directions concurrently, which is what the daemon does (§5), and is the
 only shape whose failures belong to the wire.
 
+## Taking a capture on another kernel — the one-shot protocol
+
+The 2026-07-29 6.18 capture is **Markdown**, so `docs/doctor/README.md` records its
+field set as *"n/a — not computable"*: the digest is a pure function of
+`.probes[].observations`, and Markdown has no such array. A repeat of that wastes a
+visit to a kernel nobody can iterate on. This section is the protocol that does not.
+
+### Before leaving the box you *can* iterate on
+
+1. **Commit.** `doctor/build.rs` stamps `commit` from `git status --porcelain`
+   over the whole repository, so an uncommitted line anywhere makes every artifact
+   read `<sha>-dirty` — and the strongest comparability claim this project has is
+   *"`git diff A B -- '*.rs' '*.toml'` is empty, so these are the same binary"*
+   (§15.44). A `-dirty` stamp makes that unprovable.
+2. **Take the counterpart triples at the same commit** — passive *and* rig. A
+   cross-kernel diff needs both halves from one binary, and a triple whose
+   counterpart is one code-commit behind is not that.
+3. **Warm both dependency caches**, because `--locked` on a cold `~/.cargo` needs
+   the network for every crate, and `p8_external_codec` shells out to a *second*
+   cargo build against `examples/external-codec/Cargo.toml` with no skip path:
+   `cargo fetch --locked` and the same with `--manifest-path examples/external-codec/Cargo.toml`.
+4. **Record which adapter is on which `/dev` node.** P5's pair observation key is
+   built from `--port` order, so passing them in the other order moves `field_set`
+   for a reason that has nothing to do with the kernel.
+
+### On the other kernel
+
+```console
+$ rustc --version          # the workspace requires 1.97+; there is no rust-toolchain.toml
+$ jq --version             # the gate needs it and nothing self-skips for the gate itself
+$ cargo build --workspace --locked   # NOT optional: itest::bin() panics without it
+
+$ SHA=$(git rev-parse --short=7 HEAD)
+$ ls -l /dev/serial/by-id/           # pass the same adapter first as the counterpart triple
+
+# Passive triple — three runs, because P9 and P10 vary run to run (plan §3 rule 14)
+$ for i in 1 2 3; do ./target/debug/serial-nexus-doctor --json \
+    > docs/doctor/linux-<ver>-$(date -u +%F)-$SHA-passive-$i.json ; done
+
+# The gate, EXECUTED — this is the deliverable, not a formality
+$ ./target/debug/serial-nexus-doctor --json | jq -e -f expectations/linux.jq ; echo "gate exit=$?"
+
+# Tier-3 triple with the rig cross-wired (~35 s each; P14 is ~22 s of that)
+$ for i in "" -2 -3; do ./target/debug/serial-nexus-doctor --port $A --port $B --json \
+    > docs/doctor/linux-<ver>-$(date -u +%F)-$SHA-tier3$i.json ; done
+$ ./target/debug/serial-nexus-doctor --port $A --port $B --json | jq -e -f expectations/linux.jq
+
+# Markdown as well — it is what a human pastes into an issue, and it costs one run
+$ ./target/debug/serial-nexus-doctor --port $A --port $B --markdown \
+    > docs/doctor/linux-<ver>-$(date -u +%F)-$SHA-tier3.md
+
+# The suite. --no-fail-fast because this is PLATFORM validation (AGENTS §6): without
+# it, "one known failure" and "four unknown ones" produce identical output.
+$ uptime ; nproc                     # AGENTS §8: measure the box before blaming code
+$ cargo test --workspace --locked --no-fail-fast 2>&1 | tee /tmp/suite.log
+```
+
+Capture failing test **names verbatim before any rerun** (AGENTS §8). The rig lane is
+separate and by hand; `SNX_CROSSOVER_A`/`_B` take **plain `/dev/tty*` paths** while
+`SNX_REPLUG_DEV`/`_DEV_B` take **`/dev/serial/by-id/…` paths and hard-fail on
+anything else** — the two are opposite on purpose and it is the easiest thing to get
+wrong. The replug lane additionally needs `scripts/bless` on that box, which needs
+one interactive `sudo setcap`; over SSH with no tty it refuses gracefully and the
+lane silently skips.
+
+### Reading a red
+
+Two failures are **findings about the visited kernel rather than regressions**, and
+both say so at their own site: `p10_fionread_is_trustworthy_on_the_platform_of_record`
+(a calibration measured on 7.0, whose name refers to the kernel it runs on), and any
+probe verdict that moves. §7's rule — a kernel that differs is `degraded` with the
+observation named — is discharged by the *probes*; a red *test* is the tree asserting
+something it measured elsewhere, and the answer is to record the numbers and re-scope
+the claim, never to relax the assertion so a suite goes green on a kernel nobody has
+measured.
+
 ## Kernel-of-record report (Linux 7.0.0-28-generic and -29-generic, x86_64)
 
 ### P1–P4 as of 2026-07-19

@@ -383,14 +383,29 @@ fn p14_reports_skipped_not_a_uart_against_the_software_null_modem() {
          being absent rather than about the pts having no clock"
     );
 
-    // And the claim itself is absent. A `max_reliable_baud` on a pts is the exact
-    // failure this guard exists to catch, whatever the verdict word says.
-    assert!(
-        !p14["observations"]
-            .as_array()
-            .expect("P14 has an observations array")
-            .iter()
-            .any(|o| o["key"] == json!("max_reliable_baud")),
+    // And the claim itself is absent. A `max_reliable_baud` **value** on a pts is
+    // the exact failure this guard exists to catch, whatever the verdict word says.
+    //
+    // The assertion is on the *value*, not on the key, and the difference is a
+    // collision between two correct requirements. `expectations/*.jq` needs the
+    // cell **present** on every non-skipped path — a `degraded` report that omits
+    // it is refused, which is how a marginal cable used to redden the lane — and
+    // `field_set` wants the cell set stable between a passive run and a rig-less
+    // one. So the probe stamps the three cells on every path and fills them in
+    // only when the search runs. This guard originally asserted the key was
+    // absent, and that assertion started failing the moment the cells were
+    // stamped: correct guard, superseded shape. What it must refuse is a
+    // *ceiling*, and a `null` is the probe saying it has none.
+    let ceiling = p14["observations"]
+        .as_array()
+        .expect("P14 has an observations array")
+        .iter()
+        .find(|o| o["key"] == json!("max_reliable_baud"))
+        .map(|o| o["value"].clone())
+        .expect("P14 carries the cell on every path, so the gate admits its degrades");
+    assert_eq!(
+        ceiling,
+        Value::Null,
         "P14 reported a ceiling for a software null modem: {}",
         p14["observations"]
     );

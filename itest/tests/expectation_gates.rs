@@ -714,3 +714,69 @@ fn the_handshake_clause_rejects_a_certified_pair_that_reports_no_handshake() {
         expectation.display()
     );
 }
+
+/// **The P14 presence clause must admit a `degraded` report, and it did not**
+/// (plan §3 rule 10 — plant the violation in *every* spelling the clause covers).
+///
+/// The clause exempts `skipped` and requires the cells otherwise, which is right.
+/// What was wrong was the probe: two of `p14_verdict`'s six `degraded` arms —
+/// a pair whose P5 rate ladder did not round-trip, and a pair that would not
+/// reopen — returned *before* the observation block, so they emitted a `degraded`
+/// verdict with no `max_reliable_baud` at all and the gate rejected them. A rig
+/// whose cable seated a millimetre differently would have turned the lane red for
+/// a reason that is not a defect, which is the exact failure the `degraded` arm
+/// exists to prevent.
+///
+/// The original matcher proof missed it because it planted only against
+/// `supported` and asserted the honest *passive* report passed. `degraded` is a
+/// third spelling and it is the one a real rig produces. Both directions are
+/// asserted here: the complete-but-null shape is **accepted**, and the shape with
+/// the cells missing is still **rejected**, so the fix widened the probe and not
+/// the gate.
+#[test]
+fn the_p14_presence_clause_admits_a_degraded_report_that_carries_null_cells() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let expectation = platform_expectation();
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    // The shape a rig with a failed baseline ladder produces: `degraded`, the
+    // search never ran, the cells present and honestly null.
+    let degraded_complete = jq_filter(
+        r#"(.probes[] | select(.id=="P14")) |= (.status = "degraded" | del(.reason)
+           | .observations = [{"key":"max_reliable_baud","value":null},
+                              {"key":"ceiling_kind","value":null},
+                              {"key":"structural_max_baud","value":4294967295},
+                              {"key":"ceiling_is_a_floor_over","value":"nothing yet — the search did not run on this path; the verdict says why."},
+                              {"key":"pairs_discovered","value":1}])"#,
+        &report,
+    );
+    assert!(
+        gate_accepts(&expectation, &degraded_complete),
+        "{} rejected a `degraded` P14 that carries every cell with an honest \
+         null — so a rig whose P5 ladder did not round-trip reddens the lane for \
+         a reason that is not a defect",
+        expectation.display()
+    );
+
+    // And the fix must not have loosened the clause: the same `degraded` with the
+    // cells gone is still refused.
+    let degraded_bare = jq_filter(
+        r#"(.probes[] | select(.id=="P14")) |= (.status = "degraded" | del(.reason)
+           | .observations = [{"key":"pairs_discovered","value":1},
+                              {"key":"structural_max_baud","value":4294967295}])"#,
+        &report,
+    );
+    assert!(
+        !gate_accepts(&expectation, &degraded_bare),
+        "{} admitted a `degraded` P14 carrying no ceiling cells at all — the \
+         repair was supposed to widen the probe, not the gate",
+        expectation.display()
+    );
+}

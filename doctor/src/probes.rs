@@ -1481,6 +1481,28 @@ enum CloseShape {
     /// branches on exactly this flag, so the pair is a controlled A/B on the
     /// branch rather than an inference about it.
     NoReaderNonblocking,
+    /// As `NoReader`, but **a second fd on the same slave is held open across the
+    /// writer's close**, and released only after the master has drained.
+    ///
+    /// **This shape measures the premise an entire test-harness architecture rests
+    /// on, and nothing measured it before.** notes §3.56 converted seven guards to
+    /// hold a harness-opened slave fd across the observation, on the argument that
+    /// *every kernel attaches its close-time work to the **last** close of the
+    /// pty* — XNU runs `ptsclose` → `ttylclose` → `ttywflush` at reference count
+    /// zero, Linux charges `discarded_at_last_close` at the same edge — so a
+    /// witness fd is exactly as strong as holding the writing client open. That
+    /// argument was read out of two kernels' source and never measured: P13's
+    /// other three shapes all use a **single** slave fd, so none of them can see a
+    /// reference count at all.
+    ///
+    /// Read it against `a_no_reader_blocking_slave`, which is the same session
+    /// without the witness. On a kernel that **retains** (Linux) the two agree and
+    /// the shape is a control proving itself inert — the same role P12's windows
+    /// play there. On a kernel that **discards at last close** (Darwin) they must
+    /// differ: this one recovers the payload and that one does not. A kernel where
+    /// they *do not* differ is one where a held fd buys nothing, and seven guards
+    /// in `itest` would need their argument rewritten rather than their code.
+    NoReaderSecondFdHeld,
 }
 
 impl CloseShape {
@@ -1489,6 +1511,7 @@ impl CloseShape {
             CloseShape::NoReader => "a_no_reader_blocking_slave",
             CloseShape::ReaderDrains => "b_reader_drains_before_close",
             CloseShape::NoReaderNonblocking => "c_no_reader_nonblocking_slave",
+            CloseShape::NoReaderSecondFdHeld => "d_no_reader_second_fd_held",
         }
     }
 }
@@ -1588,6 +1611,7 @@ pub fn p13_last_close_disposition() -> Probe {
         CloseShape::NoReader,
         CloseShape::ReaderDrains,
         CloseShape::NoReaderNonblocking,
+        CloseShape::NoReaderSecondFdHeld,
     ];
     let mut p = p;
     let mut results: Vec<(CloseShape, CloseResult)> = Vec::new();
@@ -1618,6 +1642,31 @@ pub fn p13_last_close_disposition() -> Probe {
     };
 
     let recovered = bare.bytes_before + bare.bytes_after;
+    // **The reference-count reading, and it is the comparison a reader would not
+    // otherwise make.** Shape `d` is shape `a` with a second fd on the same pts
+    // held across the writer's close, so the pair isolates the *last*-close edge
+    // that notes §3.56's harness architecture rests on. Which cell moves is the
+    // kernel's to decide and is exactly what a cross-kernel diff wants: on a
+    // kernel that retains, the byte counts agree and the **terminal read** is the
+    // discriminator (Linux 7.0.0-29 reads `EIO` with one fd and `EAGAIN` with the
+    // witness held — the hangup itself is deferred); on a kernel that discards at
+    // last close, the byte counts must differ, and a kernel where *neither* moves
+    // is one where a held fd buys nothing and seven `itest` guards need a new
+    // argument rather than new code.
+    let held = results
+        .iter()
+        .find(|(s, _)| matches!(s, CloseShape::NoReaderSecondFdHeld))
+        .map(|(_, r)| r);
+    let ref_count = match held {
+        Some(h) => format!(
+            " **The last-close reference count** is measured too, by holding a second fd on the same pts across the writer's close (`d_no_reader_second_fd_held` against `a_no_reader_blocking_slave`): {} of {P13_PAYLOAD} byte(s) survive with the witness held against {} without it, and the terminal read is `{}` against `{}`. Compare the two rows rather than reading either alone — that pair is the whole measurement, and if *neither* the bytes nor the terminal move on some kernel, a held fd buys nothing there and the harness rule that depends on it (notes §3.56) is resting on nothing.",
+            h.bytes_before + h.bytes_after,
+            bare.bytes_before + bare.bytes_after,
+            h.terminal,
+            bare.terminal,
+        ),
+        None => String::new(),
+    };
     let waited = bare.close_us >= P13_WAIT_THRESHOLD_US;
     let policy = p13_policy(bare.close_us, recovered);
     let drained_note = match drained {
@@ -1653,7 +1702,7 @@ pub fn p13_last_close_disposition() -> Probe {
     p.verdict(
             Status::Supported,
             &format!(
-                "This kernel **{policy}** bytes a pts client wrote but the master never read: with no reader, {recovered} of {P13_PAYLOAD} byte(s) survive the last close and `close(2)` takes {} µs (terminal read `{}`).{drained_note} Numbers, not a verdict — every policy is legitimate and the daemon is correct under each (§7.2 drains before finalizing a close, §5 accounts what it reads). Read it for two things: a cross-kernel diff, and the reason a harness reads a byte counter while its client is still open rather than after (notes §3.29). A `waits-then-*` kernel additionally means a lost byte implies a reader stalled for the whole timeout, not a lost microsecond race.",
+                "This kernel **{policy}** bytes a pts client wrote but the master never read: with no reader, {recovered} of {P13_PAYLOAD} byte(s) survive the last close and `close(2)` takes {} µs (terminal read `{}`).{drained_note} Numbers, not a verdict — every policy is legitimate and the daemon is correct under each (§7.2 drains before finalizing a close, §5 accounts what it reads). Read it for two things: a cross-kernel diff, and the reason a harness reads a byte counter while its client is still open rather than after (notes §3.29). A `waits-then-*` kernel additionally means a lost byte implies a reader stalled for the whole timeout, not a lost microsecond race.{ref_count}",
                 bare.close_us, bare.terminal
             ),
         )
@@ -1733,6 +1782,20 @@ fn p13_shape(shape: CloseShape) -> anyhow::Result<CloseResult> {
     let slave = open(pts.as_str(), flags, Mode::empty())?;
     let (slave_mode, baseline_packet_bytes) = p13_arm_slave(&slave, fd, &mut buf);
 
+    // The witness: a *second* fd on the same pts, opened before the writer closes
+    // and released after the master has drained. It is opened after the baseline
+    // re-assert so it cannot perturb it, and it is deliberately not written
+    // through — the claim under test is about the reference count, not about a
+    // second writer.
+    let witness = match shape {
+        CloseShape::NoReaderSecondFdHeld => Some(open(
+            pts.as_str(),
+            OFlag::O_RDWR | OFlag::O_NOCTTY,
+            Mode::empty(),
+        )?),
+        _ => None,
+    };
+
     // The payload is 64 `x`. That it survives a cooked discipline unchanged is a
     // property of the *byte*, not an accident to rely on silently: OPOST/ONLCR
     // expands `\n` and leaves `x` alone, measured on 7.0.0-29 as 64 recovered raw
@@ -1763,6 +1826,11 @@ fn p13_shape(shape: CloseShape) -> anyhow::Result<CloseResult> {
     let (raw_after, reads_after, _, terminal) = read_available(fd, &mut buf, 64);
     // Same control-byte correction as above.
     let bytes_after = raw_after.saturating_sub(reads_after);
+
+    // Release the witness only now — after the drain — so what was recovered above
+    // was recovered while the reference count was still above zero. Dropping it
+    // earlier would make this shape a slower spelling of `NoReader`.
+    drop(witness);
 
     Ok(CloseResult {
         close_us,
@@ -6015,6 +6083,28 @@ pub fn p14_max_rate(ports: &[PathBuf], pairs: &[VerifiedPair]) -> Probe {
         baseline_reproved: false,
         search_budget_exhausted: false,
     };
+    // **The three cells the gate requires, stamped up front on every path.**
+    //
+    // They used to be emitted only after the search ran, and two `degraded` arms
+    // return before that — a pair whose P5 ladder did not round-trip, and a pair
+    // that would not reopen. `expectations/*.jq` exempts only `skipped`, so those
+    // two arms produced a `degraded` report with no `max_reliable_baud` and the
+    // gate went **red for a reason that is not a defect** — exactly what the
+    // `degraded` arm exists to prevent. A rig whose cable seated a millimetre
+    // differently would have reddened the lane.
+    //
+    // `null` is admissible by design: the clause tests `has`, never a type and
+    // never a value, precisely so an incomplete search can say so. The search
+    // overwrites these with real values when it runs; `Probe::observe` appends, so
+    // a reader sees the later, truer pair — and a report that never got there
+    // still carries the keys with an honest `null`.
+    p = p
+        .observe("max_reliable_baud", serde_json::Value::Null)
+        .observe("ceiling_kind", serde_json::Value::Null)
+        .observe(
+            "ceiling_is_a_floor_over",
+            "nothing yet — the search did not run on this path; the verdict says why.",
+        );
     p = p.observe("pairs_discovered", pairs.len() as u64);
     // Stated on every path, including the ones that never measure a rate: a
     // report has to say what the instrument's own limit is before its answer can
@@ -7578,6 +7668,51 @@ mod tests {
     /// both end with nothing recovered. Pin all four quadrants, and pin the pair
     /// that differs *only* in the close duration, or a later simplification that
     /// drops `close_us` from the classifier would pass every other test here.
+    /// **P13's fourth shape must not be inert on the platform of record.**
+    ///
+    /// `d_no_reader_second_fd_held` is `a_no_reader_blocking_slave` with a second
+    /// fd held across the writer's close. If the two rows are identical in every
+    /// cell, the witness bought nothing here and the shape is a decoration — and
+    /// that matters beyond this probe, because notes §3.56 converted seven `itest`
+    /// guards to hold exactly such a witness on exactly that argument.
+    ///
+    /// **Which cell moves is the kernel's to decide, and this guard does not pin
+    /// it.** Linux `retains`, so the byte counts agree and the *terminal read* is
+    /// the discriminator — measured 7.0.0-29: `EIO` when the writer's close is the
+    /// last one, `EAGAIN` while the witness is held, because the hangup itself is
+    /// deferred to the reference-count edge. A kernel that discards at last close
+    /// would move the byte counts instead. Asserting "something differs" rather
+    /// than "the terminal differs" is what keeps this portable, and it is still a
+    /// real assertion: an implementation that opened no second fd would move
+    /// nothing at all.
+    #[test]
+    fn the_last_close_reference_count_shape_is_not_inert_here() {
+        let bare = p13_shape(CloseShape::NoReader).expect("the no-reader shape runs");
+        let held = p13_shape(CloseShape::NoReaderSecondFdHeld).expect("the held-fd shape runs");
+        assert_eq!(
+            bare.bytes_before + bare.bytes_after,
+            P13_PAYLOAD as u64,
+            "the platform of record retains a departed writer's bytes; if this \
+             kernel does not, the reading below changes and so does notes §3.56's \
+             argument"
+        );
+        let bytes_differ =
+            (bare.bytes_before + bare.bytes_after) != (held.bytes_before + held.bytes_after);
+        let terminal_differs = bare.terminal != held.terminal;
+        assert!(
+            bytes_differ || terminal_differs,
+            "holding a second fd on the same pts across the writer's close changed \
+             nothing at all — same bytes ({} vs {}), same terminal ({} vs {}). Then \
+             a witness fd is not the last-close edge on this kernel, and the seven \
+             guards notes §3.56 converted are resting on an argument this box does \
+             not support",
+            bare.bytes_before + bare.bytes_after,
+            held.bytes_before + held.bytes_after,
+            bare.terminal,
+            held.terminal
+        );
+    }
+
     #[test]
     fn p13_policy_reads_the_close_duration_not_only_the_byte_count() {
         let slow = P13_WAIT_THRESHOLD_US;
@@ -8208,6 +8343,21 @@ mod tests {
     /// asserts a kernel behaviour measured on Linux; running it where it was not
     /// measured is the proxy §9 forbids, and on Darwin it would assert the very
     /// defect being reported.
+    ///
+    /// **If this is red on 6.18, it is a finding about the production kernel and
+    /// not a regression — read it, do not "fix" it.** The name says *platform of
+    /// record*, and the design's platform of record is 6.18 (§13), while every
+    /// figure behind this assertion was measured on 7.0.0-29. So a red here on
+    /// the production kernel says the two Linuxes disagree about `FIONREAD` on a
+    /// pty, which invalidates exactly one thing: notes §3.45 (iv)'s reading of
+    /// Darwin's `contradicted-empty` as a *Darwin* fault rather than a general
+    /// one. It invalidates no shipped behaviour — P10 reports
+    /// `peer_pending_input_trust` as data and the daemon never consumes it — and
+    /// §7's rule that a differing kernel is `degraded` with the observation named
+    /// is discharged by the probe, which does exactly that. This is a test, and a
+    /// test's job is to be loud. Capture the numbers, record them beside §3.45,
+    /// and re-scope the Darwin claim; do not relax the assertion to make a suite
+    /// green on a kernel nobody has measured.
     #[test]
     #[cfg(target_os = "linux")]
     fn p10_fionread_is_trustworthy_on_the_platform_of_record() {
@@ -8885,6 +9035,64 @@ mod tests {
         // And the control: with the budget intact the same facts are supported,
         // so the arm above is about the budget and not about something else.
         assert!(matches!(p14_verdict(p14_good()).0, Status::Supported));
+    }
+
+    /// **Every P14 path emits the three cells the gate requires, including the
+    /// ones that return before the search runs.**
+    ///
+    /// `expectations/*.jq` exempts `skipped` and requires `max_reliable_baud`,
+    /// `ceiling_kind` and `ceiling_is_a_floor_over` otherwise. Two `degraded` arms
+    /// returned before the observation block — a pair whose P5 ladder did not
+    /// round-trip, and a pair that would not reopen — so a real rig with a
+    /// marginally seated cable produced a `degraded` report the gate **rejected**,
+    /// which is the opposite of what the `degraded` arm is for.
+    ///
+    /// The companion guard in `itest/tests/expectation_gates.rs` proves the
+    /// *clause* admits the shape; this one proves the *probe* produces it, which
+    /// is the half that reddens when the stamp is removed. It reaches the arm with
+    /// no hardware: a verified pair whose `baseline_ok` is false returns before any
+    /// port is opened.
+    #[test]
+    fn every_p14_path_carries_the_cells_the_gate_requires() {
+        let pair = VerifiedPair {
+            a: PathBuf::from("/dev/does-not-exist-a"),
+            b: PathBuf::from("/dev/does-not-exist-b"),
+            a_name: "a".into(),
+            b_name: "b".into(),
+            both_uart: true,
+            // The arm under test: discovery paired them, the certificate's rate
+            // ladder did not round-trip, so the question cannot be asked.
+            baseline_ok: false,
+        };
+        let ports = vec![pair.a.clone(), pair.b.clone()];
+        let p = p14_max_rate(&ports, std::slice::from_ref(&pair));
+        assert_eq!(
+            p.status.label(),
+            "degraded",
+            "a pair whose baseline failed must degrade, not answer"
+        );
+        for key in [
+            "max_reliable_baud",
+            "ceiling_kind",
+            "ceiling_is_a_floor_over",
+        ] {
+            assert!(
+                p.observations.iter().any(|o| o.key == key),
+                "the {key} cell is missing from a `degraded` P14, so                  `expectations/*.jq` rejects a report whose only fault is that the                  rig's cable was marginal: {:?}",
+                p.observations.iter().map(|o| &o.key).collect::<Vec<_>>()
+            );
+        }
+        // And the skip paths carry them too — the gate exempts `skipped`, but a
+        // reader diffing cell sets across kernels should not see them appear and
+        // disappear with the rig.
+        let none = p14_max_rate(&[], &[]);
+        assert_eq!(none.status.label(), "skipped");
+        assert!(
+            none.observations
+                .iter()
+                .any(|o| o.key == "max_reliable_baud"),
+            "even a skipped P14 should carry the cell, so `field_set` does not              move between a passive run and a rig-less one"
+        );
     }
 
     #[test]
