@@ -1665,6 +1665,37 @@ pub fn usb_port_of(by_id_link: &Path) -> Option<String> {
     None
 }
 
+/// Announce the TLS round-trip's self-skip — and refuse to skip when the operator
+/// has said the tier must be exercised.
+///
+/// **The one skip class that had no `required` spelling** (plan §3 rule 11, plan §18
+/// item 10). `web_tls_round_trip` is the only proof that the TLS tier's *handshake*
+/// works rather than merely that it binds, and it carries **two** silent skips: no
+/// `curl` on `PATH` (plan §11.6 names curl as the client, and `std` ships no TLS
+/// client), and an environment that cannot bind `0.0.0.0:0` with `--tls`. Either one
+/// turns the tier's only end-to-end guard into a green line, and nothing in the
+/// output distinguishes that from a run that exercised it — the shape notes §3.35
+/// measured and §3.43 measured again, both times on a box where the capability was
+/// present and the harness never used it.
+///
+/// `SNX_TLS=required` turns both into hard failures, exactly as `SNX_CROSSOVER` and
+/// `SNX_REPLUG` do for their classes. It is a third instance of one mechanism rather
+/// than a third mechanism: same variable shape, same word, same failure text — a skip
+/// class that invented its own spelling would be a fourth thing to remember.
+///
+/// `reason` names *which* of the two skips fired, because they call for different
+/// actions: one is a missing tool, the other is a sandbox that will not bind.
+pub fn skip_no_tls(test: &str, reason: &str) {
+    assert!(
+        std::env::var("SNX_TLS").as_deref() != Ok("required"),
+        "SNX_TLS=required, but {test} skipped: {reason}.\n\
+         Required mode exists so a box that can run the TLS round-trip cannot report \
+         a green run for the one guard that proves the handshake rather than the bind \
+         (plan §11.6, §3 rule 11)."
+    );
+    eprintln!("SKIP {test}: {reason}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1810,35 +1841,4 @@ mod tests {
             .expect("write the garbage line");
         let _ = sub.next(Duration::from_secs(5));
     }
-}
-
-/// Announce the TLS round-trip's self-skip — and refuse to skip when the operator
-/// has said the tier must be exercised.
-///
-/// **The one skip class that had no `required` spelling** (plan §3 rule 11, plan §18
-/// item 10). `web_tls_round_trip` is the only proof that the TLS tier's *handshake*
-/// works rather than merely that it binds, and it carries **two** silent skips: no
-/// `curl` on `PATH` (plan §11.6 names curl as the client, and `std` ships no TLS
-/// client), and an environment that cannot bind `0.0.0.0:0` with `--tls`. Either one
-/// turns the tier's only end-to-end guard into a green line, and nothing in the
-/// output distinguishes that from a run that exercised it — the shape notes §3.35
-/// measured and §3.43 measured again, both times on a box where the capability was
-/// present and the harness never used it.
-///
-/// `SNX_TLS=required` turns both into hard failures, exactly as `SNX_CROSSOVER` and
-/// `SNX_REPLUG` do for their classes. It is a third instance of one mechanism rather
-/// than a third mechanism: same variable shape, same word, same failure text — a skip
-/// class that invented its own spelling would be a fourth thing to remember.
-///
-/// `reason` names *which* of the two skips fired, because they call for different
-/// actions: one is a missing tool, the other is a sandbox that will not bind.
-pub fn skip_no_tls(test: &str, reason: &str) {
-    assert!(
-        std::env::var("SNX_TLS").as_deref() != Ok("required"),
-        "SNX_TLS=required, but {test} skipped: {reason}.\n\
-         Required mode exists so a box that can run the TLS round-trip cannot report \
-         a green run for the one guard that proves the handshake rather than the bind \
-         (plan §11.6, §3 rule 11)."
-    );
-    eprintln!("SKIP {test}: {reason}");
 }
