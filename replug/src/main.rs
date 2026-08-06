@@ -45,7 +45,11 @@
 #[path = "linux/mod.rs"]
 mod platform;
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+#[path = "macos/mod.rs"]
+mod platform;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn main() {
     platform::main();
 }
@@ -57,7 +61,7 @@ fn main() {
 /// an ambiguity. `itest`'s `blessed_replug` already reports *why* the helper is
 /// unusable rather than skipping silently; this keeps that contract on a platform
 /// where the answer is "not this kernel" instead of "not installed".
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn main() {
     eprintln!(
         "serial-nexus-replug is Linux-only (design §15.45, notes §3.65 A).\n\

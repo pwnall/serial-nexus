@@ -15,6 +15,14 @@
 #[cfg(target_os = "linux")]
 pub mod caps;
 
+/// USB re-enumeration on Darwin — the macOS half of the replug helper (§15.45).
+/// macOS-only for the mirror-image reason `caps` is Linux-only: it is IOKit, and
+/// the mechanism it wraps (`USBDeviceReEnumerate`) has no counterpart elsewhere.
+/// Unlike the Linux path it needs no privilege, and unlike the Linux path its
+/// outage is atomic — see the module docs (notes §3.66).
+#[cfg(target_os = "macos")]
+pub mod usb_macos;
+
 use nix::libc;
 use std::os::fd::RawFd;
 

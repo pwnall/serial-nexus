@@ -8487,3 +8487,92 @@ answer does not — and the passive path was checked too, where P15 skips and bo
 **What P15 does not do is answer the design question**, and that is deliberate. `rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes`
 is still red on Darwin, and it should stay red until the fault-versus-degrade decision is made,
 because a green suite would be the wrong summary of a platform that cannot do what the config asks.
+
+### 3.66 The macOS replug backend: the equivalent that exists, built as far as it goes
+
+**Design:** §15.45 (the replug helper), §16.3 (`unsafe` lives in `serial_nexus_sys` and
+nowhere else), §7 (a platform that differs is reported, never silently approximated).
+
+§3.65 A′ established that a macOS equivalent of Linux's sysfs `authorized` replug **exists** and
+measured where the equivalence stops. This entry builds it. The result is a working
+`serial-nexus-replug` on Darwin with four of six verbs doing real work, one refusing on purpose,
+and one reporting that it has nothing to do.
+
+**The mechanism, and where the `unsafe` went.** `serial_nexus_sys::usb_macos` wraps IOUSBLib's
+`USBDeviceReEnumerate` — the whole FFI surface, because §16.3 permits `unsafe` in exactly one
+crate and a platform port is not a reason to widen that. **No new crates.io dependency**: IOKit
+and CoreFoundation are linked as system frameworks with `#[link(kind = "framework")]`, so
+`cargo deny check licenses bans sources` does not move, which matters because the replug helper's
+dependency list is part of its security argument.
+
+**Two registry nodes describe one device, and confusing them is silent.** `IOUSBHostDevice` is
+the modern node and the one the serial driver's `IOSerialBSDClient` — and therefore
+`IOCalloutDevice` — hangs beneath. `IOUSBDevice` is the legacy shim carrying the `IOCFPlugInTypes`
+handle IOUSBLib needs, with no serial client under it. Enumeration reads the host node; the
+re-enumeration matches the legacy node for the plugin; both key on the serial number. An earlier
+draft read the callout from the legacy node and reported **no ttys at all**, cleanly and wrongly —
+recorded because the failure had no error attached to it.
+
+**The vtable is proven before anything destructive runs.** IOUSBLib is a COM-style plugin: the
+interface is a pointer to a pointer to a table of function pointers, and calling the wrong slot is
+calling an arbitrary function with a device open. The slot indices were **printed from the SDK
+headers with `offsetof` on this machine**, not recalled — `USBDeviceReEnumerate` is slot 37 of 51,
+`USBDeviceOpen` 8, `GetDeviceVendor` 13 — as were the three `CFUUIDBytes` constants. A number
+correct today can still be wrong on a future macOS, so `reenumerate` calls the **harmless** slot
+first: `GetDeviceVendor`, whose answer is already known from a CF property read by an entirely
+different route. If the table were misaligned the two would disagree and the function refuses
+without touching the bus. That is §9's discipline applied to an FFI boundary — prove the
+instrument, then trust the measurement — and on this rig the check reads `0403` and matches.
+
+**What the verbs do here.**
+
+| verb | Darwin |
+|---|---|
+| `cycle` | Re-enumerates, then **measures** the outage and reports `session_id` either side |
+| `status` | Identity, `session_id`, and the callout node |
+| `preflight` | Ready iff a **serial adapter** is attached, not merely a device with a serial |
+| `capabilities` | Reports that none is required, with the reason |
+| `authorize` | Nothing to repair: there is no deauthorized state to be stuck in |
+| `install` | Nothing to install: the mechanism is unprivileged |
+| `hold` | **Refused**, exit 3 |
+
+**`--hold-ms` is reported unhonoured rather than quietly dropped.** The Linux mechanism is
+two-step and holdable; this one is atomic. `cycle` therefore emits `hold_ms_requested` beside
+`hold_ms_honoured: false` and `hold_unsupported_because`, and prints a warning on the prose path.
+A helper that silently turned a requested 1500 ms hold into 41 ms would hand a test a window it
+never had, which is worse than refusing. `hold` — whose entire purpose is a caller-controlled
+window — refuses outright rather than approximating one.
+
+**`session_id` is Darwin's `devnum`, and it is the field that makes a replug provable.** Linux's
+helper reports `devnum` because the kernel reissues it on every enumeration, separating a real
+replug from a driver rebind. Measured here across a `USBDeviceReEnumerate`: the target's
+`sessionID` moves and an untouched adapter's on the same bus does **not** — which is what makes it
+a witness for *this* device rather than for bus activity. `cycle` reports
+`session_id_changed` rather than leaving a reader to compare two large integers.
+
+**`preflight` counts serial adapters, not devices with serial numbers.** Fourteen USB devices on
+this machine name a serial — the Touch Bar, the camera — and counting those would report *ready*
+on a box with no adapter attached, which is the one answer a caller uses to decide whether to
+skip. Requiring a callout node makes the evidence "a serial driver attached", and on this box that
+is 2 of 14.
+
+**A stranded adapter is a failure, and that distinction cost an enum.** Watching the callout node
+has three outcomes, not two: no node to watch (a device with no serial driver — replugging it
+still succeeded), a node that left and returned (the number), and a node that left and **did not
+come back** inside the window. Only the third is a failure, and it exits `FAILED` rather than 0,
+because telling a caller its rig is intact when an adapter is off the bus is the worst thing this
+helper can do. The first draft folded the first and third together into `Option<u64>`; the guard
+that caught it is the one that now pins all three.
+
+**Measured on the rig, both adapters, at `--json`:** `session_id_changed: true` on each, outages
+of **42 ms** and **42 ms**, both nodes returned at their original paths, exit 0. `--dry-run`
+resolves every name and changes nothing (`reenumerated: false`, `session_id` unmoved, no outage),
+which is the positive control a caller's discriminator is checked against. An unresolvable name is
+refused **even under `--dry-run`**, so a typo cannot pass as a successful rehearsal.
+
+**What is still not portable, stated so it is not rediscovered.** `itest`'s `p7_replug_hardware`
+takes `SNX_REPLUG_DEV` as a `/dev/serial/by-id/...` path and the Linux helper takes a bus port
+name like `3-1`; the macOS arm is addressed by USB serial number, because that is the identity
+IOKit offers and macOS has no bus path of that shape. Wiring the hardware replug test to this
+backend therefore needs a per-platform address in the harness, which is a change to a test's
+contract and is **not** made here.
