@@ -8040,3 +8040,73 @@ rather than assumed.
 per-trial classification collapsed back to "everything is a loss", and the budget
 arm short-circuited: each reddened its own guard, and the tree was restored green
 after each.
+
+### 3.62 §18 item 3, discriminated: H1 refuted, the correlate named, and the signature is exactly 64 bytes
+
+**Supersedes the reading of §3.58, does not replace its runs.** §3.58 recorded four
+full rig-attached runs with 0 failures and said plainly why that refuted nothing:
+the replug lane was not running, because the blessed helper read `Stale`. It was
+re-blessed, and the picture changed completely.
+
+**One correction to §3.58 first.** The helper was blessed the whole time — the
+*install* never moved (still dated 12:40, byte-identical to the build). What moved
+was `target/debug/serial-nexus-replug`: a rebuild drifted it and a later rebuild
+drifted it back, which is the reproducibility §3.54 measured and the reason the
+staleness check warns rather than fails. §3.58's runs genuinely had no replug lane
+— `SNX_REPLUG_DEV` was unset — so its evidence stands; only its explanation of
+*why* it could not run does not.
+
+**The measurements.** Same box, same commit, load 0.21–0.93 throughout.
+
+| lane | shape | runs | failing |
+|---|---|---|---|
+| replug **absent** (`SNX_REPLUG*` unset, tests self-skip, binary still built) | default threads | 3 | **0** |
+| replug **absent** | `--test-threads=1` | 1 | **0** |
+| replug **green** | default threads | 3 | **2** |
+| replug **green** | `--test-threads=1` | 2 | **1** |
+
+**H1 — "the suite got longer" — is refuted as the mechanism.** The failure
+reproduces under `--test-threads=1`, where there is no concurrency left to blame,
+and it does *not* reproduce in a run of the same length whose only difference is
+that the replug tests skipped instead of cycling the USB devices. Serialization was
+the arm §3.54 pre-registered as discriminating, and it discriminated.
+
+**What correlates is the replug lane executing**: 3 failing of 5 with it, 0 of 4
+without, on top of §3.54's own 2 of 5 with and 0 of 5 before the replug work
+existed. Combined: **5 of 10 with, 0 of 9 without.**
+
+**Two things §3.54's framing got wrong, both now measured.**
+
+1. **It is not "the same two tests".** The third failure is
+   `serial_hardware::crossover_rig_data_plane_send_and_exclusivity` — a test §3.54
+   never names — failing with the *identical* signature. So this is not two
+   timing-sensitive tests being flaky; it is `serial_hardware`'s `inject_verify`
+   path failing whenever the replug lane has run, and which of its four tests draws
+   the short straw is incidental.
+2. **The signature is exact and it repeats.** All three failures read
+   `only 32704/32768 B crossed the wire` — **exactly 64 bytes short**, three times
+   out of three, at 64.6–67.7 s against a usual ~10.4 s. A round 64 is not the
+   shape of a marginal wire; it is one FTDI bulk packet. The long duration is the
+   harness waiting out its deadline for bytes that never arrive, not a slow
+   transfer.
+
+**Mechanism not established, and no root cause is claimed.** A whole USB packet
+going missing after a deauthorize/reauthorize cycle has several readings — a stale
+URB, a device-side FIFO not drained across the cycle, a driver-side buffer boundary
+— and this session separated none of them. What is established is which variable
+moves the outcome, which is what the item asked for.
+
+**One diagnosis this session's own work is exonerated of.** `serial_hardware.rs`'s
+`inject_verify` was converted to `settled_while_open` earlier the same day
+(§3.56), which made it a candidate cause. The replug-absent arms ran the *same
+converted code* and failed 0 of 4, so the conversion is not the cause. Recorded
+because §9 makes a refuted diagnosis as load-bearing as a confirmed one, and this
+one was mine.
+
+**What the next session should do, and it is now a narrow question.** Instrument
+the 64 bytes rather than the suite: capture where in the 32768 the gap falls (head,
+tail, or interior), and compare a run whose replug hold is a no-op — authorize
+immediately, no down time — against one with the normal hold. Same binary count,
+same suite length, same test names; only the USB cycle differs. That is the
+experiment §3.58 proposed before any of this was measured, and it is now the only
+one left worth running.
