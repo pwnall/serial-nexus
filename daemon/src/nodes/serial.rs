@@ -1647,7 +1647,6 @@ mod tests {
         path: std::path::PathBuf,
     }
 
-    #[cfg(target_os = "linux")]
     /// **The premise the bare-`POLLHUP` arm rests on: a hangup that still has
     /// readable bytes reports `POLLIN` too** (notes §3.69).
     ///
@@ -1732,6 +1731,14 @@ mod tests {
         }
     }
 
+    /// Gated because `PtsFixture` is, and the two must move together. The attribute
+    /// was orphaned once already: it sat directly above this `fn`, and an insertion
+    /// between it and this line silently transferred it to the new item — a shape
+    /// `cargo build` cannot see, because it only reddens the `lib test` target and
+    /// only off Linux. The Linux CI lane now runs `cargo check --target
+    /// aarch64-apple-darwin --all-targets`, which is what catches the class rather
+    /// than this instance (notes §3.71).
+    #[cfg(target_os = "linux")]
     fn pts_fixture() -> PtsFixture {
         use nix::fcntl::OFlag;
         use nix::pty::{grantpt, posix_openpt, unlockpt};

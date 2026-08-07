@@ -9002,3 +9002,79 @@ bus — and no root cause is claimed there (§9). What is established is where t
 are *not* lost: the daemon is faultless, by its own counters and the kernel's, and
 this was never a product defect. The primer makes the rig tests measure the property
 they promise rather than the state of an adapter that was re-enumerated a moment ago.
+
+### 3.71 A cfg attribute stolen by an insertion: the macOS break `cargo build` cannot see
+
+**Design:** §13 (macOS is best-effort, and must still *compile*). **Plan:** §3 rule 8.
+**Rules:** AGENTS §3 (the gate set), §9 (fail-first; a guard must catch the class, not
+the instance).
+
+Found while answering a support report from an arm64 Darwin 27 box — the first evidence
+this tree has from either arm64 or Darwin 27. The reporter could produce a doctor report
+and not a single test result, and the reason was in this tree rather than on their
+machine.
+
+**The defect.** `3e23c52` inserted `a_hangup_with_bytes_still_queued_reports_pollin_so_
+the_reader_drains_it` into `daemon/src/nodes/serial.rs`'s test module, between the
+`#[cfg(target_os = "linux")]` that gated `fn pts_fixture` and `fn pts_fixture` itself.
+Rust applied the attribute to the new item — which already carried its own — and
+`pts_fixture` was left ungated while `struct PtsFixture` stayed gated. Off Linux that
+is `E0425` and `E0422`, and `serial-nexus-daemon (lib test)` does not build.
+
+**Why every existing gate missed it.** `cargo build --workspace` compiles no test
+target, so it is green on every platform. `cargo test` and `cargo clippy --all-targets`
+do compile it, but on Linux the cfg is satisfied and the code is correct — so the
+entire default gate set passes, on the platform the gate set runs on. The failure is
+reachable only by compiling a *test* target for a *non-Linux* target, which nothing did
+until the macOS lane, which runs last and is the lane a maintainer is primed to read as
+"macOS is flaky again".
+
+**The guard is a cross-check, not a test.** The Linux `check` job now runs `cargo check
+--target <triple> --workspace --exclude serial-nexus-web --all-targets` over both Apple
+triples. `check` does not link and needs no Apple SDK, so it costs one `rustup target
+add` and a few seconds. **Fail-first, with the guard as written**: reverting the one
+attribute in place reddens that exact command with the two errors above, and restoring
+it returns it to clean.
+
+**Both triples, and the second one is justified by measurement rather than by caution.**
+The first draft ran `aarch64` alone, reasoning that `macos-latest` is arm64 so one
+triple compiles what the protected lane compiles. That reasoning is sound for *this*
+defect and wrong for the guard's stated job, which is to catch the class. Neither target
+is a superset of the other, proved by planting a defect in each direction inside a
+`#[cfg(target_os = "macos")]` module in `sys` and running both:
+
+| plant                     | x86_64 check     | aarch64 check    |
+|---------------------------|------------------|------------------|
+| x86-only intrinsic        | **passes**       | caught (`E0433`) |
+| aarch64-only NEON type    | caught (`E0433`) | **passes**       |
+
+So each triple catches exactly the arch-specific code written on the *other*
+architecture — this session's mistake one axis over, reaching for `target_os` where the
+code is really `target_arch`. The risk is live rather than hypothetical: `macos-latest`
+is arm64, the bench rig is an Intel Mac, the newest field report is an M4, and
+`sys/src/usb_macos.rs` is hand-written FFI in the one crate allowed `unsafe`. There are
+zero `target_arch` hits in the tree today and this is what keeps that cheap to maintain.
+
+**One instrument error inside the matcher proof, recorded because it nearly passed.**
+The first mirror plant used `std::arch::aarch64::__rbit64`, which is not a real
+intrinsic. It failed on *both* triples and would have read as "x86_64 catches it too"
+— a pass for the wrong reason. The tell was the error text: `E0433 cannot find aarch64
+in arch` on x86_64 against `E0425 cannot find function __rbit64` on aarch64, two
+different failures. Re-run with a stable NEON *type* (`uint8x16_t`), which compiles on
+aarch64 and is absent on x86_64, it separates cleanly. Reading only the exit status
+would have recorded the wrong conclusion.
+
+**What the guard does not cover, stated rather than implied (§9).** `serial-nexus-web`
+is excluded: its TLS stack pulls `ring`, whose build script shells out to `cc` with
+`-arch arm64`, which a Linux runner's `cc` rejects — the step would be red for a reason
+that is not a defect. So a stolen cfg inside `web`'s own test code still reaches only
+the macOS lane. Every other crate is covered, including `daemon`, where this instance
+and the class's only other recorded member both landed.
+
+**Second instance, not third.** §3.65 A was the first macOS-only compile break — the
+`serial-nexus-replug` crate as an unconditional workspace member using a Linux-only
+symbol. A session note drafted here claimed a third; **it is withdrawn**, because
+nothing in the history or the notes substantiates it and the two mechanisms are not the
+same one twice. The distinction that matters is not the count: §3.65 A reddened
+`cargo build --workspace`, the macOS lane's own first step, and this one does not. That
+is why a new instrument was needed rather than a second reading of the old one.

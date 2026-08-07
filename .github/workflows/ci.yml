@@ -92,6 +92,53 @@ jobs:
       # unused binding when no codec is registered.
       - name: Clippy (minimal daemon, no built-in codecs)
         run: cargo clippy -p serial-nexus-daemon-bin -p serial-nexus-daemon --no-default-features --locked -- -D warnings
+      # **A `#[cfg(target_os = "linux")]` mistake in test code is invisible to every
+      # step above it and to the macOS lane's own first step.** `cargo build` compiles
+      # no test target, so an ungated test helper referring to a gated type builds
+      # clean everywhere and reddens only `cargo test`/`cargo clippy --all-targets`,
+      # and only off Linux — which puts the failure in the one lane that runs last and
+      # blames it on the platform (notes §3.71).
+      #
+      # This is the **second** recorded macOS-only compile break and the first of its
+      # shape. §3.65 A was the first: `serial-nexus-replug` was an unconditional
+      # workspace member using a Linux-only symbol. That one at least reddened
+      # `cargo build --workspace`, the macOS lane's own first step. This one does not
+      # — `cargo build` compiles no test target — which is why a *new* instrument was
+      # needed rather than a second reading of the old one.
+      # A compile-only cross-check is the cheapest instrument that sees the class:
+      # `check` does not link, needs no Apple SDK, and costs one rustup std download.
+      #
+      # **BOTH Apple triples, and that is measured rather than belt-and-braces.**
+      # Neither target is a superset of the other, proved by planting a defect in each
+      # direction inside a `#[cfg(target_os = "macos")]` module and running both
+      # (notes §3.71):
+      #
+      #   plant                          x86_64 check   aarch64 check
+      #   x86-only intrinsic             PASSES         caught (E0433)
+      #   aarch64-only NEON type         caught (E0433) PASSES
+      #
+      # So each triple catches exactly the arch-specific code written on the *other*
+      # architecture — the same mistake as this session's, one axis over: reaching for
+      # `target_os` when the code is really `target_arch`. That is a live risk here and
+      # not a hypothetical: `macos-latest` is arm64, the bench rig is an Intel Mac, and
+      # `sys/src/usb_macos.rs` is hand-written FFI in the one crate allowed `unsafe`.
+      # There are zero `target_arch` hits in the tree today; this keeps it that way
+      # cheaply instead of discovering the first one from a support report.
+      #
+      # **Say what this does NOT cover (§9).** `serial-nexus-web` is excluded because
+      # its TLS stack pulls `ring`, whose build script needs a real Apple C toolchain
+      # — `cc` on a Linux runner rejects `-arch arm64` outright, so the step would be
+      # red for a reason that is not a defect. That is the same exclusion AGENTS.md §3
+      # already names for the by-hand macOS cross-check, and it means a stolen cfg
+      # inside `web`'s own test code still reaches only the macOS lane. Every other
+      # crate — including `daemon`, where both recorded instances landed — is covered.
+      - name: Cross-check macOS test targets compile (catches stolen cfg attributes)
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo check --target "$t" --workspace --exclude serial-nexus-web \
+              --all-targets --locked
+          done
       # `cargo test` does NOT emit `target/debug/serial-nexus-daemon` (only the deps/ test
       # bins); the serial-nexus-itest harness boots that plain artifact, so build it first.
       - name: Build workspace binaries (serial-nexus-itest boots them as subprocesses)
