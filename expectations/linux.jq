@@ -100,7 +100,8 @@ and (any(.probes[]; .id == "P4" and (.status == "supported" or .status == "degra
 and (all(.probes[]; . as $p
       | ($p.id != "P4")
       or ($p.status != "supported")
-      or (((([$p.observations[] | select(.key == "canonical") | .value] | first) // -1)) > 0)))
+      or (([$p.observations[] | select(.key == "canonical") | .value] | last) as $c
+          | (($c | type) == "number") and ($c > 0))))
 and (any(.probes[]; .id == "P5" and (.status == "supported" or .status == "skipped" or .status == "degraded")))
 # **A certified pair must carry its handshake reading** (§15.52). The certificate's
 # own modem map is read with the peer port *closed*, so it cannot answer what the
@@ -132,7 +133,9 @@ and (all(.probes[]; . as $p | ($p.id != "P9") or ($p.status == "skipped") or
          and (.value.shape | type == "string")
          and (.value.mask_role | type == "string")
          and (.value.read_the_separation_from | type == "string")
-         and (.value.read_the_mask_spread_from | type == "string")))))
+         and (.value.read_the_mask_spread_from | type == "string")
+         and (.value.order_control_says | type == "string")
+         and (.value.order_control_does_not_license | type == "string")))))
 and (any(.probes[]; .id == "P10" and (.status == "supported" or .status == "skipped" or .status == "degraded")))
 # P10 carries an instrument check on its own FIONREAD reading. `peer_pending_input_bytes`
 # answers 0 on a Darwin pty master with 1024 bytes recoverable (6 of 6 captures, notes
@@ -227,6 +230,21 @@ and (all(.probes[]; . as $p | ($p.id != "P14") or ($p.status == "skipped")
           and ($p.observations | any(.key == "ceiling_kind"))
           and ($p.observations | any(.key == "structural_max_baud" and (.value | type == "number")))
           and ($p.observations | any(.key == "ceiling_is_a_floor_over" and (.value | type == "string"))))))
+# **And a `supported` P14 must have measured something.** The clause above tests
+# presence and deliberately admits `null`, because a search that could not finish
+# still has to carry its keys — that is what the `degraded` arm is for. It left a
+# hole this file could not see: a P14 reading `supported` with both cells `null`
+# satisfied every clause here, proven by mutating a committed artifact (notes
+# §3.73). `p14_verdict` already refuses that combination — it degrades whenever
+# either cell is `None` — so this clause pins a property the probe *promises*
+# rather than an answer it might give, and no honest report can trip it. It names
+# no number and no `ceiling_kind`, so plan §3 rule 14 is untouched. Read through
+# `last`: until 2026-08-07 the probe stamped a `null` placeholder and *appended*
+# the measurement, so a frozen artifact carries each key twice and only the later
+# occurrence is the answer (§16.13 leaves those files untouched).
+and (all(.probes[]; . as $p | ($p.id != "P14") or ($p.status != "supported")
+      or ((([$p.observations[] | select(.key == "max_reliable_baud") | .value] | last) != null)
+          and (([$p.observations[] | select(.key == "ceiling_kind") | .value] | last) != null))))
 # And the clause that makes the ones above worth having: a kernel-diff probe that
 # RAN must carry measurements. A verdict word cannot be diffed, so a probe whose
 # observations went empty would pass every clause above while making the 6.18 run

@@ -97,8 +97,32 @@ impl Probe {
         }
     }
 
+    /// Record an observation, **replacing** any earlier one under the same key
+    /// and keeping that key's original position.
+    ///
+    /// The replace half is load-bearing and was a defect until 2026-08-07
+    /// (notes §3.73). A probe that wants a key present on every path — P14 is the
+    /// only one that does — stamps a placeholder up front and lets the measuring
+    /// path overwrite it. With a plain `push` that produced a report carrying the
+    /// key *twice*, and the two occurrences disagreed: P14 printed
+    /// `max_reliable_baud: null` and "the search did not run on this path" nine
+    /// lines above `max_reliable_baud: 3000000`. Which one a reader saw depended
+    /// on how they read it — last-wins for `serde_json` into a map, **first-match
+    /// for the `[…] | first` idiom this repository's own gate uses**
+    /// (`expectations/linux.jq`), so the gate could read `null` off a report whose
+    /// answer was 3 Mbaud.
+    ///
+    /// Replacing in place rather than appending is what makes the placeholder
+    /// honest: the rendered order stays the one the probe declared, and the cell a
+    /// reader reaches first is the measured one. `field_set` does not move, because
+    /// `field_set_core` sorts and dedups leaf paths (so the duplicate was invisible
+    /// to it — see the guard in `expectation_gates.rs`), and `probe_set` does not
+    /// move because it digests `(id, question)` only.
     pub fn observe(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
-        self.observations.push(obs(key, value));
+        match self.observations.iter_mut().find(|o| o.key == key) {
+            Some(existing) => existing.value = value.into(),
+            None => self.observations.push(obs(key, value)),
+        }
         self
     }
 
@@ -279,8 +303,20 @@ impl Report {
     pub fn to_markdown(&self) -> String {
         let mut m = String::new();
         m.push_str("# serial-nexus-doctor report\n\n");
+        // **Ask for both renderings, because asking for one is what kept going
+        // wrong.** This sentence used to say only "paste this whole report", and
+        // three consecutive field visits from the production kernel did exactly
+        // that — leaving a report that `jq -e -f expectations/<platform>.jq`
+        // cannot parse and `--field-set` cannot recompute, because Markdown
+        // carries no JSON kinds and no `observations` array. That is not the
+        // reporter's mistake; it is what the tool asked for (notes §3.74).
         m.push_str(&format!(
-            "`{}` v{} — paste this whole report into a support request.\n\n",
+            "`{}` v{} — paste this whole report into a support request, **and attach the \
+             JSON from the same run**: re-run with `--json-out report.json` and the same \
+             `--port` arguments, or capture it directly with `--json`. This Markdown is \
+             for reading; the JSON is the only form the CI gate and the field-set \
+             recompute can read, and the only one that records whether a value is a \
+             number, a string or a boolean.\n\n",
             self.tool, self.version
         ));
         // Provenance before anything else. A reader diffing this against another
@@ -315,10 +351,15 @@ impl Report {
         m.push_str("| Check | Value | Verdict |\n|---|---|---|\n");
         for c in &self.environment {
             m.push_str(&format!(
+                // All three columns escaped, not just the middle one. `name`
+                // reaches operator input through `access:<port>` and
+                // `--dev-root`, so a path containing a pipe broke the table
+                // (notes §3.74) — a half-applied escape is worse than none,
+                // because it reads as deliberate.
                 "| {} | {} | {} |\n",
-                c.name,
+                md_escape(&c.name),
                 md_escape(&c.value),
-                c.status.badge_label()
+                md_escape(&c.status.badge_label())
             ));
         }
         m.push('\n');
@@ -491,6 +532,16 @@ pub fn field_set_of_report_json(report: &serde_json::Value) -> Option<String> {
             triples.push((id, key, value));
         }
     }
+    // **An empty observation set is not a field set.** Without this the digest of
+    // "nothing" is a well-formed 16-hex-digit string, so a report whose probes all
+    // went observation-less — or a JSON document with a `probes` array that is not
+    // a doctor report at all — printed a confident digest and exited 0, and two
+    // such reports would compare *equal* to each other (notes §3.74). Returning
+    // `None` routes it to the caller's "not a doctor report" arm and exit 2, which
+    // is the honest answer: unknown is never "equal" (`docs/doctor/README.md`).
+    if triples.is_empty() {
+        return None;
+    }
     Some(field_set_core(triples.into_iter()))
 }
 
@@ -623,6 +674,104 @@ mod tests {
 
     fn probe(id: &str, title: &str, question: &str) -> Probe {
         Probe::new(id, title, question).verdict(Status::Supported, "fine")
+    }
+
+    /// **A second `observe` under one key replaces the first, in place — it does
+    /// not append a contradicting twin** (notes §3.73).
+    ///
+    /// P14 is the probe that needs this: it stamps `max_reliable_baud`,
+    /// `ceiling_kind` and `ceiling_is_a_floor_over` as `null` placeholders on
+    /// every path so an early return still carries the keys the gate requires,
+    /// then overwrites them when the search runs. Under the old `push` the
+    /// report carried each key **twice with disagreeing values** — a `null` and
+    /// the placeholder prose "the search did not run on this path" printed nine
+    /// lines above `max_reliable_baud: 3000000` — and which one a reader got
+    /// depended on their idiom. `expectations/*.jq` reads observations with
+    /// `[…] | first`, so the repository's own gate would have taken the `null`.
+    ///
+    /// Fail-first: restoring `self.observations.push(obs(key, value))` reddens
+    /// every assertion below.
+    #[test]
+    fn a_second_observation_under_one_key_replaces_the_first_and_keeps_its_place() {
+        let p = probe("P14", "t", "q")
+            .observe("max_reliable_baud", serde_json::Value::Null)
+            .observe("ceiling_kind", serde_json::Value::Null)
+            .observe("pairs_discovered", 1u64)
+            .observe("max_reliable_baud", 3_000_000u64)
+            .observe("ceiling_kind", "adapter-refused");
+
+        // Exactly one occurrence of each key — the property the gate's
+        // first-match idiom depends on.
+        for key in ["max_reliable_baud", "ceiling_kind", "pairs_discovered"] {
+            assert_eq!(
+                p.observations.iter().filter(|o| o.key == key).count(),
+                1,
+                "{key} appears more than once: {:?}",
+                p.observations.iter().map(|o| &o.key).collect::<Vec<_>>()
+            );
+        }
+
+        // The measured value wins, and a reader that takes the FIRST match gets
+        // it — that is the half a last-wins-only fix would leave broken.
+        let first = |k: &str| {
+            p.observations
+                .iter()
+                .find(|o| o.key == k)
+                .map(|o| o.value.clone())
+        };
+        assert_eq!(first("max_reliable_baud"), Some(3_000_000u64.into()));
+        assert_eq!(
+            first("ceiling_kind"),
+            Some(serde_json::Value::from("adapter-refused"))
+        );
+
+        // Position is the one the probe declared, so the rendered order does not
+        // shuffle when a placeholder is overwritten.
+        assert_eq!(
+            p.observations
+                .iter()
+                .map(|o| o.key.as_str())
+                .collect::<Vec<_>>(),
+            ["max_reliable_baud", "ceiling_kind", "pairs_discovered"],
+        );
+
+        // Anti-vacuity: a genuinely new key still appends, or the assertions
+        // above would also pass for an `observe` that silently dropped writes.
+        let p = p.observe("first_unreliable_baud", 3_062_500u64);
+        assert_eq!(p.observations.len(), 4);
+        assert_eq!(p.observations[3].key, "first_unreliable_baud");
+    }
+
+    /// **`field_set` is blind to a duplicated key, which is why the guard above
+    /// has to exist separately.**
+    ///
+    /// `field_set_core` sorts and dedups leaf paths, so a probe emitting one key
+    /// twice digests identically to one emitting it once. That is the property
+    /// that let P14 ship duplicates through five commits and two kernels without
+    /// either digest moving (notes §3.51's residual, made concrete). It also
+    /// means the repair does **not** move `field_set`, so every committed
+    /// artifact stays field-comparable across it.
+    #[test]
+    fn the_field_set_digest_cannot_see_a_key_emitted_twice() {
+        let once = probe("P14", "t", "q").observe("max_reliable_baud", 3_000_000u64);
+        let twice = Probe {
+            observations: vec![
+                obs("max_reliable_baud", serde_json::Value::Null),
+                obs("max_reliable_baud", 3_000_000u64),
+            ],
+            ..probe("P14", "t", "q")
+        };
+        assert_eq!(
+            twice.observations.len(),
+            2,
+            "the fixture must really duplicate"
+        );
+        assert_eq!(
+            field_set_fingerprint(std::slice::from_ref(&once)),
+            field_set_fingerprint(std::slice::from_ref(&twice)),
+            "field_set moved, so the duplicate was visible to it after all — \
+             re-read the repair's claim that committed artifacts stay comparable"
+        );
     }
 
     /// The UTC stamp must agree with `date -u` on the cases a naive
@@ -815,6 +964,154 @@ mod tests {
         let undated = Report::new(None, vec![], vec![probe("P1", "t", "q")]);
         assert!(undated.to_markdown().contains("| generated | unknown |"));
         assert!(!undated.to_markdown().contains("1970-01-01"));
+    }
+
+    /// **The Markdown document's SHAPE, not a substring of it** (notes §3.74).
+    ///
+    /// Until this landed the Markdown renderer had one test, and it asserted only
+    /// that four Build-block values appear somewhere in the string. Everything
+    /// after the first fifteen lines — every environment row, every probe
+    /// section, every observation, the summary — could have vanished with the
+    /// whole gate set green, on the one rendering a human actually reads and the
+    /// only one three field visits have ever produced.
+    ///
+    /// It is built to contain the hazards rather than a happy path: a `|` in an
+    /// env-check name and in its value, a `|` in a skip reason, and observations
+    /// of every JSON kind including a nested object and an array of objects.
+    #[test]
+    fn the_markdown_document_has_the_shape_a_reader_is_promised() {
+        let env = vec![
+            EnvCheck::new("access:/dev/tty|USB0", "read+write", Status::Supported),
+            EnvCheck::new("kernel", "7.0.0-29|generic", Status::Degraded),
+        ];
+        let probes = vec![
+            Probe::new("P1", "first probe", "q1")
+                .observe("a_string", "hello")
+                .observe("a_number", 42u64)
+                .observe("a_bool", true)
+                .observe("a_null", serde_json::Value::Null)
+                .observe(
+                    "nested",
+                    serde_json::json!({"inner": 1, "deep": {"k": "v"}}),
+                )
+                .observe(
+                    "rungs",
+                    serde_json::json!([{"baud": 9600}, {"baud": 19200}]),
+                )
+                .verdict(Status::Supported, "the consequence sentence"),
+            Probe::new("P2", "second probe", "q2")
+                .verdict(Status::skipped("no --port | named"), "why it skipped"),
+        ];
+        let r = Report::new(Some(1_785_260_059_000), env, probes);
+        let md = r.to_markdown();
+        let lines: Vec<&str> = md.lines().collect();
+
+        // The four sections, present and in order.
+        let heads: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with("## "))
+            .collect();
+        assert_eq!(
+            heads,
+            ["## Build", "## Environment", "## Probes", "## Summary"],
+            "the document's sections moved or went missing:\n{md}"
+        );
+
+        // **Every table row has the same unescaped-pipe count as its header**, or
+        // an operator-supplied name has broken the table for the reader. Counting
+        // after removing the escaped ones is the whole point.
+        let unescaped_pipes = |l: &str| l.replace("\\|", "").matches('|').count();
+        let mut header: Option<usize> = None;
+        for l in &lines {
+            if !l.starts_with('|') {
+                header = None;
+                continue;
+            }
+            match header {
+                None => header = Some(unescaped_pipes(l)),
+                Some(n) => assert_eq!(
+                    unescaped_pipes(l),
+                    n,
+                    "this row has a different column count than its header, so the \
+                     table is broken for whoever pasted it:\n{l}"
+                ),
+            }
+        }
+
+        // Both env checks rendered, with their pipes escaped rather than dropped.
+        assert!(
+            md.contains("access:/dev/tty\\|USB0"),
+            "env name not escaped:\n{md}"
+        );
+        assert!(
+            md.contains("7.0.0-29\\|generic"),
+            "env value not escaped:\n{md}"
+        );
+
+        // Every probe reaches the document with its id, title, question,
+        // verdict and consequence — a section per probe, not one for the first.
+        for (id, title, question, consequence) in [
+            ("P1", "first probe", "q1", "the consequence sentence"),
+            ("P2", "second probe", "q2", "why it skipped"),
+        ] {
+            assert!(
+                md.contains(&format!("### {id} — {title}")),
+                "{id} section missing:\n{md}"
+            );
+            assert!(md.contains(question), "{id}'s question missing:\n{md}");
+            assert!(
+                md.contains(consequence),
+                "{id}'s consequence missing:\n{md}"
+            );
+        }
+        // A skip carries its reason. **Unescaped, deliberately**: the probe
+        // heading is not a table row, so a `|` there needs no escape and adding
+        // one would show the reader a stray backslash. Escaping is a table
+        // concern, which is why the env rows above assert the opposite.
+        assert!(
+            md.contains("skipped (no --port | named)"),
+            "skip reason:\n{md}"
+        );
+
+        // Every observation key reaches the document. This is the assertion that
+        // would have caught an entire probe body being dropped.
+        for key in [
+            "a_string", "a_number", "a_bool", "a_null", "nested", "rungs",
+        ] {
+            assert!(
+                md.contains(key),
+                "observation {key} missing from Markdown:\n{md}"
+            );
+        }
+        // Nested values are flattened, not truncated: the leaves are present.
+        assert!(md.contains("inner=1"), "nested leaf lost:\n{md}");
+        assert!(md.contains("k=v"), "deeply nested leaf lost:\n{md}");
+        assert!(
+            md.contains("baud=9600") && md.contains("baud=19200"),
+            "array element lost:\n{md}"
+        );
+
+        // The summary counts what the verdicts say — **environment checks and
+        // probes together**, which is why a report's "N supported" exceeds its
+        // probe count. Fixture: 1 supported env + 1 degraded env + 1 supported
+        // probe + 1 skipped probe.
+        assert!(
+            md.contains("2 supported · 1 degraded · 0 unsupported · 1 skipped"),
+            "summary does not agree with the verdicts:\n{md}"
+        );
+
+        // Anti-vacuity: a report with no probes must NOT satisfy the probe
+        // assertions above, or they are passing on the boilerplate.
+        let empty = Report::new(Some(1_785_260_059_000), vec![], vec![]).to_markdown();
+        assert!(
+            !empty.contains("### P1"),
+            "an empty report rendered a probe section"
+        );
+        assert!(
+            !empty.contains("a_string"),
+            "an empty report rendered an observation"
+        );
     }
 
     /// The refactor onto the shared encoder must not move a single committed

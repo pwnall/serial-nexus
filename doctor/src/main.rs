@@ -43,11 +43,30 @@ use report::Report;
 )]
 struct Cli {
     /// Emit JSON instead of Markdown (for CI: `serial-nexus-doctor --json | jq -e ...`).
-    #[arg(long)]
+    ///
+    /// Conflicts with `--markdown`: asking for both used to resolve silently to
+    /// JSON, which is not a choice a caller should have to discover. To get both
+    /// from one run — which is what a support request wants — use `--json-out`.
+    #[arg(long, conflicts_with = "markdown")]
     json: bool,
     /// Emit Markdown (the default).
     #[arg(long)]
     markdown: bool,
+    /// Also write the JSON twin of **this same run** to a file, while the
+    /// Markdown goes to stdout as usual.
+    ///
+    /// This exists because the two renderings were previously two different
+    /// *measurements*: the binary emits one format per invocation, so the
+    /// documented support-request path produced a Markdown paste that no gate
+    /// could read, and getting the JSON meant running the probes again. Two runs
+    /// of one rig do not agree — measured on the bench, P10's
+    /// `bytes_accepted_before_eagain` reads 11776 and 13824 across consecutive
+    /// runs, and P9's medians move a nanosecond or two — so "the Markdown and the
+    /// JSON of the same capture" was not a thing that existed (notes §3.74).
+    /// Both renderings here are pure functions of one `Report` value, so the
+    /// paste and the artifact are the same measurement.
+    #[arg(long = "json-out", value_name = "PATH")]
+    json_out: Option<PathBuf>,
     /// A serial port to include in P3, P5, P11 and P14 (repeatable). Required to
     /// open any real port — passive by default (§3), because opening a port
     /// toggles DTR on equipment that may be live. P14 additionally *transmits at
@@ -81,6 +100,26 @@ fn main() {
             std::process::exit(2);
         });
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| {
+            // The overwhelmingly common way to arrive here is the doctor's own
+            // Markdown twin, which is what a support request contains — so say
+            // that, and say what to do, rather than leaving a serde error to be
+            // interpreted (§6). Three Markdown-only field visits are on record.
+            // Matched on the H1's *shape* rather than on the tool's name: the
+            // 0.2.0-era captures in `docs/doctor/` carry a since-retired name in
+            // that heading, and §15.40's meta-gate correctly refuses to let this
+            // file spell it.
+            let first_line = text.trim_start().lines().next().unwrap_or_default();
+            if first_line.starts_with("# ") && first_line.ends_with("doctor report") {
+                eprintln!(
+                    "{}: this is the Markdown rendering, and the field set cannot be \
+                     recomputed from it — it carries no `.probes[].observations` array. \
+                     Read the value the report itself printed in its Build block, or \
+                     re-take the capture with `--json` (or `--json-out <path>`, which \
+                     writes the JSON twin of the same run).",
+                    path.display()
+                );
+                std::process::exit(2);
+            }
             eprintln!("{}: not JSON: {e}", path.display());
             std::process::exit(2);
         });
@@ -231,6 +270,18 @@ fn main() {
     probe_list.push(probes::p14_max_rate(&cli.ports, &pairs));
 
     let report = Report::new(generated_unix_ms, environment, probe_list);
+
+    // Both renderings come from this one `Report`, so `--json-out` beside the
+    // Markdown is the same measurement rather than a second run of the probes.
+    if let Some(path) = &cli.json_out {
+        if let Err(e) = std::fs::write(path, format!("{}\n", report.to_json())) {
+            // Loud and non-zero: a caller that asked for the artifact and did not
+            // get it must not discover that when they go looking for it later.
+            eprintln!("{}: could not write the JSON twin: {e}", path.display());
+            std::process::exit(2);
+        }
+        eprintln!("JSON twin of this run written to {}", path.display());
+    }
 
     if cli.json {
         println!("{}", report.to_json());

@@ -263,7 +263,8 @@ fn both_expectation_files_carry_the_same_p4_population_clause() {
     let clause = r#"and (all(.probes[]; . as $p
       | ($p.id != "P4")
       or ($p.status != "supported")
-      or (((([$p.observations[] | select(.key == "canonical") | .value] | first) // -1)) > 0)))"#;
+      or (([$p.observations[] | select(.key == "canonical") | .value] | last) as $c
+          | (($c | type) == "number") and ($c > 0))))"#;
     for name in ["expectations/linux.jq", "expectations/macos.jq"] {
         let path = repo_root().join(name);
         let text = std::fs::read_to_string(&path).expect("the expectation file is readable");
@@ -285,10 +286,17 @@ fn both_expectation_files_carry_the_same_p14_clauses() {
           and ($p.observations | any(.key == "ceiling_kind"))
           and ($p.observations | any(.key == "structural_max_baud" and (.value | type == "number")))
           and ($p.observations | any(.key == "ceiling_is_a_floor_over" and (.value | type == "string"))))))"#;
+    let measured = r#"and (all(.probes[]; . as $p | ($p.id != "P14") or ($p.status != "supported")
+      or ((([$p.observations[] | select(.key == "max_reliable_baud") | .value] | last) != null)
+          and (([$p.observations[] | select(.key == "ceiling_kind") | .value] | last) != null))))"#;
     for name in ["expectations/linux.jq", "expectations/macos.jq"] {
         let path = repo_root().join(name);
         let text = std::fs::read_to_string(&path).expect("the expectation file is readable");
-        for (what, clause) in [("status", status), ("presence", presence)] {
+        for (what, clause) in [
+            ("status", status),
+            ("presence", presence),
+            ("measured", measured),
+        ] {
             assert!(
                 text.contains(clause),
                 "{name} does not carry the P14 {what} clause verbatim — the behavioural \
@@ -777,6 +785,129 @@ fn the_p14_presence_clause_admits_a_degraded_report_that_carries_null_cells() {
         !gate_accepts(&expectation, &degraded_bare),
         "{} admitted a `degraded` P14 carrying no ceiling cells at all — the \
          repair was supposed to widen the probe, not the gate",
+        expectation.display()
+    );
+}
+
+/// **A `supported` P14 that measured nothing is rejected** (notes §3.73).
+///
+/// The presence clause above deliberately admits `null`, because a search that
+/// could not finish still has to carry its keys. That left the complementary hole,
+/// and it was a real one: a P14 reading `supported` with `max_reliable_baud: null`
+/// and `ceiling_kind: null` satisfied every clause in the file. It was found by
+/// mutating a committed artifact — `docs/doctor/linux-7.0-2026-08-05-7cf0338-tier3.json`
+/// with P14's measured trio stripped back to its placeholders — and the gate
+/// returned 0.
+///
+/// `p14_verdict` already refuses that combination (it degrades whenever either cell
+/// is `None`), so the clause pins a property the probe *promises* rather than an
+/// answer it might give: no honest report can trip it, and a refactor that broke
+/// the promise now reddens here instead of shipping a confident `supported` with
+/// nothing behind it.
+///
+/// The positive control matters as much as the plant: the same report with the
+/// measured values present must still pass, or this would prove only that the gate
+/// rejects something.
+#[test]
+fn the_p14_measured_clause_rejects_a_supported_ceiling_that_measured_nothing() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let expectation = platform_expectation();
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    // A P14 that answered: `supported`, with the number and the reason. This is
+    // the shape a rig run produces, reconstructed on a passive box so the guard
+    // needs no hardware.
+    let answered = r#"(.probes[] | select(.id=="P14")) |= (.status = "supported" | del(.reason)
+           | .observations = [{"key":"max_reliable_baud","value":3000000},
+                              {"key":"ceiling_kind","value":"adapter-refused"},
+                              {"key":"structural_max_baud","value":4294967295},
+                              {"key":"ceiling_is_a_floor_over","value":"the rates this ladder probed."},
+                              {"key":"pairs_discovered","value":1}])"#;
+    assert!(
+        gate_accepts(&expectation, &jq_filter(answered, &report)),
+        "{} rejected a `supported` P14 that carries its measurement — the clause \
+         is supposed to bite only on a ceiling that was never measured",
+        expectation.display()
+    );
+
+    // The plant, in both spellings that lose the answer while keeping the keys:
+    // the number gone, and the reason gone. Either alone must redden, because a
+    // reader needs both and the clause claims to require both.
+    for (what, null_key) in [
+        ("the number", "max_reliable_baud"),
+        ("the reason", "ceiling_kind"),
+    ] {
+        let gutted = jq_filter(
+            &answered.replace(
+                &format!(r#"{{"key":"{null_key}","value":"#),
+                &format!(r#"{{"key":"{null_key}","value":null,"was":"#),
+            ),
+            &report,
+        );
+        assert!(
+            !gate_accepts(&expectation, &gutted),
+            "{} admitted a `supported` P14 whose ceiling is present but null \
+             ({what} missing) — the vacuity notes §3.73 found is still open",
+            expectation.display()
+        );
+    }
+}
+
+/// **The P4 population clause rejects a count that is not a number** (notes §3.73).
+///
+/// The clause reads `canonical` and requires it to exceed zero. Until 2026-08-07 it
+/// spelled that as `(… // -1) > 0`, and jq orders **strings above numbers** — so a
+/// `canonical` of `"2"`, or of any string at all, compared greater than `0` and the
+/// clause passed. That is the same defect class the clause itself was written for
+/// (notes §3.45 (ii)): a population assertion that cannot see a population it does
+/// not recognise.
+///
+/// Reading through `last` rather than `first` is the second half, and it is what
+/// makes the clause safe against a probe that stamps a placeholder and overwrites
+/// it — the shape P14 uses and P4 could adopt tomorrow.
+#[test]
+fn the_p4_population_clause_rejects_a_count_that_is_not_a_number() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let expectation = platform_expectation();
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    // Positive control first: a numeric, positive population passes.
+    let numeric = jq_filter(
+        r#"(.probes[] | select(.id=="P4")) |= (.status = "supported" | del(.reason)
+           | .observations = [{"key":"canonical","value":2}])"#,
+        &report,
+    );
+    assert!(
+        gate_accepts(&expectation, &numeric),
+        "{} rejected a `supported` P4 with two canonical identities",
+        expectation.display()
+    );
+
+    // The plant: the same count as a string. `"2" > 0` is true in jq.
+    let stringly = jq_filter(
+        r#"(.probes[] | select(.id=="P4")) |= (.status = "supported" | del(.reason)
+           | .observations = [{"key":"canonical","value":"2"}])"#,
+        &report,
+    );
+    assert!(
+        !gate_accepts(&expectation, &stringly),
+        "{} admitted a `supported` P4 whose canonical count is the string \"2\" — \
+         jq compares strings above numbers, so the clause is passing on type \
+         confusion rather than on a population",
         expectation.display()
     );
 }

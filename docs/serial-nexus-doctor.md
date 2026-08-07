@@ -312,6 +312,15 @@ field set as *"n/a — not computable"*: the digest is a pure function of
 `.probes[].observations`, and Markdown has no such array. A repeat of that wastes a
 visit to a kernel nobody can iterate on. This section is the protocol that does not.
 
+**It has now been repeated twice more** — the 2026-08-07 6.18 report is the third
+Markdown-only capture — and the cause was not the reporter. The doctor's own header
+said "paste this whole report into a support request" and nothing else, and no
+invocation could produce both renderings, so doing exactly what the tool asked
+produced the one artifact no gate can read. Both are fixed (notes §3.74): the header
+now asks for the JSON too, and `--json-out <path>` writes the JSON twin of the *same
+run* beside the Markdown on stdout. If you are reading this before a visit, the whole
+protocol below collapses to: **capture with `--json-out`, and run `jq -e`.**
+
 ### Before leaving the box you *can* iterate on
 
 1. **Commit.** `doctor/build.rs` stamps `commit` from `git status --porcelain`
@@ -352,8 +361,14 @@ $ for i in "" -2 -3; do ./target/debug/serial-nexus-doctor --port $A --port $B -
     > docs/doctor/linux-<ver>-$(date -u +%F)-$SHA-tier3$i.json ; done
 $ ./target/debug/serial-nexus-doctor --port $A --port $B --json | jq -e -f expectations/linux.jq
 
-# Markdown as well — it is what a human pastes into an issue, and it costs one run
-$ ./target/debug/serial-nexus-doctor --port $A --port $B --markdown \
+# Markdown AND its JSON twin from ONE run (`--json-out`). Do not take these as two
+# runs: the Markdown is what a human pastes and the JSON is what the gate reads, and
+# two runs of one rig are two different measurements — measured on the bench, P10's
+# `bytes_accepted_before_eagain` reads 11776 and 13824 across consecutive runs. Before
+# `--json-out` existed this line was a second invocation, and a pasted report therefore
+# could not be checked against any committed artifact (notes §3.74).
+$ ./target/debug/serial-nexus-doctor --port $A --port $B \
+    --json-out docs/doctor/linux-<ver>-$(date -u +%F)-$SHA-tier3-paste.json \
     > docs/doctor/linux-<ver>-$(date -u +%F)-$SHA-tier3.md
 
 # The suite. --no-fail-fast because this is PLATFORM validation (AGENTS §6): without

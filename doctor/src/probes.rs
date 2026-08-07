@@ -684,7 +684,7 @@ pub fn p6_last_close_readiness() -> Probe {
                 p.verdict(
                     Status::Supported,
                     &format!(
-                        "POLLIN goes quiet after the last close on this kernel ({} passes, {} with POLLIN, none readable-with-nothing-to-read): an ungated `closed`-only last-close arm would NOT spin on the hangup alone here, so pty.rs's `saw_session` latch is not what holds the anti-spin argument up on this kernel.{rearm} This is a per-kernel reading — §13 forbids acting on it until the production kernel (6.18) reports the same numbers, so diff this block before simplifying anything.{discipline}",
+                        "POLLIN goes quiet after the last close on this kernel ({} passes, {} with POLLIN, none readable-with-nothing-to-read): an ungated `closed`-only last-close arm would NOT spin on the hangup alone here, so pty.rs's `saw_session` latch is not what holds the anti-spin argument up on this kernel.{rearm} This is a per-kernel reading — §13 forbids acting on it until the other kernel of record (6.18 or 7.0, whichever this run is not) reports the same numbers, so diff this block before simplifying anything.{discipline}",
                         r.after_close.passes, r.after_close.pollin
                     ),
                 )
@@ -934,7 +934,7 @@ pub fn p7_collapsed_session() -> Probe {
         "covered" => p.verdict(
             Status::Supported,
             &format!(
-                "A collapsed termios-only session leaves {} byte(s) readable past the hangup (leading {}, ioctl bit {}): pty.rs's widened last-close latch arms on it, so an `stty`/health-check/scripted client that opens, reconfigures and closes inside one poll gap still runs detach-release (§6). Diff this against the production kernel (6.18) before trusting the coverage there.{discipline}",
+                "A collapsed termios-only session leaves {} byte(s) readable past the hangup (leading {}, ioctl bit {}): pty.rs's widened last-close latch arms on it, so an `stty`/health-check/scripted client that opens, reconfigures and closes inside one poll gap still runs detach-release (§6). Diff this against the other kernel of record (6.18 or 7.0, whichever this run is not) before trusting the coverage there.{discipline}",
                 termios.map(|r| r.bytes).unwrap_or(0),
                 termios.map(|r| r.leading_hex.join(" ")).unwrap_or_default(),
                 termios.map(|r| r.ioctl_bit()).unwrap_or(false),
@@ -2002,7 +2002,7 @@ pub fn p8_epoll_readiness() -> Probe {
             p.verdict(
                 Status::Supported,
                 &format!(
-                    "{finding} After the last slave closed, the level-triggered set reported an event on {} of {} waits ({} of them with no bytes to read) — persistent readiness on a hung-up fd is expected and is why the PTY reader branches on POLLHUP rather than looping on readability. Diff both blocks against the production kernel (6.18) before drawing any conclusion from either.",
+                    "{finding} After the last slave closed, the level-triggered set reported an event on {} of {} waits ({} of them with no bytes to read) — persistent readiness on a hung-up fd is expected and is why the PTY reader branches on POLLHUP rather than looping on readability. Diff both blocks against the other kernel of record (6.18 or 7.0, whichever this run is not) before drawing any conclusion from either.",
                     hungup.ready_waits, hungup.waits, hungup.ready_then_no_data
                 ),
             )
@@ -2348,6 +2348,120 @@ fn ratio_x100(num: u64, den: u64) -> u64 {
     num.saturating_mul(100).checked_div(den).unwrap_or(0)
 }
 
+/// The resolution below which this probe declines to read an order effect, in
+/// hundredths. **A fitted constant, and its bounds are stated because they are the
+/// whole basis for it** (notes §3.73): across the 36 committed artifacts carrying
+/// the empty-mask cell, the widest intra-group spread attributable to noise is
+/// 1.279x (Darwin's not-ready group) and 1.142x on Linux 7.0, while the one reading
+/// the control exists to catch — Linux 6.18's not-ready group at `883/418/418` — is
+/// 2.112x. 150 sits above every corpus reading and below that one. It is published
+/// as a field so a later capture can re-derive the threshold rather than re-argue
+/// it.
+const P9_ORDER_TOLERANCE_X100: u64 = 150;
+
+/// What the within-group order control says, per group.
+///
+/// [`P9_REF_MASKS`]'s empty-mask cell runs **last** at each fd state, so a monotone
+/// warmup would leave it the cheapest cell in its group. The probe has documented
+/// that control since it was written and never published its outcome — a control
+/// asserted and not reported, which is the same defect class as notes §3.50's "a `0`
+/// printed with nothing beside it that says what the `0` means" (notes §3.73).
+///
+/// Deliberately **not** rank-based. A bare "is the last cell the minimum?" reading
+/// fires on 20 of 27 committed Linux 7.0 reports, on deltas of 0–3 ns out of ~260 —
+/// it would be a false-alarm generator on the platform of record. The reading is
+/// magnitude-gated by [`P9_ORDER_TOLERANCE_X100`] and per-group, and a group whose
+/// cells are not comparable says so rather than guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum P9OrderGroup {
+    /// The cells do not observe one kernel state, so their order says nothing about
+    /// warmup. On Darwin the hung-up group is this: an empty mask reads
+    /// `revents: none` where the requesting cells read `POLLHUP`, so the spread is
+    /// the mask being a *level* and reading it as instrument drift would report a
+    /// kernel difference as a warmup artifact.
+    NotComparable,
+    /// No spread above the stated resolution. **Not a strong pass**: it means there
+    /// was nothing to see, not that the control discriminated.
+    Flat,
+    /// Spread above tolerance, declining in execution order with the last-run cell
+    /// cheapest — the signature a monotone warmup would leave.
+    ConsistentWithWarmup,
+    /// Spread above tolerance but *not* declining in execution order, so whatever
+    /// moved these cells is not a monotone warmup.
+    WarmupRefuted,
+}
+
+impl P9OrderGroup {
+    fn label(self) -> &'static str {
+        match self {
+            P9OrderGroup::NotComparable => "not-comparable",
+            P9OrderGroup::Flat => "flat",
+            P9OrderGroup::ConsistentWithWarmup => "consistent-with-warmup",
+            P9OrderGroup::WarmupRefuted => "warmup-refuted",
+        }
+    }
+}
+
+/// Classify one group's medians, given in **execution order**.
+fn p9_order_group(medians: &[u64], comparable: bool) -> P9OrderGroup {
+    if !comparable || medians.len() < 2 {
+        return P9OrderGroup::NotComparable;
+    }
+    let (min, max) = match (medians.iter().copied().min(), medians.iter().copied().max()) {
+        (Some(lo), Some(hi)) => (lo, hi),
+        _ => return P9OrderGroup::NotComparable,
+    };
+    // An unmeasurable cell must not take the report down, exactly as `ratio_x100`
+    // already ensures.
+    if min == 0 {
+        return P9OrderGroup::NotComparable;
+    }
+    if ratio_x100(max, min) <= P9_ORDER_TOLERANCE_X100 {
+        return P9OrderGroup::Flat;
+    }
+    let monotone = medians.windows(2).all(|w| w[0] >= w[1]);
+    if monotone && medians.last() == Some(&min) {
+        P9OrderGroup::ConsistentWithWarmup
+    } else {
+        P9OrderGroup::WarmupRefuted
+    }
+}
+
+/// The control's combined reading, and what it does not license.
+struct P9OrderControl {
+    not_ready: P9OrderGroup,
+    ready: P9OrderGroup,
+    says: &'static str,
+}
+
+fn p9_order_control(
+    not_ready: &[u64],
+    ready: &[u64],
+    hangup_delivered_unrequested: bool,
+    ready_passes_on_unready_fd: u64,
+) -> P9OrderControl {
+    // A not-ready group is comparable only if it really was not ready; a hung-up
+    // group only where the empty mask observed the same kernel state as its
+    // siblings, which is exactly what `hangup_delivered_unrequested` measures.
+    let nr = p9_order_group(not_ready, ready_passes_on_unready_fd == 0);
+    let rd = p9_order_group(ready, hangup_delivered_unrequested);
+    let says = match (nr, rd) {
+        (P9OrderGroup::NotComparable, P9OrderGroup::NotComparable) => "unmeasured",
+        (P9OrderGroup::ConsistentWithWarmup, _) | (_, P9OrderGroup::ConsistentWithWarmup) => {
+            "warmup-not-excluded"
+        }
+        (P9OrderGroup::WarmupRefuted, _) | (_, P9OrderGroup::WarmupRefuted) => {
+            "spread-above-tolerance-not-in-execution-order"
+        }
+        _ => "excludes-warmup-above-tolerance",
+    };
+    P9OrderControl {
+        not_ready: nr,
+        ready: rd,
+        says,
+    }
+}
+
 /// How the mask column must be read on *this* kernel — derived from the
 /// measurement, never asserted.
 ///
@@ -2531,6 +2645,9 @@ pub fn p9_poll_granularity() -> Probe {
             // kernel that gates the hangup on the requested mask this is a 2x3 and the
             // empty-mask cell is a level (notes §3.53).
             let axis = p9_mask_axis(hangup_unrequested);
+            // `medians()` yields cells in `P9_REF_MASKS` order, which is the order
+            // they were measured in — the control reads nothing without that.
+            let order = p9_order_control(&not_ready, &ready, hangup_unrequested, contaminated);
             let mut zero_by_state = serde_json::json!({
                 "shape": axis.shape,
                 "isolated_variable": "ready-vs-not-ready",
@@ -2546,6 +2663,17 @@ pub fn p9_poll_granularity() -> Probe {
                 // "it does not matter" is a result, and so is "it does".
                 "mask_role": axis.role,
                 "hangup_delivered_to_a_mask_that_requested_nothing": hangup_unrequested,
+                // **The within-group order control's outcome, published rather than
+                // asserted** (notes §3.73). `mask_role` has always told the reader
+                // the empty-mask cell runs last and so doubles as a warmup control;
+                // nothing said whether it passed. `flat` is the common answer and is
+                // NOT a strong pass — it means there was nothing above the
+                // resolution to see.
+                "order_control_says": order.says,
+                "order_control_not_ready": order.not_ready.label(),
+                "order_control_ready_hungup": order.ready.label(),
+                "order_control_tolerance_x100": P9_ORDER_TOLERANCE_X100,
+                "order_control_does_not_license": "a within-group ordering, not a mechanism. `consistent-with-warmup` says the cells decline in the order they ran and does NOT name what declined — a cold cache, a frequency ramp and a genuine kernel cost are indistinguishable here. `flat` says only that nothing exceeded `order_control_tolerance_x100`, which is a fitted resolution and not a noise floor. `not-comparable` means the group's cells did not observe one kernel state, which on a hangup-gating kernel is the mask being a level rather than any instrument fault.",
                 "mask_spread_not_ready_x100": ratio_x100(nr_max, nr_min),
                 "mask_spread_ready_x100": ratio_x100(rd_max, rd_min),
                 // The same spreads with the empty mask dropped. On a kernel where it is
@@ -2590,7 +2718,7 @@ pub fn p9_poll_granularity() -> Probe {
             p.verdict(
                 Status::Supported,
                 &format!(
-                    "A zero timeout costs {zero} ns median (the cost of asking) and a requested 1 ms costs {one_ms} µs median on this kernel — that is the floor §15.19's hybrid data plane was built around and the floor poll_ready's idle backoff steps against. 16 samples per timeout: enough to see the floor, not enough to characterize a tail. `zero_timeout_by_fd_state` is a **{shape}** here: the isolated variable is ready-versus-not-ready, and whether the mask column is a control or a second axis is decided by `hangup_delivered_to_a_mask_that_requested_nothing`, which this kernel answers **{hangup_unrequested}** — see `mask_role`. Read `{separation}` against `{spread}`: the finding survives only where the first exceeds the second, and the two must come from the SAME cell set — `read_the_separation_from` and `read_the_mask_spread_from` name the matching pair, because comparing a figure that drops the empty-mask cell against one that keeps it is not a comparison. `median_ns_for_0ms_request` above is n=16 taken cold and is NOT comparable to P2's headline — `p2_instrument_blocking_fd_ns` is, and `wrapper_offset_x100` / `nonblocking_offset_x100` say how much of any residual is this probe's instrument rather than the kernel's. Diff these against the production kernel (6.18) before tuning any backoff step or timer against them.{}",
+                    "A zero timeout costs {zero} ns median (the cost of asking) and a requested 1 ms costs {one_ms} µs median on this kernel — that is the floor §15.19's hybrid data plane was built around and the floor poll_ready's idle backoff steps against. 16 samples per timeout: enough to see the floor, not enough to characterize a tail. `zero_timeout_by_fd_state` is a **{shape}** here: the isolated variable is ready-versus-not-ready, and whether the mask column is a control or a second axis is decided by `hangup_delivered_to_a_mask_that_requested_nothing`, which this kernel answers **{hangup_unrequested}** — see `mask_role`. Read `{separation}` against `{spread}`: the finding survives only where the first exceeds the second, and the two must come from the SAME cell set — `read_the_separation_from` and `read_the_mask_spread_from` name the matching pair, because comparing a figure that drops the empty-mask cell against one that keeps it is not a comparison. `median_ns_for_0ms_request` above is n=16 taken cold and is NOT comparable to P2's headline — `p2_instrument_blocking_fd_ns` is, and `wrapper_offset_x100` / `nonblocking_offset_x100` say how much of any residual is this probe's instrument rather than the kernel's. The empty-mask cell runs last at each fd state, so it doubles as a within-group warmup control, and **`order_control_says` is that control's outcome** — `flat` is the usual answer and is not a strong pass, only a statement that nothing exceeded `order_control_tolerance_x100`; read `order_control_does_not_license` before drawing a mechanism from it. Diff these against the other kernel of record (6.18 or 7.0, whichever this run is not) before tuning any backoff step or timer against them.{}",
                     if contaminated > 0 {
                         format!(" NOTE: {contaminated} pass(es) returned early because the fd reported an event, so those samples measure readiness rather than the timeout — treat the affected rows as suspect.")
                     } else {
@@ -3250,7 +3378,7 @@ pub fn p10_pty_buffer_depth() -> Probe {
             p.verdict(
                 status,
                 &format!(
-                    "This kernel's pty accepted {} byte(s) slave→master (**targetward** — a client typing, travelling toward the device, first pass ending in `{}`) and {} byte(s) master→slave (**hostward** — the node delivering device output to its client, ending in `{}`), reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. **Of those, {} and {} byte(s) were actually recoverable by the peer** ({} / {}): acceptance is not delivery, and the two are the same number only on a kernel that queues everything it takes. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands, so a one-chunk difference across kernels is noise; only an order-of-magnitude one is signal, **and only between runs whose `slave_termios_mode` agrees** — a cooked pty and a raw one give different depths on one kernel, and in opposite directions — raw accepts less and returns all of it, cooked accepts more and returns none (measured on Linux 7.0.0-29) — so a mode mismatch explains a gap before any kernel difference does, and the `slave_termios_mode` cell beside each direction is what settles it. The `recheck` block under each direction asks the second question the first cannot, at four drain sizes rather than one: after the peer is drained the pair is refilled from empty and handed back 512, 1, 128 and 900 bytes in turn, and then once from empty entirely. `ladder_reading.watermark_threshold_gt` and `_le` bracket the watermark in \"writable iff occupancy < T, then accept up to capacity\" — a rung that tops up floors T at its `occupancy_after_drain`, a rung that refuses caps it there. A null `_le` means no rung refused, which bounds T below capacity only down to the smallest rung probed and is **not** proof of a pure capacity; read `_gt` on such a run as the largest occupancy the ladder reached rather than as one the kernel accepted a write at, because on a pipeline kernel it moved under the top-up. `uniform_shortfall_bytes` names a reservation charged per fill episode; the from-empty rung (`drain_requested_bytes: null`) is the one whose top-up starts at occupancy 0, so a reservation charged at the empty→nonempty transition lands inside its number instead of behind it, and comparing its `topped_up_bytes` against the 4 KiB-chunked `refilled_from_empty_bytes` on the same rung says whether write size changes the accounting. The flat fields beside the ladder are the 512-byte rung alone, kept so older reports still diff, and `room_republished_minus_room_freed` there says whether the kernel gave back exactly the room a reader freed (a fixed queue capacity), or more (an asynchronous pipeline that advanced during the settle — Linux 7.0.0-29 reads +2048 or +9216, bimodal, never 0 across 20 samples), or less. `refill_reproduced_total` says whether the depth above is reproducible on the same pair at all; on Linux it usually is not. Numbers, not a verdict — diff them against the production kernel (6.18) before changing a default.{}{}{}",
+                    "This kernel's pty accepted {} byte(s) slave→master (**targetward** — a client typing, travelling toward the device, first pass ending in `{}`) and {} byte(s) master→slave (**hostward** — the node delivering device output to its client, ending in `{}`), reaching {} and {} in total once a short pause has let the tty's asynchronous flip work run. **Of those, {} and {} byte(s) were actually recoverable by the peer** ({} / {}): acceptance is not delivery, and the two are the same number only on a kernel that queues everything it takes. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands, so a one-chunk difference across kernels is noise; only an order-of-magnitude one is signal, **and only between runs whose `slave_termios_mode` agrees** — a cooked pty and a raw one give different depths on one kernel, and in opposite directions — raw accepts less and returns all of it, cooked accepts more and returns none (measured on Linux 7.0.0-29) — so a mode mismatch explains a gap before any kernel difference does, and the `slave_termios_mode` cell beside each direction is what settles it. The `recheck` block under each direction asks the second question the first cannot, at four drain sizes rather than one: after the peer is drained the pair is refilled from empty and handed back 512, 1, 128 and 900 bytes in turn, and then once from empty entirely. `ladder_reading.watermark_threshold_gt` and `_le` bracket the watermark in \"writable iff occupancy < T, then accept up to capacity\" — a rung that tops up floors T at its `occupancy_after_drain`, a rung that refuses caps it there. A null `_le` means no rung refused, which bounds T below capacity only down to the smallest rung probed and is **not** proof of a pure capacity; read `_gt` on such a run as the largest occupancy the ladder reached rather than as one the kernel accepted a write at, because on a pipeline kernel it moved under the top-up. `uniform_shortfall_bytes` names a reservation charged per fill episode; the from-empty rung (`drain_requested_bytes: null`) is the one whose top-up starts at occupancy 0, so a reservation charged at the empty→nonempty transition lands inside its number instead of behind it, and comparing its `topped_up_bytes` against the 4 KiB-chunked `refilled_from_empty_bytes` on the same rung says whether write size changes the accounting. The flat fields beside the ladder are the 512-byte rung alone, kept so older reports still diff, and `room_republished_minus_room_freed` there says whether the kernel gave back exactly the room a reader freed (a fixed queue capacity), or more (an asynchronous pipeline that advanced during the settle — Linux 7.0.0-29 reads +2048 or +9216, bimodal, never 0 across 20 samples), or less. `refill_reproduced_total` says whether the depth above is reproducible on the same pair at all; on Linux it usually is not. Numbers, not a verdict — diff them against the other kernel of record (6.18 or 7.0, whichever this run is not) before changing a default.{}{}{}",
                     targetward.bytes,
                     targetward.terminal,
                     hostward.bytes,
@@ -4320,38 +4448,66 @@ fn p5_handshake(port_a: &Path, port_b: &Path) -> String {
         }
     }
 
-    let rts_ab = crosses(|v| a.set_rts(v), || b.read_cts());
-    let rts_ba = crosses(|v| b.set_rts(v), || a.read_cts());
-    let dtr_ab_dsr = crosses(|v| a.set_dtr(v), || b.read_dsr());
-    let dtr_ab_dcd = crosses(|v| a.set_dtr(v), || b.read_cd());
-    let dtr_ab_ri = crosses(|v| a.set_dtr(v), || b.read_ri());
-    let dtr_ba_dsr = crosses(|v| b.set_dtr(v), || a.read_dsr());
-    p5_handshake_line(
-        &rts_ab,
-        &rts_ba,
-        &dtr_ab_dsr,
-        &dtr_ab_dcd,
-        &dtr_ab_ri,
-        &dtr_ba_dsr,
-    )
+    p5_handshake_line(&HandshakeCells {
+        rts_ab: crosses(|v| a.set_rts(v), || b.read_cts()),
+        rts_ba: crosses(|v| b.set_rts(v), || a.read_cts()),
+        dtr_ab_dsr: crosses(|v| a.set_dtr(v), || b.read_dsr()),
+        dtr_ab_dcd: crosses(|v| a.set_dtr(v), || b.read_cd()),
+        dtr_ab_ri: crosses(|v| a.set_dtr(v), || b.read_ri()),
+        dtr_ba_dsr: crosses(|v| b.set_dtr(v), || a.read_dsr()),
+        // **B→A's DCD and RI, the two crossings the verdict used to assert
+        // without measuring** (notes §3.73). Until 2026-08-07 the line printed
+        // "DTR moves nothing" from four cells — A→B against DSR/DCD/RI but B→A
+        // against DSR alone — so a rig that wired B's DTR to A's DCD read
+        // `false` on every cell it published and the sentence claimed a
+        // negative it had never asked about in that direction. Character-for-
+        // character mirrors of the two A→B lines above with `a`/`b` swapped.
+        dtr_ba_dcd: crosses(|v| b.set_dtr(v), || a.read_cd()),
+        dtr_ba_ri: crosses(|v| b.set_dtr(v), || a.read_ri()),
+    })
+}
+
+/// The eight crossings the handshake line is computed from.
+///
+/// A struct rather than eight positional `&str`: the fold is the place a
+/// transposed argument would be invisible, and `clippy::too_many_arguments`
+/// fires at eight anyway. Every field is one `crosses()` reading —
+/// `"true"`, `"false"`, `"stuck-high"` or `"inverted"`.
+struct HandshakeCells {
+    rts_ab: String,
+    rts_ba: String,
+    dtr_ab_dsr: String,
+    dtr_ab_dcd: String,
+    dtr_ab_ri: String,
+    dtr_ba_dsr: String,
+    dtr_ba_dcd: String,
+    dtr_ba_ri: String,
 }
 
 /// The handshake line's shape, split out pure so the wiring vocabulary is
 /// testable without a bench — the reason [`p5_pair_certificate`] is split the same
 /// way. It classifies, it does not judge: every value it can produce is a
 /// legitimate rig.
-fn p5_handshake_line(
-    rts_ab: &str,
-    rts_ba: &str,
-    dtr_ab_dsr: &str,
-    dtr_ab_dcd: &str,
-    dtr_ab_ri: &str,
-    dtr_ba_dsr: &str,
-) -> String {
+fn p5_handshake_line(c: &HandshakeCells) -> String {
+    let HandshakeCells {
+        rts_ab,
+        rts_ba,
+        dtr_ab_dsr,
+        dtr_ab_dcd,
+        dtr_ab_ri,
+        dtr_ba_dsr,
+        dtr_ba_dcd,
+        dtr_ba_ri,
+    } = c;
     let both_rts = rts_ab == "true" && rts_ba == "true";
-    let any_dtr = [dtr_ab_dsr, dtr_ab_dcd, dtr_ab_ri, dtr_ba_dsr]
-        .iter()
-        .any(|v| **v == *"true");
+    // **All six DTR crossings, not four.** "DTR moves nothing" is a claim about
+    // both directions against all three inputs; computing it from a subset made
+    // the verdict stronger than its measurement (notes §3.73).
+    let any_dtr = [
+        dtr_ab_dsr, dtr_ab_dcd, dtr_ab_ri, dtr_ba_dsr, dtr_ba_dcd, dtr_ba_ri,
+    ]
+    .iter()
+    .any(|v| v.as_str() == "true");
     // The name a reader wants first, then the cells it is computed from — so a
     // half-crossed handshake is named rather than left to be spotted in six
     // fields, exactly as discovery names a half-crossed data pair.
@@ -4365,7 +4521,8 @@ fn p5_handshake_line(
     format!(
         "{shape} [rts_a_to_cts_b={rts_ab} rts_b_to_cts_a={rts_ba} \
          dtr_a_to_dsr_b={dtr_ab_dsr} dtr_a_to_dcd_b={dtr_ab_dcd} \
-         dtr_a_to_ri_b={dtr_ab_ri} dtr_b_to_dsr_a={dtr_ba_dsr}]"
+         dtr_a_to_ri_b={dtr_ab_ri} dtr_b_to_dsr_a={dtr_ba_dsr} \
+         dtr_b_to_dcd_a={dtr_ba_dcd} dtr_b_to_ri_a={dtr_ba_ri}]"
     )
 }
 
@@ -6415,7 +6572,7 @@ pub fn p15_flow_control_readback(ports: &[PathBuf]) -> Probe {
     let mut p = Probe::new(
         "P15",
         "real-port flow-control honouring",
-        "Does a named port honour a requested hardware flow-control mode (CRTSCTS) on read-back, or accept the request and silently drop it (§7.1, §15.51)?",
+        "Does a named port honour a requested hardware flow-control mode (CRTSCTS) on read-back, or accept the request and silently drop it (§7.1, §15.53)?",
     );
     let mut rows: Vec<FlowReadback> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -7674,50 +7831,110 @@ mod tests {
     /// artifact whose rig nobody has re-inspected.
     #[test]
     fn the_handshake_line_names_the_wiring_and_grades_none_of_it() {
-        // The bench rig, measured (notes §3.53 i): RTS/CTS both ways, DTR nothing.
-        let five_wire = p5_handshake_line("true", "true", "false", "false", "false", "false");
+        // Eight cells, named, so a transposed argument cannot hide in a
+        // positional call — the shape that let the four-cell verdict ship
+        // (notes §3.73).
+        fn cells(v: [&str; 8]) -> HandshakeCells {
+            HandshakeCells {
+                rts_ab: v[0].into(),
+                rts_ba: v[1].into(),
+                dtr_ab_dsr: v[2].into(),
+                dtr_ab_dcd: v[3].into(),
+                dtr_ab_ri: v[4].into(),
+                dtr_ba_dsr: v[5].into(),
+                dtr_ba_dcd: v[6].into(),
+                dtr_ba_ri: v[7].into(),
+            }
+        }
+        let line = |v: [&str; 8]| p5_handshake_line(&cells(v));
+        const NONE: [&str; 8] = ["false"; 8];
+
+        // The bench rig, measured (notes §3.53 i, re-measured §3.73): RTS/CTS
+        // both ways, DTR nothing — now across all six DTR crossings.
+        let five_wire = line([
+            "true", "true", "false", "false", "false", "false", "false", "false",
+        ]);
         assert!(five_wire.starts_with("5-wire crossover"), "{five_wire}");
         // The design's stated common case.
-        let three_wire = p5_handshake_line("false", "false", "false", "false", "false", "false");
+        let three_wire = line(NONE);
         assert!(three_wire.starts_with("3-wire"), "{three_wire}");
         // The state worth naming: it carries one way, which is a wiring fault a
-        // reader would otherwise have to spot across six cells.
-        let half = p5_handshake_line("true", "false", "false", "false", "false", "false");
+        // reader would otherwise have to spot across eight cells.
+        let half = line([
+            "true", "false", "false", "false", "false", "false", "false", "false",
+        ]);
         assert!(half.contains("HALF-CROSSED"), "{half}");
         assert!(
-            p5_handshake_line("false", "true", "false", "false", "false", "false")
-                .contains("HALF-CROSSED"),
+            line([
+                "false", "true", "false", "false", "false", "false", "false", "false"
+            ])
+            .contains("HALF-CROSSED"),
             "the mirror direction must be named too"
         );
         // A rig that carries DTR as well, and one that carries only DTR.
+        let wired = line([
+            "true", "true", "true", "false", "false", "false", "false", "false",
+        ]);
         assert!(
-            p5_handshake_line("true", "true", "true", "false", "false", "false")
-                .starts_with("wired:"),
+            wired.starts_with("wired:"),
             "a fully wired rig must not be called a 5-wire crossover"
         );
-        assert!(
-            p5_handshake_line("false", "false", "true", "false", "false", "false")
-                .starts_with("DTR wired"),
-        );
+        let dtr_only = line([
+            "false", "false", "true", "false", "false", "false", "false", "false",
+        ]);
+        assert!(dtr_only.starts_with("DTR wired"));
+
+        // **Every one of the six DTR crossings must be able to move the
+        // verdict** — the defect was that two of them could not (notes §3.73).
+        // Each is raised alone, so a cell dropped from the fold reddens here
+        // and nowhere else. Fail-first: against the four-cell `any_dtr` the two
+        // B→A cases below fail.
+        for (i, which) in [
+            (2, "dtr_a_to_dsr_b"),
+            (3, "dtr_a_to_dcd_b"),
+            (4, "dtr_a_to_ri_b"),
+            (5, "dtr_b_to_dsr_a"),
+            (6, "dtr_b_to_dcd_a"),
+            (7, "dtr_b_to_ri_a"),
+        ] {
+            let mut v = NONE;
+            v[i] = "true";
+            assert!(
+                line(v).starts_with("DTR wired"),
+                "{which} alone did not register as a DTR line — the verdict is \
+                 computed from a subset of the crossings it prints"
+            );
+            let mut v = [
+                "true", "true", "false", "false", "false", "false", "false", "false",
+            ];
+            v[i] = "true";
+            let with_rts = line(v);
+            assert!(
+                with_rts.starts_with("wired:"),
+                "{which} did not lift a 5-wire crossover to `wired:` — a rig \
+                 whose DTR IS carried would be reported as carrying nothing: {with_rts}"
+            );
+            assert!(
+                !with_rts.starts_with("5-wire crossover"),
+                "{which}: the sentence claims DTR moves nothing while the cell \
+                 beside it says otherwise: {with_rts}"
+            );
+        }
+
         // Every shape must be distinguishable, or the classifier is a constant.
-        let shapes: std::collections::BTreeSet<String> = [
-            &five_wire,
-            &three_wire,
-            &half,
-            &p5_handshake_line("true", "true", "true", "false", "false", "false"),
-            &p5_handshake_line("false", "false", "true", "false", "false", "false"),
-        ]
-        .iter()
-        .map(|s| s.split(" [").next().unwrap_or_default().to_owned())
-        .collect();
+        let shapes: std::collections::BTreeSet<String> =
+            [&five_wire, &three_wire, &half, &wired, &dtr_only]
+                .iter()
+                .map(|s| s.split(" [").next().unwrap_or_default().to_owned())
+                .collect();
         assert_eq!(
             shapes.len(),
             5,
             "two wiring shapes share a name: {shapes:?}"
         );
-        // The six cells travel with the name, always — the name is a reading of
-        // them and a reader must be able to check it.
-        for line in [&five_wire, &three_wire, &half] {
+        // The eight cells travel with the name, always — the name is a reading
+        // of them and a reader must be able to check it.
+        for l in [&five_wire, &three_wire, &half, &wired, &dtr_only] {
             for key in [
                 "rts_a_to_cts_b=",
                 "rts_b_to_cts_a=",
@@ -7725,19 +7942,37 @@ mod tests {
                 "dtr_a_to_dcd_b=",
                 "dtr_a_to_ri_b=",
                 "dtr_b_to_dsr_a=",
+                "dtr_b_to_dcd_a=",
+                "dtr_b_to_ri_a=",
             ] {
-                assert!(line.contains(key), "{key} missing from {line}");
+                assert!(l.contains(key), "{key} missing from {l}");
             }
         }
+        // A non-boolean reading still reaches the reader rather than being
+        // folded away: `stuck-high` is not `true`, so it must not claim wiring.
+        let stuck = line([
+            "true",
+            "true",
+            "stuck-high",
+            "false",
+            "false",
+            "false",
+            "false",
+            "false",
+        ]);
+        assert!(
+            stuck.starts_with("5-wire crossover") && stuck.contains("dtr_a_to_dsr_b=stuck-high"),
+            "a stuck line was read as wired, or was dropped from the cells: {stuck}"
+        );
         // **Reported, never judged**: the handshake reaches no `CertFailure`, so
         // no shape can move P5's verdict. Asserted over the verdict itself rather
         // than by inspecting the call site, because that is the property.
-        for line in [&five_wire, &three_wire, &half] {
+        for l in [&five_wire, &three_wire, &half] {
             let (status, _) = p5_verdict(true, true, &[], &[], paired());
             assert_eq!(
                 status.label(),
                 "supported",
-                "a handshake reading moved the verdict: {line}"
+                "a handshake reading moved the verdict: {l}"
             );
         }
     }
@@ -8821,6 +9056,112 @@ mod tests {
     /// The two readings of the mask column, checked against each other rather than
     /// against this box (§9). Both arms ship; only one runs per kernel, and the one
     /// that does not run is exactly the one a single-kernel session cannot test.
+    /// **The within-group order control reports an outcome, and all four of its
+    /// per-group values are reachable** (notes §3.73).
+    ///
+    /// The probe documented this control from the day it was written and published
+    /// nothing about whether it passed. Three of the four values below appear in no
+    /// committed artifact — `warmup-refuted` in none at all — so a pure test is the
+    /// only thing that covers them, which is the shape §3.65 caught three times in
+    /// one session (a guard pinning the platform of record's answer instead of the
+    /// property).
+    ///
+    /// Cells are given in **execution order**, last-run cell last.
+    #[test]
+    fn the_order_control_reports_its_outcome_and_every_arm_is_reachable() {
+        // Flat: the whole committed Linux 7.0 corpus. 258/259/260 is 1.00x.
+        assert_eq!(p9_order_group(&[258, 259, 260], true), P9OrderGroup::Flat);
+        // Still flat at the widest noise the corpus shows (Darwin not-ready,
+        // 1.279x) — the tolerance exists so this does not fire.
+        assert_eq!(
+            p9_order_group(&[1279, 1000, 1100], true),
+            P9OrderGroup::Flat
+        );
+
+        // Linux 6.18's not-ready group, verbatim: 883/418/418 is 2.112x, declining,
+        // last-run cell tied cheapest. This is the reading the control was built to
+        // catch and the corpus does not contain.
+        assert_eq!(
+            p9_order_group(&[883, 418, 418], true),
+            P9OrderGroup::ConsistentWithWarmup
+        );
+
+        // Above tolerance but NOT in execution order: whatever moved these is not a
+        // monotone warmup. No committed artifact reads this.
+        assert_eq!(
+            p9_order_group(&[418, 418, 883], true),
+            P9OrderGroup::WarmupRefuted
+        );
+        assert_eq!(
+            p9_order_group(&[418, 883, 418], true),
+            P9OrderGroup::WarmupRefuted
+        );
+
+        // Not comparable: the caller says the cells did not observe one state, and
+        // an unmeasurable cell must not take the report down.
+        assert_eq!(
+            p9_order_group(&[883, 418, 418], false),
+            P9OrderGroup::NotComparable
+        );
+        assert_eq!(
+            p9_order_group(&[0, 418, 418], true),
+            P9OrderGroup::NotComparable
+        );
+        assert_eq!(p9_order_group(&[418], true), P9OrderGroup::NotComparable);
+
+        // All four labels are distinct, or the cell is a constant wearing four names.
+        let labels: std::collections::BTreeSet<&str> = [
+            P9OrderGroup::NotComparable,
+            P9OrderGroup::Flat,
+            P9OrderGroup::ConsistentWithWarmup,
+            P9OrderGroup::WarmupRefuted,
+        ]
+        .iter()
+        .map(|g| g.label())
+        .collect();
+        assert_eq!(labels.len(), 4, "two arms share a label: {labels:?}");
+
+        // The combined reading. Linux 7.0: both groups flat, hangup delivered
+        // unrequested, nothing ready on the unready fd.
+        let linux = p9_order_control(&[258, 259, 260], &[262, 261, 263], true, 0);
+        assert_eq!(linux.says, "excludes-warmup-above-tolerance");
+        assert_eq!(linux.not_ready, P9OrderGroup::Flat);
+
+        // Linux 6.18: the not-ready group fires, so the combined reading must not
+        // claim warmup was excluded.
+        let six_eighteen = p9_order_control(&[883, 418, 418], &[463, 462, 474], true, 0);
+        assert_eq!(six_eighteen.says, "warmup-not-excluded");
+        assert_eq!(six_eighteen.ready, P9OrderGroup::Flat);
+
+        // **Darwin: the hung-up group must be `not-comparable`, never a warmup
+        // reading.** Its ~11x spread there is the mask being a real level
+        // (`revents: none` against `POLLHUP` on the same fd), and reporting a
+        // kernel difference as instrument drift is the specific error this arm
+        // exists to prevent.
+        let darwin = p9_order_control(&[1279, 1000, 1100], &[1000, 1100, 10990], false, 0);
+        assert_eq!(darwin.ready, P9OrderGroup::NotComparable);
+        assert_eq!(darwin.not_ready, P9OrderGroup::Flat);
+        assert_eq!(darwin.says, "excludes-warmup-above-tolerance");
+
+        // A contaminated not-ready group (something was ready on an fd that should
+        // never be) makes that group say so rather than reading its order.
+        let contaminated = p9_order_control(&[883, 418, 418], &[463, 462, 474], true, 7);
+        assert_eq!(contaminated.not_ready, P9OrderGroup::NotComparable);
+
+        // Both groups unreadable reads `unmeasured`, not a pass.
+        let neither = p9_order_control(&[883, 418, 418], &[1, 2, 3], false, 7);
+        assert_eq!(neither.says, "unmeasured");
+
+        // The tolerance is published so a later capture can re-derive it. It must
+        // sit above the corpus and below the one firing reading, or the constant is
+        // fitted to nothing.
+        assert!(
+            (128..=211).contains(&P9_ORDER_TOLERANCE_X100),
+            "the tolerance no longer separates the committed corpus (max 1.279x) \
+             from Linux 6.18's 2.112x: {P9_ORDER_TOLERANCE_X100}"
+        );
+    }
+
     #[test]
     fn the_mask_axis_framing_is_derived_from_the_measurement_both_ways() {
         let replicate = p9_mask_axis(true);

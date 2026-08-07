@@ -2196,7 +2196,7 @@ lessons; plan §13 is the track.
 **Scale.** 69 files, ~12k insertions. Suite **265 → 435 passing / 0 failing**; nine new
 `serial-nexus-itest` files (`p9_*`), three new fuzz targets, two new meta-gates. `cargo fmt`,
 `cargo clippy` (full **and** minimal-daemon), `cargo deny`, the macOS cross-check and
-`serial-nexus-doctor --json | jq -f expectations/linux.jq` are all green.
+`serial-nexus-doctor --json | jq -e -f expectations/linux.jq` are all green (the `-e` added 2026-08-07 — without it jq exits 0 whatever the clauses say; notes §3.74).
 
 **The shape of the fixes, which matters more than the list.** Every headline defect was an
 invariant upheld in a layer that could not enforce it, so the fixes moved each one down:
@@ -8248,7 +8248,23 @@ close and releases it only after the master has drained. On Linux 7.0.0-29 it is
 counts agree (64 of 64 either way — Linux retains), and the **terminal read** moves,
 `EIO` with one fd against `EAGAIN` with the witness held. The hangup itself is
 deferred to the reference-count edge. On a kernel that discards at last close the
-byte counts must move instead, which is what a Darwin or 6.18 run will show.
+byte counts must move instead, which is what a Darwin run shows.
+
+> **Annotated 2026-08-07 (§3.73): the "or 6.18" half of that last sentence was
+> falsified by measurement and has been struck from it.** A Tier-3 6.18.14 capture
+> at `3e23c52` — the same doctor source as the committed `7cf0338` 7.0 triple, both
+> digests equal — reads `policy: retains`, with `a_no_reader_blocking_slave` and
+> `d_no_reader_second_fd_held` both recovering 64 of 64. The byte counts do **not**
+> move on 6.18; only `terminal_read` does, `EIO` against `EAGAIN`, exactly as on
+> 7.0. The Darwin half held. This was a forward-looking expectation, **not** a
+> pre-registered falsifier — §3.64 registers none, and the word is reserved here for
+> formal registrations. Nothing downstream depended on it: the guard
+> `the_last_close_reference_count_shape_is_not_inert_here` gates its strict branch
+> on `bare_bytes < P13_PAYLOAD`, false on 6.18, and falls through to the portable
+> `bytes_differ || terminal_differs`, which the `EIO`/`EAGAIN` move satisfies. What
+> 6.18 does confirm is §3.56's premise — close-time work attaches to the last close.
+> What stays single-kernel is the *strong* form: the witness fd recovering bytes
+> that would otherwise be lost still rests on Darwin alone.
 
 The guard asserts *something* differs rather than *which* cell — that is what keeps
 it portable, and it is still a real assertion, because an implementation that opened
@@ -9326,3 +9342,260 @@ measurement rather than an edit:
   a pasted report, not diffed against a committed capture. This **narrows** §18 item 8
   and does not close it: that owes `macos-26-arm64`, which is a different image, and no
   line of `sys/src/usb_macos.rs` has ever run on arm64.
+
+### 3.73 A Linux 6.18 field report: five defects it found, four of them in the instrument
+
+A `serial-nexus-doctor` Tier-3 report from a Linux 6.18.14-1rodete4-amd64 box, at
+commit `3e23c52`, probe set `82a8e2198e54626a`, field set `179c9d15c6e450f5`. Assessed
+against the committed `docs/doctor/linux-7.0-2026-08-05-7cf0338-tier3{,-2,-3}.json`
+triple. **The comparison is lawful on a stronger basis than either digest can give:**
+`git diff 7cf0338 3e23c52 -- doctor/ core/ sys/ rpc/ codec-api/ Cargo.lock` is empty,
+so the two reports came from the *same doctor source*, which closes the residual
+blindness §15.44 leaves open — a probe body that moves a number without moving a key.
+
+**The kernel answer first, because it is the least interesting part: 6.18 and 7.0 are
+the same kernel as far as this instrument can see.** `24 supported · 0 degraded · 0
+unsupported · 1 skipped`, the skip being P12's deliberately inert `SessionLatch` arm.
+Zero booleans, strings, errno histograms, byte counts, ceilings, ioctl-availability
+flags or termios modes differ across the 16 probe sections. **All five deferred
+"diff against the production kernel (6.18)" decisions are discharged and every one
+licenses nothing new** — P6's `saw_session` latch still stands (Darwin at the same
+probe set reads `pollin_passes: 64` against 6.18's 0), P8 leaves invariant 2 untouched,
+P9's 1 ms floor is *tighter* on 6.18, P10 moves no buffer default. **P13, P14 and P15
+executed on 6.18 for the first time** — the prior 6.18 artifact,
+`docs/doctor/linux-6.18-2026-07-29-tier3.md`, is P1–P12 at a dead era — and P15 reads
+`honoured_on_readback: true` with `cflag` `0x10021cb2` → `0x90021cb2`, a delta of
+exactly `CRTSCTS`, so §15.53's pre-check is inert there.
+
+**What blocks "fully supported" is execution, not behaviour, and it is plan §18 item 8
+unchanged:** no test has ever run on 6.18, and `jq -e -f expectations/linux.jq` has
+still never been *executed* there. This is the **third** Markdown-only 6.18 visit; the
+one-shot protocol in `docs/serial-nexus-doctor.md` exists to prevent exactly that and
+did not take. Every clause was evaluated by hand against a transcription and all pass,
+with eight deliberate mutations rejecting, so the report is gate-clean *on inspection*
+— which is inference, not an exit status, and five clauses rest on a JSON *kind* the
+Markdown renderer cannot express. The next visit needs one `>` redirect.
+
+**(1) `Probe::observe` appended where it had to replace, and P14 shipped every report
+carrying three keys twice.** `p14_max_rate` stamps `max_reliable_baud`, `ceiling_kind`
+and `ceiling_is_a_floor_over` as `null` placeholders on every path so an early return
+still carries the cells the gate requires, then overwrites them when the search runs.
+`observe` was a `push`, so it did not overwrite: the shipped Markdown printed "the
+search did not run on this path" **nine lines above** `max_reliable_baud: 3000000`.
+Which value a reader got depended on their idiom — last-wins reading into a map,
+**first-match for the `[…] | first` spelling `expectations/*.jq` itself uses**. P14 is
+the only probe in the tree that does this and **the only one with duplicate keys in any
+committed artifact, on both kernels** (27 observations, 24 distinct). `observe` now
+replaces in place, keeping the key's declared position so the placeholder is overwritten
+where it stands. **Neither digest moves**: `field_set_core` sorts and dedups leaf paths,
+which is why this shipped through five commits and two kernels invisibly — that blindness
+is now itself a guard, `the_field_set_digest_cannot_see_a_key_emitted_twice`.
+
+**(2) A `supported` P14 that measured nothing passed the gate.** Found by mutation, not
+by reading: strip P14's measured trio back to its placeholders in the committed
+`7cf0338` artifact, leave `status: supported`, and `jq -e -f expectations/linux.jq`
+returns **0**. The presence clause deliberately admits `null` — an unfinished search
+must be able to say so — and nothing complemented it. `p14_verdict` already refuses the
+combination (it degrades whenever either cell is `None`), so the new clause pins a
+property the probe **promises** rather than an answer it might give: no honest report can
+trip it, it names no number and no `ceiling_kind`, and plan §3 rule 14 is untouched. It
+reads through `last` so the frozen artifacts, which carry the pre-repair duplicates, are
+still read at their answer (§16.13 leaves them untouched). The probe's own guard could
+not have caught this: it exercises the `baseline_ok: false` and empty-ports arms, neither
+of which reaches the search block.
+
+**(3) The P4 population clause passed on type confusion.** It spelled its test
+`(… // -1) > 0`, and **jq orders strings above numbers**, so a `canonical` of `"2"` — or
+of any string — compared greater than `0`. That is the same defect class the clause was
+written for (§3.45 (ii)): a population assertion blind to a population it does not
+recognise. Now type-checked and read through `last`. Both new clauses are proven by
+planted violation in every spelling they claim to cover, with a positive control on each,
+and **no verdict changed across all 55 committed artifacts**.
+
+**(4) Five printed consequences told a 6.18 box to diff against itself.** P6, P7, P8, P9
+and P10 all ended "diff … against the production kernel (6.18)" — correct prose on the
+7.0 dev box, circular on the kernel the sentence names, and invisible to every gate and
+both digests because no `.jq` clause and neither fingerprint reads a consequence. They
+now say "the other kernel of record (6.18 or 7.0, whichever this run is not)".
+
+**(5) P5's handshake verdict was computed from four of the six crossings it prints.**
+"DTR moves nothing" is a claim about both directions against all three inputs, but the
+probe measured A→B against DSR/DCD/RI and B→A against **DSR alone**. A rig wiring B's
+DTR to A's DCD would have read `false` on every published cell while the sentence
+asserted a negative never asked in that direction. Both crossings are measured now, the
+fold reads all six, and the line prints eight cells. **Measured on the bench rig, and
+the pre-registered reading held exactly**: `dtr_b_to_dcd_a=false dtr_b_to_ri_a=false`,
+verdict unchanged at `5-wire crossover`. **Neither digest moves** — the handshake is one
+string cell, so the two new crossings live inside a value, which is precisely the
+"changed a number without changing a key" blindness §15.44 names; announced by hand here
+because no digest can announce it. The guard raises each of the six DTR cells alone and
+requires each to lift the verdict, so a cell dropped from the fold reddens on CI with no
+rig; fail-first against the four-cell fold names `dtr_b_to_dcd_a` exactly.
+
+**Bounds, stated rather than implied (§9).** The two new B→A cells have exercised only
+their `false` arm — nothing on this bench wires DTR — so `true`, `stuck-high` and
+`inverted` are untested there, as they already were for the four existing cells on every
+committed artifact of both kernels. And a **transposed** read (`read_ri` where `read_cd`
+was meant) is invisible to CI *and* to this rig, since both answer `false`; the two lines
+are character-for-character mirrors of their A→B siblings, and that is the whole
+mitigation.
+
+**(7) P15's `question` cited §15.51, which is P14's section — fixed, and the decline
+that guarded it is explicitly overturned.** §3.68 filed this rather than fixing it, on
+two grounds: no design entry for P15 existed, and correcting the string moves
+`probe_set`. **The first ground is gone** — design §15.53 landed in `b8e4d8f` and its own
+text says "§15.51's entry carried P15's citation because this entry did not exist yet
+(notes §3.68 filed the debt); **it is discharged here**" — so the design had already
+recorded the debt as paid while the code still carried it, which is the disagreement §5
+exists to resolve in the design's favour. **The second ground is overturned by decision
+rather than by evidence, and that is recorded as what it is** (§5): an era boundary was
+being treated as more expensive than a wrong citation, and the judgement is that a
+doctor worth collecting measurements from across every box is worth an era. The
+correction is cheap *now* and gets steadily dearer, because every capture taken under a
+wrong citation is another artifact stranded on the wrong side of the eventual fix.
+
+`probe_set` moves **`82a8e2198e54626a` → `e79f5fcd86a2e5f0`**. What that costs, stated
+plainly rather than minimised: the 6.18 Markdown report, the `7cf0338` Linux triple and
+the `acb5162` macOS triple are now a **closed era**. They stay perfectly comparable *with
+each other* — the 6.18↔7.0 pair this session established is untouched, and it remains the
+first lawful cross-kernel Linux comparison in the tree — but no future capture joins
+them, and the P1–P14 cells must not be diffed across the boundary without the mismatch
+stated. §15.44's first digest is doing exactly its job here: the unequal direction is a
+verdict, and it is now announcing a real instrument change rather than a cosmetic one.
+The `field_set` half of this session's work (`a02e07f3f25e45b9`) moves for its own
+reasons — P9's five new order-control cells — and the two movements are independent.
+
+**(6) P9 documented a within-group order control and never published its outcome.**
+`P9_REF_MASKS`'s empty-mask cell runs last at each fd state, so a monotone warmup would
+leave it the cheapest cell in its group; `mask_role` has told readers that since the
+probe was written, and nothing said whether it held. Same class as §3.50's "a `0`
+printed with nothing beside it that says what the `0` means". It reports now, as
+`order_control_says` plus a per-group cell and the tolerance it used.
+
+**The obvious design was wrong and the corpus refuted it before it shipped.** A
+rank-based "is the last-run cell the minimum?" reading fires on **20 of 27** committed
+Linux 7.0 reports, on deltas of 0–3 ns out of ~260 — it would be a false-alarm generator
+on the platform of record. So the reading is **magnitude-gated and per-group**: across
+the 36 committed artifacts carrying the cell, the widest spread attributable to noise is
+1.279x, while Linux 6.18's not-ready group at `883/418/418` is **2.112x**, larger than
+all 72 committed group readings and monotone with the last-run cell tied cheapest — the
+exact signature the control exists to catch. `P9_ORDER_TOLERANCE_X100` is 150, published
+as a field so a later capture can re-derive the threshold rather than re-argue it, and
+guarded to stay inside `128..=211` so a corpus that moved would redden rather than
+silently re-fit. **This also corrects a reading in this session's own assessment**: the
+6.18 rank *flip* between groups was called a disagreement, and it is corpus-normal noise
+— what is singular there is the magnitude, not the order.
+
+**The Darwin arm is the one that had to be got right, and it is guarded.** Its hung-up
+group spreads ~11x, which is the mask being a real *level* (`revents: none` against
+`POLLHUP` on the same fd), not instrument drift — so a group is `not-comparable` unless
+`hangup_delivered_to_a_mask_that_requested_nothing`, and reporting a kernel difference
+as a warmup artifact is structurally impossible. **Pre-registered and then run against
+every committed artifact**: 27 Linux reports read `flat`/`flat`, 9 macOS reports read
+`flat`/`not-comparable`, 19 predate the cell, and 6.18 reads `warmup-not-excluded`. All
+four per-group values are exercised by a pure test — `warmup-refuted` appears in no
+capture that exists, so nothing else covers it. `flat` is stated in the cell itself as
+**not a strong pass**: on the platform of record the control has never discriminated,
+and calling that "the control worked" would rebuild the defect one level up.
+`field_set` moves and `probe_set` does not; the gate clause is presence-and-type in both
+files, proven by mutation to bite on absence and to accept all five answers.
+
+**One instrument error of this session's own, recorded rather than buried.** The first
+attempt to prove the P4 string hole ran the *macOS* gate against a Linux artifact,
+because the shell variable holding the "old" gate had been overwritten by an earlier
+loop, and reported "old gate: rejected" — i.e. no defect. Re-run with the right file, the
+old Linux gate **accepts** the string. The hole was real; the first measurement of it was
+not. §8's rule about reverting the specific fix in place applies to gate files too.
+
+### 3.74 Two renderings, one measurement: the doctor's Markdown and JSON twins
+
+The question asked was whether the doctor needs both a Markdown and a JSON rendering,
+and if so whether each is in good shape. **Both are needed, neither can be derived from
+the other, and the defect was never in either renderer — it was that no single
+invocation produced both.**
+
+**Why both, measured rather than argued.** The Markdown is a pure function of the JSON
+model minus exactly one field (`generated_unix_ms`) — established by transcribing
+`to_markdown`/`render_value` and validating the transcription against real output at
+228 of 228 passive lines and 290 of 291 Tier-3 lines, the one difference being a genuine
+measurement drift between the two runs. The reverse does not hold: of 1064 Tier-3 scalar
+leaves, **0 carry their JSON kind**, and `expectations/linux.jq` has **22 `type ==`
+clauses** plus 5 `has()` clauses that turn on exactly that. Proven by mutating one cell's
+*kind* in a real capture — `P4.canonical` `2` → `"2"` flips the gate to exit 1 while the
+rendered Markdown stays **byte-identical** and `field_set` does not move. So the JSON is
+the artifact of record and the Markdown is a view of it. Deleting the Markdown would
+remove the thing that let a human spot P14's duplicate-key contradiction by eye when
+neither digest could (§3.73), and would raise the floor on who can file a useful report —
+§3.71 records a field report whose sender could produce a doctor report and not one test
+result. Eight distinct JSON values were demonstrated to render to byte-identical
+Markdown, including `2`/`"2"`, `null`/`"null"` and `true`/`"true"`.
+
+**The defect. `--json` and `--markdown` were mutually exclusive by construction** — the
+latter was `let _ = cli.markdown` — so the documented support-request path produced a
+paste no gate could read, and obtaining the JSON meant running the probes **again**. Two
+runs of one rig are not one measurement: on the bench P10's
+`bytes_accepted_before_eagain` reads 11776 and 13824 across consecutive runs and P9's
+medians move a nanosecond or two. So "the Markdown and the JSON of the same capture" was
+not a thing that existed, in the protocol or in CI. `--json-out <path>` writes the JSON
+twin from the same `Report` value; verified on the rig, the twin and the paste agree on
+`field_set` (`5d99bdc231f8376d`) and on P10's volatile cell (13824 both), and the twin
+passes the gate. `--json --markdown` now conflicts rather than silently resolving to
+JSON.
+
+**The header sentence, which is what actually cost three visits.** It said "paste this
+whole report into a support request" and nothing more. Three consecutive Markdown-only
+6.18 captures are three people doing exactly what the tool asked. It now asks for the
+JSON too and names the flag. `docs/serial-nexus-doctor.md`'s one-shot protocol took the
+Markdown as a *second* invocation and now uses `--json-out`.
+
+**`--field-set` had a hole of the shape §3.50 keeps finding — a confident answer that
+means nothing.** A report whose probes carried no observations produced a well-formed
+16-hex-digit digest and exit **0**, so two such reports compared *equal* to each other;
+`field_set_of_report_json` returns `None` on an empty triple set now, which routes to the
+existing "not a doctor report" arm and exit 2. Unknown is never "equal". And
+`--field-set` on the doctor's own Markdown twin answered with a bare serde error; it now
+names the cause and both remedies, which is the message the operator most likely to hit
+it will see.
+
+**The Markdown renderer had one test and it was vacuous past the Build table.**
+Everything after the first fifteen lines — every environment row, every probe section,
+every observation, the summary — could have vanished with the whole gate set green, on
+the rendering three field visits have produced and the JSON's 26 matcher-proven gates
+never touch. `the_markdown_document_has_the_shape_a_reader_is_promised` asserts the
+document's shape against a fixture built to carry the hazards: a `|` in an env-check
+name and value, a `|` in a skip reason, and observations of every JSON kind including a
+nested object and an array of objects. It checks the four section headers in order, that
+**every table row has its header's unescaped-pipe count**, that every probe reaches the
+document with its question and consequence, that nested leaves survive flattening, and
+that the summary agrees with the verdicts — with an anti-vacuity control proving an empty
+report does *not* satisfy the probe assertions. Fail-first: reverting the env-name
+escaping reddens the column-count assertion, and rendering only the first probe reddens
+on `P2 section missing`.
+
+**Two things the guard settled rather than assumed.** A `|` in a *probe heading* is
+deliberately **not** escaped — a heading is not a table row, and escaping there shows the
+reader a stray backslash — so the guard asserts the escaped form in the env table and the
+bare form in the heading. And the summary counts **environment checks and probes
+together**, which is why a report's "24 supported" exceeds its probe count; that
+arithmetic had been queried and is now pinned by a test.
+
+**Also fixed: `md_escape` was applied to one of the Environment table's three columns.**
+`name` reaches operator input through `access:<port>` and `--dev-root`, so a path
+containing a pipe broke the table. A half-applied escape is worse than none, because it
+reads as deliberate.
+
+**And a documentation defect with no runtime effect, stated because the reverse would be
+easy to assume.** `AGENTS.md` §3 spelled the doctor gate `jq -f expectations/linux.jq`,
+without `-e` — and without `-e`, jq prints `false` and exits **0**, so the command reads
+as a gate and asserts nothing. Measured against a deliberately-gutted report: exit 0
+without `-e`, exit 1 with it. **CI always had `-e`** (`.github/workflows/ci.yml:195` and
+`:251`), so no lane was ever blind and nothing shipped unchecked; only the line a human
+copies was wrong.
+
+**Filed, not fixed.** The Markdown value grammar is non-injective by construction —
+`", "`, `"="`, `"["` and `"]"` are unescaped inside values, so `{"note":"a","b":"c"}` and
+`{"note":"a, b=c"}` render identically. Quoting or escaping them would change the
+rendering of every committed `.md` artifact, and §16.13 freezes those; it wants a design
+note before a patch. A heuristic parser already recovers 483 of 483 Tier-3 leaf paths and
+reproduces the printed digest, so the practical loss today is zero — but "recoverable by
+a heuristic" is not a contract, and it should not be mistaken for one.

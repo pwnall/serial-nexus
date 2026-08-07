@@ -35,19 +35,40 @@ would otherwise disagree — which is exactly the pair below) and the
 therefore does not invalidate an archived comparison. `commit` says which tree built
 the binary; `generated` is a UTC stamp. A report with **no** `probe set` at all —
 anything built before 2026-07-28 — is not comparable with these. A report with no
-**`field set`** — anything built before `b21548d`, which is every file indexed below
-except the six `f8315cc` rows at the top, the first captures to carry the digest they
-are indexed by —
+**`field set`** — anything built before `b21548d`, the `f8315cc` rows being the first
+captures to carry the digest they are indexed by —
 has an *unknown* cell set, and unknown is never "equal": the column below carries the
 recomputation (`serial-nexus-doctor --field-set <file>`), because the digest is a pure
 function of `.probes[].observations` and so is computable for artifacts captured before
 the field existed. That is what let this column be added without touching a frozen
 artifact (§16.13).
 
+**One row is neither, and it is the top one.** `linux-6.18-2026-08-07-3e23c52-tier3.md`
+is Markdown, so its digest can be neither recomputed nor verified here — the column
+carries what the report *printed*. Trust it exactly as far as you trust the box that
+produced it, which is the reason plan §18 item 8 asks for `--json` and stays open until
+it gets it. The older `linux-6.18-2026-07-29-tier3.md` has the same limit and predates
+the field entirely, so it reads `n/a`.
+
+**A new fingerprint era opened 2026-08-07: `82a8e2198e54626a` → `e79f5fcd86a2e5f0`.**
+P15's `question` cited §15.51, which is P14's section; design §15.53 is P15's own entry
+and had already recorded the debt as discharged while the code still carried the wrong
+number. Correcting it moves the digest, and **that was the right trade rather than a
+regrettable side effect** — the alternative was accumulating captures under a citation
+known to be wrong. Everything indexed below is therefore a **closed era**: the rows
+remain comparable with each other, including the 6.18↔7.0 pair immediately below, which
+is still the first lawful cross-kernel Linux comparison this repository has. But no
+capture from a current binary joins them, and P1–P14 must not be diffed across the
+boundary without the mismatch stated (§15.44 — the unequal direction is a verdict, and
+here it is announcing a real instrument change). **No artifact from the new era is
+committed yet**: the tree that opened it was uncommitted when the era's captures would
+have been taken, so the first `e79f5fcd86a2e5f0` triple is owed, on every box.
+
 ## Index
 
 | File | Kernel / box | Binary | Probe set | Field set | Rig | Verdicts |
 |---|---|---|---|---|---|---|
+| [`linux-6.18-2026-08-07-3e23c52-tier3.md`](linux-6.18-2026-08-07-3e23c52-tier3.md) | 6.18.14-1rodete4-amd64, Debian rodete — **the production box**. **The first lawful field-by-field 6.18↔7.0 comparison this repository has ever been able to make**, and the artifact behind notes §3.73. It pairs with the `7cf0338` Linux triple below on a basis stronger than either digest: `git diff 7cf0338 3e23c52 -- doctor/ core/ sys/ rpc/ codec-api/ Cargo.lock` is **empty**, so both came from the *same doctor source*, which closes the one blindness both digests share — a probe body that moves a number without moving a key. Read the two together and **nothing differs**: zero booleans, strings, errno histograms, byte counts, ceilings, ioctl-availability flags or termios modes moved across 16 probe sections, so all five deferred "diff against the production kernel" decisions are discharged and none licenses a change. P13, P14 and P15 execute on 6.18 for the first time here — the 2026-07-29 row below is P1–P12 at a dead probe era and is **not** comparable with this. **Read it with its two bounds.** It is **Markdown**, so `field set` is not recomputable from it and the digest below is the one the report printed rather than one this repository verified; and it is a *pasted* capture, which is why plan §18 item 8 stays open — no test has ever run on 6.18 and `jq -e -f expectations/linux.jq` has still never been **executed** there. Committed as a record under the precedent the 2026-07-29 row set | `3e23c524184c` | **`82a8e2198e54626a`** | `179c9d15c6e450f5` — **as printed, not recomputed** (Markdown carries no `observations` array); equal to the `7cf0338` triple, and note that a *later* binary would not match it, since `b8e4d8f` sorts P5's pair key | **Tier 3** — the same cross-wired FT232R pair (`BH00LL8O` ↔ `BH00L4KU`), 5-wire, RTS/CTS both ways | 24 supported · 0 degraded · 0 unsupported · 1 skipped |
 | [`linux-7.0-2026-08-05-7cf0338-tier3.json`](linux-7.0-2026-08-05-7cf0338-tier3.json) | 7.0.0-29-generic, Ubuntu 26.04 — the dev box, load 0.26–0.9. **The Linux half of the P15 era, and the artifact behind every "Linux honours `CRTSCTS`" sentence in the tree** (notes §3.68). Until this capture that claim was asserted as measured fact by notes §3.65 E′/§3.67 with nothing committed behind it — `grep -l '"P15"' docs/doctor/*.json` returned only the three `acb5162` macOS files — which is exactly what §7 forbids. **P15 reads `supported` here and it is the first execution of that arm on any kernel:** `honoured_on_readback: true`, `silently_dropped: false`, `shipped_predicate_agrees: true` and `baseline_restored: true` on both ports, with `cflag_before_hex` `0x10021cb2` → `cflag_after_hex` `0x90021cb2` — a delta of exactly `CRTSCTS`. Darwin reads `0x4b00` → `0x4b00` and `honoured_on_readback: false`, so the probe's three-way discrimination is now measured on both arms rather than tested purely on one. **Read the cross-kernel pair with its bound**: the `acb5162` macOS triple shares this `probe set` and does *not* share the `field set`, because `shipped_predicate_agrees` did not exist until `17c6e87` — equal `probe set` is not comparability, and this is that rule's first cross-kernel instance rather than a same-binary pair. The macOS lane owes a capture at this tree | `7cf0338973d8` | **`82a8e2198e54626a`** | `179c9d15c6e450f5` | **Tier 3** — the cross-wired FT232R pair, `SNX_CROSSOVER=required`, both ports named | 24 supported · 0 degraded · 0 unsupported · 1 skipped |
 | [`linux-7.0-2026-08-05-7cf0338-tier3-2.json`](linux-7.0-2026-08-05-7cf0338-tier3-2.json) | ” — second sequential run, same box | ” | ” | ” | ” | ” |
 | [`linux-7.0-2026-08-05-7cf0338-tier3-3.json`](linux-7.0-2026-08-05-7cf0338-tier3-3.json) | ” — third sequential run. All three share a `field set`, and P15's reading is identical across them | ” | ” | ” | ” | ” |
@@ -362,7 +383,18 @@ diff <(jq -r '[.probes[] as $p | $p.observations[] | $p.id + "." + .key] | sort 
 the field is itself an observation-shape change — of the `Build` block, not of any probe
 — so say it plainly rather than let a reader assume. Against **any later report**: by
 field equality, directly, with no repository access; that is the property the field
-exists to provide. Against the **nineteen frozen JSON artifacts**: only by recomputation,
+exists to provide — **with one exception, measured rather than predicted (notes
+§3.73). `b21548d`-era digests are not field-equal to a post-`b8e4d8f` capture, and the
+inequality is a key *spelling*, not a cell.** `b8e4d8f` canonicalised P5's pair key by
+sorting the two port names, so the committed Linux Tier-3 family splits in two:
+`7cf0338`, `77f6798`, `f8315cc` and `-05b` carry the unsorted spelling, while
+`bf29500`, `3d850cf`, `linux-7.0-2026-08-05-tier3*`, the 2026-07-29 pair and every
+macOS artifact carry the sorted one. Re-spelling only those two keys in a `7cf0338`
+artifact moves its digest `179c9d15c6e450f5` → `f81d4a7b0828d37f`. So a report from the
+unsorted family and one from a current binary read *unequal* while carrying the same
+cells; "diff only the intersection" would drop exactly the two P5 cells that carry the
+rig certificate and the 5-wire handshake. Diff within a family, or re-capture both
+sides at one tree. Against the **nineteen frozen JSON artifacts**: only by recomputation,
 i.e. the comparison needs the tool — which is why the column above records it once.
 Against **`linux-6.18-2026-07-29-tier3.md`**: not at all; it is Markdown with no
 `observations` array, its digest is not computable, and its cell set is therefore
