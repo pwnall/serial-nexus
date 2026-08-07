@@ -574,6 +574,30 @@ impl Resolver {
         }
     }
 
+    /// Whether **any** source that can produce a canonical identity exists here.
+    ///
+    /// The resolver has exactly two: the `/dev/serial/by-id` tree and the
+    /// `<sys>/class/tty` listing it walks. On a system carrying neither — macOS,
+    /// which has no `by-id` tree at all and no sysfs (§13; the IOKit backend that
+    /// would supply identities off Linux is deferred, §14) — a `usb:` or `by-path:`
+    /// device resolves to nothing *and always will*, however many adapters are
+    /// plugged in and readable.
+    ///
+    /// Exposed because "absent" and "unresolvable here" are different facts and the
+    /// node's `waiting` reason said the first for both. `device … not present` is
+    /// actively false on a Mac where the adapter is sitting in `/dev` and
+    /// `access(2)`-readable — it sends the operator to look at cabling for a
+    /// condition no cable can change (§7: name the observation). The **status** is
+    /// unaffected and stays `waiting`: nothing here decides policy, it decides what
+    /// the operator is told.
+    ///
+    /// A directory test, not a listing: this answers "could this ever resolve",
+    /// so an empty-but-present tree is a source with nothing in it — that really is
+    /// absence — while a missing tree is no source at all.
+    pub fn has_identity_source(&self) -> bool {
+        self.dev_root.join("dev/serial/by-id").is_dir() || self.sys_root.join("class/tty").is_dir()
+    }
+
     // -- Linux by-id / by-path / sysfs backend -----------------------------
 
     /// Enumerate `/dev/serial/by-id` and derive each entry's identity. Shared
@@ -1131,6 +1155,42 @@ mod tests {
         )
         .unwrap();
         dev
+    }
+
+    /// **A system with no identity source is not a system with no devices**, and the
+    /// two must be distinguishable — a `usb:` node on a Mac waits forever beside an
+    /// adapter that is plugged in and readable, and callers need to be able to say so
+    /// rather than reporting it as absence (§12/§13, notes §3.72).
+    ///
+    /// Either source alone is enough, and an **empty** tree still counts: this answers
+    /// "could this ever resolve", so a present-but-empty `by-id` is a source with
+    /// nothing in it — genuine absence — while a missing tree is no source at all.
+    /// Testing the empty case is the point; a fixture that only ever populated the
+    /// tree could not tell the two apart.
+    #[test]
+    fn an_identity_source_is_the_tree_existing_not_the_tree_being_populated() {
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        assert!(
+            !r.has_identity_source(),
+            "a root with neither by-id nor class/tty has no identity source"
+        );
+
+        std::fs::create_dir_all(t.path().join("dev/serial/by-id")).unwrap();
+        assert!(
+            r.has_identity_source(),
+            "an EMPTY by-id tree is still a source — absence of devices, not of a backend"
+        );
+
+        // ...and sysfs alone is equally sufficient, which is the shape a container
+        // with a bare `--device=` and no udev rules presents (§15.10).
+        let t2 = TmpTree::new();
+        let r2 = Resolver::new(t2.path());
+        std::fs::create_dir_all(t2.path().join("sys/class/tty")).unwrap();
+        assert!(
+            r2.has_identity_source(),
+            "the sysfs listing alone is a source; by-id is a fast path over it"
+        );
     }
 
     #[test]

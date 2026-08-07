@@ -448,6 +448,30 @@ struct FlowPrecheckTarget<'a> {
 /// a node that is not serial, a node that did not request `rts-cts`, and a device
 /// that resolves to nothing **right now** — the last being an absent adapter, which
 /// §12 promises is a `waiting` node rather than a refusal.
+/// What to tell an operator whose `add-node` device is not present — **the remedy has
+/// to be reachable on the system being advised** (notes §3.72).
+///
+/// "Add by a `usb:`/`by-path:` identity" is right wherever an identity source exists:
+/// the node is created, waits, and binds when the adapter appears. Where none does —
+/// macOS, no by-id tree and no sysfs (§12/§13) — that same advice produces a node that
+/// waits *forever* beside an adapter which is plugged in, readable, and would work this
+/// instant under its raw path. So the one error an operator is most likely to hit first
+/// on a Mac used to hand them the single remedy guaranteed not to work.
+///
+/// A free function so both arms are assertable without standing up a daemon: what can
+/// be wrong here is the text, and the text is the whole feature.
+fn device_absent_advice(has_identity_source: bool) -> &'static str {
+    if has_identity_source {
+        "add by a usb:/by-path: identity to configure it while absent (§12)"
+    } else {
+        "this system has no /dev/serial/by-id tree and no <sys>/class/tty, so a \
+         usb:/by-path: identity resolves to nothing here and such a node would wait \
+         forever rather than bind (§12/§13; the IOKit backend that would supply \
+         identities off Linux is deferred, §14) — name the device by its raw /dev path \
+         instead, accepting the documented instability of that form"
+    }
+}
+
 fn flow_precheck_target<'a>(
     resolver: &serial_nexus_core::Resolver,
     nc: &'a serial_nexus_core::config::NodeConfig,
@@ -953,10 +977,21 @@ impl Daemon {
                     }
                 }
                 Err(serial_nexus_core::ResolveError::NotPresent { input }) => {
+                    // **The remedy has to be reachable on the system being advised.**
+                    // "Add by a `usb:`/`by-path:` identity" is right wherever an
+                    // identity source exists. Where none does — macOS, no by-id tree
+                    // and no sysfs (§13) — that advice produces a node which waits
+                    // forever beside an adapter that is plugged in and readable, so
+                    // the operator is sent from a clear error to a silent hang. Both
+                    // arms keep the "is not present" phrasing: it is the true half,
+                    // and it is what `DEVICE_ABSENT`'s consumers match on.
+                    let advice = device_absent_advice(self.resolver.has_identity_source());
                     return Err(RpcError::new(
                         app_errors::DEVICE_ABSENT,
                         format!(
-                            "device {input:?} is not present; add by a usb:/by-path: identity to configure it while absent (§12)"
+                            "device {input:?} is not present; {advice}. \
+                             `serial-nexus-ctl ports` lists the serial devices this \
+                             machine has and the identity each one would bind."
                         ),
                     ));
                 }
@@ -2711,6 +2746,40 @@ fn parse_config_param(params: Option<Value>) -> Result<GraphConfig, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The remedy must be reachable where it is offered.** On a system with no
+    /// identity source, "add by a `usb:`/`by-path:` identity" is the one remedy
+    /// guaranteed to produce a node that never binds — so the two arms must differ,
+    /// and the no-source arm must send the operator somewhere that works.
+    ///
+    /// Asserted as properties rather than as fixed strings, and negatively as well:
+    /// the no-source arm must NOT be the identity advice, because a refactor that
+    /// collapsed the branch would otherwise leave every positive clause satisfiable
+    /// by the wrong text.
+    #[test]
+    fn device_absent_advice_offers_a_remedy_that_exists_on_the_system_it_addresses() {
+        let with = device_absent_advice(true);
+        let without = device_absent_advice(false);
+        assert_ne!(with, without, "the branch must actually branch");
+
+        assert!(
+            with.contains("usb:/by-path: identity"),
+            "with a source, the identity form is the right advice: {with}"
+        );
+
+        assert!(
+            without.contains("raw /dev path"),
+            "with no source, the raw path is the only form that binds: {without}"
+        );
+        assert!(
+            without.contains("wait forever"),
+            "must say what the identity form would actually do here: {without}"
+        );
+        assert!(
+            !without.contains("add by a usb:/by-path: identity"),
+            "must not offer the remedy that cannot work here: {without}"
+        );
+    }
 
     fn scratch_dir() -> std::path::PathBuf {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

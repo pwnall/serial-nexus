@@ -9210,3 +9210,59 @@ a test: the alternative was mutating process-global environment, which in Rust 2
 means `unsafe` in a `#![forbid(unsafe_code)]` crate, and is racy under the parallel
 runner besides. An exported-but-empty `XDG_RUNTIME_DIR` is covered too: treating it as
 set yields a *relative* path the daemon would bind in its working directory.
+
+#### 6. A fault the pre-check could not prevent was also unreadable
+
+§15.53 refuses an `rts-cts` node whose driver drops `CRTSCTS`, but it must **open the
+port** to measure that, and two paths reach an open having never had a measurable one:
+`load --replace` on a port the running graph holds (the outgoing node's `TIOCEXCL`
+refuses the pre-check's open, which maps to *unmeasurable*, which is deliberately not a
+refusal), and an adapter that arrives after the config loads. On both, `serial2` fails
+by read-back and the operator got `failed to apply some or all settings` — no flow
+control, no port, no remedy.
+
+**Both repairs to the *refusal* stay declined** (§3.68 (5a)): re-checking after teardown
+means a refusal has already destroyed the good graph, and inferring from the outgoing
+node's successful open is an inference, not a measurement. Neither is re-litigated here.
+What was never declined is that the resulting *fault* must be readable, and that is what
+changed: the node's own failed open consults `sys::honours_rtscts` — the same one
+predicate — and substitutes the reading and both remedies. It runs after the open has
+already failed, decides nothing, and creates nothing, so it touches no declined ground.
+
+Bounded: the extra open happens only when the node asked for `rts-cts` *and* is already
+failing. And it consults the predicate rather than pattern-matching `serial2`'s error
+text, which is not a contract. The message logic is split into a pure
+`open_failure_text(honoured, flow, path, err)` for the reason `p15_verdict` is split
+from P15 — **the arm that matters cannot be reached on Linux**, which honours the flag,
+so a guard driving the real predicate here would exercise only the pass-through and read
+as covered. `honoured: None` is *unmeasurable* and must not blame flow control; the
+guard asserts all five non-blaming combinations explicitly, because collapsing `None`
+into `Some(false)` is exactly the mistake §15.53 names for the `load`-time predicate.
+
+#### 7. Three identity messages pointed away from the one form that works
+
+The raw `/dev/cu.*` path works end to end on macOS, and P4's `degraded` is the designed
+answer. What was wrong was everything the operator is *told*:
+
+* A `usb:`/`by-path:` node sat `waiting` with reason **`device <d> not present`** — false
+  on a box where the adapter is plugged in and `access(2)`-readable. The resolver has
+  exactly two identity sources, the by-id tree and the `<sys>/class/tty` listing, and a
+  system carrying neither resolves such a device to nothing *and always will*. So the
+  message sent that operator to inspect a cable for a condition no cable can change.
+  `Resolver::has_identity_source` distinguishes the two facts; the **status stays
+  `waiting`**, because a future IOKit backend (§14) would make exactly this config
+  resolve — only the sentence moves (§7: name the observation). A raw path is
+  deliberately excluded: it is `stat`ed literally, never resolved, so "not present" is
+  precisely true for it on every platform and widening the new text would be its own
+  false statement. The predicate is a *directory* test, so an empty-but-present by-id
+  tree is a source with nothing in it — real absence — while a missing tree is no source
+  at all; the guard asserts that distinction, since a fixture that only ever populated
+  the tree could not see it.
+* `add-node BH00L4KU` — the most natural thing to type when the node is literally
+  `cu.usbserial-BH00L4KU` — was refused with "add by a `usb:`/`by-path:` identity", i.e.
+  the one remedy guaranteed to produce the forever-waiting node above. **A remedy has to
+  be reachable on the system being advised.** Both arms now come from a free function so
+  the text is assertable without standing up a daemon, and both point at
+  `serial-nexus-ctl ports`, which lists every visible device with the identity it would
+  bind. The "is not present" phrasing is kept in both arms: it is the true half, and it
+  is what `DEVICE_ABSENT`'s consumers match on.

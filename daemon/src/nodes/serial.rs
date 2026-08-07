@@ -82,6 +82,114 @@ struct OpenParams {
     purge_on_reconnect: bool,
 }
 
+/// Why a node whose device did not resolve is waiting — "absent" and "unresolvable on
+/// this system" are different facts, and saying the first for both is a false statement
+/// on every Mac.
+///
+/// `device <d> not present` is the right answer on Linux, where an identity that does
+/// not resolve means the adapter is unplugged. On a system with **no identity source at
+/// all** — no `/dev/serial/by-id` tree and no `<sys>/class/tty`, which is macOS (§13;
+/// the IOKit backend is deferred, §14) — a `usb:`/`by-path:` device resolves to nothing
+/// no matter what is plugged in, so the node sits `waiting` forever beside an adapter
+/// that is present, readable, and would work this instant under its raw path. Telling
+/// that operator the device is "not present" sends them to look at a cable for a
+/// condition no cable can change.
+///
+/// §7's rule is that a platform which differs gets the observation *named*, and the
+/// status is deliberately unchanged: `waiting` is still correct, because a future
+/// IOKit backend would make exactly this config resolve. Only the sentence moves.
+fn waiting_reason(device: &str, resolver: &serial_nexus_core::Resolver) -> String {
+    // A raw path or `raw:` identity does not go through an identity source at all — it
+    // is `stat`ed literally — so "not present" is precisely true for it on every
+    // platform, and widening the new message to cover it would be its own false
+    // statement.
+    let identity_form = !device.starts_with('/') && !device.starts_with("raw:");
+    if identity_form && !resolver.has_identity_source() {
+        return format!(
+            "device {device} cannot be resolved on this system: there is no \
+             /dev/serial/by-id tree and no <sys>/class/tty listing, so no `usb:` or \
+             `by-path:` identity resolves here however many adapters are attached \
+             (§12/§13 — the IOKit backend that would supply identities off Linux is \
+             deferred, §14). This is not a missing device and re-seating a cable \
+             cannot change it. On this platform a raw /dev path is the working form; \
+             `serial-nexus-ctl ports` lists the devices that are visible and the \
+             identity each would bind."
+        );
+    }
+    format!("device {device} not present")
+}
+
+/// Explain an open failure that §15.53's `load`-time pre-check could not have caught.
+///
+/// The pre-check refuses an `rts-cts` node whose driver accepts `CRTSCTS` and reads it
+/// back clear, but it has to **open the port** to measure that, and two paths reach an
+/// open here having never had a measurable one:
+///
+/// * `load --replace` on a port the running graph already holds — the outgoing node's
+///   `TIOCEXCL` refuses the pre-check's own open, which maps to *unmeasurable*, which
+///   is deliberately not a refusal. Filed, and both repairs to the refusal declined
+///   with reasons (notes §3.68 (5a), §15.53): re-checking after the teardown means a
+///   refusal has already destroyed the good graph, and inferring the answer from the
+///   outgoing node's successful open is an inference, not a measurement.
+/// * An adapter that arrives *after* the config loads, including every `startup_load`
+///   replay that runs before USB enumeration. The device is simply absent at check
+///   time, and an absent device is a wait, never a refusal.
+///
+/// On both, `serial2` fails the open by read-back and the operator used to get
+/// `failed to apply some or all settings` — no mention of flow control, no port, no
+/// remedy. **That the refusal cannot fire is not a reason for the fault to be
+/// unreadable**, and nothing about explaining it afterwards touches the declined
+/// ground above: this runs *after* the open has already failed, changes no decision,
+/// and creates nothing.
+///
+/// Bounded on purpose. It costs an extra open only when the node actually asked for
+/// `rts-cts` *and* is already failing, and it consults `sys::honours_rtscts` — the one
+/// predicate §15.53 requires, the same one `load` uses and P15 cross-checks — rather
+/// than pattern-matching `serial2`'s error text, which is not a contract. Anything
+/// other than a definite `Ok(false)` leaves the original error alone: a driver that
+/// honours the flag failed for some other reason, and an `Err` here means the second
+/// open failed too, which says nothing about flow control.
+/// The message, as a pure function of what was measured.
+///
+/// Split from [`explain_open_failure`] for the same reason `p15_verdict` is split from
+/// P15: the arm that matters — a driver that accepts `CRTSCTS` and drops it — **cannot
+/// be reached on Linux**, which honours the flag, so a test driving the real predicate
+/// here would exercise only the pass-through and read as covered. `honoured: None` is
+/// *unmeasurable* (the second open failed too) and is deliberately not the same as
+/// `Some(false)`: it says nothing about flow control, so it must not blame it.
+fn open_failure_text(
+    honoured: Option<bool>,
+    flow: CfgFlow,
+    path: &std::path::Path,
+    e: &str,
+) -> String {
+    if flow != CfgFlow::RtsCts || honoured != Some(false) {
+        return e.to_owned();
+    }
+    let shown = path.display();
+    format!(
+        "{e} — this port's driver accepts a `CRTSCTS` request and reads the flag back \
+         clear, so `flow = \"rts-cts\"` cannot be honoured on it and `serial2` refuses \
+         the open (§15.53). Normally `load`/`add-node` refuses this config outright, \
+         but the pre-check could not open {shown} to measure it — either the running \
+         graph still held the port, or the device was absent when the config loaded. \
+         Use flow = \"none\" (or xon-xoff) for this port, or attach an adapter whose \
+         driver implements RTS/CTS; `serial-nexus-doctor --port {shown}` reports the \
+         same reading as P15."
+    )
+}
+
+fn explain_open_failure(path: &std::path::Path, params: &OpenParams, e: &std::io::Error) -> String {
+    // Only ask when the node actually requested `rts-cts` *and* is already failing:
+    // this costs one extra open, on a path that is not going to succeed anyway.
+    let honoured = if params.flow == CfgFlow::RtsCts {
+        serial_nexus_sys::honours_rtscts(path).ok()
+    } else {
+        None
+    };
+    open_failure_text(honoured, params.flow, path, &e.to_string())
+}
+
 /// An open [`SerialPort`] that owns every **tty-level assertion this node made on it**:
 /// the `TIOCEXCL` claim taken at open, and a break condition a signal verb left standing.
 ///
@@ -316,14 +424,17 @@ impl SerialNode {
                 ),
                 Err(e) => (
                     NodeStatus::Faulted {
-                        reason: format!("open {device}: {e}"),
+                        reason: format!(
+                            "open {device}: {}",
+                            explain_open_failure(&path, &params, &e)
+                        ),
                     },
                     None,
                 ),
             },
             None => (
                 NodeStatus::Waiting {
-                    reason: format!("device {device} not present"),
+                    reason: waiting_reason(device, resolver),
                 },
                 None,
             ),
@@ -647,7 +758,8 @@ async fn reopen(ctx: &mut SuperviseCtx, path: &std::path::Path) -> Option<Arc<No
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         // Any other error faults but keeps polling.
         Err(e) => {
-            fault(ctx, format!("reopen {}: {e}", ctx.device));
+            let why = explain_open_failure(path, &ctx.params, &e);
+            fault(ctx, format!("reopen {}: {why}", ctx.device));
             return None;
         }
     };
@@ -1353,6 +1465,119 @@ fn map_flow(f: CfgFlow) -> FlowControl {
 mod tests {
     use super::*;
     use crate::runtime::TeardownDrain;
+
+    /// **Only a measured drop blames flow control.** Every other combination must hand
+    /// the operator the driver's own error untouched — an open that failed for an
+    /// unrelated reason, dressed up as a flow-control problem, is worse than a bare
+    /// errno because it sends them to change a setting that was never at fault.
+    ///
+    /// `None` is *unmeasurable*, not `Some(false)`: it means the second open failed
+    /// too, which says nothing about `CRTSCTS`. Collapsing the two is the specific
+    /// mistake §15.53 names for the `load`-time predicate, and it would be the same
+    /// mistake here.
+    #[test]
+    fn only_a_measured_crtscts_drop_turns_an_open_failure_into_a_flow_control_message() {
+        let p = std::path::Path::new("/dev/cu.usbserial-A");
+        let bare = "failed to apply some or all settings";
+
+        let blamed = open_failure_text(Some(false), CfgFlow::RtsCts, p, bare);
+        assert!(blamed.contains("rts-cts"), "{blamed}");
+        assert!(
+            blamed.contains("/dev/cu.usbserial-A"),
+            "must name the port: {blamed}"
+        );
+        assert!(
+            blamed.contains(bare),
+            "must keep the driver's own error: {blamed}"
+        );
+        assert!(
+            blamed.contains("flow = \"none\"") && blamed.contains("adapter whose driver"),
+            "must carry both remedies: {blamed}"
+        );
+        assert!(
+            blamed.contains("serial-nexus-doctor --port"),
+            "must point at the probe that reports the same reading: {blamed}"
+        );
+
+        // Every arm that is not a measured drop passes the error through verbatim.
+        for (honoured, flow) in [
+            (Some(true), CfgFlow::RtsCts), // driver honours it — something else broke
+            (None, CfgFlow::RtsCts),       // unmeasurable — says nothing about flow
+            (Some(false), CfgFlow::None),  // node never asked for it
+            (Some(false), CfgFlow::XonXoff), // ...nor for this
+            (None, CfgFlow::None),
+        ] {
+            assert_eq!(
+                open_failure_text(honoured, flow, p, bare),
+                bare,
+                "honoured={honoured:?} flow={flow:?} must not blame flow control"
+            );
+        }
+    }
+
+    /// **"Absent" and "unresolvable here" are different facts.** On a system with no
+    /// identity source a `usb:` node waits forever beside an adapter that is plugged
+    /// in and readable, and `device … not present` sends that operator to inspect a
+    /// cable for a condition no cable can change (§7).
+    ///
+    /// Both arms are exercised against fixture roots, so this runs on any kernel —
+    /// the platform of record cannot produce the no-source shape at `/`, and a guard
+    /// that only ran on macOS would be the proxy §9 warns about.
+    #[test]
+    fn a_waiting_node_says_unresolvable_where_no_identity_source_exists_and_absent_otherwise() {
+        // Self-cleaning fixture root, the same shape `core`'s resolver tests use and
+        // for the same reason: no `tempfile` dependency, so the licensing gate stays
+        // minimal (§13).
+        struct TmpTree(std::path::PathBuf);
+        impl Drop for TmpTree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("snx-waiting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture root");
+        let tmp = TmpTree(dir);
+        let root = tmp.0.as_path();
+
+        // No `dev/serial/by-id`, no `sys/class/tty`: the macOS shape.
+        let bare = Resolver::new(root);
+        let msg = waiting_reason("usb:0403:6001:BH00L4KU:00", &bare);
+        assert!(
+            msg.contains("cannot be resolved on this system"),
+            "no-source system must say so: {msg}"
+        );
+        assert!(
+            msg.contains("re-seating a cable cannot change it"),
+            "must stop the operator inspecting hardware: {msg}"
+        );
+        assert!(
+            msg.contains("ports"),
+            "must point at the verb that lists what IS visible: {msg}"
+        );
+
+        // A raw path never goes through an identity source, so "not present" is
+        // precisely true for it even here — widening the new message would be its
+        // own false statement.
+        assert_eq!(
+            waiting_reason("/dev/cu.usbserial-A", &bare),
+            "device /dev/cu.usbserial-A not present"
+        );
+        assert_eq!(
+            waiting_reason("raw:/dev/cu.usbserial-A", &bare),
+            "device raw:/dev/cu.usbserial-A not present"
+        );
+
+        // With a source present — an empty by-id tree is still a source — an
+        // unresolved identity really does mean the adapter is not there.
+        std::fs::create_dir_all(root.join("dev/serial/by-id")).expect("mkdir by-id");
+        let sourced = Resolver::new(root);
+        assert_eq!(
+            waiting_reason("usb:0403:6001:BH00L4KU:00", &sourced),
+            "device usb:0403:6001:BH00L4KU:00 not present",
+            "an empty-but-present by-id tree is a source with nothing in it"
+        );
+    }
 
     /// A supervisor context whose only meaningful fields for `purge_on_reconnect`
     /// are `params`, `targetward`, and `purged`; the rest are inert placeholders.
