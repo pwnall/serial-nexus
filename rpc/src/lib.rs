@@ -35,6 +35,9 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// same — and each of them used to spell it out for itself.
 pub const DAEMON_NAME: &str = "serial-nexus-daemon";
 
+pub mod socket;
+pub use socket::{SocketOrigin, default_socket_path};
+
 /// The pre-§15.40 spelling of [`DAEMON_NAME`], **accepted on read for one release**
 /// (plan §17.3) and then deleted.
 ///

@@ -9078,3 +9078,135 @@ nothing in the history or the notes substantiates it and the two mechanisms are 
 same one twice. The distinction that matters is not the count: §3.65 A reddened
 `cargo build --workspace`, the macOS lane's own first step, and this one does not. That
 is why a new instrument was needed rather than a second reading of the old one.
+
+### 3.72 The M4 field report: what it settled, and the defects it found in this tree
+
+**Design:** §13, §15.44, §15.53. **Plan:** §18. **Rules:** AGENTS §7 (a differing
+kernel is `degraded` with the observation named), §9 (fail-first; record refuted
+approaches), §10.
+
+A `serial-nexus-doctor` report arrived from a **macOS box with an Apple M4, Darwin
+27.0.0, arm64** — the first evidence this tree has from either arm64 or Darwin 27, and
+taken at `3e23c52`, which was HEAD, so the binary was current rather than an artifact of
+some older vintage. The question asked of it was whether the platform needs more
+fallbacks.
+
+**It does not.** All 24 probe answers land on code paths that already ship: `14
+supported / 10 degraded / 0 unsupported / 3 skipped` is ten §7 degrades with the
+observation named, zero capabilities the daemon cannot work around, and three probes
+structurally unaskable off Linux. What the report found was **defects in this
+repository** — one of them blocking, and none of them on the reporter's machine.
+
+#### 1. The platform reading, and why it carries so little new risk
+
+Diffed cell by cell against `docs/doctor/macos-24.6.0-2026-08-05-acb5162-tier3.json`
+(x86_64 Darwin 24.6.0, same `probe_set` `82a8e2198e54626a`), the M4 is **identical to
+the already-validated Intel Mac except for durations**. Across the whole pty plane the
+key sets are equal and exactly 11 cells moved, every one of them a timing; zero
+booleans, strings, byte counts or pass counts differ. The serial plane is identical on
+both ports including `cflag 0x4b00 → 0x4b00`, `ENOTSUP` for `TIOCGICOUNT`, and P14's
+3 Mbaud `platform-refused`/errno-22 ceiling. P10's depths are byte-identical.
+
+Two macOS-only mechanisms ran on arm64 for the first time and both work. `SessionLatch`
+is `#[cfg(target_os = "macos")]` with no arch predicate, and P12 reads `supported` with
+its positive control firing at 120 µs — that is §6 detach-release, the one macOS-only
+mechanism never before exercised off x86_64. And `sys::honours_rtscts` demonstrably ran:
+`shipped_predicate_agrees: true` beside `honoured_on_readback: false` is producible only
+by `Ok(false)`, so §15.53's refusal fires on that box.
+
+**What is genuinely new**, recorded so a later session does not rediscover it: the
+Darwin↔Linux poll gap splits into two unrelated halves, and only one is CPU-bound — the
+M4 is ~4x faster than the Intel Mac on every P9 syscall cell while the timer overshoot
+does not move at all (5 ms → 641 µs here, 683–690 µs on x86_64 Darwin, 80–84 µs on
+Linux). P13's pts `close(2)` is 5–6x outside every committed envelope on both kernels
+(161/86/129 µs against maxima of 25/29/24 across 37 captures) with the *policy*
+unchanged and `a_no_reader_blocking_slave` still at 601180 µs, so §6's harness rule keeps
+its full margin. **Not separated (§9):** whether the slower close is a Darwin-27 effect
+or an arm64 one — no capture isolates them, and n=1.
+
+**Read P9's headline correctly.** `median_ns_for_0ms_request: 16333` is n=16 taken cold.
+The cell the data plane parks on is `unready_master_pollin_ns: 3833` at n=4096, so the
+honest ratio against Linux is **14.6x, not 62x**. The probe says so itself in
+`headline_over_matched_cell_x100: 426`; nothing should be tuned against the 16 µs figure.
+
+#### 2. The blocking defect was ours (§3.71)
+
+`cargo test` did not compile on any macOS at `3e23c52`. Carried in its own entry.
+
+#### 3. P15's consequence described a tree several commits old
+
+The probe's `degraded` arm told every reader that an `rts-cts` node "goes `faulted`, not
+`degraded`" and that whether to degrade or keep faulting "is a design question this
+probe exists to inform, not to answer". **Both had been false since §3.67 shipped the
+refusal at `load`.** The M4 report carried that text verbatim — so on the one platform
+where this is the report's only *actionable* finding, the sentence the operator would act
+on described behaviour that no longer existed, while every measurement beside it was
+correct.
+
+Nothing in the gate set could see it: `expectations/*.jq` assert over
+`.probes[].observations`, `probe_set` digests `(id, question)`, `field_set` digests the
+observation leaf paths, and a consequence is none of those. A consequence string is
+invisible to every gate and visible to every operator. The arm now states the shipped
+refusal, both remedies, and its own bound — the two paths that still reach a `faulted`
+node — and a guard asserts those as *properties* rather than as a golden string, with
+two negative clauses naming the retracted claims specifically, because those are what a
+revert would restore. Fail-first: restoring the old string in place reddens it.
+
+The decision it describes had also never been written into the design; §15.53 does that
+now, which discharges the debt §3.68 filed when it noted P15's `question` citing
+§15.51 — P14's section — for want of one of its own. The `question` string itself is
+**not** touched: it feeds `probe_set`, and moving the era again would orphan the macOS
+triple at `acb5162` and this report with it.
+
+#### 4. `field_set` was not stable across runs of byte-identical code
+
+Two Linux Tier-3 runs at one commit, `git diff -- doctor/` empty, produced different
+`field_set` digests. Both carried 478 leaf paths and the *entire* delta was P5's pair key
+spelled `A ↔ B` in one and `B ↔ A` in the other: the key was formatted straight from
+`ports[i]`/`ports[j]`, which follow argv, and the identity standing at a given argv
+position moves across a replug — §12's own test renumbers `ttyUSB0`/`ttyUSB1`
+deliberately. So §15.44's second digest was telling a reviewer to "diff only the
+intersection" of two runs whose cells were identical, which is the exact failure mode
+`probe_set`'s choice 3 was written to avoid, reappearing in the digest built to fix it.
+
+Sorting the two names is the whole fix, and it is deliberately a **key**-ordering change
+only: the `a`/`b` roles keep argv order, because they carry measured direction
+(`rts_a_to_cts_b` against `rts_b_to_cts_a`, P14's `ab` against `ba`), and reordering them
+would relabel measurements to stabilize a digest that does not read them. The guard
+asserts the property over several name pairs in both orders plus an anti-collapse
+control, rather than against the one pair this bench has — a single-pair fixture cannot
+see an ordering bug. **This moves `field_set` and not `probe_set`**, which is the pair
+§15.44 exists to make visible.
+
+#### 5. The doctor named a socket fallback the daemon does not use
+
+With `XDG_RUNTIME_DIR` unset the environment block said *"daemon falls back to /run or a
+--socket override"*. `/run` is the **root** arm. An unprivileged process gets
+`/tmp/<name>-<uid>.sock`, and macOS sets no `XDG_RUNTIME_DIR` and has no `/run`, so
+every unprivileged Mac session takes the arm the sentence did not mention — in the first
+field an operator reads when the socket is not where they expected, in the report the
+design calls the expected first attachment on any support request.
+
+The policy had been implemented twice (daemon, `ctl`) and *described* a third time, and
+it is the description that was wrong. The fix deletes the third copy rather than
+correcting it: `serial_nexus_rpc::socket` holds one implementation, the daemon binds
+through it, `ctl` connects through it, and the doctor **computes and prints** the path
+with `SocketOrigin` naming which arm produced it. A printed path cannot drift from the
+bound one.
+
+**A refuted placement, recorded (§9).** `serial-nexus-core` was tried first — all three
+callers already depend on it — and a meta-gate rejected it: `core` may not declare
+`nix`, because the resolver's enumeration face is passive by construction and probing a
+port toggles DTR and resets the board behind it. The gate exists for precisely the move
+being made ("just add `nix` to core for one `getuid`") and it was right.
+`serial-nexus-sys` was the next candidate and is declined: it links IOKit and
+CoreFoundation on macOS, and `ctl` does not depend on it, so reading a uid would have
+cost the CLI two framework links. It lands beside `DAEMON_NAME` instead.
+
+The policy is split into a pure `socket_path_from(is_root, xdg, uid, name)` and a
+two-line wrapper that reads the process state, so **all three arms are testable
+including root** — which the suite can never run under. That is not a seam invented for
+a test: the alternative was mutating process-global environment, which in Rust 2024
+means `unsafe` in a `#![forbid(unsafe_code)]` crate, and is racy under the parallel
+runner besides. An exported-but-empty `XDG_RUNTIME_DIR` is covered too: treating it as
+set yields a *relative* path the daemon would bind in its working directory.

@@ -970,16 +970,13 @@ fn resolve_socket(override_path: Option<PathBuf>) -> PathBuf {
 }
 
 /// The §10 default socket path for a daemon spelled `name`.
+///
+/// One line, because `ctl` looking somewhere the daemon did not bind is the whole
+/// failure this policy can produce — so it is computed by the same function the daemon
+/// binds through (`serial_nexus_rpc::socket`), not by a second copy that agrees today
+/// (notes §3.72).
 fn default_socket(name: &str) -> PathBuf {
-    if nix::unistd::geteuid().is_root() {
-        return PathBuf::from(format!("/run/{name}.sock"));
-    }
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir).join(format!("{name}.sock"));
-    }
-    PathBuf::from(format!("/tmp/{name}-{}.sock", nix::unistd::getuid()))
+    serial_nexus_rpc::default_socket_path(name).0
 }
 
 #[cfg(test)]

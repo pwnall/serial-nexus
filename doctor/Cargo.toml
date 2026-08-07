@@ -16,6 +16,9 @@ workspace = true
 
 [dependencies]
 serial-nexus-core.workspace = true
+# For `DAEMON_NAME`, so the computed socket path names the same daemon the daemon
+# does. Workspace-internal and already in the graph, so `cargo deny` does not move.
+serial-nexus-rpc.workspace = true
 serial-nexus-sys.workspace = true
 clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true }

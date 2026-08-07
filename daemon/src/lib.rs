@@ -337,20 +337,15 @@ fn apply_socket_perms(path: &Path, group: Option<&str>) -> anyhow::Result<()> {
 }
 
 /// The §10 socket path policy: privilege-based default, CLI-overridable.
+///
+/// The policy itself lives in `serial_nexus_core::socket` — one implementation, which
+/// `ctl` connects through and the doctor prints, so the three can no longer disagree
+/// about where this daemon binds (notes §3.72).
 fn resolve_socket(override_path: Option<PathBuf>) -> PathBuf {
     if let Some(p) = override_path {
         return p;
     }
-    let name = serial_nexus_rpc::DAEMON_NAME;
-    if nix::unistd::geteuid().is_root() {
-        return PathBuf::from(format!("/run/{name}.sock"));
-    }
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir).join(format!("{name}.sock"));
-    }
-    PathBuf::from(format!("/tmp/{name}-{}.sock", nix::unistd::getuid()))
+    serial_nexus_rpc::default_socket_path(serial_nexus_rpc::DAEMON_NAME).0
 }
 
 /// Where a pre-§15.40 daemon would have kept *this* daemon's state snapshot, or `None`

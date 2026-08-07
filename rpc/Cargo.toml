@@ -12,6 +12,14 @@ workspace = true
 
 [dependencies]
 serde.workspace = true
+# `user` only, for the euid/uid the §10 socket-path policy branches on (`socket.rs`).
+# This crate is where `DAEMON_NAME` lives and where the daemon's control interface is
+# defined, so "which socket that interface is at" belongs beside it. Deliberately NOT
+# `serial-nexus-core`: a meta-gate forbids `nix` there, because the resolver's
+# enumeration face must stay passive by construction — probing a port toggles DTR and
+# resets the board behind it. And deliberately not `serial-nexus-sys`, which would make
+# `ctl` link IOKit and CoreFoundation on macOS to read a uid.
+nix = { workspace = true, features = ["user"] }
 serde_json.workspace = true
 
 [dev-dependencies]

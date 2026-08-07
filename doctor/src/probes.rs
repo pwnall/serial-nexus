@@ -3873,6 +3873,34 @@ fn p5_name(port: &Path, resolver: &serial_nexus_core::Resolver) -> String {
     port.display().to_string()
 }
 
+/// The observation **key** for a pair, ordered so it does not depend on which port
+/// discovery reached first.
+///
+/// `field_set` (§15.44) digests the sorted set of observation leaf paths, so a key
+/// built as `format!("{a} ↔ {b}")` straight from `ports[i]`/`ports[j]` makes the
+/// digest a function of discovery order rather than of the cells. That is not
+/// theoretical: two Linux Tier-3 runs at the same commit, with `git diff -- doctor/`
+/// empty, produced different `field_set` values whose *entire* delta was this key
+/// spelled both ways — 478 leaf paths each, every cell present in both. A reviewer
+/// following §15.44's rule would have been told to "diff only the intersection" of two
+/// runs that carry identical cells. `ports[i]`/`ports[j]` follow argv, and the identity
+/// standing at a given argv position moves across a replug (§12's own test renumbers
+/// `ttyUSB0`/`ttyUSB1` deliberately), so the flip needs no code change to appear.
+///
+/// This is the same failure mode `probe_set`'s choice 3 (`report.rs`) was written to
+/// avoid, reappearing in the second digest. Sorting is the whole fix, and it is a
+/// **key**-ordering change only: the `a`/`b` roles below keep argv order, because they
+/// carry measured direction (`rts_a_to_cts_b` against `rts_b_to_cts_a`, P14's `ab`
+/// against `ba`) and reordering them would relabel measurements to stabilize a digest
+/// that does not read them. §15.44 already says neither digest can see a value change.
+fn p5_pair_subject(a_name: &str, b_name: &str) -> String {
+    if a_name <= b_name {
+        format!("{a_name} ↔ {b_name}")
+    } else {
+        format!("{b_name} ↔ {a_name}")
+    }
+}
+
 /// Whether this fd is a real UART — measured with an ioctl **every platform this
 /// project supports implements**, not with one only Linux does.
 ///
@@ -4665,11 +4693,8 @@ pub fn p5_rig(
             // and no fact, so the verdict read `supported` over a pair nothing
             // had certified. Not an integrity failure: the rig carried data
             // during discovery, it simply could not be characterized.
-            let subject = format!(
-                "{} ↔ {}",
-                p5_name(&ports[i], resolver),
-                p5_name(&ports[j], resolver)
-            );
+            let subject =
+                p5_pair_subject(&p5_name(&ports[i], resolver), &p5_name(&ports[j], resolver));
             p = p.observe(
                 format!("{subject} cert").as_str(),
                 "unavailable (pair would not reopen for characterization)",
@@ -4688,11 +4713,8 @@ pub fn p5_rig(
         };
         let mut baseline_ok = false;
         if a_uart && b_uart {
-            let subject = format!(
-                "{} ↔ {}",
-                p5_name(&ports[i], resolver),
-                p5_name(&ports[j], resolver)
-            );
+            let subject =
+                p5_pair_subject(&p5_name(&ports[i], resolver), &p5_name(&ports[j], resolver));
             let (cert, ladder_ok) = p5_certify_pair(&ports[i], &ports[j]);
             baseline_ok = ladder_ok;
             if cert.mismatch_transmitted {
@@ -6347,7 +6369,7 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
     (
         Status::Degraded,
         format!(
-            "**{} named port(s) ACCEPTED a `CRTSCTS` request and then reported it clear** ({}). `tcsetattr` returned success and `tcgetattr` read the flag back unset, so the driver neither honours the mode nor refuses it — and because `serial2` verifies by read-back, the serial node's open fails with `failed to apply some or all settings` and the node goes `faulted`, not `degraded`. That is the shape §7 says a differing kernel must not be given: the observation belongs in a report, and whether a `rts-cts` edge should degrade with this named or keep faulting is a design question this probe exists to inform, not to answer. Measured on Darwin 24.6.0 / macOS 15.7.8 with an FT232R on Apple's IOSerialFamily driver: `CCTS_OFLOW` alone, `CRTS_IFLOW` alone, both together, a blocking open and the `/dev/tty.*` node all behave identically, while a **pty on the same box honours the flag** — so it is the serial driver and not the tty layer. The wire is not the suspect either: RTS↔CTS crossing is independently proven on that rig.",
+            "**{} named port(s) ACCEPTED a `CRTSCTS` request and then reported it clear** ({}). `tcsetattr` returned success and `tcgetattr` read the flag back unset, so the driver neither honours the mode nor refuses it. **What the daemon does about it is decided and shipped (§15.53, notes §3.67): a node configured with `flow = \"rts-cts\"` on such a port is REFUSED at `load`/`add-node`, before anything is created** — not faulted later, and not silently run without the flow control it asked for. The refusal names the node, the device, the resolved path and the read-back, and offers two remedies: `flow = \"none\"` (or `xon-xoff`) for this port, or an adapter whose driver implements RTS/CTS. `serial-nexus-doctor --port <this port>` reports the same reading the daemon consults, and `shipped_predicate_agrees` below says whether the two agree on this box. Every other node in the config still loads. Measured on Darwin 24.6.0 / macOS 15.7.8 with an FT232R on Apple's IOSerialFamily driver: `CCTS_OFLOW` alone, `CRTS_IFLOW` alone, both together, a blocking open and the `/dev/tty.*` node all behave identically, while a **pty on the same box honours the flag** — so it is the serial driver and not the tty layer. The wire is not the suspect either: RTS↔CTS crossing is independently proven on that rig. **Two paths still reach a `faulted` node rather than the refusal**, both because the pre-check could not open the port to measure it: a `load --replace` on a port the running graph already holds (filed, notes §3.68 (5a)), and an adapter that arrives *after* the config loads. On those the node's own open fails, and the fault now carries this same reading and remedy instead of `serial2`'s bare `failed to apply some or all settings`.",
             dropped.len(),
             dropped
                 .iter()
@@ -6364,11 +6386,22 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
 /// §7.1 lets an edge ask for `rts-cts`, and the serial node applies it through
 /// `serial2`, which **verifies by read-back**: it sets the termios, reads it back,
 /// and errors when the two disagree. So a driver that silently ignores the request
-/// does not produce a degraded link — it produces `failed to apply some or all
-/// settings` and a `faulted` node. That failure mode was found by a harness test
-/// on Darwin (notes §3.65 E) and had no instrument behind it; this is the
-/// instrument, so the fault-versus-degrade decision is made against a committed
-/// artifact rather than a red test (§7).
+/// does not produce a degraded link — it produced `failed to apply some or all
+/// settings` and a `faulted` node, some time after `load` had already returned
+/// success. That failure mode was found by a harness test on Darwin (notes §3.65 E)
+/// and had no instrument behind it; this probe is the instrument, and it did its job:
+/// the decision was taken against a committed artifact rather than a red test (§7).
+///
+/// **The decision is made, and this doc comment used to outlive it.** §15.53 / notes
+/// §3.67: the daemon consults `sys::honours_rtscts` — the one predicate, which this
+/// probe also calls and cross-checks as `shipped_predicate_agrees` — and **refuses**
+/// such a config at `load`/`add-node`, before anything is created. Not degrade: the
+/// thing degraded would be the transport's contract rather than an observation, since
+/// an `rts-cts` edge exists because the far end needs the line held. What §7 forbids
+/// is the operator learning nothing, and that was the *old* behaviour. This probe now
+/// reports the shipped answer instead of describing the question as open; the guard
+/// below pins that, because a stale consequence string is invisible to every other
+/// gate and this one is read by operators on the platform it is wrong about.
 ///
 /// **Why not an observation on P11.** P11 states its own contract — it opens with
 /// the port's current settings unchanged and "inspects, it does not configure" —
@@ -6637,12 +6670,30 @@ pub fn environment(dev_root: &Path, sys_root: &Path, named_ports: &[PathBuf]) ->
             format!("{dir} (missing)"),
             Status::Degraded,
         )),
-        Err(_) => checks.push(EnvCheck::new(
-            "XDG_RUNTIME_DIR",
-            "unset — daemon falls back to /run or a --socket override",
-            Status::Degraded,
-        )),
+        Err(_) => checks.push(EnvCheck::new("XDG_RUNTIME_DIR", "unset", Status::Degraded)),
     }
+
+    // **The socket path is COMPUTED, not described** (notes §3.72).
+    //
+    // This line used to be a prose clause on the `XDG_RUNTIME_DIR` check reading
+    // "unset — daemon falls back to /run or a --socket override". That named the arm
+    // only a *root* process reaches and omitted the one an unprivileged user actually
+    // gets, so on macOS — no `XDG_RUNTIME_DIR`, no `/run` — it was wrong for every
+    // reader, in the first field they look at when the socket is not where they
+    // expected. Nothing could catch it: `expectations/*.jq` assert over `.probes[]`,
+    // `.summary` and `.build`, and the environment block is none of those.
+    //
+    // A described policy drifts from the implemented one; a computed path cannot. This
+    // calls the same function the daemon binds through and `ctl` connects to, so the
+    // operator can compare it against `ls` directly. `Supported` on every arm: all
+    // three are correct outcomes of §10, and the reason this row exists is to answer
+    // "where is it?", not to grade the answer.
+    let (sock, origin) = serial_nexus_rpc::default_socket_path(serial_nexus_rpc::DAEMON_NAME);
+    checks.push(EnvCheck::new(
+        "daemon socket (default)",
+        format!("{} — {}", sock.display(), origin.describe()),
+        Status::Supported,
+    ));
 
     // by-id tree. **The tree's absence is not the adapter's absence**, and reporting
     // it as one is how this check came to contradict a daemon working beside it: with
@@ -7372,6 +7423,50 @@ mod tests {
     /// a bare list, so a Darwin operator could re-seat cables chasing something no
     /// Darwin box can produce (§7 wants the observation named; notes §3.45 E (i)).
     ///
+    /// **A pair's observation key may not depend on which port discovery reached
+    /// first** (§15.44, notes §3.71).
+    ///
+    /// `field_set` is computed from the sorted set of observation leaf paths, so an
+    /// order-dependent key makes the digest a function of discovery order. Two Linux
+    /// Tier-3 runs at one commit produced different digests over identical cells for
+    /// exactly this reason. Asserted as the property — *any* two names, both
+    /// orders, one key — rather than against the one pair the bench happens to have,
+    /// because the bug is about ordering and a fixture with a single pair cannot see
+    /// it (§9: the guard must assert the promise, not a proxy for it).
+    ///
+    /// The third case is the anti-vacuity control: a function returning a constant
+    /// would satisfy the first two and is not what was asked for.
+    #[test]
+    fn a_pairs_observation_key_is_the_same_whichever_port_was_discovered_first() {
+        for (a, b) in [
+            ("usb:0403:6001:BH00L4KU:00", "usb:0403:6001:BH00LL8O:00"),
+            ("/dev/cu.usbserial-BH00L4KU", "/dev/cu.usbserial-BH00LL8O"),
+            ("/dev/ttyUSB0", "/dev/ttyUSB1"),
+            // Not lexicographic in path order: `ttyUSB10` sorts before `ttyUSB9`,
+            // so a "sort the paths numerically" reading of this would be wrong and
+            // the key still has to be stable under it.
+            ("/dev/ttyUSB10", "/dev/ttyUSB9"),
+        ] {
+            assert_eq!(
+                p5_pair_subject(a, b),
+                p5_pair_subject(b, a),
+                "key for ({a}, {b}) depends on discovery order"
+            );
+        }
+        // Distinct pairs must still get distinct keys — the fix is an ordering, not
+        // a collapse.
+        assert_ne!(
+            p5_pair_subject("/dev/ttyUSB0", "/dev/ttyUSB1"),
+            p5_pair_subject("/dev/ttyUSB2", "/dev/ttyUSB3"),
+        );
+        // And the key still names both ports, so the report stays readable.
+        let k = p5_pair_subject("/dev/ttyUSB1", "/dev/ttyUSB0");
+        assert!(
+            k.contains("/dev/ttyUSB0") && k.contains("/dev/ttyUSB1"),
+            "{k}"
+        );
+    }
+
     /// The negative half is the one with teeth, and it is what proves the
     /// *matcher* rather than the walker: an excuse that fires on every uncertified
     /// item reads as passing here while telling the operator to stop looking at a
@@ -8579,6 +8674,75 @@ mod tests {
         // accepts and drops: `silently_dropped` is false, so the fleet is clean.
         let refused = [flow_row("/dev/ttyUSB0", false, false, true)];
         assert!(matches!(p15_verdict(1, &refused, &[]).0, Status::Supported));
+    }
+
+    /// **The dropped arm must describe the disposition the daemon SHIPS, and this is
+    /// the one consequence string in the tree that an operator acts on** (§15.53,
+    /// notes §3.67/§3.72).
+    ///
+    /// Between §3.67 and this guard, P15's consequence told every reader that such a
+    /// node "goes `faulted`, not `degraded`" and that whether to degrade or keep
+    /// faulting "is a design question this probe exists to inform, not to answer".
+    /// Both had been false since §3.67 shipped the refusal at `load`. A field report
+    /// from an arm64 Darwin box arrived carrying that text verbatim (§3.72): the
+    /// probe's *measurements* were all correct, and the sentence a reader would act
+    /// on described the behaviour of a tree several commits old, on the one platform
+    /// where it is the only actionable finding in the report.
+    ///
+    /// **Nothing else in the gate set can see this.** `expectations/*.jq` assert over
+    /// `.probes[].observations`, never over `.consequence`; the digests cover
+    /// `(id, question)` and the observation leaf paths, and a consequence is neither.
+    /// A stale consequence is invisible to every gate and visible to every operator.
+    ///
+    /// Asserted as *properties* — the shipped verb, the refusal, both remedies, and
+    /// the bound — rather than as a golden string, so rewording stays free and only a
+    /// change of meaning fails. The two negative clauses name the specific retracted
+    /// claims, because those are what a revert would restore.
+    #[test]
+    fn p15s_dropped_arm_states_the_shipped_refusal_and_not_the_retracted_open_question() {
+        let (_, c) = p15_verdict(
+            1,
+            &[flow_row("/dev/cu.usbserial-A", true, false, true)],
+            &[],
+        );
+
+        // The disposition, and where it happens. `load`/`add-node` and "before
+        // anything is created" are the operator-visible half of §15.53.
+        assert!(
+            c.contains("REFUSED at `load`/`add-node`"),
+            "must state the shipped refusal and the verbs it fires on: {c}"
+        );
+        assert!(
+            c.contains("before anything is created"),
+            "must say the refusal precedes creation, which is why --replace is safe: {c}"
+        );
+        // Both remedies, because a refusal with no way forward is §7's complaint in
+        // a new costume.
+        assert!(
+            c.contains("flow = \\\"none\\\"") || c.contains("flow = \"none\""),
+            "must offer the config remedy: {c}"
+        );
+        assert!(
+            c.contains("adapter whose driver implements RTS/CTS"),
+            "must offer the hardware remedy: {c}"
+        );
+        // The bound. §15.53 refuses only where it can measure, and two paths still
+        // fault; a consequence claiming a total refusal would be the mirror defect.
+        assert!(
+            c.contains("--replace") && c.contains("the config loads"),
+            "must name both paths that still reach a faulted node: {c}"
+        );
+
+        // The retracted claims, named. These are exactly the sentences that were
+        // true before §3.67 and shipped for several commits after it.
+        assert!(
+            !c.contains("a design question this probe exists to inform"),
+            "the fault-versus-degrade question is DECIDED (§15.53); consequence still calls it open: {c}"
+        );
+        assert!(
+            !c.contains("the node goes `faulted`, not `degraded`"),
+            "a configured rts-cts node is refused at load, not faulted: {c}"
+        );
     }
 
     /// A probe that reconfigures a real adapter and cannot say it put it back must
