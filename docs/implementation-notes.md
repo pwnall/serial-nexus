@@ -5540,6 +5540,26 @@ leaves the mechanism open. (2) The classification is interpretable only under
 `slave_termios_mode: raw`, which the probe already reports — with ECHO on, a master legitimately has
 echoed bytes to read.
 
+<!-- ANNOTATION 2026-08-06 (§5). **Pre-registration (1) is answered, and it confirms rather
+     than refutes.** `writer_pending_input_bytes` reads **1022 hostward and 0 targetward** on
+     Darwin — 9 of 9 across three commits on the x86_64 rig, and again on an Apple M4 running
+     Darwin 27.0.0 (notes §3.72) — against `Some(0)` in both directions in every Linux capture.
+     The hostward figure is the master's own reading, it is non-zero, and it equals that
+     direction's depth exactly, which is the condition written above. So on Darwin a pty
+     master's `FIONREAD` answers out of the tty's **input** queue rather than its readable one,
+     and the `contradicted-empty` classification on the targetward direction is that same
+     mechanism seen from the other side rather than a second defect.
+     Recorded here rather than only in §3.72 because this is the paragraph a later session
+     greps for, and leaving a settled pre-registration reading as open is the defect §3.71's
+     sibling entries keep finding. What the M4 adds over the earlier captures is not the
+     answer — it was already 9 of 9 — but its scope: the same reading across a different
+     architecture and a different kernel major rules out a per-box or per-build artifact.
+     Still **not** established (§9): whether this is `n_tty`-versus-BSD-tty structure or an
+     XNU implementation detail. `bytes_recovered_by_peer` is unaffected either way — it is a
+     drain, not an ioctl, and remains the field to size anything against. -->
+
+
+
 **P10's status is deliberately unchanged.** Its `degraded` arm means "the depth you are reading is
 another configuration's" (§3.34). Folding an auxiliary ioctl fault into that word would make Darwin
 permanently yellow, masking a real mode degradation later, and would lose the direction — a
@@ -9266,3 +9286,43 @@ answer. What was wrong was everything the operator is *told*:
   `serial-nexus-ctl ports`, which lists every visible device with the identity it would
   bind. The "is not present" phrasing is kept in both arms: it is the true half, and it
   is what `DEVICE_ABSENT`'s consumers match on.
+
+#### 8. Harness messages, and four things filed rather than fixed
+
+Two harness defects were the same shape as the ones above — a message that is wrong only
+off Linux, on a lane nobody runs before pushing:
+
+* **`SNX_REPLUG=required` failed with a remedy that is a no-op on macOS.** The helper
+  lookup reported "not installed — run `install`, then the sudo command it prints", but
+  the macOS `install` deliberately installs nothing and prints no sudo command, because
+  its re-enumeration path is unprivileged (§3.66). So a Mac operator got a hard failure
+  whose fix they could run forever. The non-portability is unchanged and deliberate;
+  only the explanation is new, and it names the one thing that would actually have to
+  change (the hardware replug test's contract — it takes a `by-id` path where the macOS
+  arm is addressed by USB serial number).
+* **`p12_pty_setup.rs` hardcoded GNU's `stty -F`.** BSD spells it `-f`, so every call on
+  Darwin returned `(false, "")` — and the caller reads that as "this `stty` does not
+  report `extproc`" and **skips green, naming the wrong cause**. Right verdict, wrong
+  reason, and a skip class with no `required` spelling to force it. The portable form
+  was already in-tree in `p9_pty_collapse.rs`.
+
+**Filed as plan §18 items 12–15, not patched**, because each needs a decision or a
+measurement rather than an edit:
+
+* **12** — the anti-spin guard is a §9 proxy in space, and it is the sharpest one in the
+  tree: it self-skips off Linux, and *Linux is the kernel where the hazard it guards
+  cannot occur* (P6 reads 0 `POLLIN` passes there against Darwin's 64 of 64, on x86_64
+  and now arm64 alike). A regression widening `pty.rs`'s last-close predicate would burn
+  a core and release operator-held write locks on macOS with the suite green. Not patched
+  because the fix needs a portable CPU-time source and `p3_idle_cost.rs` states in-tree
+  that none exists — a design question (§5). Its fail-first must be proven *on Darwin*,
+  or it repeats the substitution it exists to remove.
+* **13** — idle CPU on any Mac is arithmetic, not measurement: ~4–15% of a core projected
+  on the M4, 17–19% on the Intel box, inside the 20% budget and above the 3.5% drift
+  ceiling, with nothing in the gate set able to notice. Predates this report.
+* **14** — `xon-xoff` has no pre-check and no probe, while `serial2` verifies `c_iflag`
+  by read-back exactly as it verifies `c_cflag`. **Unmeasured, not known-good.**
+* **15** — the arm64/Darwin-27 artifact is owed. Everything in this entry is quoted from
+  a pasted report, not diffed against a committed capture. This **narrows** §18 item 8
+  and does not close it: that owes `macos-26-arm64`, which is a different image, and no
+  line of `sys/src/usb_macos.rs` has ever run on arm64.

@@ -1778,6 +1778,26 @@ fn blessed_dir() -> PathBuf {
 /// — `capabilities --json` reports the effective bit it reads from its own
 /// `/proc/self/status` — which is the only answer that cannot be stale.
 pub fn blessed_replug_helper() -> Result<PathBuf, String> {
+    // **The blessing is a Linux mechanism, and the caller must be told that rather
+    // than left to infer it from a missing file** (notes §3.72). Off Linux this used
+    // to report the helper "not installed" and tell the operator to run `install` and
+    // "then the sudo command it prints" — but macOS `install` deliberately installs
+    // nothing and prints no sudo command, because its re-enumeration path is
+    // unprivileged (§3.66). So under `SNX_REPLUG=required` a Mac user got a hard
+    // failure whose remedy was a no-op they could run forever. The non-portability is
+    // deliberate and unchanged; only the explanation is new.
+    if !cfg!(target_os = "linux") {
+        return Err(
+            "the blessed replug helper is Linux-only: it exists to carry \
+             CAP_DAC_OVERRIDE for one sysfs `authorized` write, and macOS re-enumerates \
+             through IOUSBLib unprivileged, so `install` has nothing to install and \
+             prints no sudo command (§15.45, notes §3.66). Wiring the hardware replug \
+             test to the macOS backend is a change to the test's contract — it takes a \
+             /dev/serial/by-id path where the macOS arm is addressed by USB serial \
+             number — and is filed, not done (plan §18)"
+                .to_owned(),
+        );
+    }
     let path = blessed_dir().join("serial-nexus-replug");
     if !path.exists() {
         return Err(format!(

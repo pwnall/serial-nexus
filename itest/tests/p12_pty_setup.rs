@@ -120,12 +120,27 @@ fn client_termios(rpc: &Rpc, node: &str, field: &str) -> Option<Value> {
     rpc.node(node)?.get("client_termios")?.get(field).cloned()
 }
 
-/// Run `stty -F <tty> <args>`, returning its exit status and stdout. The one
-/// terminal-settings tool available without linking termios into this crate, which
+/// Run `stty` against `<tty>` with `args`, returning its exit status and stdout. The
+/// one terminal-settings tool available without linking termios into this crate, which
 /// is `#![forbid(unsafe_code)]` and must stay that way (invariant 4 / §16.3).
+///
+/// **The device flag is spelled differently on the two platforms**, and hardcoding
+/// GNU's did not fail loudly — it failed *green*. BSD `stty` rejects `-F`, so every
+/// call returned `(false, "")`, and the caller reads that as "this `stty` does not
+/// report `extproc`" and skips with a message naming the wrong cause. Right verdict,
+/// wrong reason, and a skip class with no `required` spelling to force it (notes
+/// §3.72). The portable form was already in-tree in `p9_pty_collapse.rs`; this is the
+/// second copy, kept local because a shared harness helper for one `Command` is not
+/// worth a crate seam.
 fn stty(tty: &Path, args: &[&str]) -> (bool, String) {
+    // GNU and uutils spell the device flag `-F`; BSD `stty` spells it `-f`.
+    let device_flag = if cfg!(target_os = "linux") {
+        "-F"
+    } else {
+        "-f"
+    };
     let out = std::process::Command::new("stty")
-        .arg("-F")
+        .arg(device_flag)
         .arg(tty)
         .args(args)
         .output();
