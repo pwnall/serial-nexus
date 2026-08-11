@@ -949,7 +949,7 @@ b = "c1"
 }
 
 /// A scripted fault flips a node's indicator and flips it back, live over the same
-/// bridge the page uses (§14.3). Device-free: disconnecting an interior node's
+/// bridge the page uses (plan §14.3). Device-free: disconnecting an interior node's
 /// upstream is a real fault the operator can cause, and the honest report of it is
 /// `waiting` (§15.8).
 #[test]

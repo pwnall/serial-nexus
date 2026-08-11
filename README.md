@@ -177,8 +177,8 @@ hardening guidance.
 
 ## Documentation
 
-- [`docs/39-design-claude-fable-v15.md`](docs/39-design-claude-fable-v15.md) — the normative design document (concepts, node types, RPC contract, and the reasoning behind each decision). A `§N` reference anywhere in this repository means this document. Superseded generations live in [`docs/historical/`](docs/historical/) and are **not** normative; this bullet and `AGENTS.md` §2 are the two places that name the current pair by filename as normative, so both must be bumped whenever a generation lands (the §15.41 ban-statement allowance in `itest/tests/meta_names.rs` also keys on the filenames and moves with them).
-- [`docs/40-implementation-plan-claude-fable-v15.md`](docs/40-implementation-plan-claude-fable-v15.md) — the normative implementation plan (phases, post-1.0 tracks, and the §18 open-item ledger).
+- [`docs/41-design-claude-fable-v16.md`](docs/41-design-claude-fable-v16.md) — the normative design document (concepts, node types, RPC contract, and the reasoning behind each decision). A `§N` reference anywhere in this repository means this document. Superseded generations live in [`docs/historical/`](docs/historical/) and are **not** normative; this bullet and `AGENTS.md` §2 are the two places that name the current pair by filename as normative, so both must be bumped whenever a generation lands (the §15.41 ban-statement allowance in `itest/tests/meta_names.rs` also keys on the filenames and moves with them).
+- [`docs/42-implementation-plan-claude-fable-v16.md`](docs/42-implementation-plan-claude-fable-v16.md) — the normative implementation plan (harness doctrine, testing strategy, the Status figures table, and the §18 work ledger).
 - [`docs/rpc/`](docs/rpc/) — the JSON-RPC method reference (the stable contract of §10).
 - [`docs/codec-authors.md`](docs/codec-authors.md) — writing a codec: the trait, the event vocabulary, and the envelope protocol for external (any-language) codecs.
 - [`docs/security.md`](docs/security.md) — threat model and hardening.

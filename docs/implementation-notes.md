@@ -1,17 +1,83 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-08-05 (**phases 0-8 + simplification + extension + web-console + v10 + v11
+**As of:** 2026-08-10 (**phases 0-8 + simplification + extension + web-console + v10 + v11
 console-map + review-26 remediation + v12 graph-editing + v13 browser-UI automation +
 review-32 remediation tracks done**, plus the **v14 rename track** — every binary, crate
 and default path moved to the `serial-nexus-*` / `serial_nexus_*` family, design §15.40,
 plan §17, with the consumer-context scrub of §15.41 beside it — the **review-37
-remediation**, all 82 findings dispositioned, the 2026-08-05 doctor/rig/replug sessions
-(§3.29–§3.54 below), and the **v15 documentation generation** (entry below).)
+remediation**, all 82 findings dispositioned, the 2026-08-05/07 doctor/rig/replug sessions
+(§3.29–§3.74 below), the **v15 documentation generation**, and the **v16 documentation
+generation** (entry below).)
 **Branch:** `implementation` (off `main`).
-**Normative docs are now v15:** `docs/39-design-claude-fable-v15.md` (design) and
-`docs/40-implementation-plan-claude-fable-v15.md` (plan). v1–v14 docs, the reviews and their
-remediation ledgers are in `docs/historical/`. Section references (§) point at the v15
-design.
+**Normative docs are now v16:** `docs/41-design-claude-fable-v16.md` (design) and
+`docs/42-implementation-plan-claude-fable-v16.md` (plan). v1–v15 docs, the reviews and their
+remediation ledgers are in `docs/historical/`. Section references (§) point at the v16
+design, whose §1–§17/§15.N/§16.N numbering is deliberately identical to v15's.
+
+---
+
+## THE v16 GENERATION — the full rewrite for new developers (2026-08-10 session)
+
+**What landed.** A new normative pair: `docs/41-design-claude-fable-v16.md` +
+`docs/42-implementation-plan-claude-fable-v16.md`, with the v15 pair moved to
+`docs/historical/` and the entry points (AGENTS.md §2, README's documentation index, the
+§15.41 ban-statement table and the §3.NN-scope list in `itest/tests/meta_names.rs`) bumped in
+the same commit. Unlike v12–v15, which were edits of their predecessor's bytes, v16 is a
+**full rewrite** optimized for a new developer: overview first, per-part sections diving
+progressively into detail, justifications compressed into the status-headed decision record
+(§15/§16, every entry keeping its v15 number — none dropped, none renumbered, none reused),
+stale history deleted, and the current-era figures moved out of prose into the plan's Status
+table (one row per figure, with scope/date/commit, quotable only with scope). New primary
+content, each consolidating what the record had already built or decided: §8's
+"Validating your codec" chapter (the kit, the exec battery, the corruption recipe, the
+golden vectors, the consumer template — with the codec-side gaps filed as plan §18 items
+32–39 rather than promised); §13's instrument-validity chapter (self-testimony, zero-witness,
+the vacuity taxonomy, proxy-guard rules, gate blind spots) and comparability-ladder/era-record
+section; §5's loss-taxonomy table and tripwire table; §14's deferral-state vocabulary and
+register; plan §3's rules 17–21 (appended, never renumbered) and required-mode table; and
+plan §18 rewritten under a fixed item schema — items 1–15 keep their v15 meanings, items
+16–44 are filed this generation (carried residuals plus the codec/testing construction
+items), all open at landing.
+
+**How the alignment obligation was executed.** The v12/v13 hazard — a rewrite silently
+dropping rules the code still enforces — was met structurally, since a full rewrite cannot
+use the sentence-granular diff: (1) a 17-agent digest fan-out produced must-preserve
+inventories (every rule, decline, refutation, and measured claim in the v15 pair, notes
+§3.1–§3.74, review 37 + ledger, the codec surface, and the repo ground truth); (2) a
+disposition map assigned every v15 section/entry a fate (BODY-AT/APPENDIX/STUB; two DROPs
+total, both justified) and an anchor-stability contract built from tree greps; (3) nineteen
+section writers wrote to that map; (4) ten independent adversarial verifiers checked the
+assembled pair for dropped rules, reversed declines, wrong facts, broken anchors, hygiene,
+code truth (33 mechanism claims spot-checked against source), cross-document consistency,
+the fresh-reader experience, and the codec-author experience. The verifiers found and the
+fix pass repaired: 7 blockers (a `STANDS` verdict wrongly minted for the shipped
+`connect`/`disconnect` half of §15.25's deferral; the pty `pending` payload misfiled as open
+work; a `regen-golden` cargo feature asserted that does not exist; a fixture-naming promise
+the plan did not keep; a self-contradiction about the dual-scope 835 measurement; two
+extraction-box pointers at a section that did not carry the rules; three unresolvable "box
+item" citations), ~35 majors (including three duplicated rule statements collapsed to
+single-home-plus-pointer, a fused "five later commits" caveat, an un-artifacted ~13.8 KiB
+figure re-cited to committed captures, P14's trial policy restored to §15.51, and the
+certification map in §8 corrected against what the kit can actually observe), and ~40
+minors. The fresh-reader verifier answered all five comprehension questions correctly from
+the pair alone.
+
+**Repairs to standing files made at the landing, each scheduled by the record:** AGENTS §2
+rewritten from the v15 wall-of-text to a summary pointing at the plan's Status table and
+§18 (its claims-match-reality and same-commit rules kept verbatim); AGENTS.md's glued
+`## §3` heading restored to its own line; AGENTS §3's rig-lane spelling gains
+`SNX_WEB_UI=required` (notes §3.68 measured the 835 figure with it set; the line had omitted
+it); `itest/tests/p8_web.rs:952`'s bare `(§14.3)` respelled `(plan §14.3)` and
+`expectations/linux.jq:1`'s `(plan §4.3)` respelled `(plan §3)` — the two wrong-but-real
+citations the anchor sweep found, recorded as executed in plan §18 item 23 (d).
+
+**What deliberately did not change:** every §15/§16 entry number and every plan §3 rule and
+§18 item number (the anchor contract: an entry cited by frozen artifacts, code, or gates is
+never renumbered); every recorded decline and refutation (overturned ones marked OVERTURNED
+at their entries); the withdrawn-figure ban (32/35 appears only inside §15.44's register);
+and the citation notation, with one intended simplification stated in both front matters —
+the plan's v15-era scoped exception is retired, so bare §N means the design everywhere,
+including inside the plan.
 
 ---
 

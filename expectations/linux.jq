@@ -1,4 +1,4 @@
-# Per-platform expectation for a supported Linux system (plan §4.3):
+# Per-platform expectation for a supported Linux system (the expectation-file gate, plan §3):
 #   serial-nexus-doctor --json | jq -e -f expectations/linux.jq
 #
 # Encodes what a supported Linux MUST report. Deliberately lenient where the
