@@ -1943,10 +1943,10 @@ pub fn blessed_devprep_helper() -> Result<PathBuf, String> {
         return Ok(path);
     }
     Err(format!(
-        "{} is installed but not blessed ({}). Run:\n    sudo setcap cap_dac_override+ep {}",
+        "{} is installed but not blessed ({}). Run scripts/bless — it derives the full \
+         capability set from the helper itself, so this message never has to spell it.",
         path.display(),
         text.trim(),
-        path.display()
     ))
 }
 

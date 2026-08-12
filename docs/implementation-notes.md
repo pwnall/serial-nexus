@@ -1,23 +1,152 @@
 # serial_nexus — implementation notes & handoff
 
-**As of:** 2026-08-10 (**phases 0-8 + simplification + extension + web-console + v10 + v11
+**As of:** 2026-08-12 (**phases 0-8 + simplification + extension + web-console + v10 + v11
 console-map + review-26 remediation + v12 graph-editing + v13 browser-UI automation +
 review-32 remediation tracks done**, plus the **v14 rename track** — every binary, crate
 and default path moved to the `serial-nexus-*` / `serial_nexus_*` family, design §15.40,
 plan §17, with the consumer-context scrub of §15.41 beside it — the **review-37
 remediation**, all 82 findings dispositioned, the 2026-08-05/07 doctor/rig/replug sessions
-(§3.29–§3.74 below), the **v15 documentation generation**, and the **v16 documentation
-generation** (entry below).)
+(§3.29–§3.74 below), the **v15 documentation generation**, the **v16 documentation
+generation**, and the **v17 documentation revision** (2026-08-12; entries below).)
 **Branch:** `implementation` (off `main`).
 **One name was retired tree-wide on 2026-08-12** (§3.81): the privileged helper is
 `serial-nexus-devprep` (`devprep/`), and entries written before that date were
 **mechanically rewritten** to it. Commands quoted in older entries therefore use the current
 name rather than the string that was typed; `docs/historical/` and the commit messages keep
 the original spelling. The word *replug* still means the operation everywhere it appears.
-**Normative docs are now v16:** `docs/41-design-claude-fable-v16.md` (design) and
-`docs/42-implementation-plan-claude-fable-v16.md` (plan). v1–v15 docs, the reviews and their
-remediation ledgers are in `docs/historical/`. Section references (§) point at the v16
-design, whose §1–§17/§15.N/§16.N numbering is deliberately identical to v15's.
+**Normative docs are now v17:** `docs/43-design-claude-fable-v17.md` (design) and
+`docs/44-implementation-plan-claude-fable-v17.md` (plan). v1–v16 docs, the reviews and their
+remediation ledgers are in `docs/historical/`. Section references (§) point at the v17
+design, whose §1–§17/§15.N/§16.N numbering is deliberately identical to v16's and v15's
+(§15.56, plan §3 rule 22, and plan §18 items 47–55 are v17's appended additions).
+
+---
+
+## THE v17 GENERATION — the post-landing record folded, and the pattern wait specified (2026-08-12 session)
+
+**What landed.** A new normative pair: `docs/43-design-claude-fable-v17.md` +
+`docs/44-implementation-plan-claude-fable-v17.md`, with the v16 pair moved byte-identical to
+`docs/historical/` and the entry points bumped in the same commit — AGENTS.md §2, README's
+documentation index, and the four filename-keyed code sites: `itest/tests/meta_names.rs`'s
+§15.41 ban-statement allowance and citation-gate scoping pair, and `itest/tests/meta_derive.rs`'s
+`PLAN`/`DESIGN` consts (AGENTS §2's landing list undercounted everything past the first — it
+predated both the citation gate's scoping check and item 40's gates — corrected with this
+landing). Unlike v16 (a full rewrite), v17
+is an **edit of v16's bytes**, so rewrite invariant 2's acceptance test applies directly: the
+diff against the predecessor contains nothing outside the intended-changes list below. Every
+§15/§16 entry number, plan §3 rule number, and plan §18 item number is unchanged; additions
+append (§15.56; plan §3 rule 22; plan §18 items 47–55).
+
+**The intended changes, enumerated.**
+
+1. **The pattern wait specified** (the one new capability): §10 gains *The pattern wait* —
+   `tap.wait`, a waiting verb on the observation surface under §15.20's doctrine unchanged:
+   one to eight named byte patterns (literal or bytes-regex) on a linear-time engine with
+   §16.12 maxima throughout, hub-exact matching with gap-resets-window honesty, splice-exact
+   replay inclusion, a result-shaped timeout distinct from the typed teardown outcome, results
+   on the parked request's reply only, and no web-bridge admission at introduction. §15.56 is
+   the decision record (motivation, dependency reality, and five declines); plan §18 item 47
+   the construction — design ahead of tree, AGENTS §5's amend-first order. The adjacent
+   candidate shapes in the same input were dispositioned without change: one was already
+   tracked as plan §18 item 16 exactly as filed, and the rest named no capability gap.
+2. **The post-landing record folded at its sources** (notes §3.76–§3.81): §5's tripwire-table
+   helper row, §15.45's status line, and §12's privileged-mechanism sentence now carry
+   §15.55's amendment (two capabilities; the shown, run, and verified commands derive from
+   `REQUIRED_CAPS`) — the first two had still read "one capability"; plan §2's devprep row
+   likewise; §15.52 gains the 2026-08-12 **3-wire** re-measure annotation (two independent
+   instruments; §3.63's measurement not refuted, its precondition gone); the plan's
+   named-scopes block gains the legitimate-drop rule (notes §3.80); plan §3 gains rule 22 (a
+   gate proves its own execution — the three measured instances of
+   passing-output-identical-to-not-running, notes §3.74/§3.77/§3.78); and the doctor-gate
+   spellings in plan §3 and extraction-box item 3 are corrected to CI's one-run `--json-out`
+   form per rule 21 (AGENTS §3's mirror corrected in the same commit). Three catch-up folds
+   from *earlier* session records ride with this item, each named in the design front matter:
+   §13 clause 8 gains P5's fourth discovery arm (`hung up (peer closed) — not classifiable`,
+   degrades — the P6–P11 session's record), §15.46 gains its two refutation chains
+   (§3.40/§3.45), and plan §3's sim-verdict description gains the `overshoot`/`budget_met`
+   fold (the review-32 audit session's record).
+3. **Figures repaired where they stood:** §15.51's `platform-refused` exemplar replaced with
+   the committed `42eac2a` reading — every rung to 3000000 accepted, the 3062500 ask refused —
+   because the "caps the ask at 230400" parenthetical was the pre-implementation expectation
+   and no committed capture supports it; §15.48's provider wall-clock ratio re-cited to notes
+   §3.43 (where 6.30 s / 0.55 s actually lives); §15.44's withdrawn register extended with the
+   un-artifacted poll-calibration readings (§3.41/§3.44); the Status table's 835 row annotated
+   **attribution unreconciled** — notes §3.68's verbatim record reads 830 and 834/0 · 833/1,
+   never 835 — with item 30's evidence corrected to match; and the closing register's
+   `crossover_rig_map_node_both_directions` citation corrected §3.67 → §3.65 F.
+4. **Clarifications the implementation record showed were needed:** §7.1's write-arbitration
+   pointer (thirteen sites once misattributed §6's rule to it) and the disconnect-latency
+   sentence (a destroyed tty fails the in-flight read at once — §3.54); §7.2's pty-seat
+   orientation parenthetical (§3.32's inverted labels); §10's `id: null` and
+   result-XOR-error protocol clauses (§3.5); §5's single-sink reconciliation caveat
+   (`delivered + discarded == streamed` holds per sink, never across a fan-out); §13's sixth
+   vacuity shape (a `timeout` whose stub never parks — LEG-3), the temporal self-testimony
+   clause (Err at creation, Ok after hangup — §3.45), the probe-restore rule (§3.68), and the
+   heuristic-scope corollary (§3.34); §15.44's abstain-arm rewording (§3.48); §15.45's
+   Stale-verdict sentence (§3.62); §15.51's single-predicate caveat (§3.61); plan §3 rule
+   amendments (3, 6, 8, 10, 11, 17, 19 — each citing its bought incident) and the
+   citation-gate paragraph (§3.60); plan §2's binary-named-for-its-callers heuristic (§3.81);
+   and the §15 topic index extended through §15.56 — it had stopped at §15.53 while
+   §15.54/§15.55 already existed.
+5. **New work filed, none promised as existing:** plan §18 items 48–55 — the macOS doctor
+   gate's ENOEXEC observation and its first green execution owed (48); the python3 required
+   mode and the skip-message-naming meta-gate (49); harness scaffolding consolidation beside
+   item 24 (50); the client socket-fallback hoist into rpc (51); devprep parity, JSON grant
+   reporting, the shared replug envelope, and orphaned-bless hygiene (52); the kit
+   resync-accounting suite with its kit-honesty negative (53); the macOS lint gap (54); and
+   the drifted-copy comment/dead-code sweep (55). Item 17 gains its bench re-inspection
+   clause, item 19 its two named competing readings, item 20 §3.56's outcome table by
+   reference. The closing register gains the rust-toolchain decline (previously notes-only),
+   the editor-spec recorded lead, the `--show-output` open question, and the deliberately
+   not-scheduled figure-to-artifact bijection gate.
+
+**What deliberately did not change:** every recorded decline and refutation stands (overturned
+ones stay marked at their entries); the withdrawn-figure bans are extended, never relaxed; the
+citation notation is unchanged; the required-mode lattice's authority stays the code; no §14
+register entry moved; and the era record and both digests are untouched — v17 is a documents
+change with no capture and no probe edit.
+
+**How the alignment obligation was executed.** The revision was authored from a disposition
+map built by a thirteen-agent input digest — seven readers over the whole notes file
+extracting unfolded deviations, misreading patterns, and contradictions (each verifying
+absence against the v16 pair by grep before reporting); two code-grounding surveys for the
+pattern wait (the daemon's tap/hub/waiting-verb mechanics and the client surface, with
+file-line cites); and four record-checked improvement hunts that killed their own candidates
+against the §15/§16 decline register (one candidate reported DEAD on notes §3.14/§3.20's
+standing decline rather than re-proposed). The assembled pair was then adversarially verified
+against the v16→v17 diff before landing, and the record closes this entry: **eight independent
+checkers**, one per dimension — diff-versus-intent (rewrite invariant 2's acceptance test),
+anchor stability, no-silent-reversal, request-acceptance mapping, tree-fact truth, citation
+resolution, hygiene and figure-scope, and cross-file landing consistency — returned one
+blocker, eleven majors, and twenty-five minors, every one repaired before the landing commit.
+The majority clustered on two authoring drops the checkers caught exactly as designed — an
+intended §15.46 fold that had not landed, and the quoted-ratio clause landing on rule 14
+instead of rule 19; both were then executed as intended — plus this entry's own enumeration,
+brought back into agreement with the diff. Three findings reached the *tree*: the harness's
+blessed-helper remediation string still instructed the pre-§15.55 single-capability `setcap`
+(an instruction whose product the helper's own `--verify` rejects — repaired to point at
+`scripts/bless`, which derives the set), the bless header comment's hand-written capability
+set (repaired to derivation phrasing), and the devprep `status` line's stale informational
+spelling (filed under item 52, not patched blind). The checkers also confirmed what they were
+pointed at: all 55 §15 entry titles byte-identical with §15.56 appended and none reused, the
+historical move R100 byte-identical, the ban-statement counts exactly 3 per stating file,
+§15.51's replacement figures artifact-true against the `42eac2a` triple, and §3.68's verbatim
+record carrying no 835.
+
+**Gates at landing.** `cargo build`/`fmt`/`clippy` (workspace and minimal-daemon)/`deny`, both
+Apple compile cross-check triples, the doctor jq gate in CI's one-run form (doctor exit 0, jq
+exit 0 on `expectations/linux.jq`), and all meta-gates green — the retired-names gate earned
+its keep once during authoring, catching a draft plan item quoting the retired helper name,
+paraphrased per §15.40. The suite (default CI scope, `--no-fail-fast`) reads **894 · 1 · 6**
+over 121 test-result lines, the one failure being item 46's `p3_idle_cost` at its verbatim
+recorded signature (3.80 % against the 3.50 % tripwire, "38 ticks over 10s"), reproduced in
+two of three runs — once under deliberate parallel load and once on a quiet box at load 0.33 —
+on product code this revision does not touch: item 46 resurfacing, exactly as filed, its
+disposition unchanged. The figure and its scope are in the plan's Status table. One
+process observation for the record: this session's first two suite invocations piped cargo's
+output into `tail`/`grep`, which replaced the exit status — rule 22's own class, caught on the
+third run by writing the log and reading the status separately; the recorded figures are the
+third run's.
 
 ---
 
@@ -3220,6 +3349,11 @@ the items below are refinements consistent with the design, none contradict it.
 
 ## 1. Status at a glance
 
+> **Era banner (2026-08-12, the v17 landing):** this section is a frozen 2026-08-05-era
+> snapshot kept as a record. Current figures live only in the plan's Status table, which is
+> their single home; several sentences below are superseded there and are not quotable as
+> current.
+
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 0 | Doctor + scaffolding | **done** — `serial-nexus-doctor`, CI, cargo-deny gate |
@@ -6086,6 +6220,13 @@ ladder has not separated the two on Darwin either, and the next step is a rung b
 ---
 
 ## 4. Findings carried forward (from serial-nexus-doctor)
+
+> **Era banner (2026-08-12, the v17 landing):** frozen at its writing (pre-P14/P15). At least
+> three bullets below are stale against later committed evidence — the no-udev arm is
+> exercised (plan §18 item 9, executed 2026-08-05), P11 has same-fingerprint 7.0 counterparts
+> (the `f8315cc` triples), and the Linux P13 claim is artifact-backed
+> (`docs/doctor/linux-7.0-2026-08-05-tier3.json`). Kept as written per the append-only rule;
+> read through this banner.
 
 Full report: `docs/serial-nexus-doctor.md`. Re-runnable per system with
 `cargo run -p serial-nexus-doctor` (Markdown) / `--json | jq -e -f expectations/linux.jq`.

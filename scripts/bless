@@ -9,7 +9,8 @@
 #     scripts/bless --verify     # report state, change nothing, ask for no password
 #
 # What it does per profile: build the helper, install a copy at
-# `.snx-bin/<profile>/` with mode 0700, apply `cap_dac_override+ep` with one
+# `.snx-bin/<profile>/` with mode 0700, apply the helper's own required capability
+# set (derived via `install --print-setcap`, never spelled here) with one
 # `sudo setcap`, and verify the result. It is idempotent and **skips the sudo
 # entirely** when the installed copy is already byte-identical to the build and
 # already carries the capability — so re-running it costs nothing and prompts for

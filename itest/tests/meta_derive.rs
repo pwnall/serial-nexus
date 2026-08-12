@@ -99,10 +99,10 @@ use std::path::{Path, PathBuf};
 /// name here fails loudly at [`read_tree_file`] instead of silently reading
 /// nothing. `meta_gates.rs`'s entry-point gates already hold the *other* end of
 /// that rename (README and AGENTS must name a pair that exists).
-const PLAN: &str = "docs/42-implementation-plan-claude-fable-v16.md";
+const PLAN: &str = "docs/44-implementation-plan-claude-fable-v17.md";
 
 /// The current normative design, whose §13 carries the probe roster at a glance.
-const DESIGN: &str = "docs/41-design-claude-fable-v16.md";
+const DESIGN: &str = "docs/43-design-claude-fable-v17.md";
 
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is <root>/itest — the *directory*, which §15.40 kept short.
