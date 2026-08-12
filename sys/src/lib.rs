@@ -895,17 +895,36 @@ pub fn pending_output_bytes(_fd: RawFd) -> nix::Result<usize> {
 // ---------------------------------------------------------------------------
 // POSIX ACL: granting one user read/write on a device node (§15.55)
 // ---------------------------------------------------------------------------
+//
+// **Linux-only, and gated at the module rather than inside each function.** Two
+// things here have no Darwin equivalent: `O_PATH`, which does not exist, and
+// `setxattr`, whose Darwin signature carries an extra `position` argument. Neither
+// is a portability gap worth papering over — the blessed helper this serves is
+// itself Linux-only (§15.45, notes §3.66), because macOS re-enumerates through
+// IOUSBLib unprivileged and needs no capability and no grant.
+//
+// The gate is here, on the block, rather than on the `pub fn` alone, because the
+// constants and the encoder are only ever reached through it — and a `cfg` that
+// covers less than the code it protects is the shape notes §3.71 records, where an
+// insertion stole an attribute and the break was invisible to `cargo build`.
 
 /// POSIX ACL entry tags (`linux/posix_acl_xattr.h`), in the order the kernel
 /// requires them to appear.
+#[cfg(target_os = "linux")]
 const ACL_USER_OBJ: u16 = 0x01;
+#[cfg(target_os = "linux")]
 const ACL_USER: u16 = 0x02;
+#[cfg(target_os = "linux")]
 const ACL_GROUP_OBJ: u16 = 0x04;
+#[cfg(target_os = "linux")]
 const ACL_MASK: u16 = 0x10;
+#[cfg(target_os = "linux")]
 const ACL_OTHER: u16 = 0x20;
 /// The id field of an entry that does not name one.
+#[cfg(target_os = "linux")]
 const ACL_UNDEFINED_ID: u32 = 0xffff_ffff;
 /// `POSIX_ACL_XATTR_VERSION`.
+#[cfg(target_os = "linux")]
 const ACL_XATTR_VERSION: u32 = 2;
 
 /// Encode the minimal POSIX access ACL for `mode` **plus** `u:<uid>:rw-`.
@@ -923,6 +942,7 @@ const ACL_XATTR_VERSION: u32 = 2;
 /// **Idempotent by construction.** Once an ACL exists, a file's group bits *are*
 /// its mask, so re-deriving from the mode on a second application yields the same
 /// blob rather than drifting wider each time.
+#[cfg(target_os = "linux")]
 fn encode_posix_acl_rw(mode: u32, uid: u32) -> Vec<u8> {
     const RW: u16 = 6;
     let user_obj = ((mode >> 6) & 7) as u16;
@@ -971,6 +991,7 @@ fn encode_posix_acl_rw(mode: u32, uid: u32) -> Vec<u8> {
 /// Refuses anything that is not a character device, because that is the only shape
 /// this exists to grant and a capability-carrying binary should decline everything
 /// it was not built for.
+#[cfg(target_os = "linux")]
 pub fn grant_user_rw(path: &std::path::Path, uid: u32) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -1029,7 +1050,9 @@ pub fn grant_user_rw(path: &std::path::Path, uid: u32) -> std::io::Result<()> {
 }
 
 /// Closes a raw fd on drop, so every early return above releases it.
+#[cfg(target_os = "linux")]
 struct OwnedPathFd(RawFd);
+#[cfg(target_os = "linux")]
 impl Drop for OwnedPathFd {
     fn drop(&mut self) {
         // Safety: we own this descriptor and close it exactly once.
@@ -1405,6 +1428,7 @@ mod tests {
     /// well-formed one carrying the wrong permission bits is applied exactly as
     /// written and grants whatever it says (§15.55).
     #[test]
+    #[cfg(target_os = "linux")]
     fn the_acl_blob_grants_the_named_user_and_nothing_else() {
         // A udev-fresh tty node: root:dialout 0660.
         let blob = encode_posix_acl_rw(0o660, 1000);
@@ -1435,6 +1459,7 @@ mod tests {
     /// The base entries come from the file's own mode, so a node the operator has
     /// locked down further is not quietly widened back to the common case.
     #[test]
+    #[cfg(target_os = "linux")]
     fn the_acl_blob_never_widens_the_mode_it_found() {
         // 0600: owner rw, group nothing, other nothing.
         let blob = encode_posix_acl_rw(0o600, 4242);
@@ -1460,6 +1485,7 @@ mod tests {
     /// Re-applying must not drift: once an ACL exists the group bits *are* the mask,
     /// so the second derivation has to reproduce the first.
     #[test]
+    #[cfg(target_os = "linux")]
     fn the_acl_blob_is_idempotent_under_reapplication() {
         let first = encode_posix_acl_rw(0o660, 1000);
         // After the first application the node reads 0660 still (mask 6 in the group
@@ -1471,6 +1497,7 @@ mod tests {
     /// It refuses anything that is not a character device — proved against a regular
     /// file, which is the shape a swapped path would most likely have.
     #[test]
+    #[cfg(target_os = "linux")]
     fn granting_on_a_regular_file_is_refused() {
         let tmp = std::env::temp_dir().join(format!("snx-acl-{}", std::process::id()));
         std::fs::write(&tmp, b"not a tty").expect("write the fixture");
@@ -1483,7 +1510,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod acl_kernel_probe {
     /// The kernel's own opinion of the blob, without privilege: `/dev/null` is a
     /// character device this process does not own, so a **well-formed** ACL is

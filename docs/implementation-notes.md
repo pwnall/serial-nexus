@@ -10302,6 +10302,21 @@ proceed to their own diagnoses. Blessed, it prints
 — twice in a full run, once per test binary that asked for hardware, which is the
 once-per-process guard behaving as designed rather than a repeat.
 
+**And it broke the Apple cross-check on the way in, which is worth recording rather than
+quietly fixing.** `O_PATH` does not exist on Darwin and Darwin's `setxattr` carries an extra
+`position` argument, so `serial_nexus_sys` — which compiles for macOS even though the helper
+that calls this does not — stopped building on both Apple triples. CI's `check` job caught
+it, exactly the gate notes §3.71 added for exactly this class, and it caught it because I
+pushed without running the Apple cross-check locally first: the full gate set was run before
+the *previous* commit and not re-run after this change. The repair is a module-level
+`#[cfg(target_os = "linux")]` over the whole ACL block rather than one on the `pub fn` alone,
+because the constants and the encoder are only reachable through it — and a `cfg` covering
+less than the code it protects is precisely §3.71's shape. The first attempt at that repair
+demonstrated the same hazard in miniature: one anchor did not match, the encoder kept its
+`cfg`-less definition, and both triples failed again on `ACL_XATTR_VERSION not found` — so
+the second pass verified the attribute on *every* item individually instead of trusting the
+edit. Both triples clean before the second push.
+
 **The verb, measured on the bench.** From an unprivileged shell with the blessed copy:
 `grant --port 3-2.3 --port 3-2.4 --json` → `{"granted":["/dev/ttyUSB1","/dev/ttyUSB0"],"uid":1000}`,
 after which `getfacl /dev/ttyUSB0` reads `user::rw- / user:pwnall:rw- / group::rw- / mask::rw-
