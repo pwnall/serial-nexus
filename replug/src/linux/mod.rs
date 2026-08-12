@@ -83,6 +83,28 @@ enum Verb {
         #[arg(long)]
         json: bool,
     },
+    /// Grant the **invoking user** read/write on every tty this port owns.
+    ///
+    /// The equivalent of `setfacl -m u:$USER:rw /dev/ttyUSB*` for one USB port, and
+    /// the reason this binary carries `CAP_FOWNER` beside `CAP_DAC_OVERRIDE`
+    /// (§15.55). It exists because a re-enumeration destroys the device node and
+    /// udev builds a fresh one `root:dialout 0660`: any grant made before a cycle is
+    /// gone with the inode that carried it, which is exactly how a rig lane that had
+    /// device access at the start loses it half way through.
+    ///
+    /// **The bound §15.45 states is kept, not spent.** argv carries a USB *port
+    /// name*, validated and checked against sysfs exactly as every other verb here
+    /// does; the device nodes are then derived by this binary from the kernel's own
+    /// view of that port. No caller-supplied path reaches `open`, and no
+    /// caller-supplied uid reaches the ACL — the beneficiary is `getuid()`, so this
+    /// can only ever hand access to whoever ran it.
+    Grant {
+        /// USB port name, repeatable. Not a path.
+        #[arg(long = "port", required = true)]
+        ports: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Report a port's identity and authorization state. Reads only.
     Status {
         /// USB port name, e.g. `3-1`. Not a path.
@@ -152,6 +174,12 @@ enum Verb {
         /// Only report the state; change nothing.
         #[arg(long)]
         verify: bool,
+        /// Print the exact `sudo setcap …` line for this profile and exit, changing
+        /// nothing. `scripts/bless` reads it rather than spelling the capability
+        /// list a second time, so the command an operator is shown, the command that
+        /// runs, and the set `--verify` checks against cannot drift apart.
+        #[arg(long = "print-setcap")]
+        print_setcap: bool,
     },
     /// Is the replug capability usable here? Exits 0 ready, 2 blocked-on-bless,
     /// 1 a genuinely absent facility.
@@ -266,6 +294,7 @@ pub fn main() {
     let cli = Cli::parse();
     let code = match cli.verb {
         Verb::Capabilities { json } => report_capabilities(held, hardening.is_ok(), json),
+        Verb::Grant { ports, json } => grant_verb(&ports, json),
         Verb::Status { port, json } => status(&port, json),
         Verb::Cycle {
             ports,
@@ -279,7 +308,11 @@ pub fn main() {
             dry_run,
         } => hold_until_eof(&ports, max_ms, dry_run, held),
         Verb::Authorize { port, json } => authorize(&port, json, held),
-        Verb::Install { profile, verify } => install_verb(&profile, verify, held),
+        Verb::Install {
+            profile,
+            verify,
+            print_setcap,
+        } => install_verb(&profile, verify, print_setcap, held),
         Verb::Preflight { profile, json } => preflight(&profile, json, held),
     };
     std::process::exit(code);
@@ -319,18 +352,36 @@ fn repo_root() -> Result<PathBuf, String> {
 /// indistinguishable from one that was never set — which is exactly the defect this
 /// field closes.
 fn report_capabilities(held: CapState, no_new_privs: bool, json: bool) -> i32 {
+    // Reported separately from `cap_dac_override` because they fail differently and
+    // the remedy differs: without the first there is no replug at all, without the
+    // second the replug works and the device comes back unusable (§15.55). A single
+    // `blessed` boolean cannot say which, and "the cycle succeeded but the node is
+    // still Permission denied" is exactly the confusion this field removes.
+    let fowner = caps::capability_state(caps::CAP_FOWNER);
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "cap_dac_override_permitted": held.permitted,
                 "cap_dac_override_effective": held.effective,
+                "cap_fowner_effective": fowner.effective,
+                "can_grant_device_access": fowner.effective,
                 "blessed": held.effective,
                 "no_new_privs": no_new_privs,
             })
         );
     } else if held.effective {
         println!("cap_dac_override: held (permitted and effective) — replug verbs will work");
+        println!(
+            "cap_fowner: {} — {}",
+            if fowner.effective { "held" } else { "NOT held" },
+            if fowner.effective {
+                "device-access grants will work"
+            } else {
+                "replug works, but the node it brings back stays root:dialout and \
+                 unusable; re-run the setcap `install --print-setcap` prints"
+            }
+        );
     } else if held.permitted {
         println!(
             "cap_dac_override: permitted but NOT effective — the file was blessed `+p` \
@@ -426,6 +477,85 @@ fn require_capability(held: CapState, json: bool) -> Option<i32> {
     ))
 }
 
+/// Grant the invoking user read/write on every tty `port` currently owns.
+///
+/// Returns the nodes granted, or an error naming the one that failed. Silent about
+/// a port with no tty: a device mid-enumeration legitimately has none yet, and the
+/// callers below have already waited for the tty they care about.
+fn grant_ports(ports: &[sysfs::Port]) -> Result<Vec<String>, String> {
+    let uid = caps::real_uid();
+    let mut granted = Vec::new();
+    for port in ports {
+        for tty in sysfs::ttys(port) {
+            let node = PathBuf::from("/dev").join(&tty);
+            serial_nexus_sys::grant_user_rw(&node, uid)
+                .map_err(|e| format!("granting {uid} read/write on {}: {e}", node.display()))?;
+            granted.push(node.display().to_string());
+        }
+    }
+    Ok(granted)
+}
+
+/// Grant after a reauthorization, **best-effort and always announced**.
+///
+/// Two failure shapes, deliberately treated differently. A copy blessed before
+/// `CAP_FOWNER` joined the grant (§15.55) simply cannot do this, and that must not
+/// turn every previously-working `cycle` into a failure — so a missing capability is
+/// reported and skipped, not raised. A copy that *holds* the capability and still
+/// fails is a real fault and is raised, because the caller asked for a device it can
+/// use and would otherwise meet `Permission denied` several seconds later with
+/// nothing pointing here.
+fn grant_after_reauthorize(ports: &[sysfs::Port], json: bool) -> Result<Vec<String>, i32> {
+    if !caps::capability_state(caps::CAP_FOWNER).effective {
+        if !json {
+            eprintln!(
+                "note: not granting device access — this copy does not hold cap_fowner \
+                 effectively. Re-run `install` and the sudo command it prints (§15.55)."
+            );
+        }
+        return Ok(Vec::new());
+    }
+    grant_ports(ports).map_err(|e| refuse(&e, json))
+}
+
+fn grant_verb(names: &[String], json: bool) -> i32 {
+    let mut ports = Vec::new();
+    for name in names {
+        match open_port(name) {
+            Ok(p) => ports.push(p),
+            Err(e) => return refuse(&e, json),
+        }
+    }
+    if !caps::capability_state(caps::CAP_FOWNER).effective {
+        return refuse(
+            "cap_fowner is not effective, so no ACL can be set on a root-owned tty node. \
+             Run `cargo run -p serial-nexus-replug -- install` and then the sudo command it \
+             prints (§15.55).",
+            json,
+        );
+    }
+    match grant_ports(&ports) {
+        Ok(granted) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"granted": granted, "uid": caps::real_uid()})
+                );
+            } else if granted.is_empty() {
+                println!("no tty nodes to grant (the ports own none right now)");
+            } else {
+                println!(
+                    "granted uid {} rw on {}",
+                    caps::real_uid(),
+                    granted.join(", ")
+                );
+            }
+            exit::READY
+        }
+        Err(e) => refuse(&e, json),
+    }
+}
+
 fn authorize(name: &str, json: bool, held: CapState) -> i32 {
     let port = match open_port(name) {
         Ok(p) => p,
@@ -447,13 +577,31 @@ fn authorize(name: &str, json: bool, held: CapState) -> i32 {
     }
     match sysfs::set_authorized(&port, true) {
         Ok(()) => {
+            // The reauthorization is what *destroyed* the caller's access: the node
+            // it brings back is a new inode, `root:dialout 0660`, and any ACL on the
+            // old one went with it. Restoring that access is part of putting the
+            // device back, not a separate favour, so it happens here rather than
+            // being left as a step every caller must remember (§15.55).
+            let granted = match grant_after_reauthorize(std::slice::from_ref(&port), json) {
+                Ok(g) => g,
+                Err(code) => return code,
+            };
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"port": port.name(), "authorized": true})
+                    serde_json::json!({
+                        "port": port.name(), "authorized": true, "granted": granted
+                    })
                 );
             } else {
                 println!("port {port} reauthorized");
+                if !granted.is_empty() {
+                    println!(
+                        "granted uid {} rw on {}",
+                        caps::real_uid(),
+                        granted.join(", ")
+                    );
+                }
             }
             exit::READY
         }
@@ -591,6 +739,18 @@ fn cycle(names: &[String], hold_ms: u64, dry_run: bool, json: bool, held: CapSta
         }
     }
 
+    // Every tty is back by here (the wait loop above refuses otherwise), so this is
+    // the moment the caller's access can be restored — and it must be, because the
+    // node the cycle brought back is a new inode that inherited nothing (§15.55).
+    let granted = if dry_run {
+        Vec::new()
+    } else {
+        match grant_after_reauthorize(&ports, json) {
+            Ok(g) => g,
+            Err(code) => return code,
+        }
+    };
+
     let after: Vec<serde_json::Value> = ports.iter().map(port_facts).collect();
     let report = serde_json::json!({
         "dry_run": dry_run,
@@ -600,6 +760,7 @@ fn cycle(names: &[String], hold_ms: u64, dry_run: bool, json: bool, held: CapSta
         "before": before,
         "after": after,
         "waits": waits,
+        "granted": granted,
     });
     if json {
         println!("{report}");
@@ -707,6 +868,24 @@ fn hold_until_eof(names: &[String], max_ms: u64, dry_run: bool, held: CapState) 
             }
         }
     }
+    // The device is back; the node it came back on is new and inaccessible. Wait
+    // briefly for the tty, then restore the caller's access to it (§15.55). Bounded
+    // and non-fatal: `hold`'s contract is that the caller owns the timing, so a tty
+    // that has not appeared yet is reported as nothing granted rather than as a
+    // failure of the hold.
+    let mut granted = Vec::new();
+    if !dry_run && failures.is_empty() {
+        let began = Instant::now();
+        while began.elapsed() < REENUMERATION_DEADLINE
+            && ports.iter().any(|p| sysfs::ttys(p).is_empty())
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        match grant_after_reauthorize(&ports, true) {
+            Ok(g) => granted = g,
+            Err(code) => return code,
+        }
+    }
     println!(
         "{}",
         serde_json::json!({
@@ -714,6 +893,7 @@ fn hold_until_eof(names: &[String], max_ms: u64, dry_run: bool, held: CapState) 
             "held_ms": down_at.elapsed().as_millis() as u64,
             "released_by": released_by,
             "reauthorize_failures": failures,
+            "granted": granted,
         })
     );
     let _ = std::io::stdout().flush();
@@ -724,7 +904,21 @@ fn hold_until_eof(names: &[String], max_ms: u64, dry_run: bool, held: CapState) 
     }
 }
 
-fn install_verb(profile: &str, verify: bool, held: CapState) -> i32 {
+fn install_verb(profile: &str, verify: bool, print_setcap: bool, held: CapState) -> i32 {
+    // Printing the command is a pure string derivation — no copy, no capability, no
+    // spawn — so it is answered before the blessed-copy refusal below, which exists
+    // to keep `Command::new` away from a process holding capabilities.
+    if print_setcap {
+        let root = match repo_root() {
+            Ok(r) => r,
+            Err(e) => return refuse(&e, false),
+        };
+        println!(
+            "{}",
+            install::setcap_command(&install::blessed_path(&root, profile))
+        );
+        return exit::READY;
+    }
     // A blessed process must never spawn anything, and `install` shells out to
     // `getcap`. Refusing here is what keeps `CAP_DAC_OVERRIDE` and `Command::new`
     // from ever being live in the same process.

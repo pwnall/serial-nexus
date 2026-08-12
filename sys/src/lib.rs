@@ -892,6 +892,151 @@ pub fn pending_output_bytes(_fd: RawFd) -> nix::Result<usize> {
     Err(nix::errno::Errno::ENOTSUP)
 }
 
+// ---------------------------------------------------------------------------
+// POSIX ACL: granting one user read/write on a device node (§15.55)
+// ---------------------------------------------------------------------------
+
+/// POSIX ACL entry tags (`linux/posix_acl_xattr.h`), in the order the kernel
+/// requires them to appear.
+const ACL_USER_OBJ: u16 = 0x01;
+const ACL_USER: u16 = 0x02;
+const ACL_GROUP_OBJ: u16 = 0x04;
+const ACL_MASK: u16 = 0x10;
+const ACL_OTHER: u16 = 0x20;
+/// The id field of an entry that does not name one.
+const ACL_UNDEFINED_ID: u32 = 0xffff_ffff;
+/// `POSIX_ACL_XATTR_VERSION`.
+const ACL_XATTR_VERSION: u32 = 2;
+
+/// Encode the minimal POSIX access ACL for `mode` **plus** `u:<uid>:rw-`.
+///
+/// Pure, so the wire format is unit-testable without a privileged syscall — which
+/// matters because getting it wrong is silent: the kernel rejects a malformed blob
+/// with `EINVAL`, but a *well-formed* blob with the wrong permission bits would be
+/// applied exactly as written.
+///
+/// The base entries are derived from the file's own mode rather than assumed, so
+/// this never widens `other` — a node the operator has locked down stays locked
+/// down apart from the one entry being added. The mask is the union of the named
+/// entry and the group-object bits, which is what `setfacl -m u:<uid>:rw` computes.
+///
+/// **Idempotent by construction.** Once an ACL exists, a file's group bits *are*
+/// its mask, so re-deriving from the mode on a second application yields the same
+/// blob rather than drifting wider each time.
+fn encode_posix_acl_rw(mode: u32, uid: u32) -> Vec<u8> {
+    const RW: u16 = 6;
+    let user_obj = ((mode >> 6) & 7) as u16;
+    let group_obj = ((mode >> 3) & 7) as u16;
+    let other = (mode & 7) as u16;
+    let mask = group_obj | RW;
+
+    let mut out = Vec::with_capacity(4 + 5 * 8);
+    out.extend_from_slice(&ACL_XATTR_VERSION.to_le_bytes());
+    for (tag, perm, id) in [
+        (ACL_USER_OBJ, user_obj, ACL_UNDEFINED_ID),
+        (ACL_USER, RW, uid),
+        (ACL_GROUP_OBJ, group_obj, ACL_UNDEFINED_ID),
+        (ACL_MASK, mask, ACL_UNDEFINED_ID),
+        (ACL_OTHER, other, ACL_UNDEFINED_ID),
+    ] {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&perm.to_le_bytes());
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+    out
+}
+
+/// Add `u:<uid>:rw-` to the POSIX access ACL of the **character device** at `path`.
+///
+/// The equivalent of `setfacl -m u:<uid>:rw <path>`, and the reason the replug
+/// helper carries `CAP_FOWNER` (§15.55). Used to hand a test lane access to a tty a
+/// USB re-enumeration has just recreated: udev builds the fresh node `root:dialout
+/// 0660`, so any grant made before the cycle is gone with the inode that carried it.
+///
+/// # Two hazards, both closed here rather than in the caller
+///
+/// **The node is never opened.** Opening a serial port asserts DTR and can reset the
+/// board behind it — the reason `serial-nexus-doctor` is passive until a port is
+/// named (§15.17) — so a privileged helper must not open one merely to label it.
+/// The reference is taken with `O_PATH`, which resolves the inode *without* calling
+/// the driver's open at all, and the `setxattr` is aimed at it through
+/// `/proc/self/fd/<n>`, the standard way to operate on an `O_PATH` reference.
+///
+/// **The path cannot be swapped underneath.** `O_NOFOLLOW` refuses a symlink
+/// outright, and the type check runs on the **fd**, not on the name — so the thing
+/// verified and the thing modified are the same inode, and there is no window
+/// between them. A plain `lstat`-then-`setxattr(path)` would have one, and on a
+/// binary holding `CAP_FOWNER` that window is the whole attack.
+///
+/// Refuses anything that is not a character device, because that is the only shape
+/// this exists to grant and a capability-carrying binary should decline everything
+/// it was not built for.
+pub fn grant_user_rw(path: &std::path::Path, uid: u32) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("device path contains a NUL byte"))?;
+    // Safety: `c_path` is a valid NUL-terminated string for the duration of the
+    // call. O_PATH|O_NOFOLLOW resolves the inode without opening the driver and
+    // without following a final symlink.
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Closed on every path below.
+    let guard = OwnedPathFd(fd);
+
+    // Safety: `st` is written by the kernel; `fd` is a valid O_PATH descriptor, on
+    // which `fstat` is explicitly permitted.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(guard.0, &mut st) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFCHR {
+        return Err(std::io::Error::other(format!(
+            "{} is not a character device (mode {:#o}) — this grant exists for tty \
+             nodes and refuses everything else",
+            path.display(),
+            st.st_mode
+        )));
+    }
+
+    let acl = encode_posix_acl_rw(st.st_mode & 0o7777, uid);
+    let proc_path = std::ffi::CString::new(format!("/proc/self/fd/{}", guard.0))
+        .expect("a decimal fd number contains no NUL");
+    let name = c"system.posix_acl_access";
+    // Safety: `proc_path` and `name` are valid NUL-terminated strings; `acl` is
+    // valid for reads of its own length, which is what is passed.
+    let rc = unsafe {
+        libc::setxattr(
+            proc_path.as_ptr(),
+            name.as_ptr(),
+            acl.as_ptr().cast(),
+            acl.len(),
+            0,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Closes a raw fd on drop, so every early return above releases it.
+struct OwnedPathFd(RawFd);
+impl Drop for OwnedPathFd {
+    fn drop(&mut self) {
+        // Safety: we own this descriptor and close it exactly once.
+        unsafe { libc::close(self.0) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1252,6 +1397,109 @@ mod tests {
             0,
             "set_cloexec left FD_CLOEXEC clear; every exec-codec child would still \
              inherit the fd (§7.2, §7.6)"
+        );
+    }
+
+    /// The ACL blob is checked field by field, because the failure mode it guards is
+    /// **silent**: a malformed blob is refused with `EINVAL` and noticed, while a
+    /// well-formed one carrying the wrong permission bits is applied exactly as
+    /// written and grants whatever it says (§15.55).
+    #[test]
+    fn the_acl_blob_grants_the_named_user_and_nothing_else() {
+        // A udev-fresh tty node: root:dialout 0660.
+        let blob = encode_posix_acl_rw(0o660, 1000);
+        assert_eq!(blob.len(), 4 + 5 * 8, "version word plus five entries");
+        assert_eq!(&blob[0..4], &2u32.to_le_bytes(), "POSIX_ACL_XATTR_VERSION");
+
+        let entry = |i: usize| -> (u16, u16, u32) {
+            let b = &blob[4 + i * 8..4 + i * 8 + 8];
+            (
+                u16::from_le_bytes([b[0], b[1]]),
+                u16::from_le_bytes([b[2], b[3]]),
+                u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            )
+        };
+        // Tag order is not cosmetic: the kernel requires ascending tags.
+        assert_eq!(entry(0), (ACL_USER_OBJ, 6, ACL_UNDEFINED_ID));
+        assert_eq!(entry(1), (ACL_USER, 6, 1000), "the one granted user, rw");
+        assert_eq!(entry(2), (ACL_GROUP_OBJ, 6, ACL_UNDEFINED_ID));
+        assert_eq!(entry(3), (ACL_MASK, 6, ACL_UNDEFINED_ID));
+        assert_eq!(
+            entry(4),
+            (ACL_OTHER, 0, ACL_UNDEFINED_ID),
+            "`other` must stay exactly what the mode said — a grant that opened a \
+             device node to the world would be the whole of this feature's risk"
+        );
+    }
+
+    /// The base entries come from the file's own mode, so a node the operator has
+    /// locked down further is not quietly widened back to the common case.
+    #[test]
+    fn the_acl_blob_never_widens_the_mode_it_found() {
+        // 0600: owner rw, group nothing, other nothing.
+        let blob = encode_posix_acl_rw(0o600, 4242);
+        let entry = |i: usize| -> (u16, u16, u32) {
+            let b = &blob[4 + i * 8..4 + i * 8 + 8];
+            (
+                u16::from_le_bytes([b[0], b[1]]),
+                u16::from_le_bytes([b[2], b[3]]),
+                u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            )
+        };
+        assert_eq!(
+            entry(2),
+            (ACL_GROUP_OBJ, 0, ACL_UNDEFINED_ID),
+            "group stays 0"
+        );
+        assert_eq!(entry(4), (ACL_OTHER, 0, ACL_UNDEFINED_ID), "other stays 0");
+        // The mask must still admit the named entry, or the grant would be inert.
+        assert_eq!(entry(3), (ACL_MASK, 6, ACL_UNDEFINED_ID));
+        assert_eq!(entry(1), (ACL_USER, 6, 4242));
+    }
+
+    /// Re-applying must not drift: once an ACL exists the group bits *are* the mask,
+    /// so the second derivation has to reproduce the first.
+    #[test]
+    fn the_acl_blob_is_idempotent_under_reapplication() {
+        let first = encode_posix_acl_rw(0o660, 1000);
+        // After the first application the node reads 0660 still (mask 6 in the group
+        // bits); a second pass must produce the identical blob.
+        let second = encode_posix_acl_rw(0o660, 1000);
+        assert_eq!(first, second);
+    }
+
+    /// It refuses anything that is not a character device — proved against a regular
+    /// file, which is the shape a swapped path would most likely have.
+    #[test]
+    fn granting_on_a_regular_file_is_refused() {
+        let tmp = std::env::temp_dir().join(format!("snx-acl-{}", std::process::id()));
+        std::fs::write(&tmp, b"not a tty").expect("write the fixture");
+        let err = grant_user_rw(&tmp, 1000).expect_err("a regular file must be refused");
+        assert!(
+            err.to_string().contains("not a character device"),
+            "the refusal must say what it refused and why: {err}"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod acl_kernel_probe {
+    /// The kernel's own opinion of the blob, without privilege: `/dev/null` is a
+    /// character device this process does not own, so a **well-formed** ACL is
+    /// refused `EPERM` (missing `CAP_FOWNER`) while a malformed one is refused
+    /// `EINVAL`. Distinguishing those two is the only unprivileged way to prove the
+    /// wire format is right, and it is worth proving: an `EINVAL` here would mean
+    /// the blessed binary's grant silently never worked.
+    #[test]
+    fn the_blob_is_well_formed_enough_for_the_kernel_to_reach_the_permission_check() {
+        let err = super::grant_user_rw(std::path::Path::new("/dev/null"), 1000)
+            .expect_err("an unprivileged process cannot set an ACL on a root-owned node");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EPERM),
+            "expected EPERM (well-formed, unprivileged); EINVAL would mean the ACL \
+             encoding itself is wrong and the grant would never work even blessed: {err}"
         );
     }
 }

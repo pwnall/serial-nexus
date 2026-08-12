@@ -20,6 +20,33 @@
 /// the capability itself (§15.45).
 pub const CAP_DAC_OVERRIDE: u32 = 1;
 
+/// Bit number of `CAP_FOWNER` in the capability bitmasks (`linux/capability.h`).
+///
+/// The second capability the replug helper carries, and the *only* reason it does:
+/// setting a POSIX ACL on a file you do not own requires it. The tty nodes a USB
+/// serial adapter produces are `root:dialout`, so granting the invoking user access
+/// to one is a `setxattr` the kernel refuses without this bit (§15.55).
+///
+/// It is not `CAP_CHOWN` deliberately. Chown would also solve the problem and is a
+/// strictly larger grant: it lets a process *give files away* as well as take them,
+/// and it would destroy the node's original ownership rather than adding one entry
+/// beside it. `CAP_FOWNER` plus an ACL leaves the node reading `root:dialout 0660`
+/// with one extra `user:<uid>:rw-` line that `getfacl` shows and `setfacl -b`
+/// removes.
+pub const CAP_FOWNER: u32 = 3;
+
+/// The **real** uid of the invoking user.
+///
+/// The helper is `setcap`'d, never `setuid`, so it runs as whoever launched it and
+/// this is that user. It exists so the grant verb can name its beneficiary from the
+/// kernel rather than from argv: a `--uid` flag on a capability-carrying binary
+/// would let any caller hand privilege to any account, which is the one thing the
+/// argv-only bound (§15.45) is for.
+pub fn real_uid() -> u32 {
+    // Safety: `getuid` takes no arguments, reads no memory, and cannot fail.
+    unsafe { libc::getuid() }
+}
+
 /// Whether a capability sits in this process's permitted and effective sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapState {

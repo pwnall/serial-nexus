@@ -84,20 +84,34 @@ pub fn getcap_field(line: &str) -> Option<&str> {
     field.contains('=').then_some(field)
 }
 
-/// Whether a capability field grants `cap_dac_override` *effectively*.
+/// The capabilities a blessed copy must carry, and why each is there.
+///
+/// `cap_dac_override` writes `authorized` in sysfs (`root:root 0644`);
+/// `cap_fowner` sets a POSIX ACL on a tty node the invoking user does not own
+/// (§15.55). Both are required: a copy holding only the first can replug but
+/// cannot hand back access to the node it just recreated, which is the shape the
+/// rig lane failed on.
+pub const REQUIRED_CAPS: &[&str] = &["cap_dac_override", "cap_fowner"];
+
+/// Whether a capability field grants **every** capability in [`REQUIRED_CAPS`]
+/// *effectively*.
 ///
 /// `+p`/`=p` without `e` is permitted-but-not-raised: the helper would still fail
-/// the write. Both must be present.
-pub fn field_grants_dac_override(field: &str) -> bool {
+/// the write. Both flags must be present, and every required name must appear —
+/// checked per name rather than by string equality, because libcap is free to
+/// print them in any order and to add ones we did not ask for.
+pub fn field_grants_required_caps(field: &str) -> bool {
     let Some((names, flags)) = field.rsplit_once('=') else {
         return false;
     };
     // libcap prints either `cap_dac_override=ep` or, with several caps,
-    // `cap_dac_override,cap_net_admin=ep`; `=` may also be `+`-prefixed per-cap.
-    let named = names
+    // `cap_dac_override,cap_fowner=ep`; `=` may also be `+`-prefixed per-cap.
+    let present: Vec<&str> = names
         .split(',')
-        .any(|n| n.trim_start_matches('+') == "cap_dac_override");
-    named && flags.contains('e') && flags.contains('p')
+        .map(|n| n.trim_start_matches('+'))
+        .collect();
+    let all_named = REQUIRED_CAPS.iter().all(|want| present.contains(want));
+    all_named && flags.contains('e') && flags.contains('p')
 }
 
 /// Ask `getcap` what the file carries. `Ok(None)` when it carries nothing.
@@ -133,7 +147,7 @@ pub fn inspect(repo_root: &Path, profile: &str) -> io::Result<InstallState> {
         return Ok(InstallState::WrongMode(mode));
     }
     match read_caps(&blessed)? {
-        Some(field) if field_grants_dac_override(&field) => Ok(InstallState::Ready),
+        Some(field) if field_grants_required_caps(&field) => Ok(InstallState::Ready),
         Some(field) => Ok(InstallState::Unblessed(field)),
         None => Ok(InstallState::Unblessed("(none)".to_owned())),
     }
@@ -172,8 +186,16 @@ pub fn install(repo_root: &Path, profile: &str) -> io::Result<PathBuf> {
 }
 
 /// The one command an operator must run as root, spelled exactly.
+///
+/// Derived from [`REQUIRED_CAPS`] rather than typed, so the string an operator is
+/// told to run and the string `--verify` checks for can never disagree — the
+/// hand-kept-list drift this repository keeps finding (AGENTS §3).
 pub fn setcap_command(blessed: &Path) -> String {
-    format!("sudo setcap cap_dac_override+ep {}", blessed.display())
+    format!(
+        "sudo setcap {}+ep {}",
+        REQUIRED_CAPS.join(","),
+        blessed.display()
+    )
 }
 
 #[cfg(test)]
@@ -189,7 +211,7 @@ mod tests {
         let field = getcap_field(line).expect("a caps field is present");
         assert_eq!(field, "cap_dac_override=p");
         assert!(
-            !field_grants_dac_override(field),
+            !field_grants_required_caps(field),
             "a +p-only binary must not read as blessed"
         );
         // The naive test this exists to prevent would have passed:
@@ -203,14 +225,14 @@ mod tests {
     #[test]
     fn an_effective_dac_override_is_recognised_in_each_spelling() {
         for line in [
-            "/x/serial-nexus-replug cap_dac_override=ep",
-            "/x/serial-nexus-replug cap_dac_override=pe",
-            "/x/serial-nexus-replug cap_dac_override,cap_net_admin=ep",
-            "/x/serial-nexus-replug cap_net_admin,cap_dac_override=ep\n",
+            "/x/serial-nexus-replug cap_dac_override,cap_fowner=ep",
+            "/x/serial-nexus-replug cap_fowner,cap_dac_override=pe",
+            "/x/serial-nexus-replug cap_dac_override,cap_fowner,cap_net_admin=ep",
+            "/x/serial-nexus-replug cap_net_admin,cap_fowner,cap_dac_override=ep\n",
         ] {
             let field = getcap_field(line).unwrap_or_else(|| panic!("field in {line:?}"));
             assert!(
-                field_grants_dac_override(field),
+                field_grants_required_caps(field),
                 "{line:?} should read as blessed"
             );
         }
@@ -220,12 +242,21 @@ mod tests {
     #[test]
     fn other_capabilities_and_empty_output_do_not_read_as_blessed() {
         let f = getcap_field("/x/y cap_net_raw=ep").expect("field");
-        assert!(!field_grants_dac_override(f));
+        assert!(!field_grants_required_caps(f));
         assert_eq!(getcap_field(""), None);
         assert_eq!(getcap_field("/x/y-with-no-caps\n"), None);
         // A path with a space is why the field is taken from the right, not the left.
-        let f = getcap_field("/x/my dir/serial-nexus-replug cap_dac_override=ep").expect("field");
-        assert!(field_grants_dac_override(f));
+        let f = getcap_field("/x/my dir/serial-nexus-replug cap_dac_override,cap_fowner=ep")
+            .expect("field");
+        assert!(field_grants_required_caps(f));
+        // **Half the set is not the set.** A copy blessed before `cap_fowner` joined
+        // the requirement replugs fine and then cannot grant, which is precisely the
+        // failure §15.55 exists to remove — so it must not read as blessed.
+        let half = getcap_field("/x/y cap_dac_override=ep").expect("field");
+        assert!(
+            !field_grants_required_caps(half),
+            "cap_dac_override alone must not read as blessed once cap_fowner is required"
+        );
     }
 
     /// A missing install is `Absent`, not an error — the preflight distinguishes
@@ -281,7 +312,11 @@ mod tests {
             .mode()
             & 0o7777;
         assert_eq!(mode, BLESSED_MODE, "installed copy must be owner-only");
-        assert!(setcap_command(&blessed).starts_with("sudo setcap cap_dac_override+ep "));
+        assert!(
+            setcap_command(&blessed).starts_with("sudo setcap cap_dac_override,cap_fowner+ep "),
+            "the printed command must ask for exactly REQUIRED_CAPS: {}",
+            setcap_command(&blessed)
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

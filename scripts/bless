@@ -119,7 +119,29 @@ for profile in "${profiles[@]}"; do
       ;;
   esac
 
-  if ! run_privileged /usr/sbin/setcap cap_dac_override+ep "$blessed"; then
+  # **Show it, then run it.** The command was previously printed only when there
+  # was no way to prompt for root — so on a box where sudo *could* prompt, the one
+  # privileged step this script takes happened without ever being displayed. An
+  # operator should see the exact capability grant they are being asked to approve
+  # before the password prompt, not instead of it (notes §3.79).
+  #
+  # The capability list comes from the binary (`install` prints the command it will
+  # verify against), so the string shown, the string run, and the string `--verify`
+  # checks can never drift apart.
+  setcap_cmd=$("$built" install --profile "$profile" --print-setcap 2>/dev/null || true)
+  if [ -z "$setcap_cmd" ]; then
+    echo "bless: ${profile}: could not read the setcap command from the helper" >&2
+    rc=1
+    continue
+  fi
+  echo "bless: ${profile}: granting the capability it needs, as root:"
+  echo "    $setcap_cmd"
+  # `$setcap_cmd` is `sudo setcap <caps>+ep <path>`; run_privileged supplies the
+  # privilege itself, so strip the leading `sudo` and pass the rest as arguments.
+  # shellcheck disable=SC2086
+  set -- $setcap_cmd
+  shift # drop `sudo`
+  if ! run_privileged "$@"; then
     rc=1
     continue
   fi

@@ -10191,3 +10191,200 @@ a gate skipped because the step ahead of it was red (§3.77), and now a grep who
 captured before it can be grepped. All three read as gates, all three asserted nothing, and none of
 them was wrong about anything — they were silent about everything. The tell they share: **a check
 whose passing output is identical to its not-running output.**
+
+---
+
+### 3.79 The blessed helper grants device access, at the repository owner's request
+
+**Requested by the repository owner**, in these words: *"please design and implement an
+extension of the blessed binary so that it also grant ownership to any USB /dev nodes needed
+by tests… effectively enough capabilities to be able to do the equivalent of
+`setfacl -m u:pwnall:rw` in Rust"*, together with *"have the bless script show and then run
+the command, as opposed to just showing it"*. Recorded as a request rather than as a finding
+because it is a deliberate widening of a privilege boundary, and the record should say who
+asked for it. **Design:** §15.55 (new, amend-first per AGENTS §5 — AGENTS §4 makes this exact
+change a design amendment rather than a patch).
+
+**The problem it solves, measured the hard way.** The 2026-08-12 rig lane produced nine
+failures. Eight had a single cause — `Permission denied (os error 13)` on reopen, six on
+`/dev/ttyUSB0` and two on the `usb:` identity — and the cause was not the product. Device
+access had been granted with `setfacl` on the device nodes, and the replug tests
+**re-enumerate** the adapters: udev destroys the inode and builds a fresh one,
+`root:dialout 0660`, so every grant made before a cycle is gone with the inode that carried
+it. A lane that starts with access loses it half way through, and it surfaces seconds later
+as a faulted node with nothing pointing at the cause. The ninth failure was `p3_idle_cost`
+(plan §18 item 46), unrelated.
+
+**Why the helper is the right home.** The re-enumeration is what destroys the access, the
+helper is what performs the re-enumeration, and it is already the one blessed binary in the
+tree. Anything else — a wrapper, a udev rule, a second privileged tool — either duplicates the
+privilege or leaves a window in which the node exists and cannot be opened.
+
+**What was built.** `grant --port <PORT>`, plus an automatic grant after every successful
+reauthorization in `authorize`, `cycle` and `hold`, because restoring the access the
+reauthorization destroyed is part of putting the device back rather than a step every caller
+must remember. §15.55 states the bounds in full; the ones that were actually at risk:
+
+* argv still carries a **port name**, validated by the same alphabet and the same four sysfs
+  checks; the device nodes are derived by the helper from the kernel's view of that port, so
+  **no caller-supplied path reaches `open`** — the bound AGENTS §4 warns a path-taking verb
+  dissolves;
+* the beneficiary is **`getuid()`**, never argv. There is no `--uid`, because a
+  capability-carrying binary that takes one can hand privilege to any account;
+* the node is **never opened** — `O_PATH` resolves the inode without calling the driver's
+  open, so no DTR is asserted on the operator's equipment (§15.17), and the `setxattr` goes
+  through `/proc/self/fd/<n>`;
+* the inode **verified** is the inode **modified**: `O_NOFOLLOW` refuses a symlink and the
+  character-device check runs on the fd, so there is no check-to-use window on a name.
+
+**The cost, and the choice behind it.** A second capability: setting an ACL on a file you do
+not own needs `CAP_FOWNER`, so the blessing is now `cap_dac_override,cap_fowner+ep`. An ACL
+rather than `chown` deliberately — `CAP_CHOWN` is a strictly larger grant (it lets a process
+give files away, not only take them), and chown would destroy the node's original ownership,
+where the ACL leaves it reading `root:dialout 0660` with one extra `user:<uid>:rw-` line that
+`getfacl` shows and `setfacl -b` removes.
+
+**Proving the wire format without privilege.** The ACL blob is hand-encoded
+(`system.posix_acl_access`, version 2, five entries in ascending tag order), and getting it
+wrong is *silent* in the dangerous direction: a malformed blob is refused `EINVAL` and
+noticed, but a well-formed blob carrying the wrong permission bits is applied exactly as
+written. So it is checked twice. Four unit tests pin the encoding field by field — including
+that `other` stays exactly what the mode said, which is where a mistake would open a device
+node to the world, and that re-deriving from an already-ACL'd mode is idempotent rather than
+widening a little on each pass. And one test asks the **kernel**: `grant_user_rw` on
+`/dev/null` from an unprivileged process returns **`EPERM`, not `EINVAL`** — the blob was well
+formed and only the capability was missing. That is the whole unprivileged proof available,
+and it is worth having, because the alternative was discovering the format was wrong only on
+a blessed box.
+
+**`scripts/bless` shows the command, then runs it.** It already ran it; what it did not do
+was *display* it. `run_privileged` printed the command only on the fallback path where there
+was no terminal to prompt on — so on a box where sudo could prompt, the one privileged step
+the script takes happened without ever being shown. An operator should see the exact
+capability grant they are approving before the password prompt, not instead of it. The string
+is now read from the helper itself (`install --print-setcap`), so the command shown, the
+command run, and the set `--verify` checks against all derive from `REQUIRED_CAPS` and cannot
+drift — the hand-kept-list shape §3.78 and plan §18 item 40 keep finding.
+
+**Not renamed.** The owner allowed that the binary "might need to be renamed". It is still
+`serial-nexus-replug`, because the new verb is not a second purpose: a re-enumeration is what
+makes a node inaccessible, and handing the access back is that operation finishing. A rename
+would also move a name the frozen reviews, the committed `docs/doctor/` artifacts and the
+§15.40 retired-name gate all carry, for a verb that stays inside the replug story. Recorded
+as a decision so it is not read as an oversight — if the helper ever grows a grant unrelated
+to replugging, that is the moment the name stops fitting.
+
+**Two residuals.** The grant does not survive the *next* re-enumeration either — nothing
+placed on an inode does — so it is re-applied per cycle by construction; the durable answers
+are still group membership or a udev rule, and this exists for the case where neither is
+available without a re-login. And a copy blessed before `cap_fowner` joined the set replugs
+exactly as before and *skips* the grant with a note rather than failing, because a capability
+that arrived later must not turn every previously-working `cycle` red.
+
+**Then the owner asked for the other half**, in these words: *"I'd you to use the new
+capability to get permissions for USB nodes at the beginning of the test as well. I'd rather
+not have to remember group changes + reboot when I move the project to a different system."*
+`ensure_rig_access()` runs once per test binary, resolves the four variables that already
+name the rig — `SNX_CROSSOVER_A`/`_B`, `SNX_REPLUG_DEV`/`_DEV_B` — to their USB ports,
+deduplicates (two by-id links and two tty paths routinely name the same two adapters), and
+calls `grant`. It is wired into the two funnels every hardware test passes through:
+`crossover_ports()`, and `rig()` in `p7_replug_hardware.rs` — the replug tests need it
+*before* their first cycle, since the node they open at the start is one no replug has
+touched and nothing has re-granted. It grants only for ports the environment named, because
+naming a port is the operator's statement that it is wired to a rig and not to live
+equipment (§15.17), and failure reports rather than panics: without a blessing there is
+nothing to do and each test then fails or skips with its own, more specific message.
+
+**Measured, both arms.** Unblessed, the harness prints
+`rig access: not granting device access — … is installed but not blessed` and the tests
+proceed to their own diagnoses. Blessed, it prints
+`rig access: granted on ports 3-2.4, 3-2.3 — {"granted":["/dev/ttyUSB0","/dev/ttyUSB1"],"uid":1000}`
+— twice in a full run, once per test binary that asked for hardware, which is the
+once-per-process guard behaving as designed rather than a repeat.
+
+**The verb, measured on the bench.** From an unprivileged shell with the blessed copy:
+`grant --port 3-2.3 --port 3-2.4 --json` → `{"granted":["/dev/ttyUSB1","/dev/ttyUSB0"],"uid":1000}`,
+after which `getfacl /dev/ttyUSB0` reads `user::rw- / user:pwnall:rw- / group::rw- / mask::rw-
+/ other::---` and `ls` reads `crw-rw----+ 1 root dialout`. Ownership unchanged, `other`
+unchanged — the property the unit tests pin, and the one where a mistake would have opened a
+device node to everyone.
+
+---
+
+### 3.80 The rig lane, green — and the bench is 3-wire where the record says 5
+
+The first rig lane in this record that goes green, and the first that could: it needed
+`SNX_REPLUG_DEV_B` in the documented spelling (§3.75 B3, fixed the same day) and device access
+that survives a re-enumeration (§3.79). Before both, it could not have passed on any box.
+
+**The figure, with its scope.** **894 passing · 1 failed · 6 ignored**, four self-skips, on the
+crossover box 2026-08-12. Scope is the rig lane **minus two required modes**, and both
+exclusions are measurements rather than conveniences:
+
+* `SNX_WEB_UI=required` is not set because this box has no `node` — the browser gate would
+  hard-fail on an absent interpreter, which says nothing about the product;
+* `SNX_RIG_FLOW=required` is not set because **this bench measures 3-wire**, and §15.52 makes
+  that a legitimate answer rather than a fault ("a rig that answers no is legitimate").
+
+The one failure is `p3_idle_cost` — plan §18 item 46, unrelated to the rig and reproduced
+here at the same load sensitivity that item records. Every hardware test passed, including
+`identity_survives_a_replug_that_renumbers_the_tty`, which had never executed: it is the test
+`SNX_REPLUG_DEV_B` gates, and its first run performed the swap and observed the renumbering
+(ABSCDGL6 moved ttyUSB0 → ttyUSB1).
+
+**The wiring changed under the record, and two independent instruments say so.** §15.52 and
+notes §3.53(i) record this same adapter pair as:
+
+```
+5-wire crossover: RTS/CTS both ways, DTR moves nothing
+[rts_a_to_cts_b=true rts_b_to_cts_a=true …]
+```
+
+Today, same two adapters, same probe, same `probe_set` era `e79f5fcd86a2e5f0`:
+
+```
+3-wire: no handshake lines carried
+[rts_a_to_cts_b=false rts_b_to_cts_a=false …]
+```
+
+**Why this is not one instrument's opinion.** P5 drives the lines port-to-port with no daemon
+in the path; the harness drives RTS through the *daemon* and reads CTS back through `state`'s
+`modem_lines`, and the code says in as many words that neither subsumes the other — "the
+doctor's arm would still pass if the daemon's state reporting were broken, and this one would
+still pass if the doctor's were". Both now ran with working device access, and both report no
+continuity. The harness's reading is the more pointed of the two because it shows the local
+line being asserted while the far one does not move:
+
+```
+port1 RTS high -> port0 {"cts":false,…,"rts":true}
+port1 RTS low  -> port0 {"cts":false,…,"rts":true}
+```
+
+`rts:true` in both polarities is the positive control the all-false reading needed: the
+driving side worked.
+
+**What is established, and what is not.** Established: on this bench, asserting RTS on either
+port does not move the far port's CTS, measured twice by instruments that share no code path,
+with the DTR arm reading false exactly as it always has. Not established: that the *cable*
+changed rather than CTS sensing failing on both adapters simultaneously. An all-false
+handshake cannot separate those two by itself, and no rung of this rig can — the discriminator
+would be a line known to cross, which is precisely what is missing. The cabling reading is the
+strongly favoured one, because the same adapters still certify (`custom_baud`, `break`,
+`icounter`, `rate_ladder` all true), still reach the identical P14 ceiling
+(`max_reliable_baud = 3000000`, `ceiling_kind = adapter-refused`, byte-for-byte with the
+committed captures at the same era), and still honour `CRTSCTS` at the driver
+(P15 `honoured_on_readback: true`, cflag delta exactly `CRTSCTS`, matching
+`linux-7.0-2026-08-07-2b44c17-tier3.json`). A common-mode sense failure that spared every one
+of those would be a strange thing. It is stated as favoured rather than proven because §7's
+rule is that a kernel — or here a bench — that differs is reported with the observation named,
+not argued into a conclusion.
+
+**One consequence to carry.** Notes §3.63's end-to-end RTS/CTS measurement — *a `none`
+transmitter delivers through a CTS stop in 25 ms; an `rts-cts` one never does* — was taken on
+the 5-wire bench. It is not refuted; its **precondition has gone away**, and it cannot be
+reproduced here until the pair is cross-wired again. §15.52's "reported, never judged" is what
+kept this from reading as a regression: the probe measured the bench it was given and moved no
+verdict, and the two end-to-end tests skipped with the measurement printed instead of failing.
+Plan §18 item 28's DTR work is unaffected and still wants a rig with DTR wired; item 17's
+break/parity checklist now wants a bench re-inspection too, since it was filed against a rig
+proven 5-wire.

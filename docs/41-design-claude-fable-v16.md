@@ -3890,6 +3890,67 @@ exception having no row in §5's own loss taxonomy either. A reader checking the
 would have found four counters moving on a healthy graph and no class to file them under. Nothing
 in the tree moved; the design is what was wrong (notes §3.75).
 
+### 15.55 The replug helper grants device access, and keeps the bound that made it safe
+
+**Status:** LIVE — amends §15.45, which AGENTS §4 makes a tripwire: *"its device argument
+is a kernel-verified sysfs USB port name, never a path. Giving it a verb that accepts a
+filesystem path dissolves every one of those bounds at once and is a design amendment, not
+a patch."* This is that amendment, and it is written to keep the bound rather than spend it.
+**Requested by the repository owner** after the 2026-08-12 rig session (notes §3.79).
+
+**The problem, measured.** A USB re-enumeration destroys the device node. udev builds a
+fresh one, `root:dialout 0660`, and every grant made against the old inode — an ACL, a
+chown, anything — went with it. So a rig lane that begins with device access loses it the
+moment the replug tests run: the 2026-08-12 lane produced eight failures with one cause,
+`reopen /dev/ttyUSB0: Permission denied (os error 13)`, six on the tty path and two on the
+`usb:` identity. The helper that *caused* the re-enumeration is the only thing in the tree
+positioned to undo its side effect.
+
+**The verb.** `grant --port <PORT>` adds `u:<uid>:rw-` to the POSIX access ACL of every tty
+the named port owns, and `authorize`, `cycle` and `hold` do it automatically after a
+successful reauthorization — because restoring the access the reauthorization destroyed is
+part of putting the device back, not a separate favour a caller must remember.
+
+**What is kept, and it is the whole point:**
+
+- **argv still carries a port name, never a path.** The same `validate_port_name` alphabet
+  (digits, `-`, `.`, bounded length and depth) and the same four sysfs checks run first. The
+  device nodes are then derived *by the helper* from the kernel's own view of that port, so
+  no caller-supplied path reaches `open`.
+- **The beneficiary is `getuid()`, never argv.** A `--uid` flag on a capability-carrying
+  binary would let any caller hand privilege to any account. There is no such flag; the
+  helper can only ever grant to whoever ran it.
+- **The node is never opened.** Opening a serial port asserts DTR and can reset the board
+  behind it (§15.17), so the reference is taken with `O_PATH` — which resolves the inode
+  without calling the driver's open — and the `setxattr` is aimed through
+  `/proc/self/fd/<n>`.
+- **The inode verified is the inode modified.** `O_NOFOLLOW` refuses a symlink and the
+  character-device check runs on the *fd*, so there is no name-based window between check
+  and use. On a binary holding a capability, that window would be the whole attack.
+- **No `exec` while blessed**, and `PR_SET_NO_NEW_PRIVS` still established and read back.
+
+**What it costs, stated plainly.** A second capability. Setting an ACL on a file you do not
+own requires `CAP_FOWNER`, so the blessing becomes `cap_dac_override,cap_fowner+ep` and the
+blast radius grows from "write `0`/`1` to one sysfs attribute" to "…and add one ACL entry on
+a kernel-derived tty node". `REQUIRED_CAPS` is the single source for that set: the command
+`install --print-setcap` shows, the command `scripts/bless` runs, and the set `--verify`
+checks are all derived from it, so they cannot drift.
+
+**Why an ACL and not `chown`.** `CAP_CHOWN` would also solve it and is a strictly larger
+grant — it lets a process give files away as well as take them — and chown would destroy the
+node's original ownership. The ACL leaves the node reading `root:dialout 0660` with one
+extra `user:<uid>:rw-` line that `getfacl` shows and `setfacl -b` removes. It is also
+exactly what the operator would otherwise type by hand, which is the shape this replaces.
+
+**Two residuals, recorded rather than hidden.** The grant does not survive the *next*
+re-enumeration either — nothing put on an inode does — so it is re-applied per cycle by
+construction rather than being durable; the durable answer remains group membership or a
+udev rule, and this exists for the case where neither is available without a re-login. And a
+copy blessed before `cap_fowner` joined the set replugs exactly as before and *skips* the
+grant with a note, rather than failing: a capability that arrived later must not turn every
+previously-working `cycle` red.
+
+
 ## 16. Post-completion review: reliability through simplification
 
 This is the decision record of the post-completion review round: the completed system's

@@ -1275,11 +1275,109 @@ pub fn serial_echo() -> Option<SerialEcho> {
 /// platforms a physically cross-wired pair is invisible here until the operator
 /// says so. A doctor P5 reporting Tier 3 still says nothing about whether these
 /// tests ran — it certifies the rig, not this detection (§15.21).
+/// Grant this user read/write on every rig device node the environment names,
+/// **once per test binary**, using the blessed helper (§15.55).
+///
+/// # Why this exists at all
+///
+/// A grant lives on an inode, and a USB re-enumeration destroys the inode: udev
+/// builds a fresh node `root:dialout 0660`, so anything an operator arranged before
+/// the run — `setfacl`, a chown — is gone the first time a replug test cycles an
+/// adapter. That is not hypothetical; it is the whole of the 2026-08-12 rig lane's
+/// eight `Permission denied (os error 13)` failures (notes §3.79). The helper
+/// re-grants after every reauthorization it performs, which repairs the *middle* of
+/// a run; this repairs the *start* of one, so a rig box needs nothing but the single
+/// `setcap` — no group membership, no re-login, and nothing to remember when the
+/// project moves to a different machine.
+///
+/// # What it will not do
+///
+/// It grants only for ports the environment has **already named** — the same
+/// `SNX_CROSSOVER_A`/`_B` and `SNX_REPLUG_DEV`/`_DEV_B` that opt this run into
+/// touching hardware at all. Naming a port is the operator's statement that it is
+/// wired to the rig and not to live equipment (§15.17), and this adds no new way to
+/// point the suite at a device nobody named.
+///
+/// Failure is **reported, never fatal**. Without a blessed helper there is nothing
+/// to do and the tests skip or fail on their own terms with their own messages; a
+/// panic here would replace a specific diagnostic with a generic one.
+#[cfg(target_os = "linux")]
+pub fn ensure_rig_access() {
+    use std::sync::OnceLock;
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        // Every device the operator named, deduplicated by the USB port behind it —
+        // two by-id links and two tty paths routinely name the same two adapters.
+        let mut ports: Vec<String> = Vec::new();
+        for var in [
+            "SNX_CROSSOVER_A",
+            "SNX_CROSSOVER_B",
+            "SNX_REPLUG_DEV",
+            "SNX_REPLUG_DEV_B",
+        ] {
+            let Ok(path) = std::env::var(var) else {
+                continue;
+            };
+            match usb_port_of(Path::new(&path)) {
+                Some(port) if !ports.contains(&port) => ports.push(port),
+                Some(_) => {}
+                None => eprintln!(
+                    "rig access: {var}={path} resolves to no sysfs USB port; not granting for it"
+                ),
+            }
+        }
+        if ports.is_empty() {
+            return;
+        }
+        let helper = match blessed_replug_helper() {
+            Ok(h) => h,
+            Err(why) => {
+                eprintln!(
+                    "rig access: not granting device access — {why}. Tests needing these \
+                     nodes will report their own reason."
+                );
+                return;
+            }
+        };
+        let mut args: Vec<String> = vec!["grant".to_owned()];
+        for port in &ports {
+            args.push("--port".to_owned());
+            args.push(port.clone());
+        }
+        args.push("--json".to_owned());
+        match std::process::Command::new(&helper).args(&args).output() {
+            Ok(out) if out.status.success() => {
+                eprintln!(
+                    "rig access: granted on ports {} — {}",
+                    ports.join(", "),
+                    String::from_utf8_lossy(&out.stdout).trim()
+                );
+            }
+            Ok(out) => eprintln!(
+                "rig access: `grant` refused for ports {}: {}{}",
+                ports.join(", "),
+                String::from_utf8_lossy(&out.stdout).trim(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => eprintln!("rig access: running {}: {e}", helper.display()),
+        }
+    });
+}
+
+/// Non-Linux: the blessed helper is a Linux mechanism (§15.45, notes §3.66), so
+/// there is nothing to grant and nothing to say about it.
+#[cfg(not(target_os = "linux"))]
+pub fn ensure_rig_access() {}
+
 pub fn crossover_ports() -> Option<(String, String)> {
     if let (Ok(a), Ok(b)) = (
         std::env::var("SNX_CROSSOVER_A"),
         std::env::var("SNX_CROSSOVER_B"),
     ) {
+        // The one funnel every crossover test passes through, so it is where the
+        // run acquires access to the nodes it is about to open (§15.55, notes
+        // §3.79). Once per binary; a no-op without a blessed helper.
+        ensure_rig_access();
         return Some((a, b));
     }
     #[cfg(target_os = "macos")]

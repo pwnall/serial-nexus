@@ -88,6 +88,14 @@ struct Rig {
 /// quietly does nothing is the defect §3.35 exists to kill.
 fn rig() -> Result<Rig, String> {
     let helper = blessed_replug_helper()?;
+    // The replug funnel's half of the up-front grant (§15.55, notes §3.79). The
+    // crossover funnel does this in `crossover_ports`; these tests never call it, and
+    // they need access *before* the first cycle — the node they open at the start of
+    // `a_real_usb_reenumeration_heals_the_node_at_its_canonical_identity` is one no
+    // replug has touched yet, so nothing has re-granted it. Once per binary, and it
+    // deliberately runs after `blessed_replug_helper` rather than inside it: that
+    // function is what the grant itself uses to find the helper.
+    serial_nexus_itest::ensure_rig_access();
     let Ok(dev) = std::env::var("SNX_REPLUG_DEV") else {
         return Err("SNX_REPLUG_DEV is not set (name a /dev/serial/by-id/... link)".to_owned());
     };
