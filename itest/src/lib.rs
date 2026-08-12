@@ -1329,7 +1329,7 @@ pub fn ensure_rig_access() {
         if ports.is_empty() {
             return;
         }
-        let helper = match blessed_replug_helper() {
+        let helper = match blessed_devprep_helper() {
             Ok(h) => h,
             Err(why) => {
                 eprintln!(
@@ -1849,7 +1849,7 @@ fn rig_seen() -> String {
 // ---------------------------------------------------------------------------
 // The USB replug capability (design §15.45).
 //
-// `serial-nexus-replug` is the one binary in this workspace meant to carry a Linux
+// `serial-nexus-devprep` is the one binary in this workspace meant to carry a Linux
 // file capability. Tests never hold `CAP_DAC_OVERRIDE` themselves: they shell out
 // to the blessed copy, which validates its own arguments against sysfs and performs
 // the two writes. These helpers locate that copy, prove it is actually blessed, and
@@ -1870,14 +1870,14 @@ fn blessed_dir() -> PathBuf {
     root.join(".snx-bin").join(profile)
 }
 
-/// The blessed `serial-nexus-replug`, or why it cannot be used.
+/// The blessed `serial-nexus-devprep`, or why it cannot be used.
 ///
 /// **Proves the blessing rather than assuming it**: the file existing says nothing,
 /// because the kernel strips `security.capability` on every rewrite, so a copy left
 /// over from before a rebuild is present and powerless. This asks the binary itself
 /// — `capabilities --json` reports the effective bit it reads from its own
 /// `/proc/self/status` — which is the only answer that cannot be stale.
-pub fn blessed_replug_helper() -> Result<PathBuf, String> {
+pub fn blessed_devprep_helper() -> Result<PathBuf, String> {
     // **The blessing is a Linux mechanism, and the caller must be told that rather
     // than left to infer it from a missing file** (notes §3.72). Off Linux this used
     // to report the helper "not installed" and tell the operator to run `install` and
@@ -1898,11 +1898,11 @@ pub fn blessed_replug_helper() -> Result<PathBuf, String> {
                 .to_owned(),
         );
     }
-    let path = blessed_dir().join("serial-nexus-replug");
+    let path = blessed_dir().join("serial-nexus-devprep");
     if !path.exists() {
         return Err(format!(
             "{} is not installed — run `cargo build --workspace && \
-             ./target/debug/serial-nexus-replug install`, then the sudo command it prints",
+             ./target/debug/serial-nexus-devprep install`, then the sudo command it prints",
             path.display()
         ));
     }
@@ -1923,11 +1923,11 @@ pub fn blessed_replug_helper() -> Result<PathBuf, String> {
         // code, so a test would silently measure a helper that no longer exists in
         // the tree. Warn rather than fail, because the comparison is over bytes and
         // an ordinary relink changes them (measured: a `cargo test --workspace`
-        // that touched nothing in `replug/` still produced a different build id at
+        // that touched nothing in `devprep/` still produced a different build id at
         // byte 25) — failing on that would red the suite for a no-op. A warning
         // puts the hazard in front of whoever edited the helper without costing
         // anyone else a `sudo`.
-        let built = target_dir().join("serial-nexus-replug");
+        let built = target_dir().join("serial-nexus-devprep");
         if let (Ok(a), Ok(b)) = (std::fs::read(&built), std::fs::read(&path))
             && a != b
         {

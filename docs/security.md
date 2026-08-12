@@ -43,7 +43,7 @@ one.
 
 **That enumeration is the daemon's, and the scope is deliberate.** The repository
 also carries exactly one binary that is deliberately privileged —
-`serial-nexus-replug`, a test capability no deployment installs — and it is not a
+`serial-nexus-devprep`, a test capability no deployment installs — and it is not a
 door into any console. It gets its own section below rather than a line in this
 list, because folding it in would read as "the daemon has a fourth door", which is
 the one thing it is not.
@@ -515,7 +515,7 @@ below) so "the daemon's user" is as small a blast radius as possible.
 ## The one privileged binary in the tree is a test capability, not a deployment component
 
 Everything above describes the **daemon's** attack surface. The repository also
-carries `serial-nexus-replug` (§15.45), and on Linux it is deliberately privileged,
+carries `serial-nexus-devprep` (§15.45), and on Linux it is deliberately privileged,
 so a reader who audits only the sections above would miss it. It exists for one
 reason: §12's identity promises — configs surviving a replug, identity re-resolved
 at every open — had never met a real hotplug, and making the kernel disconnect and
@@ -525,7 +525,7 @@ re-enumerate a device for real means writing `0` then `1` to that device's USB
 **Nothing in `packaging/` installs it, no daemon spawns it, and no deployment needs
 it.** The privilege lives on a copy that the tool's own `install` verb places at
 `.snx-bin/<profile>/` — project-local, gitignored, mode `0700` applied *before* the
-capability (`replug/src/linux/install.rs`, `BLESSED_MODE = 0o700`) — and it is
+capability (`devprep/src/linux/install.rs`, `BLESSED_MODE = 0o700`) — and it is
 conferred by a single `sudo setcap cap_dac_override+ep …` that the tool **prints and
 never runs**. The capability is proven, never assumed, and it self-invalidates: any
 write to the file clears `security.capability`, so a rebuilt copy is an unprivileged
@@ -537,8 +537,8 @@ fuse this with `packaging/99-serial-nexus.rules`, which is deployment configurat
 and confers nothing).
 
 `CAP_DAC_OVERRIDE` bypasses every DAC check on the system, so what bounds the grant
-is the binary's narrowness, asserted by construction (`replug/src/linux/mod.rs`,
-`replug/src/linux/sysfs.rs`):
+is the binary's narrowness, asserted by construction (`devprep/src/linux/mod.rs`,
+`devprep/src/linux/sysfs.rs`):
 
 - **One capability, and no other.** `setcap cap_dac_override+ep`, nothing else.
 - **argv only.** It reads no environment variable, so there is no `LD_PRELOAD` or
@@ -658,6 +658,6 @@ The exec codec runs as the daemon's user,
 so run that user small. There is no in-daemon crypto in v1 — that, and finer
 per-caller authorization via `SO_PEERCRED`, are named as future work, not present
 guarantees (§14, §10). All of that is the *daemon's* posture; the tree's one
-deliberately privileged binary, `serial-nexus-replug`, is a hand-blessed test
+deliberately privileged binary, `serial-nexus-devprep`, is a hand-blessed test
 capability that no deployment installs and that is narrow by construction — its own
 section above states the bounds (§15.45).

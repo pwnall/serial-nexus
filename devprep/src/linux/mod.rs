@@ -1,4 +1,4 @@
-//! `serial-nexus-replug` — deauthorize and reauthorize one named USB serial
+//! `serial-nexus-devprep` — deauthorize and reauthorize one named USB serial
 //! adapter, so §12's identity promise can be tested against a real kernel
 //! re-enumeration (design §15.45).
 //!
@@ -66,7 +66,7 @@ const REENUMERATION_DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(
-    name = "serial-nexus-replug",
+    name = "serial-nexus-devprep",
     version,
     about = "USB re-enumeration helper for the serial_nexus rig (design §15.45)"
 )]
@@ -277,7 +277,7 @@ pub fn main() {
                 // blessed copy this process can *see* runs unhardened", and no
                 // unprivileged reading of a capability can promise more than that.
                 eprintln!(
-                    "serial-nexus-replug: refusing to run: this copy holds cap_dac_override \
+                    "serial-nexus-devprep: refusing to run: this copy holds cap_dac_override \
                      but cannot establish PR_SET_NO_NEW_PRIVS — {reason}. §15.45 requires that \
                      bound on a blessed copy. Strip the capability (`sudo setcap -r <path>`) \
                      or run the unblessed copy from target/<profile>/."
@@ -285,7 +285,7 @@ pub fn main() {
                 std::process::exit(exit::REFUSED);
             }
             Unhardened::Report => eprintln!(
-                "serial-nexus-replug: {reason} — harmless in this unblessed copy, which holds \
+                "serial-nexus-devprep: {reason} — harmless in this unblessed copy, which holds \
                  no capability, but a blessed copy on this box will refuse to run (§15.45)."
             ),
         }
@@ -453,7 +453,7 @@ fn refuse(message: &str, json: bool) -> i32 {
     if json {
         println!("{}", serde_json::json!({ "error": message }));
     } else {
-        eprintln!("serial-nexus-replug: {message}");
+        eprintln!("serial-nexus-devprep: {message}");
     }
     exit::REFUSED
 }
@@ -471,7 +471,7 @@ fn require_capability(held: CapState, json: bool) -> Option<i32> {
     Some(refuse(
         &format!(
             "cap_dac_override is not effective ({hint}). Run \
-             `cargo run -p serial-nexus-replug -- install` and then the sudo command it prints."
+             `cargo run -p serial-nexus-devprep -- install` and then the sudo command it prints."
         ),
         json,
     ))
@@ -529,7 +529,7 @@ fn grant_verb(names: &[String], json: bool) -> i32 {
     if !caps::capability_state(caps::CAP_FOWNER).effective {
         return refuse(
             "cap_fowner is not effective, so no ACL can be set on a root-owned tty node. \
-             Run `cargo run -p serial-nexus-replug -- install` and then the sudo command it \
+             Run `cargo run -p serial-nexus-devprep -- install` and then the sudo command it \
              prints (§15.55).",
             json,
         );
@@ -925,7 +925,7 @@ fn install_verb(profile: &str, verify: bool, print_setcap: bool, held: CapState)
     if held.permitted || held.effective {
         return refuse(
             "refusing to run `install` from a blessed copy — run it from \
-             `target/<profile>/serial-nexus-replug` (or via `cargo run -p serial-nexus-replug`)",
+             `target/<profile>/serial-nexus-devprep` (or via `cargo run -p serial-nexus-devprep`)",
             false,
         );
     }

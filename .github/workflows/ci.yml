@@ -100,7 +100,7 @@ jobs:
       # blames it on the platform (notes §3.71).
       #
       # This is the **second** recorded macOS-only compile break and the first of its
-      # shape. §3.65 A was the first: `serial-nexus-replug` was an unconditional
+      # shape. §3.65 A was the first: `serial-nexus-devprep` was an unconditional
       # workspace member using a Linux-only symbol. That one at least reddened
       # `cargo build --workspace`, the macOS lane's own first step. This one does not
       # — `cargo build` compiles no test target — which is why a *new* instrument was

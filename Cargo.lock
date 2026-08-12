@@ -1058,6 +1058,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serial-nexus-devprep"
+version = "0.3.0"
+dependencies = [
+ "clap",
+ "serde_json",
+ "serial-nexus-sys",
+]
+
+[[package]]
 name = "serial-nexus-doctor"
 version = "0.3.0"
 dependencies = [
@@ -1085,15 +1094,6 @@ dependencies = [
  "serial-nexus-sys",
  "sha2",
  "toml",
-]
-
-[[package]]
-name = "serial-nexus-replug"
-version = "0.3.0"
-dependencies = [
- "clap",
- "serde_json",
- "serial-nexus-sys",
 ]
 
 [[package]]

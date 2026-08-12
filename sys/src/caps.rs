@@ -1,7 +1,7 @@
 //! Capability inspection and process hardening for the privileged replug helper
 //! (design §15.45).
 //!
-//! This module exists here rather than in `replug/` for the reason the whole crate
+//! This module exists here rather than in `devprep/` for the reason the whole crate
 //! exists (§16.3): `prctl(2)` needs `unsafe` somewhere, and there is exactly one
 //! crate allowed to hold it. The capability *reader* needs no `unsafe` at all — it
 //! parses `/proc/self/status` — but it lives beside the hardening calls so that
@@ -123,7 +123,7 @@ pub fn parse_capability_state(status: &str, bit: u32) -> Option<CapState> {
 /// `Err` carries an operator-readable diagnosis rather than a bare `Errno`, and the
 /// caller decides how loudly to fail: a copy that holds no capability has nothing
 /// left to harden, while a blessed one must not proceed (see the refusal in
-/// `serial-nexus-replug`'s `main`).
+/// `serial-nexus-devprep`'s `main`).
 #[cfg(target_os = "linux")]
 pub fn establish_no_new_privs() -> Result<(), String> {
     nix::sys::prctl::set_no_new_privs()

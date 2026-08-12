@@ -1,12 +1,12 @@
 [package]
-name = "serial-nexus-replug"
+name = "serial-nexus-devprep"
 version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "serial_nexus USB re-enumeration helper: deauthorize and reauthorize one named USB serial adapter, so the §12 identity promise can be tested against a real replug (design §15.45)."
+description = "serial_nexus device-preparation helper: re-enumerates a named USB serial adapter and grants the invoking user access to the tty nodes it produces, so a test run finds its devices ready (design §15.45, §15.55)."
 
 # The one binary in this workspace that is meant to carry a Linux file capability
 # (§15.45). Its dependency list is part of its security argument and is kept to

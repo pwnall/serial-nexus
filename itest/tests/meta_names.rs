@@ -42,7 +42,7 @@ const SKIP_DIRS: &[&str] = &[
     "node_modules",
     "test-results",
     "playwright-report",
-    // The capability-blessed copy of `serial-nexus-replug` (design §15.45):
+    // The capability-blessed copy of `serial-nexus-devprep` (design §15.45):
     // gitignored build output, and a directory whose contents are a binary plus
     // whatever `install` put beside it. Excluded for the same reason as `target`.
     ".snx-bin",
@@ -162,6 +162,13 @@ fn hits_ci(text: &str, token: &str) -> Vec<usize> {
 /// the first is still a *directory* name and the second is still a Cargo *feature*
 /// name, both legitimately, and plan §17.2 names exactly this set.
 const RETIRED: &[&str] = &[
+    // §15.55's rename (notes §3.81). Unlike the v14 entries below, this one retires a
+    // name that was *correct* until the helper outgrew it: the binary is invoked for
+    // every rig test, and a name ending in the one operation it performs first reads
+    // as a far narrower tool than it is. Banned tree-wide at the owner's request, so
+    // it cannot drift back one merge at a time — the same reason the v14 names are here.
+    "serial-nexus-replug",
+    "serial_nexus_replug",
     "serialnexusd",
     "serialnexusctl",
     "serialnexusweb",
@@ -215,6 +222,14 @@ const COMPAT_ALLOWANCE: &[(&str, usize)] = &[
     // disk under their old names and has to be able to recognise them: the two
     // fallbacks, the retired daemon name, and the retired CLI name.
     ("packaging/README.md", 4),
+    // The entry that *states* the 2026-08-12 rename (notes §3.81) — a rule has to be
+    // able to name what it bans, the same reason `BAN_STATEMENTS` exists below. Four:
+    // the two tokens as they join the list, the before→after line, and the stale
+    // blessed copy an operator must delete by its old path. A counted allowance rather
+    // than a blanket pass because this file is append-only and grows: a fifth mention
+    // means someone wrote the retired name into a *new* entry, which is exactly the
+    // drift the ban is for.
+    ("docs/implementation-notes.md", 4),
 ];
 
 /// **§15.40's rename is un-reintroducible.**

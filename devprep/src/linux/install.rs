@@ -1,7 +1,7 @@
 //! The bless recipe: install a copy of this binary at a stable, mode-restricted
 //! path so `setcap` has something durable to bless (design §15.45).
 //!
-//! Why a copy at all, rather than blessing `target/<profile>/serial-nexus-replug`
+//! Why a copy at all, rather than blessing `target/<profile>/serial-nexus-devprep`
 //! in place: the kernel clears `security.capability` on every write to a file, and
 //! `cargo build` rewrites that path constantly, so an in-place blessing would be
 //! destroyed by the next build and would have to be re-applied — with a `sudo` —
@@ -55,7 +55,7 @@ pub fn blessed_path(repo_root: &Path, profile: &str) -> PathBuf {
     repo_root
         .join(BIN_DIR)
         .join(profile)
-        .join("serial-nexus-replug")
+        .join("serial-nexus-devprep")
 }
 
 /// Absolute path of the freshly-built binary for `profile`.
@@ -63,7 +63,7 @@ pub fn built_path(repo_root: &Path, profile: &str) -> PathBuf {
     repo_root
         .join("target")
         .join(profile)
-        .join("serial-nexus-replug")
+        .join("serial-nexus-devprep")
 }
 
 /// Extract the capability field from one `getcap` output line.
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn a_path_containing_the_flag_letters_does_not_read_as_blessed() {
         // `+p` only — permitted, not effective. The path contains "deps" and "ep".
-        let line = "/home/steph/repo/target/debug/deps/serial-nexus-replug cap_dac_override=p\n";
+        let line = "/home/steph/repo/target/debug/deps/serial-nexus-devprep cap_dac_override=p\n";
         let field = getcap_field(line).expect("a caps field is present");
         assert_eq!(field, "cap_dac_override=p");
         assert!(
@@ -225,10 +225,10 @@ mod tests {
     #[test]
     fn an_effective_dac_override_is_recognised_in_each_spelling() {
         for line in [
-            "/x/serial-nexus-replug cap_dac_override,cap_fowner=ep",
-            "/x/serial-nexus-replug cap_fowner,cap_dac_override=pe",
-            "/x/serial-nexus-replug cap_dac_override,cap_fowner,cap_net_admin=ep",
-            "/x/serial-nexus-replug cap_net_admin,cap_fowner,cap_dac_override=ep\n",
+            "/x/serial-nexus-devprep cap_dac_override,cap_fowner=ep",
+            "/x/serial-nexus-devprep cap_fowner,cap_dac_override=pe",
+            "/x/serial-nexus-devprep cap_dac_override,cap_fowner,cap_net_admin=ep",
+            "/x/serial-nexus-devprep cap_net_admin,cap_fowner,cap_dac_override=ep\n",
         ] {
             let field = getcap_field(line).unwrap_or_else(|| panic!("field in {line:?}"));
             assert!(
@@ -246,7 +246,7 @@ mod tests {
         assert_eq!(getcap_field(""), None);
         assert_eq!(getcap_field("/x/y-with-no-caps\n"), None);
         // A path with a space is why the field is taken from the right, not the left.
-        let f = getcap_field("/x/my dir/serial-nexus-replug cap_dac_override,cap_fowner=ep")
+        let f = getcap_field("/x/my dir/serial-nexus-devprep cap_dac_override,cap_fowner=ep")
             .expect("field");
         assert!(field_grants_required_caps(f));
         // **Half the set is not the set.** A copy blessed before `cap_fowner` joined

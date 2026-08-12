@@ -1,4 +1,4 @@
-//! `serial-nexus-replug` on Darwin — the macOS half of design §15.45.
+//! `serial-nexus-devprep` on Darwin — the macOS half of design §15.45.
 //!
 //! # What is the same, and what cannot be
 //!
@@ -47,7 +47,7 @@ const SAMPLE: Duration = Duration::from_millis(2);
 
 #[derive(Parser)]
 #[command(
-    name = "serial-nexus-replug",
+    name = "serial-nexus-devprep",
     version,
     about = "serial_nexus USB re-enumeration helper (macOS: IOUSBLib, §15.45)"
 )]
@@ -135,7 +135,7 @@ fn refuse(message: &str, json: bool) -> i32 {
     if json {
         println!("{}", serde_json::json!({ "error": message }));
     } else {
-        eprintln!("serial-nexus-replug: {message}");
+        eprintln!("serial-nexus-devprep: {message}");
     }
     exit::REFUSED
 }
@@ -304,7 +304,7 @@ fn cycle(names: &[String], hold_ms: u64, dry_run: bool, json: bool) -> i32 {
         }
         if hold_ms > 0 && !dry_run {
             eprintln!(
-                "serial-nexus-replug: --hold-ms {hold_ms} was NOT honoured — this platform's \
+                "serial-nexus-devprep: --hold-ms {hold_ms} was NOT honoured — this platform's \
                  re-enumeration is atomic; see observed_outage_ms in --json"
             );
         }
@@ -315,7 +315,7 @@ fn cycle(names: &[String], hold_ms: u64, dry_run: bool, json: bool) -> i32 {
         // The device left the bus and did not come back inside the window. Exiting
         // 0 here would tell a caller its rig is intact when it is not.
         eprintln!(
-            "serial-nexus-replug: re-enumerated but the callout node never returned for {} \
+            "serial-nexus-devprep: re-enumerated but the callout node never returned for {} \
              within {RETURN_TIMEOUT:?} — the adapter may be off the bus",
             stranded.join(", ")
         );

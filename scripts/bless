@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bless `serial-nexus-replug` so the privileged replug tests can run (design §15.45).
+# Bless `serial-nexus-devprep` so the privileged replug tests can run (design §15.45).
 #
 # One command a developer types in a terminal:
 #
@@ -70,11 +70,11 @@ run_privileged() {
 rc=0
 for profile in "${profiles[@]}"; do
   echo "== ${profile} =="
-  built="$repo/target/$profile/serial-nexus-replug"
-  blessed="$repo/.snx-bin/$profile/serial-nexus-replug"
+  built="$repo/target/$profile/serial-nexus-devprep"
+  blessed="$repo/.snx-bin/$profile/serial-nexus-devprep"
 
   if [ "$verify_only" -eq 0 ]; then
-    flags=(--locked -p serial-nexus-replug)
+    flags=(--locked -p serial-nexus-devprep)
     [ "$profile" = "release" ] && flags+=(--release)
     if ! cargo build "${flags[@]}"; then
       echo "bless: ${profile}: build failed" >&2

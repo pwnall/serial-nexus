@@ -165,7 +165,7 @@ Where the code lives, in six lines:
 - `daemon/` is the daemon as an embeddable library (`serial_nexus_daemon`); `daemon-bin/` builds
   the thin `serial-nexus-daemon` binary (§15.26).
 - `ctl/` and `web/` are pure RPC clients — the CLI and the web console; the daemon links neither.
-- `sim/` is the subprocess test double, `doctor/` the kernel-capability prober, `replug/` the
+- `sim/` is the subprocess test double, `doctor/` the kernel-capability prober, `devprep/` the
   privileged USB re-enumeration helper (§15.45).
 - `itest/` is the cross-platform integration harness that boots all of the above as subprocesses.
 - Plan §2 carries the full directory → package → artifact table, the non-crate directories, and
@@ -3591,7 +3591,7 @@ configuration, not test capability). DECLINED, STANDS: a capability-conferring t
 `CAP_DAC_OVERRIDE` is root-equivalent, ambient across every `fork`/`exec` the tests make, and a
 daemon holding it would prove the daemon works as root (AGENTS §9's proxy at the largest scale).
 
-One binary, `serial-nexus-replug`, carries `CAP_DAC_OVERRIDE` on a copy its own `install` verb
+One binary, `serial-nexus-devprep`, carries `CAP_DAC_OVERRIDE` on a copy its own `install` verb
 places at `.snx-bin/<profile>/` — project-local, gitignored, mode `0700`, blessed by a single
 `sudo setcap` the tool prints and never runs. The bounds, by construction:
 
@@ -3615,7 +3615,7 @@ staleness, no stamp file); the capability is proven, never assumed. `SNX_REPLUG=
 reddens the self-skip via the same mechanism as `SNX_CROSSOVER=required`; preflight answers
 ready / blocked-on-bless / genuinely-not-ready.
 
-Two arms, one refusal: a platform dispatcher over `replug/src/linux/` (notes §3.65); the macOS
+Two arms, one refusal: a platform dispatcher over `devprep/src/linux/` (notes §3.65); the macOS
 arm (`serial_nexus_sys::usb_macos`, IOUSBLib — notes §3.66) is unprivileged and atomic (measured
 40–42 ms outages), `hold` refusing with exit 3 — its whole purpose is a caller-controlled window
 — and `--hold-ms` reported as `hold_ms_honoured: false` rather than quietly dropped.
@@ -3941,6 +3941,14 @@ grant — it lets a process give files away as well as take them — and chown w
 node's original ownership. The ACL leaves the node reading `root:dialout 0660` with one
 extra `user:<uid>:rw-` line that `getfacl` shows and `setfacl -b` removes. It is also
 exactly what the operator would otherwise type by hand, which is the shape this replaces.
+
+**The helper is `serial-nexus-devprep`** (`devprep/`), renamed from a name that described
+only its first verb. The trigger is this entry: once `ensure_rig_access()` calls it at the
+start of every run that names a rig, a tool invoked by every rig test carried a name naming
+one operation, which advertises something far narrower than what exists. The retired spelling
+joins §15.40's banned vocabulary so it cannot drift back, and the word *replug* keeps its
+meaning everywhere it denotes the operation — `SNX_REPLUG*`, `skip_no_replug`, the replug lane
+(notes §3.81, which also records what a tree-wide ban costs an append-only record).
 
 **Two residuals, recorded rather than hidden.** The grant does not survive the *next*
 re-enumeration either — nothing put on an inode does — so it is re-applied per cycle by

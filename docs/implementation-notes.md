@@ -9,6 +9,11 @@ remediation**, all 82 findings dispositioned, the 2026-08-05/07 doctor/rig/replu
 (§3.29–§3.74 below), the **v15 documentation generation**, and the **v16 documentation
 generation** (entry below).)
 **Branch:** `implementation` (off `main`).
+**One name was retired tree-wide on 2026-08-12** (§3.81): the privileged helper is
+`serial-nexus-devprep` (`devprep/`), and entries written before that date were
+**mechanically rewritten** to it. Commands quoted in older entries therefore use the current
+name rather than the string that was typed; `docs/historical/` and the commit messages keep
+the original spelling. The word *replug* still means the operation everywhere it appears.
 **Normative docs are now v16:** `docs/41-design-claude-fable-v16.md` (design) and
 `docs/42-implementation-plan-claude-fable-v16.md` (plan). v1–v15 docs, the reviews and their
 remediation ledgers are in `docs/historical/`. Section references (§) point at the v16
@@ -6844,7 +6849,8 @@ path — the daemon heals, but the kernel never enumerates, `ftdi_sio` never unb
 `/dev/serial/by-id` is never rebuilt and no `/dev` name ever changes. So the
 shipped sentence had no measurement behind it on any kernel.
 
-**What landed.** `replug/` → `serial-nexus-replug`, the one binary meant to carry a
+**What landed.** The replug helper's own crate — `devprep/` today, under a name this
+entry predates (§3.81) — the one binary meant to carry a
 Linux file capability, plus `sys/src/caps.rs` (capability reading from
 `/proc/self/status`, `PR_SET_NO_NEW_PRIVS`, `PR_SET_PDEATHSIG`, the terminate
 handler, and the `fstatfs` sysfs check) and `itest/tests/p7_replug_hardware.rs`.
@@ -7031,7 +7037,7 @@ in the tree. `blessed_replug_helper()` therefore also compares the blessed copy 
 `target/<profile>/` and **warns** when they differ, naming `scripts/bless`. A
 warning rather than a failure, because the comparison is over bytes: a relink
 changes them with no source change (measured once during a `cargo test --workspace`
-that touched nothing in `replug/` — the build id at byte 25 moved), and reddening
+that touched nothing in `devprep/` — the build id at byte 25 moved), and reddening
 the suite for a no-op would be worse than the hazard. Cargo turns out to be
 reproducible for comment-only edits — `touch` plus a trailing-comment rebuild both
 produced byte-identical binaries — so the false-positive rate is lower than feared.
@@ -7366,7 +7372,7 @@ test exclusive_write_lock_is_byte_exact ... ok
 
 The timer itself stays, and the reason is recorded rather than hidden: the sim's slave is held by a
 subprocess this harness cannot leash without a sim-side stdin-EOF hold (the shape §3.54 built for
-`serial-nexus-replug hold`), and `sim/` was outside this change's scope. The check is what converts
+`serial-nexus-devprep hold`), and `sim/` was outside this change's scope. The check is what converts
 the timer from a silent proxy into a named failure.
 
 #### Fail-first, executed
@@ -8146,7 +8152,7 @@ re-blessed, and the picture changed completely.
 
 **One correction to §3.58 first.** The helper was blessed the whole time — the
 *install* never moved (still dated 12:40, byte-identical to the build). What moved
-was `target/debug/serial-nexus-replug`: a rebuild drifted it and a later rebuild
+was `target/debug/serial-nexus-devprep`: a rebuild drifted it and a later rebuild
 drifted it back, which is the reproducibility §3.54 measured and the reason the
 staleness check warns rather than fails. §3.58's runs genuinely had no replug lane
 — `SNX_REPLUG_DEV` was unset — so its evidence stands; only its explanation of
@@ -8397,12 +8403,12 @@ guard that pins the platform of record's *answer* instead of the property — an
 the build break are genuine platform gaps.
 
 **A. `cargo build --workspace --locked` does not build on macOS, and the macOS CI lane's first
-step is exactly that command.** `serial-nexus-replug` is an unconditional workspace member whose
+step is exactly that command.** `serial-nexus-devprep` is an unconditional workspace member whose
 `main.rs` opens with `use serial_nexus_sys::caps::{self, CAP_DAC_OVERRIDE, CapState}`, and that
 module is `#[cfg(target_os = "linux")]`. The intent is already written down one file away — sys's
 own comment says the module is "Linux-only … and the helper the module supports does not build
 elsewhere" — so what is missing is not the decision but its enforcement. `cargo build --workspace
---exclude serial-nexus-replug` is clean, which locates the break precisely. The reason it went unnoticed is worth more than the patch: the replug
+--exclude serial-nexus-devprep` is clean, which locates the break precisely. The reason it went unnoticed is worth more than the patch: the replug
 commits landed after the last macOS run, and nothing between them and this session executed a
 build off Linux. **Fixed** (see A′ below, which also answers whether a macOS equivalent exists).
 
@@ -8502,9 +8508,9 @@ and passes with `--test-threads=1` — the binary's six tests now share two phys
 green here and are six now.
 
 **The gate on this box, and what it is scoped to.** 759 passing, 2 failed, 4 ignored, zero SKIP
-lines, `--no-fail-fast`, `--exclude serial-nexus-web --exclude serial-nexus-replug`; the two
+lines, `--no-fail-fast`, `--exclude serial-nexus-web --exclude serial-nexus-devprep`; the two
 failures are E above and the citation gate that this entry closes. Before the three repairs it was
-756 / 4 / 4. Keep the `--exclude serial-nexus-replug` visible when quoting the figure: it is not
+756 / 4 / 4. Keep the `--exclude serial-nexus-devprep` visible when quoting the figure: it is not
 the documented macOS scope, it is A above, and the number is smaller than it looks by however many
 tests that crate carries on Linux.
 
@@ -8531,8 +8537,8 @@ guards it converted do not depend on which disposition the kernel has, which is 
 portable guard needs and what C above found the *guard* was not yet saying.
 
 **A′ (same session) — the build break is fixed, and the macOS equivalent was investigated rather
-than assumed away.** `replug/src/{main,install,sysfs}.rs` become
-`replug/src/main.rs` (a platform dispatcher) plus `replug/src/linux/{mod,install,sysfs}.rs`
+than assumed away.** `devprep/src/{main,install,sysfs}.rs` become
+`devprep/src/main.rs` (a platform dispatcher) plus `devprep/src/linux/{mod,install,sysfs}.rs`
 reached through `#[cfg(target_os = "linux")] #[path = "linux/mod.rs"] mod platform;`. Off Linux
 the binary refuses in one place with exit **2** — the Linux binary's "refused" code, so a harness
 that shells out gets a verdict rather than an ambiguity — and `cargo build --workspace --locked`
@@ -8607,7 +8613,7 @@ nowhere else), §7 (a platform that differs is reported, never silently approxim
 
 §3.65 A′ established that a macOS equivalent of Linux's sysfs `authorized` replug **exists** and
 measured where the equivalence stops. This entry builds it. The result is a working
-`serial-nexus-replug` on Darwin with four of six verbs doing real work, one refusing on purpose,
+`serial-nexus-devprep` on Darwin with four of six verbs doing real work, one refusing on purpose,
 and one reporting that it has nothing to do.
 
 **The mechanism, and where the `unsafe` went.** `serial_nexus_sys::usb_macos` wraps IOUSBLib's
@@ -9069,7 +9075,7 @@ the tty→USB-port mapping with a `sed` that took the wrong path component, so a
 of unplug measurements deauthorized the adapter that was *not* being watched and
 concluded that a real unplug reports nothing at all. The tell was a control that had
 been added for a different reason (`down during window=False`); without it the wrong
-reading would have gone into this entry. `serial-nexus-replug status` is the
+reading would have gone into this entry. `serial-nexus-devprep status` is the
 authority for that mapping — `ttyUSB0` is on `3-3` and `ttyUSB1` on `3-1` on this box,
 the reverse of what the `sed` said.
 
@@ -9184,7 +9190,7 @@ the macOS lane. Every other crate is covered, including `daemon`, where this ins
 and the class's only other recorded member both landed.
 
 **Second instance, not third.** §3.65 A was the first macOS-only compile break — the
-`serial-nexus-replug` crate as an unconditional workspace member using a Linux-only
+`serial-nexus-devprep` crate as an unconditional workspace member using a Linux-only
 symbol. A session note drafted here claimed a third; **it is withdrawn**, because
 nothing in the history or the notes substantiates it and the two mechanisms are not the
 same one twice. The distinction that matters is not the count: §3.65 A reddened
@@ -9843,7 +9849,7 @@ are 22/12 — a pair ci.yml has never stated correctly.
 
 **D5. `set_no_new_privs` was attempted, not established.** §15.45 lists
 "`PR_SET_NO_NEW_PRIVS`-guaranteed" among five bounds holding *by construction* on the
-capability-carrying replug helper, and `replug/src/linux/mod.rs` discarded the prctl's result. A
+capability-carrying replug helper, and `devprep/src/linux/mod.rs` discarded the prctl's result. A
 failed prctl left a blessed process running unhardened and unreported. "By construction" is a
 promise about a `Result` nobody read.
 
@@ -10266,13 +10272,14 @@ is now read from the helper itself (`install --print-setcap`), so the command sh
 command run, and the set `--verify` checks against all derive from `REQUIRED_CAPS` and cannot
 drift — the hand-kept-list shape §3.78 and plan §18 item 40 keep finding.
 
-**Not renamed.** The owner allowed that the binary "might need to be renamed". It is still
-`serial-nexus-replug`, because the new verb is not a second purpose: a re-enumeration is what
-makes a node inaccessible, and handing the access back is that operation finishing. A rename
-would also move a name the frozen reviews, the committed `docs/doctor/` artifacts and the
-§15.40 retired-name gate all carry, for a verb that stays inside the replug story. Recorded
-as a decision so it is not read as an oversight — if the helper ever grows a grant unrelated
-to replugging, that is the moment the name stops fitting.
+**Not renamed — and then renamed.** The owner allowed that the binary "might need to be
+renamed"; I kept the old name and argued that the new verb was not a second purpose, since a
+re-enumeration is what makes a node inaccessible and handing the access back is that operation
+finishing. The owner overruled it, with the better reason: the helper is now *invoked for all
+tests*, so a name ending in the one operation it happens to perform first reads as a much
+narrower tool than it is. Renamed to `serial-nexus-devprep` in §3.81. The decision and its
+reversal are both kept here, because the argument for the old name was wrong in a way worth
+seeing — it weighed the verb's mechanism and not the tool's callers.
 
 **Two residuals.** The grant does not survive the *next* re-enumeration either — nothing
 placed on an inode does — so it is re-applied per cycle by construction; the durable answers
@@ -10403,3 +10410,70 @@ verdict, and the two end-to-end tests skipped with the measurement printed inste
 Plan §18 item 28's DTR work is unaffected and still wants a rig with DTR wired; item 17's
 break/parity checklist now wants a bench re-inspection too, since it was filed against a rig
 proven 5-wire.
+
+---
+
+### 3.81 `serial-nexus-devprep`: the helper outgrew a name that described its first verb
+
+**Requested by the repository owner**, who overruled the decision recorded at §3.79: *"Let's
+rename the helper. It's a bit confusing that it ends in `replug` since it's invoked for all
+tests."* Both halves of the choice were theirs — the name, from four candidates, and the
+disposition of the old one.
+
+**The argument I got wrong, kept because it is instructive.** §3.79 declined the rename on the
+grounds that granting device access is not a second purpose: a re-enumeration is what makes a
+node inaccessible, so handing access back is that operation finishing. That reasoning weighs
+the *verb's mechanism*. What decides a name is the *tool's callers* — and after §3.79 the
+helper is invoked by `ensure_rig_access()` at the start of every run that names a rig,
+including runs that never replug anything. A name ending in the operation it happens to
+perform first advertises a far narrower tool than the one that exists, and the owner's
+sentence names exactly that.
+
+**What moved.** `replug/` → `devprep/`; `serial-nexus-replug` → `serial-nexus-devprep`, crate,
+binary and installed copy at `.snx-bin/<profile>/`; `blessed_replug_helper()` →
+`blessed_devprep_helper()`. Seventeen files carried the binary name and seven more carried the
+directory path.
+
+**What deliberately did *not* move.** The word *replug* everywhere it means the operation
+rather than the tool: `SNX_REPLUG`, `SNX_REPLUG_DEV`/`_DEV_B`, `skip_no_replug`,
+`itest/tests/p7_replug{,_hardware}.rs`, "the replug lane", "a run that died mid-replug". The
+helper still performs replugs; it is simply no longer only that. Renaming those would have
+been the mirror of the mistake being fixed — losing a precise word because a tool changed
+scope.
+
+**The old name is banned tree-wide**, at the owner's choice between that and annotate-in-place.
+`serial-nexus-replug` and `serial_nexus_replug` join §15.40's `RETIRED` list, so the gate that
+keeps the v14 vocabulary from drifting back now keeps this one out too. There is precedent and it
+is the same gate: §15.40's v14 rename rewrote the tree and left the retired vocabulary only in
+`docs/historical/` and the captured `docs/doctor/` artifacts.
+
+**And here is the cost of that choice, stated rather than absorbed.** This record is
+append-only, and a tree-wide ban means pre-rename entries were **mechanically rewritten** to
+the new name. Three consequences a reader needs:
+
+1. **Commands quoted in older entries did not literally say this.** The macOS scope lines of
+   §3.65 read `--exclude serial-nexus-devprep` today; the command as *run* on 2026-08-05 named
+   the binary by its then-current name. The *meaning* is intact — the same crate was excluded,
+   and the figure it qualifies (756 / 4 / 4) is untouched — but the string is not a
+   transcript. Where a literal transcript matters, `docs/historical/` keeps the original
+   spelling, and so do the commit messages.
+2. **One entry stated a mapping that the rewrite falsified, and was repaired by hand.** The
+   v14 rename entry recorded `replug/` → its crate name *as of that rename*; a blanket
+   substitution made it claim the v14 track produced a name that did not exist until today. It
+   now names the directory and points here instead of asserting a date-wrong mapping.
+3. **§3.79's "Not renamed" paragraph is a reversed decision, not a deleted one.** It keeps the
+   argument I made and records that it was overruled, with the reason. A decline that is
+   quietly edited away is the thing AGENTS §5 forbids; a decline that is overturned in the
+   open is the thing it asks for.
+
+Found by the blanket substitution itself, which is the honest version of how this was noticed:
+the first pass rewrote all three sites silently, and reading the diff — rather than trusting
+it — is what turned them up. A rename script that touches an append-only record is a
+prose-truth hazard, not a mechanical one.
+
+**One operator consequence.** The blessed copy lives at a path that has changed, so the
+capability does not follow it: `.snx-bin/<profile>/serial-nexus-replug` still holds
+`cap_dac_override,cap_fowner` and is now an orphan no code will look for. `scripts/bless`
+installs and re-blesses the new name, and the stale copy should be deleted — a blessed binary
+nothing references is exactly the kind of thing §15.45's narrowness argument does not want
+lying around.

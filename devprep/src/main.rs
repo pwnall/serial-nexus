@@ -1,4 +1,4 @@
-//! `serial-nexus-replug` — the platform dispatcher.
+//! `serial-nexus-devprep` — the platform dispatcher.
 //!
 //! The helper's substance is in [`linux`], and it stays Linux-only for now. What
 //! this file exists for is the *build*: until 2026-08-05 the crate was an
@@ -64,7 +64,7 @@ fn main() {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn main() {
     eprintln!(
-        "serial-nexus-replug is Linux-only (design §15.45, notes §3.65 A).\n\
+        "serial-nexus-devprep is Linux-only (design §15.45, notes §3.65 A).\n\
          \n\
          It re-enumerates a USB serial adapter by writing `authorized` 0 then 1 on \
          sysfs, which is a Linux interface, and it is built to carry the Linux file \
