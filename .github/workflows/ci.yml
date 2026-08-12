@@ -196,8 +196,18 @@ jobs:
           # was archived rather than a second measurement of the same box — P9's and P10's
           # numbers move run to run, which is why the era diffs take three samples
           # (notes §3.74).
+          #
+          # **Not `| tee`.** The doctor exits **1** when any probe reports `unsupported`
+          # (`report.any_unsupported()`) and **2** when it could not produce a report at
+          # all — and in a pipeline the step's status is the LAST command's, so `tee`
+          # returning 0 discarded both. That is the `jq -e` defect in a second costume
+          # (AGENTS §3): a command that reads as a gate and cannot fail the lane on its
+          # own account. Redirect, so the exit status is the command's (notes §3.77).
+          #
+          # This job has no separate build step — `cargo run` is the build — so it stays
+          # `cargo run`; the macOS lane runs the artifact its own build step produced.
           cargo run -q --locked -p serial-nexus-doctor -- --markdown \
-              --json-out serial-nexus-doctor-report.json | tee serial-nexus-doctor-report.md
+              --json-out serial-nexus-doctor-report.json > serial-nexus-doctor-report.md
           jq -e -f expectations/linux.jq serial-nexus-doctor-report.json
       # **Both renderings, because only one of them is the artifact of record.** The
       # Markdown is for reading; the JSON is the only form the gate and the field-set
@@ -261,9 +271,23 @@ jobs:
         run: cargo test --workspace --locked --no-fail-fast
       - name: Capability report + macos.jq gate
         run: |
+          # **This step had not executed in any recent run.** Every macOS run since at
+          # least 2026-08-10 failed at the test step above, and a failed step skips the
+          # rest of the job — so the macOS jq gate AGENTS §3 names as the one this lane
+          # gates on was not running at all. The first execution, 2026-08-12, could not
+          # exec the doctor binary (`cannot execute binary file`) after `cargo build
+          # --workspace` had just built it and the harness had just run other binaries
+          # from the same directory. The diagnostic below is here to say why rather
+          # than let the next reader guess; it is cheap and it prints before the gate,
+          # so a green run carries the evidence too (notes §3.77).
+          uname -m; sw_vers || true
+          ls -la target/debug/serial-nexus-doctor || true
+          file target/debug/serial-nexus-doctor || true
           # One run, both consumers — the Linux lane's reasoning, verbatim (plan §18 item 43).
-          cargo run -q --locked -p serial-nexus-doctor -- --markdown \
-              --json-out serial-nexus-doctor-macos.json | tee serial-nexus-doctor-macos.md
+          # `cargo build` above already produced it, so run the artifact directly: the
+          # extra `cargo run` resolve is what the pipeline's exit status was hiding.
+          ./target/debug/serial-nexus-doctor --markdown \
+              --json-out serial-nexus-doctor-macos.json > serial-nexus-doctor-macos.md
           jq -e -f expectations/macos.jq serial-nexus-doctor-macos.json
       # Both renderings — the Linux lane's reasoning, verbatim (notes §3.74).
       - uses: actions/upload-artifact@v5

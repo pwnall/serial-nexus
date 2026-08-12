@@ -10091,3 +10091,44 @@ Markdown was uploaded, so the JSON, which is the artifact of record (§3.74), wa
 the end of every run. Both jobs now upload the pair. That does not discharge item 18's capture
 half — a committed artifact is a deliberate act with an era stated, not a CI by-product — but it
 means the artifact no longer has to be re-taken by hand to exist.
+
+---
+
+### 3.77 The macOS jq gate had not been running, and both lanes were discarding the doctor's exit status
+
+Two defects in one step, found by fixing §3.76 — which is the point worth keeping: repairing the
+red test is what let the step *after* it execute for the first time in a long while, and it failed
+immediately.
+
+**1. A gate that was not running.** AGENTS §3 names `jq -e -f expectations/macos.jq` as the gate
+"which the macOS lane actually gates on". It had not executed in **any** recent run. Every macOS
+run since at least 2026-08-10 — the nightlies of 08-10, 08-11 and 08-12, and the v16 landing push —
+failed at the test step, and a failed step skips the rest of the job, so the capability report and
+its gate were reported `skipped` each time. Checked, not assumed: the step's conclusion is
+`skipped` in all four runs. The macOS expectation file was being maintained against a lane that
+never read it. That is the same class as the `jq -e` omission AGENTS §3 already records — a gate
+that reads as a gate and asserts nothing — arriving through the *scheduler* rather than through the
+command.
+
+The general form is worth stating, because it will happen again: **a red test upstream of a gate
+hides the gate, and the hiding is invisible in the failure**. The job reports one failure, the
+failure is real, and every check behind it is silently untested for as long as the first one stays
+red. `--no-fail-fast` (§6) buys this *within* `cargo test` and buys nothing across job steps.
+
+**2. `| tee` discarded the doctor's exit status, on both lanes.** The doctor exits **1** when any
+probe reports `unsupported` — §13's stop condition — and **2** when it could not produce a report
+at all (`std::process::exit` at `doctor/src/main.rs`). Both were piped into `tee`, and a shell
+pipeline's status is the *last* command's, so `tee` returning 0 discarded them; only the following
+`jq` could fail the lane, and it can only speak to what reached the file. The `jq -e` defect in a
+second costume. Both lanes now redirect instead of piping, so the status is the doctor's.
+
+**What the first execution then reported, and what is not yet established.** With the test step
+green, the macOS gate ran and could not exec the binary —
+`target/debug/serial-nexus-doctor: cannot execute binary file` — 2.5 s after the step began, on a
+runner where `cargo build --workspace --locked` had just succeeded and the harness had just booted
+other binaries out of the same directory in the test step. That is `ENOEXEC`: not a signature
+problem, not a permission problem, but the file not being a loadable image for this architecture.
+**No cause is claimed.** The step now prints `uname -m`, `sw_vers`, `ls -la` and `file` on the
+binary before running it, so the next run says what it is instead of inviting the guess — and it
+prints on a *green* run too, so the evidence survives the fix. Recorded as an open observation, in
+§7's sense: measured behaviour, mechanism unestablished.
