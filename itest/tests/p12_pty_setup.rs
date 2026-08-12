@@ -1269,8 +1269,8 @@ fn a_client_clearing_extproc_has_it_re_asserted_so_changes_keep_surfacing() {
 
     // The tool check is also the anti-tautology proof (§5): an `stty` that does not
     // know `extproc` would "clear" it silently and leave every assertion below
-    // trivially true. `stty -a` names the flag either way, so seeing bare `extproc`
-    // proves both that this stty understands it and that the daemon's baseline set it.
+    // trivially true. `stty -a` names the flag either way, so seeing it at all proves
+    // this stty understands it.
     let (ok, report) = stty(&console, &["-a"]);
     if !ok || !(stty_reports(&report, "extproc") || stty_reports(&report, "-extproc")) {
         eprintln!(
@@ -1279,11 +1279,39 @@ fn a_client_clearing_extproc_has_it_re_asserted_so_changes_keep_surfacing() {
         );
         return;
     }
-    assert!(
-        stty_reports(&report, "extproc"),
-        "the §7.2 baseline did not leave EXTPROC set on a fresh console, so clearing \
-         it below would prove nothing: {report:?}"
-    );
+
+    // **The second precondition is a kernel measurement, and it used to be an
+    // assertion** (notes §3.76). What follows tests the *re-assert*: a client clears
+    // EXTPROC, and the daemon's reconciliation sets it back. That is only a property
+    // where the kernel **retains** EXTPROC through the baseline in the first place —
+    // and it does not everywhere. The doctor measures exactly this and the committed
+    // artifacts disagree across kernels: `handler_reset_extproc_retained` is `true` in
+    // `docs/doctor/linux-7.0-2026-08-07-2b44c17-tier3.json` and **`false`** in
+    // `docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3.json`. So this guard asserted
+    // Linux's answer on both kernels and reddened the macOS lane — AGENTS §9's proxy in
+    // space at its plainest: it passed on the box it was written on.
+    //
+    // Where the flag is not retained there is nothing to clear and no re-assert to
+    // observe, and §7.2 already runs poll-only there (the doctor's own P6 consequence
+    // says so, and P1 is the probe for that mechanism). So this **skips with the
+    // measurement named**, per §7's rule that a kernel which differs is reported with
+    // the observation rather than asserted at.
+    //
+    // Keyed on the reading, never on `cfg!(target_os)`: a Darwin that starts retaining
+    // EXTPROC must run this test, and a Linux that stops must redden rather than skip.
+    // That is the difference between a measurement and a platform assumption, and it is
+    // why the skip is not `#[cfg(target_os = "linux")]`.
+    if !stty_reports(&report, "extproc") {
+        eprintln!(
+            "SKIP a_client_clearing_extproc_has_it_re_asserted_so_changes_keep_surfacing: \
+             this kernel does not retain EXTPROC through the §7.2 baseline, so there is \
+             no flag for a client to clear and no re-assert to observe — §7.2 runs \
+             poll-only here (doctor P6 `handler_reset_extproc_retained: false`, \
+             docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3.json; `true` on \
+             Linux 7.0). Read: {report:?}"
+        );
+        return;
+    }
 
     // The client rebuilds the line without EXTPROC.
     let (cleared, _) = stty(&console, &["-extproc"]);

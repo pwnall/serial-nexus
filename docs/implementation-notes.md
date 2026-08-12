@@ -9989,20 +9989,33 @@ triples, and the doctor jq gate. The figure and its scope live in the plan's Sta
 `ignored` moved 4 → 6 because the two new kit suites carry ```ignore` doc examples like their four
 siblings, which is a documentation fact and not a coverage one.
 
-**`p3_idle_cost`, and why the first three readings were not evidence.** The session's first suite
-run failed it at **3.60 %** of a core against the 3.50 % drift ceiling, and two immediate re-runs
-read **5.50 %** and **4.30 %**. Measured the box before the code (AGENTS §8): a second Claude
-session, two `rust-analyzer` instances holding ~4 GB between them, a `vmcell build-kernels`, and
-this session's own 27-agent workflow fan-out. On the quiet box afterwards: **3.20, 2.90, 2.90,
-3.00, 3.00 %** — 5 of 5 under the ceiling, and green in the full suite run too. Not a defect and
-not a fix; a reading taken under uncontrolled load, which is the class of evidence AGENTS §8 exists
-to refuse.
+**`p3_idle_cost` is load-sensitive at its ceiling, and the first readings were not evidence.** The
+session's first suite run failed it at **3.60 %** of a core against the 3.50 % drift ceiling, and
+two immediate re-runs read **5.50 %** and **4.30 %**. Measured the box before the code (AGENTS §8):
+a second Claude session, two `rust-analyzer` instances holding ~4 GB between them, a
+`vmcell build-kernels`, and this session's own 27-agent workflow fan-out. Solo on the quiet box
+afterwards: **3.20, 2.90, 2.90, 3.00, 3.00 %** — 5 of 5 under the ceiling.
 
-What survives it is worth carrying rather than filing: the quiet-box figure is ~3.0 % against a
-ceiling of 3.5 % and a recorded 2 %, so the guard has roughly half a percentage point of headroom
-and this box needs to be quiet for it to hold. That is the tripwire behaving as designed — it is
-1.75× the artifact, deliberately tighter than the 20 % budget — but a future session that meets it
-red should measure the box first and reach for this paragraph before reaching for `back_off`.
+**But that does not settle it, and the honest record is that it failed again with the box to
+itself.** Two full `cargo test --workspace --no-fail-fast` runs on the quiet box, back to back: the
+first green, the second **3.80 % and red**. The suite runs test binaries in parallel, so the 10 s
+measurement window overlaps ~20 other targets — the contention is the suite's *own*, not the
+box's, and no amount of quiescing the machine removes it. So:
+
+* it is **not** a regression this session introduced (it failed before the first commit, on the
+  unmodified tree);
+* it is **not** explained away by external load, which is what the paragraph above would have
+  claimed if it had stopped at the solo readings;
+* it is a guard sitting ~0.3–0.8 pp under a ceiling it is measured against, whose outcome depends
+  on what else the runner is doing.
+
+Deliberately **not patched**. Raising the ceiling is the shape this repository forbids — the
+tripwire is 1.75× the committed artifact on purpose, and loosening it because it fired is silently
+re-fixing a decision (AGENTS §5). Re-measuring `docs/benchmarks/phase3.json` is the other
+disposition the test's own message names, and it is a decision needing a controlled box, not an
+edit. Filed as **plan §18 item 46** with every reading above. CI's Linux `check` job passed on the
+same commit, so no lane is red on it today; what is at risk is a developer's local
+`cargo test --workspace` and the credibility of the next red it produces.
 
 #### G. Refuted
 
@@ -10016,3 +10029,65 @@ load-bearing as a confirmed one (AGENTS §9).
   the elided spelling `_DEV_B`, which a literal grep for `SNX_REPLUG_DEV_B` cannot match. The
   weaker, true claim — that it is missing from the three *lane spellings* an operator copies — is
   B3 above, and it is the one that was fixed.
+
+---
+
+### 3.76 The macOS lane's one red test asserted Linux's answer, and the doctor had already measured otherwise
+
+**Design:** §7.2 (the EXTPROC re-assert), §7 (a kernel that differs is reported with the
+observation named), AGENTS §9 (proxy in space). **Found by reading CI rather than the tree:** the
+`macos` job had been the only red one for at least four consecutive runs, the v16 landing push
+included, and its failure was a **single** test out of 116 result lines — which is exactly the
+shape `--no-fail-fast` exists to make legible (§6).
+
+**The failure.** `a_client_clearing_extproc_has_it_re_asserted_so_changes_keep_surfacing`
+(`itest/tests/p12_pty_setup.rs`) tests §7.2's re-assert: a client rebuilds termios from scratch,
+clearing EXTPROC, and the daemon's reconciliation sets it back so later changes keep surfacing
+promptly instead of falling to the 3 s poll. Before clearing anything it *asserted* the baseline
+had left the flag set — "the §7.2 baseline did not leave EXTPROC set on a fresh console, so
+clearing it below would prove nothing". On Darwin `stty -a` answers `-extproc`, and it fired.
+
+**The reading was right and the assertion was wrong, and this was already measured.** The doctor
+probes exactly this property and the committed artifacts disagree across kernels by design:
+`handler_reset_extproc_retained` is **`true`** in
+`docs/doctor/linux-7.0-2026-08-07-2b44c17-tier3.json` and **`false`** in
+`docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3.json`. P6's own consequence prose says what
+follows from it — "this kernel did not retain EXTPROC afterwards … so the EXTPROC-gated
+`TIOCPKT_IOCTL` re-arm cannot fire at all" — and §7.2 already runs poll-only there. The guard was
+asserting Linux's answer on both kernels: AGENTS §9's **proxy in space** at its plainest, passing
+on the box it was written on.
+
+**Why its own anti-tautology check missed it.** It had one, aimed at a different hazard: an `stty`
+that does not *know* `extproc` would "clear" it silently and leave every later assertion trivially
+true, so the test skips where `stty -a` names the flag in neither polarity. That check is right and
+is kept. What it cannot see is the case where the tool knows the word and the **kernel** does not
+keep the flag — a vocabulary check standing in for a retention measurement.
+
+**The repair.** The second precondition becomes a measurement instead of an assertion: where the
+baseline did not leave EXTPROC set there is nothing to clear and no re-assert to observe, so the
+test **skips naming the reading and citing both artifacts**, which is §7's rule for a kernel that
+differs. Keyed on the reading and deliberately **not** on `cfg!(target_os)` — a Darwin that starts
+retaining EXTPROC must run this test, and a Linux that stops must redden rather than skip. Writing
+the skip as a `cfg` would have reintroduced the same defect pointing the other way.
+
+**Proof, and what it does not cover.** On Linux the test still *runs* — no SKIP line, 8 of 8 in the
+file — so the skip does not fire spuriously and the guard is not vacuous where it bites. The Darwin
+arm cannot be exercised on this box; its evidence is the CI log that produced the failure, which is
+the same reading the skip now keys on (job 94135042408, 2026-08-12). An honest "not exercised here"
+beats a proxy for it (AGENTS §9).
+
+**What the same CI run also bought, unasked: plan §18 item 18's suite half.** That job is a
+**whole-workspace macOS run at the current tree** — the thing item 18 records as owed, since
+`cargo test` compiled on no macOS at `3e23c52`. It read **859 passed · 1 failed · 6 ignored**, zero
+SKIP lines, on the CI arm64 runner, with the one failure being the guard above. Every target this
+session added ran there and passed: `meta_derive` 5/5, `meta_codec_authors_doc` 5/5,
+`p12_web_socket_default` 4/4. The figure is quotable only with its scope — **whole workspace
+(macOS)**, CI runner, not the x86_64 rig box — and it lands in the plan's Status table with that
+scope beside it.
+
+**And the capture half, made possible rather than done.** Item 18 also owes a macOS doctor
+artifact, and both doctor jobs now take one run and gate on its twin (item 43) — but only the
+Markdown was uploaded, so the JSON, which is the artifact of record (§3.74), was being discarded at
+the end of every run. Both jobs now upload the pair. That does not discharge item 18's capture
+half — a committed artifact is a deliberate act with an era stated, not a CI by-product — but it
+means the artifact no longer has to be re-taken by hand to exist.

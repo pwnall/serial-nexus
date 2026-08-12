@@ -26,7 +26,8 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 | **890 passing · 0 failed · 6 ignored**, of which **886 · 0 · 6** are workspace-own | Linux, default CI scope | 2026-08-12 | this session (notes §3.75) | 121 test-result lines over **117 cargo targets** (109 `Running` + 8 doc-test), zero SKIP lines; four passes and two lines are the nested `acme-codec` **and `tinymux-codec`** subprocesses (`p8_external_codec.rs`, which now builds and tests both template crates); rig attached but `SNX_CROSSOVER_A`/`_B` unexported, so `serial_hardware` self-skipped. The `ignored` moved 4 → 6 for a documentation reason, not a coverage one: the two new kit suites carry ```ignore` doc examples like their four siblings. The Linux authority row. |
 | **852 passing · 0 failed · 4 ignored**, of which **850 · 0 · 4** are workspace-own | Linux, default CI scope | 2026-08-07 | v15 Status re-measure; no sha recorded | 116 test-result lines over 114 cargo targets, zero SKIP lines; two passes and two lines are the nested `acme-codec` subprocess (`p8_external_codec.rs`). Superseded by the row above; kept because the delta between them was measured in one session at one scope. |
 | **835 passing · 0 failed · 4 ignored** | Linux, rig lane — and again at default CI scope, same session | 2026-08-05 | `17c6e87` (notes §3.68) | twice on the full rig lane, once at default CI scope, 835/0/4 each time — the last dual-scope measurement; superseded by the 852 re-measure of 2026-08-07; not the current-tree figure. |
-| **760 passing · 1 failed · 4 ignored** | macOS, gate scope **plus** `--exclude serial-nexus-replug` | 2026-08-05 | `60b9d0f` (notes §3.65) | not the documented scope — quote it with both exclusions. The macOS authority row, stale by construction; see the note below. |
+| **859 passing · 1 failed · 6 ignored** | **whole workspace (macOS)**, CI `macos-*` arm64 runner | 2026-08-12 | CI run 31603073173, job 94135042408 (notes §3.76) | the macOS authority row. No exclusions — CI runs `cargo test --workspace --locked --no-fail-fast`. Zero SKIP lines. The one failure is `a_client_clearing_extproc_has_it_re_asserted_so_changes_keep_surfacing`, which asserted Linux's EXTPROC retention on both kernels and is repaired in the same commit as this row; it is the *pre-fix* reading, kept because it is the measurement that found the defect. Not the x86_64 rig box — three machines, none substituting for another (plan §18 item 18). |
+| **760 passing · 1 failed · 4 ignored** | macOS, gate scope **plus** `--exclude serial-nexus-replug` | 2026-08-05 | `60b9d0f` (notes §3.65) | not the documented scope — quote it with both exclusions. Superseded by the row above; its one failure was the `rts-cts` platform gap §15.53 has since turned into an assertion of refusal. |
 | **3.94 s passive · 11.6 s Tier-3** (doctor wall clock) | Linux, one box | 2026-08-05 | `f8315cc` (notes §3.53) | a cost figure, not a gate figure; supersedes the 3.74 s of notes §3.50; pre-P14 — the P14 search takes a Tier-3 run to 35.0 s (`77f6798`, `docs/doctor/README.md`). |
 
 **The cargo-target count, re-derived** (plan §18 item 23c): the two prior records disagreed at
@@ -39,10 +40,13 @@ were measured equal only at the 835 era (row three); the equivalence was not re-
 or at 890 and must not be asserted at either. The macOS row: its extra exclusion existed because
 `serial-nexus-replug` did not build off Linux, and the crate split that fixed the build landed in
 the same session (notes §3.65), so the documented scope needs no second exclusion today; its one
-failure was the `rts-cts` platform gap §15.53 has since turned into an assertion of refusal; and
-**no macOS run exists at the current tree** — `cargo test` compiled on no macOS at `3e23c52`
-(notes §3.71, fixed at `25dcb9d`), so that lane owes a suite run and a doctor capture, a debt
-carried in plan §18.
+failure was the `rts-cts` platform gap §15.53 has since turned into an assertion of refusal; and the "no macOS run exists at the current tree" debt — `cargo test` compiled on no macOS at
+`3e23c52` (notes §3.71, fixed at `25dcb9d`) — is **half discharged**: the suite half is the top
+macOS row, run whole-workspace on the CI arm64 runner 2026-08-12. The **capture** half is still
+owed, and a CI artifact is not it: a committed `docs/doctor/` report is a deliberate act with its
+era stated (§16.13), not a build by-product. Both doctor jobs now upload the JSON twin beside the
+Markdown, so the artifact exists to be taken rather than having to be re-run by hand (plan §18
+items 8, 18).
 
 **Named scopes.** A scope name is part of the figure. Four are defined, and a figure taken at one
 scope never supersedes a figure taken at another:
@@ -948,8 +952,8 @@ executed bracket nor the Status line, and only a later audit caught it.
 **Numbering.** Items 1–15 keep their v15 meanings; ledger item numbers are cited from code and
 docs and are append-only — an executed item keeps its number as a disposition line, and a number
 is never reused. New items append from 16: carried-forward residuals are items 16–31,
-construction items are 32–44, and item 45 was filed 2026-08-12 by the alignment pass that
-executed most of 32–44 (notes §3.75).
+construction items are 32–44, and items 45 and 46 were filed 2026-08-12 by the alignment pass that
+executed most of 32–44 (notes §3.75, §3.76).
 
 **Schema.** An open item states, in order: **State** (open / executed / declined; size S/M/L;
 the session kind where one is needed — this line is the status a landing commit must flip),
@@ -1116,12 +1120,18 @@ Each item below uses the schema with its fields inline.
     rig proven 5-wire (notes §3.53) makes a break-reception probe feasible for the first time.
     *Validation:* rig-gated with a `required` spelling (plan §3 rule 11); reported-never-judged
     where wiring may legitimately be absent (§15.52's pattern).
-18. **The macOS capture and suite run owed at the current tree** — **open** (S, Mac rig
-    session). *Evidence:* the current `probe_set` era has no macOS triple, and no macOS suite
-    run exists at this tree — `cargo test` compiled on no macOS until the fix at `25dcb9d`
-    (notes §3.71). Distinct from item 15's arm64 box and item 8's `macos-26-arm64` image: three
-    machines, none substituting for another. *Validation:* the documented scope quoted with its
-    exclusions; the era row in `docs/doctor/README.md` updated.
+18. **The macOS capture and suite run owed at the current tree** — **open in its capture half
+    only** (S, Mac rig session). *Suite half executed 2026-08-12* (notes §3.76): CI's `macos` job
+    ran the **whole workspace** at this tree and read 859 passed · 1 failed · 6 ignored, zero SKIP
+    lines, with the one failure being a guard that asserted Linux's EXTPROC retention on both
+    kernels and is repaired in the same commit. The figure and its scope are in the Status table.
+    *Remainder:* the committed doctor artifact. Both doctor jobs now upload the JSON twin beside
+    the Markdown, so the capture exists to be taken — but a CI by-product is not a committed
+    artifact: §16.13 wants a deliberate capture with its era stated. *Evidence:* the current
+    `probe_set` era still has no macOS triple. Distinct from item 15's arm64 box and item 8's
+    `macos-26-arm64` image — three machines, none substituting for another; the run above is the
+    CI runner, which is item 8's machine and not item 15's. *Validation:* the documented scope
+    quoted with its exclusions; the era row in `docs/doctor/README.md` updated.
 19. **P10's drain ladder: both kernels' bounds** — **open** (S, one rig visit per kernel).
     *Evidence:* on Linux the ladder is bounded by its largest rung — 900 bytes against a
     ~15360-byte capacity — so no watermark bound is recoverable there, and the top-up is
@@ -1324,6 +1334,25 @@ existing — §8 names them as ledger items.
     `existing_terminal_is_refused_at_load_listing_the_shipped_kinds` asserts **today's**
     behaviour, so the upgrade reddens it loudly rather than passing through unnoticed — the
     handshake is deliberate.
+
+46. **`p3_idle_cost` sits too close to its own ceiling under suite parallelism** — **open**
+    (S/M; a measurement and then a decision, not an edit). Filed 2026-08-12 (notes §3.75 §I).
+    *Evidence:* the guard fails at **3.60 / 5.50 / 4.30 %** of a core under heavy external load,
+    reads **2.90–3.20 %** in five solo runs on a quiet box, and still read **3.80 % and red** in
+    one of two back-to-back whole-suite runs on that same quiet box — the suite runs targets in
+    parallel, so the 10 s window overlaps ~20 other binaries and the contention is the suite's own.
+    The ceiling is 3.50 %, being 1.75× the 2 % in `docs/benchmarks/phase3.json`. Not a regression
+    from this session: it failed on the unmodified tree. CI's Linux lane passes it.
+    *Declined, explicitly:* raising the ceiling because it fired — the tripwire is deliberately
+    tighter than the 20 % budget and loosening it is silently re-fixing a recorded decision
+    (AGENTS §5). *Remainder:* one controlled measurement deciding between the two dispositions the
+    test's own failure message names — the `ACTIVE_POLL`→`IDLE_POLL` backoff regressed, or the cost
+    is genuinely higher now and the artifact should be re-measured with its era stated. A third
+    disposition is available and must be chosen rather than drifted into: measure *under the
+    suite's own parallelism* and record that as the guard's operating condition, since that is
+    where it actually runs. *Validation:* the reading taken on a box with a stated load, three
+    samples minimum (P9/P10's rule — one sample of a varying quantity is indistinguishable from a
+    difference); any artifact update carries its date and commit.
 
 ### Evaluated and deliberately not scheduled — the closing register
 

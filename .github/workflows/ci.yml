@@ -199,10 +199,18 @@ jobs:
           cargo run -q --locked -p serial-nexus-doctor -- --markdown \
               --json-out serial-nexus-doctor-report.json | tee serial-nexus-doctor-report.md
           jq -e -f expectations/linux.jq serial-nexus-doctor-report.json
+      # **Both renderings, because only one of them is the artifact of record.** The
+      # Markdown is for reading; the JSON is the only form the gate and the field-set
+      # recompute can read, and the only one that records whether a value is a number,
+      # a string or a boolean (notes §3.74). Uploading only the Markdown wrote the twin
+      # and then threw it away at the end of every run — which is the half plan §18
+      # items 8 and 18 are owed captures of.
       - uses: actions/upload-artifact@v5
         with:
           name: serial-nexus-doctor-report
-          path: serial-nexus-doctor-report.md
+          path: |
+            serial-nexus-doctor-report.md
+            serial-nexus-doctor-report.json
 
   # Out-of-tree codec template (§15.26 / plan §10.3): build the out-of-tree stand-in
   # from the CONSUMER's own position (its own workspace manifest, path deps standing
@@ -257,10 +265,13 @@ jobs:
           cargo run -q --locked -p serial-nexus-doctor -- --markdown \
               --json-out serial-nexus-doctor-macos.json | tee serial-nexus-doctor-macos.md
           jq -e -f expectations/macos.jq serial-nexus-doctor-macos.json
+      # Both renderings — the Linux lane's reasoning, verbatim (notes §3.74).
       - uses: actions/upload-artifact@v5
         with:
           name: serial-nexus-doctor-macos-report
-          path: serial-nexus-doctor-macos.md
+          path: |
+            serial-nexus-doctor-macos.md
+            serial-nexus-doctor-macos.json
 
   # The web console's browser half, in real headless Chromium (design §15.37, plan §15).
   # §16.7's doctrine only allows a behavior the sim cannot exercise to be checklist-
