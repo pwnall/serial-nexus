@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `connect` / `disconnect` — live edge surgery (design §15.35; plan §14.2).
 //!
 //! The two verbs left §14 so that reshaping a graph stops meaning either

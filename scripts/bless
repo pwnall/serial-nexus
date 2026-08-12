@@ -135,7 +135,11 @@ done
 if [ "$rc" -eq 0 ]; then
   echo
   echo "Run the privileged tests with:"
-  echo "    SNX_REPLUG=required SNX_REPLUG_DEV=/dev/serial/by-id/<your-adapter> \\"
+  echo "    SNX_REPLUG=required SNX_REPLUG_DEV=/dev/serial/by-id/<adapter-a> \\"
+  echo "        SNX_REPLUG_DEV_B=/dev/serial/by-id/<adapter-b> \\"
   echo "        cargo test -p serial-nexus-itest --test p7_replug_hardware"
+  echo
+  echo "Both adapters are named on purpose: the renumbering test needs two to force a"
+  echo "swap, and under SNX_REPLUG=required its self-skip is a hard failure, not a skip."
 fi
 exit "$rc"

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 7 device-identity matrix, ported from `scripts/validate/phase7/matrix.sh`
 //! (design §12, plan §Phase 7 item 4). The §12 identity↔path resolution is exercised
 //! unprivileged against fixture `/dev/serial/by-id`, `/dev/serial/by-path`, and sysfs

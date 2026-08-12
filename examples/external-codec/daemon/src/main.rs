@@ -41,10 +41,22 @@ fn main() -> anyhow::Result<()> {
     // The one line an out-of-tree daemon adds: its own codec, registered by name.
     // A name collision with a built-in (or a reserved name) is a startup error, so
     // this `?` refuses before the daemon ever serves traffic (§8/§15.26).
-    let registry = Registry::with_builtins().register("acme", |_attributes| {
-        let codec: Box<dyn Codec> = Box::new(acme_codec::AcmeCodec::new());
-        Ok(codec)
-    })?;
+    let registry = Registry::with_builtins()
+        .register("acme", |_attributes| {
+            let codec: Box<dyn Codec> = Box::new(acme_codec::AcmeCodec::new());
+            Ok(codec)
+        })?
+        // A second codec, registered by chaining — and the shape of a factory that
+        // *takes attributes*: the opaque table goes straight to the codec crate's own
+        // schema, whose `Err` is a structural load failure with nothing created (§8
+        // clause 12, §11). Note what this closure does not do: it does not validate,
+        // default, or reinterpret anything. The schema belongs to the codec, which is
+        // why the codec's own tests can prove it (plan §18 item 39).
+        .register("tinymux", |attributes| {
+            let codec: Box<dyn Codec> =
+                Box::new(tinymux_codec::TinyMuxCodec::from_attributes(attributes)?);
+            Ok(codec)
+        })?;
 
     let options = RunOptions {
         socket: cli.socket,

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 6 wire hostility, ported from `scripts/validate/phase6/hostility.sh`
 //! (design §9 clause-4/6 clean-refusal contract, §7.4 leg self-heal).
 //!

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 8 browser-side console modules: the pure, DOM- and storage-free ES modules the
 //! web console is built out of (plan §11.9 / design §15.32) — today the offset-splice +
 //! retention core (`history.mjs`, spliced by the plan §11.8 tap offsets so a reload never

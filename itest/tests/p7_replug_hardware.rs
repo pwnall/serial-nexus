@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! §12's identity promise, measured against a **real** USB re-enumeration
 //! (design §15.45, notes §3.54).
 //!

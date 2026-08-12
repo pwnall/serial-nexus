@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 6 leg head-of-line slice, ported from
 //! `scripts/validate/phase6/head-of-line.sh` (design §9 whole-connection flow
 //! control, §15.22 direction independence).

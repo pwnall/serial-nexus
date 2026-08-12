@@ -1032,7 +1032,7 @@ behavioural, guarded.
 **Scale and gates.** Suite **485 → 630 passing / 0 failing / 4 ignored** (+145). `cargo fmt`,
 `cargo clippy` (workspace **and** minimal-daemon), `cargo deny check licenses bans sources`, the macOS
 cross-check, `serial-nexus-doctor --json | jq -e -f expectations/linux.jq` and the headless-Chromium suite
-(19 specs per push, 2 `@slow` nightly) are all green. This review's guards are the **`p12_*`** family in
+(19 specs per push at that landing, 2 `@slow` nightly — the per-push count has since grown; the plan's Status table is the home of the current figure (notes §3.75)) are all green. This review's guards are the **`p12_*`** family in
 `itest/tests/`, plus `p6_fragmentation.rs` (§15.24 named a leg guard by number and the leg family
 is `p6_*`) and new cases inside the modules that changed.
 
@@ -1592,7 +1592,7 @@ what it is looking at through the environment (`SNX_WEB_URL`, `SNX_ECHO_CONSOLE`
 
 ### §15.2 — the behaviour suites, and the three defects they found
 
-13 specs per push plus one nightly. What matters is the first run: **three failed, and
+13 specs per push plus one nightly (the figure at that landing; the current one lives in the plan's Status table). What matters is the first run: **three failed, and
 only one was a browser defect.** Each was independently adversarially verified before any
 fix shipped (§15.36 rule 5), and two of the five verifications materially corrected the
 diagnosis they reviewed — including one that corrected a comment this session had already
@@ -5805,6 +5805,16 @@ paired test assertion, the `supported` bullet in `docs/serial-nexus-doctor.md`, 
 around lines 707 and 889. They are adjacent to this change and out of its scope; the correction is
 owed and is recorded here rather than folded in quietly.
 
+<!-- ANNOTATION 2026-08-12 (§3.75, plan §18 item 23a). **All three are discharged.** The first two
+     were corrected in an earlier sweep and now quote the old wording as superseded history — the
+     uncharacterized-arm constant in `doctor/src/probes.rs` (with a guard forbidding the string
+     "Linux-only" in that constant) and `docs/serial-nexus-doctor.md`'s `supported` bullet. The
+     third was still live and is corrected in place, keeping the old sentence beside it: it was
+     wrong *twice over*, because P3's verdict never read the counters either (`p3_serial` turns on
+     `custom_baud_ok && exclusivity_ok`, and the committed
+     `macos-24.6.0-2026-08-05-1a9a8fc-tier3.json` reads P3 `supported` with
+     `tiocgicount_supported: false`), and P5 degrades on exactly two certificate *items*. -->
+
 ---
 
 ### 3.51 "Equal `probe_set` ⇒ comparable field by field" is false, and the tree holds the counterexample
@@ -9665,3 +9675,344 @@ rendering of every committed `.md` artifact, and §16.13 freezes those; it wants
 note before a patch. A heuristic parser already recovers 483 of 483 Tier-3 leaf paths and
 reproduces the printed digest, so the practical loss today is zero — but "recoverable by
 a heuristic" is not a contract, and it should not be mistaken for one.
+
+---
+
+### 3.75 The v16 alignment pass, executed: nineteen deviations found, and the codec-author surface closed
+
+**Design:** §15.54 (new, amend-first per §5), §5 (wiring invariant, loss taxonomy), §7.2, §8, §11.
+**Plan:** §18 items 32, 33, 34, 35, 37, 39, 40, 43, 44 and 23; plan §3's env-var table; the Status
+table's rig-lane scope.
+
+The v16 pair landed 2026-08-10 as a full rewrite whose alignment obligation was met *structurally*
+— a disposition map and ten blind verifiers over the documents. This session ran the other half of
+that obligation: the pair against **the tree**. Six readers took a region each and checked 460
+normative clauses against the code; each candidate went to an adversarial verifier that had read
+the claim and not the reasoning. **Nineteen survived, two were refuted.** The refutations are as
+load-bearing as the findings (AGENTS §9) and are recorded at the foot of this entry.
+
+The shape of what was found is worth stating before the list, because it is not the shape a
+rewrite is usually feared for. Not one finding was a rule the rewrite dropped. Fourteen were the
+opposite — **prose that outran the tree**: an absolute where the code has a documented exception, a
+figure re-cited rather than re-derived, a citation pointing one section off, a comment stating a
+constant the gate does not assert. Two were real product defects, one of them shipping. The
+rewrite's own invariant 2 held; what did not hold is that a document nobody executes drifts from
+the tree in the direction of *sounding* more settled than it is.
+
+#### A. The two product defects
+
+**A1. The web console resolved a socket the daemon never binds.** §10 says the control-socket path
+policy has "exactly one implementation". It had two: `web/src/rpc.rs` carried a copy with **two**
+arms where the policy has three — it never asked `geteuid`, so it read `XDG_RUNTIME_DIR` first and
+handed every process without a usable one the **root** arm `/run/serial-nexus-daemon.sock`, while
+`serial_nexus_rpc::default_socket_path` returns `/tmp/serial-nexus-daemon-<uid>.sock`. That is every
+unprivileged macOS session (no `XDG_RUNTIME_DIR`, no `/run`) and any stripped service environment
+exporting the variable empty; the console reported the daemon unreachable at a path nothing on the
+machine will ever create, under a `--help` line promising "defaults match the daemon, §10". All
+eleven web spawns in the harness pass `--socket`, so no test could see it. Fixed by deletion —
+`default_socket` is now one line delegating to the single implementation — and guarded by
+`itest/tests/p12_web_socket_default.rs`, which reads **two real processes** (the doctor's computed
+`daemon socket (default)` row and the line `serial-nexus-web` now logs before it binds) across three
+environments, because the policy's discriminators are `geteuid()` and one environment variable and
+mutating either in-process is `unsafe` (§16.3) and racy under the parallel runner. The guard also
+requires the case set to have **discriminated** — unprivileged, the three cases must land on two
+different arms — so it cannot pass by comparing one arm with itself. Fail-first: with the two-arm
+copy restored, the `unset` and `empty` cases fail naming both paths; the `set` case passes either
+way, which is exactly why it cannot be the only case.
+
+**A2. A duplicated serial number was refused with a remedy that does not work.** §12 clause 4
+requires the bare-serial ambiguity refusal to name every device *and the identity that pins each*.
+It printed each device's `usb:` identity — in the two-clone shape, one string both devices answer
+to, printed twice — and then advised "add by one of the identities listed here", which walks the
+operator into §15.10's resolution-side ambiguity guard: the add succeeds, the identity binds
+nothing, and the node waits forever with no further remedy named. It now offers what
+`capture_for_dev` would store for that device — the same fallback chain `add-node <path>` and
+`ports` read — so the identity offered is exactly what binding that device's path would bind, and
+where the chain bottoms out at `raw:` the message says so rather than dressing a path up as an
+identity.
+
+#### B. The gate holes
+
+**B1. Three doctor probes spelled an error `skipped`, and `skipped` is what the gate exempts.**
+§13 is categorical: `skipped` is never an error path's output. P8, P9 and P10 routed their
+catch-all `Err` arm there, and because the jq clauses exempt a skip, a probe that *errored* left
+`jq -e -f expectations/linux.jq` at exit 0 — the P9 discriminator clause and the two P10 content
+clauses going vacuously green exactly when the measurement they exist to guarantee was never taken.
+The same failure spelled `degraded` exits 1. This is §9's vacuity taxonomy catching the instrument
+that enforces §9.
+
+**B2. `serial-nexus-itest` never carried `#![forbid(unsafe_code)]`, and two of its own files said
+it did.** §16.3 and §5's tripwire table say `unsafe` lives only in `serial_nexus_sys` and
+everything else forbids it. The harness crate — its `src/lib.rs` plus every file under `tests/`,
+each its own crate root — carried the attribute nowhere; the invariant rested entirely on a grep
+that cannot see edition-2024 `unsafe(...)` attributes or macro-generated blocks, while comments in
+`p12_pty_setup.rs` and `p12_sim_idle_cpu.rs` told a reader checking the invariant that the
+attribute was present. **92 of 95 crate roots** were missing it (three already had it), the sweep
+compiles clean — nothing in the harness ever used `unsafe` — and the drift is now gated by
+`every_crate_root_forbids_unsafe_except_the_one_that_may_not`, which enumerates crate roots from
+the `crate_dirs` walk rather than from a list and checks **both** directions: the attribute must be
+present, and the `#![allow(unsafe_code)]` exception must be exactly `sys/src/lib.rs` and nothing
+else, because §16.3's whole value is that the answer to "where is the `unsafe`" is one directory.
+The gate proved itself the minute it existed: it reddened on `itest/tests/meta_derive.rs`, a file
+written by another agent in the same session and forgotten in exactly the way the gate exists to
+catch.
+
+**B3. The documented rig lane could not go green on the rig it describes.** Every normative
+spelling of the lane — AGENTS §3, the plan's Status scope list, and the command `scripts/bless`
+prints — set `SNX_REPLUG=required` without naming `SNX_REPLUG_DEV_B`. Without it,
+`identity_survives_a_replug_that_renumbers_the_tty` takes its `skip_no_replug` path, and the
+required-mode assert turns that legitimate skip into a **hard failure**. The variable was
+documented (elided as `_DEV_B` in two places, which is why a literal grep missed it and one
+auditor's stronger claim was refuted) — it was missing from the three places an operator copies.
+Plan §3's "Three further variables are parameters" was also an undercount: there are four.
+
+#### C. The design amendments (§15.54)
+
+Two findings were the design being wrong about code that is right, which AGENTS §5 makes an
+amendment rather than a patch.
+
+§5's wiring invariant states three endpoint states with **"not attached parks"** as an absolute.
+The leg's channel pump and the exec codec's mux route deliberately **drain and count** instead, and
+say why in place: a leg's channels share one socket, so a parked channel head-of-line blocks a
+cross-machine link (§9); the exec mux route runs inside the child's single stdout decode loop, so a
+parked mux event stalls every hostward channel queued behind it. The codec, map and pty park as
+written. The rule the tree actually follows is **park where the stall is confined to the endpoint
+whose edge was removed, drain where one pump serves many** — and it was stated correctly in the v12
+session log, with that exact qualifier, which was dropped when plan §14 promoted the invariant into
+§5's body. Recorded now as §15.54, with the sentence corrected in place and the reason it went
+uncaught named: nothing in the tree moved.
+
+Its twin: §5's loss taxonomy asserted that "the only counters that can ever move for targetward
+bytes are the purge family and the teardown ledger". Four shipped counters falsify that on a
+*healthy* graph — `discarded_targetward` (codec, exec), `discarded_no_raw_edge` (map),
+`discarded_unframable`, `discarded_peer_gone` — and the table had no row for the family. An
+absolute that makes its own instances unreadable is worse than no rule: a reader checking the tree
+against §5 would have found counters moving and no class to file them under. The table gains a
+**pump-side discard** row and the paragraph is narrowed to targetward *delivery* loss.
+
+#### C2. A deferral that refuses in a different shape than the vocabulary says
+
+§14 entry 15 (`existing-terminal`) is tagged *refused-at-load*, a state whose definition includes
+"the refusal is live, **tested** behavior — never a silent no-op". Nothing tested it: the refusal
+fell out incidentally of serde's internally-tagged `NodeConfig` enum and was asserted only by a doc
+comment, while its sibling entry 14 has a guard. It is now guarded — and writing the guard is what
+found the second half. The refusal is real (nothing is created, and the shipped node kinds *are*
+listed), but it is **not** entry 14's shape: `existing-terminal` is not a `NodeConfig` variant at
+all, so serde refuses the tag at `INVALID_PARAMS` rather than `GraphConfig::validate` refusing it
+structurally with the deferral named. §7.7's "the same treatment §7.1 gives the serial output leg"
+was therefore half-true, and the vocabulary's "the schema admits the words" was false of this entry.
+
+Dispositioned as a decision rather than a patch, both halves recorded so neither is silent: the
+design now states **both** shapes under `refused-at-load` and says which entry has which, and the
+upgrade — a variant refused in `validate` so the two deferrals read alike — is **plan §18 item 45**.
+The guard asserts *today's* behaviour on purpose, so landing item 45 reddens it loudly instead of
+passing unnoticed.
+
+#### D. Figures and citations
+
+**D1. §7.2's pts-queue depth was not the figure its artifact carries.** The design quoted
+"13.8–15 KiB recovered across the committed P10 captures" and cited
+`linux-7.0-2026-08-05-tier3.json`, which reads a flat `bytes_recovered_by_peer: 15360` in both
+directions. Worse, "13.8–15" is not one unit: 13.8 is 13824 bytes counted in **KB**, 15 is 15360
+counted in **KiB**, and no capture reads 13.8 KiB (14131 B). Re-derived across every committed
+Linux 7.0 P10 capture: **13824–15872 bytes**, varying run to run and direction by direction, with
+§15.46's cited triple spanning 13824–15360. §15.46 was already right; a v15-era un-artifacted
+number had been re-cited rather than re-derived at the rewrite — the exact move §16.13 and AGENTS
+§7 exist to stop, and `doctor/src/probes.rs` bans the same string from the shipped report.
+
+**D2. §11 over-stated the destroying-verb ledger.** It said `teardown`, `remove-node` and
+`load --replace` all reply with `torn_down` and `discarded_at_teardown`. `remove-node` carries no
+`torn_down` and never has — it removes one node, so a node count would say nothing; its pair is
+`cascaded_edges`, and `docs/rpc/configuration.md`, the schema authority, documents no such field.
+§5, §15.50 and every shipped guard scope the pair correctly. Corrected in the design, not on the
+wire.
+
+**D3. Thirteen sites cited §7.1 — the serial port node — for a rule that lives in §6.** The leg's
+implicit-acquire / idle-release / release-on-peer-disconnect rule is §6's "Write modes" clause 2,
+and §7.4 correctly refers back to it; eight sites in `nodes/leg.rs` and five in
+`p9_leg_arbitration.rs` sent a reader to a section containing no write-lock, idle, or
+peer-disconnect rule at all — one of them putting quotation marks around a sentence §7.1 does not
+contain, and one citing both sections for the same rule in one breath.
+
+**D4. Two more comments that were claims.** `daemon/src/lib.rs` pointed at
+`serial_nexus_core::socket` — a module that does not exist, and a placement a meta-gate has already
+refuted — one line above the call that correctly uses `serial_nexus_rpc::default_socket_path`; that
+is a *fourth* description of the policy §10 says has one implementation. And `ci.yml` told
+operators the Playwright lane holds the suite to floors of 19/10 specs where the gate's constants
+are 22/12 — a pair ci.yml has never stated correctly.
+
+**D5. `set_no_new_privs` was attempted, not established.** §15.45 lists
+"`PR_SET_NO_NEW_PRIVS`-guaranteed" among five bounds holding *by construction* on the
+capability-carrying replug helper, and `replug/src/linux/mod.rs` discarded the prctl's result. A
+failed prctl left a blessed process running unhardened and unreported. "By construction" is a
+promise about a `Result` nobody read.
+
+#### E. The exec battery told a deadline as a loss
+
+§8 promises the battery "reports a failed check with the deadline named on stderr", and plan §3's
+standing rule is that the harness marks `timed_out` so a deadline is never read as a drop. Only the
+*stdin-drain* deadline was ever named. The per-frame **echo** deadline that all four core checks
+gate on returned a silent `Recv::Timeout` that every caller collapsed into a bare `false`, with no
+discriminating field in the verdict — so "your codec did not answer in 2000 ms" and "your codec
+lost frames" arrived as byte-identical verdicts with empty stderr. The checks now return an outcome
+carrying `pass`, `timed_out` and a `detail`, `Recv` keeps `Timeout` and `Closed` apart, and the
+verdict carries `timed_out` and `details`. A guard pins both directions: the half-duplex fixture's
+failure must name the deadline, and a *passing* run must name none — without the second, the first
+would pass against a verdict that named a deadline unconditionally.
+
+Beside it, the `envelope` mode's stdin write was an unbounded `write_all` on a detached thread
+whose only bound was a **total** 5000 ms deadline on the child completing — while §8 states the
+idle deadline as a contract over *the battery*, in the paragraph that has just named both modes. A
+correct-but-slow child failed there at the wall clock its sibling passed it at. Both modes now
+drive the child through one boundary.
+
+#### F. The codec-author validation surface, closed
+
+§8's "Validating your codec" chapter named its own gaps and filed them rather than promising them.
+Six of the eight shipped this session; **items 36 and 38 stay open** and are the whole of what §8
+still defers.
+
+* **Item 32 — `attributes_are_structural`.** Generic over the table type, so the kit stays
+  dependency-free and never names a TOML crate. Every good table builds; every bad one returns
+  `Err` **without panicking** (a panic is not a structural refusal — it unwinds through the daemon
+  instead of aborting the load with a message an operator can act on) and names the key it refused.
+  Four negatives prove each arm bites: lenient, unwinding, and anonymous-refusal schemas. Three
+  consumers run it — the **exec** codec's schema (the richest in tree), the built-in `reference`
+  factory, and `tinymux` from the consumer position — so `precheck_codecs`' promise is now proven
+  from the position that depends on it rather than asserted about it.
+* **Item 33 — `recovers_after_garbage`.** Clause 6's codec-side half: after one refused frame the
+  next valid one decodes whole. `LatchesOnError` is its negative and its point — a decoder that
+  drains correctly, passes every other suite in the kit, and fails only this one. Its stated limit
+  is part of the suite: it injects an **envelope** frame with an unknown type byte so a
+  length-guided resyncer skips exactly `4 + body_len`, and it deliberately does **not** assert
+  re-alignment after unaligned noise, because where a correct resyncer re-aligns depends on the
+  noise and a suite demanding one answer would fail correct codecs. That is `lag.py`'s lesson,
+  applied inside the kit.
+* **Item 34 — the exec battery's error paths.** `--error-paths`, opt-in, three arms: an unknown
+  type byte at offset 4, an oversize length prefix at offset 0, a channel length overrunning its
+  body at offset 5. Each requires the child to **terminate**, to not echo the fault back as a valid
+  frame, and to **signal** the refusal — a non-zero exit or an `error` event, because a child that
+  swallows a fault and exits 0 is indistinguishable from one that never received it. `strict.py` is
+  the new positive control and the shape to copy where truncation must be reported; `passthrough.py`
+  fails all three, which is both the fail-first proof and the honest statement that a permissive
+  relay is legal but visible — this battery's `Hoarder`. The format's other two decode errors
+  (non-UTF-8 channel identity, non-UTF-8 `error` reason) are deliberately not injected: the
+  harness's own encoder cannot express them, so a hand-rolled frame would say more about our byte
+  poking than about the child.
+* **Item 35 — the demux shape.** `--mux-to <channel>` declares the swap a real demux performs, and
+  the *whole* battery then runs against the codec an author ships rather than a passthrough build
+  of it — the largest author-experience hole in the exec route. The golden battery gains one frame
+  in each direction of the declared mapping (so both halves are exercised whatever channel is
+  named), and liveness, fragmentation and restart drive the multiplexed side. Fail-first is the
+  same fixture without the flag: `passthrough-codec.py console` fails `golden`, because every
+  `console` frame comes back on the empty channel. Identity mode is byte-compatible — the map is
+  the identity function in every method and an undeclared run carries no `mux_to`.
+* **Item 37 — the author guide, executed.** Five guards in `meta_codec_authors_doc.rs`, every
+  expectation **parsed from the document**: a table lookup would be a hand-kept copy of the doc's
+  contents, and the first row someone added would be the row the gate never checked. The four
+  frozen hex vectors and the worked `data("", "AB")` example must equal `encode()`; the §5 TOML
+  block loads against a real daemon (four paths rewritten, each asserted present so a renamed one
+  cannot silently leave the original in place); every counter the closing paragraph names must be
+  one a graph carrying **both** codec kinds reports. Three mutations executed and reverted — one
+  hex digit in the table, one in the worked example, one invented counter — each reddening exactly
+  one guard. A fourth guard is the fail-first for the third: stripping the multiplexed
+  `write_mode` the doc spends a paragraph on must be refused naming the edge.
+* **Item 39 — the second template codec.** `tinymux-codec`: a two-channel tag framer
+  (`tag|kind|len|payload`) with parser state, byte-wise resync, and one attribute. It exists
+  because `acme` is a passthrough and exercises none of `control_event_round_trip`,
+  `assert_buffer_bounded`, or `attributes_are_structural` — the three suites now have a consumer
+  built from the consumer's position on every push. Deliberately **not** an envelope codec: a
+  device's own framing is the commoner case, and this shows what it costs. `info.codecs` moves to
+  `["acme", "exec", "reference", "tinymux"]` in the gate and the template README together, and the
+  gate additionally asserts that a bad attribute table is refused **naming the key** with nothing
+  created — §11's pre-create precheck, observed from outside the tree.
+
+#### H. The derive-from-tools gates (item 40), and one more hand-kept list
+
+AGENTS §3's closing rule — "CI enumerates loops from tools, never hand-kept lists; meta-gates
+assert *execution*, not file existence, and a scanning gate proves its **matcher** as well as its
+walker" — was doctrine with three of its four instances ungated. `itest/tests/meta_derive.rs` is
+the four gates, each enumerating both sides from their real sources and each proved fail-first
+against a planted stale entry.
+
+Two of them found something on arrival, which is the whole argument for the item:
+
+* **The probe roster in `doctor/src/main.rs`'s module doc was three probes stale** — it stopped at
+  P12 while the registry holds P15 — and nobody had noticed. The item sanctioned either repair;
+  **deleted** was the right one, because `docs/serial-nexus-doctor.md` is the registry of record
+  (§13) and a second roster in a module doc buys nothing it can keep true. That documented roster
+  was itself missing P15 until this same session (item 44), so both copies had drifted, in
+  different directions, at once.
+* **The fuzz gate that already existed was matching the wrong side.**
+  `every_unstable_fuzz_api_export_has_a_fuzz_target` enumerates targets by listing
+  `fuzz/fuzz_targets/*.rs`; CI's nightly loop iterates `cargo fuzz list`, which prints
+  `fuzz/Cargo.toml`'s `[[bin]]` names. An unregistered `.rs` file therefore answered "yes, a target
+  drives it" to the gate while never being built and never being fuzzed. The new gate is the
+  bijection between manifest and corpus, and it composes with the old one rather than replacing it
+  — stated in the file so nobody re-adds the duplicate. The manifest is *parsed*, not obtained by
+  shelling out: `cargo fuzz` needs nightly and lives only in the scheduled lane, so a gate that
+  called it would self-skip on every developer box and in every push lane, which is the vacuous
+  green the `required` lattice exists to prevent. Narrow parsing is safe in the only direction that
+  matters here, because the assertion is a bijection — a registration the parser misses leaves its
+  file unregistered, which is loud.
+
+A third enumeration was closed on the verifier's report rather than merely named: §13 rule 1's
+prose says "**The probe roster is P1–P15**", which is a hand-kept list wearing two numbers and the
+form most likely to survive a P16 unnoticed — a new row lands in the tables because the author is
+looking at them, and that sentence is a page away. Gate (b) now reads it against the same registry
+count, fail-first proven by planting `P1–P14`. Two enumerations remain ungated and are said rather
+than implied in the gate's own header: `expectations/{linux,macos}.jq` each carry a per-probe
+`.id == "PN"` clause, so a probe with no clause is ungated there — a gate-coverage question, not a
+roster-drift one.
+
+The same verifier caught two sentences this session's own repair falsified. The gate's header said
+the roster "appears three times outside `probes.rs`" and named the parenthetical the same unit of
+work had just deleted; and the replacement comment in `doctor/src/main.rs` said the roster "lives
+once", which the design's §13 glance table — checked by the very gate cited two sentences later —
+makes false. Both corrected. Worth recording rather than quietly fixing: a gate against hand-kept
+lists shipped with a hand-kept count in its own header, which is the failure mode arriving through
+the front door.
+
+And the fifth gate, written beside them for B2:
+`every_crate_root_forbids_unsafe_except_the_one_that_may_not` (above). It caught two things the
+hour it existed — `meta_derive.rs`, written minutes earlier and missing the attribute, and then
+**itself**: the detector's own `#![allow(unsafe_code)]` literal made `meta_gates.rs` read as a
+second exemption. Both needles are now built by concatenation, the same dodge the planted-`unsafe`
+sample beside it has always used, and the episode is left in the comment because a detector that
+matches itself is the failure mode this file exists to keep teaching.
+
+#### I. The gates, and one measurement that was the box rather than the code
+
+**Green at default CI scope: 890 passing · 0 failed · 6 ignored**, 121 test-result lines over 117
+cargo targets, zero SKIP lines — with build, both clippy lanes, fmt, `cargo deny`, both Apple
+triples, and the doctor jq gate. The figure and its scope live in the plan's Status table; the
+`ignored` moved 4 → 6 because the two new kit suites carry ```ignore` doc examples like their four
+siblings, which is a documentation fact and not a coverage one.
+
+**`p3_idle_cost`, and why the first three readings were not evidence.** The session's first suite
+run failed it at **3.60 %** of a core against the 3.50 % drift ceiling, and two immediate re-runs
+read **5.50 %** and **4.30 %**. Measured the box before the code (AGENTS §8): a second Claude
+session, two `rust-analyzer` instances holding ~4 GB between them, a `vmcell build-kernels`, and
+this session's own 27-agent workflow fan-out. On the quiet box afterwards: **3.20, 2.90, 2.90,
+3.00, 3.00 %** — 5 of 5 under the ceiling, and green in the full suite run too. Not a defect and
+not a fix; a reading taken under uncontrolled load, which is the class of evidence AGENTS §8 exists
+to refuse.
+
+What survives it is worth carrying rather than filing: the quiet-box figure is ~3.0 % against a
+ceiling of 3.5 % and a recorded 2 %, so the guard has roughly half a percentage point of headroom
+and this box needs to be quiet for it to hold. That is the tripwire behaving as designed — it is
+1.75× the artifact, deliberately tighter than the 20 % budget — but a future session that meets it
+red should measure the box first and reach for this paragraph before reaching for `back_off`.
+
+#### G. Refuted
+
+Two candidates did not survive verification, recorded because a refuted diagnosis is as
+load-bearing as a confirmed one (AGENTS §9).
+
+* **"The pty node's `advertised_baud` has no structurally checked maximum, against §5's wire
+  maxima."** The code facts were accurate as far as they went and the verifier still refuted the
+  finding.
+* **"`SNX_REPLUG_DEV_B` is documented nowhere."** False on this tree: two sites document it under
+  the elided spelling `_DEV_B`, which a literal grep for `SNX_REPLUG_DEV_B` cannot match. The
+  weaker, true claim — that it is missing from the three *lane spellings* an operator copies — is
+  B3 above, and it is the one that was fixed.

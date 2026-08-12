@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 6 leg-outage slice, ported from `scripts/validate/phase6/outage.sh`
 //! (design §7.4 leg lifecycle, §9 wire, §6 arbitration). A `serial-nexus-sim tcp-proxy`
 //! between two daemons severs the link mid-stream (`--drop-after`) and restores it
@@ -669,7 +671,8 @@ fn a_receiving_leg_purges_its_own_targetward_backlog_on_peer_disconnect() {
         Some(0),
         "purged bytes were also counted as an ordinary discard: {node}"
     );
-    // …and the leg gave the local endpoint's floor back on the way out (§7.1).
+    // …and the leg gave the local endpoint's floor back on the way out (§6's write
+    // modes clause 2 — release on peer disconnect; §7.4 refers back to it).
     assert!(
         wait_until(Duration::from_secs(5), || holder(rpc).is_none()),
         "the leg kept the local write lock after purging: {:?}",

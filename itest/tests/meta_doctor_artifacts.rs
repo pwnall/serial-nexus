@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The comparability rule, checked against the artifacts it is a rule about.
 //!
 //! `probe_set` equality was read as "these two reports are comparable field by

@@ -137,6 +137,14 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         None => new_token(),
     };
     let socket = serial_nexus_web::resolve_socket(args.socket);
+    // The resolved socket is **printed, not described** (notes §3.72). §10's default is
+    // a three-arm policy — root, `XDG_RUNTIME_DIR`, per-uid `/tmp` — and the one failure
+    // it can produce is a console looking where the daemon did not bind, which the
+    // operator otherwise only discovers as a 503 after opening a tab. Naming the path
+    // here, before anything binds, lets them compare it against `ls` rather than
+    // re-derive the rule from `--help`; it is the exact value handed to `ServerConfig`
+    // below, so it cannot describe a socket the bridge does not use.
+    tracing::info!("daemon control socket: {}", socket.display());
 
     // Host values accepted off loopback (DNS-rebinding defense, §15.29): always the
     // localhost family, plus any operator-declared names — normalized to the form the

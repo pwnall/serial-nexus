@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 2 data-plane slice, ported from `scripts/validate/phase2/data-path.sh`
 //! (design §5, §7.1, §7.2): real bytes flow client → daemon → device through a
 //! `serial → pty` graph, the §7.2 baseline termios is confirmed end to end, and

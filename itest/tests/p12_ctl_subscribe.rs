@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `serial-nexus-ctl subscribe` must **read its acknowledgement** (37-TOOL-2, design
 //! §10 / §15.16).
 //!

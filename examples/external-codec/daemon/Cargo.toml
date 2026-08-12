@@ -17,6 +17,7 @@ path = "src/main.rs"
 serial-nexus-daemon = { path = "../../../daemon" }
 serial-nexus-codec-api = { path = "../../../codec-api" }
 acme-codec = { path = "../codec" }
+tinymux-codec = { path = "../tinymux" }
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow = "1"

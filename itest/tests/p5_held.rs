@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 5 held-lock slice, ported from `scripts/validate/phase5/held.sh`
 //! (design §6 arbitration / held origins, §7.5 the demux codec).
 //!

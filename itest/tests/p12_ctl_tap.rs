@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Review 32, `CTL-1` — `serial-nexus-ctl tap` must **exit** on the terminal
 //! `tap.closed` notification instead of blocking forever on a live connection.
 //!

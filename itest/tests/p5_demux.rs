@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 5 deterministic demultiplexing, ported from `scripts/validate/phase5/demux.sh`
 //! (plan §Phase 5 item 1; design §7.5 codec, §5 loss accounting, §6 held lock,
 //! §15.17 no-hardware).

@@ -8,8 +8,11 @@ crate (§15.31); macOS is runtime-verified on real hardware. No implementation t
 fifteen items the ledger carried in, items 1, 2, 3, 5, 6, 7, 9, 10 and 11 are executed
 (2026-08-05/07; notes §3.55, §3.56, §3.57, §3.63, §3.70, §3.73); items 4 (residual only), 8, and
 12–15 remain open; items this generation files are appended from 16 — item numbers are
-append-only and never reused, and plan §18 carries each item's state, evidence, and validation;
-items 16–44, filed this generation, are all open at landing.
+append-only and never reused, and plan §18 carries each item's state, evidence, and validation.
+Of items 16–45: **23, 32, 33, 34, 35, 37, 39, 40, 43 and 44 were executed 2026-08-12** by the
+alignment pass that ran the v16 pair against the *tree* (notes §3.75; 460 clauses checked,
+nineteen deviations confirmed and repaired, two refuted), which also filed item 45; the rest
+remain open.
 The two-test whole-suite flake the Linux figure used to be quoted beside is closed (notes §3.70):
 a re-enumerated FT232R eats the first 64 bytes — one USB bulk packet — of the first traffic that
 crosses afterwards, every daemon-side counter reads 0, and it was never a product defect.
@@ -20,14 +23,20 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 
 | Figure | Scope | Date | Commit / record | Caveat |
 |---|---|---|---|---|
-| **852 passing · 0 failed · 4 ignored**, of which **850 · 0 · 4** are workspace-own | Linux, default CI scope | 2026-08-07 | v15 Status re-measure; no sha recorded | 116 test-result lines over 114 cargo targets, zero SKIP lines; two passes and two lines are the nested `acme-codec` subprocess (`p8_external_codec.rs`); rig attached but `SNX_CROSSOVER_A`/`_B` unexported, so `serial_hardware` self-skipped. The Linux authority row. |
+| **890 passing · 0 failed · 6 ignored**, of which **886 · 0 · 6** are workspace-own | Linux, default CI scope | 2026-08-12 | this session (notes §3.75) | 121 test-result lines over **117 cargo targets** (109 `Running` + 8 doc-test), zero SKIP lines; four passes and two lines are the nested `acme-codec` **and `tinymux-codec`** subprocesses (`p8_external_codec.rs`, which now builds and tests both template crates); rig attached but `SNX_CROSSOVER_A`/`_B` unexported, so `serial_hardware` self-skipped. The `ignored` moved 4 → 6 for a documentation reason, not a coverage one: the two new kit suites carry ```ignore` doc examples like their four siblings. The Linux authority row. |
+| **852 passing · 0 failed · 4 ignored**, of which **850 · 0 · 4** are workspace-own | Linux, default CI scope | 2026-08-07 | v15 Status re-measure; no sha recorded | 116 test-result lines over 114 cargo targets, zero SKIP lines; two passes and two lines are the nested `acme-codec` subprocess (`p8_external_codec.rs`). Superseded by the row above; kept because the delta between them was measured in one session at one scope. |
 | **835 passing · 0 failed · 4 ignored** | Linux, rig lane — and again at default CI scope, same session | 2026-08-05 | `17c6e87` (notes §3.68) | twice on the full rig lane, once at default CI scope, 835/0/4 each time — the last dual-scope measurement; superseded by the 852 re-measure of 2026-08-07; not the current-tree figure. |
 | **760 passing · 1 failed · 4 ignored** | macOS, gate scope **plus** `--exclude serial-nexus-replug` | 2026-08-05 | `60b9d0f` (notes §3.65) | not the documented scope — quote it with both exclusions. The macOS authority row, stale by construction; see the note below. |
 | **3.94 s passive · 11.6 s Tier-3** (doctor wall clock) | Linux, one box | 2026-08-05 | `f8315cc` (notes §3.53) | a cost figure, not a gate figure; supersedes the 3.74 s of notes §3.50; pre-P14 — the P14 search takes a Tier-3 run to 35.0 s (`77f6798`, `docs/doctor/README.md`). |
 
+**The cargo-target count, re-derived** (plan §18 item 23c): the two prior records disagreed at
+104 versus 106 `Running` lines because they were taken at different eras, not because either was
+wrong. Measured once on this tree: **109 `Running` + 8 doc-test = 117 cargo targets**, against 121
+`test result:` lines. The four-line gap is the nested template subprocesses.
+
 Two rows need sentences no cell can hold. The equivalence claim: default CI scope and rig lane
-were measured equal only at the 835 era (row two); the equivalence was not re-measured at 852
-and must not be asserted there. The macOS row: its extra exclusion existed because
+were measured equal only at the 835 era (row three); the equivalence was not re-measured at 852
+or at 890 and must not be asserted at either. The macOS row: its extra exclusion existed because
 `serial-nexus-replug` did not build off Linux, and the crate split that fixed the build landed in
 the same session (notes §3.65), so the documented scope needs no second exclusion today; its one
 failure was the `rts-cts` platform gap §15.53 has since turned into an assertion of refusal; and
@@ -41,9 +50,11 @@ scope never supersedes a figure taken at another:
 - **default CI scope** — Linux, `cargo test --workspace --locked`, no `SNX_*=required` mode
   exported: gated tests self-skip, visibly, under plan §3's skip discipline.
 - **rig lane** — Linux, by hand on the crossover box: `SNX_CROSSOVER=required SNX_REPLUG=required
-  SNX_TLS=required SNX_RIG_FLOW=required SNX_WEB_UI=required` with both ports named and
-  `--no-fail-fast` (notes §3.68; AGENTS §3's rig-lane spelling predates `SNX_WEB_UI` and is
-  corrected at landing; the env-var table is at plan §3).
+  SNX_TLS=required SNX_RIG_FLOW=required SNX_WEB_UI=required` with both ports named, **both
+  `SNX_REPLUG_DEV` and `SNX_REPLUG_DEV_B` named**, and `--no-fail-fast` (notes §3.68; AGENTS §3's
+  rig-lane spelling predates `SNX_WEB_UI` and is corrected at landing; `_DEV_B` was missing from
+  every spelling until 2026-08-12 — notes §3.75 — which made the documented lane fail rather than
+  skip; the env-var table is at plan §3).
 - **macOS gate scope** — `cargo test --workspace --exclude serial-nexus-web --no-fail-fast`, the
   documented Mac scope.
 - **whole workspace (macOS)** — no exclusions; one recorded measurement (2026-08-04 at `fa4b12d`,
@@ -188,8 +199,12 @@ compiles no test target, notes §3.71; then `cargo build --workspace --locked` a
 build step); `license-gate` (deny plus the planted-crate rejection proof); `doctor`
 (`jq -e -f expectations/linux.jq` over the probe run, report archived; `skipped(no adapter)` is a
 valid CI verdict, a failing probe is not — plan §3); `external-codec` (the consumer-position
-template build, plan §10.3); `macos` (the macOS gate scope, `--no-fail-fast`, the `macos.jq`
-gate; an arm64 runner, not the local x86_64 rig box — plan §18 item 8 owes its doctor artifact);
+template build, plan §10.3); `macos` (**whole workspace (macOS)** — `cargo test --workspace --locked --no-fail-fast`,
+with no exclusion — plus the `macos.jq` gate; an arm64 runner, not the local x86_64 rig box —
+plan §18 item 8 owes its doctor artifact. This line said "the macOS gate scope" until 2026-08-12,
+naming a *narrower* scope than the lane runs: harmless to the lane, which is stricter than its
+label, and not harmless to a figure taken from it, which rule 19 would have filed under a scope
+it was not measured at — notes §3.75);
 `web-ui` (Playwright under `SNX_WEB_UI=required`, spec-count floor). Scheduled/dispatch lanes:
 `soak-nightly`, `sweep-nightly` (`--include-ignored`), `web-ui-nightly`, `fuzz-nightly` (targets
 from `cargo fuzz list`, with an empty-list guard). The rig lane is by hand on the crossover box,
@@ -450,11 +465,16 @@ variables (rule 11).
 | `SNX_LICENSE_GATE` | Licensing-gate lane | Self-skip | Skip is a failure | — |
 | `SNX_SERIAL_PAIR=rig` | Forces `serial_pair_or_rig()` onto hardware (§15.48) — not a required mode | Software wins by default | Forcing with no rig visible is a hard failure, never a silent fallback | Provider printed before transmit |
 
-Three further variables are parameters, not gates. `SNX_CROSSOVER_A`/`_B` name the two rig port
+**Four** further variables are parameters, not gates. `SNX_CROSSOVER_A`/`_B` name the two rig port
 paths; after a renumbering replug they may name the swapped adapters — harmless on a symmetric
-crossover, and the test announces it (notes §3.54). `SNX_REPLUG_DEV` accepts only
-`/dev/serial/by-id/...` and hard-fails on any other form, because re-enumeration can renumber
-`ttyUSBn` — the premise §12 is built on (notes §3.54).
+crossover, and the test announces it (notes §3.54). `SNX_REPLUG_DEV` **and `SNX_REPLUG_DEV_B`**
+accept only `/dev/serial/by-id/...` and hard-fail on any other form, because re-enumeration can
+renumber `ttyUSBn` — the premise §12 is built on (notes §3.54). `_DEV_B` names the *second*
+adapter, and it is a parameter with a gate's consequence: `identity_survives_a_replug_that_
+renumbers_the_tty` needs two adapters to force a renumbering, so under `SNX_REPLUG=required` its
+absence is not a skip but a failure — which is why the lane spellings below name it. It was
+missing from every one of them until 2026-08-12 (notes §3.75), so the documented rig lane could
+not go green on the rig it describes.
 
 ### Context hygiene (§15.41)
 
@@ -868,7 +888,8 @@ module docs naming the finding ids — put a new review-32 guard there, not in a
    review 37 (37-WEBS-6): a reserve refuses at accept and so refuses the operator too; the
    shipped mechanism is a disjoint 32-slot pre-auth pool evicting its oldest member. The
    residual that cannot close — a sibling-port page can fetch its own `/ws` — is documented in
-   `docs/security.md` (§17, §15.29) — `p12_web_session.rs`, `p12_web_tls.rs`.
+   `docs/security.md` (§17, §15.29) — `p12_web_session.rs`, `p12_web_tls.rs`,
+   `p12_web_socket_default.rs` (the §10 default the console resolves — notes §3.75).
 10. **The first-read documents are part of the deliverable** — the 6.18 claim narrowed to its
     evidence, then closed by measurement, both artifacts committed; superseded in detail by
     notes §3.73's same-source comparison — the conclusions agree.
@@ -927,7 +948,8 @@ executed bracket nor the Status line, and only a later audit caught it.
 **Numbering.** Items 1–15 keep their v15 meanings; ledger item numbers are cited from code and
 docs and are append-only — an executed item keeps its number as a disposition line, and a number
 is never reused. New items append from 16: carried-forward residuals are items 16–31,
-construction items are 32–44.
+construction items are 32–44, and item 45 was filed 2026-08-12 by the alignment pass that
+executed most of 32–44 (notes §3.75).
 
 **Schema.** An open item states, in order: **State** (open / executed / declined; size S/M/L;
 the session kind where one is needed — this line is the status a landing commit must flip),
@@ -1128,18 +1150,22 @@ Each item below uses the schema with its fields inline.
     close-wait — the shape the failing macOS test inhabits (notes §3.29); the committed shapes
     all fix the reader's state before the close. *Validation:* measured on both kernels;
     presence-never-answer; the `field_set` move announced.
-23. **Prose and figure corrections, verified first** — **open** (S). Each sub-item is checked
-    against the current tree before editing — item 1's sweep may have discharged parts.
-    *Remainder:* (a) notes §3.49's three recorded "TIOCGICOUNT, which is Linux-only" sites —
-    verify, then discharge or drop. (b) P10's shipped consequence string still carries the two
-    raw/cooked byte figures backed by no committed artifact — the relation stays, the numbers
-    go; a deliberate output change, announced as one. (c) The two prior records of the suite's
-    cargo-target `Running` count disagree — re-derive once rather than copy either, landing
-    the result only in the plan Status table. (d) *Executed at the v16
-    landing:* `itest/tests/p8_web.rs:952`'s bare `(§14.3)` meant plan §14.3 and is respelled
-    `(plan §14.3)`; `expectations/linux.jq:1`'s `(plan §4.3)` meant the expectation-file gate
-    (now plan §3) and is respelled. *Validation:*
-    replacements greppable; frozen artifacts untouched (item 1's rules).
+23. **Prose and figure corrections, verified first** — **executed 2026-08-12** (notes §3.75).
+    Its own instruction — check each sub-item against the current tree before editing — is what
+    closed most of it: (a) of notes §3.49's three "TIOCGICOUNT, which is Linux-only" sites, two
+    were **already discharged**, both quoting the old wording as superseded history
+    (`doctor/src/probes.rs`'s `p5_verdict` arm and constant; `docs/serial-nexus-doctor.md`'s
+    bullet); the third, `docs/macos.md`'s "P3 / P5 degrade where `TIOCGICOUNT` is absent", was
+    corrected — §15.47 widened the predicate to `TIOCMGET || TIOCGICOUNT`, so P5 degrades on two
+    certificate *items*, not on characterization. (b) **Already discharged**: P10's shipped
+    consequence string states the raw/cooked relation without figures, and the withdrawal of the
+    "~13.8 KiB raw / ~23.5 KiB cooked" pair is recorded where the mode is measured. (c)
+    Re-derived once on the current tree: **106 `Running` lines + 8 `Doc-tests` = 114 cargo
+    targets**, against 116 `test result:` lines — the two prior records disagreed because they
+    were taken at different eras (104 at the 767 era, 106 at the 852 one), not because either was
+    wrong; the figure lands in the Status table and nowhere else. (d) Executed at the v16 landing:
+    `itest/tests/p8_web.rs:952`'s bare `(§14.3)` and `expectations/linux.jq:1`'s `(plan §4.3)`,
+    both respelled.
 24. **Leash coverage for `Sim` and raw daemon spawn sites** — **open** (S). *Evidence:* the
     stdin-EOF leash (§15.43) exists only via `Daemon::start`; `Sim` and the raw spawn sites are
     uncovered, and the notes §3.39 orphan's trigger is still unestablished. *Validation:*
@@ -1192,54 +1218,72 @@ The alignment pass's filings: the codec-author validation surface (§8) named it
 derive-from-tools doctrine named its missing gates. All are **open**; none is promised as
 existing — §8 names them as ledger items.
 
-32. **Conformance kit: attribute-schema suite** (S).
-    `attributes_are_structural(factory, good, bad[])` — builds on every good table, returns
-    `Err` and never panics on each bad one, refuses an unknown key naming the key. *Evidence:*
-    `precheck_codecs`' promise rests on codec-side behavior nothing lets an author prove from
-    the consumer position. *Validation:* a deliberately-lenient toy codec fails it, fail-first.
-33. **Conformance kit: Err-then-Ok recovery suite** (S). An opt-in stricter form of
-    `handles_garbage` for resyncing codecs; a never-resync codec exempts itself by not opting
-    in, mirroring `control_event_round_trip`. *Evidence:* the non-latching fault contract's
-    codec-side half is untestable today from the kit. *Validation:* a negative codec proving
-    the suite bites.
-34. **Exec battery: error-path fixtures** (M). Malformed frame, oversize length prefix, and
-    unknown type byte sent to the child; clean refusal asserted; the harness names the
-    offending byte offset. *Evidence:* five named decode error cases, zero fixtures exercising
-    an author's implementation of any. *Validation:* fail-first via a fixture that emits
-    garbage.
-35. **Exec conformance for the demux shape** (M). A declared channel mapping (`--mux-to
-    <channel>` or a small table) so a real channel-swapping child runs the full battery without
-    maintaining a passthrough build — the largest author-experience hole in the exec route.
-    *Validation:* the shipped `passthrough-codec.py console` shape passes the mapped battery;
-    identity mode stays byte-compatible.
+32. **Conformance kit: attribute-schema suite** (S). **Executed 2026-08-12** (notes §3.75):
+    `attributes_are_structural(factory, good, bad[])` in `codec-api/src/test_support.rs`, generic
+    over the table type so the kit still names no TOML crate. Four negatives prove it bites —
+    lenient, unwinding, and anonymous-refusal schemas — and three consumers run it: the exec
+    codec's schema, the `reference` factory, and `tinymux-codec` from the consumer position.
+33. **Conformance kit: Err-then-Ok recovery suite** (S). **Executed 2026-08-12** (notes §3.75):
+    `recovers_after_garbage`, opt-in, with `LatchesOnError` — a decoder that drains correctly,
+    passes every other suite in the kit, and fails only this one — as its negative. The
+    reference codec runs it. Its stated limit is part of the suite: it feeds an *envelope* frame
+    with an unknown type byte and does **not** assert re-alignment after unaligned noise, because
+    where a correct length-guided resyncer re-aligns depends on the noise (§8's kit-honesty rule).
+34. **Exec battery: error-path fixtures** (M). **Executed 2026-08-12** (notes §3.75):
+    `--error-paths`, opt-in, three arms — unknown type byte, oversize length prefix, a channel
+    length overrunning its body — each requiring the child to terminate, not relay the fault, and
+    *signal* the refusal; the verdict names the arm and the byte offset. `strict.py` is the new
+    positive control; `passthrough.py` fails all three, which is the fail-first proof and the
+    honest statement that a permissive relay is legal but visible. The two remaining decode
+    errors (non-UTF-8 channel identity, non-UTF-8 `error` reason) are deliberately not injected:
+    the harness's own encoder cannot express them.
+35. **Exec conformance for the demux shape** (M). **Executed 2026-08-12** (notes §3.75):
+    `--mux-to <channel>` on both exec modes. `passthrough-codec.py console` passes the whole
+    battery under its declared mapping and **fails golden without it** — the fail-first proof that
+    the mapping is load-bearing. Identity mode is byte-compatible: the map is the identity
+    function in every method, and a run with no mapping declares none in its verdict.
 36. **Golden transcripts of the daemon boundary** (L). Replayable byte transcripts of the
     daemon driving a demux (empty-channel in both directions, oversize fragmented, open/close,
     unconfigured-channel counted) plus a sim replay mode; generated by a test against the live
     daemon so they cannot drift. *Evidence:* golden vectors cover single frames; nothing gives
     an author the *conversation*. *Validation:* replay fails on a planted one-byte mutation.
-37. **Executable doc examples for `docs/codec-authors.md`** (M). Guards that load the doc's
-    TOML block against the daemon, assert the four hex vectors and the worked `data("", "AB")`
-    example equal `encode()`, and check its counter names against the state schema. *Evidence:*
-    the doc's byte-level claims are verified only by the hand that wrote them — item 1's rule
-    extended to author-facing prose. *Validation:* mutate one hex digit in the doc; the gate
-    reds.
+37. **Executable doc examples for `docs/codec-authors.md`** (M). **Executed 2026-08-12** (notes
+    §3.75): `itest/tests/meta_codec_authors_doc.rs`, five guards, every expectation *parsed from
+    the document* rather than typed beside it. Three mutations executed and reverted: one hex
+    digit in the frozen table, one digit in the worked `data("", "AB")` example, and one invented
+    counter name — each reddened exactly one guard. The doc's §5 TOML loads against a real daemon,
+    and stripping its multiplexed `write_mode` is refused naming the edge.
 38. **Codec-node teardown-conservation suite** (M). A conformance test shape asserting
     `discarded_at_teardown` and the conservation equality on a codec node under teardown, so an
     author inherits the loss-accounting promise (§15.50); folds review 37's codec guards into
     the kit surface (mid-chunk refusal with `accepted + discarded == total`, unknown-key naming,
     reserved-identity lifecycle, quoted exec paths, teardown-tolerant partial frame).
     *Validation:* notes §3.55's disjoint-reddening fail-first is the template.
-39. **A second template codec** (S; a small, deliberate scope decision). A tiny two-channel
-    framer with one attribute, exercising `control_event_round_trip`,
-    `assert_buffer_bounded`, and attribute validation from the consumer position — `acme` is a
-    passthrough and demonstrates none of the three. *Validation:* built from the consumer's
-    position per push, like the first template.
-40. **Derive-from-tools meta-gates** (M). Four gates closing hand-kept-list drift: (a) the
-    `SNX_*=required` roster enumerated from code; (b) doc probe enumerations matched against
-    the probe registry — or the enumeration deleted from `doctor/src/main.rs`; (c) each
-    `unstable_fuzz_api` re-export matched by a fuzz target; (d) the documented verb table
-    matched against `ctl`. *Validation:* each gate fail-first via a planted stale entry;
-    matcher and walker proven (AGENTS §3).
+39. **A second template codec** (S). **Executed 2026-08-12** (notes §3.75):
+    `examples/external-codec/tinymux/`, a two-channel tag framer (`tag|kind|len|payload`) with
+    parser state, byte-wise resync, and one attribute (`channels`). It runs the three suites
+    `acme` cannot, from the consumer position. Deliberately **not** an envelope codec: a device's
+    own framing is the commoner case. `info.codecs` moves to
+    `["acme", "exec", "reference", "tinymux"]` in the gate and the template README together, and
+    the gate additionally asserts a bad attribute table is refused naming the key with nothing
+    created — §11's pre-create precheck, from outside the tree.
+40. **Derive-from-tools meta-gates** (M). **Executed 2026-08-12** (notes §3.75) as
+    `itest/tests/meta_derive.rs`, four gates, each enumerating **both** sides from their real
+    sources and each fail-first against a planted stale entry. (a) The `SNX_*=required` roster,
+    from the harness code against plan §3's table. (b) Both documented probe rosters against the
+    registry in `probes.rs` — and the item's alternative was taken for the third copy: the
+    enumeration in `doctor/src/main.rs`'s module doc is **deleted**, because
+    `docs/serial-nexus-doctor.md` is the registry of record (§13) and that copy had drifted three
+    probes without anyone noticing. (c) A bijection between `fuzz/Cargo.toml`'s `[[bin]]` table
+    and the corpus directory: the pre-existing
+    `every_unstable_fuzz_api_export_has_a_fuzz_target` enumerates targets by *listing files*,
+    while CI's loop iterates `cargo fuzz list`, which reads the manifest — so an unregistered
+    `.rs` file satisfied the old gate while never being built or fuzzed. The manifest is parsed
+    rather than shelled out to, because `cargo fuzz` needs nightly and is installed only in the
+    scheduled lane; a gate that self-skipped on every push is the vacuous green the required-mode
+    lattice exists to prevent. (d) The documented verb index against the daemon and `ctl` (the
+    error-code table in the same file was already derived). One gate landed red on arrival, which
+    is the item working: it found the `main.rs` roster three probes stale.
 41. **`actual_baud` read-back on serial open** (M; new design content — the probe already
     proves the instrument). Report the actual rate beside the requested one in node state;
     reporting only, no verdict or fault change. *Evidence:* P14's `adapter-refused` class — a
@@ -1249,15 +1293,37 @@ existing — §8 names them as ledger items.
     `serial.rs`/`pty.rs`/log on it, preserving join-after-abort ordering — §16.1's recipe
     (notes §3.21) followed as written. *Validation:* existing boundary guards unchanged; no
     behavior delta, asserted by test.
-43. **`--json-out` everywhere the doctor runs twice** (S). Switch the CI doctor jobs and the
-    `docs/doctor/README.md` "Adding one" recipe to single-run capture — two runs of one rig are
-    two measurements (notes §3.74). *Validation:* the gate consumes the twin.
-44. **Aux-doc corrections** (S; not v16-pair work, but the pair must not inherit the errors).
-    `docs/macos.md` — annotate the withdrawn leaf-path figures in place (the §15.44 register
-    names them; notes §3.51). `docs/serial-nexus-doctor.md` — the P15 row, the closed-era
-    heading, the end-of-document caution. `docs/security.md` — name the blessed replug helper
-    or scope its door enumeration to the daemon. *Validation:* each correction greppable;
-    frozen artifacts untouched (item 1's rules).
+43. **`--json-out` everywhere the doctor runs twice** (S). **Executed 2026-08-12** (notes
+    §3.75): the `docs/doctor/README.md` "Adding one" recipe and both CI doctor jobs take one run
+    and gate on its twin — `--json-out <path>` then `jq -e -f expectations/<os>.jq <path>`,
+    verified end to end (exit 0 on both halves). The recipe now states why: P9's and P10's numbers
+    move run to run, which is the same reason the era diffs take three samples.
+44. **Aux-doc corrections** (S). **Executed 2026-08-12** (notes §3.75); no clause had been
+    discharged by an earlier sweep, and two of them were worse than filed. `docs/macos.md`: the
+    withdrawn 32/35 leaf-path pair was still **live** in the sentence it serves, not merely
+    unannotated — replaced with the reproducible 65/71 and annotated in place under §15.44's
+    register, the counterexample being *bigger* than was stated, not smaller; and the
+    `TIOCGICOUNT` bullet (item 23a's third site) was wrong twice over, since P3's verdict never
+    read the counters either. `docs/serial-nexus-doctor.md`: the P15 row was not stale but
+    **absent** — the roster ran P1–P14 — which is the drift shape item 40 gates. `docs/security.md`:
+    its door enumeration is now explicitly the *daemon's*, with the blessed replug helper given its
+    own section stating §15.45's five bounds rather than a line implying a fourth daemon door.
+    Frozen `docs/doctor/` artifacts untouched.
+
+45. **`existing-terminal`'s refusal, made structural** (S; a decision first, then a small patch).
+    Filed 2026-08-12 (notes §3.75) rather than done silently, because it is a change to what an
+    operator reads. *Evidence:* §14 entry 15 is *refused-at-load*, and the refusal is real,
+    live and now guarded — but it is serde's unknown-variant error at `INVALID_PARAMS`, which
+    lists the shipped kinds and cites nothing, where entry 14's sibling is a structural error
+    from `GraphConfig::validate` naming the deferral and its section. §7.7's "the same treatment
+    §7.1 gives the serial output leg" was the claim that made the gap visible; the design now
+    states both shapes instead (§14's vocabulary). *Remainder:* add a `NodeConfig` variant for
+    it refused in `validate` with a "not implemented (§14)" message, so the two deferrals of one
+    kind read alike — or record the decision that a schema which never admits the word is the
+    better answer and close the item. *Validation:* the existing guard
+    `existing_terminal_is_refused_at_load_listing_the_shipped_kinds` asserts **today's**
+    behaviour, so the upgrade reddens it loudly rather than passing through unnoticed — the
+    handshake is deliberate.
 
 ### Evaluated and deliberately not scheduled — the closing register
 

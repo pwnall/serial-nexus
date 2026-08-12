@@ -438,7 +438,7 @@ impl Resolver {
         if matches.len() > 1 {
             return Err(ResolveError::Malformed {
                 input: serial.to_owned(),
-                reason: ambiguous_serial_reason(&matches),
+                reason: self.ambiguous_serial_reason(&matches),
             });
         }
         let Some((dev_path, _)) = matches.pop() else {
@@ -474,6 +474,70 @@ impl Resolver {
             .into_iter()
             .filter(|(_, info)| usb_serial_field(&info.identity) == Some(serial))
             .collect()
+    }
+
+    /// The refusal a bare *serial number* gets when more than one present device
+    /// carries it (§12 clause 4): every device that carries it **and the identity
+    /// that pins each**.
+    ///
+    /// A raw path pins the device, so capture can degrade a duplicated serial to the
+    /// by-path identity of *that* device; a serial number pins nothing, so there is
+    /// no device to degrade to and picking one binds a physical port the operator
+    /// never named. Both shapes land here — two clones with one hard-coded serial,
+    /// and one multi-port adapter whose UARTs differ only in the interface index —
+    /// and they want different answers, so the identity offered per device comes from
+    /// [`Self::capture_for_dev`], the same fallback chain `add-node <path>` and
+    /// `ports` read. What this message offers is therefore exactly what binding that
+    /// device's path would store, never a second opinion about it: each UART's own
+    /// `usb:` identity for the multi-port adapter, and for the clones the by-path
+    /// identity `ports` lists for each.
+    ///
+    /// It used to print every device's `usb:` identity unconditionally — in the clone
+    /// shape one string both devices answer to, printed twice — and then advise "add
+    /// by one of the identities listed here". That advice walked the operator into
+    /// the resolution-side ambiguity guard (§15.10's three doors, [`Self::find_usb`]):
+    /// the add succeeds, the identity binds nothing, and the node waits forever with
+    /// no further remedy named. A refusal that names a remedy owns whether it works.
+    ///
+    /// Where the chain bottoms out at `raw:` — no by-path tree, the `/sys`-only
+    /// container §12 keeps returning to — nothing published here pins the *adapter*,
+    /// and the message says that rather than dressing a path up as an identity.
+    ///
+    /// The chain costs one `<sys_root>/class/tty` listing per device named, since
+    /// [`Self::capture_for_dev`] re-asks whether each identity is ambiguous. This
+    /// runs once per *refused* `add-node`, over the two-to-four devices one serial
+    /// number named, and nothing here opens a device (§15.35) — so it is `stat`s on
+    /// an error path, not DTR on a hot one.
+    fn ambiguous_serial_reason(&self, matches: &[(PathBuf, UsbInfo)]) -> String {
+        let mut unpinned = false;
+        let devices: Vec<String> = matches
+            .iter()
+            .map(|(path, _)| {
+                let dev_name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let raw = format!("/dev/{dev_name}");
+                let pinning = self.capture_for_dev(&dev_name, path.clone(), &raw);
+                unpinned |= pinning.kind == DeviceKind::Raw;
+                format!("{} → {}", path.display(), pinning.identity)
+            })
+            .collect();
+        // Said once, after the list: a device-by-device caveat repeated for each clone
+        // buries the list it is about. The wording deliberately carries no
+        // scheme-prefixed token of its own — a bare `raw:` in the prose would read as
+        // one more identity on offer, and this message's whole defect was offering an
+        // identity that resolves to nothing.
+        let caveat = if unpinned {
+            "; where the list shows a raw path, no by-path entry covers that device here, so it names the path and not the adapter — nothing published here pins that one across a replug"
+        } else {
+            ""
+        };
+        format!(
+            "{} present devices carry this serial number ({}) — a serial number that names more than one adapter pins none of them; add by the identity listed against the adapter you mean, or by its device path{caveat} (§12)",
+            devices.len(),
+            devices.join(", ")
+        )
     }
 
     /// The best identity for a present device node, applying the §12 fallback
@@ -948,26 +1012,6 @@ fn ambiguous_warning(matches: &[(PathBuf, UsbInfo)]) -> String {
         .collect();
     format!(
         "ambiguous usb identity: {} present devices answer to it ({}) — a duplicated serial number pins no single adapter, so nothing is bound and the node stays waiting; bind each adapter by the by-path: identity `ports` lists for it instead (§12)",
-        devices.len(),
-        devices.join(", ")
-    )
-}
-
-/// The refusal a bare *serial number* gets when more than one present device carries
-/// it (§12/§15.10). A raw path pins the device, so capture can degrade a duplicated
-/// serial to the by-path identity of *that* device; a serial number pins nothing, so
-/// there is no device to degrade to and picking one binds a physical port the
-/// operator never named. Both shapes land here — two clones with one hard-coded
-/// serial, and one multi-port adapter whose UARTs differ only in the interface index
-/// — so the refusal names every device that carries it and the identity that pins
-/// each, which is the way out `ports` shows too.
-fn ambiguous_serial_reason(matches: &[(PathBuf, UsbInfo)]) -> String {
-    let devices: Vec<String> = matches
-        .iter()
-        .map(|(p, info)| format!("{} ({})", p.display(), info.identity))
-        .collect();
-    format!(
-        "{} present devices carry this serial number ({}) — a serial number that names more than one adapter pins none of them; add by one of the identities listed here, or by the device path (§12)",
         devices.len(),
         devices.join(", ")
     )
@@ -2112,6 +2156,153 @@ mod tests {
         assert_eq!(r.resolve_current_path("DUP"), None);
     }
 
+    /// Every identity a resolver message **offers** the operator: its tokens carrying
+    /// a §12 scheme prefix. A remedy that names an identity is a remedy only if that
+    /// identity resolves, so the tests below scan the whole message instead of
+    /// asserting one hand-picked substring — the shape this catches is precisely a
+    /// message that reads as helpful and names a string pinning nothing.
+    fn offered_identities(message: &str) -> Vec<&str> {
+        message
+            .split([' ', ',', '(', ')'])
+            .filter(|t| t.starts_with("usb:") || t.starts_with("by-path:") || t.starts_with("raw:"))
+            .collect()
+    }
+
+    #[test]
+    fn the_duplicate_serial_refusal_names_the_by_path_identity_that_pins_each() {
+        // §12 clause 4: a serial number two present devices answer is refused *naming
+        // every device and the by-path identity that pins each*. The refusal named
+        // every device and then, for the identity, printed each device's `usb:`
+        // string — which in this shape is one identity both clones answer to, printed
+        // twice. Its own advice ("add by one of the identities listed here") therefore
+        // routed the operator straight into the resolution-side ambiguity guard: the
+        // add succeeds, nothing binds, and the node waits forever (§15.10's three
+        // doors). The remedy a refusal names has to work, so this asserts the
+        // *property* — every identity the message offers resolves, and between them
+        // they pin each device once — rather than a substring.
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        add_usb_device(
+            t.path(),
+            "1-1",
+            "ttyUSB0",
+            "usb-Clone_DUP-if00-port0",
+            "1a86",
+            "7523",
+            Some("DUP"),
+            "00",
+            None,
+        );
+        // udev publishes exactly one by-id link for the colliding name (RES-1), so
+        // the second clone is unlinked there — but by-path names physical ports, and
+        // a port is not a function of the serial number, so both are covered here.
+        add_usb_device_unlinked(
+            t.path(),
+            "2-1",
+            "ttyUSB1",
+            "1a86",
+            "7523",
+            Some("DUP"),
+            "00",
+            None,
+        );
+        let by_path = t.path().join("dev/serial/by-path");
+        std::fs::create_dir_all(&by_path).unwrap();
+        std::os::unix::fs::symlink("../../ttyUSB0", by_path.join("pci-0:1:1.0-port0")).unwrap();
+        std::os::unix::fs::symlink("../../ttyUSB1", by_path.join("pci-0:2:1.0-port0")).unwrap();
+
+        let Err(ResolveError::Malformed { reason, .. }) = r.resolve_input("DUP") else {
+            panic!("a serial two adapters carry must be refused");
+        };
+        for dev in ["ttyUSB0", "ttyUSB1"] {
+            assert!(
+                reason.contains(dev),
+                "the refusal must name every device that carries it: {reason}"
+            );
+        }
+        let offered = offered_identities(&reason);
+        assert_eq!(
+            offered.len(),
+            2,
+            "one identity per device the refusal names: {reason}"
+        );
+        let pinned: Vec<Option<PathBuf>> = offered
+            .iter()
+            .map(|id| r.resolve_current_path(id))
+            .collect();
+        assert_eq!(
+            pinned,
+            vec![
+                Some(t.path().join("dev/ttyUSB0")),
+                Some(t.path().join("dev/ttyUSB1")),
+            ],
+            "every identity the refusal offers must pin the device it is listed \
+             against — offered {offered:?} in {reason}"
+        );
+    }
+
+    #[test]
+    fn the_duplicate_serial_refusal_admits_when_nothing_pins_a_clone() {
+        // The same shape in the environment §12 keeps returning to: `/sys` and no udev
+        // rules at all (a container handed a bare `--device=`), so there is no by-path
+        // tree to degrade into. There is genuinely no identity that pins either clone
+        // here, and the refusal must say that rather than reach for a string that
+        // reads like one — a `usb:` identity both clones answer to is exactly such a
+        // string. What is left is what `ports` shows for these devices and what
+        // binding their paths would store: the raw-path escape hatch, named as the
+        // fallback it is (§12's fallback chain).
+        let t = TmpTree::new();
+        let r = Resolver::new(t.path());
+        add_usb_device_unlinked(
+            t.path(),
+            "1-1",
+            "ttyUSB0",
+            "1a86",
+            "7523",
+            Some("DUP"),
+            "00",
+            None,
+        );
+        add_usb_device_unlinked(
+            t.path(),
+            "2-1",
+            "ttyUSB1",
+            "1a86",
+            "7523",
+            Some("DUP"),
+            "00",
+            None,
+        );
+
+        let Err(ResolveError::Malformed { reason, .. }) = r.resolve_input("DUP") else {
+            panic!("a serial two adapters carry must be refused");
+        };
+        assert!(
+            !reason.contains("usb:1a86:7523:DUP:00"),
+            "the identity both clones answer to pins neither, so the refusal must not \
+             offer it: {reason}"
+        );
+        assert!(
+            reason.contains("by-path"),
+            "the refusal must say the pinning identity is missing, not stay silent \
+             about why it names none: {reason}"
+        );
+        let offered = offered_identities(&reason);
+        let pinned: Vec<Option<PathBuf>> = offered
+            .iter()
+            .map(|id| r.resolve_current_path(id))
+            .collect();
+        assert_eq!(
+            pinned,
+            vec![
+                Some(t.path().join("dev/ttyUSB0")),
+                Some(t.path().join("dev/ttyUSB1")),
+            ],
+            "whatever the refusal offers must still resolve one device each — \
+             offered {offered:?} in {reason}"
+        );
+    }
+
     #[test]
     fn a_multi_port_adapters_one_serial_names_no_single_uart() {
         // The shape §12 has in mind when it says the interface index is part of the
@@ -2143,11 +2334,19 @@ mod tests {
             None,
         );
 
-        assert!(
-            matches!(r.resolve_input("MP1"), Err(ResolveError::Malformed { .. })),
-            "one serial over two interfaces names no single UART"
-        );
+        let Err(ResolveError::Malformed { reason, .. }) = r.resolve_input("MP1") else {
+            panic!("one serial over two interfaces names no single UART");
+        };
         assert_eq!(r.resolve_current_path("MP1"), None);
+        // Here the `usb:` identities *do* pin — the interface index is part of the
+        // identity precisely for this adapter (§12) — so the refusal must offer them
+        // and not degrade to a topology identity that says less. Same property as the
+        // clone shape, opposite arm of the fallback chain.
+        assert_eq!(
+            offered_identities(&reason),
+            vec!["usb:0403:6011:MP1:00", "usb:0403:6011:MP1:01"],
+            "the refusal must offer each UART's own identity: {reason}"
+        );
         // Each interface is still bindable by the identity that does pin it — the
         // refusal is scoped to the ambiguous *input*, not to the adapter.
         assert_eq!(

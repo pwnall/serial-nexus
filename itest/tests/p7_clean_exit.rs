@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The daemon's **clean-exit seam** (design §10 control socket, §7.2 pty teardown,
 //! §11/§15.9 state persistence) — the path review 37 found nothing observing
 //! (37-SEAM-1).

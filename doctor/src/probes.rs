@@ -33,6 +33,10 @@
 //! decision should be made against (P9, P10, P11). "This kernel behaves
 //! differently from the dev box" is `degraded` with the observation named, or
 //! `skipped` where the mechanism does not exist at all — never `unsupported`.
+//! **"The probe itself failed" is `degraded` too, never `skipped`** ([`measurement_failed`]):
+//! `skipped` is the one word every conditional clause in `expectations/*.jq`
+//! exempts, so an error path wearing it exempts itself from exactly the clauses
+//! that exist to notice the measurement is missing (§13).
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -1843,6 +1847,47 @@ fn p13_shape(shape: CloseShape) -> anyhow::Result<CloseResult> {
 }
 
 // ---------------------------------------------------------------------------
+// The verdict P8/P9/P10 take when the measurement itself failed (§13)
+// ---------------------------------------------------------------------------
+
+/// The verdict a kernel-diff probe takes when its measurement did not run.
+///
+/// **`skipped` is not available here, and the reason is mechanical rather than
+/// stylistic.** It is the one word every conditional clause in
+/// `expectations/{linux,macos}.jq` exempts — the exemption exists so a `--port`-gated
+/// probe does not redden a passive lane — so an error path spelling itself `skipped`
+/// exempts itself from exactly the clauses that exist to notice a measurement is
+/// missing. Measured, not reasoned: with these three arms spelling `skipped`, a
+/// report in which P8, P9 and P10 all errored passed `jq -e -f expectations/linux.jq`
+/// at exit **0**, taking P9's discriminator clause and both of P10's content clauses
+/// green with it; the identical failure spelled `degraded` exits 1. That is §13's
+/// rule verbatim ("`skipped` is never an error path's output") and it is why the
+/// three arms route here instead of each spelling their own word.
+///
+/// `degraded` is what §13 gives a run that could not ask its question, and it costs
+/// no lane its exit code on its own account: the summary clause fails on
+/// `unsupported` alone, and `unsupported` would be wrong — none of these three
+/// probes is a premise the daemon depends on, so an unmeasured one contradicts
+/// nothing. What it does do is redden the clauses that were about to certify a
+/// measurement nobody took, which is the whole point.
+///
+/// The error is named twice, deliberately. `probe_error` is the structured cell a
+/// gate or a cross-kernel diff can read — a `degraded` with no observation is a
+/// verdict word, and §13 forbids diffing those — and the consequence sentence is
+/// what an operator reads, keeping the old wording's correct half: what the failure
+/// does *not* put at risk.
+fn measurement_failed(p: Probe, e: &anyhow::Error, consequence: &str) -> Probe {
+    p.observe("probe_error", e.to_string()).verdict(
+        Status::Degraded,
+        &format!(
+            "{consequence} The measurement did not run: {e}. Reported `degraded` rather than \
+             `skipped` because a probe that errored still owes the gate the answer it did not \
+             give, and `skipped` is the word that would excuse it (§13)."
+        ),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // P8 — epoll vs read(2) on a pty master (invariant 1, §15.18, §13)
 //
 // Linux-only in substance, but NOT `#[cfg]`-gated: `serial_nexus_sys::Epoll` keeps a
@@ -1976,12 +2021,23 @@ const P8_PASS_PAUSE: Duration = Duration::from_millis(1);
 ///   under `ready_then_no_data` rather than `ready_then_eagain` so the two are
 ///   never conflated.
 pub fn p8_epoll_readiness() -> Probe {
+    p8_verdict(p8_inner())
+}
+
+/// P8's verdict, split from its measurement so that every arm is reachable from a
+/// unit test on a box that can produce none of its input (§13: verdicts are pure
+/// functions of measured facts, which is how `p5_verdict` and `p12_verdict` are
+/// tested where the rig cannot exist). The **error** arm is why the split was
+/// worth taking: a box that can open a pty cannot be asked to fail one on demand,
+/// so the arm §13's `skipped` rule governs had no executable test at all, and it
+/// was wrong for exactly as long.
+fn p8_verdict(measured: anyhow::Result<(EpollSpin, EpollSpin)>) -> Probe {
     let p = Probe::new(
         "P8",
         "epoll vs read(2) on a pty master",
         "Does epoll report a pty master readable while read(2) returns EAGAIN — the busy-loop shape that made the data plane use poll(2) instead (invariant 1, §15.18)?",
     );
-    match p8_inner() {
+    match measured {
         Ok((idle, hungup)) => {
             let p = p
                 .observe("slave_open_idle", idle.observations(P8_TIMEOUT_MS))
@@ -2007,17 +2063,28 @@ pub fn p8_epoll_readiness() -> Probe {
                 ),
             )
         }
-        // Never `unsupported`, and never `degraded`: the design does not rest on
-        // this answer, so a kernel without epoll (macOS, §13) or a probe that could
-        // not run leaves nothing at risk — it leaves a question unmeasured, which is
-        // what `skipped` says. The reason carries the errno so a failure is visible
-        // rather than silent.
+        // Two error arms, and the split between them is §13's rule rather than a
+        // stylistic preference. A platform with no epoll (macOS) offers no
+        // mechanism to measure, so the question is *unmeasurable here*: a genuine
+        // skip, and the only one this probe is entitled to. A probe that **errored**
+        // is not that — it is a run that could not ask its own question, which §13
+        // gives `degraded` with the observation named. Both arms stay clear of
+        // `unsupported`, because the design is *justified* by P8's answer rather
+        // than dependent on it, so neither outcome contradicts anything.
+        //
+        // The second arm spelled itself `skipped` until 2026-08-12 and that was a
+        // hole, not a nicety: this probe's own status clause admits `supported` or
+        // `skipped`, so a report whose epoll/read comparison never ran satisfied it
+        // (see [`measurement_failed`], and `the_kernel_diff_clauses_bite_on_a_probe_that_errored`
+        // in `itest/tests/expectation_gates.rs`, which runs both spellings through
+        // the real gate).
         Err(e) if is_unsupported_errno(&e) => p.verdict(
             Status::skipped("epoll is Linux-only"),
             "epoll(7) has no portable equivalent, and the data plane is forbidden from using it anyway (invariant 1) — nothing here is untested, only unmeasurable on this platform (§13).",
         ),
-        Err(e) => p.verdict(
-            Status::skipped(format!("probe error: {e}")),
+        Err(e) => measurement_failed(
+            p,
+            &e,
             "The epoll/read comparison did not run; invariant 1's justification is unmeasured on this box, and the data plane's poll(2) readiness is unaffected either way (§15.18).",
         ),
     }
@@ -2100,9 +2167,20 @@ fn p8_phase(fd: RawFd) -> anyhow::Result<EpollSpin> {
 
 /// Whether an error is "this platform does not implement it" — the `ENOTSUP` the
 /// `serial-nexus-sys` stubs answer off Linux (`Epoll`, `pending_output_bytes`,
-/// `read_icounts`). A probe turns *this* error into `skipped` with a platform
-/// reason, and any other error into `skipped` with the error text, so a genuine
-/// failure never hides behind "Linux-only".
+/// `read_icounts`).
+///
+/// A probe turns *this* error into `skipped` with a platform reason, and **any other
+/// error into `degraded`** with the error named in a `probe_error` observation
+/// ([`measurement_failed`]) — so a genuine failure never hides behind "Linux-only",
+/// and never behind `skipped` either. Until 2026-08-12 the second arm was also
+/// `skipped`, which is the one word every jq clause exempts, so an errored probe
+/// exempted itself from the clauses that read its measurements (§13; notes §3.75).
+///
+/// It matches **both** error carriers on purpose, and the distinction is not
+/// academic: the `serial-nexus-sys` epoll stub returns a
+/// `std::io::Error::from_raw_os_error(ENOTSUP)`, while a real `nix` call returns a
+/// `nix::Error` — so a guard that exercises only one branch proves nothing about the
+/// path the other platform actually takes (AGENTS §9's proxy rule).
 fn is_unsupported_errno(e: &anyhow::Error) -> bool {
     if let Some(io) = e.downcast_ref::<std::io::Error>() {
         return io.raw_os_error() == Some(libc::ENOTSUP);
@@ -2573,12 +2651,19 @@ impl Granularity {
 /// introduced by the kernel, and on a pty master with an open slave, which is the
 /// fd class the daemon actually parks on.
 pub fn p9_poll_granularity() -> Probe {
+    p9_verdict(p9_inner())
+}
+
+/// P9's verdict, split from its measurement for the reason [`p8_verdict`] gives:
+/// the arms become pure functions of measured facts (§13), so the error arm — the
+/// one no box can be asked to produce on demand — is reachable from a unit test.
+fn p9_verdict(measured: anyhow::Result<(Vec<Granularity>, ZeroTimeoutRefs)>) -> Probe {
     let p = Probe::new(
         "P9",
         "poll(2) timeout granularity",
         "For a never-ready tty fd, what does a requested poll(2) timeout of 0/1/5/10 ms actually cost (min/median/max, µs)?",
     );
-    match p9_inner() {
+    match measured {
         Ok((rows, refs)) => {
             let mut p = p;
             let mut one_ms = 0u64;
@@ -2731,10 +2816,18 @@ pub fn p9_poll_granularity() -> Probe {
             )
         }
         // Nothing in the design rests on a *measurement* being available — the
-        // floor is whatever it is, and the code copes with any value — so an
-        // unmeasured probe is `skipped`, never `unsupported` or `degraded`.
-        Err(e) => p.verdict(
-            Status::skipped(format!("probe error: {e}")),
+        // floor is whatever it is, and the code copes with any value — so this arm
+        // is never `unsupported`. It is not `skipped` either, and that half was
+        // wrong until 2026-08-12: `skipped` is the exemption both expectation files
+        // grant the clause that reads `zero_timeout_by_fd_state`, the clause whose
+        // whole job is to check that P9's mask column measured its own framing
+        // (notes §3.65). A P9 that errored into `skipped` therefore carried that
+        // clause green, on precisely the run where the framing was never measured.
+        // `degraded` with the error named is §13's word for a run that could not
+        // ask its question — see [`measurement_failed`].
+        Err(e) => measurement_failed(
+            p,
+            &e,
             "Timeout granularity unmeasured on this box; §15.19's blocking-thread hot path and poll_ready's backoff are unaffected (both are correct at any floor).",
         ),
     }
@@ -3355,12 +3448,22 @@ impl FillResult {
 /// move; a diff against an older report shows the two keys renamed with their
 /// numbers unchanged, which is exactly the swap.
 pub fn p10_pty_buffer_depth() -> Probe {
+    p10_verdict(p10_fill_direction(true), p10_fill_direction(false))
+}
+
+/// P10's verdict, split from its two fills for the reason [`p8_verdict`] gives:
+/// the arms become pure functions of measured facts (§13), so the error arm is
+/// reachable from a unit test on a box whose ptys all work.
+fn p10_verdict(
+    targetward: anyhow::Result<FillResult>,
+    hostward: anyhow::Result<FillResult>,
+) -> Probe {
     let p = Probe::new(
         "P10",
         "pty buffer depth",
         "How many bytes does a pty accept in each direction before it would block, with nothing draining the other end?",
     );
-    match (p10_fill_direction(true), p10_fill_direction(false)) {
+    match (targetward, hostward) {
         (Ok(targetward), Ok(hostward)) => {
             let p = p
                 .observe("slave_to_master_targetward", targetward.observations())
@@ -3418,9 +3521,18 @@ pub fn p10_pty_buffer_depth() -> Probe {
         }
         // Nothing is contradicted by an unmeasured buffer depth: the defaults are
         // configuration, and every one of them works at any depth (backpressure is
-        // the mechanism either way, §5). So `skipped`, never `unsupported`.
-        (Err(e), _) | (_, Err(e)) => p.verdict(
-            Status::skipped(format!("probe error: {e}")),
+        // the mechanism either way, §5). So never `unsupported` — and, since
+        // 2026-08-12, never `skipped` either. This probe is the one where that word
+        // cost the most: its status clause already admits `degraded` (a non-raw
+        // line discipline degrades by design), so the two clauses carrying P10's
+        // content — the FIONREAD cross-check, and the recheck *ladder*, which
+        // exists because a one-rung recheck passed both gates while bracketing
+        // nothing — hang off `$p.status == "skipped"` alone. An errored P10
+        // spelling itself `skipped` took both of them green with it, on the one run
+        // where neither direction was measured at all. See [`measurement_failed`].
+        (Err(e), _) | (_, Err(e)) => measurement_failed(
+            p,
+            &e,
             "Pty buffer depth unmeasured on this box; the hostward_buffer defaults are unaffected (they bound the daemon's own queue, and backpressure holds at any kernel depth, §5).",
         ),
     }
@@ -10183,5 +10295,113 @@ mod tests {
         assert_eq!(p14_refusal(&syscall), RungOutcome::PlatformRefused);
         let verification = std::io::Error::other("failed to apply some or all settings");
         assert_eq!(p14_refusal(&verification), RungOutcome::AdapterRefused);
+    }
+
+    // -- P8/P9/P10: an error is not a skip (§13) ------------------------------
+
+    /// **`skipped` is never an error path's output** (§13), asserted on the three
+    /// probes that broke the rule until 2026-08-12.
+    ///
+    /// The consequence was not cosmetic. `skipped` is the word every conditional
+    /// clause in `expectations/{linux,macos}.jq` exempts, so each of these three
+    /// error paths exempted itself from the clauses written to notice a missing
+    /// measurement: P8's and P9's own status clauses (`supported` or `skipped`),
+    /// P9's `zero_timeout_by_fd_state` discriminator, and both of P10's content
+    /// clauses. A report in which all three errored passed `jq -e -f
+    /// expectations/linux.jq` at exit 0; spelled `degraded` it exits 1. The gate
+    /// half of that pair is proven against the real expectation file in
+    /// `itest/tests/expectation_gates.rs`; this is the probe half — which the
+    /// error arms had no way to have at all until [`p8_verdict`], [`p9_verdict`]
+    /// and [`p10_verdict`] were split from their measurements (§13: verdicts are
+    /// pure functions of measured facts), because no box that can open a pty can
+    /// be asked to fail one.
+    ///
+    /// Fail-first, run against the unfixed tree: all three assert `degraded` and
+    /// read back `skipped`.
+    #[test]
+    fn a_kernel_diff_probe_that_errored_degrades_and_names_the_error() {
+        // The shape a container with no `/dev/ptmx` produces — the realistic way
+        // these three fail, and the one place all three converge.
+        let boom = || anyhow::anyhow!("posix_openpt: ENOENT: No such file or directory");
+        for p in [
+            p8_verdict(Err(boom())),
+            p9_verdict(Err(boom())),
+            p10_verdict(Err(boom()), Err(boom())),
+        ] {
+            assert_eq!(
+                p.status.label(),
+                "degraded",
+                "{} spelled a probe error `{}`, which is the one word that exempts \
+                 every conditional gate clause — the measurement is missing and the \
+                 gate would certify it anyway (§13)",
+                p.id,
+                p.status.label()
+            );
+            // A verdict word cannot be diffed across kernels (§13), so the reason
+            // has to ride in a cell as well as in the prose. `degraded` carries no
+            // `reason` field of its own — that is `skipped`'s — which is exactly
+            // why this observation exists.
+            assert_eq!(
+                observed(&p, "probe_error"),
+                Some("posix_openpt: ENOENT: No such file or directory".into()),
+                "{}'s degraded verdict names no error: {:#?}",
+                p.id,
+                p.observations
+            );
+            assert!(
+                p.consequence.contains("posix_openpt: ENOENT"),
+                "{}'s consequence sentence does not say what failed, so the report \
+                 an operator pastes into a thread reads as a shrug: {}",
+                p.id,
+                p.consequence
+            );
+        }
+    }
+
+    /// The other half of the same rule, and the one a repair can quietly destroy:
+    /// **a genuine skip must still skip.**
+    ///
+    /// P8 off Linux has no mechanism to measure — `serial_nexus_sys::Epoll` keeps a
+    /// stub whose every method answers `ENOTSUP` rather than `#[cfg]`-gating the
+    /// probe away — and "unmeasurable here" is not "the probe failed" (§13, and
+    /// §15.47's unmeasurable-as-data rule). Routing it to `degraded` with the rest
+    /// would redden the macOS lane on every run, which is how a rule against
+    /// over-skipping turns into a rule against reporting.
+    #[test]
+    fn p8_still_skips_where_epoll_does_not_exist() {
+        // **Both carriers, because only one of them is the Darwin path.**
+        // `sys::Epoll::new()` off Linux returns
+        // `std::io::Error::from_raw_os_error(libc::ENOTSUP)` — the *io* branch of
+        // `is_unsupported_errno` — while a `nix` call returns a `nix::Error`. A guard
+        // that fed only the `nix` shape would assert this skip on a code path Darwin
+        // never takes, which is AGENTS §9's proxy in space: passing on the box it was
+        // written on and saying nothing about the platform it protects.
+        let carriers: [(&str, anyhow::Error); 2] = [
+            (
+                "the io::Error the serial-nexus-sys epoll stub really returns",
+                std::io::Error::from_raw_os_error(libc::ENOTSUP).into(),
+            ),
+            ("a nix::Error ENOTSUP", nix::Error::ENOTSUP.into()),
+        ];
+        for (what, err) in carriers {
+            let p = p8_verdict(Err(err));
+            assert_eq!(
+                p.status.label(),
+                "skipped",
+                "{what}: the epoll stub's ENOTSUP is a mechanism that does not exist \
+                 here, not a failed measurement: {:?}",
+                p.status
+            );
+            assert!(
+                p.status.badge_label().contains("epoll is Linux-only"),
+                "{what}: the skip does not say why: {}",
+                p.status.badge_label()
+            );
+            assert_eq!(
+                observed(&p, "probe_error"),
+                None,
+                "{what}: an unmeasurable-here skip must not claim an error it did not have"
+            );
+        }
     }
 }

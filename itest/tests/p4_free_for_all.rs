@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 4 arbitration opt-out (design §6), ported from
 //! `scripts/validate/phase4/free-for-all.sh`.
 //!

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 0 licensing gate, folded from `scripts/validate/phase0/license-gate.sh` into
 //! the Rust harness (§16.11). Proves the §13 permissive-only policy actually *rejects* a
 //! banned crate rather than merely being configured to (plan §2: "the gate is proven,

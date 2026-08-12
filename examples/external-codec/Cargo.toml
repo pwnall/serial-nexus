@@ -6,4 +6,4 @@
 # proven to compile rather than merely promised (plan §10.3).
 [workspace]
 resolver = "2"
-members = ["codec", "daemon"]
+members = ["codec", "daemon", "tinymux"]

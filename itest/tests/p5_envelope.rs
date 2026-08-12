@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 5 any-language envelope conformance, ported from
 //! `scripts/validate/phase5/envelope.sh` (design §8, plan §Phase 5 item 3).
 //!

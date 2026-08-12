@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 3 `subscribe` + client-termios slice, ported from
 //! `scripts/validate/phase3/subscribe.sh` (design §10 / §7.2).
 //!

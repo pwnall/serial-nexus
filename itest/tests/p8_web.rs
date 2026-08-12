@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 8 web-console slice, ported from `scripts/validate/phase8/web.sh`
 //! (design §17 / §15.29, plan §11.3-6): the `serial-nexus-web` HTTP + WebSocket
 //! console, a pure loopback RPC client of the daemon. The properties, and how each is

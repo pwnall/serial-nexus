@@ -1079,6 +1079,7 @@ version = "0.3.0"
 dependencies = [
  "libc",
  "serde_json",
+ "serial-nexus-codec-api",
  "serial-nexus-core",
  "serial-nexus-rpc",
  "serial-nexus-sys",

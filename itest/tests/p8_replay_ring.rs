@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 8 replay-ring slice, ported from `scripts/validate/phase8/replay-ring.sh`
 //! (design §5 / §17, the web-console track). `replay_ring = <bytes>` on a
 //! host-facing endpoint retains the most recent hostward bytes so a late

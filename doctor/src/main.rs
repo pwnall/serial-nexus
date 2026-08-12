@@ -2,15 +2,22 @@
 
 //! `serial-nexus-doctor` — the serial_nexus capability checker (design §15.17).
 //!
-//! One consolidated binary that runs every kernel-behavior probe the design
-//! depends on (P1 EXTPROC/TIOCPKT, P2 PTY presence, P3 serial fit, P4 device
-//! identity resolution, P5 rig certification, P6 post-hangup pty readiness, P7 collapsed
-//! client-session evidence, P8 epoll vs read(2) on a pty master, P9 poll(2)
-//! timeout granularity, P10 pty buffer depth, P11 real-port line-state counters,
-//! P12 the session-boundary edge P7's packet route substitutes for on Linux)
-//! plus environment checks, and emits a copy-pasteable Markdown report — the
-//! expected first attachment on any support request — with a `--json` twin for
-//! CI.
+//! One consolidated binary that runs every kernel-behavior probe the design depends
+//! on, plus environment checks, and emits a copy-pasteable Markdown report — the
+//! expected first attachment on any support request — with a `--json` twin for CI.
+//!
+//! **The probe roster is not repeated here.** `probes.rs` *is* the registry; the
+//! documented rosters are `docs/serial-nexus-doctor.md`'s table, which §13 makes the
+//! registry of record, and the design's §13 glance table — two, both gated against
+//! `probes.rs`, which is two more copies than a module doc can justify adding to.
+//! This comment used to carry a
+//! second copy that stopped at the twelfth probe, and it had drifted **three probes**
+//! behind — the last three ids in `probes.rs` — without anyone noticing, which is
+//! what a hand-kept list adjacent to the thing it lists always does. Deleted rather
+//! than extended, and the drift is now gated in both directions:
+//! `every_documented_probe_roster_matches_the_doctor_registry` matches the documented
+//! roster against the registry and reds on either a probe with no row or a row with no
+//! probe (plan §18 item 40; notes §3.75).
 //!
 //! The `--json` twin is also the **cross-kernel diff artifact**: production runs
 //! Linux 6.18 and this tree is developed on 7.0, so §13 forbids a one-way

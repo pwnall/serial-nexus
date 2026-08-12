@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Review-32 guards for the two kind-dependent **configuration rules** that decide
 //! what `load` accepts (design §6 arbitration, §7.2 pty, §11 load atomicity,
 //! §15.26 "a structurally-invalid config never destroys a good running graph").

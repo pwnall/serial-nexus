@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 3 boundary-counter checks, ported from `scripts/validate/phase3/counters.sh`
 //! (design §5, §7.1, §7.2, and the §15.17 no-target doctrine). Every hostward drop
 //! must be located, counted, and attributable in `state`:

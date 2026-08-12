@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 3 log fault-isolation slice, ported from
 //! `scripts/validate/phase3/log-enospc.sh` (design §5 / §7.3): a `log` node whose
 //! file lives on a full disk faults with an ENOSPC write reason, while the port and

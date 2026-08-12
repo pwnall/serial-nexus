@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 7 replug slice, ported from `scripts/validate/phase7/replug.sh`
 //! (design §7.1 faulted-and-wait / reopen ritual, §12 device identity, §5 never-drop
 //! targetward). One property, proven end to end:

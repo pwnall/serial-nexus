@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 4 arbitration — the FIFO waiter queue is fair and cancel-safe, ported from
 //! `scripts/validate/phase4/waiting.sh` (design §6 arbitration / §15.20 two-lane
 //! control plane).

@@ -1224,4 +1224,44 @@ mod tests {
             "names the maximum, the same one the other timers use: {err}"
         );
     }
+
+    /// The exec codec's schema — the richest attribute table the tree ships — run
+    /// through the conformance kit's own attribute suite (§8 clause 12; plan §18
+    /// item 32). The two tests above assert the *specific* refusals this schema owes;
+    /// this one asserts the same schema against the *generic* contract every codec
+    /// owes, using the identical suite an out-of-tree author calls from the consumer
+    /// position. If the suite ever weakens, the in-tree schema notices.
+    #[test]
+    fn the_exec_schema_satisfies_the_kit_attribute_suite() {
+        use serial_nexus_codec_api::test_support as kit;
+        let attrs = |src: &str| -> toml::Table { src.parse().expect("test attributes parse") };
+
+        kit::attributes_are_structural(
+            |t: &toml::Table| parse_attributes(t),
+            &[
+                attrs("argv = [\"/bin/true\"]"),
+                attrs("argv = [\"/bin/true\"]\nrestart_backoff_ms = 0"),
+                attrs(&format!(
+                    "argv = [\"/bin/true\"]\nrestart_backoff_ms = {MAX_TIMER_MS}\n[env]\nTERM = \"dumb\""
+                )),
+            ],
+            &[
+                // Required and non-empty.
+                (attrs(""), "argv"),
+                (attrs("argv = []"), "argv"),
+                // Unknown key, refused by name.
+                (
+                    attrs("argv = [\"/bin/true\"]\nrestart_backoffms = 1"),
+                    "restart_backoffms",
+                ),
+                // Out of range, structurally.
+                (
+                    attrs("argv = [\"/bin/true\"]\nrestart_backoff_ms = 86400000"),
+                    "restart_backoff_ms",
+                ),
+                // Wrong type — serde's own refusal still has to name the field.
+                (attrs("argv = \"/bin/true\""), "argv"),
+            ],
+        );
+    }
 }

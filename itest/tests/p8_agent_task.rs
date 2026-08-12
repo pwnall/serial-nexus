@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 8 agent-task slice, ported from `scripts/validate/phase8/agent-task.sh`
 //! (design §6, §7.3, §10). The full operator scenario driven purely through
 //! structured RPC (the Rust stand-in for §15.16's `serial-nexus-ctl --json | jq`

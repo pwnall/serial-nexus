@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 8 tap stream offsets + the per-boot instance nonce (plan §11.8 / design §10 /
 //! §15.32). Two protocol facts the browser history of §17 rests on:
 //!

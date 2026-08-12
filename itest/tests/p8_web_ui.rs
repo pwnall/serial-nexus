@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The browser half of the web console, gated from Rust (design §15.37, plan §15).
 //!
 //! §16.7's doctrine says any behaviour the sim structurally cannot exercise must either
@@ -63,13 +65,15 @@ const HOSE_BYTES: &str = "64MiB";
 /// The floor the browser suite must clear, **as a function of the fixture this gate
 /// built** (review 32 ITEST-4).
 ///
-/// `web/ui-tests/tests/` declares 23 specs. Two are tagged `@slow` and
-/// excluded per push (`--grep-invert @slow` below), leaving **21**; ten of those 21
-/// `test.skip` themselves when the fixture has no serial device (`!ECHO` / `!HOSE`),
-/// leaving **11** that run on any platform. (Eleven specs carry a device skip in all,
-/// but one of them is `@slow` and is not in the per-push run; both counts below are
-/// per-push counts, re-measured against the suite on 2026-07-29 when plan §17.3's
-/// provenance spec — device-free — joined it.)
+/// `web/ui-tests/tests/` declares **27** specs (console 15, history 6, graph-editor 5,
+/// lifecycle 1). Exactly **two** are tagged `@slow` and excluded per push
+/// (`--grep-invert @slow` below), leaving **25**; ten of those 25 `test.skip` themselves
+/// when the fixture has no serial device (`!ECHO` / `!HOSE`), leaving **15** that run on
+/// any platform. (Eleven specs carry a device skip in all, but one of them is `@slow` and
+/// is not in the per-push run; both counts below are per-push counts. Recounted against
+/// the suite on 2026-08-12: this prose had said 23/21/11, four specs behind the tree,
+/// while the 15-passed/10-skipped measurement below — which is what 25 per-push specs
+/// with ten device gates reports — had matched all along.)
 ///
 /// One constant used to do both jobs: `MIN_SPECS = 8` sat at the device-free count, which
 /// is tight on macOS and carried six specs of slack on `ubuntu-latest` — the only platform
@@ -78,15 +82,16 @@ const HOSE_BYTES: &str = "64MiB";
 /// `--grep` mistake) and the gate stayed green, while its own assertion message promised
 /// that "a *removed* spec … trips it". The gate already knows which fixture it built, so
 /// it can hold the suite to the right number instead of to the smaller of the two.
-/// **Both carry slack as of 2026-07-30, and the numbers above are stale.** Measured on
-/// the macOS rig (device-free fixture, so `SPECS_DEVICE_FREE` is the arm that ran): the
-/// per-push suite reported **15 passed, 10 skipped**, against a floor of 11. Adding the
-/// 1009 close-code spec to `console.spec.mjs` accounts for one of those; the other three
-/// predate it. Each floor is raised by exactly the spec added here rather than to the
-/// measured figure, because the with-device arm cannot be measured on a Mac — a pts is
-/// not a serial device here (`docs/macos.md`), so `serial_echo()` is `None` and the ten
-/// device-gated specs never run — and a floor guessed above the truth reddens the Linux
-/// lane for a reason that is not the tree's. Re-measure both on a Linux rig and set them
+/// **Both floors sit three specs under the recount above, deliberately.** Measured on
+/// the macOS rig on 2026-07-30 (device-free fixture, so `SPECS_DEVICE_FREE` is the arm
+/// that ran): the per-push suite reported **15 passed, 10 skipped**, against a floor of
+/// 11 — four of slack. Adding the 1009 close-code spec to `console.spec.mjs` accounts
+/// for one of those four; the other three predate it. Each floor is raised by exactly
+/// the spec added here rather than to the measured figure, because the with-device arm
+/// cannot be measured on a Mac — a pts is not a serial device here (`docs/macos.md`), so
+/// `serial_echo()` is `None` and the ten device-gated specs never run — and a floor
+/// guessed above the truth reddens the Linux lane for a reason that is not the tree's.
+/// Re-measure both on a Linux rig and set them
 /// to the counts it reports; the comment above describes what they are *for*, and that
 /// intent is right even while the constants lag.
 const SPECS_WITH_DEVICE: usize = 22;
@@ -285,10 +290,12 @@ device = "{dev}"
         pw_args.push(&grep);
     }
     // `@slow` specs are the project's `#[ignore]` in Playwright's spelling: excluded per
-    // push, run in the nightly lane with `SNX_UI_SLOW=1`. Today that is the forced tap
-    // shed, which costs about a minute of real renderer time for reasons the spec
-    // records. Excluding by *tag* rather than by name means a new slow spec joins the
-    // nightly lane by annotating itself, not by editing this list.
+    // push, run in the nightly lane with `SNX_UI_SLOW=1`. Today that is two specs, both in
+    // `console.spec.mjs`: the forced tap shed, which costs about a minute of real renderer
+    // time, and the unwatched-console tap release, whose subject *is* the grace interval
+    // and so spends it twice over — reasons each spec records at its own tag. Excluding by
+    // *tag* rather than by name means a new slow spec joins the nightly lane by annotating
+    // itself, not by editing this list.
     if std::env::var("SNX_UI_SLOW").as_deref() != Ok("1") && grep.is_empty() {
         pw_args.push("--grep-invert");
         pw_args.push("@slow");

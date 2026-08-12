@@ -41,6 +41,13 @@ the control socket never sees, and each is governed by its own file mode. All
 three are enumerated below, because a deployment is only as tight as its widest
 one.
 
+**That enumeration is the daemon's, and the scope is deliberate.** The repository
+also carries exactly one binary that is deliberately privileged —
+`serial-nexus-replug`, a test capability no deployment installs — and it is not a
+door into any console. It gets its own section below rather than a line in this
+list, because folding it in would read as "the daemon has a fourth door", which is
+the one thing it is not.
+
 **Socket path.** Chosen by privilege, overridable with `--socket`:
 
 - running as root: `/run/serial-nexus-daemon.sock`
@@ -505,6 +512,64 @@ care you would vet anything launched by the account `serial-nexus-daemon` runs a
 prefer running the daemon under a dedicated, unprivileged user (see the checklist
 below) so "the daemon's user" is as small a blast radius as possible.
 
+## The one privileged binary in the tree is a test capability, not a deployment component
+
+Everything above describes the **daemon's** attack surface. The repository also
+carries `serial-nexus-replug` (§15.45), and on Linux it is deliberately privileged,
+so a reader who audits only the sections above would miss it. It exists for one
+reason: §12's identity promises — configs surviving a replug, identity re-resolved
+at every open — had never met a real hotplug, and making the kernel disconnect and
+re-enumerate a device for real means writing `0` then `1` to that device's USB
+`authorized` attribute, which is `root:root 0644`.
+
+**Nothing in `packaging/` installs it, no daemon spawns it, and no deployment needs
+it.** The privilege lives on a copy that the tool's own `install` verb places at
+`.snx-bin/<profile>/` — project-local, gitignored, mode `0700` applied *before* the
+capability (`replug/src/linux/install.rs`, `BLESSED_MODE = 0o700`) — and it is
+conferred by a single `sudo setcap cap_dac_override+ep …` that the tool **prints and
+never runs**. The capability is proven, never assumed, and it self-invalidates: any
+write to the file clears `security.capability`, so a rebuilt copy is an unprivileged
+copy. CI never blesses anything. A checkout that moves loses the capability, which
+is the point — the alternative designs, a udev rule granting the `dialout` group
+write access or a capability-conferring test runner, were both declined because they
+put the grant on the *machine* rather than on one auditable binary (§15.45; do not
+fuse this with `packaging/99-serial-nexus.rules`, which is deployment configuration
+and confers nothing).
+
+`CAP_DAC_OVERRIDE` bypasses every DAC check on the system, so what bounds the grant
+is the binary's narrowness, asserted by construction (`replug/src/linux/mod.rs`,
+`replug/src/linux/sysfs.rs`):
+
+- **One capability, and no other.** `setcap cap_dac_override+ep`, nothing else.
+- **argv only.** It reads no environment variable, so there is no `LD_PRELOAD` or
+  config-file path into a capability-holding process.
+- **No `exec` while blessed.** `PR_SET_NO_NEW_PRIVS` makes that a kernel guarantee
+  rather than a property of the code, and it is *established and read back* — a
+  blessed copy that cannot get both answers refuses to run at all rather than
+  continuing unhardened. The one module that spawns anything (`install`) is refused
+  while the capability is held.
+- **No path parameter.** The device argument is a USB port *name* like `3-1`,
+  validated against an alphabet of digits, `-` and `.` with no `..` component, and
+  joined to a compile-time root — so no caller-supplied byte ever reaches `open(2)`
+  as a path.
+- **The kernel confirms the filesystem.** `fstatfs` must report `SYSFS_MAGIC` before
+  any write, which a `starts_with` on a canonicalized path cannot establish.
+- **Non-hub serial adapters only.** A device whose `bDeviceClass` reads `09` — a USB
+  hub — is refused.
+- **No `deauthorize` verb.** `cycle` performs both writes in one process and
+  re-authorizes on signals; any hold is capped at 30 s; an idempotent `authorize`
+  repair verb exists for a run that died mid-replug.
+
+Adding a verb that accepts a filesystem path would dissolve every one of those
+bounds at once. That is a design amendment (§15.45), never a patch — and it is a
+standing tripwire in the operating manual for exactly that reason.
+
+Off Linux none of this applies: the macOS arm re-enumerates through IOUSBLib
+unprivileged, so `capabilities` reports that no capability is required, `install`
+has nothing to install, and the atomic mechanism means `hold` refuses rather than
+pretending to hold a device down. On any other platform the binary compiles so the
+workspace build does not fail, and every verb refuses.
+
 ## What v1 deliberately does not do
 
 - **No in-daemon cryptography.** There is no TLS, no wire encryption, and no
@@ -592,4 +657,7 @@ host, so that token is only as safe as the other local ports the operator visits
 The exec codec runs as the daemon's user,
 so run that user small. There is no in-daemon crypto in v1 — that, and finer
 per-caller authorization via `SO_PEERCRED`, are named as future work, not present
-guarantees (§14, §10).
+guarantees (§14, §10). All of that is the *daemon's* posture; the tree's one
+deliberately privileged binary, `serial-nexus-replug`, is a hand-blessed test
+capability that no deployment installs and that is narrow by construction — its own
+section above states the bounds (§15.45).

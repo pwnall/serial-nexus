@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 7 doctor probe P5, ported from `scripts/validate/phase7/p5.sh`
 //! (design §13, §15.21 — rig discovery and certification without a bench).
 //!

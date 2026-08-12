@@ -454,16 +454,21 @@ enumeration and stays so.
 | `discarded_at_teardown` | targetward | teardown loss | Bytes destroyed with their node; `0` on any node still visible in `state` (see the teardown ledger below). |
 | driver overrun (`TIOCGICOUNT`) | hostward, below the daemon | kernel loss | The driver overran before the daemon ever saw the bytes; surfaced beside the daemon's counters so the layer that lost them is named (§7.1). |
 | `framing_errors`, `demux_errors`, `multiplexed.discarded_hostward` (codec/exec) | hostward | transform refusal | The transform's own resyncs and the daemon's demux-refusal accounting (§7.5, §8); `framing_errors == 0` is not health (§8). |
+| `discarded_targetward` (codec/exec), `discarded_no_raw_edge` (map), `discarded_unframable`, `discarded_peer_gone` | targetward | pump-side discard | A pump looked at targetward bytes and could not place them: the edge is read-only or detached, the framer refused an oversize unit, or the peer left. Sanctioned where the wiring invariant's *drains-and-counts* arms apply (§15.54), and located rather than silent — which is the whole of §5's demand on it. |
 | `timed_out` (sim verdict) | — | harness flag, not a counter | The sim marks deadline expiry so a deadline is never read as a drop (plan §3). |
 
 The loss fingerprint: a hostward shortfall matching `received + dropped_slow_consumer == sent`
 is the lossy-boundary signature, not a data-loss bug; a test that requires a large hostward
 stream to arrive complete provisions `hostward_buffer` explicitly and cites this section
-(plan §3). And targetward has no loss counter in steady state, by construction: queued bytes
-on a surviving node are backlog, never loss, and the only counters that can ever move for
-targetward bytes are the purge family (§6) and the teardown ledger below. Anything that does
-not fit the fingerprint or one of the classes above is a defect, and the taxonomy is what
-makes that claim checkable.
+(plan §3). And targetward *delivery* loss has no counter in steady state, by construction:
+queued bytes on a surviving node are backlog, never loss. What can move for targetward bytes on
+a surviving node is the purge family (§6), the teardown ledger below, and the pump-side discard
+row above — and nothing else. Anything that does not fit the fingerprint or one of the classes
+above is a defect, and the taxonomy is what makes that claim checkable. *(This paragraph read
+"targetward has no loss counter in steady state … the only counters that can ever move …are the
+purge family and the teardown ledger" until 2026-08-12. Four shipped counters falsified it on a
+healthy graph, and the table had no row for them — an absolute that made its own instances
+unreadable rather than a rule anything enforced. §15.54, notes §3.75.)*
 
 ### The fragment-never-drop obligation
 
@@ -536,9 +541,13 @@ know before touching the data plane.
    possible at all.
 3. The three states an endpoint can be in behave differently on purpose: attached-and-writable
    forwards; **attached but read-only** drains-and-counts, because parking would wedge a
-   writer on a configuration that will never become writable; and **not attached** parks,
-   because this section forbids dropping targetward — a detached edge stalls its writers
-   exactly as a steal does (§6).
+   writer on a configuration that will never become writable; and **not attached** parks —
+   because this section forbids dropping targetward, and a detached edge stalls its writers
+   exactly as a steal does (§6) — **where the pump serves one endpoint**. Where one pump
+   serves many, it drains and counts instead: parking would stall traffic that has nothing
+   to do with the detached edge. Which pumps those are, and why the choice is per node and
+   not shared, is **§15.54**; the counters it charges are the taxonomy's pump-side discard
+   row below.
 
 ### The teardown ledger
 
@@ -1064,9 +1073,16 @@ character size, parity, flags), and drop counters.
    client session starts deterministic in both senses that phrase must carry: how the next
    session's bytes are *framed*, and *which bytes it sees at all*. Only the first half shipped
    originally, and the sentence read as though it covered both: the kernel keeps a departed
-   session's undelivered output across the close, up to the pts input queue's depth (13.8–15 KiB
-   recovered across the committed P10 captures, `docs/doctor/linux-7.0-2026-08-05-tier3.json`), and
-   hands it to the next opener, so a fresh `picocom` opens onto the previous operator's scrollback.
+   session's undelivered output across the close, up to the pts input queue's depth — on Linux
+   7.0.0-29, **13824–15872 bytes** recovered across the committed P10 captures, varying run to run
+   and direction by direction, with §15.46's cited triple
+   (`docs/doctor/linux-7.0-2026-08-05b-tier3{,-2,-3}.json`) spanning 13824–15360 — and hands it to
+   the next opener, so a fresh `picocom` opens onto the previous operator's scrollback. *(The
+   figure this sentence carried until 2026-08-12 was "13.8–15 KiB", which is no capture's reading
+   and not even one unit: 13.8 is 13824 bytes counted in KB, 15 is 15360 counted in KiB, and the
+   artifact it cited reads a flat 15360 in both directions. A v15-era un-artifacted number
+   re-cited rather than re-derived — the exact move §16.13 and AGENTS §7 exist to stop; notes
+   §3.75.)*
    The discard is **counted** (`discarded_at_last_close`), because §5 permits a slow or absent
    consumer to cost itself data and never permits losing it invisibly.
 4. Mechanically the daemon **reads the slave dry** rather than issuing `tcflush`: the queue
@@ -1290,8 +1306,12 @@ daemon feeds a stream into some other program's terminal. Otherwise it behaves a
 with the standard policies.
 
 **Refused-at-load** (§14's deferral vocabulary): the node remains in the model but is not
-implemented, and a configuration naming it is refused, listing the node kinds that do exist —
-the same treatment §7.1 gives the serial output leg. Stated here, not only in §14,
+implemented, and a configuration naming it is refused, listing the node kinds that do exist.
+Not the *same* treatment §7.1 gives the serial output leg, which this sentence claimed until
+2026-08-12: that one is a structural error from validation naming the deferral, and this one is
+serde's unknown-variant error at `INVALID_PARAMS`, because `existing-terminal` is not a schema
+variant at all. Both refuse at load with nothing created; only the first says why (§14 entry 15;
+plan §18 item 45). Stated here, not only in §14,
 because this section once read in the present tense while absent from §14 (review 32 DEVR-3).
 §3's "existing-PTY connectors" and §12's "Existing-terminal nodes … pass through as path
 identities" describe this same deferred node type.
@@ -1524,9 +1544,10 @@ daemons' `WIRE_VERSION` may move without you, and wire evolution never breaks en
 
 **What each check certifies.** The numbered contract above is the thing under test. The golden
 vectors certify clause-level frame encoding; the kit's suites certify clauses 1, 2 (via the
-opt-in accessor), 4–5's accept/need-more discipline, and 9's termination half from the
-consumer's position; clauses 6–7 are daemon-side accounting pinned by the daemon's own guards,
-their codec-side halves filed as plan §18 items 33–34; the sim corruption run certifies clause
+opt-in accessor), 4–5's accept/need-more discipline, 6's codec-side half (the opt-in recovery
+suite), 9's termination half, and 12's schema discipline — all from the consumer's position; the
+exec battery's opt-in error paths certify clause 5's third outcome for a child; clause 7 is
+daemon-side accounting pinned by the daemon's own guards; the sim corruption run certifies clause
 9's accounting against a computed manifest; and the daemon enforces clauses 3, 11, 12, and 13
 structurally at load, before anything is created.
 
@@ -1542,10 +1563,26 @@ assumes it.
 dev-dependency, compiled only on opt-in) ships suites that any `Codec` implementation instantiates
 in its own tests; each takes a factory (`Fn() -> C`) and fails by panic, so a broken codec fails
 its own `#[test]`. Four are universal — `round_trip_identity`, `fragmentation_tolerance`,
-`handles_garbage`, `bounded_parser_state` — and two are opt-in: `control_event_round_trip`, only
-for codecs that transport the control vocabulary (a passthrough legitimately must not run it), and
-`assert_buffer_bounded`, for codecs exposing a buffered-byte accessor. The kit is deliberately
-dependency-free — a seeded LCG, no `rand` — so instantiating it adds no crates to your tree.
+`handles_garbage`, `bounded_parser_state` — and four are opt-in, each for a codec that has the
+property to prove:
+
+- `control_event_round_trip`, only for codecs that transport the control vocabulary (a passthrough
+  legitimately must not run it);
+- `assert_buffer_bounded`, for codecs exposing a buffered-byte accessor;
+- `recovers_after_garbage`, clause 6's codec-side half, for codecs that **resync**: after one
+  refused frame the next valid one must decode whole. A codec on a reliable transport exempts
+  itself by not calling it, and the suite feeds an *envelope* frame with an unknown type byte, so
+  a codec with its own framing replicates the pattern rather than calling this. It deliberately
+  does not assert re-alignment after unaligned noise: where a correct length-guided resyncer
+  re-aligns depends on the noise, and a suite demanding one answer would fail correct codecs — the
+  trap `lag.py` was written to pin, in the kit;
+- `attributes_are_structural`, clause 12's suite: every good table builds, every bad one returns
+  `Err` **without panicking**, and a refusal names the key it refused. It is generic over the table
+  type, so the kit still names no TOML crate, and it is what lets `precheck_codecs`' promise be
+  proven from the consumer position rather than asserted about it.
+
+The kit is deliberately dependency-free — a seeded LCG, no `rand` — so instantiating it adds no
+crates to your tree.
 
 **The kit-honesty rule.** A conformance suite that cannot observe a property must document that in
 its own doc comment, ship the negative codec proving the gap, and offer the opt-in accessor-based
@@ -1557,7 +1594,10 @@ negative codec proves both sides (`a_hoarding_codec_passes_the_trait_only_suites
 buffer, expose an accessor and opt in. Every kit suite likewise has a deliberately-broken codec
 proving it bites — `DropsLastByte`, `DropsOpen`, `PanicsOnGarbage`, `Amplifier`,
 `WholeFrameOnly`, `Hoarder` — fail-first discipline (plan §3) applied to the kit itself, and the
-rule any future suite inherits.
+rule any future suite inherits. `LatchesOnError` and the lenient/unwinding/anonymous attribute
+schemas are the same discipline for the four opt-in suites: the latching decoder drains correctly,
+passes every other suite in the kit, and fails only `recovers_after_garbage` — Hoarder's shape,
+one contract over.
 
 **The exec battery.** `serial-nexus-sim` ships two exec modes, both reporting a JSON verdict —
 never parsed text. `envelope` runs a 10-frame golden-vector battery through your child;
@@ -1568,10 +1608,31 @@ Two properties of the battery are contracts you can rely on: the stdin write car
 slow, only for stopping — a child that never reads yields a failing verdict rather than a wedged CI
 job; and `--exec` reaches your child through `sh -c` verbatim, so quote your paths — the in-tree
 harness single-quotes and proves a spaced checkout runs
-(`a_fixture_path_containing_a_space_still_runs`). One limitation, stated where you will hit it:
-**both modes expect an identity passthrough** — run them against a passthrough build of your codec,
-not the channel-swapping demux you actually ship, which today is validated end to end only by
-booting the daemon (`docs/codec-authors.md` §5–§6).
+(`a_fixture_path_containing_a_space_still_runs`). Both properties hold in **both** modes: the
+`envelope` feeder was an unbounded write behind a *total* deadline until 2026-08-12, which failed a
+correct-but-slow child at the wall clock its sibling passed it at, and both now drive the child
+through one boundary (notes §3.75).
+
+Two flags widen what the battery can judge:
+
+- **`--mux-to <channel>`** declares a demux shape instead of an identity passthrough: your child
+  swaps the reserved empty channel identity with that channel in both directions, and the *whole*
+  battery runs against the codec you actually ship rather than a passthrough build of it. The
+  golden battery gains a frame in each direction of the declared mapping, and liveness,
+  fragmentation and restart drive the multiplexed side. Omit it and every expectation is the
+  identity it has always been, byte for byte.
+- **`--error-paths`** adds clause 5's third outcome: an unknown type byte, an oversize length
+  prefix, and a body truncated below its own declared channel length are each handed to a fresh
+  child, which must **terminate**, must not echo the fault back as a valid frame, and must
+  *signal* the refusal (a non-zero exit, or an `error` event). The verdict names the arm and the
+  byte offset of the injected fault. Opt-in, because a permissive relay is a legal thing to write —
+  and `passthrough.py` is exactly that, so it passes every universal check and fails all three
+  arms, which is this battery's `Hoarder` and its fail-first proof. `strict.py` is the positive
+  control and the shape to copy where a codec must report rather than relay.
+
+A verdict never leaves a deadline unnamed: a check that expired reports so in `timed_out` and says
+what it saw in `details`, because "not delivered within the deadline" and "dropped" are different
+findings (plan §3).
 
 **The corruption recipe.** Resynchronization is accounted, not approximate. If your codec speaks
 the envelope framing, wire it under `serial-nexus-sim mux --corrupt-every N`: the sim emits a loss
@@ -1582,14 +1643,19 @@ manifest, with the same two equalities (`itest/tests/p5_resync.rs` is the worked
 Remember clause 8 while you read the counters: a corrupted length prefix that stays under the frame
 bound merges silently, so `framing_errors == 0` is not health and only the manifest equality is.
 
-**The consumer template.** `examples/external-codec/` — a trivial `acme-codec` crate plus a
-dozen-line `acme-daemon`, workspace-excluded with its own `Cargo.lock` — is built from the
-consumer's position on every push by `itest/tests/p8_external_codec.rs`, with `--locked` on both
-the build and the conformance run so a drifted lock fails loudly. It boots the custom daemon and
-asserts a `codec = "acme"` node loads with structured state, never CLI text, and it pins the
-*whole* `info.codecs` list — `["acme", "exec", "reference"]` — against the template README,
-because a containment check cannot see the list drift. If your build breaks against a new tag,
-this template broke first, on the push that would have broken you.
+**The consumer template.** `examples/external-codec/` — two codec crates plus a dozen-line
+`acme-daemon`, workspace-excluded with its own `Cargo.lock` — is built from the consumer's position
+on every push by `itest/tests/p8_external_codec.rs`, with `--locked` on both the build and the
+conformance runs so a drifted lock fails loudly. `acme-codec` is a passthrough that demonstrates
+the embedding pattern; `tinymux-codec` is a two-channel tag framer with parser state and one
+attribute, and it exists because a passthrough exercises none of `control_event_round_trip`,
+`assert_buffer_bounded`, or `attributes_are_structural` — the three suites now have a consumer.
+The gate boots the custom daemon, asserts a `codec = "acme"` node loads with structured state
+(never CLI text) and a `codec = "tinymux"` node loads with its attributes while a bad table is
+refused naming the key with nothing created, and it pins the *whole* `info.codecs` list —
+`["acme", "exec", "reference", "tinymux"]` — against the template README, because a containment
+check cannot see the list drift. If your build breaks against a new tag, this template broke
+first, on the push that would have broken you.
 
 **Fixtures that must survive every rewrite.** Four Python fixtures under `tests/ext-codec/` and
 one negative pair in the kit are load-bearing — named here, and in the plan's workspace map, so a
@@ -1619,12 +1685,13 @@ build your own harness around the envelope, give it a positive control — a kno
 it must pass and a known-broken codec it must fail — before you let it judge your codec, because
 the tree's own battery once failed correct codecs until `lag.py` pinned the check.
 
-Further kit and battery capabilities are filed as plan §18 ledger items, deliberately not promised
-here as existing: an attribute-schema conformance suite, an `Err`-then-`Ok` recovery suite,
-error-path fixtures in the exec battery, demux-shape exec conformance (retiring the
-identity-passthrough limitation), golden transcripts of the daemon boundary, executable doc
-examples for `docs/codec-authors.md`, a teardown-conservation suite on a codec node, and a second
-template codec exercising the whole kit.
+Further kit and battery capabilities stay filed as plan §18 ledger items, deliberately not promised
+here as existing: **golden transcripts of the daemon boundary** (item 36) and a
+**teardown-conservation suite on a codec node** (item 38). The five this list carried alongside
+them shipped 2026-08-12 and are described above and in `docs/codec-authors.md`: the
+attribute-schema suite (item 32), the `Err`-then-`Ok` recovery suite (item 33), the exec battery's
+error paths (item 34), demux-shape exec conformance (item 35, retiring the identity-passthrough
+limitation), executable doc examples (item 37), and the second template codec (item 39).
 
 ### The extension surface
 
@@ -1752,7 +1819,8 @@ unset, since honouring it would yield a relative bind path. Any arm is overridde
 command-line argument.
 
 That policy has exactly one implementation, `serial_nexus_rpc::socket`, and every consumer goes
-through it: the daemon binds through it, `serial-nexus-ctl` connects through it, and the doctor
+through it: the daemon binds through it, `serial-nexus-ctl` connects through it, the web console
+resolves its default through it and names the result at startup, and the doctor
 computes and prints it, with `SocketOrigin` naming which arm applied — so anything *printed*
 about the path is computed from the same code that binds it, and a printed path cannot drift from
 a bound one. **Misreading, recorded:** the doctor once named a socket fallback the daemon does
@@ -2022,11 +2090,21 @@ contract:
 
 ### Replies account for what they destroy
 
-The destroying verbs report their destruction in §5's two-sided ledger form (§15.50):
-`teardown`, `remove-node`, and `load --replace` — the third destroying verb and the largest
-loss, since it destroys the whole graph — reply with `torn_down` and `discarded_at_teardown`.
-Both fields are always present, `0` included, on plain `load` too: a `0` with nothing beside it
-saying what it counts is unreadable (§15.49; notes §3.59).
+The destroying verbs report their destruction in §5's two-sided ledger form (§15.50): a count of
+what was removed beside the bytes removing it cost, because a bare `0` with nothing saying what it
+counts is unreadable (§15.49; notes §3.59). There are three of them, and the *count* half is
+whatever that verb removes:
+
+- `teardown` and `load --replace` — the largest loss, since it displaces the whole graph — reply
+  with **`torn_down`** (nodes removed) and `discarded_at_teardown`. Both fields are always
+  present, `0` included, on plain `load` too.
+- `remove-node` removes exactly one node, so a node count would say nothing; its pair is
+  **`cascaded_edges`** beside `discarded_at_teardown`, with `released_locks` and `purged_bytes`
+  for what the cascade cost at the edges (review 37 `37-LIFE-1`). It carries no `torn_down` and
+  never has — `docs/rpc/configuration.md` is the schema authority and documents none. *(This
+  sentence read "`teardown`, `remove-node`, and `load --replace` … reply with `torn_down`" until
+  2026-08-12, over-stating a settled contract that §5, §15.50 and the shipped guards all scope
+  correctly; corrected in the design, not on the wire — notes §3.75.)*
 
 ### Dump round-trips
 
@@ -2581,9 +2659,15 @@ Every entry carries exactly one of five states; the record once used four differ
 verbs in four places, and these are now the only ones.
 
 - **deferred** — named future work no configuration can reach; this entry is its only surface.
-- **refused-at-load** — the model specifies it and the schema admits the words, but the
-  implementation does not exist: a configuration naming it is refused with a structural error
-  listing what does exist. The refusal is live, tested behavior — never a silent no-op.
+- **refused-at-load** — the model specifies it but the implementation does not exist, so a
+  configuration naming it is refused at load, listing what does exist, with nothing created.
+  The refusal is live, **tested** behavior — never a silent no-op. Two shapes qualify, and the
+  entry says which: where the **schema admits the words**, the refusal is a structural error
+  from `GraphConfig::validate` naming the deferral and its section (entry 14); where the schema
+  does not admit them at all, the refusal is serde's own unknown-variant error at
+  deserialization, which lists the shipped kinds and cites no section (entry 15). The second
+  shape is weaker in what it *says*, not in what it *does*, and §18 item 45 carries the
+  decision about upgrading it (notes §3.75).
 - **accepted-and-waiting** — validation accepts the configuration and the graph loads; the
   instance waits for a missing driver.
 - **graduated** — a driver arrived and the capability shipped; the body sections named in the
@@ -2633,8 +2717,14 @@ verbs in four places, and these are now the only ones.
 14. **The serial output leg** (`faces = target`, §7.1) — *refused-at-load*: accepted in the
     model but refused until a driving use case arrives, with a structural error naming the
     deferral.
-15. **The existing-terminal node** (§7.7) — *refused-at-load*: specified in the model, not
-    implemented; a configuration naming it is refused, listing the node kinds that do exist.
+15. **The existing-terminal node** (§7.7) — *refused-at-load*, in the vocabulary's **second**
+    shape: specified in the model, not implemented, and `existing-terminal` is not a
+    `NodeConfig` variant — so a configuration naming it is refused by serde's unknown-variant
+    error at `INVALID_PARAMS`, listing the node kinds that do exist, with nothing created. It is
+    a real refusal and it is now tested (`existing_terminal_is_refused_at_load_listing_the_
+    shipped_kinds`), but it is **not** entry 14's structural form: it names no section and cites
+    no deferral. Making it structural is plan §18 item 45, filed rather than done quietly, and
+    the guard asserts today's behaviour so that upgrade reddens it loudly (notes §3.75).
 
 *§17 follows; §15–§16 are the decision record and read as an appendix — the numbering is stable
 across generations by rule (front matter).*
@@ -3760,6 +3850,45 @@ because this entry did not exist; notes §3.68 filed and declined the string fix
 **overturned that decline**, deliberately moving `probe_set` `82a8e2198e54626a` →
 `e79f5fcd86a2e5f0` and closing that era — a correction only gets dearer as captures accumulate
 under a wrong citation.
+
+### 15.54 Park or drain is a property of the pump, not of the edge
+
+**Status:** LIVE — amends §5's wiring invariant (clause 3) and its loss taxonomy, which stated the
+park rule as an absolute and carried no row for the counters the exception charges. The behaviour
+is unchanged and was always deliberate; what changes is that the design now says what the tree
+does.
+
+**The rule.** On a targetward edge that is **not attached**, a pump whose stall is confined to the
+endpoint whose edge was removed **parks** — the writers behind it backpressure, exactly as a steal
+makes them (§6), and nothing is dropped. A pump whose stall would reach traffic belonging to
+*other* endpoints **drains and counts** instead, charging a located pump-side discard (§5's
+taxonomy). Which arm a node takes is that node's own policy, and the three shipped instances name
+their reasons in place:
+
+- the **interior** nodes — codec, map, pty — park (`nodes/codec.rs`, `nodes/map.rs`): one pump per
+  host-facing endpoint, so the stall lands exactly on the writers of the edge that went away;
+- the **leg** drains, charging per-channel `discarded_targetward` (`nodes/leg.rs`): its channels
+  share one socket, so a parked channel fills its bounded queue and then head-of-line blocks every
+  other channel on a cross-machine link (§9). §7.4 already counts data for a channel with no local
+  endpoint;
+- the **exec** codec drains, charging `mux_discarded_targetward` (`nodes/exec.rs`): the mux route
+  runs inside the child's single stdout decode loop, so a parked mux event stalls every *hostward*
+  channel event queued behind it — one detached device edge would stop delivery to local consumers
+  that have nothing to do with it.
+
+**Why it is not unified.** Only the send-and-charge *tail* is shared (`runtime.rs`'s
+`forward_targetward`, SIMP-2); the pump around it is not, precisely because this choice differs.
+Sharing the whole pump would force one arm on all three and silently break whichever two it was
+not written for — which is why the tail is where exits get forgotten (CODEXEC-2 returned through
+one without charging) and the arm is where the policy stays.
+
+**Why it is recorded now.** The rule was stated correctly in the v12 session log, with the
+qualifier *"park only where the stall is confined to the endpoint whose edge was removed"*. When
+plan §14 promoted the invariant into §5's body the qualifier was dropped, and the design then
+stated an absolute that three shipped nodes did not follow — with the counters charging on the
+exception having no row in §5's own loss taxonomy either. A reader checking the tree against §5
+would have found four counters moving on a healthy graph and no class to file them under. Nothing
+in the tree moved; the design is what was wrong (notes §3.75).
 
 ## 16. Post-completion review: reliability through simplification
 

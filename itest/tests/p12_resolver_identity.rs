@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Review-32 regression guards for the resolver's two §12 directions (design §12,
 //! §15.10, §15.35). One file per defect area, per §5; `p12_*` is this review's
 //! family as `p9_*` is review 26's.

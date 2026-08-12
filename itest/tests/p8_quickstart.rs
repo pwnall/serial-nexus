@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 8 validation (item 1): the five-minute quickstart, ported from
 //! `scripts/validate/phase8/quickstart.sh` (design §2, plan §Phase 8 item 1). The
 //! README happy path, exactly:

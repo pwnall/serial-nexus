@@ -45,3 +45,7 @@ libc.workspace = true
 [dev-dependencies]
 # Property tests for the pure boundary-supervisor primitives (§16.1 / plan §9.1).
 proptest.workspace = true
+# The conformance kit's attribute-schema suite (§8 clause 12), run against the
+# built-in factories this crate ships — the same suite an out-of-tree codec runs
+# from the consumer position (plan §18 item 32).
+serial-nexus-codec-api = { workspace = true, features = ["test-support"] }

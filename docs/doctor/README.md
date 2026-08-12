@@ -370,13 +370,22 @@ one run of making. Sequential runs on a quiet box (load 0.44, no other load), al
 
 ## Adding one
 
+**One run, both consumers.** The capture and the gate read the *same* `Report`: `--json-out`
+writes the JSON twin of the run that is already happening, so the artifact you commit is the
+report the gate passed. Two invocations of one binary on one box are **two measurements** — P9's
+and P10's numbers move run to run, which is the whole reason the diffs above take three samples —
+so a recipe that captured one run and gated another was quietly comparing across them (notes
+§3.74, plan §18 item 43).
+
 ```sh
 cargo build --workspace --locked
-./target/debug/serial-nexus-doctor --json > docs/doctor/<os>-<kver>-<yyyy-mm-dd>[-<commit>][-<rig>][-N].json
-./target/debug/serial-nexus-doctor --json | jq -e -f expectations/linux.jq   # or macos.jq
+# ONE run. The `.json` is committed; the gate reads that same file.
+./target/debug/serial-nexus-doctor --json-out docs/doctor/<os>-<kver>-<yyyy-mm-dd>[-<commit>][-<rig>][-N].json
+jq -e -f expectations/linux.jq docs/doctor/<...>.json   # or macos.jq
 # With a rig, opt the ports in explicitly — this transmits, and a listed port could
-# be wired to live equipment (§15.17):
-./target/debug/serial-nexus-doctor --port /dev/ttyUSB0 --port /dev/ttyUSB1 > docs/doctor/….md
+# be wired to live equipment (§15.17). Markdown to read, JSON twin to keep, one run:
+./target/debug/serial-nexus-doctor --port /dev/ttyUSB0 --port /dev/ttyUSB1 \
+    --markdown --json-out docs/doctor/<...>.json > docs/doctor/….md
 # The cell-set digest of any captured report, including ones taken before the field
 # existed (it is a pure function of .probes[].observations) — this is what computed the
 # `Field set` column above, with the artifacts untouched:

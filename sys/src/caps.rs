@@ -73,15 +73,44 @@ pub fn parse_capability_state(status: &str, bit: u32) -> Option<CapState> {
     })
 }
 
-/// Set `PR_SET_NO_NEW_PRIVS`, so no `execve` from this process can ever gain
-/// privilege — including through a setuid binary or another file capability.
+/// Set `PR_SET_NO_NEW_PRIVS` **and confirm with the kernel that it took**, so no
+/// `execve` from this thread — or from anything it forks — can ever gain privilege,
+/// including through a setuid binary or another file capability.
 ///
-/// The helper never `exec`s anything, so this is belt-and-braces; it is set anyway
-/// because it is one syscall and it converts "the helper does not exec" from a
-/// property of the code into a property the kernel enforces.
+/// The helper never `exec`s anything while blessed, so this is belt-and-braces; it
+/// is set anyway because it is one syscall and it converts "the helper does not
+/// exec" from a property of the code into a property the kernel enforces. §15.45
+/// lists that conversion among the five bounds that hold *by construction*, and a
+/// bound holds by construction only if the construction is checked: `prctl(2)`
+/// answers `EINVAL` for `PR_SET_NO_NEW_PRIVS` on kernels before 3.5, and a seccomp
+/// policy can filter either call, so a caller that dropped the return value would
+/// be asserting an intention. This function therefore checks the setter *and* reads
+/// the bit back with `PR_GET_NO_NEW_PRIVS`, which is the kernel's own answer and
+/// needs no `/proc` mount (unlike [`capability_state`], where the alternative to
+/// `/proc` was `capget(2)` and more `unsafe`).
+///
+/// The bit is per-thread, inherited across `fork` and `execve`, and cannot be
+/// unset; setting it on the helper's only thread — before it creates any — covers
+/// every process that thread could become.
+///
+/// `Err` carries an operator-readable diagnosis rather than a bare `Errno`, and the
+/// caller decides how loudly to fail: a copy that holds no capability has nothing
+/// left to harden, while a blessed one must not proceed (see the refusal in
+/// `serial-nexus-replug`'s `main`).
 #[cfg(target_os = "linux")]
-pub fn set_no_new_privs() -> nix::Result<()> {
+pub fn establish_no_new_privs() -> Result<(), String> {
     nix::sys::prctl::set_no_new_privs()
+        .map_err(|e| format!("prctl(PR_SET_NO_NEW_PRIVS) failed: {e}"))?;
+    match nix::sys::prctl::get_no_new_privs() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(
+            "prctl(PR_SET_NO_NEW_PRIVS) reported success but PR_GET_NO_NEW_PRIVS reads 0"
+                .to_owned(),
+        ),
+        Err(e) => Err(format!(
+            "prctl(PR_GET_NO_NEW_PRIVS) failed: {e} — the bit cannot be confirmed set"
+        )),
+    }
 }
 
 /// Ask the kernel to send `SIGTERM` to this process when its parent dies.
@@ -230,6 +259,33 @@ mod tests {
     #[test]
     fn this_unprivileged_test_process_holds_no_dac_override() {
         assert_eq!(capability_state(CAP_DAC_OVERRIDE), CapState::NONE);
+    }
+
+    /// The no-new-privs bound is *established*, not attempted: the same read that
+    /// answers "set" afterwards answers "unset" before, so the instrument is shown
+    /// able to fire in both directions (§15.46's discriminator-can-fire rule applied
+    /// to a one-bit measurement). Without the "before" half this test would pass
+    /// against a kernel that reported the bit set unconditionally.
+    ///
+    /// Safe to run inside the suite because `PR_SET_NO_NEW_PRIVS` is a *per-thread*
+    /// attribute: it lands on the libtest thread executing this test and on nothing
+    /// else, so no other test's `execve` is affected. It is irreversible on that
+    /// thread, which is why the assertion is here and not in a shared helper.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_new_privs_reads_unset_before_and_set_after_establishing_it() {
+        assert_eq!(
+            nix::sys::prctl::get_no_new_privs(),
+            Ok(false),
+            "this test thread must start unhardened, or the transition below measures nothing"
+        );
+        establish_no_new_privs().expect("PR_SET_NO_NEW_PRIVS on Linux 3.5 or later");
+        assert_eq!(
+            nix::sys::prctl::get_no_new_privs(),
+            Ok(true),
+            "the kernel must report the bit this process just set — the read-back is the \
+             whole difference between establishing the bound and attempting it"
+        );
     }
 
     /// The confinement check answers the kernel's question, not the path's: a real

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 12 — the web console's **session and connection lifetime** (review
 //! `docs/32-claude-opus-code-review.md`).
 //!

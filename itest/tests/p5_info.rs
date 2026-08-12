@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 5 `info`-verb slice, ported from `scripts/validate/phase5/info.sh`
 //! (design §10 / §15.26 / §8). Two properties, neither needing a serial *device*,
 //! so both run on **every platform** — the macOS-portable replacement for the

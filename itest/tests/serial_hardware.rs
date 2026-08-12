@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Real-hardware serial data plane over a cross-wired null-modem rig — the macOS
 //! analogue of the retired `hardware/crossover-rig.sh` (design §13/§15.21), and the
 //! *only* way to exercise the serial path on macOS (a pty cannot stand in for a serial

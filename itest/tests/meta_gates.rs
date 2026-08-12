@@ -1591,3 +1591,115 @@ fn entry_point_design_and_plan_names_resolve() {
          nothing passes forever"
     );
 }
+
+/// **Every crate root forbids `unsafe`, and exactly one does not** (§16.3; §5's
+/// tripwire table; plan §2).
+///
+/// The invariant is stated absolutely — "`unsafe` lives only in `serial_nexus_sys`;
+/// everything else is `#![forbid(unsafe_code)]`" — and until 2026-08-12 the harness
+/// crate satisfied *neither* half of it: `serial-nexus-itest` carried the attribute on
+/// **none** of its 95 crate roots (`src/lib.rs` plus 94 files under `tests/`, each its
+/// own crate root and therefore its own place the attribute has to appear), while two
+/// of its files told a reader checking the invariant that it was present. What held
+/// the line was [`unsafe_is_confined_to_serial_nexus_sys`] above — a grep, and a grep
+/// is a *detector*, not a compiler: it cannot see an edition-2024 `unsafe(…)`
+/// attribute, and it cannot see a macro that expands to an `unsafe` block.
+///
+/// This gate is the structural half, and it is deliberately a **two-sided** check.
+/// Forgetting the attribute on a new test file is the drift it exists to catch; the
+/// other side matters as much — the exception set must stay at exactly one file, so
+/// the sanctioned inner `allow` cannot quietly spread to a second crate that found it
+/// convenient. §16.3's whole value is that the answer to "where is the `unsafe`" is
+/// one directory.
+///
+/// Crate roots are enumerated rather than listed: `src/lib.rs`, `src/main.rs`, and
+/// every `tests/*.rs` of every crate the [`crate_dirs`] walk finds. A list typed here
+/// would be the hand-kept roster this repository keeps learning not to keep
+/// (AGENTS §3).
+#[test]
+fn every_crate_root_forbids_unsafe_except_the_one_that_may_not() {
+    const FORBID: &str = "#![forbid(unsafe_code)]";
+    // Built by concatenation, exactly like the planted `unsafe` sample above and for
+    // the same reason: a literal here would make **this file** an exemption, since it
+    // is a crate root the scan below reads. Caught on the first run — the gate reported
+    // `["itest/tests/meta_gates.rs", "sys/src/lib.rs"]`, which is a detector matching
+    // itself rather than a second crate going soft. The `forbid` needle needs no such
+    // dodge: this file carries that attribute for real, as every crate root must.
+    let allow = format!("#![{}(unsafe_code)]", "allow");
+    let allow = allow.as_str();
+    // The one crate §16.3 names. Spelled as a repo-relative path, not a base name:
+    // `lib.rs` is the commonest file name in the tree.
+    const EXCEPTION: &str = "sys/src/lib.rs";
+
+    let root = repo_root();
+    let mut unreadable = Vec::new();
+    let crates = crate_dirs(&root, &mut unreadable);
+    assert!(
+        unreadable.is_empty(),
+        "the crate walk could not read {unreadable:?} — a crate it never reached is a \
+         crate whose missing attribute reads as compliance"
+    );
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for dir in &crates {
+        for candidate in ["src/lib.rs", "src/main.rs"] {
+            let p = dir.join(candidate);
+            if p.is_file() {
+                roots.push(p);
+            }
+        }
+        // Integration tests: each file directly under `tests/` is its own crate root,
+        // which is exactly why the attribute has to be repeated per file and exactly
+        // why 94 of them were missed.
+        if let Ok(entries) = std::fs::read_dir(dir.join("tests")) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() && p.extension().is_some_and(|e| e == "rs") {
+                    roots.push(p);
+                }
+            }
+        }
+    }
+    roots.sort();
+
+    // Non-vacuity, both directions: this tree has well over a hundred crate roots, and
+    // a walk that found a handful has stopped walking rather than found compliance.
+    assert!(
+        roots.len() > 100,
+        "only {} crate roots found; the enumeration has stopped seeing them and a gate \
+         that checks nothing passes forever",
+        roots.len()
+    );
+
+    let mut missing = Vec::new();
+    let mut exempted = Vec::new();
+    for path in &roots {
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let src = std::fs::read_to_string(path).unwrap_or_default();
+        if src.contains(allow) {
+            exempted.push(rel);
+        } else if !src.contains(FORBID) {
+            missing.push(rel);
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "these crate roots carry neither `{FORBID}` nor the one sanctioned \
+         `{allow}`: {missing:?}. §16.3 makes the attribute the invariant and the \
+         `unsafe` grep only its detector — a file without it is a file where the \
+         compiler is not enforcing anything"
+    );
+    assert_eq!(
+        exempted,
+        vec![EXCEPTION.to_owned()],
+        "the `{allow}` exception must be exactly `{EXCEPTION}` and nothing else \
+         (§16.3): `unsafe` lives in one crate so that the answer to \"where is the \
+         unsafe\" is one directory, and a second exemption ends that whatever its \
+         reason"
+    );
+}

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! MAP-1's shape, generalised: **a `waiting` interior node must be inert, not
 //! destructive** (design §15.8, §5).
 //!

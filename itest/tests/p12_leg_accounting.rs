@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Review-32 cluster 4: **§5's "loss is always visible and attributable" had holes
 //! in the leg** (design §5, §7.4, §9; AGENTS.md invariant 3 clause 3 and invariant 9).
 //!

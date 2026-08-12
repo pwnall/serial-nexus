@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 6 leg loopback-only security gate, ported from
 //! `scripts/validate/phase6/insecure-bind.sh` (design §7.4/§9, footgun surfaced per
 //! §15.12).

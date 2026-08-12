@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 12 — the web console's **post-handshake WebSocket bounds** (review
 //! `docs/37-claude-fable-code-review.md`, 37-WEBS-4).
 //!

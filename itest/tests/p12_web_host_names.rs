@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 12 — the web console's **operator-declared Host names** (review
 //! `docs/37-claude-fable-code-review.md`, 37-WEBS-2).
 //!

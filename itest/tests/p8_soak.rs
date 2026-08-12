@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 8 soak slice, ported from `scripts/validate/phase8/soak.sh`
 //! (design §5, plan §Phase 8). A daemon under continuous synthetic load, asserting
 //! the four release-soak signals throughout:

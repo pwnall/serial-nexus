@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Out-of-tree codec template slice, folded from
 //! `scripts/validate/phase8/external-codec.sh` into the Rust harness (§16.11; design
 //! §15.26 / plan §10.3-10.4). The last of the three surviving shell scripts to retire —
@@ -6,21 +8,29 @@
 //! The supported way to ship a proprietary codec is **source-level composition** against
 //! two semver'd contracts (`serial-nexus-codec-api` + `serial-nexus-daemon`), never a dynamically loaded
 //! plugin. `examples/external-codec/` is a self-contained workspace standing in for that
-//! out-of-tree repository: `acme-codec` (a codec depending only on `serial-nexus-codec-api`) and `acme-daemon`
-//! (the in-tree `serial-nexus-daemon` plus one line — `Registry::with_builtins().register("acme",
-//! …)`). This test proves the embedding pattern *builds and works from the consumer
-//! position* per push rather than by promise:
+//! out-of-tree repository: two codec crates depending only on `serial-nexus-codec-api`
+//! — `acme-codec` (a passthrough) and `tinymux-codec` (a two-channel tag framer with
+//! parser state and one attribute) — plus `acme-daemon` (the in-tree
+//! `serial-nexus-daemon` plus two chained `Registry::with_builtins().register(…)` calls).
+//! This test proves the embedding pattern *builds and works from the consumer position*
+//! per push rather than by promise:
 //!
 //! 1. The template workspace **builds from its own manifest** (path deps standing in for
-//!    version pins) and its codec passes the `serial-nexus-codec-api` conformance kit
-//!    (`cargo test -p acme-codec --features conformance`).
-//! 2. The custom `acme-daemon` reports its own `acme` codec **alongside** the built-in
+//!    version pins) and **both** codecs pass the `serial-nexus-codec-api` conformance kit
+//!    (`cargo test -p <crate> --features conformance`). Two crates, because a passthrough
+//!    cannot exercise the control-event round-trip, the buffer bound, or the attribute
+//!    schema — the three suites `tinymux` exists to carry (plan §18 item 39).
+//! 2. The custom `acme-daemon` reports **its own** codecs **alongside** the built-in
 //!    `reference` codec via the unchanged `info` RPC (§15.16) — the CLI / RPC surface
 //!    never bakes in the codec list. The *whole* list is pinned as well, because the
 //!    template's README prints it as what an embedder should expect and a containment
 //!    check cannot see it drift (37-DOC-4).
 //! 3. A config naming `codec = "acme"` loads, and the resulting node's state carries
 //!    `codec == "acme"` (it comes up `waiting` — no attached mux upstream).
+//! 4. A `codec = "tinymux"` node loads **with its attributes**, and an unknown attribute
+//!    key is refused *naming the key* with nothing created — the out-of-tree half of §11's
+//!    pre-create precheck: the daemon never sees that schema, the codec crate owns it,
+//!    and the operator still gets a sentence pointing at the mistake (§8 clause 12).
 //!
 //! Ground truth is structured RPC (`info.codecs`, the codec node's `state` object), never
 //! parsed CLI text (§5). Unlike the batch-2b port, this test **builds the template
@@ -98,28 +108,35 @@ fn external_codec_template_builds_and_serves_acme_alongside_builtins() {
         .expect("run cargo build on the external-codec template");
     assert!(built.success(), "external-codec template build failed");
 
-    // (1b) The template's own conformance-kit test, from the consumer position — also
+    // (1b) The template's own conformance-kit tests, from the consumer position — also
     // `--locked`, so the conformance run cannot resolve a different graph than (1a).
-    let conformance = Command::new("cargo")
-        .args([
-            "test",
-            "-q",
-            "--locked",
-            "-p",
-            "acme-codec",
-            "--features",
-            "conformance",
-            "--manifest-path",
-        ])
-        .arg(&manifest)
-        .arg("--target-dir")
-        .arg(&target)
-        .status()
-        .expect("run the acme conformance-kit test");
-    assert!(
-        conformance.success(),
-        "acme codec conformance-kit test failed"
-    );
+    // Both codec crates: `acme` is the passthrough that proves the embedding pattern,
+    // `tinymux` the two-channel framer that proves the three suites a passthrough
+    // cannot reach — the control-event round-trip, the buffer bound, and the attribute
+    // schema (plan §18 item 39). Running only the first is what left those three with
+    // no consumer at all.
+    for crate_name in ["acme-codec", "tinymux-codec"] {
+        let conformance = Command::new("cargo")
+            .args([
+                "test",
+                "-q",
+                "--locked",
+                "-p",
+                crate_name,
+                "--features",
+                "conformance",
+                "--manifest-path",
+            ])
+            .arg(&manifest)
+            .arg("--target-dir")
+            .arg(&target)
+            .status()
+            .unwrap_or_else(|e| panic!("run the {crate_name} conformance-kit test: {e}"));
+        assert!(
+            conformance.success(),
+            "{crate_name} conformance-kit test failed"
+        );
+    }
 
     let daemon_bin = acme_daemon_bin();
     assert!(
@@ -170,7 +187,7 @@ fn external_codec_template_builds_and_serves_acme_alongside_builtins() {
     // what the README did (review 37, 37-DOC-4).
     assert_eq!(
         codecs,
-        &json!(["acme", "exec", "reference"]),
+        &json!(["acme", "exec", "reference", "tinymux"]),
         "the custom daemon's info.codecs is not the list the template README prints \
          (37-DOC-4): {info}"
     );
@@ -194,6 +211,61 @@ channels = ["console"]
         mux.get("codec").and_then(Value::as_str),
         Some("acme"),
         "the mux node's codec is not \"acme\": {mux}"
+    );
+
+    // (4) The second template codec takes an **attribute**, so it exercises the half
+    // of the embedding contract `acme` cannot: the opaque table reaches the codec's own
+    // schema through the registry factory, and the schema's verdict is the load's
+    // verdict (§8 clause 12, §11). A good table loads…
+    let good = r#"
+[[node]]
+type = "codec"
+name = "tiny"
+codec = "tinymux"
+faces = "target"
+channels = ["console", "trace"]
+
+  [node.attributes]
+  channels = ["console", "trace"]
+"#;
+    rpc.add_node_toml(good)
+        .expect("the tinymux node failed to load");
+    let tiny = rpc
+        .node("tiny")
+        .unwrap_or_else(|| panic!("the tinymux codec node did not load: {}", rpc.state()));
+    assert_eq!(
+        tiny.get("codec").and_then(Value::as_str),
+        Some("tinymux"),
+        "the tiny node's codec is not \"tinymux\": {tiny}"
+    );
+
+    // …and a bad one is refused **naming the key**, with nothing created. This is the
+    // out-of-tree half of the pre-create precheck contract (§11): the daemon never
+    // sees the schema, the codec crate owns it, and the operator still gets a sentence
+    // that points at the mistake.
+    let bad = r#"
+[[node]]
+type = "codec"
+name = "tiny2"
+codec = "tinymux"
+channels = ["console"]
+
+  [node.attributes]
+  channels = ["console"]
+  widgets = 3
+"#;
+    let err = rpc
+        .add_node_toml(bad)
+        .expect_err("an unknown tinymux attribute key must be refused");
+    let text = format!("{err:?}");
+    assert!(
+        text.contains("widgets"),
+        "the refusal must name the offending key (§8 clause 12): {text}"
+    );
+    assert!(
+        rpc.node("tiny2").is_none(),
+        "a refused load created a node anyway — §11 promises nothing is created: {}",
+        rpc.state()
     );
 
     // Clean shutdown; KillOnDrop is the backstop.

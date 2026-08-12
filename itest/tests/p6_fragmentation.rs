@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The **leg's** oversize-chunk fragmentation, end to end (design §15.24, §9 clause 5,
 //! AGENTS.md invariant 3). Review 32 WIRER-3.
 //!

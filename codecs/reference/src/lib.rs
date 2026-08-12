@@ -377,6 +377,11 @@ mod tests {
         // the property the trait-only suite cannot see: length-guided resync keeps
         // the buffer within one frame even on undecodable input (§5).
         kit::assert_buffer_bounded(ReferenceCodec::new, ReferenceCodec::buffered);
+        // It resyncs by length guidance (§8 clause 9), so it also owes the opt-in
+        // Err-then-Ok recovery suite: one refused frame is skipped whole and the
+        // next decodes — clause 6's non-latching contract, codec side. A codec on a
+        // reliable transport (the link codec) legitimately does not call this.
+        kit::recovers_after_garbage(ReferenceCodec::new, "console");
     }
 
     proptest! {

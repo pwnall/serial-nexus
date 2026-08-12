@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 8 tap slice, ported from `scripts/validate/phase8/tap.sh` (design §5 / §17,
 //! the web-console track). A **tap** is a connection-scoped, read-only dynamic
 //! attachment on a host-facing endpoint — the `never` write mode in dynamic form.

@@ -25,7 +25,10 @@
 //!   or config-file path into a capability-holding process.
 //! * **no `exec`.** It never spawns anything while privileged; `PR_SET_NO_NEW_PRIVS`
 //!   makes that a kernel guarantee rather than a property of the code, and the one
-//!   module that does spawn (`install`) is refused when the capability is held.
+//!   module that does spawn (`install`) is refused when the capability is held. The
+//!   prctl is *established*, not attempted: [`main`] checks it, reads the bit back
+//!   from the kernel, and a copy holding the capability that cannot get both answers
+//!   refuses to run at all rather than continuing unhardened.
 //! * **no path parameter.** The only device argument is a USB port *name* like
 //!   `3-1`, validated against a digit/`-`/`.` alphabet and joined to a compile-time
 //!   root, so no caller-supplied byte ever reaches `open(2)` as a path.
@@ -176,16 +179,93 @@ mod exit {
     pub const FAILED: i32 = 70;
 }
 
+/// What it means that the no-new-privs bound could not be established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unhardened {
+    /// Say so and carry on. This copy holds no capability, so there is nothing left
+    /// for the bound to protect — and `install`, `preflight` and the read-only verbs
+    /// are exactly what an operator needs on a box whose kernel or sandbox answered
+    /// this way. Reported on stderr, never silent.
+    Report,
+    /// Refuse to run at all. This copy is blessed and one of §15.45's five bounds is
+    /// missing.
+    Refuse,
+}
+
+/// The disposition, split out from [`main`] so the branch that can only occur on a
+/// blessed copy — which no unprivileged suite can produce — is still exercised by a
+/// test rather than reasoned about.
+///
+/// `permitted` counts and not only `effective`: a copy blessed `+p` can raise the
+/// capability into its effective set itself at any moment, no further privilege
+/// required, so it is a blessed process for this purpose. `install_verb` refuses on
+/// exactly the same pair for exactly the same reason.
+fn unhardened_disposition(held: CapState) -> Unhardened {
+    if held.permitted || held.effective {
+        Unhardened::Refuse
+    } else {
+        Unhardened::Report
+    }
+}
+
 pub fn main() {
-    let cli = Cli::parse();
+    // Hardening first, before an argument is looked at and before anything but
+    // `/proc/self/status` is read. Cheap, irreversible, and it means every path
+    // below runs under the same restriction.
+    //
+    // **Checked, because §15.45 says this bound holds by construction.** The entry
+    // lists "no `exec` while blessed — `PR_SET_NO_NEW_PRIVS`-guaranteed" among five
+    // bounds on a process carrying `CAP_DAC_OVERRIDE`, and a guarantee whose return
+    // value is discarded is an attempt: `prctl(2)` refuses `PR_SET_NO_NEW_PRIVS`
+    // with `EINVAL` before Linux 3.5 and a seccomp policy can filter it, and until
+    // 2026-08-12 this line was `let _ = …`, so a failure would have left a blessed
+    // process running unhardened and said nothing. `establish_no_new_privs` checks
+    // the setter and reads the bit back from the kernel; what is left here is the
+    // decision about what an unestablished bound means.
+    let hardening = caps::establish_no_new_privs();
+    // Decided once, and true for this process's lifetime: file capabilities arrive
+    // at `execve` and this binary never `exec`s, so nothing below can acquire the
+    // capability after this branch.
     let held = caps::capability_state(CAP_DAC_OVERRIDE);
+    if let Err(reason) = &hardening {
+        match unhardened_disposition(held) {
+            Unhardened::Refuse => {
+                // A blessed copy that cannot harden itself does not run. Not a
+                // warning: the reason this binary may carry a root-equivalent
+                // capability at all is that its bounds are established rather than
+                // hoped for, and one of the five is missing. Stderr and an exit code
+                // rather than the usual `--json` refusal, because argv has
+                // deliberately not been parsed yet, and `itest`'s `replug()` helper
+                // treats a non-zero exit as fatal and surfaces stderr with it.
+                //
+                // **The bound this branch keys on is capability, and capability is read
+                // from `/proc`.** `capability_state` answers `NONE` when
+                // `/proc/self/status` is unreadable, because every *other* caller wants
+                // "cannot prove it is held" to behave like "not held" — the privileged
+                // verbs refuse in both cases. Here that default runs the other way: a
+                // genuinely blessed copy on a box with no readable `/proc` **and** a
+                // filtered prctl takes the Report branch and keeps going unhardened. It
+                // is stated rather than papered over, because the honest bound is "no
+                // blessed copy this process can *see* runs unhardened", and no
+                // unprivileged reading of a capability can promise more than that.
+                eprintln!(
+                    "serial-nexus-replug: refusing to run: this copy holds cap_dac_override \
+                     but cannot establish PR_SET_NO_NEW_PRIVS — {reason}. §15.45 requires that \
+                     bound on a blessed copy. Strip the capability (`sudo setcap -r <path>`) \
+                     or run the unblessed copy from target/<profile>/."
+                );
+                std::process::exit(exit::REFUSED);
+            }
+            Unhardened::Report => eprintln!(
+                "serial-nexus-replug: {reason} — harmless in this unblessed copy, which holds \
+                 no capability, but a blessed copy on this box will refuse to run (§15.45)."
+            ),
+        }
+    }
 
-    // Hardening first, before anything reads a file or looks at an argument. Cheap,
-    // and it means every path below runs under the same restrictions.
-    let _ = caps::set_no_new_privs();
-
+    let cli = Cli::parse();
     let code = match cli.verb {
-        Verb::Capabilities { json } => report_capabilities(held, json),
+        Verb::Capabilities { json } => report_capabilities(held, hardening.is_ok(), json),
         Verb::Status { port, json } => status(&port, json),
         Verb::Cycle {
             ports,
@@ -230,7 +310,15 @@ fn repo_root() -> Result<PathBuf, String> {
     Ok(root.to_owned())
 }
 
-fn report_capabilities(held: CapState, json: bool) -> i32 {
+/// Report what this process holds and what it has established — the two halves of
+/// §15.45's privilege story, from the process that is the subject of both.
+///
+/// `no_new_privs` is the read-back result from `main`, not a second measurement:
+/// the bit cannot be unset, so one answer is the whole life of the process. It is
+/// reported rather than merely acted on because a bound nothing ever observes is
+/// indistinguishable from one that was never set — which is exactly the defect this
+/// field closes.
+fn report_capabilities(held: CapState, no_new_privs: bool, json: bool) -> i32 {
     if json {
         println!(
             "{}",
@@ -238,6 +326,7 @@ fn report_capabilities(held: CapState, json: bool) -> i32 {
                 "cap_dac_override_permitted": held.permitted,
                 "cap_dac_override_effective": held.effective,
                 "blessed": held.effective,
+                "no_new_privs": no_new_privs,
             })
         );
     } else if held.effective {
@@ -249,6 +338,17 @@ fn report_capabilities(held: CapState, json: bool) -> i32 {
         );
     } else {
         println!("cap_dac_override: not held — this copy is not blessed");
+    }
+    if !json {
+        println!(
+            "no_new_privs: {} — {}",
+            no_new_privs,
+            if no_new_privs {
+                "PR_SET_NO_NEW_PRIVS set and read back; no exec from here can gain privilege"
+            } else {
+                "the kernel would not confirm the bit; a blessed copy refuses to run (§15.45)"
+            }
+        );
     }
     exit::READY
 }
@@ -764,4 +864,52 @@ fn discover_serial_ports() -> Vec<String> {
     }
     found.sort();
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unestablished `PR_SET_NO_NEW_PRIVS` is fatal exactly when this copy is
+    /// blessed, and `+p`-only counts as blessed.
+    ///
+    /// This is the half of the fix a suite can reach. The other half — a `prctl`
+    /// that actually fails — needs either a pre-3.5 kernel or a seccomp policy that
+    /// filters the call, and the refusal it triggers needs a process holding
+    /// `CAP_DAC_OVERRIDE`; neither is producible from an unprivileged test on this
+    /// box, so the decision is factored out of `main` and asserted here rather than
+    /// asserted through a proxy that would pass for the wrong reason (AGENTS §9).
+    #[test]
+    fn an_unestablished_bound_is_fatal_exactly_when_the_copy_is_blessed() {
+        assert_eq!(
+            unhardened_disposition(CapState::NONE),
+            Unhardened::Report,
+            "an unblessed copy holds nothing to protect and must stay usable"
+        );
+        assert_eq!(
+            unhardened_disposition(CapState {
+                permitted: true,
+                effective: true
+            }),
+            Unhardened::Refuse
+        );
+        assert_eq!(
+            unhardened_disposition(CapState {
+                permitted: true,
+                effective: false
+            }),
+            Unhardened::Refuse,
+            "`+p` without `+e` is one capset(2) away from effective, and this process \
+             could make that call itself"
+        );
+        assert_eq!(
+            unhardened_disposition(CapState {
+                permitted: false,
+                effective: true
+            }),
+            Unhardened::Refuse,
+            "the kernel does not produce effective-without-permitted, but if it ever \
+             appeared it is privilege, and privilege refuses"
+        );
+    }
 }

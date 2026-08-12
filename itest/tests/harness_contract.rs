@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Harness self-checks that need a live daemon (design §5's anti-tautology rule: a
 //! broken harness must fail loudly, never pass vacuously).
 //!

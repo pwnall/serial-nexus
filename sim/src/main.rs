@@ -37,8 +37,8 @@ use nix::sys::termios::{
 };
 use serde_json::{Value, json};
 use serial_nexus_codec_api::{
-    Event, EventKind, FrameDecoder, Hello, MAX_FRAME_SIZE, WIRE_MAGIC, WIRE_VERSION, encode,
-    encode_hello, try_decode_hello,
+    ChannelId, Event, EventKind, FrameDecoder, Hello, MAX_FRAME_SIZE, WIRE_MAGIC, WIRE_VERSION,
+    encode, encode_hello, try_decode_hello,
 };
 use sha2::{Digest, Sha256};
 
@@ -280,6 +280,11 @@ struct EnvelopeArgs {
     /// frames on stdin and re-emit them on stdout (a passthrough codec).
     #[arg(long)]
     exec: String,
+    /// Declare the child's demultiplexing shape: it swaps the reserved empty
+    /// channel identity with this channel, in both directions (§8 clause 13). See
+    /// [`ExecConformanceArgs::mux_to`] — the same flag, the same meaning.
+    #[arg(long)]
+    mux_to: Option<String>,
     #[arg(long, default_value_t = 5_000)]
     timeout_ms: u64,
 }
@@ -299,6 +304,31 @@ struct ExecConformanceArgs {
     /// How many frames the full-duplex liveness check interleaves.
     #[arg(long, default_value_t = 64)]
     liveness_frames: usize,
+    /// **Declare a demux shape** instead of an identity passthrough: the child swaps
+    /// the reserved *empty* channel identity (the multiplexed side, §8 clause 13)
+    /// with this channel, in both directions, and passes every other identity
+    /// through. That is the shape a real demux codec has — `passthrough-codec.py`
+    /// is the in-tree skeleton — and without this flag the battery could only be run
+    /// against a passthrough *build* of a codec, never the one an author ships.
+    ///
+    /// With the mapping declared, the battery drives the multiplexed side and expects
+    /// the mapped side back; the golden battery additionally carries one frame in each
+    /// direction of the declared mapping, whatever channel it names. Omitted, every
+    /// expectation is the identity it has always been, byte for byte.
+    #[arg(long)]
+    mux_to: Option<String>,
+    /// Additionally run the **error-path** checks (opt-in): an unknown type byte, an
+    /// oversize length prefix, and a body truncated below its own declared channel
+    /// length are each fed to a fresh child, which must refuse cleanly (§8 clause 5)
+    /// — terminate, never echo the bad frame back as if valid, and *signal* the
+    /// refusal with a non-zero exit or an `error` event.
+    ///
+    /// Opt-in because a permissive relay is a legal thing to write and this battery's
+    /// other checks are the universal ones; a codec that decodes the envelope owes
+    /// clause 5's three-outcome discipline and should turn this on in CI. The offset
+    /// of the injected fault is named in the verdict and on stderr.
+    #[arg(long)]
+    error_paths: bool,
 }
 
 #[derive(Args)]
@@ -1483,6 +1513,62 @@ fn run_mux_inner(a: &MuxArgs) -> anyhow::Result<Value> {
 
 // --- envelope mode ---------------------------------------------------------
 
+/// The demultiplexing shape a battery run declares (`--mux-to`), and the one place
+/// that knows what a conforming child is expected to echo.
+///
+/// **Identity by default.** With no mapping declared this is the identity function
+/// in every method, so every check keeps the exact expectations it has always had —
+/// the byte-compatibility the flag was added under (plan §18 item 35).
+///
+/// **Declared**, it is the swap a real demux codec performs: the reserved *empty*
+/// channel identity (the multiplexed side, §8 clause 13) becomes the named channel
+/// and the named channel becomes the empty one, with every other identity passed
+/// through. Nothing here is codec-specific — `passthrough-codec.py` is one instance
+/// of this shape, not its definition.
+#[derive(Clone, Default)]
+struct ChannelMap {
+    mux_to: Option<String>,
+}
+
+impl ChannelMap {
+    fn declared(mux_to: &Option<String>) -> ChannelMap {
+        ChannelMap {
+            mux_to: mux_to.clone(),
+        }
+    }
+
+    /// The channel a conforming child emits on, for a frame it received on
+    /// `channel`.
+    fn apply(&self, channel: &str) -> String {
+        match &self.mux_to {
+            None => channel.to_owned(),
+            Some(mapped) if channel.is_empty() => mapped.clone(),
+            Some(mapped) if channel == mapped => String::new(),
+            Some(_) => channel.to_owned(),
+        }
+    }
+
+    /// The event a conforming child emits, for `event`. Only the channel moves: a
+    /// demux relabels, it does not reinterpret (§8 clause 1's fixed vocabulary).
+    fn expect(&self, event: &Event) -> Event {
+        Event {
+            channel: ChannelId::new(self.apply(event.channel.as_str())),
+            kind: event.kind.clone(),
+        }
+    }
+
+    /// The channel the single-channel checks drive. With a mapping declared that is
+    /// the multiplexed side, so the mapping is actually exercised by liveness,
+    /// fragmentation and restart rather than by the golden vectors alone; without
+    /// one it is the check's own historical channel, unchanged.
+    fn drive_channel<'a>(&self, identity_default: &'a str) -> &'a str {
+        match self.mux_to {
+            None => identity_default,
+            Some(_) => "",
+        }
+    }
+}
+
 /// The golden-vector battery: every event kind plus edge cases (empty payload,
 /// binary payload, a long channel id, back-to-back frames on one channel). A
 /// conforming child re-emits exactly this sequence.
@@ -1501,6 +1587,24 @@ fn golden_battery() -> Vec<Event> {
     ]
 }
 
+/// The battery a run sends, given its declared mapping. Identity mode gets exactly
+/// [`golden_battery`]; a declared mapping additionally carries one frame in *each*
+/// direction of that mapping — a frame on the multiplexed side, and one on the named
+/// channel — so both halves of the swap are exercised whatever channel is named.
+/// Without these two the coverage would depend on whether the fixed battery happened
+/// to mention the caller's channel.
+fn golden_battery_for(map: &ChannelMap) -> Vec<Event> {
+    let mut battery = golden_battery();
+    if let Some(mux_to) = &map.mux_to {
+        battery.push(Event::data("", Bytes::from_static(b"\x00mux side\xff")));
+        battery.push(Event::data(
+            ChannelId::new(mux_to.clone()),
+            Bytes::from_static(b"channel side"),
+        ));
+    }
+    battery
+}
+
 fn run_envelope(a: EnvelopeArgs) -> Value {
     match run_envelope_inner(&a) {
         Ok(v) => v,
@@ -1509,70 +1613,66 @@ fn run_envelope(a: EnvelopeArgs) -> Value {
 }
 
 fn run_envelope_inner(a: &EnvelopeArgs) -> anyhow::Result<Value> {
-    let battery = golden_battery();
+    let map = ChannelMap::declared(&a.mux_to);
+    let battery = golden_battery_for(&map);
+    let expected: Vec<Event> = battery.iter().map(|ev| map.expect(ev)).collect();
     let mut input = Vec::new();
     for ev in &battery {
         encode(ev, &mut input).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
     }
 
-    // Drive the child as a shell command so `--exec "python3 x.py"` works verbatim.
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(&a.exec)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("spawn {:?}: {e}", a.exec))?;
+    // Drive the child through the same boundary `exec-conformance` uses, for the
+    // reason §8 states as a contract over *the battery*: the stdin write carries an
+    // **idle** deadline, reset by every byte the child accepts, so a slow codec is
+    // never failed for being slow — only for stopping. This mode used to feed stdin
+    // with an unbounded `write_all` on a detached thread whose only bound was a
+    // *total* deadline on the child completing, which fails a correct-but-slow child
+    // at exactly the wall clock its sibling mode passes it at. One boundary, one
+    // contract, and the two modes can no longer disagree about it.
+    let mut child = ExecChild::spawn(&a.exec)?;
+    if !child.write_raw(&input)? {
+        anyhow::bail!(
+            "child stopped draining stdin (idle deadline; the offset it stopped at is \
+             on stderr)"
+        );
+    }
+    child.close_stdin();
 
-    // Feed stdin from a thread and close it (EOF), so a child that writes as it
-    // reads cannot deadlock against a full stdout pipe.
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    let writer = thread::spawn(move || {
-        let _ = stdin.write_all(&input);
-        // Dropping `stdin` here closes the child's stdin.
-    });
-    let mut stdout = child.stdout.take().expect("piped stdout");
-
-    // Read stdout to EOF on a thread, bounded by the timeout.
-    let (tx, rx) = std_mpsc::channel();
-    thread::spawn(move || {
-        let mut out = Vec::new();
-        let res = stdout.read_to_end(&mut out).map(|_| out);
-        let _ = tx.send(res);
-    });
-    let output = match rx.recv_timeout(Duration::from_millis(a.timeout_ms)) {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            let _ = child.kill();
-            anyhow::bail!("reading child stdout: {e}");
-        }
-        Err(_) => {
-            let _ = child.kill();
-            anyhow::bail!("child did not complete within {} ms", a.timeout_ms);
-        }
-    };
-    let _ = writer.join();
-    let _ = child.wait();
-
-    // Decode what the child re-emitted and compare to the battery.
-    let mut dec = FrameDecoder::new();
-    dec.push(&output);
+    // Drain the echoes. The per-frame bound is the run's own `--timeout-ms`: the
+    // battery is short, and a child that has answered nothing for that long has
+    // stopped rather than slowed.
+    let per_frame = Duration::from_millis(a.timeout_ms);
     let mut got = Vec::new();
+    let mut trailing = 0usize;
+    let mut timed_out = false;
     loop {
-        match dec.next_event() {
-            Ok(Some(ev)) => got.push(ev),
-            Ok(None) => break,
-            Err(e) => anyhow::bail!("child emitted a malformed frame: {e}"),
+        match child.recv(per_frame) {
+            Recv::Event(ev) => got.push(ev),
+            Recv::Closed(left) => {
+                trailing = left;
+                break;
+            }
+            Recv::Timeout => {
+                timed_out = true;
+                break;
+            }
+            Recv::Malformed => anyhow::bail!("child emitted a malformed frame"),
         }
     }
-    let trailing = dec.buffered();
-    let pass = got == battery && trailing == 0;
-    Ok(json!({
+
+    let pass = got == expected && trailing == 0 && !timed_out;
+    let mut verdict = json!({
         "tool": "serial-nexus-sim", "mode": "envelope",
         "sent_frames": battery.len(), "received_frames": got.len(),
         "trailing_bytes": trailing, "pass": pass,
-    }))
+        // Same rule as the sibling mode's verdict (plan §3): a deadline expiry is
+        // reported as one, never left to read as a lost frame.
+        "timed_out": timed_out,
+    });
+    if let Some(mux_to) = &map.mux_to {
+        verdict["mux_to"] = json!(mux_to);
+    }
+    Ok(verdict)
 }
 
 // --- exec conformance (§15.26 / plan §10.5) --------------------------------
@@ -1608,14 +1708,21 @@ const STDIN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 enum FrameMsg {
     Event(Event),
     Malformed(String),
-    Closed,
+    /// The child's stdout reached EOF (or errored), carrying however many bytes the
+    /// decoder still held — a partial trailing frame the child never finished.
+    Closed(usize),
 }
 
 /// The outcome of waiting for one echoed frame.
+///
+/// `Timeout` and `Closed` are kept **apart** on purpose. Collapsing them into one
+/// "no frame" answer is what made a deadline expiry indistinguishable from a child
+/// that stopped: plan §3's rule is that a deadline is never read as a drop, and a
+/// check cannot honour it if the two arrive as the same value.
 enum Recv {
     Event(Event),
     Timeout,
-    Closed,
+    Closed(usize),
     Malformed,
 }
 
@@ -1643,7 +1750,7 @@ impl ExecChild {
             loop {
                 match stdout.read(&mut buf) {
                     Ok(0) => {
-                        let _ = tx.send(FrameMsg::Closed);
+                        let _ = tx.send(FrameMsg::Closed(dec.buffered()));
                         break;
                     }
                     Ok(n) => {
@@ -1664,7 +1771,7 @@ impl ExecChild {
                         }
                     }
                     Err(_) => {
-                        let _ = tx.send(FrameMsg::Closed);
+                        let _ = tx.send(FrameMsg::Closed(dec.buffered()));
                         break;
                     }
                 }
@@ -1743,6 +1850,28 @@ impl ExecChild {
         self.stdin = None;
     }
 
+    /// Wait for the child to exit, bounded. `None` means it was still running at the
+    /// deadline — for the error-path checks that is itself the finding, so this
+    /// returns rather than killing: [`Drop`] reaps either way.
+    ///
+    /// A process has no fd to `poll`, so this is the one place in the battery that
+    /// samples instead of waiting on readiness; 20 ms is far below any deadline it is
+    /// asked about and costs at most a handful of wakeups per arm.
+    fn wait_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) => {}
+                Err(_) => return None,
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Wait for the next echoed frame, bounded by `timeout`.
     fn recv(&self, timeout: Duration) -> Recv {
         match self.frames.recv_timeout(timeout) {
@@ -1751,9 +1880,11 @@ impl ExecChild {
                 eprintln!("exec-conformance: child emitted a malformed frame: {reason}");
                 Recv::Malformed
             }
-            Ok(FrameMsg::Closed) => Recv::Closed,
+            Ok(FrameMsg::Closed(trailing)) => Recv::Closed(trailing),
             Err(std_mpsc::RecvTimeoutError::Timeout) => Recv::Timeout,
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => Recv::Closed,
+            // The reader thread is gone without having said so: no decoder state is
+            // recoverable, so nothing is claimed about trailing bytes.
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => Recv::Closed(0),
         }
     }
 }
@@ -1767,6 +1898,50 @@ impl Drop for ExecChild {
     }
 }
 
+/// One battery check's outcome.
+///
+/// It is not a `bool`, and that is the whole point. Every check here gates on a
+/// deadline, and a check that returns only `false` has thrown away *which* of two
+/// different findings it made: "your codec lost bytes" and "your codec did not answer
+/// within N ms" are not the same sentence, and plan §3's rule — the harness marks
+/// `timed_out`, so a deadline is never read as a drop — cannot be honoured by a value
+/// that cannot carry it. `detail` is what an author reads when their CI goes red;
+/// without it a failing verdict says only which check failed, never why.
+struct CheckOutcome {
+    pass: bool,
+    timed_out: bool,
+    detail: String,
+}
+
+impl CheckOutcome {
+    fn pass() -> CheckOutcome {
+        CheckOutcome {
+            pass: true,
+            timed_out: false,
+            detail: String::new(),
+        }
+    }
+    fn fail(detail: impl Into<String>) -> CheckOutcome {
+        CheckOutcome {
+            pass: false,
+            timed_out: false,
+            detail: detail.into(),
+        }
+    }
+    /// A failure whose cause was a deadline, not a loss. Named on stderr as it is
+    /// built, because the operator reading a wedged CI job has the log and not the
+    /// verdict.
+    fn expired(check: &str, detail: impl Into<String>) -> CheckOutcome {
+        let detail = detail.into();
+        eprintln!("exec-conformance: {check} timed out: {detail}");
+        CheckOutcome {
+            pass: false,
+            timed_out: true,
+            detail,
+        }
+    }
+}
+
 fn run_exec_conformance(a: ExecConformanceArgs) -> Value {
     match run_exec_conformance_inner(&a) {
         Ok(v) => v,
@@ -1776,44 +1951,125 @@ fn run_exec_conformance(a: ExecConformanceArgs) -> Value {
 
 fn run_exec_conformance_inner(a: &ExecConformanceArgs) -> anyhow::Result<Value> {
     let per_frame = Duration::from_millis(a.frame_timeout_ms);
-    let golden = check_golden(&a.exec, per_frame)?;
-    let liveness = check_liveness(&a.exec, per_frame, a.liveness_frames)?;
-    let fragmentation = check_fragmentation(&a.exec, per_frame)?;
-    let restart = check_restart(&a.exec, per_frame)?;
-    let pass = golden && liveness && fragmentation && restart;
-    Ok(json!({
+    let map = ChannelMap::declared(&a.mux_to);
+    let outcomes = [
+        ("golden", check_golden(&a.exec, per_frame, &map)?),
+        (
+            "liveness",
+            check_liveness(&a.exec, per_frame, a.liveness_frames, &map)?,
+        ),
+        (
+            "fragmentation",
+            check_fragmentation(&a.exec, per_frame, &map)?,
+        ),
+        ("restart", check_restart(&a.exec, per_frame, &map)?),
+    ];
+    let mut pass = outcomes.iter().all(|(_, o)| o.pass);
+
+    let checks: serde_json::Map<String, Value> = outcomes
+        .iter()
+        .map(|(name, o)| ((*name).to_owned(), json!(o.pass)))
+        .collect();
+    // The two fields a `false` cannot carry. `timed_out` names every check whose
+    // failure was a deadline rather than a loss (plan §3), and `details` says what was
+    // seen — so a red CI job is diagnosable from the verdict alone, which is the whole
+    // reason the verdict is structured rather than printed.
+    let timed_out: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, o)| o.timed_out)
+        .map(|(name, _)| *name)
+        .collect();
+    let details: serde_json::Map<String, Value> = outcomes
+        .iter()
+        .filter(|(_, o)| !o.detail.is_empty())
+        .map(|(name, o)| ((*name).to_owned(), json!(o.detail)))
+        .collect();
+
+    let mut verdict = json!({
         "tool": "serial-nexus-sim", "mode": "exec-conformance",
-        "checks": {
-            "golden": golden,
-            "liveness": liveness,
-            "fragmentation": fragmentation,
-            "restart": restart,
-        },
-        "pass": pass,
-    }))
+        "checks": Value::Object(checks),
+        "timed_out": timed_out,
+        "details": Value::Object(details),
+    });
+    if let Some(mux_to) = &map.mux_to {
+        verdict["mux_to"] = json!(mux_to);
+    }
+    // Opt-in, so a run without `--error-paths` keeps the verdict shape it had: the
+    // key is absent rather than `false`, and an absent check is not a failed one.
+    if a.error_paths {
+        let arms = check_error_paths(&a.exec, per_frame)?;
+        let all = arms.iter().all(|arm| arm.pass);
+        verdict["checks"]["error_paths"] = json!(all);
+        verdict["error_paths"] = json!(
+            arms.iter()
+                .map(|arm| json!({
+                    "arm": arm.name,
+                    "offset": arm.offset,
+                    "pass": arm.pass,
+                    "why": arm.why,
+                }))
+                .collect::<Vec<Value>>()
+        );
+        pass = pass && all;
+    }
+    verdict["pass"] = json!(pass);
+    Ok(verdict)
 }
 
 /// Golden vectors: the child re-emits the whole battery byte-for-byte (correctness,
-/// independent of timing — stdin is closed so a batching child still flushes).
-fn check_golden(exec: &str, timeout: Duration) -> anyhow::Result<bool> {
-    let battery = golden_battery();
+/// independent of timing — stdin is closed so a batching child still flushes). With
+/// a demux mapping declared, "byte-for-byte" means through the mapping: the battery
+/// carries a frame in each direction of the swap and every expectation is
+/// [`ChannelMap::expect`] of what was sent.
+fn check_golden(exec: &str, timeout: Duration, map: &ChannelMap) -> anyhow::Result<CheckOutcome> {
+    let battery = golden_battery_for(map);
+    let expected: Vec<Event> = battery.iter().map(|ev| map.expect(ev)).collect();
     let mut child = ExecChild::spawn(exec)?;
     for ev in &battery {
         // A child that stops draining stdin fails the check; it never hangs the run.
         if !child.send(ev)? {
-            return Ok(false);
+            return Ok(CheckOutcome::expired(
+                "golden",
+                "the child stopped draining stdin mid-battery",
+            ));
         }
     }
     child.close_stdin();
     let mut got = Vec::new();
+    let mut expiry = None;
     loop {
         match child.recv(timeout) {
             Recv::Event(ev) => got.push(ev),
-            Recv::Closed | Recv::Timeout => break,
-            Recv::Malformed => return Ok(false),
+            Recv::Closed(_) => break,
+            Recv::Timeout => {
+                expiry = Some(format!(
+                    "no further frame within {} ms after stdin closed ({} of {} echoed)",
+                    timeout.as_millis(),
+                    got.len(),
+                    expected.len()
+                ));
+                break;
+            }
+            Recv::Malformed => {
+                return Ok(CheckOutcome::fail(
+                    "the child emitted a malformed frame (named on stderr)",
+                ));
+            }
         }
     }
-    Ok(got == battery)
+    if got == expected {
+        return Ok(CheckOutcome::pass());
+    }
+    // The discrimination that matters: short *and* the deadline expired is a stall;
+    // short with the child gone, or wrong content, is the child's answer.
+    match expiry {
+        Some(why) if got.len() < expected.len() => Ok(CheckOutcome::expired("golden", why)),
+        _ => Ok(CheckOutcome::fail(format!(
+            "the child echoed {} of {} frames, and what came back is not what was sent",
+            got.len(),
+            expected.len()
+        ))),
+    }
 }
 
 /// Full-duplex liveness (the §15.22 deadlock class). Sends a sustained pipeline of
@@ -1825,16 +2081,26 @@ fn check_golden(exec: &str, timeout: Duration) -> anyhow::Result<bool> {
 /// holds is drained after stdin closes. Only read-all-first / hoarding shapes fail
 /// (§15.26; see docs/codec-authors.md). This is NOT a lock-step ping-pong — that
 /// would false-fail any legitimately buffering codec.
-fn check_liveness(exec: &str, per_frame: Duration, frames: usize) -> anyhow::Result<bool> {
+fn check_liveness(
+    exec: &str,
+    per_frame: Duration,
+    frames: usize,
+    map: &ChannelMap,
+) -> anyhow::Result<CheckOutcome> {
     let mut child = ExecChild::spawn(exec)?;
+    let channel = map.drive_channel("live");
     let sent: Vec<Event> = (0..frames)
-        .map(|i| Event::data("live", Bytes::from(seeded_bytes(1000 + i as u64, 512))))
+        .map(|i| Event::data(channel, Bytes::from(seeded_bytes(1000 + i as u64, 512))))
         .collect();
+    let expected: Vec<Event> = sent.iter().map(|ev| map.expect(ev)).collect();
     for ev in &sent {
         // Past ~124 frames the pipeline exceeds one pipe-full, so this loop reaches
         // the same unbounded write `check_fragmentation` did (SIM-1).
         if !child.send(ev)? {
-            return Ok(false);
+            return Ok(CheckOutcome::expired(
+                "liveness",
+                "the child stopped draining stdin mid-pipeline",
+            ));
         }
     }
 
@@ -1849,30 +2115,64 @@ fn check_liveness(exec: &str, per_frame: Duration, frames: usize) -> anyhow::Res
         }
     }
     // Fewer than half the frames echoed before EOF ⇒ the child is not interleaving
-    // (read-all-first, or hoarding more than a bounded lag). Liveness fails.
+    // (read-all-first, or hoarding more than a bounded lag). Liveness fails — and
+    // this failure IS the deadline, which is the finding: the half-duplex fixture
+    // reaches here by holding its output, not by losing it.
     if received.len() * 2 < frames {
-        return Ok(false);
+        return Ok(CheckOutcome::expired(
+            "liveness",
+            format!(
+                "only {} of {frames} frames echoed before EOF, at {} ms per frame — the \
+                 child is not interleaving read and write (the §15.22 deadlock class)",
+                received.len(),
+                per_frame.as_millis()
+            ),
+        ));
     }
 
     // Phase 2 — completeness: close stdin so a bounded-lag child flushes its held
     // tail, then drain the rest and require an exact, in-order match.
     child.close_stdin();
+    let mut expiry = None;
     while received.len() < frames {
         match child.recv(per_frame) {
             Recv::Event(ev) => received.push(ev),
+            Recv::Timeout => {
+                expiry = Some(format!(
+                    "the held tail never arrived: {} of {frames} frames after stdin \
+                     closed, waiting {} ms each",
+                    received.len(),
+                    per_frame.as_millis()
+                ));
+                break;
+            }
             _ => break,
         }
     }
-    Ok(received == sent)
+    if received == expected {
+        return Ok(CheckOutcome::pass());
+    }
+    match expiry {
+        Some(why) => Ok(CheckOutcome::expired("liveness", why)),
+        None => Ok(CheckOutcome::fail(format!(
+            "the child echoed {} of {frames} frames, and the sequence is not what was sent",
+            received.len()
+        ))),
+    }
 }
 
 /// Fragmentation: a large frame whose wire bytes are delivered to stdin in small
 /// pieces must still be reassembled and echoed whole. A child that assumes a whole
 /// frame arrives per `read()` fails.
-fn check_fragmentation(exec: &str, timeout: Duration) -> anyhow::Result<bool> {
+fn check_fragmentation(
+    exec: &str,
+    timeout: Duration,
+    map: &ChannelMap,
+) -> anyhow::Result<CheckOutcome> {
     // A near-maximum frame, so the wire bytes span many pipe reads.
     let payload = seeded_bytes(7, MAX_FRAME_SIZE - 128);
-    let sent = Event::data("frag", Bytes::from(payload));
+    let sent = Event::data(map.drive_channel("frag"), Bytes::from(payload));
+    let expected = map.expect(&sent);
     let mut wire = Vec::new();
     encode(&sent, &mut wire).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
 
@@ -1881,15 +2181,34 @@ fn check_fragmentation(exec: &str, timeout: Duration) -> anyhow::Result<bool> {
         // The frame is larger than a pipe, so a child that does not read stdin
         // cannot be written to — that is a failed check, not a hung harness (SIM-1).
         if !child.write_raw(piece)? {
-            return Ok(false);
+            return Ok(CheckOutcome::expired(
+                "fragmentation",
+                "the child stopped draining stdin part-way through the frame",
+            ));
         }
     }
     child.close_stdin();
     // Generous total bound for a big frame; scale off the per-frame timeout.
     let bound = timeout.max(Duration::from_secs(5));
     match child.recv(bound) {
-        Recv::Event(got) => Ok(got == sent),
-        _ => Ok(false),
+        Recv::Event(got) if got == expected => Ok(CheckOutcome::pass()),
+        Recv::Event(_) => Ok(CheckOutcome::fail(
+            "the reassembled frame is not the one that was sent",
+        )),
+        Recv::Timeout => Ok(CheckOutcome::expired(
+            "fragmentation",
+            format!(
+                "no reassembled frame within {} ms of the last piece",
+                bound.as_millis()
+            ),
+        )),
+        Recv::Closed(trailing) => Ok(CheckOutcome::fail(format!(
+            "the child exited without echoing the frame ({trailing} bytes of a partial \
+             frame left undecoded) — it did not reassemble across reads"
+        ))),
+        Recv::Malformed => Ok(CheckOutcome::fail(
+            "the child emitted a malformed frame (named on stderr)",
+        )),
     }
 }
 
@@ -1898,29 +2217,235 @@ fn check_fragmentation(exec: &str, timeout: Duration) -> anyhow::Result<bool> {
 /// a `kill -9` would strand (the §7.6 restart-with-backoff contract, child side).
 /// stdin is closed before the echo is required, so a batching or bounded-lag child
 /// flushes at EOF — this check tests restart cleanliness, not liveness.
-fn check_restart(exec: &str, timeout: Duration) -> anyhow::Result<bool> {
-    let probe = Event::data("c0", Bytes::from_static(b"probe"));
+fn check_restart(exec: &str, timeout: Duration, map: &ChannelMap) -> anyhow::Result<CheckOutcome> {
+    let probe = Event::data(map.drive_channel("c0"), Bytes::from_static(b"probe"));
+    let expected = map.expect(&probe);
+
+    // One probe exchange against a fresh child, named so the two rounds below report
+    // *which* of them failed — "restart is not clean" and "it never worked once" are
+    // different findings about a codec.
+    let round = |which: &str| -> anyhow::Result<CheckOutcome> {
+        let mut child = ExecChild::spawn(exec)?;
+        if !child.send(&probe)? {
+            return Ok(CheckOutcome::expired(
+                "restart",
+                format!("the {which} child stopped draining stdin"),
+            ));
+        }
+        child.close_stdin();
+        Ok(match child.recv(timeout) {
+            Recv::Event(ref got) if *got == expected => CheckOutcome::pass(),
+            Recv::Event(_) => {
+                CheckOutcome::fail(format!("the {which} child echoed something else"))
+            }
+            Recv::Timeout => CheckOutcome::expired(
+                "restart",
+                format!(
+                    "the {which} child did not echo within {} ms of stdin closing",
+                    timeout.as_millis()
+                ),
+            ),
+            Recv::Closed(_) => {
+                CheckOutcome::fail(format!("the {which} child exited without echoing"))
+            }
+            Recv::Malformed => CheckOutcome::fail(format!(
+                "the {which} child emitted a malformed frame (named on stderr)"
+            )),
+        })
+    };
 
     // First child: prove it echoes (stdin closed → it flushes), then drop it (Drop
-    // kills and reaps).
+    // kills and reaps). Only then is a *restart* the thing being measured.
+    let first = round("first")?;
+    if !first.pass {
+        return Ok(first);
+    }
+    // A freshly spawned child must echo cleanly with no shared state.
+    round("restarted")
+}
+
+// --- error paths (§8 clause 5; plan §18 item 34) ----------------------------
+
+/// One error-path arm's outcome, so the verdict names *which* refusal a child owes
+/// and where the fault it was handed lives.
+struct ErrorArm {
+    /// The decode-error case (`docs/codec-authors.md` §3 names five; three are
+    /// reachable by handing a child bytes).
+    name: &'static str,
+    /// Byte offset, within the injected frame, of the field carrying the fault. The
+    /// point of reporting it: a child that refuses is refusing *something*, and an
+    /// author debugging a failing arm otherwise has to re-derive the layout by hand.
+    offset: usize,
+    pass: bool,
+    why: String,
+}
+
+/// The three decode faults a child can be handed on stdin, each as
+/// `(name, offset, bytes)`. The other two of the format's five error cases —
+/// a non-UTF-8 channel identity and a non-UTF-8 `error` reason — are deliberately
+/// absent: this harness's own encoder cannot express them (both fields are `String`
+/// on the way in), so injecting them would mean hand-rolling frames whose refusal
+/// says more about our byte-poking than about the child.
+fn error_path_inputs() -> Vec<(&'static str, usize, Vec<u8>)> {
+    let mut arms = Vec::new();
+
+    // (1) Unknown type byte. The four §8 kinds are 0..=3; the type byte is the first
+    // byte of the body, so offset 4.
     {
-        let mut first = ExecChild::spawn(exec)?;
-        if !first.send(&probe)? {
-            return Ok(false);
-        }
-        first.close_stdin();
-        if !matches!(first.recv(timeout), Recv::Event(ref got) if *got == probe) {
-            return Ok(false);
-        }
+        let mut body = vec![0x7f_u8];
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(b"c0");
+        body.extend_from_slice(b"unknown kind");
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        arms.push(("unknown_type", 4, frame));
     }
 
-    // A freshly spawned child must echo cleanly with no shared state.
-    let mut second = ExecChild::spawn(exec)?;
-    if !second.send(&probe)? {
-        return Ok(false);
+    // (2) Oversize length prefix — refused *before* the body is buffered (§8 clause
+    // 5), which is why only a few body bytes follow: a child that waits for 64 KiB+1
+    // bytes it will never receive has already failed the clause. The prefix is the
+    // frame's first field, so offset 0.
+    {
+        let mut frame = ((MAX_FRAME_SIZE + 1) as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&[0x00, 0x00, 0x02, b'c', b'0']);
+        arms.push(("oversize_length", 0, frame));
     }
-    second.close_stdin();
-    Ok(matches!(second.recv(timeout), Recv::Event(got) if got == probe))
+
+    // (3) A body truncated below its own declared channel length: the frame's length
+    // prefix is honest, but the `u16` channel identity length inside it declares more
+    // bytes than the body holds. The channel length sits after the 4-byte prefix and
+    // the type byte, so offset 5.
+    {
+        let mut body = vec![0x00_u8];
+        body.extend_from_slice(&0xffff_u16.to_be_bytes());
+        body.extend_from_slice(b"c0");
+        body.extend_from_slice(b"payload");
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        arms.push(("truncated_body", 5, frame));
+    }
+
+    arms
+}
+
+/// **Error paths**: each fault of [`error_path_inputs`] goes to a fresh child, which
+/// must refuse it cleanly (§8 clause 5's third outcome). Three obligations, and the
+/// arm names which one failed:
+///
+/// 1. **It terminates.** A child still running once stdin is closed and the deadline
+///    has passed is wedged on the fault — the shape that turns a CI failure into a
+///    CI hang.
+/// 2. **It does not echo the fault back as if valid.** Any frame that is not an
+///    `error` event fails: relaying an unknown type byte or a lying channel length
+///    onward launders corruption into the graph, and the daemon treats a malformed
+///    frame from a child's stdout as a crash (§7.6).
+/// 3. **It signals the refusal** — a non-zero exit, or an `error` event. A child that
+///    swallows the fault and exits 0 is indistinguishable from one that never
+///    received it, which is the failure mode this arm exists to make visible.
+fn check_error_paths(exec: &str, timeout: Duration) -> anyhow::Result<Vec<ErrorArm>> {
+    // Exit is bounded by the same per-frame budget, floored so a short
+    // `--frame-timeout-ms` cannot fail a child for interpreter start-up alone.
+    let exit_budget = timeout.max(Duration::from_secs(2));
+    let mut arms = Vec::new();
+
+    for (name, offset, bytes) in error_path_inputs() {
+        let mut child = ExecChild::spawn(exec)?;
+        // A child that refuses *and exits* closes its stdin before we finish writing,
+        // so a short write here is a pass, not a fault: EPIPE is the refusal arriving
+        // out of band.
+        let delivered = match child.write_raw(&bytes) {
+            Ok(accepted) => accepted,
+            Err(e)
+                if e.downcast_ref::<std::io::Error>().map(std::io::Error::kind)
+                    == Some(std::io::ErrorKind::BrokenPipe) =>
+            {
+                true
+            }
+            Err(e) => return Err(e),
+        };
+        let _ = delivered;
+        child.close_stdin();
+
+        let mut echoed_frame = false;
+        let mut signalled_error_event = false;
+        let mut malformed_output = false;
+        loop {
+            match child.recv(timeout) {
+                Recv::Event(ev) => {
+                    if matches!(ev.kind, EventKind::Error(_)) {
+                        signalled_error_event = true;
+                    } else {
+                        echoed_frame = true;
+                    }
+                }
+                Recv::Malformed => {
+                    malformed_output = true;
+                    break;
+                }
+                Recv::Closed(_) | Recv::Timeout => break,
+            }
+        }
+        let exit = child.wait_exit(exit_budget);
+
+        let (pass, why) = if malformed_output {
+            (
+                false,
+                format!(
+                    "the child emitted a malformed frame of its own after being handed \
+                     the {name} fault at byte {offset}: a refusal is silence or an `error` \
+                     event, never corruption passed onward (§8 clause 5)"
+                ),
+            )
+        } else if echoed_frame {
+            (
+                false,
+                format!(
+                    "the child echoed the {name} fault at byte {offset} back as a valid \
+                     frame: a malformed frame must be refused, not relayed (§8 clause 5; \
+                     the daemon reads a malformed frame from a child's stdout as a crash, \
+                     §7.6)"
+                ),
+            )
+        } else if exit.is_none() {
+            (
+                false,
+                format!(
+                    "the child was still running {} ms after stdin closed on the {name} \
+                     fault at byte {offset}: a refusal terminates, it does not wedge",
+                    exit_budget.as_millis()
+                ),
+            )
+        } else if signalled_error_event {
+            (true, format!("refused with an `error` event ({name})"))
+        } else if exit.is_some_and(|status| !status.success()) {
+            (
+                true,
+                format!(
+                    "refused by exiting {} ({name})",
+                    exit.map_or_else(|| "?".to_owned(), |s| s.to_string())
+                ),
+            )
+        } else {
+            (
+                false,
+                format!(
+                    "the child accepted the {name} fault at byte {offset} silently and \
+                     exited 0: nothing distinguishes that from never having received it. \
+                     Signal the refusal — a non-zero exit, or an `error` event (§8 clause 5)"
+                ),
+            )
+        };
+        if !pass {
+            eprintln!("exec-conformance: error path {name} (byte {offset}): {why}");
+        }
+        arms.push(ErrorArm {
+            name,
+            offset,
+            pass,
+            why,
+        });
+    }
+    Ok(arms)
 }
 
 // --- wire / tcp-proxy sockets ----------------------------------------------

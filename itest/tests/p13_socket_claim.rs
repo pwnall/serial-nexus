@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! **One daemon per control-socket path** (37-SEAM-3; design §10).
 //!
 //! §10 says "the standard stale-socket unlink dance runs at startup". The dance is three

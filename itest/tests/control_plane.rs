@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 2 control-plane slice, ported from `scripts/validate/phase2/control-plane.sh`
 //! (design §10/§11): boot, socket perms, structural atomicity, truthful state,
 //! dump→load round-trip, JSON-RPC hygiene. Needs no serial *device*, so it runs on

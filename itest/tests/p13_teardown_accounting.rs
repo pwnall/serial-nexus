@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! §5's "all loss is visible" at the one moment the daemon used to break it: node
 //! **teardown** (notes §3.31, design §5, §11, §15.35).
 //!

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 4 arbitration, ported from `scripts/validate/phase4/exclusivity.sh`
 //! (design §6): the per-endpoint exclusive write lock. Two on-demand PTYs and a
 //! `write=never` spy fan into one serial endpoint (a legal §4 fan-out). Only the

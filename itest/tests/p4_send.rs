@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 4 arbitration (design §6), ported from `scripts/validate/phase4/send.sh`.
 //!
 //! The atomic `send` verb: `send` names the ENDPOINT, and the CLI is a transient

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The control connection keeps streaming while one of its verbs is parked
 //! (design §10 "a tap streams its hostward bytes as id-less `tap.data` notifications
 //! on that connection"; §17 one daemon connection per browser; review **CTRLW-1**).

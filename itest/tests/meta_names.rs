@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Naming and context meta-gates (design §15.40 and §15.41; plan §17.2 and §17.4).
 //!
 //! Two scans over the whole tree, each with the shape review 32 item 7 demanded of a

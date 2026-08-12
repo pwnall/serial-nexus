@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The expectation files are gates, and a gate proves its **matcher** (AGENTS §3).
 //!
 //! `expectations/linux.jq` and `expectations/macos.jq` are the per-platform gates CI
@@ -1026,6 +1028,122 @@ fn the_flow_control_clause_rejects_a_reading_that_cannot_say_what_it_measured() 
         ),
         "{} admitted a `supported` P15 that measured nothing and only listed the \
          ports it could not open",
+        expectation.display()
+    );
+}
+
+/// **The kernel-diff clauses bite on a probe that ERRORED — until 2026-08-12 they
+/// could not** (§13, "`skipped` is never an error path's output"; plan §3 rule 10).
+///
+/// `skipped` is the one word every conditional clause in both expectation files
+/// exempts, and the exemption is right: a `--port`-gated probe must not redden a
+/// passive lane. What it cannot survive is an *error* path wearing it. P8, P9 and
+/// P10 each routed their catch-all `Err` arm to `skipped (probe error: …)`, so a
+/// report in which the measurement never happened satisfied P8's and P9's status
+/// clauses, P9's `zero_timeout_by_fd_state` discriminator and both of P10's
+/// content clauses — every clause written to notice a missing measurement went
+/// green *because* the measurement was missing. Measured before the repair, by
+/// splicing the probes' own error-arm output into a live report: exit **0** with
+/// the old spelling, exit **1** with the new one, for each of the three
+/// separately.
+///
+/// This is the **gate half** of the two-guard pattern (§13's gate-design rule 2).
+/// It proves the clauses reject the shape the repaired probes emit, and — the half
+/// that keeps it honest — that they *accept* the identical failure spelled
+/// `skipped`, which is what makes the probe's choice of word the whole defence:
+/// `reason` is free text and no clause can read a failure out of it. The **probe
+/// half**, that the three arms really do emit `degraded` with the error named,
+/// is `a_kernel_diff_probe_that_errored_degrades_and_names_the_error` in
+/// `doctor/src/probes.rs`; neither half substitutes for the other, and a repair
+/// that moved to the gate instead would have to amend §13 rather than delete a
+/// control here.
+///
+/// The plants carry the emitter's shape exactly: `degraded` has no `reason` (that
+/// field belongs to `skipped`) and one `probe_error` observation. That last detail
+/// is load-bearing — it satisfies the "a probe that RAN must carry measurements"
+/// clause, so the rejections below are attributable to the status and content
+/// clauses rather than to an empty observation list.
+#[test]
+fn the_kernel_diff_clauses_bite_on_a_probe_that_errored() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let expectation = platform_expectation();
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    // The honest passive report must PASS, or every rejection below is about some
+    // other clause entirely.
+    assert!(
+        gate_accepts(&expectation, &report),
+        "{} rejected an honest passive report",
+        expectation.display()
+    );
+
+    // The realistic failure for all three: a box whose pty allocation does not
+    // work. One error, three probes, because they share `new_master`.
+    const ERROR: &str = "posix_openpt: ENOENT: No such file or directory";
+
+    for id in ["P8", "P9", "P10"] {
+        // The shape `measurement_failed` emits (`doctor/src/probes.rs`).
+        let degraded = jq_filter(
+            &format!(
+                r#"(.probes[] | select(.id=="{id}")) |= (.status = "degraded" | del(.reason)
+                   | .observations = [{{"key":"probe_error","value":"{ERROR}"}}])"#
+            ),
+            &report,
+        );
+        assert!(
+            !gate_accepts(&expectation, &degraded),
+            "{} admitted a {id} that ERRORED: the measurement was never taken and \
+             the clauses that read it certified it anyway (§13)",
+            expectation.display()
+        );
+
+        // The same failure in the spelling it wore until 2026-08-12 — accepted,
+        // and that is the point rather than an oversight. No clause can tell this
+        // from a legitimate skip, because `reason` is free text; the word is the
+        // only signal, so the probe is where the rule has to live. Tightening the
+        // gate here instead is a design change (§13's rule 3), not an edit to this
+        // control.
+        let skipped = jq_filter(
+            &format!(
+                r#"(.probes[] | select(.id=="{id}")) |= (.status = "skipped"
+                   | .reason = "probe error: {ERROR}" | .observations = [])"#
+            ),
+            &report,
+        );
+        assert!(
+            gate_accepts(&expectation, &skipped),
+            "{} rejected a {id} that spelled its error `skipped` — if that is now \
+             deliberate, §13's rule 3 and the three arms in `doctor/src/probes.rs` \
+             need re-reading together, because this control is the reason they \
+             route to `degraded`",
+            expectation.display()
+        );
+    }
+
+    // P10's own control, and it is not the same as the two above. Its status clause
+    // *admits* `degraded` — a slave measured in a non-raw line discipline degrades
+    // by design (§7.2) — so the rejection above has to come from the two content
+    // clauses rather than from the word. This asserts exactly that: the same
+    // `degraded`, with the direction measurements left in place, still passes. A
+    // repair that reddened this arm would turn a legitimate reading into a lane
+    // failure.
+    let degraded_with_content = jq_filter(
+        r#"(.probes[] | select(.id=="P10")) |= (.status = "degraded" | del(.reason))"#,
+        &report,
+    );
+    assert!(
+        gate_accepts(&expectation, &degraded_with_content),
+        "{} rejected a `degraded` P10 that carries both directions' measurements — \
+         that is the non-raw line-discipline arm, a legitimate reading, and the \
+         rejection above is then about the verdict word rather than the missing \
+         measurement",
         expectation.display()
     );
 }

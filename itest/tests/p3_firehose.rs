@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 3 firehose integrity + bounded memory, ported from
 //! `scripts/validate/phase3/firehose.sh` (design §5 + §15.18/§15.19).
 //!

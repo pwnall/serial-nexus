@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Review 32, item 1 — "give exclusivity an owner", end to end (design §7.1, §15.38
 //! D2/D3, §11 invariant 13). One file per defect area, the `p9_*` convention; `p12_*`
 //! is this review's family.

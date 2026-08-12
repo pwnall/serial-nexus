@@ -28,10 +28,13 @@
 #     `epoll(7)` does not exist here, `serial-nexus-sys`'s stub answers ENOTSUP, and the
 #     data plane is forbidden from using epoll anyway (invariant 1), so nothing is
 #     untested — only unmeasurable. `unsupported` would be flatly wrong.
-#   - P9 (poll timeout granularity) and P10 (pty buffer depth) are POSIX and
-#     should measure here, but a probe error skips rather than failing the lane:
-#     both are informational numbers a tuning decision is read against, and macOS
-#     is not the tuning target.
+#   - P9 (poll timeout granularity) and P10 (pty buffer depth) are POSIX and should
+#     measure here, and a probe error **reddens this lane**, on purpose. That they are
+#     informational numbers is why these probes never report `unsupported`; it is not a
+#     licence to certify a measurement nobody took (§13). Until 2026-08-12 their error
+#     arms spelled themselves `skipped` — the one word this file exempts — so the
+#     clauses that read their measurements went green exactly when there were none
+#     (notes §3.75).
 #   - P10 additionally admits `degraded`, and this platform is *why*. Its depths are
 #     only this kernel's depths if the pty was in the daemon's raw baseline, and off
 #     Linux that baseline is applied through a slave `apply_pty_baseline` immediately

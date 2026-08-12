@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Structural configuration validation, end-to-end through a live daemon
 //! (design §4 the graph rules, §11 load atomicity, §15.26 "a structurally-invalid
 //! config never destroys a good running graph").
@@ -21,6 +23,22 @@
 //! | CP-2/CFG-3 | unknown keys were ignored, and a mis-typed *table* name plus `--replace` destroyed the running graph while reporting success |
 //! | CFG-1 | normative §7.1 spells the flow-control values `xonxoff`/`rtscts`, which failed to deserialize — rejecting the entire file |
 //! | AGENTS-INV7 | a whitespace-only name is the empty name wearing a costume (§3/§11/§12) |
+//!
+//! One family here is not a review defect and takes the same shape for a different
+//! reason: §14's **refused-at-load** entries, whose deferral state is defined as "the
+//! refusal is live, tested behavior — never a silent no-op". A refusal nobody exercises
+//! is a claim, not a behavior, so each such entry gets a guard that hands **the daemon**
+//! a configuration naming the deferred capability over RPC and asserts the refusal, its
+//! text, and the untouched graph. §14 entry 14 (the serial output leg, §7.1) is DM-1's
+//! test below; §14 entry 15 (the existing-terminal node, §7.7) is the pair after it.
+//!
+//! **What that pair does not cover, said rather than implied:** `serial-nexus-ctl load
+//! <file.toml>` parses the file *client-side*, so an operator using the CLI meets a
+//! `ctl`-side deserialization failure and the config never reaches the daemon at all.
+//! These guards assert the daemon's refusal on the RPC surface — which is the one the
+//! web console, the harness and any other client reach, and the one §14's "live, tested
+//! behavior" is a claim about. The CLI's own refusal is a separate surface with a
+//! separate error path, and neither guard here speaks for it.
 //!
 //! **Platform.** Structural validation needs no serial device, so all but one test
 //! run everywhere (RULE 2). The single exception is CODEC-1's *positive* half, which
@@ -679,6 +697,218 @@ channels = ["c0"]
         node_names(rpc),
         ["mux", "uplink"],
         "unexpected graph after the target-facing load"
+    );
+}
+
+// ===========================================================================
+// §14.15 (medium) — the existing-terminal node (§7.7) is *refused-at-load*, and
+// the refusal names the node kinds that do exist.
+// ===========================================================================
+
+/// The shipped node kinds, spelled as `type` accepts them — `NodeConfig`'s variants
+/// under `rename_all = "kebab-case"` (§7.1–§7.6, §7.8). §7.7's existing-terminal node
+/// is deliberately absent: it is design-specified and unimplemented (§14 entry 15).
+///
+/// Hand-kept, and that is the point — this list is the *design's* claim about which
+/// kinds exist, checked against the refusal the daemon actually emits. A seventh kind
+/// landing reddens `existing_terminal_is_refused_at_load_listing_the_shipped_kinds`
+/// until someone re-reads §7.7 and §14 and adds it here, which is the only moment at
+/// which "listing the node kinds that do exist" can go quietly stale.
+const SHIPPED_NODE_KINDS: [&str; 6] = ["serial", "pty", "log", "codec", "leg", "map"];
+
+/// The §7.7 configuration an operator would actually write — a QEMU serial console
+/// reached by path, `faces = "host"` because the far side acts as the target. Both
+/// keys are §7.7's own vocabulary and neither is ever read: the node kind is refused
+/// before any field of it is deserialized.
+fn existing_terminal_graph(d: &Daemon) -> String {
+    format!(
+        r#"
+[[node]]
+type = "existing-terminal"
+name = "qemu"
+path = "{tty}"
+faces = "host"
+"#,
+        tty = d.run().join("qemu-console").display(),
+    )
+}
+
+/// The backtick-quoted kind names serde lists after `expected one of`, in order.
+/// Returns an empty vector when the message has no such clause at all, so the
+/// assertion that consumes it fails naming the whole message rather than panicking.
+fn kinds_listed_in(message: &str) -> Vec<String> {
+    let Some((_, tail)) = message.split_once("expected one of ") else {
+        return Vec::new();
+    };
+    tail.split(',')
+        .filter_map(|s| s.trim().strip_prefix('`')?.strip_suffix('`'))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn existing_terminal_is_refused_at_load_listing_the_shipped_kinds() {
+    // §14's deferral vocabulary calls this state *refused-at-load*: "the model
+    // specifies it and the schema admits the words, but the implementation does not
+    // exist: a configuration naming it is refused ... listing what does exist. The
+    // refusal is live, tested behavior — never a silent no-op." This test is the
+    // "tested" half; before it existed the refusal was real but unexercised, falling
+    // out incidentally of serde's internally-tagged enum rather than being anybody's
+    // asserted promise (finding 12).
+    //
+    // **What the daemon actually answers, which is not what §14's vocabulary says.**
+    // §7.7 promises "the same treatment §7.1 gives the serial output leg", and §7.1's
+    // is the DM-1 test above: `GraphConfig::validate` refuses it with a STRUCTURAL
+    // error whose text says "not implemented" and cites §14. §7.7's node never reaches
+    // `validate`. `type = "existing-terminal"` is not a `NodeConfig` variant, so it
+    // dies one stage earlier, in `parse_config_param`'s `serde_json::from_value`, as
+    // INVALID_PARAMS carrying serde's unknown-variant text. That text does list the
+    // shipped kinds — the substance §7.7 and §14 promise — but it is not a structural
+    // error and it names neither the deferral nor §14. Asserted here as it is: a guard
+    // written to §14's vocabulary instead of to the daemon would be a guard for
+    // behavior that does not exist, and the divergence belongs in the design's hands,
+    // not hidden behind a laxer assertion here.
+    let d = Daemon::start();
+    let rpc = d.rpc();
+
+    let err = rpc
+        .load_toml(&existing_terminal_graph(&d), false)
+        .expect_err("an existing-terminal node must be refused at load, not created");
+    assert_eq!(
+        err.code, INVALID_PARAMS,
+        "the existing-terminal node was refused, but not while parsing params: [{}] {}",
+        err.code, err.message
+    );
+    // The operator has to learn *which word* the daemon rejected, or a refusal of a
+    // five-node file is a bisect.
+    assert!(
+        err.message.contains("existing-terminal"),
+        "the refusal must name the node kind it refused: {}",
+        err.message
+    );
+
+    // The promise §7.7 and §14 both spell out: the refusal lists the node kinds that
+    // do exist. Checked as a set equality, not as "contains serial" — a message that
+    // listed four of six would satisfy every containment check while sending the
+    // operator looking for a kind it never mentioned.
+    let mut listed = kinds_listed_in(&err.message);
+    let mut expected: Vec<String> = SHIPPED_NODE_KINDS.iter().map(|s| (*s).to_owned()).collect();
+    listed.sort();
+    expected.sort();
+    assert_eq!(
+        listed, expected,
+        "the refusal must list exactly the shipped node kinds (§7.7): {}",
+        err.message
+    );
+
+    // Refused *at load* means nothing was created — §11 judges the whole file before
+    // anything exists, and a deferred kind must not be the exception that leaves a
+    // half-graph behind.
+    assert!(
+        node_names(rpc).is_empty(),
+        "a refused existing-terminal load created nodes: {:?}",
+        node_names(rpc)
+    );
+    assert!(
+        state_file_text(&d).is_empty(),
+        "a refused existing-terminal load reached the persisted snapshot: {}",
+        state_file_text(&d)
+    );
+
+    // The control: the same file with a shipped kind loads. Without it, this guard
+    // would pass just as happily against a daemon that refused every config it was
+    // handed, and would say nothing about the *kind* being the reason.
+    let shipped = format!(
+        r#"
+[[node]]
+type = "pty"
+name = "qemu"
+path = "{tty}"
+"#,
+        tty = d.run().join("qemu-console").display(),
+    );
+    let r = rpc
+        .load_toml(&shipped, false)
+        .expect("a shipped node kind at the same path must still load");
+    assert_eq!(
+        r.get("loaded").and_then(Value::as_u64),
+        Some(1),
+        "the control graph did not load: {r}"
+    );
+}
+
+#[test]
+fn a_refused_existing_terminal_disturbs_neither_the_running_graph_nor_the_daemon() {
+    // The other half of "never a silent no-op" (§14): the refusal must also not be a
+    // silent *demolition*. `load --replace` of an unknown node kind is exactly the
+    // CP-2/CFG-3 shape below — a file the daemon cannot deserialize, arriving with a
+    // verb that tears the good graph down first — so the deferred kind gets the same
+    // check the mis-typed table name gets, and `add-node` gets it too, since that is
+    // the surface an operator reaches for when a graph is already running.
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let before = load_good_graph(&d);
+    let boot = instance(rpc);
+    // `Daemon::dispatch` snapshots a successful config mutation **before** it writes the
+    // reply, so `load` having answered already means the file is on disk. The wait is a
+    // cheap belt on the file *appearing* (a fresh run starts with no state file at all),
+    // not a race with the write — and it still fails loudly rather than comparing
+    // against an empty baseline, which would assert nothing.
+    assert!(
+        wait_until(Duration::from_secs(5), || !state_file_text(&d).is_empty()),
+        "the good load did not persist a configuration snapshot"
+    );
+    let persisted = state_file_text(&d);
+
+    let err = rpc
+        .load_toml(&existing_terminal_graph(&d), true)
+        .expect_err("an existing-terminal node must be refused under --replace too");
+    assert_eq!(
+        err.code, INVALID_PARAMS,
+        "the --replace refusal changed code: [{}] {}",
+        err.code, err.message
+    );
+
+    let err = rpc
+        .add_node_toml(&existing_terminal_graph(&d))
+        .expect_err("`add-node` of an existing-terminal node must be refused");
+    assert_eq!(
+        err.code, INVALID_PARAMS,
+        "the add-node refusal was not an invalid-params error: [{}] {}. This pins TODAY's \
+         shape deliberately — §14 entry 15's refusal is serde's unknown-variant error, not \
+         entry 14's structural one, and plan §18 item 45 is the decision about upgrading it. \
+         If item 45 landed, this guard is what tells you,",
+        err.code, err.message
+    );
+    assert!(
+        err.message.contains("existing-terminal"),
+        "the add-node refusal must name the node kind it refused: {}",
+        err.message
+    );
+    // Set equality, not a count: six *wrong* names would satisfy a length check, and the
+    // helper already returns the names. The asymmetry with the `load` assertion above was
+    // free to remove and is exactly the shape that makes one of two sibling guards weaker
+    // than it reads.
+    let mut listed = kinds_listed_in(&err.message);
+    listed.sort();
+    let mut shipped: Vec<String> = SHIPPED_NODE_KINDS.iter().map(|k| (*k).to_owned()).collect();
+    shipped.sort();
+    assert_eq!(
+        listed, shipped,
+        "the add-node refusal must list exactly the shipped kinds too: {}",
+        err.message
+    );
+
+    assert_eq!(instance(rpc), boot, "the daemon restarted");
+    assert_eq!(
+        node_names(rpc),
+        before,
+        "a refused existing-terminal config disturbed the running graph"
+    );
+    assert_eq!(
+        state_file_text(&d),
+        persisted,
+        "a refused existing-terminal config rewrote the persisted snapshot"
     );
 }
 

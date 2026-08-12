@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 6 reference topology, ported from `scripts/validate/phase6/reference.sh`
 //! (design §2 reference topology, §7.4 leg transport, §9 wire/handshake).
 //!

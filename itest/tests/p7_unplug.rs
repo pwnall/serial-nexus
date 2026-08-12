@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 7 unplug slice, ported from `scripts/validate/phase7/unplug.sh`
 //! (plan §Phase 7 item 1; design §7.1 faulted-and-wait, §12 device identity).
 //!

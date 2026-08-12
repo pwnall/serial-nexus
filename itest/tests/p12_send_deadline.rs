@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Review 32 arbitration guards: `send`'s deadline covers the *write*, and a waiter
 //! that loses its edge is told so (design §6, §15.20, §15.35).
 //!

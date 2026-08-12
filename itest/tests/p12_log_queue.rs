@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Review 32, log-queue slice (design §5 "loss is always visible and attributable",
 //! §7.3 log state). One property, over both of the ways the log's writer thread can
 //! stop draining:

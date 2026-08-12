@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 3 log-node slice, ported from `scripts/validate/phase3/log.sh`
 //! (design §7.3). Three properties:
 //!

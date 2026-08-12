@@ -20,11 +20,22 @@ analysis agents started (§8) — three sequential runs, `docs/doctor/macos-24.6
 **These captures and the `-05b` Linux triple are the same binary**, not merely the same fingerprint:
 `1a9a8fca1c36` is `4b78fffc4bf2` plus a docs-only commit, and `git diff 4b78fff 1a9a8fc -- '*.rs'
 '*.toml'` is empty. That matters because `probe_set` digests only `(id, question)` and cannot state
-it — four binaries in `docs/doctor/` print `a131e1f4b46d6c83` while macOS alone gains 32 newly-present
-observation leaf paths between `7ead470` and `1a9a8fc` (35 against `fa4b12d`) — all under one
-unchanged digest. So "equal fingerprint ⇒ field-by-field comparable" is false and this tree carries
-the counterexample; only the converse ("an *unequal* fingerprint means the runs ask different
+it — four binaries in `docs/doctor/` print `a131e1f4b46d6c83` while macOS alone gains **65**
+newly-present observation leaf paths between `7ead470` and `1a9a8fc` (**71** against `fa4b12d`) — all
+under one unchanged digest. So "equal fingerprint ⇒ field-by-field comparable" is false and this tree
+carries the counterexample; only the converse ("an *unequal* fingerprint means the runs ask different
 questions") is sound.
+
+**WITHDRAWN FIGURES, annotated in place (§15.44's withdrawn-figures register; notes §3.51).** Until
+2026-08-12 the paragraph above quoted **32** and **35** for those two pairs, carried over from an
+earlier commit message. That pair is withdrawn and must never be re-quoted: notes §3.51 recomputed
+every leaf path — scalar paths under `.probes[].observations`, arrays collapsed to one `[]` step —
+with an independent `jq` walker cross-checked against the shipped `--field-set`, and **no collapsing
+tried reproduces 32/35** (collapsing sibling repetitions to `<probe id>.<leaf name>` gives 38 and 41).
+65 and 71 are the reproducible figures for the same two pairs, and the *direction* of the claim is
+unaffected: the counterexample is bigger than was stated, not smaller. The sentence the numbers serve
+is now also a shipped field rather than only prose — `build.field_set` digests exactly this cell set,
+so a reader holding two JSON files can check comparability without recomputing anything (§15.44).
 
 **Both pre-registered experiments answered.** P10: `room_republished_minus_room_freed` **0** and
 `refill_reproduced_total` **true** in 6 of 6, against Linux's +2048 in 6 of 6 — Darwin republishes
@@ -900,9 +911,37 @@ here for free, and the counter that names the discard has nothing to name. **ver
 
 ### 5. Doctor behavior on macOS
 
-- **P3 / P5 (UART certification)** degrade where `TIOCGICOUNT` is absent: the
-  error-counter clause reports `unsupported`/`skipped`, and the surviving clauses
-  (custom baud, `TIOCEXCL`, modem lines, break) still run against a named `--port`.
+- **P3 does not degrade on `TIOCGICOUNT` at all, and P5 degrades on two certificate
+  *items* rather than on its predicate.** P3's verdict turns on `custom_baud_ok &&
+  exclusivity_ok` and on nothing else (`doctor/src/probes.rs::p3_serial`); counter
+  availability is reported as the observation `tiocgicount_supported` and moves no
+  status. P5's is-this-a-UART predicate has been the disjunction `TIOCMGET ||
+  TIOCGICOUNT` since §15.47 (`p5_is_uart`) — a widening, never a replacement, because
+  a widening cannot lose a port — so a real FTDI answers it here and characterization
+  runs. What stays unmeasurable on this kernel is exactly two certificate items, both
+  of which read `TIOCGICOUNT`: `icounter` per port, and the pair item
+  `deliberate_mismatch`, whose second half is the receiver's frame-error counter, so
+  `after > before` reduces to `0 > 0` however the wire behaved — the bulk pattern is
+  still transmitted. **Nothing else is excused**, and that list is load-bearing:
+  `custom_baud` and `break`, the `reopen` / `pair_reopen` / `mismatch_reopen` rig
+  states, and the integrity item `rate_ladder` are measured on every kernel — the
+  excuse is carried as data on the two counter-reading sites and can never widen to
+  them. P3's own checks (custom baud, `TIOCEXCL`, modem lines, break) likewise all run
+  against a named `--port` here. Measured, in
+  `docs/doctor/macos-24.6.0-2026-08-05-1a9a8fc-tier3.json` (binary `1a9a8fca1c36`,
+  probe set `a131e1f4b46d6c83`, 2026-08-05): P3 `supported` on both rig ports with
+  `tiocgicount_supported: false`, and P5 `degraded` naming three uncertified items —
+  `icounter` on each port and `deliberate_mismatch` on the pair — beside
+  `custom_baud=true break=true` on both ports and `rate_ladder=true` over the physical
+  wire — a capture whose rig was proven on the wire the same session (top of this file).
+  *(Superseded wording, kept so it is not re-derived: this bullet read "**P3 / P5
+  (UART certification)** degrade where `TIOCGICOUNT` is absent" until 2026-08-12. It
+  was true of the pre-widening predicate and is false of the shipped one twice over —
+  P3's verdict never read the counters, and P5's predicate no longer does. notes §3.49
+  filed it as the third of three sites owed this correction; the other two, the
+  uncharacterized arm in `doctor/src/probes.rs` and the `supported` bullet in
+  `docs/serial-nexus-doctor.md`, were discharged earlier and quote the old sentence as
+  history.)*
 - **Environment group checks are Linux-centric.** `dialout`/`plugdev` do not govern
   serial access on macOS — device-node **ownership** (often `wheel`, or the owning
   user) does. With `getgroups` unavailable on Apple, the doctor reports these as

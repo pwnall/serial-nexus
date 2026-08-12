@@ -265,6 +265,32 @@ mod tests {
         assert_eq!(err, RegistryError::Reserved("exec".to_owned()));
     }
 
+    /// The built-in `reference` factory owes the same attribute contract an
+    /// out-of-tree codec owes (§8 clause 12; plan §18 item 32), so it is run through
+    /// the kit's own suite rather than a bespoke assertion. `reference` takes no
+    /// attributes, so its whole schema is the unknown-key refusal — which is exactly
+    /// the arm the suite requires of every codec.
+    #[cfg(feature = "codec-reference")]
+    #[test]
+    fn the_reference_factory_satisfies_the_kit_attribute_suite() {
+        use serial_nexus_codec_api::test_support as kit;
+        let registry = Registry::with_builtins();
+        let factory = registry
+            .factories
+            .get("reference")
+            .expect("the reference codec is a built-in")
+            .clone();
+
+        let mut widgets = toml::Table::new();
+        widgets.insert("widgets".to_owned(), toml::Value::Integer(3));
+
+        kit::attributes_are_structural(
+            |t: &toml::Table| factory(t),
+            &[toml::Table::new()],
+            &[(widgets, "widgets")],
+        );
+    }
+
     #[test]
     fn an_unknown_codec_build_names_the_available_list() {
         let registry = Registry::with_builtins();

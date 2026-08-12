@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Control-plane pipelining behind an in-flight *waiting* verb (design §15.20;
 //! review CTRL-1/CP-1, reproduction 5).
 //!

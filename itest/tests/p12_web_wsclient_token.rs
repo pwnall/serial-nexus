@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 12 — **how the headless client receives its token** (review
 //! `docs/37-claude-fable-code-review.md`, 37-WEBS-1).
 //!

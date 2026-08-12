@@ -291,13 +291,14 @@ struct LegShared {
     /// LEG-3), which is what makes it shared rather than a supervisor argument.
     purge_on_reconnect: bool,
     /// Pulsed by the supervisor when a connection drops, so each faces=target
-    /// channel task promptly releases its on-demand write lock (§7.1: release on
-    /// idle *or* peer disconnect), rather than holding the local floor until idle.
+    /// channel task promptly releases its on-demand write lock (§6's `on-demand`
+    /// write mode: a leg "releases after a configurable idle interval or on peer
+    /// disconnect"), rather than holding the local floor until idle.
     disconnect: Notify,
     /// Incremented alongside every `disconnect` pulse. Because `notify_waiters`
     /// stores no permit, a channel task blocked in a backpressured local write
     /// misses the pulse; it compares this counter against the one its chunk was
-    /// *enqueued* under, releasing the lock promptly when it changed (§7.1, LEG-4)
+    /// *enqueued* under, releasing the lock promptly when it changed (§6, LEG-4)
     /// and purging the chunk when the connection that delivered it is the one that
     /// went away (§6, 37-LEG-1 — see [`Inbound`]).
     disconnect_epoch: Cell<u64>,
@@ -1081,7 +1082,7 @@ async fn supervise(a: SuperviseArgs) {
 ///
 /// The epoch is bumped *before* the pulse: `notify_waiters` stores no permit, so a
 /// channel task blocked in a backpressured local write misses the pulse and detects
-/// the drop by re-reading the epoch after its write instead (§7.1, LEG-4).
+/// the drop by re-reading the epoch after its write instead (§6, LEG-4).
 fn clear_connection_state(stats: &Rc<HashMap<String, Rc<ChannelStat>>>, shared: &Rc<LegShared>) {
     for stat in stats.values() {
         stat.bound.set(false);
@@ -1428,9 +1429,11 @@ fn note_undeliverable(
 
 /// A faces=target channel's targetward task: hand each wire-arriving chunk into the
 /// local graph, gated on this leg's on-demand origin lock (§6). Acquires implicitly
-/// on data arrival and releases after `idle` *or* on peer disconnect (§7.1); the
-/// framed chunk is backpressured (`send().await`), never dropped — except by
-/// purge-on-reconnect, §6's one sanctioned targetward drain.
+/// on data arrival and releases after `idle` *or* on peer disconnect — the whole of
+/// §6's `on-demand` write mode for leg channels, which §7.4 only configures
+/// (`idle_release_ms`) and points back at rather than restating; the framed chunk is
+/// backpressured (`send().await`), never dropped — except by purge-on-reconnect,
+/// §6's one sanctioned targetward drain.
 ///
 /// **The receiving side's purge (LEG-3).** The sending side of a leg is not the only
 /// place outage-era commands accumulate: this task owns a bounded queue of up to
@@ -1509,7 +1512,7 @@ async fn channel_targetward(
                     continue;
                 }
                 // The peer dropped: yield the local endpoint's floor now, so a local
-                // operator is not blocked behind a vanished remote (§7.1). What the
+                // operator is not blocked behind a vanished remote (§6). What the
                 // dead connection left queued is discarded as the loop dequeues it —
                 // every chunk names the connection that delivered it (§6, LEG-3,
                 // 37-LEG-1), so nothing here has to be swept up on a deadline.
@@ -1530,7 +1533,7 @@ async fn channel_targetward(
         // stale before it was ever considered, whether the pulse that ended it was
         // observable from here or not (§6, 37-LEG-1). The check leads the acquire so a
         // dead peer's backlog is never made to queue for a contended local floor
-        // first, and takes the floor back if this task still holds it (§7.1).
+        // first, and takes the floor back if this task still holds it (§6).
         if purging && shared.disconnect_epoch.get() != epoch {
             stat.purged_on_reconnect.add(n);
             if let Some((old_lock, old_id)) = holding.take() {
@@ -1597,7 +1600,7 @@ async fn channel_targetward(
         }
         // The chunk is delivered (no targetward drop, §5); if the peer vanished
         // while we acquired or wrote, yield the local floor now rather than holding
-        // it behind a vanished remote until the idle interval (§7.1, LEG-4). The
+        // it behind a vanished remote until the idle interval (§6, LEG-4). The
         // outage-era backlog behind it is discarded per chunk as the loop reaches it.
         if shared.disconnect_epoch.get() != epoch {
             release(&lock, id);
@@ -1648,8 +1651,9 @@ fn release(lock: &SharedLock, id: OriginId) {
 /// Poll every send receiver once (round-robin from `start` for basic fairness),
 /// yielding the first available (channel, chunk). A `waiting` (unbound) channel is
 /// skipped, not drained, so its bounded receiver fills and the writer backpressures
-/// per faulted-and-wait (§7.1/§8) rather than sending bytes the unconfigured peer
-/// would drop; a skipped channel counts as open (not closed). `Ready(None)` only
+/// per faulted-and-wait (§8's unbound/`waiting` rule, which reuses §7's state family
+/// wholesale) rather than sending bytes the unconfigured peer would drop; a skipped
+/// channel counts as open (not closed). `Ready(None)` only
 /// when every receiver is closed (all local producers gone) — binding is stable for
 /// a pump's lifetime, so a skipped channel never needs its waker re-registered here.
 fn next_send<'a>(
@@ -2116,7 +2120,7 @@ mod tests {
         assert!(!stats["console"].bound.get());
         assert!(!stats["console"].active.get());
         // The epoch bump is what a channel task blocked in a local write reads
-        // (§7.1, LEG-4) — and now also its cue to purge (LEG-3).
+        // (§6, LEG-4) — and now also its cue to purge (LEG-3).
         assert_eq!(shared.disconnect_epoch.get(), epoch + 1);
     }
 

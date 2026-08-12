@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 4 arbitration (design §6), ported from `scripts/validate/phase4/held.sh`.
 //!
 //! A `write_mode = "held"` origin acquires the write lock **on attach** and holds it

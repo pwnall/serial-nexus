@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 1 sim self-test, ported from `scripts/validate/phase1/sim-selftest.sh`
 //! (plan §4): calibrate the judges before they judge. A `serial-nexus-sim pty --echo`
 //! double against a `serial-nexus-sim client --send seeded:1MiB --expect echo` must

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 3 exact loss accounting, ported from `scripts/validate/phase3/exact-loss.sh`
 //! (design §5 loss accounting, §7.2 the PTY boundary).
 //!

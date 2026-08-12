@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 12 — **how the web console's credentials travel** (review
 //! `docs/32-claude-opus-code-review.md`).
 //!

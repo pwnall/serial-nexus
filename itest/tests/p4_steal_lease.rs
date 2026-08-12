@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 4 arbitration: steal + lease, ported from
 //! `scripts/validate/phase4/steal-lease.sh` (design §6 arbitration, §10
 //! notifications, §15.20 two-lane control plane).

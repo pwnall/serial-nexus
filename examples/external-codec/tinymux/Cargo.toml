@@ -1,0 +1,21 @@
+[package]
+name = "tinymux-codec"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The second template codec (plan §18 item 39). Like `acme-codec` it depends on the
+# one open contract — `serial-nexus-codec-api` — and never on the daemon (§8/§15.26).
+# Unlike `acme` it takes an attribute, so it also takes `toml`: attribute tables
+# arrive as an opaque TOML table at the registry boundary, and a codec that validates
+# its own schema (§8 clause 12) is the crate that has to read one. That is a plain
+# third-party dependency, not a daemon dependency — the boundary is intact.
+[dependencies]
+serial-nexus-codec-api = { path = "../../../codec-api" }
+toml = "1"
+
+[features]
+# `cargo test --features conformance` runs the shared kit against `TinyMuxCodec` from
+# the consumer position, including the three suites `acme` cannot exercise.
+conformance = ["serial-nexus-codec-api/test-support"]

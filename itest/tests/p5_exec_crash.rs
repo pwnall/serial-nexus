@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 5 exec-codec crash-containment slice, ported from
 //! `scripts/validate/phase5/exec-crash.sh` (design §7.6 exec lifecycle, §15.22 the
 //! child-pipe boundary + concurrent pump).

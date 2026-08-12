@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Cross-platform Rust integration-test harness for serial_nexus.
 //!
 //! This crate replaces the bash validation scripts under `scripts/validate/**` with

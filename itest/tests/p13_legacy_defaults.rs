@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The §15.40 rename's compatibility window (plan §17.3): the pre-rename default
 //! socket and state file are **accepted on read for one release**.
 //!

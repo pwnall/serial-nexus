@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The state snapshot across the *lifecycle* verbs (design §11/§15.9): what
 //! `remove-node`, `teardown` and a clean shutdown leave on disk for the next boot.
 //!

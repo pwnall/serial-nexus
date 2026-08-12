@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Console map track (plan §12.1; design §7.8, §15.33): the per-console character
 //! map node, driven end-to-end through the daemon.
 //!

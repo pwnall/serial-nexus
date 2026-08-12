@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 12 (review 32 remediation): the web console's TLS tier treats its cert and
 //! key as **one atomic pair**.
 //!

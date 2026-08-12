@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The `ports` verb — the resolver's passive device enumeration (design §12,
 //! §15.35; plan §14.1).
 //!

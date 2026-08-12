@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 9 — the **filesystem half of the §10 authorization model**, from review 26
 //! (`docs/historical/26-claude-opus-code-review.md` findings CP-3, SEC-4/RV-6, SEC-2, SEC-8).
 //!

@@ -284,6 +284,172 @@ pub fn assert_buffer_bounded<C: Codec>(make: impl Fn() -> C, buffered: impl Fn(&
     }
 }
 
+/// **Err-then-Ok recovery** — the codec-side half of §8 clause 6's non-latching
+/// contract, and the opt-in stricter form of [`handles_garbage`].
+///
+/// [`handles_garbage`] deliberately asserts only that `demux` *returns* and stays
+/// callable; it says nothing about whether anything is decoded afterwards, because a
+/// codec over a reliable transport legitimately never resynchronizes. This suite
+/// asserts the stronger property a **resyncing** codec promises: after refusing one
+/// malformed frame, the very next valid frame decodes whole. A codec that latches —
+/// poisons itself on the first decode error and emits nothing ever again — passes
+/// every other suite in this kit and fails only this one.
+///
+/// **Opt-in, like [`control_event_round_trip`].** A never-resync codec exempts
+/// itself by not calling it; that is a legitimate policy (§8 clause 9), not a gap.
+///
+/// **It assumes the shared envelope framing.** The malformed unit it injects is an
+/// envelope frame with an unknown type byte, because that is the framing §8's decode
+/// contract is written against. A codec with its **own** framing does not call this —
+/// it replicates the pattern with a malformed unit of its own shape, exactly as §8's
+/// corruption recipe says to do for its own manifest.
+///
+/// ```ignore
+/// kit::recovers_after_garbage(MyCodec::new, "console");
+/// ```
+///
+/// **What it deliberately does not assert.** The malformed frame carries a *valid*
+/// length prefix and an unknown type byte, so a length-guided resyncer skips exactly
+/// `4 + body_len` and stays frame-aligned (§8 clause 9's reference policy). Recovery
+/// from *unaligned* noise — arbitrary bytes at an arbitrary offset — is **not**
+/// checked, because where a correct length-guided codec re-aligns depends on the
+/// noise, and a suite that demanded a particular re-alignment would false-fail
+/// correct codecs. That is the same trap `lag.py` was written to pin in the exec
+/// battery, and the kit-honesty rule (§8) applies here: this suite sees latching, not
+/// alignment.
+pub fn recovers_after_garbage<C: Codec>(make: impl Fn() -> C, channel: &str) {
+    // A well-formed *envelope* frame whose type byte is not one of the four §8
+    // kinds: `try_decode` refuses it, and its honest length prefix lets a
+    // length-guided resyncer skip exactly this frame and stay aligned.
+    let mut malformed = Vec::new();
+    let body: Vec<u8> = {
+        let mut b = vec![0x7f]; // an unknown type byte (the four kinds are 0..=3)
+        b.extend_from_slice(&(channel.len() as u16).to_be_bytes());
+        b.extend_from_slice(channel.as_bytes());
+        b.extend_from_slice(b"unknown-kind payload");
+        b
+    };
+    malformed.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    malformed.extend_from_slice(&body);
+
+    let payload = seeded_bytes(11, 512);
+    let mut enc = make();
+    let mut good = Vec::new();
+    enc.mux(&Event::data(channel, payload.clone()), &mut good)
+        .expect("mux of a data event must succeed");
+
+    let mut dec = make();
+    // The refusal itself is not asserted: a codec may salvage and return `Ok`, or
+    // return `Err`. Both are legal (§8 clause 7's emit-before-error). What is not
+    // legal is never decoding again.
+    let _ = demux_data(&mut dec, &malformed);
+
+    let (got, ok) = demux_data(&mut dec, &good);
+    assert!(
+        ok,
+        "the codec latched: a valid frame fed after one malformed frame still \
+         returned Err. A demux error is non-latching (§8 clause 6) — it clears the \
+         moment a later chunk decodes"
+    );
+    let folded = fold_channels(got);
+    assert_eq!(
+        folded.get(channel).map(Vec::as_slice),
+        Some(payload.as_slice()),
+        "the codec did not recover: the valid frame fed after one malformed frame \
+         was not decoded whole on {channel:?}. A resyncing codec skips the refused \
+         frame and stays aligned (§8 clause 9); a codec that never resyncs must not \
+         call this opt-in suite"
+    );
+}
+
+/// **Attribute schemas fail structurally** (§8 clause 12) — the one suite that tests
+/// a codec's *configuration* surface rather than its framing.
+///
+/// A codec's attributes arrive as an opaque table which the codec deserializes and
+/// validates itself; a schema failure is structural and aborts the load with nothing
+/// created (§11). The daemon's `precheck_codecs` promises that a bad table on a known
+/// codec can never destroy a good graph on its way to failing — but that promise rests
+/// entirely on codec-side behavior, which nothing else lets an author prove from the
+/// consumer position. This suite is that proof.
+///
+/// It is generic over the table type on purpose: the kit stays dependency-free (§8),
+/// so it never names `toml`. Pass whatever your factory takes.
+///
+/// * every table in `good` must build — a schema that refuses a table its own author
+///   declared valid is a defect;
+/// * every table in `bad` must return `Err` — **and must not panic**. A panic is not a
+///   structural refusal: it unwinds through the daemon instead of aborting the load
+///   with a message an operator can act on;
+/// * where a `bad` entry names a string, the refusal must *contain* it. An unknown key
+///   refused as a bare "invalid attributes" tells an operator nothing; §8 clause 12
+///   requires the key be named.
+///
+/// ```ignore
+/// kit::attributes_are_structural(
+///     |t| MyCodec::from_attributes(t),
+///     &[good_minimal, good_full],
+///     &[(unknown_key_table, "widgets"), (out_of_range_table, "max_frames")],
+/// );
+/// ```
+pub fn attributes_are_structural<T, C, E>(
+    factory: impl Fn(&T) -> Result<C, E>,
+    good: &[T],
+    bad: &[(T, &str)],
+) where
+    E: std::fmt::Display,
+{
+    assert!(
+        !good.is_empty(),
+        "give the kit at least one table the codec must accept"
+    );
+    assert!(
+        !bad.is_empty(),
+        "give the kit at least one table the codec must refuse — an unknown key is \
+         the refusal every codec owes (§8 clause 12)"
+    );
+
+    for (i, table) in good.iter().enumerate() {
+        if let Err(e) = factory(table) {
+            panic!(
+                "the attribute schema refused table #{i} of `good`, which the author \
+                 declared valid: {e}"
+            );
+        }
+    }
+
+    for (i, (table, must_name)) in bad.iter().enumerate() {
+        // A schema failure is structural (§8 clause 12): it returns, it does not
+        // unwind. Catching here is what turns "panicked" into a *named* failure
+        // instead of an opaque test crash.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory(table)));
+        let Ok(result) = outcome else {
+            panic!(
+                "the attribute schema PANICKED on table #{i} of `bad` instead of \
+                 returning Err. A schema failure is structural (§8 clause 12, §11): it \
+                 aborts the load with a message, it does not unwind through the daemon"
+            );
+        };
+        match result {
+            Ok(_) => panic!(
+                "the attribute schema ACCEPTED table #{i} of `bad`. An unknown key, an \
+                 out-of-range value, or a missing required key is refused at load with \
+                 nothing created (§8 clause 12) — a lenient schema defers the failure \
+                 to run time, where §11's nothing-created promise no longer holds"
+            ),
+            Err(e) if !must_name.is_empty() => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains(must_name),
+                    "the refusal of table #{i} of `bad` does not name {must_name:?}: \
+                     {msg}. §8 clause 12 requires the offending key be named — an \
+                     operator cannot fix what the error will not point at"
+                );
+            }
+            Err(_) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +519,9 @@ mod tests {
         // The resyncing framing codec drains on an oversize prefix, so its buffer
         // stays within one frame.
         assert_buffer_bounded(GoodFraming::default, |c| c.buf.len());
+        // It resyncs by length guidance, so it also passes the opt-in Err-then-Ok
+        // recovery suite: the refused frame is skipped whole and the next one decodes.
+        recovers_after_garbage(GoodFraming::default, "console");
     }
 
     // A single-channel passthrough (like the external template's codec) also
@@ -608,5 +777,184 @@ mod tests {
     #[should_panic(expected = "hoards undecodable input")]
     fn a_hoarding_codec_fails_the_buffer_bound() {
         assert_buffer_bounded(Hoarder::default, |c| c.buf.len());
+    }
+
+    /// The latching decoder: it drains correctly (so its buffer stays bounded) but
+    /// poisons itself on the first decode error and never emits again. This is the
+    /// codec-side violation of §8 clause 6's non-latching contract, and it is
+    /// invisible to every other suite in this kit — which is exactly why
+    /// [`recovers_after_garbage`] exists.
+    #[derive(Default)]
+    struct LatchesOnError {
+        buf: Vec<u8>,
+        poisoned: bool,
+    }
+    impl Codec for LatchesOnError {
+        fn name(&self) -> &str {
+            "latches-on-error"
+        }
+        fn demux(
+            &mut self,
+            input: &[u8],
+            emit: &mut dyn FnMut(Event),
+        ) -> Result<(), crate::CodecError> {
+            self.buf.extend_from_slice(input);
+            loop {
+                match crate::try_decode(&self.buf) {
+                    Ok(Some((event, consumed))) => {
+                        self.buf.drain(..consumed);
+                        // Decoded, but the latch swallows it forever after the first
+                        // refusal — the whole defect, in one line.
+                        if !self.poisoned {
+                            emit(event);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        // Drains like a correct resyncer (so the buffer bound holds)
+                        // and then latches.
+                        self.poisoned = true;
+                        if self.buf.len() < 4 {
+                            break;
+                        }
+                        let body_len = u32::from_be_bytes([
+                            self.buf[0],
+                            self.buf[1],
+                            self.buf[2],
+                            self.buf[3],
+                        ]) as usize;
+                        let skip = if body_len <= MAX_FRAME_SIZE && self.buf.len() >= 4 + body_len {
+                            4 + body_len
+                        } else {
+                            4
+                        };
+                        self.buf.drain(..skip);
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn mux(&mut self, event: &Event, out: &mut Vec<u8>) -> Result<(), crate::CodecError> {
+            crate::encode(event, out)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_latching_codec_passes_every_other_suite() {
+        // The gap `recovers_after_garbage` closes: a codec that never decodes again
+        // after one bad frame is conformant by every other measure the kit has.
+        round_trip_identity(LatchesOnError::default, &["console"]);
+        control_event_round_trip(LatchesOnError::default, &["console"]);
+        fragmentation_tolerance(LatchesOnError::default, "console");
+        handles_garbage(LatchesOnError::default, "console");
+        bounded_parser_state(LatchesOnError::default);
+        assert_buffer_bounded(LatchesOnError::default, |c| c.buf.len());
+    }
+
+    #[test]
+    #[should_panic(expected = "did not recover")]
+    fn a_latching_codec_fails_the_recovery_suite() {
+        recovers_after_garbage(LatchesOnError::default, "console");
+    }
+
+    // --- Attribute schemas (§8 clause 12). The table type is deliberately not
+    //     `toml::Table`: the kit is generic over it and dependency-free, and a plain
+    //     map proves both.
+
+    type ToyTable = std::collections::BTreeMap<String, String>;
+
+    fn table(pairs: &[(&str, &str)]) -> ToyTable {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    /// A conforming schema: one optional bounded key, every unknown key refused **by
+    /// name**, every failure returned rather than raised.
+    fn strict_attributes(t: &ToyTable) -> Result<usize, String> {
+        let mut frame_max = 512usize;
+        for (key, value) in t {
+            match key.as_str() {
+                "frame_max" => {
+                    let n: usize = value
+                        .parse()
+                        .map_err(|_| format!("frame_max: {value:?} is not an integer"))?;
+                    if n == 0 || n > 4096 {
+                        return Err(format!("frame_max: {n} is outside 1..=4096"));
+                    }
+                    frame_max = n;
+                }
+                other => return Err(format!("unknown attribute {other:?}")),
+            }
+        }
+        Ok(frame_max)
+    }
+
+    /// The lenient toy schema: it ignores unknown keys and clamps out-of-range
+    /// values, so a typo'd attribute loads silently and does nothing.
+    fn lenient_attributes(t: &ToyTable) -> Result<usize, String> {
+        Ok(t.get("frame_max")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512)
+            .clamp(1, 4096))
+    }
+
+    /// Validates by `expect`, so a bad value unwinds instead of refusing — a schema
+    /// failure that is not structural.
+    fn panicking_attributes(t: &ToyTable) -> Result<usize, String> {
+        Ok(t.get("frame_max")
+            .map(|v| v.parse::<usize>().expect("frame_max is an integer"))
+            .unwrap_or(512))
+    }
+
+    /// Refuses the right tables but with a bare message, so an operator is told
+    /// something is wrong and never which key.
+    fn anonymous_refusal(t: &ToyTable) -> Result<usize, String> {
+        strict_attributes(t).map_err(|_| "invalid attributes".to_owned())
+    }
+
+    #[test]
+    fn a_strict_attribute_schema_passes() {
+        attributes_are_structural(
+            strict_attributes,
+            &[table(&[]), table(&[("frame_max", "1024")])],
+            &[
+                (table(&[("widgets", "3")]), "widgets"),
+                (table(&[("frame_max", "99999")]), "frame_max"),
+                (table(&[("frame_max", "abc")]), "frame_max"),
+            ],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ACCEPTED")]
+    fn a_lenient_attribute_schema_is_caught() {
+        attributes_are_structural(
+            lenient_attributes,
+            &[table(&[])],
+            &[(table(&[("widgets", "3")]), "widgets")],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "PANICKED")]
+    fn an_unwinding_attribute_schema_is_caught() {
+        attributes_are_structural(
+            panicking_attributes,
+            &[table(&[])],
+            &[(table(&[("frame_max", "abc")]), "frame_max")],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "does not name")]
+    fn a_refusal_that_names_no_key_is_caught() {
+        attributes_are_structural(
+            anonymous_refusal,
+            &[table(&[])],
+            &[(table(&[("widgets", "3")]), "widgets")],
+        );
     }
 }

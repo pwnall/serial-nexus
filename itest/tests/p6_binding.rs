@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 6 binding, ported from `scripts/validate/phase6/binding.sh`
 //! (design §8 binding, §7.4 leg lifecycle, §9 the wire hello): announcements never
 //! mutate the graph.

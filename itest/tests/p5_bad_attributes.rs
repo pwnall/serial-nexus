@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 5 bad-codec-attributes slice, ported from
 //! `scripts/validate/phase5/bad-attributes.sh` (design §8, §11, §15.26).
 //!

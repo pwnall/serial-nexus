@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The **collapsed PTY client session** guard (design §6 detach-release, §7.2
 //! presence) — the regression test the fix at `b8d8ed8` shipped without (review
 //! §2 item 1, T2).

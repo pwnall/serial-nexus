@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `load --replace` must not fault the serial port it is keeping (design §11, §7.1).
 //!
 //! Found by the v13 browser-UI track (plan §15): the Playwright lifecycle spec could not

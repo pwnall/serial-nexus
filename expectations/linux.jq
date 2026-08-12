@@ -52,8 +52,13 @@
 #     OR `skipped` — never `degraded`, which is the real content of this clause.
 #     They are informational: the design is *justified* by P8's answer rather than
 #     dependent on it, and P9 reports numbers a tuning decision is made against.
-#     `skipped` covers a mechanism that does not exist (epoll off Linux) or a probe
-#     that could not run, with the reason attached.
+#     `skipped` covers exactly one thing: a mechanism that does not exist (epoll off
+#     Linux), with the reason attached. A probe that *errored* reports `degraded` and
+#     reddens here deliberately — §13's "`skipped` is never an error path's output".
+#     Until 2026-08-12 those error arms spelled themselves `skipped`, so a report in
+#     which the measurement never happened satisfied this clause *because* it never
+#     happened (notes §3.75); see `measurement_failed` in `doctor/src/probes.rs` and
+#     `the_kernel_diff_clauses_bite_on_a_probe_that_errored`.
 #   - P10 (pty buffer depth) additionally admits `degraded`, and that arm is not a
 #     loosening — it is the clause that stops the probe lying. A depth measured in
 #     the wrong line discipline is not this kernel's depth (raw and cooked differ

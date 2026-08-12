@@ -338,9 +338,16 @@ fn apply_socket_perms(path: &Path, group: Option<&str>) -> anyhow::Result<()> {
 
 /// The §10 socket path policy: privilege-based default, CLI-overridable.
 ///
-/// The policy itself lives in `serial_nexus_core::socket` — one implementation, which
-/// `ctl` connects through and the doctor prints, so the three can no longer disagree
-/// about where this daemon binds (notes §3.72).
+/// The policy itself lives in [`serial_nexus_rpc::default_socket_path`] (`rpc/src/socket.rs`)
+/// — one implementation, which `ctl` connects through (`ctl/src/main.rs`), the doctor prints
+/// (`doctor/src/probes.rs`) and the web console resolves through (`web/src/rpc.rs`), so the
+/// four can no longer disagree about where this daemon binds (notes §3.72, §3.75).
+///
+/// The web console is on that list because it *was not*: it carried a second, two-arm copy
+/// that never asked `geteuid`, so an unprivileged console with no usable `XDG_RUNTIME_DIR`
+/// looked for this daemon on the root arm while this daemon bound the per-uid `/tmp` one
+/// (notes §3.75). The copy is deleted, not corrected — which is the only repair that keeps
+/// "exactly one implementation" true.
 fn resolve_socket(override_path: Option<PathBuf>) -> PathBuf {
     if let Some(p) = override_path {
         return p;

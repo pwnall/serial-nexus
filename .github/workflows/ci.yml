@@ -191,8 +191,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
       - name: Capability report
         run: |
-          cargo run -q --locked -p serial-nexus-doctor -- --markdown | tee serial-nexus-doctor-report.md
-          cargo run -q --locked -p serial-nexus-doctor -- --json | jq -e -f expectations/linux.jq
+          # ONE run, both consumers (plan §18 item 43). `--json-out` writes the JSON twin
+          # of the same `Report` the Markdown renders, so the gate reads the report that
+          # was archived rather than a second measurement of the same box — P9's and P10's
+          # numbers move run to run, which is why the era diffs take three samples
+          # (notes §3.74).
+          cargo run -q --locked -p serial-nexus-doctor -- --markdown \
+              --json-out serial-nexus-doctor-report.json | tee serial-nexus-doctor-report.md
+          jq -e -f expectations/linux.jq serial-nexus-doctor-report.json
       - uses: actions/upload-artifact@v5
         with:
           name: serial-nexus-doctor-report
@@ -247,8 +253,10 @@ jobs:
         run: cargo test --workspace --locked --no-fail-fast
       - name: Capability report + macos.jq gate
         run: |
-          cargo run -q --locked -p serial-nexus-doctor -- --markdown | tee serial-nexus-doctor-macos.md
-          cargo run -q --locked -p serial-nexus-doctor -- --json | jq -e -f expectations/macos.jq
+          # One run, both consumers — the Linux lane's reasoning, verbatim (plan §18 item 43).
+          cargo run -q --locked -p serial-nexus-doctor -- --markdown \
+              --json-out serial-nexus-doctor-macos.json | tee serial-nexus-doctor-macos.md
+          jq -e -f expectations/macos.jq serial-nexus-doctor-macos.json
       - uses: actions/upload-artifact@v5
         with:
           name: serial-nexus-doctor-macos-report
@@ -268,13 +276,19 @@ jobs:
   # `check` job above skips them), and this variable turns every one of those skips into a
   # failure. Without it the job could go green having run nothing — the same shape as the
   # fuzz loop that ran a stale list (§15.36 rule 7). `p8_web_ui` additionally asserts a
-  # floor on the number of specs that passed — the count for the fixture it actually built
-  # (19 with a serial device, 10 device-free) — and that nothing skipped itself when a
-  # device was present.
+  # floor on the number of specs that passed — a different floor per fixture, one for the
+  # with-device arm and one for the device-free arm — and that nothing skipped itself when
+  # a device was present. The two numbers are deliberately NOT repeated here: they live as
+  # `SPECS_WITH_DEVICE` / `SPECS_DEVICE_FREE` in `itest/tests/p8_web_ui.rs`, next to the
+  # spec recount that justifies them, because this comment carried "19 with a serial
+  # device, 10 device-free" against constants that had since become 22 and 12 — a lane
+  # description drifting from the gate it describes is exactly what naming the constants
+  # instead of copying their values prevents.
   #
-  # `@slow` specs (today: the forced tap shed, which costs a minute of real renderer
-  # time) are excluded here and run in the nightly lane below — Playwright's spelling of
-  # this repo's `#[ignore]` convention.
+  # `@slow` specs (today two, both in `console.spec.mjs`: the forced tap shed, and the
+  # unwatched-console tap release whose subject is the grace interval itself) are excluded
+  # here and run in the nightly lane below — Playwright's spelling of this repo's
+  # `#[ignore]` convention.
   web-ui:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -379,10 +393,13 @@ jobs:
       - name: Full suite including ignored (endurance/heavy)
         run: cargo test --workspace --locked -- --include-ignored
 
-  # Nightly browser lane: the same gate with the `@slow` specs included — today the
-  # forced tap shed, which drowns the renderer on purpose and therefore takes about a
-  # minute of real browser time to surface the counter it is asserting. Playwright's
-  # spelling of the `#[ignore]` + nightly-sweep convention the Rust suite already uses.
+  # Nightly browser lane: the same gate with the `@slow` specs included — today two, both
+  # in `console.spec.mjs`. The forced tap shed drowns the renderer on purpose and takes
+  # about a minute of real browser time to surface the counter it is asserting; the
+  # unwatched-console tap release waits out the shipped grace interval twice, because that
+  # interval is the thing under test and shortening it would assert a timer this product
+  # does not ship. Playwright's spelling of the `#[ignore]` + nightly-sweep convention the
+  # Rust suite already uses.
   web-ui-nightly:
     # Scheduled or hand-started; see the `workflow_dispatch` note on `on:` above.
     if: >-

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 3's **idle-cost exit criterion**, made executable again (plan §Phase 3 item
 //! 6; design §15.18/§15.19).
 //!

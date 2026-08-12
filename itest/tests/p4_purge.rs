@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 4 arbitration purge rules, ported from `scripts/validate/phase4/purge.sh`
 //! (design §6). Three properties of the write-lock's purge machinery:
 //!

@@ -32,3 +32,9 @@ serial-nexus-rpc.workspace = true
 # validator (plan §12.2 "the example config load-verifies with the map present"),
 # with no daemon and no filesystem side effects.
 serial-nexus-core = { path = "../core" }
+# `meta_codec_authors_doc.rs` checks the author guide's hex vectors against the real
+# `encode()` rather than against a copy of them (plan §18 item 37): the point of the
+# gate is that the document and the envelope cannot drift, which needs the envelope
+# itself. A workspace-internal crate already in the graph, so `cargo deny` does not
+# move.
+serial-nexus-codec-api.workspace = true

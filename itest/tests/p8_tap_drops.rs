@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 8 tap-drops slice, ported from `scripts/validate/phase8/tap-drops.sh`
 //! (design §5 / §17): a slow tap costs only itself. An unread ("paused browser tab")
 //! tap's bounded per-connection queue fills and drops-with-a-counter, while a

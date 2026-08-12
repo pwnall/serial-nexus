@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 7 crash-recovery slice, ported from `scripts/validate/phase7/crash-recovery.sh`
 //! (plan §Phase 7 item 5; design §11/§15.9): crash recovery is exact. Restart, replug,
 //! and first boot are one code path.

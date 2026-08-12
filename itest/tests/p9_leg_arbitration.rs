@@ -1,6 +1,11 @@
-//! A `faces = target` leg's **write arbitration** against the local graph (design
-//! §6, §7.1 "release on idle *or* peer disconnect", §7.4) — the path review §2 item 4
-//! (T1) found normative and untested.
+#![forbid(unsafe_code)]
+
+//! A `faces = target` leg's **write arbitration** against the local graph — design §6's
+//! `on-demand` write mode, whose second clause is the whole rule under test ("a leg
+//! acquires when it has pending targetward bytes and the lock is free, and releases
+//! after a configurable idle interval or on peer disconnect"), and which §7.4 only
+//! configures (`idle_release_ms`) and points back at. The path review §2 item 4 (T1)
+//! found it normative and untested.
 //!
 //! When wire data arrives for a channel, the leg is just another writer at the local
 //! host-facing endpoint: it must take that endpoint's write lock **implicitly**, on
@@ -169,7 +174,7 @@ fn the_leg_acquires_on_first_data_and_releases_when_idle() {
         .expect("send");
     const SENT: u64 = 6;
 
-    // Implicit acquire (§7.1): the leg's origin — named for its endpoint address —
+    // Implicit acquire (§6): the leg's origin — named for its endpoint address —
     // takes the local endpoint's write lock on the first targetward byte, with no
     // `lock` verb anywhere in this test.
     assert!(
@@ -186,7 +191,7 @@ fn the_leg_acquires_on_first_data_and_releases_when_idle() {
         rpc_a.node("uplink")
     );
 
-    // Idle-release (§7.1): quiet for longer than `idle_release_ms` frees the floor
+    // Idle-release (§6): quiet for longer than `idle_release_ms` frees the floor
     // for a local operator. Bounded wait, generously above the configured idle.
     assert!(
         wait_until(Duration::from_secs(10), || holder(rpc_a).is_none()),
@@ -221,7 +226,7 @@ fn the_leg_acquires_on_first_data_and_releases_when_idle() {
 fn the_leg_releases_the_local_lock_when_the_peer_disconnects() {
     // A minute of idle allowance: nothing that happens inside this test's bounded
     // waits can be the idle timer, so a release here is the disconnect path or
-    // nothing (§7.1, LEG-4).
+    // nothing (§6, LEG-4).
     const IDLE_MS: u64 = 60_000;
     let (da, db) = connected_pair(IDLE_MS);
     let rpc_a = da.rpc();
@@ -249,7 +254,7 @@ fn the_leg_releases_the_local_lock_when_the_peer_disconnects() {
     assert!(
         wait_until(Duration::from_secs(10), || holder(rpc_a).is_none()),
         "the leg kept the local write lock after its peer disconnected — a local \
-         operator is blocked behind a vanished remote (§7.1): {:?}",
+         operator is blocked behind a vanished remote (§6): {:?}",
         rpc_a.node("usb0")
     );
     // The node itself is unharmed and simply waiting for the peer to come back

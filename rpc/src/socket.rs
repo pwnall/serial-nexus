@@ -30,8 +30,10 @@
 //!
 //! # Why it lives *here*, and the home that was tried first
 //!
-//! The three callers are the daemon, `ctl` and the doctor. The obvious shared crate is
-//! `serial-nexus-core` — all three already depend on it — and that was tried first. A
+//! The four callers are the daemon, `ctl`, the doctor and the web console — the last
+//! of which arrived here in 2026-08-12 by having its *own* two-arm copy deleted
+//! (notes §3.75). The obvious shared crate is
+//! `serial-nexus-core` — all four already depend on it — and that was tried first. A
 //! meta-gate rejected it: `core` may not declare `nix`, because the resolver's
 //! enumeration face is passive **by construction**, and probing a port toggles DTR and
 //! resets the board behind it. The gate exists for exactly the move that was being

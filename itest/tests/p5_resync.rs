@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 5 resynchronization accounting, ported from `scripts/validate/phase5/resync.sh`
 //! (plan §Phase 5 item 2; design §7.5 framing / §9 length-guided resync).
 //!

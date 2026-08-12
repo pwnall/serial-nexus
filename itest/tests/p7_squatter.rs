@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 7 squatter slice, ported from `scripts/validate/phase7/squatter.sh`
 //! (plan §Phase 7 item 3; design §7.1 faulted-and-wait, §12 squatter-safe device
 //! identity). One property, proven end to end:

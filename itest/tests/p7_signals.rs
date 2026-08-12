@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Phase 7 serial-signal + lifecycle slice, ported from
 //! `scripts/validate/phase7/signals.sh` (design §7.1 signal verbs, §6/§15.20 lock
 //! detach-release, §13 no-target doctrine). Five properties:

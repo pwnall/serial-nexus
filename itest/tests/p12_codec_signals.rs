@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Codec and exec-codec **signals**: what a demux node tells an operator when its
 //! transform, or the wire, does something the configuration did not anticipate
 //! (`docs/32-claude-opus-code-review.md` — WIRE-1, CODEC-1, CORE-3/EXEC-2, the

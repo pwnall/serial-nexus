@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Review-32 regression guards for the tap hub's replay and gap accounting
 //! (`daemon/src/tap.rs`; design §5 replay ring, plan §11.8 offsets, invariant 10).
 //! Two protocol facts a client splicing by offset depends on, each broken in a
