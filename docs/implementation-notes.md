@@ -9984,8 +9984,9 @@ matches itself is the failure mode this file exists to keep teaching.
 #### I. The gates, and one measurement that was the box rather than the code
 
 **Green at default CI scope: 890 passing · 0 failed · 6 ignored**, 121 test-result lines over 117
-cargo targets, zero SKIP lines — with build, both clippy lanes, fmt, `cargo deny`, both Apple
-triples, and the doctor jq gate. The figure and its scope live in the plan's Status table; the
+cargo targets — with build, both clippy lanes, fmt, `cargo deny`, both Apple triples, and the
+doctor jq gate. The **12 self-skips** in that run are measured with `--nocapture`, not asserted
+from a default-capture log where the count is 0 whatever skipped (§3.78). The figure and its scope live in the plan's Status table; the
 `ignored` moved 4 → 6 because the two new kit suites carry ```ignore` doc examples like their four
 siblings, which is a documentation fact and not a coverage one.
 
@@ -10078,8 +10079,10 @@ beats a proxy for it (AGENTS §9).
 
 **What the same CI run also bought, unasked: plan §18 item 18's suite half.** That job is a
 **whole-workspace macOS run at the current tree** — the thing item 18 records as owed, since
-`cargo test` compiled on no macOS at `3e23c52`. It read **859 passed · 1 failed · 6 ignored**, zero
-SKIP lines, on the CI arm64 runner, with the one failure being the guard above. Every target this
+`cargo test` compiled on no macOS at `3e23c52`. It read **859 passed · 1 failed · 6 ignored** on the CI arm64 runner with the one failure being the
+guard above, and **860 · 0 · 6** on the next run once it was repaired — the first green macOS lane
+in this record. (Neither states a skip count: CI passes no `--nocapture`, so that log cannot
+produce one — §3.78.) Every target this
 session added ran there and passed: `meta_derive` 5/5, `meta_codec_authors_doc` 5/5,
 `p12_web_socket_default` 4/4. The figure is quotable only with its scope — **whole workspace
 (macOS)**, CI runner, not the x86_64 rig box — and it lands in the plan's Status table with that
@@ -10093,6 +10096,17 @@ half — a committed artifact is a deliberate act with an era stated, not a CI b
 means the artifact no longer has to be re-taken by hand to exist.
 
 ---
+
+
+**Footnote, recorded so it is not re-derived as a fresh finding.** The run that turned the macOS
+lane green failed `web-ui` instead, on
+`graph-editor.spec.mjs:171 › adding a console through the editor makes bytes flow end to end` —
+the **named** instance of §3.58's in-suite contention datum, which measured that same spec at 1 of
+3 in-suite and 0 of 5 in isolation. The commit under it touched `ci.yml`, `AGENTS.md` and the notes
+and nothing web-facing, and the same console code had passed `web-ui` in the two runs before it. A
+re-run of the failed job alone, on the identical tree, went green. Its assertion differs from
+§3.58's (`toHaveClass` rather than the status-line regex), so this is the same spec and the same
+class, not the identical failure — stated that way rather than rounded to "the known flake".
 
 ### 3.77 The macOS jq gate had not been running, and both lanes were discarding the doctor's exit status
 
@@ -10132,3 +10146,48 @@ problem, not a permission problem, but the file not being a loadable image for t
 binary before running it, so the next run says what it is instead of inviting the guess — and it
 prints on a *green* run too, so the evidence survives the fix. Recorded as an open observation, in
 §7's sense: measured behaviour, mechanism unestablished.
+
+---
+
+### 3.78 "Zero SKIP lines" asserts nothing, and this record has quoted it as evidence for four generations
+
+Found by disbelieving a green log. The macOS lane came back **860 passed · 0 failed · 6 ignored,
+zero SKIP lines** — and the guard §3.76 had just converted from an assertion to a self-skip should
+have skipped there, since the same runner had failed its assertion an hour earlier on the same
+reading. A skip that leaves no trace in the log it is supposed to be visible in is either not a
+skip or not visible.
+
+**It is not visible.** `cargo test` captures a *passing* test's stdout and stderr and prints them
+only for failures, and a self-skip is a passing test that printed to stderr. Measured on this box
+against `serial_hardware`, which self-skips six times here with `SNX_CROSSOVER_A`/`_B` unexported:
+
+* `cargo test -p serial-nexus-itest --test serial_hardware` → **0** SKIP lines;
+* the same command with `-- --nocapture` → **6**.
+
+CI passes `--nocapture` nowhere except the soak lane. So every "zero SKIP lines" quoted beside a
+suite figure — the plan's Status table, this session's own §3.75 §I, and the runs the v15 record
+took — was reading a constant. It is §13's vacuity taxonomy applied to the suite's own skip
+discipline: a check that reads as a check and cannot fail.
+
+**The real figure, measured.** One `cargo test --workspace --locked --no-fail-fast -- --nocapture`
+on Linux at default CI scope: **12 self-skips**, from twelve distinct tests, every one accounted
+for by a capability this box was not given — the five `crossover_rig_*` tests and
+`rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes` (no `SNX_CROSSOVER_A`/`_B`), three
+replug tests and `a_break_straddled_by_a_replace_leaves_the_line_transmitting` (unblessed helper),
+and the two browser tests (no node). Nothing skipped that should have run — which is the answer
+the vacuous check was always giving and never actually checking.
+
+**Not repaired by making CI shout.** The temptation is `--nocapture` everywhere; it is the wrong
+fix. The mechanism that makes a skip *fail* already exists and is the one plan §3 rule 11 built:
+`SNX_*=required` turns a self-skip into a hard failure for the capability an operator says must be
+exercised, and it does that whether or not anyone reads the log. A SKIP-line grep was never the
+enforcement — it was a comfort reading beside it, and the honest repair is to stop quoting it as
+evidence, which the Status table now does: the Linux row states 12 with the flag it was measured
+under, the macOS row states **no** skip count because CI cannot produce one, and the v15-era row's
+"zero SKIP lines" is withdrawn in place rather than deleted (§15.44's rule for a withdrawn figure).
+
+**The general shape, because it is the third instance this session.** `jq` without `-e` (AGENTS §3),
+a gate skipped because the step ahead of it was red (§3.77), and now a grep whose subject is
+captured before it can be grepped. All three read as gates, all three asserted nothing, and none of
+them was wrong about anything — they were silent about everything. The tell they share: **a check
+whose passing output is identical to its not-running output.**
