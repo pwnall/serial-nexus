@@ -11363,15 +11363,31 @@ axis of one artifact and not the other. It also orphans a tripwire: §5's ring-s
 this benchmark as its detector, and a `VecDeque<u8>` rewrite would clear 4.27 MiB/s comfortably, so
 that row is currently upheld by review (item 61).
 
-**And an instrument-validity finding, before anything was built on it.** The obvious tool for the
-packaging gate is `systemd-analyze verify`. Measured on this box, exit status read directly rather
-than through a pipe: it catches an unknown directive (1) and a missing `ExecStart` (1), does **not**
-catch a bad value (`RestartSec=notanumber` → **0**), and returns **1 on the real unit** because
-`/usr/local/bin/serial-nexus-daemon` is not installed here. So its exit status conflates a unit
-defect with a missing install, and both naive uses are traps — trusting it reddens every dev box,
-ignoring it makes the command read as a gate and assert nothing. Recorded because the temptation
-was to wire it up first and measure later, which is how the five previous assert-nothing checks
-happened.
+**And an instrument-validity finding — which the next agent then proved I had got wrong.** The
+obvious tool for the packaging gate is `systemd-analyze verify`. I measured it, exit status read
+directly rather than through a pipe, and reported that it catches an unknown directive (1) and a
+missing `ExecStart` (1) while missing a bad value (0), and that it returns 1 on the real unit
+because the daemon binary the unit names is not installed here. The last of those is true. **The
+first is an artifact of it.** Re-run with the environmental arm removed:
+
+    unstaged (real ExecStart, nothing installed):  real=1  unknown=1  badval=1  noexec=1
+    staged   (ExecStart -> an executable stub):    real=0  unknown=0  badval=0  noexec=1
+    staged   + --recursive-errors=no:              real=0  unknown=1  badval=1  noexec=1
+
+Every exit 1 in my row was the missing binary talking, not the planted defect. With it staged away,
+systemd 259 exits **0** on an unknown directive, an unknown *section*, and a bad value alike — the
+tool is far blinder than I reported, and I had built the "at least it catches structure" half of my
+own recommendation on a confound. What survives every configuration is **stderr**: the diagnostic is
+always printed. So the gate requires exit 0 **and empty stderr**, which also makes it work on
+systemd < v250 where `--recursive-errors` does not exist. And a second finding, deterministic and
+opposite to what the flag name suggests: `--recursive-errors=no` makes the exit status bite.
+
+**Two lessons, and the second is the one that generalises.** A tool that prints a diagnostic and
+exits 0 is the `jq -e` instance in a third costume — the family now has six members. And *the
+control has to be part of the measurement*: I planted defects into a unit that was already failing
+for an unrelated reason, so every reading was the confound's. Rule 17 says re-verify what you
+inherit, and the agent that did — against a brief that handed it four confident numbers — is the
+only reason the gate does not now rest on them.
 
 ---
 
@@ -11405,11 +11421,16 @@ finding: `cargo test` has no per-test timeout, so in CI that class is a job time
 test name — the one thing AGENTS §8 says to capture verbatim, missing exactly when it is needed.
 Filed as item 64(h).
 
-**And the meta-gate caught the orchestrator.** `retired_names_appear_only_where_history_lives` went
-red on `docs/44-…-v17.md:1395 -> nexus-daemon` — my own prose, from the guard-audit commit. I had
-line-wrapped `/usr/local/bin/serial-nexus-daemon` across a break, leaving `nexus-daemon` at the
-start of the next line: the pre-§15.40 spelling, reintroduced by typography rather than by
-intent. §15.40's whole point is that the retired vocabulary is un-reintroducible, and a scanner
+**And the meta-gate caught the orchestrator — twice, the second time inside this very
+paragraph.** `retired_names_appear_only_where_history_lives` went red on the plan, at prose from
+the guard-audit commit: I had line-wrapped an absolute path to the daemon binary across a break,
+so the hyphen fell after the family prefix and the tail of the path began the next line as the
+**pre-§15.40 spelling of the daemon's name** — the retired vocabulary reintroduced by typography
+rather than by intent. Then, writing *this* entry, I quoted that spelling verbatim to explain it,
+and the gate reddened again on the notes. AGENTS §10 already has the answer and I walked past it:
+**when quoting material that violates the rule, paraphrase.** A record of a banned word cannot
+contain the banned word; that is what makes the ban un-reintroducible rather than merely
+discouraged. §15.40's whole point is that the retired vocabulary is un-reintroducible, and a scanner
 that folds lines is why. Two things follow. The gate is right and the fix was to rewrap, not to
 widen the allowance — that would have been silently re-fixing a decision. And the process failure
 is mine: I ran the meta-gates before that edit and not after, so the commit went out red and the

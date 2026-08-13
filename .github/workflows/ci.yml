@@ -293,6 +293,73 @@ jobs:
             serial-nexus-doctor-report.md
             serial-nexus-doctor-report.json
 
+  # The packaging gate (plan §18 item 31). Two arms, and the split is the point.
+  #
+  # The UNPRIVILEGED arm demands the validators — `systemd-analyze verify` over the
+  # unit, `udevadm verify` over the udev rules, each staged past its environmental
+  # arm. Without `required`, a runner image that stopped shipping systemd would
+  # report the whole packaged deployment surface green without reading a byte of it,
+  # and libtest captures a passing test's stderr so even the SKIP line would be
+  # invisible (plan §3 rules 11 and 22). Three text checks in the same file need no
+  # tool at all and never skip, so the drift class this tree can actually cause —
+  # the unit and its README disagreeing — stays covered even where systemd is absent.
+  #
+  # **The tool needs using carefully and that was measured, not assumed.** With the
+  # unit's `ExecStart` pointing at an uninstalled binary, `systemd-analyze verify`
+  # exits 1 for that reason alone, which masquerades as "it caught my defect"; with
+  # the path staged to an executable stub, systemd 259 exits **0** on an unknown
+  # directive, an unknown section AND a bad value. What is always present is the
+  # diagnostic on stderr, so the gate asserts exit 0 **and empty stderr**. A command
+  # that prints a complaint and exits 0 is the `jq -e` defect in a third costume.
+  #
+  # The ROOT arm is item 31's owed measurement: what `DynamicUser=` does to
+  # `StateDirectory=`, and what `ReadWritePaths=` does NOT do to ownership. No box
+  # this project has measured on can run it — the development box cannot `systemctl
+  # start` (polkit refuses without a terminal to prompt on) and cannot fall back to a
+  # user namespace (`unshare -Ur` is refused at `/proc/self/uid_map`). A GitHub-hosted
+  # runner has passwordless sudo, so it may be able to. **Whether it also runs systemd
+  # as PID 1 is UNMEASURED, which is exactly why `SNX_PACKAGING_ROOT` is not set
+  # here:** this arm reports what it found. Turning `required` on is a follow-up, once
+  # a green run proves the precondition — the precedent is `SNX_RIG_FLOW` (§15.52),
+  # whose precondition was measured before it was demanded.
+  packaging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup toolchain install "$MSRV" --profile minimal && rustup default "$MSRV"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install jq (locating the test binary from cargo's JSON output)
+        run: sudo apt-get update && sudo apt-get install -y jq
+      # The precondition, measured and printed rather than assumed. This step is what
+      # tells the next session whether SNX_PACKAGING_ROOT can be demanded.
+      - name: What this runner actually is
+        run: |
+          echo "PID 1:  $(cat /proc/1/comm 2>/dev/null || echo '<no procfs>')"
+          echo "uid:    $(id -u)   sudo: $(sudo -n true 2>/dev/null && echo passwordless || echo 'needs a password')"
+          systemd-analyze --version 2>/dev/null | head -1 || echo 'no systemd-analyze'
+          udevadm --version 2>/dev/null || echo 'no udevadm'
+          command -v systemd-run || echo 'no systemd-run'
+      - name: Packaging gate (unprivileged; the validators are required here)
+        env:
+          SNX_PACKAGING: required
+        run: cargo test -p serial-nexus-itest --test p8_packaging --locked -- --nocapture
+      # `cargo test` is deliberately NOT re-run under sudo: root has a different HOME
+      # and PATH, cargo would re-resolve and rebuild, and a sudo'd build is a different
+      # build. The already-built binary is run instead, and its path comes from cargo
+      # itself rather than from a glob — rule 7's "enumerate from the tool", applied to
+      # a file path.
+      - name: Packaging gate (root arm — item 31's owed measurement, reporting only)
+        run: |
+          BIN=$(cargo test -p serial-nexus-itest --test p8_packaging --locked --no-run \
+                  --message-format=json \
+                | jq -r 'select(.executable != null and .target.name == "p8_packaging") | .executable' \
+                | tail -1)
+          test -n "$BIN" || { echo "could not locate the p8_packaging test binary"; exit 1; }
+          echo "running $BIN as root"
+          sudo -n "$BIN" --nocapture --test-threads=1
+
   # Out-of-tree codec template (§15.26 / plan §10.3): build the out-of-tree stand-in
   # from the CONSUMER's own position (its own workspace manifest, path deps standing
   # in for version pins), run its conformance-kit test, and prove the custom daemon

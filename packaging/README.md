@@ -11,6 +11,12 @@ for the threat model you accept by exposing the control socket.
 | `serial-nexus-daemon.example.toml` | first-boot configuration seed |
 | `99-serial-nexus.rules` | optional udev rules for narrower device access |
 
+Every deployment claim on this page and in the unit carries a recorded **evidence
+class** — see [Evidence classes](#evidence-classes) at the end. Two sentences that
+read alike can rest on very different ground: one on a guard this tree runs, one on
+a paragraph of `systemd.exec(5)` nobody here has ever executed. The table says which
+is which, and `itest/tests/p8_packaging.rs` keeps it honest.
+
 ## Install
 
 ```sh
@@ -265,3 +271,86 @@ destroy the running graph, which is the point of the change (§11). Run
 - **A structurally invalid *state file* no longer prevents startup.** The daemon logs
   an error naming the file, preserves it untouched, and comes up with an empty graph.
   An invalid `--config` file given explicitly on the command line still fails fast.
+
+## Evidence classes
+
+Packaging is where this project's prose is furthest from its tests. A sentence about
+`ProtectSystem=strict` and a sentence about the control socket's mode look identical
+on the page, and only one of them has a guard behind it. This section records, for
+every claim these files make, **which kind of thing it is** — so that a reader
+deciding how much to trust a line does not have to guess, and so that a future
+session knows which claims are still owed a measurement.
+
+Three classes, and nothing else is allowed:
+
+| Class | Means |
+|---|---|
+| **measured** | Something in this tree, or a run recorded here with its box and date, exercised the behaviour. The Evidence column names it. |
+| **man-page** | The claim restates documented systemd behaviour. Nothing in this tree executes it. The Evidence column names the page and the directive whose documented behaviour is being relied on. |
+| **unverified** | Neither. A recipe nobody has run end to end, or a statement about a distro this project has never booted. |
+
+**man-page is not a synonym for true, and it is not an apology either.** It means the
+claim's warrant is systemd's documentation rather than this tree's CI, which is the
+correct warrant for most of a unit file — we do not re-test systemd. It becomes a
+problem exactly where the deployment *depends* on the documented behaviour being what
+we think it is, and the two rows below marked man-page-and-owed are that case; they
+are what plan §18 item 31 exists for.
+
+**Boxes these measurements were taken on.** `linux-2026-08-12` is Ubuntu with systemd
+259 (259.5-0ubuntu3.4), kernel 7.0.0-29, 20 cores, systemd as PID 1, unprivileged (no
+root, no polkit, and `unshare -Ur` refused: `write failed /proc/self/uid_map:
+Operation not permitted`). Suite citations name the guard, which is the durable form:
+a test that is renamed away takes its citation with it, and `itest/tests/meta_derive.rs`
+already holds the tree to that discipline elsewhere.
+
+### The unit's directives
+
+Every active directive in `serial-nexus-daemon.service` appears here exactly once,
+and `p8_packaging.rs` derives both sides of that correspondence from the two files
+rather than from any list a human keeps.
+
+| Directive(s) | The claim attached to it | Class | Evidence |
+|---|---|---|---|
+| `Description=`, `Documentation=`, `After=`, `WantedBy=` | Unit metadata and ordering; nothing operator-visible depends on them | man-page | `systemd.unit(5)`; `After=network.target` orders only, it does not wait for connectivity |
+| `Type=` | `Type=exec` reports the unit started once the binary has been executed, so a failed `exec` is a failed start | man-page | `systemd.service(5)`, `Type=exec` |
+| `ExecStart=` | The daemon accepts `--socket`, `--state-file` and `--config` with these meanings | measured | `serial-nexus-daemon --help` on linux-2026-08-12: all three present, `--state-file` documented as the reboot-durable path |
+| ↳ | the daemon prefers the persisted state file over `--config` | measured | `p13_legacy_defaults.rs::a_pre_rename_state_file_is_adopted_and_rewritten_under_the_current_name`, and its explicit-directory sibling |
+| ↳ | the daemon opens its own socket and exits cleanly on `SIGTERM`/`SIGINT`, releasing PTY symlinks and ports | measured | `p7_clean_exit.rs::sigterm_exits_cleanly_and_releases_the_node_environment` and the `sigint`/`shutdown` siblings |
+| `DynamicUser=` | A transient, unprivileged identity | man-page | `systemd.exec(5)`, `DynamicUser=` |
+| ↳ | under `DynamicUser=`, `StateDirectory=` really lives under `/var/lib/private/`, which is inaccessible to unprivileged users, so the pre-rename snapshot needs a root `cp` | **man-page, and owed a measurement** | `systemd.exec(5)`: "the directories are created below `/var/cache/private`, `/var/log/private` and `/var/lib/private`, respectively, which are host directories made inaccessible to unprivileged users". Plan §18 item 31's root-box half; `p8_packaging.rs::dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown` measures it where root exists |
+| `SupplementaryGroups=` | The service needs `dialout` because USB serial nodes are `root:dialout` mode 0660 | measured (partially) | linux-2026-08-12: `crw-rw---- 1 root dialout 188, 0 /dev/ttyUSB0`. One box, one distro, and **no `/dev/ttyACM*` was present to check** — the `ttyACM` half of that sentence and the `uucp` remark are unverified |
+| `RuntimeDirectory=`, `StateDirectory=`, `LogsDirectory=` | systemd creates each and chowns it to the service identity on every start | man-page | `systemd.exec(5)`: "the innermost specified directories will be owned by the user and group specified in `User=` and `Group=`" |
+| `RuntimeDirectoryMode=`, `StateDirectoryMode=`, `LogsDirectoryMode=` | 0700 on the socket directory bounds the post-bind window; 0750 on logs exposes them to the identity's group | man-page | `systemd.exec(5)`, the `*DirectoryMode=` family |
+| ↳ | that the daemon then narrows its own socket to 0600, and that `--socket-group` widens it to 0660 with the group's gid | measured | `p9_permissions.rs::a_running_daemon_writes_its_socket_state_and_logs_owner_only` and `::socket_group_chgrps_the_control_socket_and_widens_it_to_0660` |
+| ↳ | the socket-group recipe in the unit's comment block (`groupadd`/`useradd`, `DynamicUser=no`, `User=`, `Group=`, and the `stat` output it predicts) | **unverified** | Nothing in this tree has run it. Its premise (systemd chowns to `User=`/`Group=` and `SupplementaryGroups=` cannot reach a directory) is the man-page row above; the recipe built on that premise has never been executed |
+| `KillSignal=`, `TimeoutStopSec=`, `Restart=`, `RestartSec=` | Stop signalling and restart policy | man-page | `systemd.kill(5)`, `systemd.service(5)` |
+| `NoNewPrivileges=`, `ProtectSystem=`, `ProtectHome=`, `PrivateTmp=`, `ProtectProc=`, `ProtectKernelTunables=`, `ProtectKernelModules=`, `ProtectKernelLogs=`, `ProtectControlGroups=`, `ProtectClock=`, `ProtectHostname=`, `LockPersonality=`, `MemoryDenyWriteExecute=`, `RestrictRealtime=`, `RestrictSUIDSGID=`, `RestrictNamespaces=`, `SystemCallArchitectures=`, `SystemCallFilter=`, `SystemCallErrorNumber=` | The hardening block: each buys what `systemd.exec(5)` says it buys, and the daemon still starts under all of them | man-page for the effect; **measured for acceptance** | `systemd.exec(5)`. Acceptance — that systemd parses every one of these on this systemd version rather than warning past a typo — is measured by `p8_packaging.rs::the_packaged_unit_verifies_clean_under_systemd_analyze`. That the *daemon* runs under the resulting sandbox is **unverified**: no lane starts it as a service |
+| `RestrictAddressFamilies=` | `AF_INET`/`AF_INET6` are needed only for leg nodes, which bind loopback-only by default | measured (the loopback default) | `p6_insecure_bind.rs::loopback_bind_loads_without_flag`, `::non_loopback_bind_without_flag_is_structural_refusal`, `::insecure_bind_true_loads_and_marks_state`. The address-family restriction itself is `systemd.exec(5)` |
+| `PrivateDevices=`, `DevicePolicy=`, `DeviceAllow=` | `PrivateDevices=yes` would hide `/dev/ttyUSB*`, so it stays off and `/dev` is scoped by device class instead | man-page | `systemd.exec(5)`, `PrivateDevices=` ("a private `/dev/` mount … with API pseudo devices only"). Which majors a given adapter enumerates under is the operator's to check |
+
+### Claims on this page
+
+| Claim | Class | Evidence |
+|---|---|---|
+| The install steps produce `/usr/local/bin/serial-nexus-daemon` and `serial-nexus-ctl` from `cargo build --release` | measured | The workspace's binary names; linux-2026-08-12 built both |
+| Every command in "Operating it" is a live verb | measured | `serial-nexus-ctl --help` on linux-2026-08-12: `load`, `add-node`, `remove-node`, `connect`, `disconnect`, `dump`, `state`, `info`, `ports`, `subscribe`, `tap`, `tap-wait`, `rotate`, `send-break`, `set-modem`, `pulse-dtr`, `lock`, `unlock`, `send`, `teardown`, `shutdown` — and no `reload`, which is why the restart note is there |
+| `ports` opens nothing, so listing never toggles DTR | measured | `p10_ports.rs::ports_enumerates_every_candidate_in_its_identity_form` and the binding-status guards beside it |
+| The control socket is mode 0600, and whoever can open it owns every console | measured (the mode) | `p9_permissions.rs::a_running_daemon_writes_its_socket_state_and_logs_owner_only`; the consequence is `../docs/security.md`'s threat model |
+| The operators-group paragraph: `SupplementaryGroups=` cannot reach the runtime directory, so a static identity is the working recipe | man-page for the premise, **unverified** for the recipe | Same pair as the unit's socket-group row |
+| Extra log directories need `ReadWritePaths=` **and** a pre-`chown`, because `ReadWritePaths=` flips the mount without chowning | **man-page, and owed a measurement** | `systemd.exec(5)`: "Paths listed in `ReadWritePaths=` are accessible from within the namespace with the same access modes as from outside of it." Plan §18 item 31's root-box half measures the `EACCES`-versus-`EROFS` split that makes this concrete |
+| The udev step is a silent failure in both half-done directions | measured (the faulted arm) | A serial node that cannot open its device comes up `faulted` with the error named — `p9_permissions.rs`'s refusal guards; that a group without rules grants nothing is definitional |
+| The `99-serial-nexus.rules` file is syntactically valid udev | measured | `p8_packaging.rs::the_packaged_udev_rules_verify_clean_under_udevadm` on any box with `udevadm verify` |
+| The upgrade section's adoption behaviours (pre-rename state file adopted; client socket fallback; a live daemon never passed over) | measured | `p13_legacy_defaults.rs`, all five guards |
+| The upgrade section's root `cp` procedure, step by step | **unverified** | Never executed. Its necessity is the `/var/lib/private` man-page row |
+| Every "configurations that used to load and now do not" bullet, and the behaviour-change bullets | measured | `p9_config_validation.rs`, `p12_config_rules.rs`, `p8_map.rs` (the `spchex` change), `p9_permissions.rs` (the 0600/0640 file modes), `p3_log.rs` (rotate ordered against the write queue) |
+| Legs are loopback-only by default and `insecure_bind` is the deliberate footgun | measured | `p6_insecure_bind.rs`, all three guards |
+
+### What is still owed
+
+Two rows above are marked **man-page, and owed a measurement**, and they are the same
+root-box measurement seen from two directions: what `DynamicUser=` does to
+`StateDirectory=`, and what `ReadWritePaths=` does *not* do to ownership. Both are
+carried by `p8_packaging.rs`'s root-gated test, which self-skips with a precise
+reason on a box that cannot become root — which is every box this project has
+measured on so far. Its skip line names what it saw, so a run that could have
+measured and did not is distinguishable from a run that never tried.

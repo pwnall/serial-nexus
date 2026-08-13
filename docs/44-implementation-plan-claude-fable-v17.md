@@ -561,6 +561,8 @@ variables (rule 11).
 | `SNX_WEB_UI` | Playwright browser suite (§15.37) | Self-skip without node | Skip is a failure | Retries stay 0 (rule 15) |
 | `SNX_LICENSE_GATE` | Licensing-gate lane | Self-skip | Skip is a failure | — |
 | `SNX_EXEC_CODEC` | The out-of-process codec battery (§8, §15.26): thirteen tests over four files that drive a codec child through an external interpreter — `exec-conformance`, the any-language envelope battery, the crash-and-restart guard, the unconfigured-channel counter | Self-skip naming what the provider saw (`python3 not found`) | Skip is a failure (item 49) | Named for the **capability**, not the tool, like every instance beside it — `SNX_TLS`'s absent tool is `curl`, `SNX_WEB_UI`'s is `node`. A fixture ported to another language would leave an `SNX_PYTHON` naming nothing while the battery it gated still existed; the tool's name belongs in the message, on the box printing it (rule 11) |
+| `SNX_PACKAGING` | The packaged deployment surface (item 31): `systemd-analyze verify` over the unit and `udevadm verify` over the udev rules, each staged past its environmental arm | Self-skip naming what the provider saw (`systemd-analyze not found on PATH`) | Skip is a failure | Named for the **capability**, not the tool, like every instance beside it. The three text checks in the same file need no tool and **never skip**, so the drift class this tree can cause stays covered where this variable's subjects are absent |
+| `SNX_PACKAGING_ROOT` | Item 31's owed measurement: the `/var/lib/private/` indirection under `DynamicUser=`, and the EACCES-versus-EROFS pair proving `ReadWritePaths=` flips the mount without chowning | Self-skip naming the precondition that failed — PID 1's name, the effective uid, or `systemd-run`'s absence | Skip is a failure | **Deliberately set nowhere yet.** Whether a CI runner is systemd-as-PID-1 with passwordless root is unmeasured, and shipping `required` on an assumption reddens a lane for someone else's runner image — the discipline §15.52 set for `SNX_RIG_FLOW`, whose precondition was measured before it was demanded |
 | `SNX_SERIAL_PAIR=rig` | Forces `serial_pair_or_rig()` onto hardware (§15.48) — not a required mode | Software wins by default | Forcing with no rig visible is a hard failure, never a silent fallback | Provider printed before transmit |
 
 **Four** further variables are parameters, not gates. `SNX_CROSSOVER_A`/`_B` name the two rig port
@@ -1381,6 +1383,23 @@ Each item below uses the schema with its fields inline.
     re-scope is a decision about where the evidence lives: a measurement taken once on a
     maintainer's laptop is not a regression guard, and the whole point of this item is claims whose
     evidence class nobody can see.
+    *Executed 2026-08-12: (a) and (b) in full, (c) built and self-skipping.* The README gained an
+    **Evidence classes** section — a three-class vocabulary, a per-directive table for the unit and
+    a per-claim table for the page, covering all **41 active directives**. Several claims moved
+    from assumed to measured by being checked (`--help` for every flag and verb the page names;
+    the tty node's real mode and group), several are honestly **man-page** with the quote verified
+    to exist in `systemd.exec(5)` on this box, and six are **unverified** and say so — the
+    socket-group static-identity recipe, the upgrade procedure, and the `/dev/ttyACM*` half of the
+    dialout claim, which no box this project has measured on possesses. `itest/tests/p8_packaging.rs`
+    is the gate: six tests, **three of which need no tool and never skip**, so the drift class this
+    tree can cause is covered on macOS too. Eight plants against the real tree, each reddening and
+    each restored md5-identical. What it provably does *not* catch is in its own module doc — a
+    `SupplementaryGroups=` naming a nonexistent group (measured: exit 0, empty stderr, reported
+    each run rather than asserted, so a stricter systemd is noticed rather than contradicted), and
+    a *value* change on a well-formed directive. **(c)** exists and self-skips naming the
+    precondition that failed; its `required` mode is set nowhere until a CI run proves a runner is
+    systemd-as-PID-1 with passwordless root. *Remaining:* that switch, and the four `unverified`
+    rows, whose machinery the root arm already has.
     *Split:* **(a)** the evidence-class pass over `packaging/serial-nexus-daemon.service` and its
     README — marking each deployment claim *measured* / *man-page* / *unverified* — needs no root
     and is the item's first validation clause; **(b)** a no-root gate that runs on every push,
@@ -1389,14 +1408,24 @@ Each item below uses the schema with its fields inline.
     `DynamicUser=` mount measurement itself, which needs root and therefore belongs in a CI job
     that has passwordless sudo, not on a laptop.
     *Instrument validity, measured before building on it* (§13's own rule, applied to a tool
-    rather than a probe): `systemd-analyze verify` catches an unknown directive (exit 1) and a
-    missing `ExecStart` (exit 1), does **not** catch a bad value (`RestartSec=notanumber` → exit
-    **0**), and exits **1 on the real unit** for an environmental reason: the daemon binary
-    the unit names is not installed on a dev box. So its exit status conflates a unit defect with a
-    missing install, and both naive uses are traps: trusting it reddens any box without an install,
-    ignoring it makes the command read as a gate and assert nothing (rule 22's own class). A usable
-    gate stages the unit with the `ExecStart` path stubbed, *then* trusts the exit status, and
-    states the bad-value blind spot rather than letting a reader assume coverage.
+    rather than a probe) — **and the first measurement was wrong in the direction that matters,
+    which is why re-verification is rule 17**. The orchestrator read `systemd-analyze verify` as
+    catching an unknown directive (exit 1) while missing a bad value (exit 0). Re-run with the
+    environmental arm removed, the truth is worse and simpler:
+
+        unstaged (real ExecStart, nothing installed):  real=1  unknown=1  badval=1  noexec=1
+        staged   (ExecStart -> an executable stub):    real=0  unknown=0  badval=0  noexec=1
+        staged   + --recursive-errors=no:              real=0  unknown=1  badval=1  noexec=1
+
+    The "caught" reading was an **artifact of the missing binary** — every exit 1 in the first row
+    is the environmental arm, not the defect. With it removed, systemd 259's default flags exit 0
+    on an unknown directive, an unknown *section* and a bad value alike. What survives every
+    configuration is **stderr**: the diagnostic is always printed. So the gate requires **exit 0
+    AND empty stderr**, and the stderr half is what makes it work on systemd < v250, which has no
+    `--recursive-errors`. Second finding, deterministic across three runs and the opposite of what
+    the flag name suggests: **`--recursive-errors=no` makes the exit status bite**, so the gate
+    probes `--help` and passes it when advertised, as an independent second signal.
+    A tool that prints a diagnostic and exits 0 is the `jq -e` instance in a third costume.
     *Sequencing, deliberately:* the root-gated half lands **self-skipping with its reason printed**,
     and its `required` mode is switched on only after a CI run proves the runner actually provides
     systemd as PID 1 — measured, not declared, the way §15.52 made `SNX_RIG_FLOW`'s precondition a
