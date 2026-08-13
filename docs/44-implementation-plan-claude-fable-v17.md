@@ -2725,11 +2725,25 @@ for is one the next review cannot check was fixed — item 16's lesson.
     directory prints the message, exits **2**, and produces no further output (CI's signature
     exactly), while `true >` prints `write=denied`, reaches the end, and exits **0**. `true` is
     a regular built-in. Repaired at both call sites.
+    **Fourth stage, and the last of the same gotcha.** With `true` in place the probe ran to
+    completion and reached a *property* assertion for the first time — and the property is
+    **passing**: the write into the listed directory is refused, which is the README's claim.
+    What failed is the errno capture, `listed_write=fail:` with nothing after the colon.
+    Redirections are applied left to right, so `> file 2>/tmp/e2` fails on `> file` and never
+    applies the `2>`; the diagnostic went to the inherited stderr, which is exactly where CI
+    had been showing it all along. Verified on dash again rather than reasoned: the old order
+    reads `fail:`, the new one `fail:/bin/dash: 2: cannot create …: Permission denied`, which
+    is what the downstream assertion needs to tell EACCES from EROFS. Reordered at both sites.
+    **The pattern across the four stages is the item's most transferable content**: each fix
+    revealed the next defect, every one of them the probe's rather than the packaged unit's,
+    and the property under test was never the thing failing. A test that cannot run has no
+    verdict, and four different mechanisms conspired to make "cannot run" look like "the claim
+    is false".
     *Remainder:* **the `continue-on-error` line is a step asserting nothing, which AGENTS §3
     names as a tell, so it is temporary by construction** — one green run at this tree flips it
     back off, and it has not come yet. *Limit, now smaller but still real:* the shell behaviour
-    is verified, and whether the whole arm passes on the runner is not — that is the next run's
-    measurement, as it has been for each stage. *Validation:* the flip-back is the item's
+    is verified on the shell that runs it, and whether the whole arm passes on the runner is
+    not — that is the next run's measurement, as it has been for each stage. *Validation:* the flip-back is the item's
     close; a run that is still red names its new status word or its new failing assertion
     rather than re-asserting any of the three diagnoses.
 69. **The macOS lane's two Linux-shaped guards, and what they say about coverage** —

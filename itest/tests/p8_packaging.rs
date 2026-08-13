@@ -1294,6 +1294,16 @@ fn dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown() {
     // The write being *denied* is the expected result — it is the README's claim that
     // `ReadWritePaths` flips the mount without chowning — so the probe was dying
     // exactly on success.
+    //
+    // **And `2>/tmp/eN` comes BEFORE the failing redirection, which is the other half
+    // of the same gotcha.** Redirections are applied left to right, so `> file
+    // 2>/tmp/e2` fails on `> file` and never applies `2>`: the diagnostic goes to the
+    // *inherited* stderr and the capture file stays empty. CI read exactly that —
+    // `listed_write=fail:` with nothing after the colon, while the message appeared in
+    // the unit's own stderr. Verified on dash rather than reasoned: with the old order
+    // the reading is `fail:`, with this one it is `fail:/bin/dash: 2: cannot create
+    // …: Permission denied`, which is what the assertion downstream needs to tell
+    // EACCES from EROFS.
     args.push(format!(
         r#"set +e
 sd=/var/lib/{tag}
@@ -1303,9 +1313,9 @@ if echo probe > "$sd/probe.txt" 2>/tmp/e1; then printf 'state_write=ok\n'
 else printf 'state_write=fail:%s\n' "$(tr -d '\n' < /tmp/e1)"; fi
 printf 'state_stat=%s\n' "$(stat -c '%U:%a' "$sd" 2>/dev/null || echo none)"
 printf 'state_real=%s\n' "$(readlink -f "$sd" 2>/dev/null || echo none)"
-if true > "{rw}/probe.txt" 2>/tmp/e2; then printf 'listed_write=ok\n'
+if true 2>/tmp/e2 > "{rw}/probe.txt"; then printf 'listed_write=ok\n'
 else printf 'listed_write=fail:%s\n' "$(tr -d '\n' < /tmp/e2)"; fi
-if true > "{ro}/probe.txt" 2>/tmp/e3; then printf 'unlisted_write=ok\n'
+if true 2>/tmp/e3 > "{ro}/probe.txt"; then printf 'unlisted_write=ok\n'
 else printf 'unlisted_write=fail:%s\n' "$(tr -d '\n' < /tmp/e3)"; fi
 if ls /var/lib/private > /dev/null 2>/tmp/e4; then printf 'private_list=ok\n'
 else printf 'private_list=fail:%s\n' "$(tr -d '\n' < /tmp/e4)"; fi
