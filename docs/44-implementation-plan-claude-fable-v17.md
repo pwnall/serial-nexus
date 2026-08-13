@@ -2734,11 +2734,21 @@ for is one the next review cannot check was fixed — item 16's lesson.
     had been showing it all along. Verified on dash again rather than reasoned: the old order
     reads `fail:`, the new one `fail:/bin/dash: 2: cannot create …: Permission denied`, which
     is what the downstream assertion needs to tell EACCES from EROFS. Reordered at both sites.
-    **The pattern across the four stages is the item's most transferable content**: each fix
+    **Fifth stage, and it is the *control* this time.** The errno capture fixed, CI read
+    `listed_write=fail:… Permission denied` — Claim 4's ownership arm **passing**, the README
+    confirmed — and failed on the arm beside it with `unlisted_write=ok`. `/run` is writable
+    for services, so `ProtectSystem=strict` never refuses anything there and the control cannot
+    produce the `EROFS` that separates "the mount flipped" from "the ownership changed". Moved
+    to `/var/lib/<tag>-scratch`: `/var` *is* read-only under strict, so the unlisted sibling
+    gets `EROFS` while the listed one, remounted read-write and root-owned 0755, gets `EACCES`.
+    A sibling of `StateDirectory`'s `/var/lib/<tag>`, never inside it. **The four rejected
+    locations and why each failed are now written at the code**, since the requirement turns
+    out to be exact and each candidate fails differently.
+    **The pattern across the five stages is the item's most transferable content**: each fix
     revealed the next defect, every one of them the probe's rather than the packaged unit's,
-    and the property under test was never the thing failing. A test that cannot run has no
-    verdict, and four different mechanisms conspired to make "cannot run" look like "the claim
-    is false".
+    and the property under test was never the thing failing — by stage five one of Claim 4's
+    two arms is confirmed. A test that cannot run has no verdict, and five different mechanisms
+    conspired to make "cannot run" look like "the claim is false".
     *Remainder:* **the `continue-on-error` line is a step asserting nothing, which AGENTS §3
     names as a tell, so it is temporary by construction** — one green run at this tree flips it
     back off, and it has not come yet. *Limit, now smaller but still real:* the shell behaviour

@@ -1246,16 +1246,36 @@ fn dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown() {
     // writes into under this unit's `ProtectSystem=strict` — so `ReadWritePaths=`
     // has something real to re-mount read-write, which is the mechanism under test.
     //
-    // **`-scratch`, and the suffix is load-bearing.** `service_properties` renames the
-    // unit's three `*Directory=` values to `tag`, so `RuntimeDirectory=<tag>` makes
-    // systemd create — and, under `DynamicUser=yes`, **chown** — `/run/<tag>` for the
-    // service's dynamic user. Putting the probe directories inside that path handed
-    // their ownership to the very user whose writes this test is trying to refuse, and
-    // the ownership control died silently: the first CI run after the `/tmp` repair got
-    // past `EXIT_NAMESPACE` and then reported `listed_write=ok` on a directory it had
-    // just created root-owned 0755. Two different paths that must not be one, so they
-    // are spelled differently rather than kept apart by a comment.
-    let base = PathBuf::from("/run").join(format!("{tag}-scratch"));
+    // **Where the probe directories live is the measurement**, and getting there took
+    // four CI runs, each ruling one candidate out. The requirement is exact: a tree
+    // that `ProtectSystem=strict` genuinely mounts **read-only**, that exists inside
+    // the namespace, and that is **not** one of the unit's own `*Directory=` trees.
+    //
+    // * `/tmp` (and `/var/tmp`) — refused: `PrivateTmp=yes` replaces both, so a
+    //   `ReadWritePaths=` naming a path under them names one that does not exist in
+    //   the namespace, and systemd fails mount setup with `status=226` `EXIT_NAMESPACE`
+    //   before `ExecStart`.
+    // * `/run/<tag>` — refused: `service_properties` renames the three `*Directory=`
+    //   values to `tag`, so `RuntimeDirectory=<tag>` is *this same path*, which systemd
+    //   creates and, under `DynamicUser=yes`, **chowns** to the service user. That
+    //   handed the probe directories to the very user whose writes the test refuses,
+    //   and the ownership arm died silently reporting `listed_write=ok`.
+    // * `/run/<tag>-scratch` — refused, and this one is subtler: it fixed the ownership
+    //   arm (`listed_write` correctly read `fail:… Permission denied`) and broke the
+    //   **control**, which reported `unlisted_write=ok`. `/run` is writable for
+    //   services, so `ProtectSystem=strict` never refuses anything there and the
+    //   control cannot produce the `EROFS` that separates "the mount flipped" from
+    //   "the ownership changed".
+    // * `/var/lib/<tag>-scratch` — this one. `/var` is read-only under
+    //   `ProtectSystem=strict`, so the unlisted sibling gets `EROFS`; the listed one is
+    //   remounted read-write by `ReadWritePaths=` and, being root-owned 0755, gets
+    //   `EACCES`. That is the pair Claim 4 needs. It is a *sibling* of
+    //   `StateDirectory`'s `/var/lib/<tag>`, never inside it, which is what the
+    //   `-scratch` suffix keeps true.
+    //
+    // **Unverified on a real box, like each of its predecessors** — this session has no
+    // systemd, and the next CI run is the measurement (plan §18 item 68).
+    let base = PathBuf::from("/var/lib").join(format!("{tag}-scratch"));
     let rw_dir = base.join("rw-listed");
     let ro_dir = base.join("rw-unlisted");
     std::fs::create_dir_all(&rw_dir).expect("create the ReadWritePaths probe directory");
