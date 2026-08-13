@@ -53,6 +53,7 @@ use serial2::{CharSize, FlowControl, Parity, SerialPort, Settings, StopBits};
 
 use crate::report::{EnvCheck, Probe, Status};
 use serial_nexus_sys as sys;
+use serial_nexus_sys::RtsCtsOutcome;
 
 const CUSTOM_BAUD: u32 = 250_000;
 
@@ -6469,6 +6470,10 @@ struct FlowReadback {
     port: String,
     /// Did `tcsetattr` report success? A driver that *refuses* is not the
     /// interesting case — it is honest. The interesting one accepts and drops.
+    /// **This cell is what separates them**, and it is why the probe can make
+    /// §7.1's three-way call from the two cells here: with the flag reading back
+    /// clear, a failed set is the honest refusal and a successful one is the
+    /// defect (`silently_dropped`).
     tcsetattr_ok: bool,
     tcsetattr_error: Option<String>,
     cflag_before: u64,
@@ -6476,10 +6481,11 @@ struct FlowReadback {
     /// The whole point: `CRTSCTS` present in the read-back.
     honoured: bool,
     /// Does `serial_nexus_sys::honours_rtscts` — the predicate the daemon's `load`
-    /// consults — agree with the reading beside it? `None` when that predicate could
-    /// not run (an unreadable port is not a disagreement). A `false` here means the
-    /// report and the daemon would answer differently about the same port, which is
-    /// worse than either answer.
+    /// consults — agree with the reading beside it, **as an arm of §7.1's three-way
+    /// call rather than as a read-back**? `None` when that predicate could not run
+    /// (an unreadable port is not a disagreement). A `false` here means the report
+    /// and the daemon would answer differently about the same port, which is worse
+    /// than either answer.
     shipped_predicate_agrees: Option<bool>,
     /// Set back to what it was, and checked. A probe that reconfigures a real
     /// port and cannot say it restored it is a probe nobody should run twice.
@@ -6532,17 +6538,28 @@ fn p15_readback(path: &PathBuf) -> Result<FlowReadback, String> {
     let after = after.map_err(|e| format!("tcgetattr after: {e}"))?;
 
     // **The daemon's refusal and this report must never disagree.** The daemon
-    // rejects a `flow = "rts-cts"` config at load time on a port that answers
-    // `false` to `sys::honours_rtscts`; if P15 measured the same thing by its own
-    // code path, a drift between the two would let a report call a port fine while
-    // `load` refuses it. So the shipped predicate is called here and its answer is
-    // required to match the one this probe just read by hand — an operator reading
-    // `honoured_on_readback` is reading the exact function `load` consults (notes
-    // §3.67).
+    // rejects a `flow_control = "rts-cts"` config at load time on a port that answers
+    // `AcceptedThenDropped` to `sys::honours_rtscts`; if P15 measured the same thing
+    // by its own code path, a drift between the two would let a report call a port
+    // fine while `load` refuses it. So the shipped predicate is called here and its
+    // answer is required to match the one this probe just read by hand — an operator
+    // reading `honoured_on_readback` and `tcsetattr_ok` is reading the exact function
+    // `load` consults (notes §3.67).
+    //
+    // **The comparison is over the three-way answer, not over the read-back**
+    // (§7.1 clause 7, §15.53). It compared `honoured` alone until 2026-08-12, which
+    // agreed by construction on the half that could not differ: an honest refusal
+    // and an accept-then-drop both read the flag back clear, so the two sides could
+    // classify the same port into different arms — the arm that decides whether
+    // `load` refuses — and this field would still say `true`. The readings stay
+    // independently taken (that is what this cross-check is for); only the rule
+    // that turns two readings into an arm is shared, so a disagreement here is
+    // about the *port*, never about the meaning of the arms.
     let honoured = after.control_flags.contains(ControlFlags::CRTSCTS);
+    let by_hand = RtsCtsOutcome::classify(set.is_ok(), honoured);
     let shipped = serial_nexus_sys::honours_rtscts(path);
     let agrees = match &shipped {
-        Ok(v) => Some(*v == honoured),
+        Ok(v) => Some(*v == by_hand),
         Err(_) => None,
     };
 
@@ -6617,7 +6634,7 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
         return (
             Status::Degraded,
             format!(
-                "**This report and the daemon would answer differently about {}.**                  `serial_nexus_sys::honours_rtscts` is the predicate `load` consults to                  refuse a `flow = \"rts-cts\"` config, and it disagreed with the read-back                  this probe took by hand on the same port. Neither reading can be trusted                  until they are reconciled: a report that calls a port fine while `load`                  refuses it — or the reverse — is worse than either verdict on its own.",
+                "**This report and the daemon would answer differently about {}.**                  `serial_nexus_sys::honours_rtscts` is the predicate `load` consults to                  refuse a `flow_control = \"rts-cts\"` config, and it disagreed with the read-back                  this probe took by hand on the same port. Neither reading can be trusted                  until they are reconciled: a report that calls a port fine while `load`                  refuses it — or the reverse — is worse than either verdict on its own.",
                 disagreeing
                     .iter()
                     .map(|r| r.port.as_str())
@@ -6626,19 +6643,48 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
             ),
         );
     }
+    // **A port that REFUSED the request is not a port that honoured it, and the
+    // verdict may not say it was** (§7.1 clause 7, §15.53). Both readings are
+    // `supported` — an honest refusal is a legitimate driver answer and §7.1
+    // deliberately does not refuse such a config at `load` — but they are different
+    // facts, and this arm printed "Every named port honoured `CRTSCTS` on read-back"
+    // over both until 2026-08-12. On a refusing port that sentence is simply false:
+    // `honoured_on_readback` is `false` in the cell right beside it, which is the
+    // shape §13 exists to prevent (a verdict a reader would act on, contradicted by
+    // the observation under it). The probe already had the data — `tcsetattr_ok`
+    // separates the two — and only the prose could not tell them apart.
+    let refused: Vec<&FlowReadback> = rows
+        .iter()
+        .filter(|r| !r.tcsetattr_ok && !r.honoured)
+        .collect();
+    if dropped.is_empty() && refused.is_empty() {
+        return (
+            Status::Supported,
+            format!(
+                "Every named port ({}) honoured `CRTSCTS` on read-back, so a `flow_control = \"rts-cts\"` edge configures here and the driver agrees it did. `serial2` verifies settings by reading them back, so this is exactly the check the serial node's open performs.",
+                rows.len()
+            ),
+        );
+    }
     if dropped.is_empty() {
         return (
             Status::Supported,
             format!(
-                "Every named port ({}) honoured `CRTSCTS` on read-back, so a `flow = \"rts-cts\"` edge configures here and the driver agrees it did. `serial2` verifies settings by reading them back, so this is exactly the check the serial node's open performs.",
-                rows.len()
+                "**{} of {} named port(s) REFUSED the `CRTSCTS` request outright** ({}); the rest honoured it on read-back. A refusal is `tcsetattr` *failing* rather than reporting success and leaving the flag clear, and it is the honest answer: nothing about the request was silently discarded. **A `flow_control = \"rts-cts\"` config on such a port is therefore NOT refused at `load`/`add-node` (§7.1, §15.53)** — only the accept-then-drop driver is, because only that one would leave a link running without the flow control it asked for. The node's own open fails instead, loudly, carrying the driver's own error plus the flag, the port and both remedies: `flow_control = \"none\"` (or `xon-xoff`) for this port, or an adapter whose driver implements RTS/CTS. Read this beside `honoured_on_readback` and `tcsetattr_ok` in the cells below: those two together are the three-way discrimination this probe exists to make, and `silently_dropped` is `false` here.",
+                refused.len(),
+                rows.len(),
+                refused
+                    .iter()
+                    .map(|r| r.port.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         );
     }
     (
         Status::Degraded,
         format!(
-            "**{} named port(s) ACCEPTED a `CRTSCTS` request and then reported it clear** ({}). `tcsetattr` returned success and `tcgetattr` read the flag back unset, so the driver neither honours the mode nor refuses it. **What the daemon does about it is decided and shipped (§15.53, notes §3.67): a node configured with `flow = \"rts-cts\"` on such a port is REFUSED at `load`/`add-node`, before anything is created** — not faulted later, and not silently run without the flow control it asked for. The refusal names the node, the device, the resolved path and the read-back, and offers two remedies: `flow = \"none\"` (or `xon-xoff`) for this port, or an adapter whose driver implements RTS/CTS. `serial-nexus-doctor --port <this port>` reports the same reading the daemon consults, and `shipped_predicate_agrees` below says whether the two agree on this box. Every other node in the config still loads. Measured on Darwin 24.6.0 / macOS 15.7.8 with an FT232R on Apple's IOSerialFamily driver: `CCTS_OFLOW` alone, `CRTS_IFLOW` alone, both together, a blocking open and the `/dev/tty.*` node all behave identically, while a **pty on the same box honours the flag** — so it is the serial driver and not the tty layer. The wire is not the suspect either: RTS↔CTS crossing is independently proven on that rig. **Two paths still reach a `faulted` node rather than the refusal**, both because the pre-check could not open the port to measure it: a `load --replace` on a port the running graph already holds (filed, notes §3.68 (5a)), and an adapter that arrives *after* the config loads. On those the node's own open fails, and the fault now carries this same reading and remedy instead of `serial2`'s bare `failed to apply some or all settings`.",
+            "**{} named port(s) ACCEPTED a `CRTSCTS` request and then reported it clear** ({}). `tcsetattr` returned success and `tcgetattr` read the flag back unset, so the driver neither honours the mode nor refuses it. **What the daemon does about it is decided and shipped (§15.53, notes §3.67): a node configured with `flow_control = \"rts-cts\"` on such a port is REFUSED at `load`/`add-node`, before anything is created** — not faulted later, and not silently run without the flow control it asked for. The refusal names the node, the device, the resolved path and the read-back, and offers two remedies: `flow_control = \"none\"` (or `xon-xoff`) for this port, or an adapter whose driver implements RTS/CTS. `serial-nexus-doctor --port <this port>` reports the same reading the daemon consults, and `shipped_predicate_agrees` below says whether the two agree on this box. The refusal is structural and creates **nothing** — §11's load is atomic, so a five-node file with one such port creates zero nodes, not four; what survives is the *running* graph, because the pre-check runs before any teardown, so a refused `load --replace` leaves what is already up untouched. Measured on Darwin 24.6.0 / macOS 15.7.8 with an FT232R on Apple's IOSerialFamily driver: `CCTS_OFLOW` alone, `CRTS_IFLOW` alone, both together, a blocking open and the `/dev/tty.*` node all behave identically, while a **pty on the same box honours the flag** — so it is the serial driver and not the tty layer. The wire is not the suspect either: RTS↔CTS crossing is independently proven on that rig. **Two paths still reach a `faulted` node rather than the refusal**, both because the pre-check could not open the port to measure it: a `load --replace` on a port the running graph already holds (filed, notes §3.68 (5a)), and an adapter that arrives *after* the config loads. On those the node's own open fails, and the fault now carries this same reading and remedy instead of `serial2`'s bare `failed to apply some or all settings`.",
             dropped.len(),
             dropped
                 .iter()
@@ -6664,13 +6710,23 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
 /// **The decision is made, and this doc comment used to outlive it.** §15.53 / notes
 /// §3.67: the daemon consults `sys::honours_rtscts` — the one predicate, which this
 /// probe also calls and cross-checks as `shipped_predicate_agrees` — and **refuses**
-/// such a config at `load`/`add-node`, before anything is created. Not degrade: the
-/// thing degraded would be the transport's contract rather than an observation, since
-/// an `rts-cts` edge exists because the far end needs the line held. What §7 forbids
-/// is the operator learning nothing, and that was the *old* behaviour. This probe now
-/// reports the shipped answer instead of describing the question as open; the guard
-/// below pins that, because a stale consequence string is invisible to every other
-/// gate and this one is read by operators on the platform it is wrong about.
+/// an *accept-then-drop* config at `load`/`add-node`, before anything is created. Not
+/// degrade: the thing degraded would be the transport's contract rather than an
+/// observation, since an `rts-cts` edge exists because the far end needs the line
+/// held. What §7 forbids is the operator learning nothing, and that was the *old*
+/// behaviour. This probe now reports the shipped answer instead of describing the
+/// question as open; the guard below pins that, because a stale consequence string is
+/// invisible to every other gate and this one is read by operators on the platform it
+/// is wrong about.
+///
+/// **Three answers, two of them `supported`, and the verdict must say which**
+/// (§7.1 clause 7). A driver that *refuses* `CRTSCTS` outright is honest — §7.1 does
+/// not refuse its config at `load`, because nothing runs silently without the flow
+/// control it asked for; the node's own open fails loudly instead. It reads
+/// `supported` here for that reason, and it gets its own named arm, because the arm
+/// it used to share said "every named port honoured `CRTSCTS`" over a cell reading
+/// `honoured_on_readback: false`. The probe always had the data — `tcsetattr_ok` is
+/// the discriminator — so this cost no new observation key and moved neither digest.
 ///
 /// **Why not an observation on P11.** P11 states its own contract — it opens with
 /// the port's current settings unchanged and "inspects, it does not configure" —
@@ -9023,6 +9079,79 @@ mod tests {
         assert!(matches!(p15_verdict(1, &refused, &[]).0, Status::Supported));
     }
 
+    /// **`supported` is one status over two different facts, and the sentence must
+    /// say which one it measured** (§7.1 clause 7, §13, §15.53).
+    ///
+    /// An honest refusal reads `supported` here on purpose — the driver said no, the
+    /// operator learns it, and §7.1 does not refuse such a config at `load`. But
+    /// until 2026-08-12 the arm above it printed **"Every named port honoured
+    /// `CRTSCTS` on read-back"** over that reading, with `honoured_on_readback:
+    /// false` in the cell directly beneath. A verdict contradicted by its own
+    /// observation is the failure §13's reported-never-judged discipline exists to
+    /// prevent, and this is the operator-facing half of the same collapse that made
+    /// `load` refuse a config §7.1 does not refuse.
+    ///
+    /// Nothing else in the gate set can see it: `expectations/*.jq` assert over
+    /// `.probes[].observations` and never over `.consequence`, and the two digests
+    /// cover `(id, question)` and observation leaf paths. Asserted as properties —
+    /// the arm is named, the honour claim is *absent*, the port is named, the
+    /// non-refusal at `load` is stated — so rewording stays free (the same shape as
+    /// the dropped arm's guard below).
+    #[test]
+    fn p15s_supported_verdict_never_claims_an_honour_a_refusing_port_did_not_give() {
+        let refused = [flow_row("/dev/ttyS9", false, false, true)];
+        let (s, c) = p15_verdict(1, &refused, &[]);
+        assert!(
+            matches!(s, Status::Supported),
+            "an honest refusal is a legitimate driver answer, not a degradation (§7)"
+        );
+        assert!(
+            !c.contains("Every named port"),
+            "the verdict claims every port honoured CRTSCTS while `honoured_on_readback` \
+             reads false in the cell beside it — that sentence is FALSE on this fleet: {c}"
+        );
+        assert!(
+            c.contains("REFUSED") && c.contains("/dev/ttyS9"),
+            "the refusing port must get its own named arm, and be named: {c}"
+        );
+        assert!(
+            c.contains("NOT refused at `load`/`add-node`"),
+            "the operator's next question is what the daemon will do with this port, \
+             and §7.1's answer is that it loads: {c}"
+        );
+
+        // A mixed fleet is the shape that hides best: one port honours, one refuses,
+        // and the old sentence was true of the first and false of the second.
+        let mixed = [
+            flow_row("/dev/ttyUSB0", true, true, true),
+            flow_row("/dev/ttyS9", false, false, true),
+        ];
+        let (s, c) = p15_verdict(2, &mixed, &[]);
+        assert!(matches!(s, Status::Supported));
+        assert!(
+            !c.contains("Every named port"),
+            "one of the two ports did not honour it: {c}"
+        );
+        assert!(
+            c.contains("/dev/ttyS9") && !c.contains("/dev/ttyUSB0"),
+            "the arm must name the ports it is about — the refusing one — and not \
+             the ones it is not: {c}"
+        );
+
+        // And the accept-then-drop finding still outranks it: a fleet carrying both
+        // must lead with the defect, not with the honest answer.
+        let both = [
+            flow_row("/dev/ttyS9", false, false, true),
+            flow_row("/dev/cu.usbserial-A", true, false, true),
+        ];
+        let (s, c) = p15_verdict(2, &both, &[]);
+        assert!(matches!(s, Status::Degraded));
+        assert!(
+            c.contains("ACCEPTED a `CRTSCTS` request"),
+            "the defect must lead over the honest refusal: {c}"
+        );
+    }
+
     /// **The dropped arm must describe the disposition the daemon SHIPS, and this is
     /// the one consequence string in the tree that an operator acts on** (§15.53,
     /// notes §3.67/§3.72).
@@ -9066,7 +9195,7 @@ mod tests {
         // Both remedies, because a refusal with no way forward is §7's complaint in
         // a new costume.
         assert!(
-            c.contains("flow = \\\"none\\\"") || c.contains("flow = \"none\""),
+            c.contains("flow_control = \\\"none\\\"") || c.contains("flow_control = \"none\""),
             "must offer the config remedy: {c}"
         );
         assert!(

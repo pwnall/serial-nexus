@@ -46,13 +46,57 @@ use crate::cell::CriticalCell;
 use crate::nodes::codec::UnconfiguredChannels;
 use crate::runtime::{
     CHANNEL_CAP, DataFrame, DropCounters, HostwardChannelStat, LossCounter, READ_BUF, SharedFanOut,
-    SharedTargetEdge, TeardownLoss, Wiring, data_frames, forward_targetward, route_channel_data,
+    SharedTargetEdge, TargetwardInbox, TeardownBytes, TeardownLoss, Wiring, data_frames,
+    forward_targetward, route_channel_data,
 };
 use crate::tap::TapFeed;
 
 /// The reserved wire channel identity for the multiplexed (device) side (§15.22).
 /// The graph forbids an empty real channel identity, so this never collides.
 const MUX_CHANNEL: &str = "";
+
+/// One item on the merged source that feeds the child's stdin: the wire channel
+/// identity it will ride on, and its bytes.
+///
+/// A named struct rather than the `(String, Chunk)` tuple this used to be, for one
+/// reason: the teardown ledger has to **discriminate** the two halves of this queue
+/// (§5, §15.50), and that rule has to live on the item's type. See the
+/// [`TeardownBytes`] impl below.
+struct FeedItem {
+    /// The wire channel identity: [`MUX_CHANNEL`] for the raw device stream on its
+    /// way *into* the child, a real channel identity for a targetward write.
+    channel: String,
+    bytes: Chunk,
+}
+
+/// **Only the targetward half of the merge queue is teardown loss** (§5, §15.50).
+///
+/// The merge stage is the one queue in this daemon that carries *both* directions at
+/// once — that is what "merged source" means here (§15.22). An item tagged with the
+/// reserved [`MUX_CHANNEL`] is the raw **hostward** device stream being framed into
+/// the child's stdin; every other identity is a channel's **targetward** write.
+/// `discarded_at_teardown` names targetward loss, so charging the hostward half here
+/// would report a hostward loss under a targetward name — the precise error the
+/// leg's per-channel *relay* is deliberately excluded from the ledger to avoid
+/// (notes §3.55). Hostward loss has its own names at its own consuming boundary
+/// (`dropped_slow_consumer`, `discarded_unattached`), and it is not this counter's to
+/// report.
+///
+/// A blanket `impl TeardownBytes for (String, Chunk)` in `runtime.rs` — the shape
+/// notes §3.55 sketched when it said "the merge queue needs only a `TeardownBytes`
+/// impl for its `(String, Chunk)`" — could not carry this rule: the reserved identity
+/// is `exec`'s, not the runtime's, and a generic tuple impl would have to charge
+/// everything. Naming the item type is what keeps the discrimination where the
+/// knowledge is.
+impl TeardownBytes for FeedItem {
+    fn teardown_bytes(&self) -> u64 {
+        if self.channel == MUX_CHANNEL {
+            0
+        } else {
+            self.bytes.len() as u64
+        }
+    }
+}
 
 /// The exec codec's validated attribute schema (§7.6). Deserialized from the
 /// opaque config table; a schema failure is structural and fails the load (§11).
@@ -327,7 +371,18 @@ impl ExecCodecNode {
         // hostward device stream (tagged with the reserved multiplexed channel) and
         // each channel's targetward writes (tagged with the channel identity). The
         // forwarders outlive child restarts, so the merged source survives them.
-        let (src_tx, src_rx) = mpsc::channel::<(String, Chunk)>(CHANNEL_CAP);
+        //
+        // **The merge queue is watched too, which is what makes this node's teardown
+        // figure a total rather than a floor** (§5, §15.50, plan §18 item 21). It used
+        // to be a bare `mpsc::Receiver` moved into the supervisor's future, so
+        // `TaskSet::abort_all` destroyed it and everything in it unread — notes
+        // §3.31's original defect, surviving one stage further in than the fix reached.
+        // Watching it costs nothing structural: [`TargetwardInbox`] keeps the receiver
+        // in a slot the *node* holds, so `signal_stop` can count the queue at the
+        // instant the operator asks, and `pump_child` reads through the same handle.
+        // Only the targetward half is charged — see [`FeedItem`]'s [`TeardownBytes`].
+        let (src_tx, src_rx) = mpsc::channel::<FeedItem>(CHANNEL_CAP);
+        let src = self.teardown_loss.watch(src_rx);
         if let Some(mut inbox) = mux_inbox {
             let src_tx = src_tx.clone();
             self.tasks.push(tokio::task::spawn_local(async move {
@@ -336,7 +391,11 @@ impl ExecCodecNode {
                 // closes it, park again.
                 while let Some(mut rx) = inbox.recv().await {
                     while let Some(chunk) = rx.recv().await {
-                        if src_tx.send((MUX_CHANNEL.to_owned(), chunk)).await.is_err() {
+                        let item = FeedItem {
+                            channel: MUX_CHANNEL.to_owned(),
+                            bytes: chunk,
+                        };
+                        if src_tx.send(item).await.is_err() {
                             return;
                         }
                     }
@@ -347,8 +406,26 @@ impl ExecCodecNode {
             let rx = self.teardown_loss.watch(rx);
             let src_tx = src_tx.clone();
             self.tasks.push(tokio::task::spawn_local(async move {
+                // **Why the two watched stages cannot double-count the same chunk.**
+                // This loop hands a chunk from one watched queue to another, so the
+                // ledger's exactness turns on the hand-off having no window in which
+                // both stages claim it. It has none, and the reason is structural:
+                // teardown is synchronous and this daemon is single-threaded, so it
+                // can only interleave at an `.await`, and there are exactly two here.
+                // Suspended inside `src_tx.send`, the chunk is out of the channel
+                // queue and not yet in the merge queue, and `TargetwardInbox`'s `held`
+                // slot carries it. Suspended inside `rx.recv`, the chunk is in the
+                // merge queue and `held` was cleared — by `recv`'s own `settle_held`,
+                // which runs *before* it polls, with nothing awaiting in between. A
+                // failed `send` breaks with `held` still set and the chunk destroyed
+                // inside the `SendError`, which is the third exit and also counted
+                // once. (§5, notes §3.55's two-sided rule.)
                 while let Some(chunk) = rx.recv().await {
-                    if src_tx.send((ch.clone(), chunk)).await.is_err() {
+                    let item = FeedItem {
+                        channel: ch.clone(),
+                        bytes: chunk,
+                    };
+                    if src_tx.send(item).await.is_err() {
                         break;
                     }
                 }
@@ -363,7 +440,7 @@ impl ExecCodecNode {
                 argv: self.attrs.argv.clone(),
                 env: self.attrs.env.clone().into_iter().collect(),
                 backoff_ms: self.attrs.restart_backoff_ms,
-                src_rx,
+                src,
                 mux_edge,
                 channel_sinks,
                 channel_feeds,
@@ -432,21 +509,16 @@ impl ExecCodecNode {
             // Bytes that never reached the child because the envelope refused to
             // frame them (§5 all-loss-counted; unreachable for a sane channel id).
             "discarded_unframable": self.unframable_discarded.get(),
-            // A **floor, not a total**, and the one kind whose figure is (§5, §15.50,
-            // notes §3.31). What is watched is the host-facing per-channel queues the
-            // forwarders read from; those forwarders then push into `src_tx`, a second
-            // *internal* merged queue `pump_child` reads, and a chunk that has already
-            // moved into that stage is beyond this handle's reach. So a torn-down exec
-            // can destroy more than it reports — never less, which is the direction §5
-            // requires when a figure has to be inexact.
-            //
-            // Closing it no longer needs a new mechanism: since `serial` and `leg`
-            // adopted the ledger the inbox is generic over its item type (notes §3.55),
-            // so the merge queue needs only a `TeardownBytes` impl for its
-            // `(String, Chunk)` and the same `watch`/`drain` pair. What it needs is a
-            // guard, and the guard is the hard half — "a chunk is sitting in the merge
-            // queue" is not something an RPC ack can make true, so it wants a child
-            // that has stopped reading its stdin.
+            // A **total**, as of plan §18 item 21 — it was a floor until then, and the
+            // one kind whose figure was (§5, §15.50, notes §3.31/§3.55). Both watched
+            // stages are counted now: the host-facing per-channel queues the forwarders
+            // read from, and the *internal* merged queue they push into, which
+            // `pump_child` reads. The two remaining exclusions are deliberate and are
+            // not shortfalls in this figure: the merge queue's hostward half (charging
+            // it would report a hostward loss under a targetward name — [`FeedItem`]'s
+            // `TeardownBytes`), and bytes already written into the child's stdin pipe,
+            // which have left the daemon exactly as bytes written to a device fd have
+            // and are delivery, not loss.
             "discarded_at_teardown": self.teardown_loss.bytes(),
             "multiplexed": {
                 "dropped_slow_consumer": self.mux_counters.as_ref().map_or(0, |c| c.dropped_full()),
@@ -483,15 +555,27 @@ impl ExecCodecNode {
     /// Targetward bytes this node destroyed at teardown (§5, notes §3.31). `0` until
     /// `signal_stop` has run, which is where the queues are drained and counted.
     ///
-    /// **A floor, not a total — the one kind whose figure is** (§5, §15.50). The ledger
-    /// watches the host-facing per-channel queues; those forwarders push into `src_tx`,
-    /// a second *internal* merged queue `pump_child` reads, and a chunk already moved
-    /// into that stage is beyond this handle's reach. So a torn-down exec can destroy
-    /// more than it reports — never less, which is the direction §5 requires when a
-    /// figure has to be inexact. `state_extra` carries the same caveat at the wire
-    /// field, and `Node::discarded_at_teardown` carries it at the dispatch; it is
-    /// restated here because this is the method both of those call, and a reader who
-    /// arrives at it directly would otherwise take an exact number away.
+    /// **A total, since plan §18 item 21** — it was this daemon's one *floor* before
+    /// that (§5, §15.50, notes §3.55). The ledger watches both of the node's targetward
+    /// stages: the host-facing per-channel queues the forwarders read from, and the
+    /// internal merged queue they push into, which `pump_child` reads through the same
+    /// [`TargetwardInbox`] handle rather than owning a receiver of its own.
+    ///
+    /// Two things are outside it, both deliberately and neither a shortfall:
+    ///
+    /// * the merge queue's **hostward** half — items tagged with the reserved
+    ///   [`MUX_CHANNEL`] are the raw device stream on its way into the child, and
+    ///   charging them here would report a hostward loss under a targetward name
+    ///   ([`FeedItem`]'s [`TeardownBytes`], the same exclusion the leg's per-channel
+    ///   relay carries);
+    /// * bytes already written into the **child's stdin pipe**, which have left the
+    ///   daemon. The exec codec's obligation ends at the child's stdin exactly as a
+    ///   serial node's ends at the device fd, so those bytes are delivery, not loss.
+    ///
+    /// A conservation sum over `exec` is therefore `accepted == destroyed + written to
+    /// the child`, and the second term is unobservable from outside — which is why the
+    /// portable guard for this counter uses a graph where **no child can spawn**, so
+    /// that term is structurally zero and the law closes as an equality.
     pub fn discarded_at_teardown(&self) -> u64 {
         self.teardown_loss.bytes()
     }
@@ -501,7 +585,10 @@ struct SuperviseArgs {
     argv: Vec<String>,
     env: Vec<(String, String)>,
     backoff_ms: u64,
-    src_rx: mpsc::Receiver<(String, Chunk)>,
+    /// The merged stdin source, reached through the node's own handle so a teardown
+    /// can count what is queued in it (§5, §15.50). Not a bare `mpsc::Receiver`:
+    /// that form lived inside this future and died with it, uncounted.
+    src: TargetwardInbox<FeedItem>,
     mux_edge: SharedTargetEdge,
     channel_sinks: HashMap<String, SharedFanOut>,
     channel_feeds: HashMap<String, TapFeed>,
@@ -517,7 +604,7 @@ struct SuperviseArgs {
 /// Supervise the child: (re)spawn it, pump envelope frames both ways until it
 /// dies, then fault, back off, and restart (§7.6). The merged source and routing
 /// outputs persist across restarts, so a restarted child resumes cleanly.
-async fn supervise(mut a: SuperviseArgs) {
+async fn supervise(a: SuperviseArgs) {
     // Fixed restart backoff (§7.6): a constant wait between a crash and the respawn.
     let mut backoff = boundary::Backoff::fixed(a.backoff_ms);
     loop {
@@ -580,7 +667,7 @@ async fn supervise(mut a: SuperviseArgs) {
             unframable_discarded: &a.unframable_discarded,
             unconfigured: &a.unconfigured,
         };
-        let end = pump_child(stdin, stdout, stderr, &mut a.src_rx, &routing).await;
+        let end = pump_child(stdin, stdout, stderr, &a.src, &routing).await;
 
         let _ = child.kill().await;
         // No child again until the next successful spawn, so whatever status this
@@ -588,7 +675,8 @@ async fn supervise(mut a: SuperviseArgs) {
         a.child_live.set(false);
         match end {
             // The merged source closed: the node was torn down (its forwarders
-            // dropped their senders) or its upstream is gone. Stop; do not respawn.
+            // dropped their senders, or `signal_stop` took the queue out of the inbox
+            // to count it) or its upstream is gone. Stop; do not respawn.
             PumpEnd::SourceClosed => return,
             PumpEnd::ChildDied => {
                 a.restart_count.set(a.restart_count.get() + 1);
@@ -643,7 +731,7 @@ async fn pump_child(
     mut stdin: tokio::process::ChildStdin,
     mut stdout: tokio::process::ChildStdout,
     mut stderr: tokio::process::ChildStderr,
-    src_rx: &mut mpsc::Receiver<(String, Chunk)>,
+    src: &TargetwardInbox<FeedItem>,
     routing: &Routing<'_>,
 ) -> PumpEnd {
     // stdin: frame each tagged chunk and write it to the child. A chunk larger than
@@ -652,8 +740,17 @@ async fn pump_child(
     // is fragmented into consecutive data frames rather than dropped (the child
     // reassembles per channel), preserving §5's no-drop / all-loss-counted invariant
     // just as the leg does (§15.24).
+    //
+    // Receiving through the node's [`TargetwardInbox`] rather than through a borrowed
+    // `mpsc::Receiver` is what keeps the merge stage countable at teardown (§5,
+    // §15.50): the receiver never leaves the node's slot, and the chunk this loop is
+    // mid-way through framing is carried in the inbox's `held` slot, cleared by
+    // `recv`'s own `settle_held` at the one point the previous chunk's fate is
+    // settled. Lending the receiver out here — the shape that reads most naturally —
+    // is the defect notes §3.55 names: a `remove-node` landing on one of the awaits
+    // below would find an empty slot and charge `0`.
     let feed = async {
-        while let Some((channel, bytes)) = src_rx.recv().await {
+        while let Some(FeedItem { channel, bytes }) = src.recv().await {
             for item in data_frames(channel.as_str(), &bytes) {
                 match item {
                     DataFrame::Piece(_len, frame) => {
@@ -1098,6 +1195,52 @@ mod tests {
             u.report_into(&mut obj);
             assert_eq!(obj["unconfigured_channels"], json!(["gps"]));
         });
+    }
+
+    /// Plan §18 item 21's discrimination rule, at the one place it is written: the
+    /// merge queue carries **both** directions, and only its targetward half is
+    /// teardown loss (§5, §15.50).
+    ///
+    /// This is not a restatement of the impl for its own sake. The obvious way to make
+    /// `exec`'s figure a total — the one notes §3.55 sketched, a `TeardownBytes` on the
+    /// bare `(String, Chunk)` — charges everything in the queue, and *half* of that
+    /// queue is the raw device stream on its way into the child (§15.22's reserved
+    /// identity). A daemon that did that would answer a `remove-node` with a
+    /// `discarded_at_teardown` inflated by hostward bytes: a targetward name over a
+    /// hostward loss, which is the exact confusion the leg's per-channel relay is
+    /// excluded from the ledger to avoid. So the rule needs a guard of its own, and it
+    /// cannot be an integration test — the two halves are indistinguishable in the
+    /// reply, which is precisely why getting them wrong would be invisible.
+    #[test]
+    fn only_the_targetward_half_of_the_merge_queue_is_teardown_loss() {
+        let targetward = FeedItem {
+            channel: "c0".to_owned(),
+            bytes: Chunk::from_static(b"a channel's write, device-bound"),
+        };
+        assert_eq!(
+            targetward.teardown_bytes(),
+            31,
+            "a channel's targetward write is exactly what this counter names"
+        );
+
+        let hostward = FeedItem {
+            channel: MUX_CHANNEL.to_owned(),
+            bytes: Chunk::from_static(b"raw device bytes on their way into the child"),
+        };
+        assert_eq!(
+            hostward.teardown_bytes(),
+            0,
+            "the reserved multiplexed identity is the HOSTWARD device stream (§15.22); \
+             charging it here reports a hostward loss under a targetward name"
+        );
+
+        // The rule keys on the identity, not on emptiness: an empty targetward chunk
+        // still answers 0, and that must not be read as the mux arm working.
+        let empty = FeedItem {
+            channel: "c0".to_owned(),
+            bytes: Chunk::from_static(b""),
+        };
+        assert_eq!(empty.teardown_bytes(), 0);
     }
 
     /// The node fixture for the status tests: an exec codec built straight from a

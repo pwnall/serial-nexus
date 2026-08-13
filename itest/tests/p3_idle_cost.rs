@@ -1,17 +1,18 @@
 #![forbid(unsafe_code)]
 
 //! Phase 3's **idle-cost exit criterion**, made executable again (plan §Phase 3 item
-//! 6; design §15.18/§15.19).
+//! 6; design §15.18/§15.19) — and, since plan §18 item 46, read as a *marginal*
+//! per-fd cost rather than an absolute total.
 //!
 //! The phase-3 benchmark had two axes and `docs/benchmarks/phase3.json` still records
 //! both: throughput (183 MiB/s against a 30 MiB/s headroom target) and idle cost
-//! (**total daemon CPU with 32 idle tty fds**, under a stated budget). The §16.11
-//! migration folded the shell benchmarks into Rust — but only the throughput half
-//! travelled. The idle half lost its producer with the script, so the recorded
-//! `idle_cost` block became a number nothing regenerates and nothing checks (review 37,
-//! 37-TEST-3), while the mechanism underneath it — the `ACTIVE_POLL`→`IDLE_POLL`
-//! adaptive backoff that §15.19 measured at ~0.06 % of a core per polled fd — went back
-//! to being upheld by review.
+//! (daemon CPU with idle tty fds, under a stated budget). The §16.11 migration folded
+//! the shell benchmarks into Rust — but only the throughput half travelled. The idle
+//! half lost its producer with the script, so the recorded `idle_cost` block became a
+//! number nothing regenerates and nothing checks (review 37, 37-TEST-3), while the
+//! mechanism underneath it — the `ACTIVE_POLL`→`IDLE_POLL` adaptive backoff that
+//! §15.19 measured at ~0.06 % of a core per polled fd — went back to being upheld by
+//! review.
 //!
 //! That mechanism is exactly the kind that regresses silently: deleting the backoff
 //! leaves every functional test green (readiness is still correct, just re-checked
@@ -20,21 +21,58 @@
 //! the sim doubles (`p12_sim_idle_cpu`) exists for the same reason and reads its CPU
 //! the same way.
 //!
-//! **The fd count and both ceilings are derived from `docs/benchmarks/phase3.json`**,
-//! not restated here. That artifact is the recorded exit criterion; a guard that copied
-//! the numbers would let the two drift, which is how the axis came to have no
-//! executable meaning in the first place. Two ceilings, because the recorded 20 %
-//! *budget* is a design-decision trigger rather than a regression detector — a wholly
-//! deleted `back_off` measures about 5 % here and would sail through it. The second is
-//! a multiple of the recorded 2 %; its derivation and the measurements behind it are in
-//! `DRIFT_FACTOR`.
+//! # Two rungs in one process, because the fixed cost is not the mechanism's
 //!
-//! What this establishes, and what it does not: it measures the shipped daemon's idle
-//! cost at the recorded fd count, so it catches a deleted or weakened backoff (proved
-//! fail-first by neutering `back_off`). It cannot attribute a *passing* figure to that
-//! specific mechanism — any other change that made an idle poll cheap would also pass —
-//! and a ceiling is not a proof of sleeping. Linux-only: per-process CPU sampling needs
-//! `/proc/<pid>/stat`, and there is no portable analogue (the same skip
+//! An idle daemon's CPU is a fixed term plus a per-fd term, and only the second is
+//! the one the backoff controls. `total_cpu_percent` in the artifact is a single
+//! total at 32 fds with no baseline rung, so it cannot be decomposed — and a ceiling
+//! derived from it is dominated by a term the mechanism under test does not touch.
+//! Measured (the sweep is tabulated at [`DRIFT_FACTOR`]): the fixed term on a 20-core
+//! box is **1.194 %** of a core against a **0.0728 %/fd** slope, so at 32 fds the
+//! fixed half is a third of the total and the old ceiling — 1.75× the artifact's
+//! 2.00 %, i.e. 3.50 % — sat barely above that box's healthy 3.3–3.6 % reading. It
+//! fired, repeatedly, with the backoff measurably intact (plan §18 item 46). The
+//! eleven-run validation sweep at [`DRIFT_FACTOR`], on that box at loads from 1.4 to
+//! 12.7, read 3.30–4.30 % of a core in total: **nine of the eleven are past the old
+//! 3.50 % ceiling on a tree whose `back_off` is the shipped one**, and all eleven are
+//! inside the marginal ceiling that replaced it.
+//!
+//! So the guard measures **two rungs and takes their difference**: a baseline count of
+//! idle fds, then the recorded count, with `(full − baseline) / (fds − baseline)` the
+//! marginal cost of one idle fd. Both rungs run in **one daemon process**, grown from
+//! the baseline with `add-node` (§11), which makes the fixed term identical by
+//! construction rather than merely similar — two daemons would differ by whatever the
+//! box did between the two starts, which is the whole quantity being cancelled.
+//!
+//! # What this changes about coverage, said rather than hidden
+//!
+//! A regression that inflates the daemon's **fixed** cost without scaling per fd — a
+//! control loop that stopped sleeping, a timer that stopped coalescing — used to be
+//! caught incidentally by the absolute ceiling and is now caught only by assertion
+//! (1), the recorded 20 % budget, which is far looser. That is a real loss of
+//! sensitivity, and it is the right trade: the absolute form could not tell that class
+//! of regression from *a different box*, which is exactly how it came to redden on
+//! this one over a 1.19 % fixed cost while the mechanism it names in its own failure
+//! message was intact. A tripwire that fires for the machine it runs on teaches its
+//! readers to raise it, and item 46 explicitly declines raising it. Recovering the
+//! lost sensitivity honestly needs a recorded *fixed-cost* figure with an era of its
+//! own — a `baseline_cpu_percent` beside the per-fd one, measured across more than one
+//! box — which is a measurement nobody has taken, not a number to invent here.
+//!
+//! **The two fd counts, the budget and the per-fd figure are all derived from
+//! `docs/benchmarks/phase3.json`**, not restated here. That artifact is the recorded
+//! exit criterion; a guard that copied the numbers would let the two drift, which is
+//! how the axis came to have no executable meaning in the first place. Two ceilings,
+//! because the recorded 20 % *budget* is a design-decision trigger rather than a
+//! regression detector — a wholly deleted `back_off` measures about 10 % at 32 fds
+//! here and would sail through it.
+//!
+//! What this establishes, and what it does not: it measures the shipped daemon's
+//! marginal cost per idle polled fd, so it catches a deleted or weakened backoff
+//! (proved fail-first by neutering `back_off`). It cannot attribute a *passing* figure
+//! to that specific mechanism — any other change that made an idle poll cheap would
+//! also pass — and a ceiling is not a proof of sleeping. Linux-only: per-process CPU
+//! sampling needs `/proc/<pid>/stat`, and there is no portable analogue (the same skip
 //! `p9_pty_collapse` and `p12_sim_idle_cpu` take).
 
 #[cfg(target_os = "linux")]
@@ -45,38 +83,84 @@ mod linux_impl {
     use serde_json::Value;
     use serial_nexus_itest::{Daemon, cpu_ticks, wait_until};
 
-    /// The measurement window. Ticks are USER_HZ (100/s on Linux), so a whole core is
-    /// 1000 of them here and the recorded 2 % is 20 — enough resolution that the
-    /// healthy reading reproduces to within one tick run to run (see [`DRIFT_FACTOR`]),
-    /// which a shorter window did not give.
+    /// The measurement window, per rung. Ticks are USER_HZ (100/s on Linux), so a
+    /// whole core is 1000 of them here and one tick is 0.1 % — at the sweep's 24-fd
+    /// span that is 0.004 %/fd of quantization against a 0.127 %/fd ceiling, which a
+    /// shorter window did not give. Two rungs, so the test spends 2×`WINDOW` asleep.
     const WINDOW: Duration = Duration::from_secs(10);
 
-    /// The drift tripwire, as a multiple of the artifact's own recorded figure.
+    /// The drift tripwire, as a multiple of the artifact's recorded **per-fd** figure.
     ///
     /// Two ceilings, because the recorded **budget** and the regression this axis
     /// protects are two different sizes. The 20 % budget is a design-decision trigger —
     /// plan §Phase 3 item 6 spends it on selecting a §15.18 escape hatch — and it is far
     /// too loose to notice a lost backoff: with `back_off` neutered the daemon re-polls
-    /// every idle fd at `ACTIVE_POLL` and lands around 5 %, comfortably inside 20 %.
+    /// every idle fd at `ACTIVE_POLL` and lands around 10 % at 32 fds, inside 20 %.
     ///
-    /// Measured before choosing the number (AGENTS §8), on a quiet 8-core box (load
-    /// 0.2–0.8), 10 s window, 32 fds — four healthy runs against three with `back_off`
-    /// neutered in place:
+    /// Measured before choosing the number (AGENTS §8), on a 20-core box (Linux
+    /// 7.0.0-29-generic, tree at `e135b53`, 2026-08-12, load between 1.0 and 2.5 at
+    /// every sample), 10 s window — three samples per rung healthy, two per rung with
+    /// `back_off`'s body replaced by `let _ = wait;` and the workspace rebuilt:
     ///
-    /// * healthy: 20, 21, 21, 21 ticks (2.00–2.10 %) — the artifact's 2 %, reproduced;
-    /// * `back_off` deleted: 46, 49, 51 ticks (4.60–5.10 %).
+    /// | idle fds | healthy, % of a core | `back_off` neutered |
+    /// | --- | --- | --- |
+    /// | 1  | 1.30 1.10 1.20 | — |
+    /// | 2  | 1.40 1.20 1.40 | — |
+    /// | 8  | 1.90 1.70 1.80 | 4.80 5.20 |
+    /// | 16 | 2.30 2.40 2.70 | 7.10 6.50 |
+    /// | 32 | 3.60 3.30 3.50 | 9.80 9.90 |
     ///
-    /// 1.75× the recorded figure is 3.5 %: 1.67× above the worst healthy reading and
-    /// below every regression reading. Deliberately not tighter — the failure it exists
-    /// for is 2.3× away, not two ticks, and a gate that flakes gets deleted rather than
-    /// fixed.
+    /// Least squares over the fifteen healthy points: **0.0728 %/fd** with a **1.194 %**
+    /// intercept. Over the six neutered points: **0.2004 %/fd** with a 3.476 %
+    /// intercept. The slopes separate by **2.75×** — and the healthy one reproduces
+    /// §15.19's recorded ~0.06 %/fd within 20 %, which is the finding item 46 asked
+    /// for: the backoff has *not* regressed, so the first disposition this test's own
+    /// failure message names is refuted by measurement. What had moved is the fixed
+    /// term, which the artifact never recorded separately.
+    ///
+    /// 1.75 × the recorded 0.0728 %/fd is **0.127 %/fd**: by construction 1.75× above
+    /// the healthy slope, and 1.57× below the neutered one (0.2004 / 0.127 = 1.57). The
+    /// two-rung difference this guard actually computes reads a little under the fit —
+    /// (3.467 − 1.800) / 24 = 0.069 %/fd healthy, (9.850 − 5.000) / 24 = 0.202 %/fd
+    /// neutered — so the ceiling sits 1.84× above the healthy reading and 1.59× below
+    /// the regression it exists for.
+    ///
+    /// The factor is unchanged at 1.75 from the derivation it replaces (an 8-core box's
+    /// *absolute* readings: 2.00–2.10 % healthy against 4.60–5.10 % neutered, a 2.4×
+    /// separation) — what changed is the figure it multiplies, not the multiplier.
+    /// Deliberately not tighter: the two separations agree within 15 % across two
+    /// unrelated boxes, the failure this exists for is 2.75× away rather than two
+    /// ticks, and a gate that flakes gets deleted rather than fixed — which is the
+    /// report item 46 opened with.
+    ///
+    /// Validated by running *this* guard rather than by arithmetic alone — a sweep of
+    /// eleven healthy runs on the same box at loads from 1.4 to 12.7, reading 0.0542
+    /// 0.0625 0.0667 0.0750 0.0792 0.0792 0.0792 0.0833 0.0833 0.0875 0.0958 %/fd (mean
+    /// 0.077, and the *difference* the guard takes has a standard deviation of 2.8
+    /// ticks, so the ceiling sits 4.3σ out), against three neutered runs reading 0.1542
+    /// 0.2375 0.2500 %/fd. Both arms are one-sided in the same direction, which is why
+    /// the ceiling sits nearer the healthy arm than the midpoint: 1.33× above the worst
+    /// healthy reading, 1.21× below the best neutered one. The noisier arm is the
+    /// neutered one, because
+    /// a `back_off` that never backs off is *scheduler-limited* — under load it burns
+    /// less, not more — so a busy box compresses the separation from above while
+    /// leaving the healthy arm where it was.
     const DRIFT_FACTOR: f64 = 1.75;
 
     /// The recorded phase-3 exit criterion.
     pub struct IdleCriterion {
+        /// The rung the recorded figures are stated at (`idle_tty_fds`).
         pub fds: usize,
+        /// The rung the marginal cost is measured *from* (`baseline_tty_fds`).
+        pub baseline_fds: usize,
         pub budget_percent: f64,
-        pub recorded_percent: f64,
+        /// The recorded marginal cost of one idle tty fd, in percent of one core.
+        pub recorded_per_fd_percent: f64,
+        /// The original benchmark's single-rung total at `fds`, kept as the record it
+        /// is. Nothing derives a ceiling from it any more (see the module doc); it is
+        /// still printed and still checked against the budget for internal
+        /// consistency.
+        pub historical_total_percent: f64,
     }
 
     /// Read the `idle_cost` axis from `docs/benchmarks/phase3.json`.
@@ -102,47 +186,167 @@ mod linux_impl {
         };
         let c = IdleCriterion {
             fds: num("idle_tty_fds") as usize,
+            baseline_fds: num("baseline_tty_fds") as usize,
             budget_percent: num("budget_percent"),
-            recorded_percent: num("total_cpu_percent"),
+            recorded_per_fd_percent: num("per_fd_cpu_percent"),
+            historical_total_percent: num("total_cpu_percent"),
         };
         // The artifact must be internally consistent, or the budget below is being
         // read from a record that already fails its own criterion.
         assert!(
-            c.fds > 0 && c.recorded_percent <= c.budget_percent,
+            c.fds > 0 && c.historical_total_percent <= c.budget_percent,
             "docs/benchmarks/phase3.json records {} % at {} idle fds against a {} % \
              budget — the recorded run does not meet the recorded criterion",
-            c.recorded_percent,
+            c.historical_total_percent,
             c.fds,
             c.budget_percent
+        );
+        // And the two rungs must actually be two rungs, in that order, with a positive
+        // recorded slope between them: a baseline at or above the recorded count makes
+        // the marginal cost a division by zero or a sign flip, and a zero recorded
+        // per-fd figure makes the drift ceiling zero — which no daemon can meet, so
+        // the guard would fail for the artifact's reasons rather than the tree's.
+        assert!(
+            c.baseline_fds > 0 && c.baseline_fds < c.fds && c.recorded_per_fd_percent > 0.0,
+            "docs/benchmarks/phase3.json records a baseline of {} fds against {} \
+             recorded fds at {} %/fd — the marginal cost needs 0 < baseline < recorded \
+             and a positive per-fd figure",
+            c.baseline_fds,
+            c.fds,
+            c.recorded_per_fd_percent
         );
         c
     }
 
-    /// A graph of `n` idle `pty` nodes — `n` tty masters the daemon polls with nothing
-    /// ever arriving on them, which is precisely the phase-3 idle shape. No edges: a
-    /// target-facing peer would be a serial device, and the axis is about the polling
-    /// cost of the fds themselves.
+    /// One `[[node]]` block for idle pty number `i` — a tty master the daemon polls
+    /// with nothing ever arriving on it, which is precisely the phase-3 idle shape. No
+    /// edges: a target-facing peer would be a serial device, and the axis is about the
+    /// polling cost of the fds themselves.
+    fn node_toml(run: &Path, i: usize) -> String {
+        format!(
+            "[[node]]\ntype = \"pty\"\nname = \"con{i}\"\npath = \"{}\"\n",
+            run.join(format!("con{i}")).display()
+        )
+    }
+
+    /// The baseline rung as one `load` config.
     fn cfg(run: &Path, n: usize) -> String {
-        let mut s = String::new();
-        for i in 0..n {
-            s.push_str(&format!(
-                "[[node]]\ntype = \"pty\"\nname = \"con{i}\"\npath = \"{}\"\n",
-                run.join(format!("con{i}")).display()
-            ));
-        }
-        s
+        (0..n).map(|i| node_toml(run, i)).collect()
     }
 
     pub fn run(c: IdleCriterion) {
         let d = Daemon::start();
         let rpc = d.rpc();
-        rpc.load_toml(&cfg(d.run().path(), c.fds), false)
-            .expect("load the idle pty graph");
+        rpc.load_toml(&cfg(d.run().path(), c.baseline_fds), false)
+            .expect("load the baseline idle pty graph");
+        settled(&d, c.baseline_fds);
 
-        // Every fd must actually be open before the window starts: a node still
-        // faulting or still coming up is an fd nobody is polling, and the measurement
-        // would report the backoff working on a graph that is not there.
+        let pid = d.pid();
+        let base_ticks = sample(pid);
+
+        // Grow the *same* process to the recorded rung, one `add-node` at a time (§11).
+        // This is the point of the whole shape: the fixed term measured in `base_ticks`
+        // is this daemon's, on this box, at this instant, so subtracting it leaves the
+        // per-fd term and nothing else. `load` cannot do this — it is refused on a
+        // non-empty graph unless `replace` is set, and `replace` composes a teardown,
+        // which would put the baseline fds back on the wrong side of the measurement.
+        for i in c.baseline_fds..c.fds {
+            rpc.add_node_toml(&node_toml(d.run().path(), i))
+                .unwrap_or_else(|e| panic!("add-node con{i}: {e:?}"));
+        }
+        settled(&d, c.fds);
+
+        let full_ticks = sample(pid);
+
+        // USER_HZ is 100/s on Linux, so `ticks / window_seconds` is percent of one core.
+        let pct = |ticks: u64| ticks as f64 / WINDOW.as_secs_f64();
+        let (base_percent, full_percent) = (pct(base_ticks), pct(full_ticks));
+        // The marginal cost of one idle fd, with the box's fixed cost differenced out.
+        // Clamped at zero rather than signed: a `full` below `base` is a quiet box
+        // drifting by a tick or two, and a negative slope has no meaning to report.
+        let marginal = (full_percent - base_percent).max(0.0) / (c.fds - c.baseline_fds) as f64;
+        eprintln!(
+            "p3_idle_cost: {base_ticks} ticks at {} idle tty fds = {base_percent:.2} %, \
+             {full_ticks} ticks at {} = {full_percent:.2} % (each over {WINDOW:?}, one \
+             daemon) -> {marginal:.4} %/fd marginal (recorded {} %/fd, ceiling \
+             {:.4} %/fd; budget {} % of a core)",
+            c.baseline_fds,
+            c.fds,
+            c.recorded_per_fd_percent,
+            c.recorded_per_fd_percent * DRIFT_FACTOR,
+            c.budget_percent
+        );
+
+        // (1) The recorded exit criterion itself.
+        assert!(
+            full_percent <= c.budget_percent,
+            "the daemon burned {full_percent:.2} % of a core over {WINDOW:?} with {} idle \
+             tty fds, above the {} % budget recorded in docs/benchmarks/phase3.json \
+             (that run measured {} %). Per plan §Phase 3 item 6, exceeding this budget \
+             selects a §15.18 escape hatch — adaptive backoff or `spawn_blocking` \
+             readers — as a phase task, never a return to epoll (invariant 1).",
+            c.fds,
+            c.budget_percent,
+            c.historical_total_percent
+        );
+
+        // (2) The drift tripwire, which is what actually notices a weakened backoff —
+        //     the budget above is a decision trigger and would not. It reads the
+        //     *marginal* cost, because that is the quantity §15.19 promises and the
+        //     only one the backoff controls; the box's fixed cost is differenced out
+        //     above and is deliberately not asserted (module doc, coverage).
+        let drift = c.recorded_per_fd_percent * DRIFT_FACTOR;
+        assert!(
+            marginal <= drift,
+            "one idle tty fd cost {marginal:.4} % of a core here — measured as \
+             ({full_percent:.2} % at {} fds − {base_percent:.2} % at {} fds) / {}, in \
+             one daemon process so the fixed cost cancels — past the {drift:.4} %/fd \
+             ceiling ({DRIFT_FACTOR}× the {} %/fd docs/benchmarks/phase3.json records). \
+             The ACTIVE_POLL->IDLE_POLL backoff is what holds this number down \
+             (§15.18/§15.19, ~0.06 % per polled fd): check `back_off` and the boundary \
+             waits that reset and grow their readiness interval. A neutered `back_off` \
+             measures about 0.20 %/fd. If the cost is genuinely higher now and that is \
+             intended, re-measure and update the artifact's per_fd_cpu_percent and its \
+             provenance block — it is the record this ceiling is derived from, and it \
+             carries its box and its date for exactly this conversation.",
+            c.fds,
+            c.baseline_fds,
+            c.fds - c.baseline_fds,
+            c.recorded_per_fd_percent
+        );
+
+        // Non-vacuity: a daemon that had died, or whose nodes had faulted out from
+        // under either window, would score beautifully. The fds must still be there.
         for i in 0..c.fds {
+            let name = format!("con{i}");
+            assert_eq!(
+                rpc.node_status(&name),
+                "active",
+                "{name} did not survive the idle windows — the readings above were \
+                 measured against fewer than {} fds",
+                c.fds
+            );
+        }
+    }
+
+    /// Sample the daemon's CPU across one [`WINDOW`], in USER_HZ ticks.
+    fn sample(pid: u32) -> u64 {
+        let before = cpu_ticks(pid);
+        // A *measurement window*, not a readiness wait: the claim under test is how
+        // little CPU passes while nothing happens, so the window has to elapse.
+        std::thread::sleep(WINDOW);
+        cpu_ticks(pid).saturating_sub(before)
+    }
+
+    /// Every one of the first `n` fds must actually be open before a window starts: a
+    /// node still faulting or still coming up is an fd nobody is polling, and the
+    /// measurement would report the backoff working on a graph that is not there. Run
+    /// before *both* rungs — the grown half needs it as much as the loaded half, and a
+    /// baseline taken while the recorded rung's nodes were still arriving would carry
+    /// their startup cost into the term that gets subtracted.
+    fn settled(d: &Daemon, n: usize) {
+        let rpc = d.rpc();
+        for i in 0..n {
             let name = format!("con{i}");
             assert!(
                 rpc.wait_status(&name, "active", Duration::from_secs(30)),
@@ -156,67 +360,15 @@ mod linux_impl {
                 link.display()
             );
         }
-
-        let pid = d.pid();
-        let before = cpu_ticks(pid);
-        // A *measurement window*, not a readiness wait: the claim under test is how
-        // little CPU passes while nothing happens, so the window has to elapse.
-        std::thread::sleep(WINDOW);
-        let spent = cpu_ticks(pid).saturating_sub(before);
-
-        // USER_HZ is 100/s on Linux, so `spent / window_seconds` is percent of one core.
-        let percent = spent as f64 / WINDOW.as_secs_f64();
-        eprintln!(
-            "p3_idle_cost: {spent} ticks over {WINDOW:?} at {} idle tty fds = {percent:.2} % \
-             of a core (budget {} %, recorded {} %)",
-            c.fds, c.budget_percent, c.recorded_percent
-        );
-        // (1) The recorded exit criterion itself.
-        assert!(
-            percent <= c.budget_percent,
-            "the daemon burned {percent:.2} % of a core over {WINDOW:?} with {} idle \
-             tty fds, above the {} % budget recorded in docs/benchmarks/phase3.json \
-             (that run measured {} %). Per plan §Phase 3 item 6, exceeding this budget \
-             selects a §15.18 escape hatch — adaptive backoff or `spawn_blocking` \
-             readers — as a phase task, never a return to epoll (invariant 1).",
-            c.fds,
-            c.budget_percent,
-            c.recorded_percent
-        );
-
-        // (2) The tighter drift tripwire, which is what actually notices a weakened
-        //     backoff — the budget above is a decision trigger and would not.
-        let drift = c.recorded_percent * DRIFT_FACTOR;
-        assert!(
-            percent <= drift,
-            "the daemon burned {percent:.2} % of a core over {WINDOW:?} with {} idle \
-             tty fds — inside the {} % budget, but past {drift:.2} % ({DRIFT_FACTOR}× \
-             the {} % docs/benchmarks/phase3.json recorded). The ACTIVE_POLL->IDLE_POLL \
-             backoff is what holds this number down (§15.18/§15.19, ~0.06 % per polled \
-             fd): check `back_off` and the boundary waits that reset and grow their \
-             readiness interval. If the cost is genuinely higher now and that is \
-             intended, re-measure and update the artifact — it is the record this \
-             ceiling is derived from.",
-            c.fds,
-            c.budget_percent,
-            c.recorded_percent
-        );
-
-        // Non-vacuity: a daemon that had died, or whose nodes had faulted out from
-        // under the window, would score beautifully. The fds must still be there.
-        for i in 0..c.fds {
-            let name = format!("con{i}");
-            assert_eq!(
-                rpc.node_status(&name),
-                "active",
-                "{name} did not survive the idle window — the budget above was \
-                 measured against fewer than {} fds",
-                c.fds
-            );
-        }
     }
 }
 
+/// The name is kept verbatim across item 46's rework, deliberately: it names assertion
+/// (1), which is unchanged — thirty-two idle tty fds do still have to stay under the
+/// recorded budget — and it is the identifier the plan's Status rows and AGENTS §2 quote
+/// when they record this guard's readings. Renaming it would invalidate those records to
+/// describe an assertion the name never covered in the first place (the drift tripwire
+/// was always the second one).
 #[test]
 fn thirty_two_idle_tty_fds_stay_under_the_recorded_cpu_budget() {
     #[cfg(target_os = "linux")]

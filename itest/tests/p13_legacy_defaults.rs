@@ -12,7 +12,7 @@
 //! built by `add-node`/`connect` since the last `load` — the exact loss the snapshot
 //! exists to prevent, delivered by a rename.
 //!
-//! Four properties, one per test:
+//! Five properties, one per test:
 //!
 //! 1. a legacy snapshot beside a default socket is adopted, and the next mutation
 //!    rewrites under the *current* name while the legacy file is left untouched;
@@ -20,17 +20,29 @@
 //!    where the rename moved the snapshot's *directory* rather than its name;
 //! 3. a client with no `--socket` finds a pre-rename daemon's socket;
 //! 4. …but only when there is no current one — a live daemon is never passed over in
-//!    favour of a stale socket from an older release.
+//!    favour of a stale socket from an older release;
+//! 5. and the *other* client — the web console — takes the same fallback, because the
+//!    two clients resolve through one implementation and a browser and a terminal
+//!    pointed at one machine must reach one daemon.
 //!
 //! Fail-first (plan §3 rule 4): tests 1 and 2 were proved against the unfixed tree by
 //! reverting the adoption block in `daemon/src/lib.rs` in place — each fails with an
-//! empty graph, which is precisely the defect. Tests 3 and 4 fail the same way with the
-//! fallback removed from `ctl`'s `resolve_socket`.
+//! empty graph, which is precisely the defect. Tests 3, 4 and 5 fail the same way with
+//! the fallback removed from `serial_nexus_rpc::resolve_client_socket` — which is where
+//! the policy lives since plan §18 item 51 hoisted it out of `ctl` and the web console,
+//! whose copies were byte-duplicates of each other; test 5 was additionally proved by
+//! re-pointing `serial-nexus-web` at `default_socket_path`, the one-word slip the hoist
+//! makes possible. These three stay *end to end* for the reason rule 4 gives: the unit
+//! tests beside that function assert the policy, and only a real client process with no
+//! `--socket` asserts that the shipped binary is wired to it.
 //!
 //! When the window closes, this file and `serial_nexus_rpc::LEGACY_DAEMON_NAME` are
 //! deleted together, and the `meta_names` allowance that names them both goes with them.
 
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use serial_nexus_itest::{Rpc, TempRun, bin, daemon_answers, wait_until};
@@ -337,5 +349,90 @@ fn a_current_socket_wins_over_a_stale_pre_rename_one() {
         names,
         vec!["live"],
         "the CLI reached the wrong daemon: {state}"
+    );
+}
+
+/// The control socket `serial-nexus-web` resolved under `XDG_RUNTIME_DIR = run`, read
+/// from the line it logs before it binds anything.
+///
+/// The observation is the console's *own* report of the `PathBuf` it hands
+/// `ServerConfig` — the socket its bridge dials, not a re-derivation of it. Reading it
+/// from a failed upgrade's 503 body was rejected when `p12_web_socket_default` first
+/// needed this, and for a reason that applies here too: that body only names the path
+/// when nothing is listening at it, and this fixture has a daemon listening on purpose.
+///
+/// `--bind 127.0.0.1:0` so the test never competes for a port, a pinned `--token`
+/// because nothing connects, and `RUST_LOG=info` so a developer's own filter cannot
+/// decide whether this guard can see the line.
+fn web_resolved_socket(run: &TempRun) -> PathBuf {
+    const MARKER: &str = "daemon control socket: ";
+    let mut child = Command::new(bin("serial-nexus-web"))
+        .args([
+            "--bind",
+            "127.0.0.1:0",
+            "--token",
+            "0123456789abcdef0123456789abcdef",
+        ])
+        .env("XDG_RUNTIME_DIR", run.path())
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn serial-nexus-web");
+
+    // Drained on a thread: the server is long-lived, and its stdout must not be left to
+    // fill a pipe buffer while this thread blocks on a line that already arrived.
+    let stdout = child.stdout.take().expect("piped serial-nexus-web stdout");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(i) = line.find(MARKER) {
+                let _ = tx.send(line[i + MARKER.len()..].trim().to_owned());
+                return;
+            }
+        }
+    });
+    let found = rx.recv_timeout(Duration::from_secs(20));
+    let _ = child.kill();
+    let _ = child.wait();
+    PathBuf::from(found.expect(
+        "serial-nexus-web never named the control socket it resolved (looked for \
+         \"daemon control socket: \" on stdout)",
+    ))
+}
+
+/// **The web console falls back too** — the other client of the same policy.
+///
+/// Tests 3 and 4 exercise `ctl`, and until plan §18 item 51 that was all they could
+/// exercise: the console carried its *own* byte-duplicate copy of the fallback, so a
+/// green `ctl` said nothing about the browser. Now there is one implementation and this
+/// test asserts the half that a shared implementation does not give for free — that the
+/// shipped `serial-nexus-web` is *wired* to it. Re-pointing that one call at
+/// `default_socket_path` compiles, passes every other test in the tree, and silently
+/// leaves the console reporting every port unreachable on exactly the machines the
+/// window exists for.
+///
+/// The daemon here is a real pre-rename one rather than a bare inode, so the path being
+/// compared is a socket something is actually listening on.
+#[test]
+fn the_web_console_falls_back_to_the_pre_rename_socket_when_there_is_no_current_one() {
+    let run = TempRun::new();
+    let legacy_sock = run.join(&format!("{LEGACY}.sock"));
+    let (_d, _rpc) = spawn(
+        &run,
+        &format!("{LEGACY}.sock"),
+        &["--socket", legacy_sock.to_str().unwrap()],
+    );
+    assert!(
+        !run.join(&format!("{CURRENT}.sock")).exists(),
+        "no current-name socket should exist in this fixture"
+    );
+
+    assert_eq!(
+        web_resolved_socket(&run),
+        legacy_sock,
+        "the web console resolved a different socket than the pre-rename daemon running \
+         beside it, which `serial-nexus-ctl` reaches in the same environment (test 3). \
+         A browser and a terminal pointed at one machine must reach one daemon."
     );
 }

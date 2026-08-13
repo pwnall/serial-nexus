@@ -136,7 +136,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         Some(t) => t,
         None => new_token(),
     };
-    let socket = serial_nexus_web::resolve_socket(args.socket);
+    // `--socket` when given, else §10's default with the §17.3 rename-window fallback —
+    // resolved by `serial_nexus_rpc`, the same call `ctl` makes, so a browser and a
+    // terminal pointed at this machine always reach the same daemon. This console used
+    // to answer it from its own module, whose two copies (the path policy and the
+    // window) are both why that module is gone (plan §18 item 51, notes §3.72/§3.75).
+    let socket = serial_nexus_rpc::resolve_client_socket(args.socket);
     // The resolved socket is **printed, not described** (notes §3.72). §10's default is
     // a three-arm policy — root, `XDG_RUNTIME_DIR`, per-uid `/tmp` — and the one failure
     // it can produce is a console looking where the daemon did not bind, which the

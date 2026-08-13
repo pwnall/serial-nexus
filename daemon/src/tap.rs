@@ -394,8 +394,14 @@ struct Tap {
 }
 
 /// A bounded ring of the most recent hostward bytes on a host-facing endpoint
-/// (design §5 replay ring). `cap == 0` means no ring (the default), and no bytes
-/// are ever stored.
+/// (design §5 replay ring). The ring is **on by default** — `replay_ring` defaults to
+/// [`serial_nexus_core::config::DEFAULT_REPLAY_RING`] (64 KiB) on every host-facing
+/// endpoint, `0` opts out (§15.32). `cap == 0` is a defensive branch and nothing more:
+/// [`TapHub::new`] builds the ring as `(ring_cap > 0).then(...)`, so a zero-cap
+/// `ReplayRing` is never constructed. *(This paragraph said `cap == 0` was "the
+/// default" until 2026-08-12 — true in the opt-in era, and left behind when §15.32
+/// flipped the ring on. The paragraph below it had already been rewritten for the new
+/// default, so one comment carried both answers.)*
 ///
 /// Backed by a fixed circular `Vec<u8>` (lazily allocated to `cap` on first use), so
 /// `push` is at most two `copy_from_slice`s — O(bytes) with **bulk** memcpy, never the

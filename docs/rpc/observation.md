@@ -774,7 +774,7 @@ telling a timeout from a teardown. This verb is those rules written once.
 | `patterns` | array | 1 to 8 [pattern objects](#pattern-objects); the first to appear wins |
 | `timeout_ms` | integer | **required** — give up after this long. Maximum 3600000. Required rather than optional because a wait holds this connection's one waiting slot until it settles, and because a deadline that was never stated cannot be reported as one |
 | `replay` | bool | *optional*, default `false` — scan the endpoint's replay ring (§5) before arming on the live stream, so a pattern that appeared just **before** this call still matches |
-| `lookback` | integer | *optional*, default 4096, maximum 65536 — how many bytes of already-seen stream a match may span |
+| `lookback` | integer | *optional*, default 4096, maximum 65536 — how many bytes of already-seen stream a match may span. There is also a **floor**, and it is not a constant: the window must be at least as long as your longest `literal`, because a window shorter than the pattern could never hold it and the verb would answer `timed_out: true` with `gaps: 0` — a clean-scan claim — for a string that was on the wire. `lookback: 0` is refused for the same reason. The daemon can size literals exactly and **cannot** size a `regex` (`a{1000}` is a six-byte source), so for regex patterns the floor is whatever the literals in the same set demand and the adequacy of the window is the caller's to judge |
 | `context` | integer | *optional*, default 128, maximum 4096 — how many bytes of surrounding context a match reports |
 
 Every one of these is range-checked, and the patterns compiled, **before anything
@@ -859,7 +859,7 @@ scanned even when it is deeper than `lookback`; `lookback` bounds only how far a
 
 | Code | When |
 | --- | --- |
-| `-32602` | the endpoint is unknown or not host-facing; `timeout_ms` missing; any maximum exceeded; a malformed, un-decodable, duplicate-named, or uncompilable pattern |
+| `-32602` | the endpoint is unknown or not host-facing; `timeout_ms` missing; any maximum exceeded; **`lookback` under the floor its own patterns need** (the message names the value and the floor); a malformed, un-decodable, duplicate-named, or uncompilable pattern |
 | `-32006` | another waiting verb is already parked on this connection (§15.20) |
 | `-32008` | the graph dropped the endpoint while this wait was parked — `teardown`, `load --replace`, `remove-node`. `data` carries the same scan and gap counters the result would have |
 

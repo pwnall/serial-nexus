@@ -714,6 +714,14 @@ channels = ["c0"]
 /// landing reddens `existing_terminal_is_refused_at_load_listing_the_shipped_kinds`
 /// until someone re-reads §7.7 and §14 and adds it here, which is the only moment at
 /// which "listing the node kinds that do exist" can go quietly stale.
+///
+/// Six is now a *decision*, not a waiting room: plan §18 item 45 asked whether
+/// `existing-terminal` should become a seventh variant refused by `validate`, and the
+/// answer was no — the schema's silence is the refusal (`core/src/config.rs`'s module
+/// header carries the reasoning and the two measured costs). So this list is also the
+/// tripwire on that decline: planting the variant was measured to redden both guards
+/// below at their error-code assertions — `-32002` where they demand `-32602` — since
+/// serde stops calling the word unknown one stage before this list is ever reached.
 const SHIPPED_NODE_KINDS: [&str; 6] = ["serial", "pty", "log", "codec", "leg", "map"];
 
 /// The §7.7 configuration an operator would actually write — a QEMU serial console
@@ -749,25 +757,32 @@ fn kinds_listed_in(message: &str) -> Vec<String> {
 #[test]
 fn existing_terminal_is_refused_at_load_listing_the_shipped_kinds() {
     // §14's deferral vocabulary calls this state *refused-at-load*: "the model
-    // specifies it and the schema admits the words, but the implementation does not
-    // exist: a configuration naming it is refused ... listing what does exist. The
-    // refusal is live, tested behavior — never a silent no-op." This test is the
-    // "tested" half; before it existed the refusal was real but unexercised, falling
-    // out incidentally of serde's internally-tagged enum rather than being anybody's
-    // asserted promise (finding 12).
+    // specifies it but the implementation does not exist, so a configuration naming it
+    // is refused at load, listing what does exist, with nothing created. The refusal is
+    // live, tested behavior — never a silent no-op." This test is the "tested" half;
+    // before it existed the refusal was real but unexercised, falling out incidentally
+    // of serde's internally-tagged enum rather than being anybody's asserted promise
+    // (finding 12).
     //
-    // **What the daemon actually answers, which is not what §14's vocabulary says.**
-    // §7.7 promises "the same treatment §7.1 gives the serial output leg", and §7.1's
-    // is the DM-1 test above: `GraphConfig::validate` refuses it with a STRUCTURAL
-    // error whose text says "not implemented" and cites §14. §7.7's node never reaches
-    // `validate`. `type = "existing-terminal"` is not a `NodeConfig` variant, so it
-    // dies one stage earlier, in `parse_config_param`'s `serde_json::from_value`, as
-    // INVALID_PARAMS carrying serde's unknown-variant text. That text does list the
-    // shipped kinds — the substance §7.7 and §14 promise — but it is not a structural
-    // error and it names neither the deferral nor §14. Asserted here as it is: a guard
-    // written to §14's vocabulary instead of to the daemon would be a guard for
-    // behavior that does not exist, and the divergence belongs in the design's hands,
-    // not hidden behind a laxer assertion here.
+    // **Which of §14's two shapes this is, and why it is the settled one.** Entry 14
+    // (the serial output leg) is the DM-1 test above: `GraphConfig::validate` refuses
+    // it with a STRUCTURAL error whose text says "not implemented" and cites §14.
+    // §7.7's node never reaches `validate` at all. `type = "existing-terminal"` is not
+    // a `NodeConfig` variant, so it dies one stage earlier, in `parse_config_param`'s
+    // `serde_json::from_value`, as INVALID_PARAMS carrying serde's unknown-variant
+    // text — which lists the shipped kinds (the substance §7.7 and §14 promise) but
+    // names neither the deferral nor a section.
+    //
+    // That gap was plan §18 item 45, and the item is now **closed as a decline**: the
+    // schema stays closed and this shape is final, because entry 14 refuses from
+    // `validate` only for want of an alternative (`faces` is the shared `Facing` enum,
+    // so the schema cannot exclude `faces = "target"` on a serial node) while entry 15
+    // has the stronger option and takes it — a word the schema never admits is
+    // unreachable by construction, where a `validate` refusal is one forgotten call
+    // away from admitted. `core/src/config.rs`'s module header carries the reasoning
+    // and the two measured costs of the variant. So this guard is no longer pinning a
+    // placeholder pending a decision; it pins the answer, and it is the tripwire that
+    // reddens if anyone re-opens it silently (AGENTS §5).
     let d = Daemon::start();
     let rpc = d.rpc();
 
@@ -776,7 +791,15 @@ fn existing_terminal_is_refused_at_load_listing_the_shipped_kinds() {
         .expect_err("an existing-terminal node must be refused at load, not created");
     assert_eq!(
         err.code, INVALID_PARAMS,
-        "the existing-terminal node was refused, but not while parsing params: [{}] {}",
+        "the existing-terminal node was refused, but not while parsing params: [{}] {}. \
+         **This is the assertion an item-45 (A) plant reaches FIRST** — `load` calls \
+         `config.validate()` after deserialization, so a `NodeConfig::ExistingTerminal` \
+         variant turns every one of the three refusals in this file STRUCTURAL and only \
+         ordering decides which message you are reading. Plan §18 item 45 closed as a \
+         decline: the schema never admits the word, which is unreachable by construction \
+         where a `validate` refusal is one forgotten call away from admitted. If you are \
+         here because you added the variant, read `core/src/config.rs`'s module header \
+         before re-landing it",
         err.code, err.message
     );
     // The operator has to learn *which word* the daemon rejected, or a refusal of a
@@ -874,10 +897,12 @@ fn a_refused_existing_terminal_disturbs_neither_the_running_graph_nor_the_daemon
         .expect_err("`add-node` of an existing-terminal node must be refused");
     assert_eq!(
         err.code, INVALID_PARAMS,
-        "the add-node refusal was not an invalid-params error: [{}] {}. This pins TODAY's \
-         shape deliberately — §14 entry 15's refusal is serde's unknown-variant error, not \
-         entry 14's structural one, and plan §18 item 45 is the decision about upgrading it. \
-         If item 45 landed, this guard is what tells you,",
+        "the add-node refusal was not an invalid-params error: [{}] {}. This pins the \
+         SETTLED shape, not a placeholder — §14 entry 15's refusal is serde's unknown-variant \
+         error, not entry 14's structural one, and plan §18 item 45 closed as a decline: the \
+         schema never admits the word, which is unreachable by construction where a `validate` \
+         refusal is one forgotten call away from admitted. If this went STRUCTURAL, someone \
+         added the variant — read `core/src/config.rs`'s module header before re-landing it,",
         err.code, err.message
     );
     assert!(

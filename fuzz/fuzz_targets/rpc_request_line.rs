@@ -1,4 +1,5 @@
 #![no_main]
+#![forbid(unsafe_code)]
 //! Fuzz the **daemon's front door** — `serial_nexus_rpc::parse_incoming_request`, the parser
 //! every byte written to the 0600 control socket passes through (§10, §15.16).
 //!

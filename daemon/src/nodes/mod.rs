@@ -1,10 +1,18 @@
-//! Boundary node runtimes (design §7). Phase 2 lands the serial and PTY nodes.
+//! Boundary node runtimes (design §7): the seven kinds a graph is built from,
+//! each owning both its environment and its data plane.
 //!
-//! Slice 1 (this): real environmental setup — the PTY pair, baseline termios,
-//! packet mode and symlink; the serial open with TIOCEXCL — so `state` reports
-//! the truth, and environmental failure faults a node without failing the
-//! operation that created it (§15.8). Slice 2 wires the data plane so bytes flow
-//! serial↔PTY and adds presence gating.
+//! The rule this module exists to hold is §15.8's, and it governs every kind
+//! below: **setup is real**. The PTY pair is allocated, the baseline termios
+//! set, the symlink installed; the serial port is opened with TIOCEXCL — so
+//! `state` reports what the environment actually is rather than what the
+//! configuration intended, and an environmental failure faults the node
+//! *without* failing the operation that created it.
+//!
+//! (This header used to frame that in construction phases — "Phase 2", "Slice 1
+//! (this)", "Slice 2 wires the data plane so bytes flow serial↔PTY". All of it
+//! landed long ago, across seven node kinds rather than two, so the labels had
+//! become a map of a tree that no longer exists. Retired with `daemon.rs`'s
+//! drifted verb index for the same reason — plan §18 item 55.)
 
 pub mod codec;
 pub mod exec;
@@ -287,11 +295,16 @@ impl Node {
     /// to be necessary and not sufficient: the count had to stop crossing those yields
     /// too (notes §3.59, `TargetwardInbox::purge_to_quiescence`).
     ///
-    /// **`exec`'s answer is a floor; every other kind's is exact.** Its ledger watches
-    /// the host-facing per-channel queues, and a chunk that has already moved into the
-    /// node's *internal* merged queue (`src_tx`, which `pump_child` reads) is beyond the
-    /// handle's reach — so a torn-down exec can destroy more than it reports, never
-    /// less, which is the direction §5 requires of an inexact figure. That caveat is
+    /// **Every kind's answer is now exact, `exec`'s included** (plan §18 item 21). It
+    /// was the one floor: its ledger watched only the host-facing per-channel queues,
+    /// and a chunk that had moved into the node's *internal* merged queue — the one
+    /// `pump_child` reads — was beyond the handle's reach, so a torn-down exec could
+    /// destroy more than it reported. The merge queue is watched now, through the same
+    /// generic [`crate::runtime::TargetwardInbox`] `serial` and `leg` made possible
+    /// (notes §3.55), with the reserved multiplexed identity charging `0` because that
+    /// half of the merged queue is hostward and hostward loss has its own names.
+    /// What stays outside every kind's figure is what has left the daemon — bytes in a
+    /// child's stdin pipe, like bytes written to a device fd, are delivery. That is
     /// stated here rather than only at `exec.rs` because this arm is where a caller
     /// reading the enum learns what the number means, and the two structural `0`s below
     /// are already spelled out for exactly the same reason.
@@ -299,10 +312,6 @@ impl Node {
         match self {
             Node::Map(n) => n.discarded_at_teardown(),
             Node::Codec(n) => n.discarded_at_teardown(),
-            // A floor, not a total — see this method's doc. The remaining reach is the
-            // internal merge stage, and closing it needs no new mechanism (the inbox is
-            // generic over its item type since notes §3.55) but does need a guard that
-            // can *hold* a chunk in that stage, which no RPC ack can arrange.
             Node::Exec(n) => n.discarded_at_teardown(),
             Node::Serial(n) => n.discarded_at_teardown(),
             Node::Leg(n) => n.discarded_at_teardown(),

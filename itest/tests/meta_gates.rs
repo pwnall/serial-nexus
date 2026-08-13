@@ -123,18 +123,19 @@ const THIS_FILE: &str = "itest/tests/meta_gates.rs";
 
 /// The floor on `.rs` files a whole-tree [`walk_rs`] pass must reach.
 ///
-/// The tree carries ~130 outside `fuzz/`. The floor exists because a walker that
-/// quietly stopped walking reports the same green as a clean tree (review 37,
-/// 37-TEST-1): `read_dir` failures were swallowed, so a scan over a shrunken file
+/// The tree carries ~165, the nine `fuzz/fuzz_targets/` sources among them since the
+/// walk stopped skipping `fuzz/` (see [`is_fuzz_scratch`]). The floor exists because a
+/// walker that quietly stopped walking reports the same green as a clean tree (review
+/// 37, 37-TEST-1): `read_dir` failures were swallowed, so a scan over a shrunken file
 /// set — one crate, or none — passed the ban gates for invariants 1 and 5. Set well
 /// below the real count so ordinary deletions do not trip it, and far above the
 /// single-crate degradation it exists to catch.
 const MIN_RS_FILES: usize = 100;
 
-/// The floor on crate roots [`crate_dirs`] must find. Fifteen today (twelve workspace
-/// members plus the out-of-tree consumer template's three). Same reasoning as
-/// [`MIN_RS_FILES`]: the completeness half of the `RefCell` ban is only as good as the
-/// list of crates it ranges over.
+/// The floor on crate roots [`crate_dirs`] must find. Eighteen today (the workspace
+/// members, the out-of-tree consumer template's four manifests, and the
+/// workspace-*excluded* `fuzz/`). Same reasoning as [`MIN_RS_FILES`]: the completeness
+/// half of the `RefCell` ban is only as good as the list of crates it ranges over.
 const MIN_CRATE_DIRS: usize = 12;
 
 /// `path` relative to `root`, with separators normalised, so a comparison against a
@@ -179,6 +180,41 @@ fn is_nested_checkout(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
 
+/// Is `dir` cargo-fuzz's **generated** state — a corpus, a crash-artifact directory or
+/// a coverage dump — rather than tracked source?
+///
+/// `fuzz/` itself is walked. It was skipped by name until 2026-08-12, and that skip was
+/// a hole in §16.3's containment rather than a saving: the nine `fuzz/fuzz_targets/`
+/// sources are each their own crate root, they link `serial-nexus-daemon` and
+/// `serial-nexus-web` through their `unstable_fuzz_api` modules, and an `unsafe` block
+/// landing in one was invisible to both halves of the invariant's enforcement — the
+/// whole-tree scan in [`unsafe_is_confined_to_serial_nexus_sys`] and the enumeration in
+/// [`every_crate_root_forbids_unsafe_except_the_one_that_may_not`] skipped the same
+/// directory by the same name. Being excluded from the workspace makes a crate
+/// *unbuilt by `cargo build --workspace`*, which is an argument for scanning it harder,
+/// not for scanning it not at all.
+///
+/// What genuinely must not be walked is what the fuzzer *writes*. `/fuzz/corpus` and
+/// `/fuzz/artifacts` are gitignored and hold whatever libFuzzer produced — tens of
+/// thousands of input files after one nightly loop, none of them source, all of them
+/// attacker-shaped bytes that a token scan has no business reading. `fuzz/coverage` is
+/// the same for `cargo fuzz coverage`. `fuzz/target` is already covered by the `target`
+/// skip.
+///
+/// Keyed on the **path** (`fuzz/<name>`), never on the bare directory name, for the
+/// reason [`THIS_FILE`] and [`REFCELL_EXEMPT`] are both paths (review 32 TESTR-7,
+/// review 37 37-TEST-2): a name list would hand a blanket exemption to any future
+/// directory called `corpus` anywhere in the tree, and an exemption nobody stated is
+/// exactly the shape these gates keep being written to catch.
+fn is_fuzz_scratch(dir: &Path) -> bool {
+    let name = dir.file_name().and_then(|n| n.to_str());
+    let parent = dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str());
+    matches!(name, Some("corpus" | "artifacts" | "coverage")) && parent == Some("fuzz")
+}
+
 fn walk_rs(dir: &Path, visit: &mut impl FnMut(&Path, &str)) -> WalkStats {
     fn inner<F: FnMut(&Path, &str)>(dir: &Path, visit: &mut F, stats: &mut WalkStats) {
         let entries = match std::fs::read_dir(dir) {
@@ -195,9 +231,12 @@ fn walk_rs(dir: &Path, visit: &mut impl FnMut(&Path, &str)) -> WalkStats {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if path.is_dir() {
-                // Skip build output, VCS, the excluded fuzz crate, vendored trees, and
-                // any nested worktree/clone (see `is_nested_checkout`).
-                if matches!(name.as_ref(), "target" | ".git" | "fuzz" | "node_modules")
+                // Skip build output, VCS, vendored trees, the fuzzer's generated
+                // corpus/artifact/coverage trees (see `is_fuzz_scratch` — the fuzz
+                // *sources* are walked), and any nested worktree/clone (see
+                // `is_nested_checkout`).
+                if matches!(name.as_ref(), "target" | ".git" | "node_modules")
+                    || is_fuzz_scratch(&path)
                     || is_nested_checkout(&path)
                 {
                     continue;
@@ -325,11 +364,16 @@ fn crate_dirs(root: &Path, unreadable: &mut Vec<String>) -> Vec<PathBuf> {
             }
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            // Build output, VCS, vendored trees, the workspace-excluded fuzz crate (its
-            // own toolchain, no daemon state), and any nested worktree/clone — whose
-            // crates are this workspace's crates counted twice (see
-            // `is_nested_checkout`).
-            if matches!(name.as_ref(), "target" | ".git" | "fuzz" | "node_modules")
+            // Build output, VCS, vendored trees, the fuzzer's generated corpus and
+            // artifact trees, and any nested worktree/clone — whose crates are this
+            // workspace's crates counted twice (see `is_nested_checkout`).
+            //
+            // `fuzz/` itself is **not** skipped any more: it holds a real crate root,
+            // and the gate that made this walk's list of crates matter — every crate
+            // root forbidding `unsafe` — was blind to nine of them for exactly as long
+            // as the name sat here (see `is_fuzz_scratch`).
+            if matches!(name.as_ref(), "target" | ".git" | "node_modules")
+                || is_fuzz_scratch(&path)
                 || is_nested_checkout(&path)
             {
                 continue;
@@ -343,6 +387,63 @@ fn crate_dirs(root: &Path, unreadable: &mut Vec<String>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     walk(root, &mut out, unreadable);
     out
+}
+
+/// The `path` of every `[[bin]]` entry in a cargo manifest, in manifest order.
+///
+/// The **third shape a crate root comes in**, after `src/lib.rs`/`src/main.rs` and the
+/// per-file roots under `tests/`: a `[[bin]]` with an explicit `path` puts a crate root
+/// anywhere the author likes, and `fuzz/Cargo.toml` puts nine of them under
+/// `fuzz/fuzz_targets/`. A gate that enumerates only the first two shapes reports green
+/// over every one of them.
+///
+/// Hand-parsed, deliberately and narrowly, over the exact subset of TOML these
+/// manifests are written in — an array-of-tables header followed by `key = "value"`
+/// lines. `meta_derive.rs`'s `fuzz_bin_table` reads the same table the same way for the
+/// registration bijection, and records the reason neither shells out to `cargo fuzz
+/// list`: cargo-fuzz needs a nightly toolchain and libFuzzer and is installed only in
+/// the scheduled fuzz job, so a gate built on it would self-skip on every ordinary run
+/// — which is every run where the attribute actually goes missing. The narrowness is
+/// safe in the direction that matters: a registration spelled in some form this misses
+/// drops a root out of the enumeration, and the fuzz floor in
+/// [`every_crate_root_forbids_unsafe_except_the_one_that_may_not`] turns that into a
+/// loud failure rather than a silent pass.
+fn manifest_bin_paths(manifest: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_bin = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_bin = trimmed == "[[bin]]";
+            continue;
+        }
+        if !in_bin {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() == "path" {
+            out.push(value.trim().trim_matches('"').to_owned());
+        }
+    }
+    out
+}
+
+/// The crate roots `dir`'s own manifest declares explicitly, resolved against `dir`.
+///
+/// Missing paths are **kept**, not filtered: a `[[bin]]` registered at a file that does
+/// not exist is a manifest `cargo fuzz build` fails on, and it surfaces here as a root
+/// carrying no attribute (`meta_derive.rs`'s registration bijection says it more
+/// precisely). Dropping it would be the silent half.
+fn manifest_bin_roots(dir: &Path) -> Vec<PathBuf> {
+    let Ok(manifest) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    manifest_bin_paths(&manifest)
+        .into_iter()
+        .map(|p| dir.join(p))
+        .collect()
 }
 
 /// Every `.rs` under `dir`, as (path, source), plus the walk's own evidence. The
@@ -436,6 +537,22 @@ fn unsafe_is_confined_to_serial_nexus_sys() {
     scratch.write("nested/deep/offender.rs", &planted);
     scratch.write("nested/deep/offender.txt", &planted);
     scratch.write("target/debug/build/offender.rs", &planted);
+    // The fuzz crate, in both of its halves. A fuzz **target** is tracked source and a
+    // crate root, so it must be surfaced — this directory was skipped by name until
+    // 2026-08-12 and an `unsafe` block in one was invisible to this gate. What the
+    // fuzzer *writes* must not be: a corpus entry is attacker-shaped bytes and a crash
+    // artifact is a reproducer, neither is source, and after one nightly loop there are
+    // tens of thousands of them. Planted with an `.rs` extension precisely because the
+    // extension filter would otherwise hide whether the skip works at all — a skip is a
+    // matcher too (AGENTS §3), so it is planted in every spelling it claims to cover.
+    scratch.write("fuzz/fuzz_targets/offender.rs", &planted);
+    scratch.write("fuzz/corpus/rpc_base64/seed.rs", &planted);
+    scratch.write("fuzz/artifacts/rpc_base64/crash-dead.rs", &planted);
+    scratch.write("fuzz/coverage/rpc_base64/coverage.rs", &planted);
+    scratch.write("fuzz/target/debug/build/offender.rs", &planted);
+    // …and the name-keyed spelling of that skip, which must NOT swallow anything: a
+    // `corpus/` that is not the fuzzer's is ordinary source and stays in the scan.
+    scratch.write("krate/src/corpus/offender.rs", &planted);
     // A nested **worktree** (a `.git` gitfile, which is what `git worktree add` leaves)
     // and a nested **clone** (a `.git` directory), each carrying the offender. Both must
     // be skipped whole: they are copies of a tree, not part of this one, and before this
@@ -453,18 +570,26 @@ fn unsafe_is_confined_to_serial_nexus_sys() {
             planted_hits.push(rel_path(scratch.path(), path));
         }
     });
+    // Sorted: `read_dir` order is the filesystem's, and this list stopped being one
+    // entry long when the fuzz sources joined the walk.
+    planted_hits.sort();
     assert_eq!(
         planted_hits,
-        vec!["nested/deep/offender.rs".to_owned()],
+        vec![
+            "fuzz/fuzz_targets/offender.rs".to_owned(),
+            "krate/src/corpus/offender.rs".to_owned(),
+            "nested/deep/offender.rs".to_owned(),
+        ],
         "the walker missed a planted `unsafe`, or surfaced one inside a directory it must \
-         skip (`target/`, a nested worktree, a nested clone) — this gate would either pass \
-         over anything or convict the repository of a copy's contents"
+         skip (`target/`, the fuzzer's corpus/artifacts/coverage trees, a nested worktree, \
+         a nested clone) — this gate would either pass over anything or convict the \
+         repository of a copy's or a corpus entry's contents"
     );
     assert_eq!(
-        stats.files, 1,
-        "the walker visited {} files in a scratch tree holding exactly one `.rs` \
-         outside target/ and the two nested checkouts — the extension filter or the skip \
-         list has moved",
+        stats.files, 3,
+        "the walker visited {} files in a scratch tree holding exactly three `.rs` \
+         outside target/, the fuzzer's generated trees and the two nested checkouts — \
+         the extension filter or the skip list has moved",
         stats.files
     );
     drop(scratch);
@@ -743,8 +868,19 @@ fn refcell_ban_covers_every_crate_that_holds_daemon_state() {
         if REFCELL_BAN_CRATES.contains(&name.as_str()) {
             continue;
         }
-        let uses_it = sources_under(&dir.join("src"))
-            .0
+        // `src/` plus whatever the manifest puts elsewhere. A crate whose sources do
+        // not live under `src/` is a crate this completeness claim silently never
+        // ranged over, and the tree has one: `fuzz/`'s roots are `[[bin]] path`
+        // entries under `fuzz_targets/`, in a crate that links `serial-nexus-daemon`
+        // through `unstable_fuzz_api`. Each fuzz target is a single file with no
+        // modules, so its registration *is* its whole source (§16.2, invariant 5).
+        let mut sources = sources_under(&dir.join("src")).0;
+        for path in manifest_bin_roots(&dir) {
+            if let Ok(src) = std::fs::read_to_string(&path) {
+                sources.push((path, src));
+            }
+        }
+        let uses_it = sources
             .iter()
             .any(|(p, src)| !is_this_file(&root, p) && has_code_token(src, &critical));
         if uses_it {
@@ -1612,10 +1748,23 @@ fn entry_point_design_and_plan_names_resolve() {
 /// convenient. §16.3's whole value is that the answer to "where is the `unsafe`" is
 /// one directory.
 ///
-/// Crate roots are enumerated rather than listed: `src/lib.rs`, `src/main.rs`, and
-/// every `tests/*.rs` of every crate the [`crate_dirs`] walk finds. A list typed here
-/// would be the hand-kept roster this repository keeps learning not to keep
-/// (AGENTS §3).
+/// Crate roots are enumerated rather than listed: `src/lib.rs`, `src/main.rs`, every
+/// `tests/*.rs`, and every `[[bin]] path` the manifest declares, for every crate the
+/// [`crate_dirs`] walk finds. A list typed here would be the hand-kept roster this
+/// repository keeps learning not to keep (AGENTS §3).
+///
+/// The `[[bin]]` shape is the newest of the three and was the second hole of the same
+/// kind: `fuzz/fuzz_targets/*.rs` are nine crate roots that live under neither `src/`
+/// nor `tests/`, and until 2026-08-12 both this gate and
+/// [`unsafe_is_confined_to_serial_nexus_sys`] skipped the directory holding them by
+/// name. None of the nine carried the attribute, and an `unsafe` block in any of them
+/// would have been seen by neither half of §16.3's enforcement — in a crate that links
+/// `serial-nexus-daemon` and `serial-nexus-web` through their `unstable_fuzz_api`
+/// modules, and that `cargo build --workspace` does not compile, so the compiler was
+/// not watching either. Derived from the manifest ([`manifest_bin_roots`]) rather than
+/// globbed from the directory, because the registration is what decides whether a file
+/// is built at all — that is item 40's doctrine and the same rule `meta_derive.rs`'s
+/// bijection gate enforces from the other side.
 #[test]
 fn every_crate_root_forbids_unsafe_except_the_one_that_may_not() {
     const FORBID: &str = "#![forbid(unsafe_code)]";
@@ -1632,6 +1781,31 @@ fn every_crate_root_forbids_unsafe_except_the_one_that_may_not() {
     const EXCEPTION: &str = "sys/src/lib.rs";
 
     let root = repo_root();
+
+    // 0. The manifest matcher first, on a planted registration: the `[[bin]]` shape is
+    //    the only one of the three that is *parsed* rather than found on disk, so a
+    //    parser that stopped parsing would drop nine roots and report the same green as
+    //    a compliant tree. Both directions, and both endings a block has — the last
+    //    registration in a manifest is terminated by end-of-file, not by a header.
+    let planted_manifest = "[[bin]]\nname = \"planted\"\npath = \"fuzz_targets/planted.rs\"\n\
+         test = false\n\n[[bin]]\nname = \"second\"\npath = \"fuzz_targets/second.rs\"\n";
+    assert_eq!(
+        manifest_bin_paths(planted_manifest),
+        vec![
+            "fuzz_targets/planted.rs".to_owned(),
+            "fuzz_targets/second.rs".to_owned()
+        ],
+        "the manifest parser cannot read the `[[bin]]` shape every fuzz target is \
+         registered in — the nine roots under fuzz/fuzz_targets/ would drop out of the \
+         enumeration silently"
+    );
+    assert!(
+        manifest_bin_paths("[dependencies]\nname = \"x\"\npath = \"src/not-a-bin.rs\"\n")
+            .is_empty(),
+        "a `path` key under another table header is read as a crate root — the parser \
+         would invent roots that cargo never builds"
+    );
+
     let mut unreadable = Vec::new();
     let crates = crate_dirs(&root, &mut unreadable);
     assert!(
@@ -1659,8 +1833,14 @@ fn every_crate_root_forbids_unsafe_except_the_one_that_may_not() {
                 }
             }
         }
+        // …and the third shape: a `[[bin]]` with an explicit `path`, which puts a crate
+        // root wherever the manifest says. Nine of the tree's live under
+        // `fuzz/fuzz_targets/`; the workspace binaries' registrations name their own
+        // `src/main.rs`, hence the dedup below.
+        roots.extend(manifest_bin_roots(dir));
     }
     roots.sort();
+    roots.dedup();
 
     // Non-vacuity, both directions: this tree has well over a hundred crate roots, and
     // a walk that found a handful has stopped walking rather than found compliance.
@@ -1669,6 +1849,23 @@ fn every_crate_root_forbids_unsafe_except_the_one_that_may_not() {
         "only {} crate roots found; the enumeration has stopped seeing them and a gate \
          that checks nothing passes forever",
         roots.len()
+    );
+
+    // …and specifically the manifest-declared ones, which the count above cannot speak
+    // for: the other 150-odd roots would carry that assertion on their own while the
+    // `[[bin]]` shape silently contributed nothing, which is the state this gate was in
+    // until 2026-08-12. `MIN_FUZZ_TARGETS` is the same floor the `unstable_fuzz_api`
+    // gate holds the corpus to.
+    let fuzz_roots = roots
+        .iter()
+        .filter(|p| rel_path(&root, p).starts_with("fuzz/fuzz_targets/"))
+        .count();
+    assert!(
+        fuzz_roots >= MIN_FUZZ_TARGETS,
+        "only {fuzz_roots} crate root(s) enumerated under fuzz/fuzz_targets/ (floor \
+         {MIN_FUZZ_TARGETS}) — either fuzz/Cargo.toml's [[bin]] table stopped being \
+         read or the crate walk stopped reaching fuzz/. Each of those files is a crate \
+         root §16.3 covers, in a crate `cargo build --workspace` never compiles"
     );
 
     let mut missing = Vec::new();
@@ -1701,5 +1898,166 @@ fn every_crate_root_forbids_unsafe_except_the_one_that_may_not() {
          (§16.3): `unsafe` lives in one crate so that the answer to \"where is the \
          unsafe\" is one directory, and a second exemption ends that whatever its \
          reason"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The devprep platform arms answer the same verbs (plan §18 item 52 (a)).
+// ---------------------------------------------------------------------------
+
+/// The verb names of a `#[derive(Subcommand)] enum Verb { … }`, in source order.
+///
+/// A parser rather than a grep, because the thing being compared is the *set of
+/// verbs clap will accept* and nothing else in either file may be mistaken for one.
+/// Line comments — including doc comments, which in these two files talk about the
+/// other arm's verbs constantly — are stripped before anything is matched, and
+/// candidates are only taken at the enum's own brace depth, so a variant's fields
+/// and its `#[arg(...)]` attributes cannot be read as verbs.
+fn verb_variants(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth: isize = 0;
+    let mut started = false;
+    for raw in src.lines() {
+        // Everything from `//` on is prose: `///`, `//!` and ordinary comments alike.
+        let line = raw.split("//").next().unwrap_or("");
+        let trimmed = line.trim();
+        if !started {
+            if trimmed.starts_with("enum Verb") && trimmed.ends_with('{') {
+                started = true;
+                depth = 1;
+            }
+            continue;
+        }
+        // A variant is an identifier at the head of a line at the enum's own depth.
+        if depth == 1
+            && let Some(name) = trimmed
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+            && !name.is_empty()
+            && name.starts_with(|c: char| c.is_ascii_uppercase())
+        {
+            out.push(name.to_owned());
+        }
+        depth += line.matches('{').count() as isize;
+        depth -= line.matches('}').count() as isize;
+        if depth <= 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// What each arm accepts that the other does not, as `(missing on macOS, missing on
+/// Linux)`.
+fn verb_parity(linux: &str, macos: &str) -> (Vec<String>, Vec<String>) {
+    let (l, m) = (verb_variants(linux), verb_variants(macos));
+    let missing_on_macos: Vec<String> = l.iter().filter(|v| !m.contains(v)).cloned().collect();
+    let missing_on_linux: Vec<String> = m.iter().filter(|v| !l.contains(v)).cloned().collect();
+    (missing_on_macos, missing_on_linux)
+}
+
+/// Every verb `serial-nexus-devprep` accepts on one platform is accepted on the
+/// other, even where the honest answer is "nothing to do".
+///
+/// **The contract is the macOS file's own**, stated in its module doc about
+/// `capabilities`, `install` and `preflight`: *"They stay, because a caller that
+/// shells out to them must get a clean answer rather than an unknown verb, and they
+/// report ready with the reason."* An unknown-subcommand error is precisely what that
+/// bans — and `grant` had been left out of the enum since §15.55 added it, so the one
+/// verb that arm's own amendment introduced was the one it refused (plan §18 item 52
+/// (a)). Concretely: §15.55 makes `grant` the step `authorize`, `cycle` and `hold`
+/// take automatically after a reauthorization, so a caller performing that step by
+/// hand met clap's usage error on a platform whose answer is "nothing to do".
+///
+/// Checked **both ways**. A verb macOS accepts and Linux does not is the same defect
+/// with the platforms swapped, and a one-directional gate would treat the reference
+/// arm as privileged for no stated reason.
+///
+/// Neither list is typed here. The gate parses both enums, so a ninth verb inherits
+/// the rule the day it is added — the hand-kept-roster failure this repository keeps
+/// finding (AGENTS §3), and the same failure §15.55 already paid for once with two
+/// capability lists that had to agree.
+#[test]
+fn every_devprep_verb_answers_on_both_platform_arms() {
+    let root = repo_root();
+    // The *directory* is what a filesystem-scanning gate spells (AGENTS §11); the
+    // crate name carries the family prefix and this path must not.
+    let linux_path = root.join("devprep/src/linux/mod.rs");
+    let macos_path = root.join("devprep/src/macos/mod.rs");
+    let linux = std::fs::read_to_string(&linux_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", linux_path.display()));
+    let macos = std::fs::read_to_string(&macos_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", macos_path.display()));
+
+    // Parity first, non-vacuity second, and that order is deliberate: the floors
+    // below are keyed to today's verb count, so putting them first would let *any*
+    // parity break redden on "only parsed seven" instead of on the sentence that
+    // names the defect (measured — the first fail-first run of this gate did exactly
+    // that). A parse that collapses to nothing still cannot slip through, because
+    // parity over two empty sets is vacuously clean and the floors catch it.
+    let (missing_on_macos, missing_on_linux) = verb_parity(&linux, &macos);
+    assert!(
+        missing_on_macos.is_empty(),
+        "{} accepts {missing_on_macos:?} and {} does not — that is clap's \
+         unknown-subcommand error, which the macOS arm's own module doc bans: a caller \
+         that shells out must get a clean answer with the reason, not a usage error",
+        linux_path.display(),
+        macos_path.display()
+    );
+    assert!(
+        missing_on_linux.is_empty(),
+        "{} accepts {missing_on_linux:?} and {} does not",
+        macos_path.display(),
+        linux_path.display()
+    );
+
+    let linux_verbs = verb_variants(&linux);
+    let macos_verbs = verb_variants(&macos);
+    // Non-vacuity: a parser that found nothing reports the same clean parity as two
+    // identical enums, which is the tell AGENTS §3 names — a passing gate whose
+    // output is identical to its not-running output.
+    assert!(
+        linux_verbs.len() >= 8,
+        "only parsed {linux_verbs:?} from {} — the enum moved or the parser stopped \
+         seeing it, and either way this gate is asserting nothing",
+        linux_path.display()
+    );
+    assert!(
+        macos_verbs.len() >= 8,
+        "only parsed {macos_verbs:?} from {}",
+        macos_path.display()
+    );
+    // The verb §15.55 introduced, named explicitly: it is the one this gate was
+    // written for, and a parser that quietly stopped recognising it would leave the
+    // set comparison green for the wrong reason.
+    for verbs in [&linux_verbs, &macos_verbs] {
+        assert!(
+            verbs.contains(&"Grant".to_owned()),
+            "`Grant` is §15.55's verb and must be in {verbs:?}"
+        );
+    }
+
+    // The **matcher and the parser**, proven against planted sources rather than
+    // trusted (AGENTS §3). Three plants: the real defect, a doc comment that names
+    // the missing verb (a grep would call this parity), and a variant *field* whose
+    // name looks like a verb.
+    let planted_linux = "#[derive(Subcommand)]\nenum Verb {\n    Cycle {\n        #[arg(long)]\n        json: bool,\n    },\n    Grant {\n        Port: String,\n    },\n}\n";
+    let planted_macos_missing = "#[derive(Subcommand)]\nenum Verb {\n    /// Grant is not implementable here.\n    Cycle {\n        #[arg(long)]\n        json: bool,\n    },\n}\n";
+    assert_eq!(
+        verb_parity(planted_linux, planted_macos_missing).0,
+        vec!["Grant".to_owned()],
+        "the planted omission must surface, and the planted doc comment naming it \
+         must not paper over it"
+    );
+    assert_eq!(
+        verb_variants(planted_linux),
+        vec!["Cycle".to_owned(), "Grant".to_owned()],
+        "a variant's fields sit one brace deeper and are not verbs"
+    );
+    // And the parser must not run past the enum into whatever follows it.
+    let after = format!("{planted_linux}\nenum Other {{\n    Nope,\n}}\n");
+    assert_eq!(
+        verb_variants(&after),
+        vec!["Cycle".to_owned(), "Grant".to_owned()]
     );
 }

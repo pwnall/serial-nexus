@@ -1,4 +1,5 @@
 #![no_main]
+#![forbid(unsafe_code)]
 //! Fuzz the reference codec's demultiplexer (`serial_nexus_codec_reference::ReferenceCodec`,
 //! §7.5) — the length-guided resync path. Arbitrary bytes, fed in arbitrary chunks,
 //! must always RETURN (resync terminates — no infinite loop), never panic, keep the

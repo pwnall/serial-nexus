@@ -382,6 +382,20 @@ mod tests {
         // next decodes — clause 6's non-latching contract, codec side. A codec on a
         // reliable transport (the link codec) legitimately does not call this.
         kit::recovers_after_garbage(ReferenceCodec::new, "console");
+        // …and, resyncing, it owes the accounting too: `resync_count` is what the
+        // daemon reports as this node's `framing_errors` (§7.5). The malformed unit
+        // is this codec's own — one frame whose type byte is not one of the four §8
+        // kinds, with its length prefix intact, which length-guided resync skips
+        // whole for exactly one count. `corrupt_type_byte_resyncs_exactly_and_counts`
+        // above proves the *recovery*; the kit suite proves the counter is honest and
+        // is not consumed by the read (`state` reads it once per poll).
+        let mut malformed = mux_all(&[Event::data("console", Bytes::from_static(b"unknown kind"))]);
+        malformed[4] = 0x7f; // the body's type byte
+        kit::resync_is_counted(ReferenceCodec::new, &malformed, 1);
+        // The interior fragments a targetward write on the shared boundary and hands
+        // this codec one piece at a time; its own framing unit is that same envelope,
+        // so the largest piece is exactly one maximal frame (§15.24/§15.27).
+        kit::targetward_fragmentation_is_lossless(ReferenceCodec::new, "console");
     }
 
     proptest! {

@@ -2201,6 +2201,48 @@ pub fn skip_no_tls(test: &str, reason: &str) {
     eprintln!("SKIP {test}: {reason}");
 }
 
+/// Announce an out-of-process codec test's self-skip — and refuse to skip when the
+/// operator has said the battery must be exercised.
+///
+/// **The python3 class** (plan §3 rule 11, plan §18 item 49). Thirteen tests across
+/// four files drive a codec child through an external `python3`: the whole
+/// `exec-conformance` battery (§15.26), the any-language envelope battery (§8), the
+/// crash-and-restart guard, and the unconfigured-channel counter. Every one of them
+/// self-skips when the interpreter is absent, and until this existed **no lane
+/// asserted they had executed** — so a runner image that dropped python3 would have
+/// reported the entire out-of-process codec surface green without running a byte of
+/// it. That is plan §3 rule 22's tell in its plainest form: the passing output and
+/// the not-running output are the same line, and libtest captures a passing test's
+/// stderr, so even the SKIP lines are invisible without `--nocapture` (notes §3.78).
+/// It is the same hole `SNX_WEB_UI=required` closed for `node`.
+///
+/// **Why the variable names the capability and not the interpreter.** Every existing
+/// instance is named for the coverage at stake rather than for the tool that is
+/// missing: `SNX_TLS` gates a tier whose absent tool is `curl`, `SNX_WEB_UI` a suite
+/// whose absent tool is `node`, `SNX_LICENSE_GATE` a lane whose absent tool is
+/// `cargo-deny`. The coverage at stake here is the out-of-process codec battery —
+/// the extension surface §8 and §15.26 promise — and `python3` is merely the language
+/// the shipped fixtures happen to be written in; a fixture ported to another one
+/// would leave an `SNX_PYTHON` naming nothing while the battery it gated still
+/// existed. `reason` carries what the provider actually *saw* ("python3 not found"),
+/// which is where rule 11 puts the tool's name: in the message, on the box printing
+/// it.
+///
+/// The seventh instance of one mechanism, not a seventh mechanism: same variable
+/// shape, same word, same failure text as [`skip_no_tls`] — a skip class that
+/// invented its own spelling would be one more thing to remember (plan §3 rule 11).
+pub fn skip_no_exec_codec(test: &str, reason: &str) {
+    assert!(
+        std::env::var("SNX_EXEC_CODEC").as_deref() != Ok("required"),
+        "SNX_EXEC_CODEC=required, but {test} skipped: {reason}.\n\
+         Required mode exists so a box that can run an out-of-process codec child \
+         cannot report a green run for the conformance battery that proves the \
+         extension surface works at all (§8, §15.26, plan §3 rule 11). Install \
+         python3, or unset SNX_EXEC_CODEC."
+    );
+    eprintln!("SKIP {test}: {reason}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

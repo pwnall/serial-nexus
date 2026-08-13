@@ -35,6 +35,16 @@
 //! fact the harness observed rather than a timing assumption. No serial device and no
 //! pts client is involved, so these run on every platform.
 //!
+//! **`exec` arrived last, and it arrived as a *floor*.** Alone among the kinds, an
+//! exec codec has a second, *internal* targetward stage — the merged queue its channel
+//! forwarders push into and `pump_child` frames into the child's stdin — and until plan
+//! §18 item 21 nothing counted it, so the reported figure was a floor and §15.50 said
+//! so where the counter is documented. The two guards below close it, and they are
+//! deliberately different instruments: one where **no child can spawn**, which makes
+//! the law an equality because nothing can have left the daemon, and one where a child
+//! is up and **has stopped reading its stdin**, which is the only shape that exercises
+//! the merge stage while `pump_child` holds it.
+//!
 //! **The two boundary kinds arrived late, and that is the finding.** `serial` and
 //! `leg` were named in §15.50 as owning queues of the same shape and reporting nothing
 //! — deliberately, because a counter reading `0` while bytes are destroyed is worse
@@ -42,10 +52,12 @@
 //! two: the deepest backlog the daemon can accumulate is the one a `waiting` node
 //! builds *by design*, and it was the one nothing counted.
 
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use serial_nexus_itest::Daemon;
+use serial_nexus_itest::{Daemon, skip_no_exec_codec};
 
 /// A map whose raw side is deliberately left unwired, so its targetward pump parks.
 /// The pty gives the mapped endpoint a consumer edge (§4 rule 2) and is otherwise
@@ -421,6 +433,262 @@ fn every_byte_sent_to_a_peerless_leg_is_accounted_across_the_removal() {
         "conservation across the removal: destroyed {destroyed} + purged {purged} + \
          on-the-wire {on_the_wire} + purged-on-reconnect {purged_before} must equal \
          the {queued} accepted. reply={reply} state={before}"
+    );
+}
+
+// --- the last floor: `exec`'s internal merge stage (plan §18 item 21) -------------
+
+/// Absolute path to a fixture under the workspace's `tests/ext-codec/`, derived from
+/// this crate's compile-time manifest dir (the same helper `p5_exec_crash` carries).
+fn ext_codec(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("serial-nexus-itest has a parent (the workspace root)")
+        .join("tests")
+        .join("ext-codec")
+        .join(name)
+}
+
+/// Whether `python3` is invocable — the exec child is a Python script.
+fn have_python3() -> bool {
+    Command::new("python3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// A standalone `faces = "target"` exec codec with one channel, running `argv`. No
+/// edges and no device: the multiplexed side has no attached upstream, which is a legal
+/// load outcome (§7.5/§15.8) and is what keeps this device-free on every platform. The
+/// channel endpoint faces host, so `send` can inject into it exactly as it does for the
+/// map, the serial and the leg above.
+///
+/// `restart_backoff_ms` is the schema maximum (`MAX_TIMER_MS`, one hour). It is
+/// load-bearing in the no-child guard and merely defensive in the deaf-child one: on
+/// the first, it means the supervisor makes **one** spawn attempt and then sleeps for
+/// longer than any test run, so `restart_count` is a stable `1` and nothing in the node
+/// touches the merge queue while the measurement is taken.
+fn exec_graph(argv: &str) -> String {
+    format!(
+        r#"
+[[node]]
+type = "codec"
+name = "mux"
+codec = "exec"
+faces = "target"
+channels = ["c0"]
+[node.attributes]
+argv = {argv}
+restart_backoff_ms = 3600000
+"#
+    )
+}
+
+/// The depth of every arbitrated targetward channel in the daemon —
+/// `serial_nexus_daemon`'s `runtime::CHANNEL_CAP`, named here because the daemon's
+/// internals are private to its crate and an integration test cannot import them.
+///
+/// Only [`exec_teardown_counts_a_merge_stage_a_deaf_child_is_holding`] needs it, and it
+/// needs it as an *upper bound on the host-facing stage*: that guard's whole claim is
+/// that the reported figure exceeds everything the per-channel queue plus one held
+/// chunk could possibly account for, so what is left can only have come from the merge
+/// stage. If the constant moves, this bound must move with it; the assertion message
+/// says so, so the failure diagnoses itself rather than reading as a lost byte.
+const CHANNEL_CAP: u64 = 256;
+
+/// **`exec`'s floor, closed — and measured as an equality** (plan §18 item 21, §5,
+/// §15.50).
+///
+/// An exec codec's channel forwarders read the host-facing targetward queues and push
+/// into a second, *internal* merged queue that `pump_child` frames into the child's
+/// stdin. Until item 21 the ledger watched only the first stage, so a torn-down exec
+/// reported a **floor**: whatever happened to still be in the per-channel queues, never
+/// what had already moved on. This pins the total.
+///
+/// **Why the child deliberately cannot spawn.** It is what makes the conservation law
+/// an *equality* rather than an inequality, and the reason is §9's, not convenience.
+/// For any exec codec with a live child, some bytes are inside the child's stdin pipe:
+/// they have left the daemon — the exec codec's obligation ends at the child's stdin
+/// exactly as a serial node's ends at the device fd — so they are delivery, not loss,
+/// and *nothing observable reports how many*. Point `argv` at a path that does not
+/// exist and that term is structurally zero: `spawn` fails with ENOENT, `pump_child` is
+/// never entered, not one byte can have reached a child, and every acked byte is
+/// therefore still inside the node in one of its two counted stages. The `faulted …
+/// spawn` status is the witness, the same role `open: false` plays for the waiting
+/// serial above.
+///
+/// **Why 300 sends.** The merge queue is `CHANNEL_CAP` (256) chunks deep and nothing
+/// drains it, so more than 256 chunks guarantees the merge stage is *saturated* and the
+/// remainder backs up into the per-channel queue behind it. That makes the fail-first
+/// deterministic in both directions rather than a race with the forwarder task: an
+/// unfixed daemon can report at most the 43-odd chunks left in the host-facing queue,
+/// and never the 300 the equality below demands. 300 also stays well inside the
+/// combined depth (256 + 1 held + 256), so no `send` ever meets backpressure.
+///
+/// Fail-first, measured: with the merge queue's `TeardownLoss::watch` removed —
+/// `let src = TargetwardInbox::new(src_rx);` in place of `self.teardown_loss.watch(…)`,
+/// which is the shipped shape this replaced — the reply reads
+/// `discarded_at_teardown: 44000` against a node that just destroyed 300 000 bytes:
+/// the 43 chunks the host-facing queue happened to still hold, plus the one in hand,
+/// and none of the 256 the merge stage had taken. The other eight guards in this file
+/// stay green under the same revert, which is what says this is `exec`'s own stage and
+/// not the shared ledger answering for it (notes §3.55's disjoint-reddening method).
+#[test]
+fn exec_teardown_counts_the_merge_stage_when_no_child_can_spawn() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    // Inside the run dir and never created, so `spawn` answers ENOENT every time and no
+    // child can exist even transiently.
+    let absent = d.run().join("no-such-codec-binary");
+    let argv = format!("[{:?}]", absent.display().to_string());
+    rpc.load_toml(&exec_graph(&argv), false)
+        .expect("load the unspawnable-exec graph");
+
+    // The witness that no byte can have been delivered: the node faulted at *spawn*.
+    // Asserting the reason names the spawn — rather than only that the count moved — is
+    // what separates "no child ever existed" from "a child ran and then died", which
+    // are the same `restart_count` and very different accounting.
+    let faulted = serial_nexus_itest::wait_until(Duration::from_secs(10), || {
+        rpc.node("mux")
+            .and_then(|n| n["status"].as_str().map(str::to_owned))
+            .as_deref()
+            == Some("faulted")
+    });
+    let before = rpc.node("mux").expect("exec codec node");
+    assert!(
+        faulted,
+        "the exec child must fail to spawn for delivery to be witnessed at zero: {before}"
+    );
+    assert!(
+        before["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("spawn")),
+        "the fault must be a spawn failure, not a child that ran and died: {before}"
+    );
+    assert_eq!(
+        before["discarded_at_teardown"].as_u64(),
+        Some(0),
+        "queued bytes are backlog until the node is torn down: {before}"
+    );
+
+    let queued = inject(rpc, "mux/c0", &"z".repeat(999), 300);
+
+    let reply = rpc.remove_node("mux", true).expect("remove-node");
+    assert_eq!(
+        reply["discarded_at_teardown"].as_u64(),
+        Some(queued),
+        "the removal must report every targetward byte it destroyed, the merge stage \
+         included (§5, §15.50): {reply}"
+    );
+
+    // Conservation across the removal, stated as the equality the witness above buys:
+    // with no child there is nothing to deliver to and no purge in this graph, so the
+    // destroyed figure *is* the whole accepted total. A counter that merely moved the
+    // loss into a different silence would satisfy the assertion above and fail this one.
+    let destroyed = reply["discarded_at_teardown"].as_u64().unwrap_or(0);
+    let purged = reply["purged_bytes"].as_u64().unwrap_or(0);
+    assert_eq!(
+        destroyed + purged,
+        queued,
+        "conservation across the removal: destroyed {destroyed} + purged {purged} must \
+         equal the {queued} accepted, with delivery witnessed at zero by a node that \
+         never spawned a child. reply={reply}"
+    );
+}
+
+/// **The same floor, closed under the item's own fixture: a child that has stopped
+/// reading its stdin** (plan §18 item 21's stated validation shape).
+///
+/// The guard above never enters `pump_child`, and that is exactly the gap this one
+/// fills. The natural wrong way to make the merge queue countable is to *lend* the
+/// receiver to the pump — `slot.take()`, pump, put it back — which notes §3.55 records
+/// as the shape that reads most naturally and is wrong: a `remove-node` landing while
+/// the pump holds it finds an empty slot and charges `0`. A lending implementation
+/// passes the no-child guard (its pump never runs) and fails this one, which is the
+/// whole reason both exist.
+///
+/// `deaf.py` spawns, holds its pipes, and never reads a byte. The daemon fills the
+/// child's stdin pipe, blocks in `write_all`, and everything behind it backs up: the
+/// merge queue fills, then the per-channel queue. That is the state item 21 names.
+///
+/// **What this shape cannot assert, and what it asserts instead.** Bytes already inside
+/// the child's stdin pipe have left the daemon and no counter reports them, so there is
+/// no equality to be had here (see the guard above). The claim is therefore a bound
+/// that no floor can reach: the host-facing stage holds at most [`CHANNEL_CAP`] queued
+/// chunks plus the one the forwarder is mid-hand-off, so a figure *above* that could
+/// only have come from the merge stage. 450 chunks of ~4 KiB is chosen so the claim
+/// survives the pipe with room to spare — it needs only that the child's stdin pipe be
+/// smaller than about 193 chunks (~770 KiB), against a 64 KiB default on both platforms
+/// of record — while staying inside the daemon's own combined depth so no `send` meets
+/// backpressure.
+///
+/// Fail-first, measured: with the merge queue's `TeardownLoss::watch` removed the reply
+/// reads `discarded_at_teardown: 708000` — the 177 chunks left in the host-facing queue
+/// — against a bound of 1 028 000 and a fixed figure of 1 736 000. The remaining 64 000
+/// is the child's stdin pipe, and the split lands exactly where the code says it should:
+/// 16 whole chunks in the pipe, the 17th one carried by the feed's `held` slot because
+/// it was mid-`write_all` when the node died.
+#[test]
+fn exec_teardown_counts_a_merge_stage_a_deaf_child_is_holding() {
+    if !have_python3() {
+        skip_no_exec_codec(
+            "exec_teardown_counts_a_merge_stage_a_deaf_child_is_holding",
+            "python3 not found",
+        );
+        return;
+    }
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    let deaf = ext_codec("deaf.py");
+    let argv = format!("[\"python3\", {:?}]", deaf.display().to_string());
+    rpc.load_toml(&exec_graph(&argv), false)
+        .expect("load the deaf-child exec graph");
+
+    let line = "z".repeat(3999);
+    let queued = inject(rpc, "mux/c0", &line, 450);
+    let per_chunk = (line.len() + 1) as u64; // `send` appends the newline it promises
+
+    // One child, spawned once and never restarted. A restart would hand the feed a
+    // fresh pipe and drain another pipe-full out of the queue under the measurement,
+    // and a *failed* spawn would make this the guard above wearing the wrong name.
+    let before = rpc.node("mux").expect("exec codec node");
+    assert_eq!(
+        before["restart_count"].as_u64(),
+        Some(0),
+        "the child must be the original one, still up and still deaf: {before}"
+    );
+    assert_eq!(
+        before["discarded_at_teardown"].as_u64(),
+        Some(0),
+        "queued bytes are backlog until the node is torn down: {before}"
+    );
+
+    let reply = rpc.remove_node("mux", true).expect("remove-node");
+    let destroyed = reply["discarded_at_teardown"].as_u64().unwrap_or(0);
+
+    // The bound a floor cannot cross: everything the host-facing stage can hold.
+    let host_facing_ceiling = (CHANNEL_CAP + 1) * per_chunk;
+    assert!(
+        destroyed > host_facing_ceiling,
+        "the merge stage was not counted: the removal reported {destroyed} bytes, which \
+         the host-facing per-channel queue alone could hold ({CHANNEL_CAP} chunks + the \
+         one in hand = {host_facing_ceiling} bytes of {queued} accepted). If \
+         `runtime::CHANNEL_CAP` moved, this bound must move with it. reply={reply}"
+    );
+    // And the other side of it: the figure names loss, so it can never exceed what the
+    // daemon accepted. Some of those bytes are in the child's stdin pipe, which is
+    // delivery and not this counter's to claim.
+    assert!(
+        destroyed <= queued,
+        "the removal reported {destroyed} destroyed of {queued} accepted — a teardown \
+         figure above the accepted total is over-reporting, not loss: reply={reply}"
+    );
+    assert!(
+        destroyed < queued,
+        "nothing reached the child at all, so this is the no-child guard in disguise \
+         rather than a merge stage a running pump was holding: {reply}"
     );
 }
 

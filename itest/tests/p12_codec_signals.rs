@@ -45,13 +45,16 @@
 //! emit-then-refuse charge) and only their *names* are pinned here.
 //!
 //! Device-free throughout, so it runs on every platform; the exec case self-skips
-//! without `python3`, exactly as `p5_exec_crash` does.
+//! without `python3`, exactly as `p5_exec_crash` does — and honours
+//! **`SNX_EXEC_CODEC=required`** the same way, so a lane that provisions the
+//! interpreter proves this counter was actually exercised (plan §3 rule 11 / §18
+//! item 49).
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use serial_nexus_itest::{Daemon, wait_until};
+use serial_nexus_itest::{Daemon, skip_no_exec_codec, wait_until};
 
 /// Whether `python3` is invocable — the exec child is a Python script. Absent ⇒ skip
 /// (an environmental prerequisite, like a missing serial device). Local to this file
@@ -106,7 +109,10 @@ fn field(d: &Daemon, node: &str, key: &str) -> Value {
 #[test]
 fn an_unconfigured_channel_identity_is_counted_and_named() {
     if !have_python3() {
-        eprintln!("SKIP an_unconfigured_channel_identity_is_counted_and_named: python3 not found");
+        skip_no_exec_codec(
+            "an_unconfigured_channel_identity_is_counted_and_named",
+            "python3 not found",
+        );
         return;
     }
     let d = Daemon::start();

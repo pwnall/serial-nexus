@@ -1,4 +1,5 @@
 #![no_main]
+#![forbid(unsafe_code)]
 //! The web console's **HTTP request-head parser** and the header checks that gate on
 //! it (review 26, SEC-7).
 //!

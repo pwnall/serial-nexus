@@ -1,11 +1,13 @@
 //! PTY node (design §7.2). Faces target.
 //!
-//! Slice 1 built the pair: allocate the master/slave, set the baseline termios
-//! (raw, echo off, EXTPROC on), enable packet mode on the master, install the
-//! configured symlink (with the stale-dangling-symlink recovery rule), apply
-//! owner/mode to the slave device node, and *prime* the slave by opening and
-//! closing it once so POLLHUP reports "absent" for the never-opened case
-//! (serial-nexus-doctor P2 finding).
+//! Setup, at node creation (§15.8 — real, so `state` reports the truth): allocate
+//! the master/slave, set the baseline termios (raw, echo off, EXTPROC on), enable
+//! packet mode on the master, install the configured symlink (with the
+//! stale-dangling-symlink recovery rule), apply owner/mode to the slave device
+//! node, and *prime* the slave by opening and closing it once so POLLHUP reports
+//! "absent" for the never-opened case (serial-nexus-doctor P2 finding). The
+//! construction-era "Slice 1 built the pair" framing this paragraph opened with is
+//! retired — plan §18 item 55.
 //!
 //! Byte flow and presence (never `AsyncFd`, whose epoll readiness busy-loops on
 //! pty masters — §15.18):
@@ -707,7 +709,10 @@ fn make_drainable(fd: BorrowedFd) {
 /// termios so every client session starts deterministic". The termios half settles
 /// how the next session's bytes are *framed*; this settles *which bytes it sees at
 /// all*. Without it the kernel keeps the departed session's undelivered output
-/// across the close — up to the pts input queue's depth, measured at ~13.8 KiB —
+/// across the close — up to the pts input queue's depth, 13824–15872 bytes across the
+/// committed P10 captures on Linux 7.0.0-29 (§7.2; the "~13.8 KiB" this line carried
+/// until 2026-08-12 is 14131 bytes, which no capture reads — the design withdrew the
+/// same figure at its own site and this copy was missed) —
 /// and hands it to the next opener, so a fresh `picocom` opens onto the previous
 /// operator's scrollback. Worse for §5: nothing counted the loss when that data was
 /// finally destroyed, so `state` reported `discarded_no_client: 0` on a boundary

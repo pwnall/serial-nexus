@@ -16,6 +16,14 @@
 # already carries the capability — so re-running it costs nothing and prompts for
 # nothing.
 #
+# Every run also leaves `.snx-bin/<profile>/` holding exactly one capability-carrying
+# file: the copy that belongs there. The sweep lives in the helper's own `install`
+# verb — it is derived from the capability set that verb already owns, rather than
+# from a list spelled here — and it runs on `--verify` too, which is why even the
+# already-blessed fast path below restores that invariant. A blessed binary nothing
+# references is what §15.45's narrowness argument is about, and a rename left exactly
+# one behind (notes §3.81).
+#
 # Why a sudo at all, and why only here: `authorized` under /sys is root-owned, so
 # writing it needs CAP_DAC_OVERRIDE, and only root may grant a file capability.
 # Nothing else in this repository asks for privilege, and the helper itself never
@@ -37,7 +45,13 @@ for arg in "$@"; do
     --all)     profiles+=("debug" "release") ;;
     --verify)  verify_only=1 ;;
     -h|--help)
-      sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+      # The header block, **derived rather than a line range**. This was
+      # `sed -n '2,28p'`, and a hand-kept range is a hand-kept list one dimension
+      # over: the first paragraph added to the header above truncated `--help`
+      # mid-sentence and nothing said so (measured — the 2026-08-12 sweep paragraph
+      # did exactly that). Print every comment line after the shebang and stop at
+      # the first line that is not one.
+      awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
       exit 0
       ;;
     *)
@@ -93,7 +107,14 @@ for profile in "${profiles[@]}"; do
   # Ask the tool, not the filesystem: `install --verify` compares the installed
   # copy byte-for-byte against the build and re-reads mode and capability, so
   # "already blessed" is a measurement rather than the presence of a stamp file.
-  if "$built" install --profile "$profile" --verify >/dev/null 2>&1; then
+  #
+  # **stdout is discarded and stderr is not**, deliberately. The `ready (…)` line is
+  # noise on a path whose whole message is "nothing to do"; the orphan sweep's report
+  # is on stderr precisely so that a removed capability-carrying file is announced
+  # even here, where nothing else runs. Discarding both — which this line did until
+  # 2026-08-12 — would make the one path most likely to *find* an orphan the one path
+  # that could not tell you about it.
+  if "$built" install --profile "$profile" --verify >/dev/null; then
     echo "bless: ${profile}: already blessed (build unchanged, mode 0700, +ep) — nothing to do"
     continue
   fi

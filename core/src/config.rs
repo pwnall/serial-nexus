@@ -10,10 +10,55 @@
 //! variant: it is an ordinary [`NodeConfig::Codec`] selected by `codec = "exec"`,
 //! with its child process configured in the opaque `attributes` table (see that
 //! variant's docs). And `existing-terminal` (§7.7) is design-specified but
-//! deliberately unimplemented (§14), so the daemon answers an `existing-terminal`
-//! node with serde's unknown-variant error. The format is designed to grow
-//! additively (§15.16); node kinds are internally tagged by `type` with inline
-//! fields, so they serialize cleanly to TOML without `flatten`.
+//! deliberately unimplemented (§14 entry 15), so the daemon answers an
+//! `existing-terminal` node with serde's unknown-variant error, which lists the six
+//! kinds above and cites no section. The format is designed to grow additively
+//! (§15.16); node kinds are internally tagged by `type` with inline fields, so they
+//! serialize cleanly to TOML without `flatten`.
+//!
+//! **That absence *is* the refusal, and it stays that way.** Plan §18 item 45 asked
+//! whether to promote it to §14 entry 14's shape — a variant the schema admits,
+//! refused by [`GraphConfig::validate`] with a "not implemented (§14)" message — so
+//! that the two deferrals would read alike. Answered no, and recorded here rather
+//! than only in the ledger, because this module is where a future reader will reach
+//! for the variant. The two are not one kind of deferral:
+//!
+//! * **Entry 14 is a *role* of a shipped kind, and structural refusal is the only
+//!   shape available to it.** `faces` is typed [`Facing`], the same two-valued enum
+//!   `codec` and `leg` carry, where target-facing is legitimate and tested — so the
+//!   schema cannot exclude `faces = "target"` on a serial node without inventing a
+//!   serial-only facing type. `validate` refuses it because nothing else can.
+//! * **Entry 15 is a whole kind, and a word the schema never admits is unreachable
+//!   by construction** — by any code path, present or future — where a `validate`
+//!   refusal is one forgotten call away from admitted. This module's own header makes
+//!   exactly that trade one paragraph up: §15.8's configuration/state split is
+//!   "enforced mechanically: state fields simply do not exist on configuration types"
+//!   — not a `validate` rule about which fields an operator may write, but a schema
+//!   from which the question cannot be asked. *(An earlier draft of this paragraph
+//!   cited §15.4's merge diamond as the precedent. It is not one, and it reads as a
+//!   counterexample once followed: the one-producer invariant is
+//!   [`crate::graph::ValidationError::TargetEndpointOversubscribed`], reached from
+//!   `GraphModel::validate` — a two-edge config deserializes perfectly and is
+//!   *refused*. Corrected 2026-08-12 by the review of this very change.)*
+//!
+//! Two costs would be paid forever for a better sentence in one error message, and
+//! both were measured on a scratch tree carrying the variant. Serde's
+//! internally-tagged unknown-variant error enumerates *every* variant, so a plain
+//! typo — `type = "seriall"` — would be answered with `serial`, `pty`, `log`,
+//! `codec`, `leg`, `map`, `existing-terminal`: the daemon advertising a kind it
+//! refuses one stage later. And §7.7 states two fields (`path`, `faces`) and then
+//! "otherwise it behaves as a boundary with the standard policies", so the rest of
+//! the field set would be a guess — frozen by `deny_unknown_fields` and by §15.16's
+//! additive-growth promise — while [`NodeConfig::shape`] would owe
+//! [`GraphConfig::to_model`] an endpoint topology for a node type whose endpoints
+//! the design never states, letting an operator's *edges* validate against a shape
+//! nobody designed.
+//!
+//! The refusal is live, tested behavior (§14's requirement) end to end, by the pair
+//! in `itest/tests/p9_config_validation.rs`, and that pair is also the tripwire on
+//! this decline: planting the variant was measured to redden both guards at their
+//! error-code assertions — `-32002` where they demand `-32602`, since the word stops
+//! being unknown one stage before the listed-kinds clause is ever reached.
 
 use serde::{Deserialize, Serialize};
 
@@ -552,7 +597,14 @@ pub struct EdgeConfig {
     pub a: EndpointAddr,
     pub b: EndpointAddr,
     /// Write-arbitration mode for this edge (§6). Two runtime overrides exist, both
-    /// applied in the daemon's `Wiring::build`: on an edge whose target is an
+    /// computed by [`GraphConfig::effective_write_mode`] — the single place they
+    /// live (§16 "one rule, one place", notes §3.17). The daemon's `Wiring::build`
+    /// *calls* that function rather than owning the rules, and so does
+    /// [`GraphConfig::validate`] for the at-most-one-`held`-origin-per-endpoint
+    /// check; a validator that re-derived them would miss the promoted shape, which
+    /// is the defect that moved them out of the wiring (review 26, RV-4).
+    ///
+    /// On an edge whose target is an
     /// inherently read-only node (a log, §7.3) the effective mode is forced to
     /// `never` (the log gets no targetward path and no lock handle); and on a map's
     /// raw edge (target = `node/raw`, §7.8) an omitted or `on-demand` mode is promoted
@@ -775,8 +827,10 @@ pub enum NodeConfig {
     /// node's endpoint speaks mapped; `send` at the upstream endpoint, after a steal,
     /// speaks raw. Because the generic edge default is `on-demand` — which a
     /// held-origin interior pump cannot drive — an omitted or `on-demand` raw edge is
-    /// treated as `held` at runtime ([`crate::config`] → the daemon's `Wiring::build`);
-    /// an explicit `never` makes a read-only/display map with no targetward path.
+    /// treated as `held` at runtime by [`GraphConfig::effective_write_mode`], which is
+    /// where both promotions live and which the daemon's wiring calls rather than
+    /// re-deriving (notes §3.17); an explicit `never` makes a read-only/display map
+    /// with no targetward path.
     Map {
         name: String,
         /// Ordered mappings applied to **hostward** bytes (device → consumers) —

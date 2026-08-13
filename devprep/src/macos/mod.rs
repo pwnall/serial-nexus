@@ -63,6 +63,24 @@ enum Verb {
         #[arg(long)]
         json: bool,
     },
+    /// Nothing to grant: this arm holds no capability to grant *with*.
+    ///
+    /// Present for the reason the three verbs below it are present — a caller that
+    /// shells out here must get a clean answer rather than an unknown-subcommand
+    /// error — and it was the one verb that had been left out, so `grant` was
+    /// exactly the failure this file's own contract bans (plan §18 item 52 (a)).
+    /// That mattered concretely: §15.55 makes `grant` the step `authorize`, `cycle`
+    /// and `hold` perform automatically after a reauthorization, so a caller
+    /// following that recipe by hand hit clap's usage error and a non-zero exit on
+    /// a platform where the honest answer is "nothing to do".
+    Grant {
+        /// USB serial number, repeatable — the same argument shape the Linux arm
+        /// takes, so a caller's argument list does not fork per platform.
+        #[arg(long = "port", required = true)]
+        ports: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Report an adapter's identity and its re-enumeration witness. Reads only.
     Status {
         /// USB **serial number**, e.g. `BH00L4KU` — not a path, and not a Linux
@@ -217,6 +235,51 @@ fn status(name: &str, json: bool) -> i32 {
     }
 }
 
+/// The macOS `grant`: resolve the named adapters, then report that there is nothing
+/// to do and why — a *clean* answer, which is this arm's whole job.
+///
+/// **What it deliberately does not do, and does not claim.** §15.55's Linux grant
+/// adds `u:<uid>:rw-` to the POSIX ACL of the tty a reauthorization recreated, and it
+/// needs `CAP_FOWNER` to do it because that node comes back `root:dialout 0660`.
+/// Neither half of that has a counterpart here: this arm holds no capability at all
+/// (`USBDeviceOpen` succeeds at an ordinary euid — notes §3.66), so there is nothing
+/// to grant *with*, and whether the recreated `/dev/cu.usbserial-*` node is reachable
+/// by the invoking user is a property of this machine's device permissions rather
+/// than something this helper took away and could hand back. Saying that is the
+/// answer; silently exiting 0 would let a caller believe a grant happened, which is
+/// the failure §15.55's skip-with-a-note exists to prevent one platform over.
+///
+/// The name is still resolved first, so a typo is refused exactly as the Linux arm
+/// refuses it. A verb that answered "nothing to do" to a port that does not exist
+/// would be clean about the wrong thing.
+fn grant(names: &[String], json: bool) -> i32 {
+    /// Carried under the field name the Linux arm reports it under (§15.55, plan §18
+    /// item 52 (b)), so one JSON reader serves both platforms.
+    const WHY: &str = "macOS has no capability to grant with and no ACL to grant: this arm is \
+                       unprivileged, and the callout node's reachability is a property of the \
+                       machine's device permissions rather than of the re-enumeration.";
+    let mut resolved = Vec::new();
+    for name in names {
+        match usb_macos::find(name) {
+            Ok(a) => resolved.push(a.serial),
+            Err(e) => return refuse(&e, json),
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ports": resolved,
+                "granted": [],
+                "grant_skipped": WHY,
+            })
+        );
+    } else {
+        println!("nothing to grant for {}: {WHY}", resolved.join(", "));
+    }
+    exit::READY
+}
+
 fn cycle(names: &[String], hold_ms: u64, dry_run: bool, json: bool) -> i32 {
     // Resolve every adapter BEFORE touching any of them, so a typo in the second
     // name cannot leave the first one already re-enumerated.
@@ -346,6 +409,7 @@ pub fn main() {
             }
             exit::READY
         }
+        Verb::Grant { ports, json } => grant(&ports, json),
         Verb::Status { port, json } => status(&port, json),
         Verb::Cycle {
             ports,

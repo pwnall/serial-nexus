@@ -580,26 +580,103 @@ fn grant_ports(ports: &[sysfs::Port]) -> Result<Vec<String>, String> {
     Ok(granted)
 }
 
+/// What the post-reauthorization grant did — a **value**, not a printed side effect.
+///
+/// It used to be `Result<Vec<String>, i32>`, and the skip case was folded into the
+/// success arm with a note printed from inside the helper *only when the caller was
+/// not in JSON mode*. Two consequences, both real (plan §18 item 52 (b)): §15.55's
+/// promise that a copy blessed before `cap_fowner` "skips the grant with a note"
+/// was silent for every JSON caller, and `hold` — whose two report lines are always
+/// JSON — therefore said nothing at all while quietly granting nothing. A caller
+/// reading `"granted": []` could not tell "this port owns no tty right now" from
+/// "this copy cannot grant and never will".
+///
+/// Three outcomes, deliberately not two:
+///
+/// * **Granted** — possibly of zero nodes, which is *not* a skip: a device
+///   mid-enumeration legitimately owns no tty yet.
+/// * **Skipped** — a stated reason, never an empty success. §15.55's whole point is
+///   that a capability which arrived later must not turn every previously-working
+///   `cycle` red, and the price of that is saying so out loud.
+/// * **Failed** — the copy holds the capability and the grant still failed. A real
+///   fault, raised, because the caller asked for a device it can use and would
+///   otherwise meet `Permission denied` seconds later with nothing pointing here.
+#[derive(Debug)]
+enum GrantOutcome {
+    Granted(Vec<String>),
+    Skipped(&'static str),
+    Failed(String),
+}
+
+/// Reasons a grant was skipped. Spelled once each, because they are wire-visible:
+/// `grant_skipped` carries the reason verbatim.
+mod grant_skip {
+    /// The dry run's control property: it writes nothing, so nothing lost access.
+    pub const DRY_RUN: &str =
+        "--dry-run: nothing was deauthorized, so no node lost the caller's access";
+    /// §15.55's second residual, in the field a JSON caller reads.
+    pub const NO_FOWNER: &str = "this copy does not hold cap_fowner effectively — it was blessed before the \
+         capability joined the set (§15.55). The replug worked; re-run `scripts/bless` \
+         to get the grant back.";
+    /// `hold` only: there is nothing to grant on when the device is still down.
+    pub const REAUTHORIZE_FAILED: &str =
+        "the reauthorization failed, so there is no returned node to grant access on";
+}
+
+impl GrantOutcome {
+    /// The nodes granted, for the `granted` field every report already carried.
+    fn granted(&self) -> &[String] {
+        match self {
+            Self::Granted(g) => g,
+            _ => &[],
+        }
+    }
+
+    /// The `grant_skipped` field: the **reason**, or `null`.
+    ///
+    /// A reason rather than a boolean, for two reasons that both matter. §15.55
+    /// promises a *note*, and "true" is not a note — the three skips call for three
+    /// different actions. And a JSON consumer writing the naive `if (r.grant_skipped)`
+    /// still gets the right answer, because a non-empty string is truthy and `null`
+    /// is not, so the strictly-more-informative shape costs a reader nothing.
+    fn skipped(&self) -> Option<&'static str> {
+        match self {
+            Self::Skipped(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// The fault, when the copy could grant and did not.
+    fn failed(&self) -> Option<&str> {
+        match self {
+            Self::Failed(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// The prose form of [`Self::skipped`], for the callers that print sentences
+    /// instead of JSON. `None` when there is nothing to say.
+    fn note(&self) -> Option<String> {
+        self.skipped()
+            .map(|why| format!("note: not granting device access — {why}"))
+    }
+}
+
 /// Grant after a reauthorization, **best-effort and always announced**.
 ///
-/// Two failure shapes, deliberately treated differently. A copy blessed before
-/// `CAP_FOWNER` joined the grant (§15.55) simply cannot do this, and that must not
-/// turn every previously-working `cycle` into a failure — so a missing capability is
-/// reported and skipped, not raised. A copy that *holds* the capability and still
-/// fails is a real fault and is raised, because the caller asked for a device it can
-/// use and would otherwise meet `Permission denied` several seconds later with
-/// nothing pointing here.
-fn grant_after_reauthorize(ports: &[sysfs::Port], json: bool) -> Result<Vec<String>, i32> {
-    if !caps::capability_state(caps::CAP_FOWNER).effective {
-        if !json {
-            eprintln!(
-                "note: not granting device access — this copy does not hold cap_fowner \
-                 effectively. Re-run `install` and the sudo command it prints (§15.55)."
-            );
-        }
-        return Ok(Vec::new());
+/// The announcing is the caller's now — this returns the announcement rather than
+/// printing it — because there are three callers and one of them prints only JSON.
+fn grant_after_reauthorize(ports: &[sysfs::Port], dry_run: bool) -> GrantOutcome {
+    if dry_run {
+        return GrantOutcome::Skipped(grant_skip::DRY_RUN);
     }
-    grant_ports(ports).map_err(|e| refuse(&e, json))
+    if !caps::capability_state(caps::CAP_FOWNER).effective {
+        return GrantOutcome::Skipped(grant_skip::NO_FOWNER);
+    }
+    match grant_ports(ports) {
+        Ok(granted) => GrantOutcome::Granted(granted),
+        Err(e) => GrantOutcome::Failed(e),
+    }
 }
 
 fn grant_verb(names: &[String], json: bool) -> i32 {
@@ -666,15 +743,24 @@ fn authorize(name: &str, json: bool, held: CapState) -> i32 {
             // old one went with it. Restoring that access is part of putting the
             // device back, not a separate favour, so it happens here rather than
             // being left as a step every caller must remember (§15.55).
-            let granted = match grant_after_reauthorize(std::slice::from_ref(&port), json) {
-                Ok(g) => g,
-                Err(code) => return code,
-            };
+            let grant = grant_after_reauthorize(std::slice::from_ref(&port), false);
+            if let Some(e) = grant.failed() {
+                return refuse(e, json);
+            }
+            // Printed here rather than inside the grant so the ordering is the one it
+            // has always had: the note precedes the verb's own answer.
+            if !json && let Some(note) = grant.note() {
+                eprintln!("{note}");
+            }
+            let granted = grant.granted();
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "port": port.name(), "authorized": true, "granted": granted
+                        "port": port.name(),
+                        "authorized": true,
+                        "granted": granted,
+                        "grant_skipped": grant.skipped(),
                     })
                 );
             } else {
@@ -693,54 +779,162 @@ fn authorize(name: &str, json: bool, held: CapState) -> i32 {
     }
 }
 
+/// The replug envelope: everything `cycle` and `hold` do identically, written once.
+///
+/// The two verbs differ in exactly three places — how long the device stays down,
+/// what a failed reauthorization means to the caller, and what the caller is told —
+/// and until this factoring every *other* step was pasted twice: resolve the port
+/// names, gate on the capability, arm crash safety, write `authorized=0` with a
+/// rollback, write `authorized=1` in reverse order, hand the caller back access to
+/// the node that came back. Roughly ninety duplicated lines, and the duplication had
+/// already done what duplication does (plan §18 item 52 (c)): the grant step existed
+/// at three sites, one of them had drifted into passing `json: true` at a call whose
+/// only effect was to suppress §15.55's promised note, and the reauthorize loops had
+/// drifted apart in what they do after the first refusal.
+///
+/// The rule this establishes: a difference between the two verbs is a **parameter**,
+/// or a step the caller takes for itself around the envelope. It cannot go on being
+/// an accident of which copy someone last edited.
+struct Envelope {
+    ports: Vec<Port>,
+    dry_run: bool,
+    /// Whether a refusal raised inside the envelope prints JSON on stdout instead of
+    /// prose on stderr. `cycle` passes its `--json`; `hold` has no such flag and
+    /// passes `false`, which is what it has always done.
+    json: bool,
+    /// The pid that started this process, sampled once before the first write. Both
+    /// hold loops re-check it: a parent that dies is a caller that will never close
+    /// the leash, and the device has to come back anyway.
+    parent: u32,
+}
+
+impl Envelope {
+    /// Resolve, gate, and arm crash safety — everything that must succeed *before*
+    /// any write happens, so a failure here can never leave hardware down.
+    ///
+    /// `verb` appears in exactly one message and switches no behaviour.
+    fn open(
+        names: &[String],
+        dry_run: bool,
+        json: bool,
+        held: CapState,
+        verb: &str,
+    ) -> Result<Self, i32> {
+        let mut ports = Vec::new();
+        for name in names {
+            match open_port(name) {
+                Ok(p) => ports.push(p),
+                Err(e) => return Err(refuse(&e, json)),
+            }
+        }
+        if !dry_run && let Some(code) = require_capability(held, json) {
+            return Err(code);
+        }
+        // Crash safety, installed before the first write and not before: everything
+        // above this point can fail without leaving hardware down.
+        let parent = std::os::unix::process::parent_id();
+        let _ = caps::catch_terminate();
+        let _ = caps::set_pdeathsig_term();
+        // The pdeathsig race: if the parent died between spawn and the call above,
+        // the signal will never come, so check once explicitly.
+        if !caps::parent_is(parent) {
+            return Err(refuse(
+                &format!("parent exited before the {verb} began; refusing to start"),
+                json,
+            ));
+        }
+        Ok(Self {
+            ports,
+            dry_run,
+            json,
+            parent,
+        })
+    }
+
+    /// Deauthorize every port in the order given; the returned instant is the moment
+    /// the last one went down.
+    ///
+    /// A refused write puts back whatever already went down before reporting: a
+    /// helper that leaves half a rig deauthorized because the second port refused is
+    /// exactly the state §15.45's crash-safety argument exists to prevent.
+    fn down(&self) -> Result<Instant, i32> {
+        if !self.dry_run {
+            for port in &self.ports {
+                if let Err(e) = sysfs::set_authorized(port, false) {
+                    // Best effort to undo whatever already went down, then report.
+                    for done in &self.ports {
+                        let _ = sysfs::set_authorized(done, true);
+                    }
+                    return Err(refuse(
+                        &format!("writing authorized=0 on {port}: {e}"),
+                        self.json,
+                    ));
+                }
+            }
+        }
+        Ok(Instant::now())
+    }
+
+    /// Reauthorize in **reverse** order, and report every port that refused as
+    /// `(port name, error)`.
+    ///
+    /// Reverse because the device that returns first takes the lowest free minor,
+    /// which is how two adapters cycled together come back renumbered — the effect
+    /// `identity_survives_a_replug_that_renumbers_the_tty` is built on.
+    ///
+    /// **Every port is attempted, even after one fails**, and that is where the two
+    /// pasted copies had drifted: `hold` collected failures and carried on, `cycle`
+    /// returned at the first and left the remaining devices deauthorized with no
+    /// further attempt. Neither shape was argued for anywhere. The envelope takes the
+    /// one that puts more hardware back — a device left off the bus is the worst
+    /// thing this helper can do (AGENTS §8's "a run that died mid-replug leaves a USB
+    /// adapter deauthorized") — and each caller still decides what a failure *means*.
+    fn up(&self) -> Vec<(String, String)> {
+        let mut failures = Vec::new();
+        if !self.dry_run {
+            for port in self.ports.iter().rev() {
+                if let Err(e) = sysfs::set_authorized(port, true) {
+                    failures.push((port.name().to_owned(), e.to_string()));
+                }
+            }
+        }
+        failures
+    }
+
+    /// Hand the invoking user back read/write on every tty these ports own.
+    ///
+    /// The one grant site. Its outcome is a [`GrantOutcome`] rather than a printed
+    /// note, because the three callers report in three different shapes and the
+    /// previous arrangement — print from in here, only when the caller was not in
+    /// JSON mode — is what made §15.55's promise silent for `hold` (item 52 (b)).
+    fn grant(&self) -> GrantOutcome {
+        grant_after_reauthorize(&self.ports, self.dry_run)
+    }
+}
+
 /// The replug. Deauthorize every port, hold, reauthorize in reverse order, then
 /// wait for each device's tty to come back.
 fn cycle(names: &[String], hold_ms: u64, dry_run: bool, json: bool, held: CapState) -> i32 {
-    let mut ports = Vec::new();
-    for name in names {
-        match open_port(name) {
-            Ok(p) => ports.push(p),
-            Err(e) => return refuse(&e, json),
-        }
-    }
-    if !dry_run && let Some(code) = require_capability(held, json) {
-        return code;
-    }
+    let env = match Envelope::open(names, dry_run, json, held, "cycle") {
+        Ok(e) => e,
+        Err(code) => return code,
+    };
+    let ports = &env.ports;
     let hold = Duration::from_millis(hold_ms).min(MAX_HOLD);
-
-    // Crash safety, installed before the first write and not before: everything
-    // above this point can fail without leaving hardware down.
-    let parent = std::os::unix::process::parent_id();
-    let _ = caps::catch_terminate();
-    let _ = caps::set_pdeathsig_term();
-    // The pdeathsig race: if the parent died between spawn and the call above, the
-    // signal will never come, so check once explicitly.
-    if !caps::parent_is(parent) {
-        return refuse(
-            "parent exited before the cycle began; refusing to start",
-            json,
-        );
-    }
 
     let before: Vec<serde_json::Value> = ports.iter().map(port_facts).collect();
     let started = Instant::now();
 
-    // Down, in the order given.
-    if !dry_run {
-        for port in &ports {
-            if let Err(e) = sysfs::set_authorized(port, false) {
-                // Best effort to undo whatever already went down, then report.
-                for done in &ports {
-                    let _ = sysfs::set_authorized(done, true);
-                }
-                return refuse(&format!("writing authorized=0 on {port}: {e}"), json);
-            }
-        }
-    }
+    let down_at = match env.down() {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
 
     // Hold, watching for a signal so a terminated helper still puts the hardware
     // back. This is the only sleep in the binary and it is the experiment's
-    // variable, not a wait for something to become true.
+    // variable, not a wait for something to become true — which is why it stays here
+    // rather than moving into the envelope: it is one of the three things that make
+    // `cycle` a different verb from `hold`.
     //
     // The hold is also the **only** window in which the disconnect is observable,
     // which is why the discriminator is sampled here rather than inferred
@@ -755,7 +949,6 @@ fn cycle(names: &[String], hold_ms: u64, dry_run: bool, json: bool, held: CapSta
     let mut cut_short = false;
     let mut vanished: Vec<bool> = vec![false; ports.len()];
     let mut vanish_ms: Vec<Option<u64>> = vec![None; ports.len()];
-    let down_at = Instant::now();
     let hold_until = down_at + hold;
     while Instant::now() < hold_until {
         for (i, port) in ports.iter().enumerate() {
@@ -764,33 +957,30 @@ fn cycle(names: &[String], hold_ms: u64, dry_run: bool, json: bool, held: CapSta
                 vanish_ms[i] = Some(down_at.elapsed().as_millis() as u64);
             }
         }
-        if caps::terminate_requested() || !caps::parent_is(parent) {
+        if caps::terminate_requested() || !caps::parent_is(env.parent) {
             cut_short = true;
             break;
         }
         std::thread::sleep(TERMINATE_POLL.min(hold_until - Instant::now()));
     }
 
-    // Up, in reverse: the device that returns first takes the lowest free minor,
-    // which is how two adapters cycled together come back renumbered.
-    if !dry_run {
-        for port in ports.iter().rev() {
-            if let Err(e) = sysfs::set_authorized(port, true) {
-                return refuse(
-                    &format!(
-                        "writing authorized=1 on {port}: {e} — the device is still \
-                         deauthorized; repair with `authorize --port {port}`"
-                    ),
-                    json,
-                );
-            }
-        }
+    if let Some((port, e)) = env.up().first() {
+        return refuse(
+            &format!(
+                "writing authorized=1 on {port}: {e} — the device is still \
+                 deauthorized; repair with `authorize --port {port}`"
+            ),
+            json,
+        );
     }
 
     // Wait for the kernel, never sleep for it. Reported per port so a failure is
     // attributable to enumeration rather than to whatever the caller does next.
+    // `cycle`'s post-condition — every tty is back, or this verb refuses — is the
+    // second of the three things that separate it from `hold`, whose contract is
+    // that the caller owns the timing; so the wait stays per-verb.
     let mut waits = Vec::new();
-    for port in &ports {
+    for port in ports {
         let began = Instant::now();
         let mut back = false;
         while began.elapsed() < REENUMERATION_DEADLINE {
@@ -826,14 +1016,13 @@ fn cycle(names: &[String], hold_ms: u64, dry_run: bool, json: bool, held: CapSta
     // Every tty is back by here (the wait loop above refuses otherwise), so this is
     // the moment the caller's access can be restored — and it must be, because the
     // node the cycle brought back is a new inode that inherited nothing (§15.55).
-    let granted = if dry_run {
-        Vec::new()
-    } else {
-        match grant_after_reauthorize(&ports, json) {
-            Ok(g) => g,
-            Err(code) => return code,
-        }
-    };
+    let grant = env.grant();
+    if let Some(e) = grant.failed() {
+        return refuse(e, json);
+    }
+    if !json && let Some(note) = grant.note() {
+        eprintln!("{note}");
+    }
 
     let after: Vec<serde_json::Value> = ports.iter().map(port_facts).collect();
     let report = serde_json::json!({
@@ -844,7 +1033,10 @@ fn cycle(names: &[String], hold_ms: u64, dry_run: bool, json: bool, held: CapSta
         "before": before,
         "after": after,
         "waits": waits,
-        "granted": granted,
+        "granted": grant.granted(),
+        // §15.55's note, in the field a JSON caller can read. `null` when the grant
+        // happened; a reason, never a bare `true`, when it did not (item 52 (b)).
+        "grant_skipped": grant.skipped(),
     });
     if json {
         println!("{report}");
@@ -871,45 +1063,25 @@ fn cycle(names: &[String], hold_ms: u64, dry_run: bool, json: bool, held: CapSta
 fn hold_until_eof(names: &[String], max_ms: u64, dry_run: bool, held: CapState) -> i32 {
     use std::io::{BufRead, Write};
 
-    let mut ports = Vec::new();
-    for name in names {
-        match open_port(name) {
-            Ok(p) => ports.push(p),
-            Err(e) => return refuse(&e, false),
-        }
-    }
-    if !dry_run && let Some(code) = require_capability(held, false) {
-        return code;
-    }
+    // `json: false` — `hold` has no `--json` flag. Its two report lines are always
+    // JSON; a *refusal* raised before the protocol starts is prose on stderr, which
+    // is what a caller that never got a `down` line can actually read.
+    let env = match Envelope::open(names, dry_run, false, held, "hold") {
+        Ok(e) => e,
+        Err(code) => return code,
+    };
     let ceiling = Duration::from_millis(max_ms).min(MAX_HOLD);
 
-    let parent = std::os::unix::process::parent_id();
-    let _ = caps::catch_terminate();
-    let _ = caps::set_pdeathsig_term();
-    if !caps::parent_is(parent) {
-        return refuse(
-            "parent exited before the hold began; refusing to start",
-            false,
-        );
-    }
-
-    if !dry_run {
-        for port in &ports {
-            if let Err(e) = sysfs::set_authorized(port, false) {
-                for done in &ports {
-                    let _ = sysfs::set_authorized(done, true);
-                }
-                return refuse(&format!("writing authorized=0 on {port}: {e}"), false);
-            }
-        }
-    }
-    let down_at = Instant::now();
+    let down_at = match env.down() {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
     println!(
         "{}",
         serde_json::json!({
             "state": "down",
             "dry_run": dry_run,
-            "ports": ports.iter().map(|p| p.name()).collect::<Vec<_>>(),
+            "ports": env.ports.iter().map(|p| p.name()).collect::<Vec<_>>(),
             "max_hold_ms": ceiling.as_millis() as u64,
         })
     );
@@ -917,7 +1089,9 @@ fn hold_until_eof(names: &[String], max_ms: u64, dry_run: bool, held: CapState) 
 
     // Wait for EOF on stdin. A caller that dies — for any reason, including
     // SIGKILL — closes its end, so this returns and the device comes back. The
-    // ceiling covers a caller that lives but never closes.
+    // ceiling covers a caller that lives but never closes. This is the first of the
+    // three things that make `hold` a different verb from `cycle`: the outage's
+    // length belongs to the caller, not to this binary.
     let released_by = {
         let stdin = std::io::stdin();
         let mut line = String::new();
@@ -927,7 +1101,7 @@ fn hold_until_eof(names: &[String], max_ms: u64, dry_run: bool, held: CapState) 
                 reason = "max-ms";
                 break;
             }
-            if caps::terminate_requested() || !caps::parent_is(parent) {
+            if caps::terminate_requested() || !caps::parent_is(env.parent) {
                 reason = "signal";
                 break;
             }
@@ -944,48 +1118,104 @@ fn hold_until_eof(names: &[String], max_ms: u64, dry_run: bool, held: CapState) 
         reason
     };
 
-    let mut failures = Vec::new();
-    if !dry_run {
-        for port in ports.iter().rev() {
-            if let Err(e) = sysfs::set_authorized(port, true) {
-                failures.push(format!("{port}: {e}"));
+    let failures = env.up();
+    let grant = if failures.is_empty() {
+        // The device is back; the node it came back on is new and inaccessible.
+        // Wait briefly for the tty, then restore the caller's access to it (§15.55).
+        // Bounded and non-fatal: `hold`'s contract is that the caller owns the
+        // timing, so a tty that has not appeared yet is reported as nothing granted
+        // rather than as a failure of the hold. That is the third difference from
+        // `cycle`, whose wait refuses — and it is why the wait is here and not in
+        // the envelope.
+        if !dry_run {
+            let began = Instant::now();
+            while began.elapsed() < REENUMERATION_DEADLINE
+                && env.ports.iter().any(|p| sysfs::ttys(p).is_empty())
+            {
+                std::thread::sleep(Duration::from_millis(5));
             }
         }
-    }
-    // The device is back; the node it came back on is new and inaccessible. Wait
-    // briefly for the tty, then restore the caller's access to it (§15.55). Bounded
-    // and non-fatal: `hold`'s contract is that the caller owns the timing, so a tty
-    // that has not appeared yet is reported as nothing granted rather than as a
-    // failure of the hold.
-    let mut granted = Vec::new();
-    if !dry_run && failures.is_empty() {
-        let began = Instant::now();
-        while began.elapsed() < REENUMERATION_DEADLINE
-            && ports.iter().any(|p| sysfs::ttys(p).is_empty())
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        match grant_after_reauthorize(&ports, true) {
-            Ok(g) => granted = g,
-            Err(code) => return code,
-        }
-    }
-    println!(
-        "{}",
-        serde_json::json!({
-            "state": "up",
-            "held_ms": down_at.elapsed().as_millis() as u64,
-            "released_by": released_by,
-            "reauthorize_failures": failures,
-            "granted": granted,
-        })
-    );
-    let _ = std::io::stdout().flush();
-    if failures.is_empty() {
-        exit::READY
+        env.grant()
     } else {
-        exit::FAILED
+        GrantOutcome::Skipped(grant_skip::REAUTHORIZE_FAILED)
+    };
+
+    let (up_line, conclusion) = hold_conclusion(
+        down_at.elapsed().as_millis() as u64,
+        released_by,
+        &failures,
+        &grant,
+    );
+    println!("{up_line}");
+    let _ = std::io::stdout().flush();
+    match conclusion {
+        HoldExit::Ready => exit::READY,
+        HoldExit::ReauthorizeFailed => exit::FAILED,
+        // The `up` line is already out, which is the whole of item 52 (b)'s second
+        // half. What follows is the refusal object and the exit code this case has
+        // always produced — now *after* the line the two-line protocol promises,
+        // rather than instead of it.
+        HoldExit::GrantFailed(e) => refuse(&e, true),
     }
+}
+
+/// What `hold` leaves with once the device is back.
+#[derive(Debug, PartialEq, Eq)]
+enum HoldExit {
+    Ready,
+    /// A port refused `authorized=1`. The device may still be down; the failures are
+    /// in the `up` line.
+    ReauthorizeFailed,
+    /// The device came back and the caller's access did not.
+    GrantFailed(String),
+}
+
+/// `hold`'s `up` line and its exit, produced **as one value**.
+///
+/// The defect plan §18 item 52 (b) names is a `return` in the middle of this tail: a
+/// grant failure left the verb before the `up` line its two-line protocol promises,
+/// so a caller reading line-by-line got a `down`, then a refusal object where the
+/// `up` belonged, and no `held_ms`, `released_by` or `reauthorize_failures` at all —
+/// on the one path where knowing whether the device came back matters most.
+///
+/// Expressing the conclusion as data rather than as control flow is what makes that
+/// unrepresentable: the line and the exit are computed together, so there is no order
+/// of statements in which the caller can reach the second without the first. It is
+/// also what makes the property testable at all — no unprivileged test can make a
+/// real grant fail, so the branch is asserted directly rather than through a proxy
+/// (AGENTS §9), exactly as [`unhardened_disposition`] is.
+///
+/// Precedence is the one the verb has always had: a reauthorization failure outranks
+/// a grant failure, because a device still deauthorized is the worse state and the
+/// grant is skipped in that case rather than attempted.
+fn hold_conclusion(
+    held_ms: u64,
+    released_by: &str,
+    failures: &[(String, String)],
+    grant: &GrantOutcome,
+) -> (serde_json::Value, HoldExit) {
+    let line = serde_json::json!({
+        "state": "up",
+        "held_ms": held_ms,
+        "released_by": released_by,
+        "reauthorize_failures": failures
+            .iter()
+            .map(|(port, e)| format!("{port}: {e}"))
+            .collect::<Vec<_>>(),
+        "granted": grant.granted(),
+        // §15.55's promised note, in the only shape `hold` can carry one: it prints
+        // no prose at all, so before this field the promise was silent here (item 52).
+        "grant_skipped": grant.skipped(),
+        "grant_failed": grant.failed(),
+    });
+    let conclusion = if !failures.is_empty() {
+        HoldExit::ReauthorizeFailed
+    } else if let Some(e) = grant.failed() {
+        HoldExit::GrantFailed(e.to_owned())
+    } else {
+        HoldExit::Ready
+    };
+    (line, conclusion)
 }
 
 fn install_verb(profile: &str, verify: bool, print_setcap: bool, held: CapState) -> i32 {
@@ -1026,14 +1256,19 @@ fn install_verb(profile: &str, verify: bool, print_setcap: bool, held: CapState)
             Err(e) => return refuse(&format!("{e}"), false),
         }
     }
+    sweep_orphaned_capabilities(&root, profile);
     match install::inspect(&root, profile) {
         Ok(state) => {
             let path = install::blessed_path(&root, profile);
             match state {
                 install::InstallState::Ready => {
+                    // Derived, never typed: this line printed the pre-§15.55
+                    // single-capability form until 2026-08-12 (plan §18 item 52 (e)),
+                    // naming a smaller grant than the file it was describing carried.
                     println!(
-                        "{}: ready (mode 0700, cap_dac_override +ep)",
-                        path.display()
+                        "{}: ready ({})",
+                        path.display(),
+                        install::ready_description()
                     );
                     exit::READY
                 }
@@ -1045,6 +1280,60 @@ fn install_verb(profile: &str, verify: bool, print_setcap: bool, held: CapState)
             }
         }
         Err(e) => refuse(&format!("inspecting the install: {e}"), false),
+    }
+}
+
+/// Remove any capability-carrying file left in `.snx-bin/<profile>/` that is not the
+/// copy that belongs there, and say so on stderr.
+///
+/// **Why this runs on `--verify` too.** `--verify` promises to report the state and
+/// change nothing — and what it promises that about is the *installed copy*, plus the
+/// password it will not ask for. Unlinking a stray is neither: it needs no privilege
+/// (write permission on a directory this tool created is enough — `setcap -r` would
+/// need root, which is why the sweep deletes rather than strips), and the stray is
+/// not part of the state being reported. Running it on both paths is what makes the
+/// invariant hold rather than merely be available: **every** `scripts/bless` run
+/// leaves exactly one capability-carrying file per profile directory, including the
+/// already-blessed fast path, which calls nothing but `install --verify`. A `--verify`
+/// that noticed a live root-equivalent capability nothing references and left it
+/// there would have done the diagnosis and skipped the cure, on the one class of file
+/// §15.45's narrowness argument is entirely about (notes §3.81 — the rename left
+/// exactly such an orphan).
+///
+/// Reported on stderr rather than stdout so anything parsing this verb's answer is
+/// unaffected, and **never fatal**: a directory that cannot be read is worth saying
+/// out loud and is not a reason to fail an install that otherwise worked.
+fn sweep_orphaned_capabilities(root: &std::path::Path, profile: &str) {
+    match install::sweep_orphans(root, profile) {
+        Ok(swept) => {
+            for entry in &swept {
+                let whose = if entry.orphan.ours {
+                    "a capability this tool grants"
+                } else {
+                    "a capability this tool never grants — worth a look at where it came from"
+                };
+                match &entry.error {
+                    None => eprintln!(
+                        "serial-nexus-devprep: removed orphaned blessed copy {} \
+                         (carried {}, {whose}); nothing references it and \
+                         `scripts/bless` reproduces it",
+                        entry.orphan.path.display(),
+                        entry.orphan.field,
+                    ),
+                    Some(e) => eprintln!(
+                        "serial-nexus-devprep: could NOT remove orphaned blessed copy {} \
+                         (carries {}, {whose}): {e} — delete it by hand",
+                        entry.orphan.path.display(),
+                        entry.orphan.field,
+                    ),
+                }
+            }
+        }
+        Err(e) => eprintln!(
+            "serial-nexus-devprep: could not sweep {}/{profile} for orphaned \
+             capabilities: {e}",
+            install::BIN_DIR,
+        ),
     }
 }
 
@@ -1230,5 +1519,119 @@ mod tests {
             install::REQUIRED_CAPS.len() >= 2,
             "REQUIRED_CAPS is the set this folds; §15.55 put two in it"
         );
+    }
+
+    /// §15.55's skip-with-a-note is a **field**, not a prose side effect — which is
+    /// what makes it visible to the JSON callers that are the majority of them
+    /// (plan §18 item 52 (b)).
+    ///
+    /// **Fail-first, recorded.** Reverting [`GrantOutcome::skipped`] to `None` — the
+    /// shape the tree had, where the skip was folded into an empty-success `Ok(vec![])`
+    /// and the note printed only when the caller was *not* in JSON mode — turns the
+    /// three `grant_skipped` assertions below red at once. It also, as the third
+    /// assertion pins, makes "granted nothing because there is no tty right now"
+    /// indistinguishable from "granted nothing because this copy never can".
+    #[test]
+    fn a_skipped_grant_says_why_in_the_json_and_not_only_in_prose() {
+        let skipped = GrantOutcome::Skipped(grant_skip::NO_FOWNER);
+        assert_eq!(skipped.skipped(), Some(grant_skip::NO_FOWNER));
+        assert!(skipped.granted().is_empty());
+        assert_eq!(skipped.failed(), None);
+        assert!(
+            skipped.note().is_some_and(|n| n.contains("cap_fowner")),
+            "the prose callers still get the sentence §15.55 promises"
+        );
+
+        // The distinction the field exists to draw: a real grant of zero nodes.
+        let nothing_to_do = GrantOutcome::Granted(Vec::new());
+        assert_eq!(
+            nothing_to_do.skipped(),
+            None,
+            "a port that owns no tty right now was granted, not skipped — and only \
+             `grant_skipped` can tell a caller which of the two produced `granted: []`"
+        );
+        assert_eq!(nothing_to_do.note(), None);
+
+        let failed = GrantOutcome::Failed("setxattr: EPERM".to_owned());
+        assert_eq!(failed.failed(), Some("setxattr: EPERM"));
+        assert_eq!(
+            failed.skipped(),
+            None,
+            "a fault is raised, never reported as a skip: §15.55 makes exactly one of \
+             the two survivable"
+        );
+
+        // A dry run grants nothing because nothing lost access — a third reason,
+        // and the control property depends on saying so rather than on an empty list.
+        assert_eq!(
+            GrantOutcome::Skipped(grant_skip::DRY_RUN).skipped(),
+            Some(grant_skip::DRY_RUN)
+        );
+    }
+
+    /// `hold` emits its `up` line **before** it reports a grant failure, because the
+    /// line and the exit are one value (plan §18 item 52 (b)).
+    ///
+    /// The branch is unreachable from an unprivileged suite — making a real grant
+    /// fail needs a process holding `CAP_FOWNER` and a tty it cannot write — so the
+    /// decision is factored out of the verb and asserted here rather than through a
+    /// proxy that would pass for the wrong reason (AGENTS §9), exactly as
+    /// [`unhardened_disposition`] is.
+    ///
+    /// **Fail-first, recorded.** The defect is the shape the tree had: a grant
+    /// failure `return`ed `refuse(...)` from the middle of the tail, so no `up` line
+    /// was printed at all. Planted here as a [`hold_conclusion`] that answers
+    /// `(Value::Null, HoldExit::GrantFailed(..))` on that branch, the first assertion
+    /// below goes red on `state`.
+    #[test]
+    fn hold_reports_up_even_when_the_grant_failed() {
+        let (line, conclusion) = hold_conclusion(
+            1500,
+            "stdin-eof",
+            &[],
+            &GrantOutcome::Failed("granting 1000 read/write on /dev/ttyUSB0: EPERM".to_owned()),
+        );
+        assert_eq!(
+            line["state"], "up",
+            "the two-line protocol promises an `up` line; a caller reading it \
+             line-by-line must not be handed a refusal where the line belongs"
+        );
+        assert_eq!(line["held_ms"], 1500);
+        assert_eq!(line["released_by"], "stdin-eof");
+        assert!(
+            line["grant_failed"]
+                .as_str()
+                .is_some_and(|s| s.contains("EPERM")),
+            "and the failure travels in the line, not only in the exit code: {line}"
+        );
+        assert!(
+            matches!(conclusion, HoldExit::GrantFailed(ref e) if e.contains("EPERM")),
+            "the exit still says the grant failed"
+        );
+
+        // Precedence, unchanged: a device still deauthorized outranks a lost ACL,
+        // and the grant is skipped rather than attempted in that case.
+        let (line, conclusion) = hold_conclusion(
+            10,
+            "signal",
+            &[("3-1".to_owned(), "EIO".to_owned())],
+            &GrantOutcome::Skipped(grant_skip::REAUTHORIZE_FAILED),
+        );
+        assert_eq!(line["state"], "up");
+        assert_eq!(line["reauthorize_failures"][0], "3-1: EIO");
+        assert_eq!(line["grant_skipped"], grant_skip::REAUTHORIZE_FAILED);
+        assert_eq!(conclusion, HoldExit::ReauthorizeFailed);
+
+        // And the ordinary path: an `up` line with a grant and no excuse on it.
+        let (line, conclusion) = hold_conclusion(
+            200,
+            "max-ms",
+            &[],
+            &GrantOutcome::Granted(vec!["/dev/ttyUSB0".to_owned()]),
+        );
+        assert_eq!(line["granted"][0], "/dev/ttyUSB0");
+        assert_eq!(line["grant_skipped"], serde_json::Value::Null);
+        assert_eq!(line["grant_failed"], serde_json::Value::Null);
+        assert_eq!(conclusion, HoldExit::Ready);
     }
 }

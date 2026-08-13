@@ -31,7 +31,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use serial_nexus_itest::{Daemon, Rpc, Sim, serial_echo, wait_until};
+use serial_nexus_itest::{Daemon, Rpc, Sim, serial_echo, skip_no_exec_codec, wait_until};
 
 /// Absolute path to a fixture under the workspace's `tests/ext-codec/`, derived from
 /// this crate's compile-time manifest dir — the portable replacement for the bash's
@@ -159,8 +159,13 @@ fn exec_codec_crash_faults_restarts_and_data_plane_survives() {
         return;
     };
     if !have_python3() {
-        eprintln!(
-            "SKIP exec_codec_crash_faults_restarts_and_data_plane_survives: python3 not found"
+        // The serial-device skips above stay plain `eprintln!`s: a pty cannot be a
+        // serial device off Linux, which is a platform fact `SNX_EXEC_CODEC` must not
+        // redden. This one is the provisionable prerequisite (plan §3 rule 11, §18
+        // item 49).
+        skip_no_exec_codec(
+            "exec_codec_crash_faults_restarts_and_data_plane_survives",
+            "python3 not found",
         );
         return;
     }

@@ -13,7 +13,10 @@
 //! Needs NO serial *device* — the child speaks the envelope over a plain pipe — so this
 //! runs on every platform. It does require an external `python3` (the any-language
 //! escape hatch's demonstration child); absent it, the test skips with a note rather
-//! than flaking an environmental failure.
+//! than flaking an environmental failure — and where the interpreter is provisioned on
+//! purpose, **`SNX_EXEC_CODEC=required`** turns that skip back into a failure
+//! ([`serial_nexus_itest::skip_no_exec_codec`], plan §3 rule 11 / §18 item 49), so the
+//! only end-to-end proof §8's envelope round-trips cannot go green by not running.
 //!
 //! Assertions preserved from the bash's single `jq -e` gate over the verdict:
 //!   * `.pass == true`
@@ -25,7 +28,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::Value;
-use serial_nexus_itest::bin;
+use serial_nexus_itest::{bin, skip_no_exec_codec};
 
 /// The workspace root — the parent of this crate's manifest directory. The passthrough
 /// child lives at `<repo>/tests/ext-codec/passthrough.py` (as the bash's `$REPO_ROOT`
@@ -51,7 +54,10 @@ fn have_python3() -> bool {
 #[test]
 fn envelope_passthrough_child_reemits_golden_battery() {
     if !have_python3() {
-        eprintln!("SKIP envelope_passthrough_child_reemits_golden_battery: no python3 on PATH");
+        skip_no_exec_codec(
+            "envelope_passthrough_child_reemits_golden_battery",
+            "no python3 on PATH",
+        );
         return;
     }
     let passthrough = repo_root().join("tests/ext-codec/passthrough.py");

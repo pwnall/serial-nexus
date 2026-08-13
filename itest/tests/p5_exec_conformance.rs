@@ -24,7 +24,12 @@
 //!   --workspace` already builds `serial-nexus-sim`, and [`serial_nexus_itest::bin`] asserts it exists.
 //! * The bash `fail`s if `python3` is absent; a portable test instead **skips** (an
 //!   environmental prerequisite, like a missing serial device). `sh -c` and `python3`
-//!   are present on the Linux/macOS boxes this suite targets.
+//!   are present on the Linux/macOS boxes this suite targets — and where they are
+//!   provisioned on purpose, **`SNX_EXEC_CODEC=required`** turns the skip back into a
+//!   failure ([`serial_nexus_itest::skip_no_exec_codec`], plan §3 rule 11 / §18 item
+//!   49): ten of this file's tests self-skip on one missing interpreter, so an image
+//!   that dropped it would have reported the whole battery green without running a
+//!   byte of it.
 //! * The three sub-checks become three self-contained `#[test]`s (each spawns its own
 //!   sim), so a failure is attributable to one fixture.
 //!
@@ -36,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde_json::Value;
-use serial_nexus_itest::{TempRun, bin};
+use serial_nexus_itest::{TempRun, bin, skip_no_exec_codec};
 
 /// Absolute path to a fixture under the workspace's `tests/ext-codec/`. Derived from
 /// this crate's compile-time manifest dir (`itest/` — the directory, §15.40), so it is location- and
@@ -135,7 +140,10 @@ fn error_arm(v: &Value, arm: &str) -> (bool, String) {
 #[test]
 fn passthrough_passes_every_conformance_check() {
     if !have_python3() {
-        eprintln!("SKIP passthrough_passes_every_conformance_check: python3 not found");
+        skip_no_exec_codec(
+            "passthrough_passes_every_conformance_check",
+            "python3 not found",
+        );
         return;
     }
     let v = run_conformance("passthrough.py", &[]);
@@ -159,7 +167,10 @@ fn passthrough_passes_every_conformance_check() {
 #[test]
 fn bounded_lag_codec_is_not_wrongly_rejected() {
     if !have_python3() {
-        eprintln!("SKIP bounded_lag_codec_is_not_wrongly_rejected: python3 not found");
+        skip_no_exec_codec(
+            "bounded_lag_codec_is_not_wrongly_rejected",
+            "python3 not found",
+        );
         return;
     }
     let v = run_conformance("lag.py", &[]);
@@ -183,7 +194,10 @@ fn bounded_lag_codec_is_not_wrongly_rejected() {
 #[test]
 fn half_duplex_fixture_caught_by_liveness() {
     if !have_python3() {
-        eprintln!("SKIP half_duplex_fixture_caught_by_liveness: python3 not found");
+        skip_no_exec_codec(
+            "half_duplex_fixture_caught_by_liveness",
+            "python3 not found",
+        );
         return;
     }
     let v = run_conformance("half-duplex.py", &["--frame-timeout-ms", "800"]);
@@ -228,7 +242,7 @@ fn half_duplex_fixture_caught_by_liveness() {
 #[test]
 fn a_passing_run_names_no_deadline() {
     if !have_python3() {
-        eprintln!("SKIP a_passing_run_names_no_deadline: python3 not found");
+        skip_no_exec_codec("a_passing_run_names_no_deadline", "python3 not found");
         return;
     }
     let v = run_conformance("passthrough.py", &[]);
@@ -255,7 +269,10 @@ fn a_passing_run_names_no_deadline() {
 #[test]
 fn a_declared_demux_shape_runs_the_whole_battery() {
     if !have_python3() {
-        eprintln!("SKIP a_declared_demux_shape_runs_the_whole_battery: python3 not found");
+        skip_no_exec_codec(
+            "a_declared_demux_shape_runs_the_whole_battery",
+            "python3 not found",
+        );
         return;
     }
     // The fixture takes its real channel as argv[1]; the flag must name the same one.
@@ -294,8 +311,9 @@ fn a_declared_demux_shape_runs_the_whole_battery() {
 #[test]
 fn the_same_demux_fixture_fails_when_the_mapping_is_not_declared() {
     if !have_python3() {
-        eprintln!(
-            "SKIP the_same_demux_fixture_fails_when_the_mapping_is_not_declared: python3 not found"
+        skip_no_exec_codec(
+            "the_same_demux_fixture_fails_when_the_mapping_is_not_declared",
+            "python3 not found",
         );
         return;
     }
@@ -333,7 +351,10 @@ fn the_same_demux_fixture_fails_when_the_mapping_is_not_declared() {
 #[test]
 fn a_strict_codec_refuses_every_injected_decode_fault() {
     if !have_python3() {
-        eprintln!("SKIP a_strict_codec_refuses_every_injected_decode_fault: python3 not found");
+        skip_no_exec_codec(
+            "a_strict_codec_refuses_every_injected_decode_fault",
+            "python3 not found",
+        );
         return;
     }
     let v = run_conformance("strict.py", &["--error-paths"]);
@@ -371,7 +392,10 @@ fn a_strict_codec_refuses_every_injected_decode_fault() {
 #[test]
 fn a_permissive_codec_fails_every_error_path_arm() {
     if !have_python3() {
-        eprintln!("SKIP a_permissive_codec_fails_every_error_path_arm: python3 not found");
+        skip_no_exec_codec(
+            "a_permissive_codec_fails_every_error_path_arm",
+            "python3 not found",
+        );
         return;
     }
     let v = run_conformance("passthrough.py", &["--error-paths"]);
@@ -412,8 +436,9 @@ fn a_permissive_codec_fails_every_error_path_arm() {
 #[test]
 fn error_paths_are_absent_from_a_run_that_did_not_ask_for_them() {
     if !have_python3() {
-        eprintln!(
-            "SKIP error_paths_are_absent_from_a_run_that_did_not_ask_for_them: python3 not found"
+        skip_no_exec_codec(
+            "error_paths_are_absent_from_a_run_that_did_not_ask_for_them",
+            "python3 not found",
         );
         return;
     }
@@ -434,7 +459,10 @@ fn error_paths_are_absent_from_a_run_that_did_not_ask_for_them() {
 #[test]
 fn a_fixture_path_containing_a_space_still_runs() {
     if !have_python3() {
-        eprintln!("SKIP a_fixture_path_containing_a_space_still_runs: python3 not found");
+        skip_no_exec_codec(
+            "a_fixture_path_containing_a_space_still_runs",
+            "python3 not found",
+        );
         return;
     }
     let run = TempRun::new();

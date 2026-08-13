@@ -8,8 +8,43 @@
   },
   "idle_cost": {
     "idle_tty_fds": 32,
-    "total_cpu_percent": 2.00,
+    "baseline_tty_fds": 8,
     "budget_percent": 20,
-    "mechanism": "adaptive poll backoff to IDLE_POLL when quiescent (§15.18)"
+    "per_fd_cpu_percent": 0.0728,
+    "total_cpu_percent": 2.00,
+    "total_cpu_percent_status": "HISTORICAL. A single total at 32 idle fds from the original phase-3 benchmark script: no box, no date, no commit, and no baseline rung, so it cannot be decomposed into the daemon's fixed cost and the per-fd cost the poll backoff actually controls. Kept as the record it is. It is no longer the derivation for the drift tripwire, because an absolute total is dominated by the fixed term: on the 20-core box below the fixed term alone is 1.194 %, so 1.75x of this 2.00 % put the ceiling at 3.50 % where the healthy reading is 3.3-3.6 % and the guard fired with the mechanism measurably intact (plan §18 item 46). The 20 % budget_percent beside it is unchanged and is still the recorded exit criterion.",
+    "mechanism": "adaptive poll backoff to IDLE_POLL when quiescent (§15.18/§15.19)",
+    "per_fd_provenance": {
+      "what": "per_fd_cpu_percent is the marginal cost of one additional idle tty fd, in percent of one core. It is the quantity design §15.19 records (~0.06 %/fd) and the quantity the ACTIVE_POLL->IDLE_POLL backoff controls; the fixed cost of a running daemon is a different term and belongs to the box.",
+      "box": "20-core x86_64, Linux 7.0.0-29-generic, load between 1.0 and 2.5 at every sample",
+      "date": "2026-08-12",
+      "commit": "e135b53",
+      "window_seconds": 10,
+      "healthy_percent_of_a_core": {
+        "1": [1.30, 1.10, 1.20],
+        "2": [1.40, 1.20, 1.40],
+        "8": [1.90, 1.70, 1.80],
+        "16": [2.30, 2.40, 2.70],
+        "32": [3.60, 3.30, 3.50]
+      },
+      "healthy_least_squares": {
+        "slope_percent_per_fd": 0.0728,
+        "intercept_percent": 1.194,
+        "points": 15
+      },
+      "control": "the same sweep with daemon/src/runtime.rs's `back_off` body replaced by `let _ = wait;` and the workspace rebuilt, so every idle fd re-polls at ACTIVE_POLL forever",
+      "control_percent_of_a_core": {
+        "8": [4.80, 5.20],
+        "16": [7.10, 6.50],
+        "32": [9.80, 9.90]
+      },
+      "control_least_squares": {
+        "slope_percent_per_fd": 0.2004,
+        "intercept_percent": 3.476,
+        "points": 6
+      },
+      "separation": "2.75x in the slope (0.2004 / 0.0728). The healthy slope reproduces design §15.19's ~0.06 %/fd within 20 %, so the backoff has not regressed: that is the disposition plan §18 item 46 asked for, decided by measurement and REFUTING the 'the backoff regressed' branch of the guard's own failure message.",
+      "guard_form": "itest/tests/p3_idle_cost.rs measures the two-rung difference (baseline_tty_fds -> idle_tty_fds) inside one daemon process, which cancels the fixed term by construction. On the healthy data above that form reads (3.467 - 1.800) / 24 = 0.069 %/fd, 5 % under the 15-point fit; on the control data it reads (9.850 - 5.000) / 24 = 0.202 %/fd."
+    }
   }
 }

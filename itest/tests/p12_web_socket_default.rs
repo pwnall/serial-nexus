@@ -50,10 +50,16 @@
 //! the equality is still meaningful there (the deleted copy diverged from it in the
 //! `XDG_RUNTIME_DIR`-set case), it is simply a weaker fixture.
 //!
-//! Fail-first (plan §3 rule 4): with the two-arm copy restored in `web/src/rpc.rs`, the
-//! `unset` and `empty` cases fail naming both paths — `/run/serial-nexus-daemon.sock`
-//! against `/tmp/serial-nexus-daemon-1000.sock`. The `set` case passes either way, which
-//! is precisely why it cannot be the only case.
+//! Fail-first (plan §3 rule 4): with the two-arm copy restored, the `unset` and `empty`
+//! cases fail naming both paths — `/run/serial-nexus-daemon.sock` against
+//! `/tmp/serial-nexus-daemon-1000.sock`. The `set` case passes either way, which is
+//! precisely why it cannot be the only case. (That copy lived in the console's own `rpc`
+//! module; the module itself is gone since plan §18 item 51 hoisted the last thing in it
+//! — the §17.3 rename-window fallback, which `ctl` implemented identically — into
+//! `serial_nexus_rpc`. The console's socket resolution is now one call in `web/src/main.rs`,
+//! and `p13_legacy_defaults`'s fifth test is what asserts that call is the shared one:
+//! this guard passes with the console re-pointed at `default_socket_path`, because no
+//! fixture here has a pre-rename socket in it.)
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;

@@ -530,8 +530,28 @@ fn writer_loop(shared: &Shared, dir: PathBuf, filename: String, padding: usize, 
     shared.cv.notify_all();
 }
 
-/// The blocking writer drain: pull the queue, `write(2)` each chunk, perform each
-/// rotation *at its place in the stream*, and flush on close (§7.3).
+/// The blocking writer drain: pull the queue, `write(2)` each chunk, and perform
+/// each rotation *at its place in the stream* (§7.3).
+///
+/// **§7.3's "flush the queue" is drain-to-`write(2)`, and this loop is the whole of
+/// it.** A chunk has left the daemon when [`write_chunk`] returns: [`File`] carries
+/// no userspace buffer, and `std`'s `impl Write for File` implements `flush` as
+/// `Ok(())` on unix — it forwards to `sys::fs::unix::File::flush`, whose body is
+/// literally `Ok(())`. Three `let _ = file.flush()` calls used to stand here, at the
+/// `closing` return below, and in [`perform_rotation`], one of them gated by an `ok`
+/// flag that existed for nothing else. They were deleted rather than left as
+/// documentation, because a no-op spelled like a durability step gets read as one —
+/// and the `ok` flag made the first of them look like a *policy* decision about when
+/// data is safe (plan §18 item 55).
+///
+/// **fsync is deliberately not owed here, and adding it is an amendment.** §16.6
+/// scopes durability to the state file — fsync the temp file and its directory
+/// around the rename — on the stated ground that config mutations are rare, so the
+/// cost is unmeasurable. A log is the opposite case: a console at line rate, where
+/// the same promise would put a disk round-trip on the per-batch path and turn
+/// §7.3's *bounded* teardown wait into a bound on the storage stack rather than on
+/// the queue. Extending §16.6 to logs is therefore a design amendment with a
+/// measurement behind it (AGENTS §5), never a patch to this function.
 fn writer_drain(shared: &Shared, dir: PathBuf, filename: String, padding: usize, mut file: File) {
     let current = dir.join(&filename);
     loop {
@@ -553,7 +573,6 @@ fn writer_drain(shared: &Shared, dir: PathBuf, filename: String, padding: usize,
 
         // Write the drained batch (blocking). On error, honor the policy: fault
         // the node (and stop), or drop-and-count and keep going.
-        let mut ok = true;
         for (i, item) in batch.iter().enumerate() {
             match item {
                 QueueItem::Bytes(chunk) => {
@@ -591,14 +610,12 @@ fn writer_drain(shared: &Shared, dir: PathBuf, filename: String, padding: usize,
                                     Some(format!("write {}: {e}", current.display()));
                             }
                         }
-                        ok = false;
                     }
                 }
                 QueueItem::Rotate => {
-                    match perform_rotation(shared, &dir, &filename, padding, &mut file) {
+                    match perform_rotation(shared, &dir, &filename, padding) {
                         Ok(f) => {
                             file = f;
-                            ok = true; // fresh file; nothing is pending on the old one
                         }
                         Err(()) => {
                             // Rotation faulted the node and the writer stops here,
@@ -613,16 +630,15 @@ fn writer_drain(shared: &Shared, dir: PathBuf, filename: String, padding: usize,
                 }
             }
         }
-        if ok {
-            let _ = file.flush();
-        }
-
         if closing {
             {
                 let mut q = shared.q.lock().unwrap();
                 q.draining_bytes = 0;
             }
-            let _ = file.flush();
+            // Nothing to flush on the way out (see this function's doc): every
+            // chunk reached the file inside `write_chunk`, and the queue is now
+            // empty and `closed` — which is exactly the condition §7.3's bounded
+            // teardown collector waits on.
             return;
         }
     }
@@ -680,19 +696,26 @@ fn abandon_queue(q: &mut Queue) {
     count_abandoned(q, orphaned.make_contiguous());
 }
 
-/// Perform one queued rotation exactly here in the stream (§7.3): flush, rename
-/// the current file to `<name>.NNN` (higher is newer), reopen fresh. Returns the
+/// Perform one queued rotation exactly here in the stream (§7.3): rename the
+/// current file to `<name>.NNN` (higher is newer), reopen fresh. Returns the
 /// reopened file, or `Err` after faulting the node — no bytes cross a rotation
 /// boundary mid-chunk either way.
+///
+/// The rename needs nothing flushed ahead of it: every chunk queued before this
+/// `Rotate` marker already went through `write(2)`, so the inode being renamed is
+/// complete by construction ([`writer_drain`]'s doc — the `let _ = file.flush()`
+/// that stood on the first line of this body was one of three no-ops deleted with
+/// plan §18 item 55). That flush was also the *only* use of the current file this
+/// function had, which is why it no longer takes one: rotation is a directory
+/// operation plus a reopen, and it never needed the open handle. The caller still
+/// owns that handle and replaces it with the returned one.
 fn perform_rotation(
     shared: &Shared,
     dir: &Path,
     filename: &str,
     padding: usize,
-    file: &mut File,
 ) -> Result<File, ()> {
     let current = dir.join(filename);
-    let _ = file.flush();
     let next = {
         let q = shared.q.lock().unwrap();
         q.rotation.map_or(0, |n| n.saturating_add(1))

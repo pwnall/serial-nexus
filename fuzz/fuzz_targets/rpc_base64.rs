@@ -1,4 +1,5 @@
 #![no_main]
+#![forbid(unsafe_code)]
 //! Fuzz `serial_nexus_rpc::base64_decode`/`base64_encode` — the dependency-free codec that
 //! carries arbitrary console bytes inside a JSON string (`tap.data`, §10/§17).
 //!

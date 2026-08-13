@@ -132,18 +132,61 @@ jobs:
       # already names for the by-hand macOS cross-check, and it means a stolen cfg
       # inside `web`'s own test code still reaches only the macOS lane. Every other
       # crate — including `daemon`, where both recorded instances landed — is covered.
-      - name: Cross-check macOS test targets compile (catches stolen cfg attributes)
+      #
+      # **It runs `clippy`, not `check`, and that is plan §18 item 54.** Clippy does
+      # everything `cargo check` does and then lints, so this is strictly the wider
+      # instrument at nearly the same cost — and the class it adds is a real hole, not a
+      # tidiness one. Lints were running on Linux only: `clippy` (workspace and
+      # minimal-daemon) lived in this job and nowhere else, and the `macos` job runs no
+      # lint at all, so **cfg-gated-only-caller dead code was caught by nothing in CI**.
+      # A helper whose only caller is `#[cfg(target_os = "linux")]` is dead off Linux,
+      # and dead code is a `-D warnings` error.
+      #
+      # Measured on the development box before the change, planting exactly that shape in
+      # `sys/src/lib.rs` — an ungated private fn with one Linux-only caller (item 54's
+      # validation clause, read at its error text per plan §3 rule 17 f):
+      #
+      #   lane                                              exit   says
+      #   `cargo clippy --workspace` (Linux, this job)         0    nothing — blind
+      #   `cargo check --target aarch64-apple-darwin`          0    nothing — blind
+      #   `cargo clippy --target aarch64-apple-darwin`       101    error: function
+      #                                                             `item54_planted_helper`
+      #                                                             is never used
+      #
+      # So neither pre-existing lane saw it and this one does. All four invocations below
+      # are green on the unplanted tree, measured the same session.
+      #
+      # The minimal-daemon build gets the same treatment on both triples for the reason
+      # the Linux lane already gives it: the registry-as-value path is easy to leave with
+      # an unused binding when no codec is registered, and "unused" is exactly the class
+      # that changes meaning with the target.
+      - name: Cross-check macOS targets compile AND lint (stolen cfg + macOS-only dead code)
         run: |
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
           for t in aarch64-apple-darwin x86_64-apple-darwin; do
-            cargo check --target "$t" --workspace --exclude serial-nexus-web \
-              --all-targets --locked
+            cargo clippy --target "$t" --workspace --exclude serial-nexus-web \
+              --all-targets --locked -- -D warnings
+            cargo clippy --target "$t" -p serial-nexus-daemon-bin -p serial-nexus-daemon \
+              --no-default-features --locked -- -D warnings
           done
       # `cargo test` does NOT emit `target/debug/serial-nexus-daemon` (only the deps/ test
       # bins); the serial-nexus-itest harness boots that plain artifact, so build it first.
       - name: Build workspace binaries (serial-nexus-itest boots them as subprocesses)
         run: cargo build --workspace --locked
+      # `SNX_EXEC_CODEC=required` is the seventh instance of the one required-mode
+      # mechanism (plan §3 rule 11, plan §18 item 49), and this is the job that earns
+      # the right to set it: the ubuntu image provides python3, so a skip *here* is a
+      # runner that lost the interpreter, not a laptop without it. Thirteen tests over
+      # four files drive a codec child through it — the whole out-of-process extension
+      # surface §8 and §15.26 promise — and until item 49 no lane asserted they had
+      # executed, so an image that dropped python3 would have reported the entire
+      # battery green without running a byte of it. Rule 22's tell in its plainest form:
+      # the passing output and the not-running output are the same line, and libtest
+      # captures a passing test's stderr, so even the SKIP lines are invisible without
+      # `--nocapture` (notes §3.78).
       - name: Test (unit + property + serial-nexus-itest integration harness)
+        env:
+          SNX_EXEC_CODEC: required
         run: cargo test --workspace --locked
 
   # The licensing gate proven, not assumed (§13). cargo-deny plus the serial-nexus-itest test
@@ -214,8 +257,11 @@ jobs:
       # recompute can read, and the only one that records whether a value is a number,
       # a string or a boolean (notes §3.74). Uploading only the Markdown wrote the twin
       # and then threw it away at the end of every run — which is the half plan §18
-      # items 8 and 18 are owed captures of.
+      # items 8 and 18 are owed captures of. `!cancelled()` for the reason the macOS lane
+      # gives: a report that failed its expectation is the one most worth reading, and
+      # without the condition a red `jq -e` uploaded nothing at all.
       - uses: actions/upload-artifact@v5
+        if: ${{ !cancelled() }}
         with:
           name: serial-nexus-doctor-report
           path: |
@@ -259,27 +305,30 @@ jobs:
       # As on Linux: `cargo test` never emits the plain `target/debug/serial-nexus-daemon`
       # the serial-nexus-itest harness boots — build the workspace bins first.
       - name: Build workspace binaries (serial-nexus-itest boots them as subprocesses)
+        id: build
         run: cargo build --workspace --locked
-      # `--no-fail-fast` here and not on the Linux lane, because this is the lane nobody
-      # runs before pushing. `cargo test --workspace` stops at the first failing test
-      # BINARY, so a red macOS job reports one crate and says nothing about the 80-odd
-      # targets behind it — which is exactly how one failing unit test hid three more for
-      # six consecutive pushes (docs/macos.md, the 2026-07-28 block). The lesson was
-      # written down then and never reached this file; a job that is going to be red
-      # anyway costs nothing by being red *completely*.
-      - name: Build + test (portable core + integration harness; serial tests self-skip)
-        run: cargo test --workspace --locked --no-fail-fast
+      # **The gate runs BEFORE the tests, and that ordering is plan §18 item 48's second
+      # half.** It used to sit last, and every macOS run from at least 2026-08-10 to
+      # 2026-08-12 failed at the test step — a failed step skips the rest of the job, so
+      # the one gate AGENTS §3 says this lane gates on was not running at all. That is
+      # plan §3 rule 22's own class arriving by *placement* rather than by spelling: the
+      # step's passing output and its not-running output were both "nothing", and the
+      # first time it did execute it could not even exec the binary (notes §3.77, §3.83).
+      #
+      # The gate needs only `cargo build`, never `cargo test`, so the fix is to put it
+      # where its real dependency is. The test step below then carries an explicit
+      # condition so the swap does not simply move the hiding in the other direction: it
+      # runs whenever the *build* succeeded, whatever the gate did. Both signals now
+      # reach the lane on every run that compiled, which is the property that was missing.
       - name: Capability report + macos.jq gate
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
-          # **This step had not executed in any recent run.** Every macOS run since at
-          # least 2026-08-10 failed at the test step above, and a failed step skips the
-          # rest of the job — so the macOS jq gate AGENTS §3 names as the one this lane
-          # gates on was not running at all. The first execution, 2026-08-12, could not
-          # exec the doctor binary (`cannot execute binary file`) after `cargo build
-          # --workspace` had just built it and the harness had just run other binaries
-          # from the same directory. The diagnostic below is here to say why rather
-          # than let the next reader guess; it is cheap and it prints before the gate,
-          # so a green run carries the evidence too (notes §3.77).
+          # The diagnostic prints on green runs too, deliberately: 2026-08-12's ENOEXEC
+          # (`cannot execute binary file`, on a runner where `cargo build --workspace`
+          # had just succeeded) has not recurred and **no cause is claimed for it** — it
+          # was seen once and has not been seen since, which is not the same as explained
+          # (AGENTS §8). Evidence on every run is what makes the next occurrence
+          # diagnosable instead of guessable.
           uname -m; sw_vers || true
           ls -la target/debug/serial-nexus-doctor || true
           file target/debug/serial-nexus-doctor || true
@@ -289,8 +338,25 @@ jobs:
           ./target/debug/serial-nexus-doctor --markdown \
               --json-out serial-nexus-doctor-macos.json > serial-nexus-doctor-macos.md
           jq -e -f expectations/macos.jq serial-nexus-doctor-macos.json
-      # Both renderings — the Linux lane's reasoning, verbatim (notes §3.74).
+      # `--no-fail-fast` here and not on the Linux lane, because this is the lane nobody
+      # runs before pushing. `cargo test --workspace` stops at the first failing test
+      # BINARY, so a red macOS job reports one crate and says nothing about the 80-odd
+      # targets behind it — which is exactly how one failing unit test hid three more for
+      # six consecutive pushes (docs/macos.md, the 2026-07-28 block). The lesson was
+      # written down then and never reached this file; a job that is going to be red
+      # anyway costs nothing by being red *completely*.
+      #
+      # The condition is the other half of the reorder above: a red *gate* must not hide
+      # the suite any more than a red suite was allowed to hide the gate. It keys on the
+      # build because that is what this step actually needs.
+      - name: Build + test (portable core + integration harness; serial tests self-skip)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: cargo test --workspace --locked --no-fail-fast
+      # Both renderings — the Linux lane's reasoning, verbatim (notes §3.74). `!cancelled()`
+      # because a report that FAILED its expectation is the one most worth having in hand;
+      # without it a red gate uploaded nothing and left the reader with only the log.
       - uses: actions/upload-artifact@v5
+        if: ${{ !cancelled() }}
         with:
           name: serial-nexus-doctor-macos-report
           path: |

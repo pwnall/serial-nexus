@@ -1,4 +1,5 @@
 #![no_main]
+#![forbid(unsafe_code)]
 //! The daemon's control-socket **line framer** — `RequestLines` (review 26, SEC-7).
 //!
 //! This is the daemon's front door. It frames every byte a client writes to the 0600

@@ -328,7 +328,8 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"remove-node","params":{"node"
   "removed": "usb0",
   "cascaded_edges": 2,
   "released_locks": 1,
-  "purged_bytes": 41
+  "purged_bytes": 41,
+  "discarded_at_teardown": 0
 }
 ```
 

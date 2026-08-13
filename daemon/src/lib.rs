@@ -340,9 +340,12 @@ fn apply_socket_perms(path: &Path, group: Option<&str>) -> anyhow::Result<()> {
 /// The §10 socket path policy: privilege-based default, CLI-overridable.
 ///
 /// The policy itself lives in [`serial_nexus_rpc::default_socket_path`] (`rpc/src/socket.rs`)
-/// — one implementation, which `ctl` connects through (`ctl/src/main.rs`), the doctor prints
-/// (`doctor/src/probes.rs`) and the web console resolves through (`web/src/rpc.rs`), so the
-/// four can no longer disagree about where this daemon binds (notes §3.72, §3.75).
+/// — one implementation, which the doctor prints (`doctor/src/probes.rs`) and which both
+/// clients reach through one shared entry point, `rpc::socket::resolve_client_socket`: `ctl`
+/// (`ctl/src/main.rs`) and the web console (`web/src/main.rs`). So this daemon, the doctor and
+/// the two clients can no longer disagree about where this daemon binds (notes §3.72, §3.75;
+/// the client entry point is plan §18 item 51, which is also what deleted `web/src/rpc.rs` —
+/// named here until 2026-08-12).
 ///
 /// The web console is on that list because it *was not*: it carried a second, two-arm copy
 /// that never asked `geteuid`, so an unprivileged console with no usable `XDG_RUNTIME_DIR`
@@ -467,11 +470,6 @@ fn resolve_state_file(override_path: Option<PathBuf>, socket_path: &Path) -> Pat
     socket_path.with_file_name(format!("{stem}.state.toml"))
 }
 
-/// How long a pre-bind dial at the control-socket path may take before the existing
-/// socket is read as live. A socket nobody listens on refuses *immediately*
-/// (`ECONNREFUSED`), so anything slower is somebody answering, and the safe reading of
-/// an ambiguous answer is "not mine to unlink" — the leg's SEC-8 budget, applied to the
-/// control socket (SEAM-2).
 /// Watch stdin for EOF on a detached thread, resolving the returned receiver when it
 /// arrives — the daemon's half of the orphan leash (§15.43).
 ///
@@ -520,6 +518,16 @@ fn watch_stdin_eof() -> anyhow::Result<tokio::sync::oneshot::Receiver<()>> {
     Ok(rx)
 }
 
+/// How long a pre-bind dial at the control-socket path may take before the existing
+/// socket is read as live. A socket nobody listens on refuses *immediately*
+/// (`ECONNREFUSED`), so anything slower is somebody answering, and the safe reading of
+/// an ambiguous answer is "not mine to unlink" — the leg's SEC-8 budget, applied to the
+/// control socket (SEAM-2).
+///
+/// Read by [`prepare_socket`], which is the whole of its use. These five lines sat
+/// fused to the head of [`watch_stdin_eof`]'s rustdoc — a different mechanism entirely
+/// — while this const stood undocumented, so both were misread on sight (plan §18
+/// item 55).
 const SOCKET_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// One daemon's exclusive claim on one control-socket path, held from before the

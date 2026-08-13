@@ -783,11 +783,63 @@ fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
     // stricter check than a self-skip, and it is the §9 tell that the portable form
     // was found: the platform that cannot do the thing still has a promise to keep.
     //
-    // Measured on Darwin 24.6.0 with an FT232R on Apple's `IOSerialFamily`:
-    // `tcsetattr` succeeds and the flag reads back clear. Linux honours it, and
-    // takes the arm below.
-    if !serial_nexus_sys::honours_rtscts(std::path::Path::new(&p0)).unwrap_or(true) {
-        eprintln!("{p0}: driver does not honour rts-cts — asserting the load refusal instead");
+    // **Three drivers, three promises** (§7.1 clause 7, §15.53). This branched on a
+    // two-valued predicate until 2026-08-12 and so demanded the *refusal* from an
+    // honestly-refusing driver too — a promise §7.1 does not make and the daemon no
+    // longer keeps. Each arm asserts the promise that driver is owed:
+    //
+    // * accept-then-drop → refused at `load`, nothing created. Measured on Darwin
+    //   24.6.0 with an FT232R on Apple's `IOSerialFamily`: `tcsetattr` succeeds and
+    //   the flag reads back clear.
+    // * honest refusal → **loads**, and faults loudly on the node's own open. No
+    //   driver measured by this project takes this arm; it ships unexecuted, like
+    //   the arm above did before a Mac ran it.
+    // * honoured → the real flow-control test below. Linux + FT232R takes this one.
+    let measured = serial_nexus_sys::honours_rtscts(std::path::Path::new(&p0));
+    if measured == Ok(serial_nexus_sys::RtsCtsOutcome::Refused) {
+        eprintln!("{p0}: driver REFUSES rts-cts outright — asserting the honest-refusal path");
+        let d = Daemon::start();
+        let run_dir = d.run().path().to_path_buf();
+        let inj0 = d.run().join("inj0");
+        let inj1 = d.run().join("inj1");
+        // Not refused: §7.1 clause 7 says an honest refusal is not the defect, so
+        // the config loads and the graph is built.
+        d.rpc()
+            .load_toml(
+                &flow_cfg(
+                    &p0,
+                    &p1,
+                    115_200,
+                    ("rts-cts", "none"),
+                    &run_dir,
+                    &inj0,
+                    &inj1,
+                ),
+                false,
+            )
+            .expect(
+                "a driver that REFUSES CRTSCTS is honest and its config must LOAD — only \
+                 accept-then-drop is refused (§7.1 clause 7)",
+            );
+        // ...and the failure is loud rather than silent: the node's own open carries
+        // the driver's error, and the fault names the flag and the port so the
+        // operator is not left with a bare errno (§7.1 clause 5).
+        let node = d.rpc().node("port0").expect("the node was created");
+        assert_eq!(
+            d.rpc().node_status("port0"),
+            "faulted",
+            "an rts-cts node on a refusing driver must fault at open, not run \
+             silently without the flow control it asked for: {node:?}"
+        );
+        let reason = format!("{node:?}");
+        assert!(
+            reason.contains("rts-cts") && reason.contains(&p0),
+            "the fault must name the flow control and the port: {reason}"
+        );
+        return;
+    }
+    if measured == Ok(serial_nexus_sys::RtsCtsOutcome::AcceptedThenDropped) {
+        eprintln!("{p0}: driver accepts rts-cts and drops it — asserting the load refusal instead");
         let d = Daemon::start();
         let run_dir = d.run().path().to_path_buf();
         let inj0 = d.run().join("inj0");

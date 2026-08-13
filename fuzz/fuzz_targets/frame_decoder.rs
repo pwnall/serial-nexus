@@ -1,4 +1,5 @@
 #![no_main]
+#![forbid(unsafe_code)]
 //! Fuzz the streaming envelope decoder (`serial_nexus_codec_api::FrameDecoder`) — the
 //! partial-frame reassembly path a single `try_decode` call does not exercise.
 //! Feeding arbitrary bytes in arbitrary chunks must never panic and the drain loop

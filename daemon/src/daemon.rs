@@ -1,9 +1,20 @@
 //! The daemon's graph state and the RPC method implementations (design §10,
 //! §11). Mutations run on the current-thread runtime, so a single-threaded cell
-//! serializes them with no locks (plan §2). Verbs: `load`/`dump`/`state`/
-//! `teardown`/`shutdown` (phase 2) plus `rotate`/`subscribe` (phase 3) plus the
-//! arbitration surface `lock`/`unlock`/`send` with `--steal`/`--lease`/`--wait`
-//! (phase 4).
+//! serializes them with no locks (plan §2).
+//!
+//! **There is deliberately no verb list here.** `docs/rpc/` is the registry of
+//! record and [`Daemon::dispatch`] is the implementation; the meta-gate
+//! `the_documented_rpc_verb_table_matches_the_daemon_and_ctl`
+//! (`itest/tests/meta_derive.rs`) derives *both* of its sides from those two, so
+//! a third copy in prose here is ungated by construction — the gate's scanner
+//! strips comments before it looks. The copy that stood on these lines proved
+//! why that matters: it had drifted nine-plus verbs (`add-node`, `remove-node`,
+//! `connect`, `disconnect`, `info`, `ports`, `tap.open`, `tap.close`,
+//! `tap.wait`, `send-break`, `set-modem`, `pulse-dtr`) while still reading as an
+//! index, and it labelled the surface with construction-era phases the tree no
+//! longer has. Item 40(b) settled this shape rather than re-arguing it: the
+//! doctor's third probe roster was deleted for exactly this, three probes stale
+//! and nobody the wiser (plan §18 item 55).
 //!
 //! **The two-lane control plane (§15.20).** Every lock transition — acquire,
 //! release, steal, lease expiry — is a *synchronous critical section* on the
@@ -497,6 +508,42 @@ fn flow_precheck_target<'a>(
     })
 }
 
+/// **Does this reading refuse the config?** — the other half of the pre-check a
+/// kernel-independent test can pin, and the half that decides (§7.1 clause 7,
+/// §15.53).
+///
+/// §7.1 makes a three-way call and **only one arm refuses**: accept-then-drop, the
+/// driver that returns success from `tcsetattr` and reads the flag back clear. The
+/// other two do not, for different reasons that must not be collapsed:
+///
+/// * [`RtsCtsOutcome::Honoured`] — the mode works here; nothing to refuse.
+/// * [`RtsCtsOutcome::Refused`] — the driver said **no**, and that is honest.
+///   §7.1 clause 7: "a driver that *refuses* the flag outright is honest and is not
+///   refused here; only accept-then-drop is the defect". Refusing it would deny an
+///   operator a whole config over a port whose failure is already loud — `serial2`
+///   propagates the `tcsetattr`/`TCSETSW2` errno straight out of `SerialPort::open`
+///   (pinned 0.2.37, `sys/unix/mod.rs::set_on_file` → `set_configuration` → `open`),
+///   so such a node faults at open carrying the driver's own error, and
+///   `nodes::serial::open_failure_text` names the flag and both remedies on top of
+///   it. Nothing runs silently without the flow control it asked for, which is the
+///   entire property this pre-check exists to protect.
+/// * `None` — **unmeasured**, never a refusal (§7.1 clause 2, §9). An absent or
+///   busy port is a `waiting` node.
+///
+/// Until 2026-08-12 this could not be written, because the predicate returned
+/// `nix::Result<bool>` and an honest refusal was byte-identical to accept-then-drop
+/// (`Ok(false)`) — so `load` refused a config §7.1 does not refuse, while doctor
+/// P15, which kept `tcsetattr_ok`, called the same port `supported`. That is the
+/// split §7.1 clause 2 calls worse than either verdict alone, and no amount of
+/// cross-checking could find it: `shipped_predicate_agrees` compared the two sides'
+/// read-backs, which were the half that agreed.
+fn flow_precheck_refuses(measured: Option<serial_nexus_sys::RtsCtsOutcome>) -> bool {
+    matches!(
+        measured,
+        Some(serial_nexus_sys::RtsCtsOutcome::AcceptedThenDropped)
+    )
+}
+
 impl Daemon {
     pub fn new(
         resolver: serial_nexus_core::Resolver,
@@ -690,9 +737,9 @@ impl Daemon {
     ///
     /// Measured on the bench crossover, counting the far port's CTS interrupts with
     /// `TIOCGICOUNT` — an exact kernel counter, not a sampled line, because the pulse
-    /// is ~0.7 ms and a poll loop misses it. A `load` of a `flow = "rts-cts"` node
+    /// is ~0.7 ms and a poll loop misses it. A `load` of a `flow_control = "rts-cts"` node
     /// moves the far CTS **2, 2, 2** times against **0, 0, 1** for the identical
-    /// config at `flow = "none"`; with this pre-check disabled in place the same
+    /// config at `flow_control = "none"`; with this pre-check disabled in place the same
     /// `rts-cts` load moves it **0, 0, 0**, so the edges are this open's and not the
     /// node's `CRTSCTS` (which moves no line by itself). RTS is what the rig can
     /// observe — it cross-wires RTS↔CTS and leaves DTR unwired — so the DTR half is
@@ -717,35 +764,36 @@ impl Daemon {
             else {
                 continue;
             };
-            match serial_nexus_sys::honours_rtscts(&path) {
-                // Honoured, or unmeasurable. Neither is a refusal.
-                Ok(true) | Err(_) => {}
-                Ok(false) => {
-                    let shown = path.display();
-                    return Err(structural_error(
-                        &format!(
-                            "node {name:?}: device {device} (currently {shown}) does not \
-                             honour rts-cts flow control — its driver accepts the request \
-                             and reads the flag back clear, so the link would run without \
-                             the flow control this config asks for. Refused here rather \
-                             than faulting the node at open. Use flow = \"none\" (or \
-                             xon-xoff) for this port, or attach an adapter whose driver \
-                             implements RTS/CTS; `serial-nexus-doctor --port {shown}` \
-                             reports the same reading as P15."
-                        ),
-                        Some(json!({
-                            "node": name,
-                            "device": device,
-                            // The path actually interrogated. It is not always the
-                            // `device` string — §12 configs name an identity, and the
-                            // port behind it renumbers across a replug.
-                            "resolved_path": shown.to_string(),
-                            "requested_flow_control": "rts-cts",
-                            "honoured_on_readback": false,
-                        })),
-                    ));
-                }
+            // `.ok()` is the *unmeasured* collapse and the only one sanctioned here:
+            // an `Err` is a port that could not be opened or interrogated, which
+            // §7.1 makes a wait rather than a refusal. The three measured answers
+            // stay separate all the way into the decision below.
+            if !flow_precheck_refuses(serial_nexus_sys::honours_rtscts(&path).ok()) {
+                continue;
             }
+            let shown = path.display();
+            return Err(structural_error(
+                &format!(
+                    "node {name:?}: device {device} (currently {shown}) does not \
+                     honour rts-cts flow control — its driver accepts the request \
+                     and reads the flag back clear, so the link would run without \
+                     the flow control this config asks for. Refused here rather \
+                     than faulting the node at open. Use flow_control = \"none\" (or \
+                     xon-xoff) for this port, or attach an adapter whose driver \
+                     implements RTS/CTS; `serial-nexus-doctor --port {shown}` \
+                     reports the same reading as P15."
+                ),
+                Some(json!({
+                    "node": name,
+                    "device": device,
+                    // The path actually interrogated. It is not always the
+                    // `device` string — §12 configs name an identity, and the
+                    // port behind it renumbers across a replug.
+                    "resolved_path": shown.to_string(),
+                    "requested_flow_control": "rts-cts",
+                    "honoured_on_readback": false,
+                })),
+            ));
         }
         Ok(())
     }
@@ -3236,6 +3284,49 @@ mod tests {
         assert!(
             flow_precheck_target(&r, &serial_node("raw:/dev/null", "none")).is_none(),
             "only an rts-cts config may cause the pre-check to open a port"
+        );
+    }
+
+    /// **The pre-check's other kernel-independent half: which reading refuses**
+    /// (§7.1 clause 7, §15.53).
+    ///
+    /// The test above pins *which port gets asked*; this pins *what the answer
+    /// does*, and the two together are the whole of the decision that is this
+    /// daemon's rather than the platform's. §7.1 makes a three-way call and only
+    /// accept-then-drop refuses — an honest refusal is explicitly "not refused
+    /// here", and an unmeasured port is a `waiting` node, never a refusal.
+    ///
+    /// **Injected, because no adapter can produce all four inputs.** The rig here is
+    /// two FT232R whose Linux driver honours `CRTSCTS`; Darwin's `IOSerialFamily`
+    /// accepts-then-drops it on the same adapters; nothing measured in this project
+    /// refuses it outright. A test that drove the real predicate would exercise one
+    /// arm and read as covering the decision (§9), which is exactly how the
+    /// two-valued predicate's collapse survived: `load` refused an honest refusal
+    /// and nothing in the tree could tell.
+    #[test]
+    fn only_an_accept_then_drop_reading_refuses_the_config() {
+        use serial_nexus_sys::RtsCtsOutcome::{AcceptedThenDropped, Honoured, Refused};
+
+        assert!(
+            flow_precheck_refuses(Some(AcceptedThenDropped)),
+            "the driver returned success and cleared the flag: the link would run \
+             without the flow control the config asked for, which is the one arm \
+             §7.1 refuses"
+        );
+        assert!(
+            !flow_precheck_refuses(Some(Refused)),
+            "a driver that refuses CRTSCTS outright is HONEST and §7.1 clause 7 does \
+             not refuse the config for it — the node's own open fails loudly with the \
+             driver's error instead. Refusing here denies a whole config over a port \
+             whose failure was never silent."
+        );
+        assert!(
+            !flow_precheck_refuses(Some(Honoured)),
+            "the mode works on this port; there is nothing to refuse"
+        );
+        assert!(
+            !flow_precheck_refuses(None),
+            "an unmeasured port is a `waiting` node, never a refusal (§7.1 clause 2, §9)"
         );
     }
 

@@ -72,6 +72,19 @@ serial-nexus-web = { path = "../web" }
 tokio = { version = "1", features = ["rt", "io-util", "macros"] }
 
 # Fuzz targets are their own binaries; keep them out of docs/tests/benches.
+#
+# Each `path` below is a **crate root**, which is why every one of these files carries
+# `#![forbid(unsafe_code)]` beside its `#![no_main]` (design §16.3: "every raw wrapper
+# lives in one crate ... everything else is `#![forbid(unsafe_code)]`"). The attribute
+# is per-root and cannot be inherited: this crate is excluded from the workspace, so it
+# picks up no `[lints] workspace = true`, and `cargo build --workspace` never compiles
+# it — the two facts that let nine roots sit outside the invariant until 2026-08-12,
+# when both enforcing gates in `itest/tests/meta_gates.rs` were still skipping this
+# directory by name. Those gates now derive these roots from the `[[bin]]` table below
+# rather than globbing `fuzz_targets/`, so a target that is registered is a target that
+# is checked. Verified to compile with the attribute on stable `cargo check --bins`,
+# with and without `--cfg fuzzing`: `fuzz_target!` expands to `#[no_mangle]` and no
+# `unsafe`, so the forbid costs the harness nothing.
 [[bin]]
 name = "envelope_decode"
 path = "fuzz_targets/envelope_decode.rs"

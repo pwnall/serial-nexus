@@ -10952,3 +10952,338 @@ rig lane was **discarded rather than recorded**. It had started against the prev
 helper, and `scripts/bless` replaced that binary underneath it mid-run, so the lane would have
 exercised two different helper binaries. The rig was checked clean first (`authorized=1` on both
 ports — AGENTS §8's dead-run residue) and the lane re-run whole.
+
+---
+
+### 3.84 The v17 alignment pass against the tree: fifteen deviations, eight refuted, and the defect a refutation was standing on
+
+**What was run.** The v17 revision's alignment obligation executed against the *tree* rather than
+the documents (AGENTS §5; the v16 pair had its own such pass at §3.75). Eleven readers, one per
+design section range, each extracting the normative clauses of its range and checking every one
+against the code by grep-and-read; then one adversarial verifier per claimed deviation, told to
+**refute** it and given only the finding and the tree, never the finder's reasoning (AGENTS §9).
+Twenty-three claims survived the finders; the verifiers confirmed **fifteen** and refuted
+**eight**. Both halves are recorded, because a refutation is a decision.
+
+**Design moved, nine times** — each corrected in place with the old reading annotated, never
+silently rewritten. §6 sent readers to §17 for the tap contract, which is §10's (§17 is the web
+console). §5 attributed a checksum assertion to `p6_head_of_line.rs`, which reads a monotonic
+`delivered_hostward` byte counter and contains no checksum. §7.1 clause 1 promised "every other
+node in the config still loads" — the one thing a *pre-create* precheck cannot do, since it
+returns `Err` out of `load` and §11's atomicity creates nothing; the false half had also reached
+an operator through P15's shipped consequence string, repaired in the same change. §7.3 clause 2
+named `last_write_error` for the fault policy, where the tree deliberately puts the errno in the
+fault reason and says so at the branch. §7.7 quoted §3 as saying "existing-PTY connectors", words
+§3 has not carried since the v16 rewrite. §8's must-survive-every-rewrite fixture register said
+"four Python fixtures" and omitted `strict.py` — the `--error-paths` positive control that shipped
+with item 34 the same week the register was last rewritten, which is exactly the gap a
+must-preserve list exists to close — and its sibling sentence said "the five this list carried"
+over an enumeration of six. §17 claimed "permissive HTTP and WebSocket crates": the tree takes one
+protocol crate for RFC 6455 framing and hand-rolls every byte of HTTP, including the token/Host
+gate, which makes the sentence hide *where the security-relevant surface lives*. §17 keyed browser
+history by the daemon's socket path — a value the daemon never puts on the §10 wire, so no
+conforming client could key on it; the tree substitutes the web origin and documented the
+substitution.
+
+**Tree moved, six times.** Two drifted comments (`ReplayRing`'s rustdoc still called a ring-off
+endpoint "the default" while its own next paragraph argued from the default-on ring, and repeated
+a `cap == 0` construction the wiring never performs; `pty.rs` kept the withdrawn "~13.8 KiB"
+figure the design had already repaired at its own site — 14131 bytes, which no committed P10
+capture reads). Two schema-authority gaps in `docs/rpc/`, which §10 names as the authority and
+deliberately duplicates none of: `tap.wait`'s `lookback` **floor** was enforced by the daemon and
+documented nowhere, so a request inside the documented range answered `-32602`; and
+`configuration.md`'s worked `remove-node` reply omitted `discarded_at_teardown`, which its own
+table calls always present. And the two below, which are the pass's real yield.
+
+**The major one: a three-way contract with a two-valued predicate underneath it.** §7.1 clause 7
+says "a driver that *refuses* the flag outright is honest and is not refused here; only
+accept-then-drop is the defect", and §11 calls it "the three-way discrimination — honour, honest
+refusal, accept-then-drop". `serial_nexus_sys::honours_rtscts` could not make that call: it
+discarded the `tcsetattr` result (`let _ = tcsetattr(...)`) and answered on the read-back alone,
+so an honest refusal returned `Ok(false)` — byte-identical to accept-then-drop — and
+`precheck_flow_control` refused the config. P15 *does* record `tcsetattr_ok`, so on the same port
+the doctor answered `Supported` with the sentence "Every named port honoured `CRTSCTS` on
+read-back" while `load` refused the node: precisely the split §7.1 clause 2 calls "worse than
+either verdict alone", with `shipped_predicate_agrees` — the field that exists to catch exactly
+this — blind by construction, both sides reading the same read-back.
+
+**Why it survived a generation, which is the part worth keeping.** The design stated *both*
+shapes and only one of them was code: clause 7 described the behaviour, clause 2 enumerated a
+two-valued predicate ("`Ok(false)` refuses"). A reader checking the tree against clause 2 found
+agreement. The repair moved the tree to clause 7 — `RtsCtsOutcome::{Honoured, Refused,
+AcceptedThenDropped}` plus `Err` for unmeasured, with the read-back asked *first* because a port
+already carrying CRTSCTS reads back set whatever the set returned — and then moved clause 2 to
+describe the tree it now has. No two-valued shim was kept: the bool shape is what let two callers
+collapse different facts into one answer. Five plants, each the exact pre-fix defect, reddened and
+were restored. Neither `probe_set` nor `field_set` moved, proven three ways, so no era row is
+owed.
+
+**The defect a refutation was standing on top of.** One claim — "the design and the daemon's own
+refusal message name a serial config key `flow` that the schema rejects" — came back REFUTED, and
+correctly so *as framed*: the design never states the key normatively, and its `flow = "none"` is
+prose shorthand. But the verifier's own confirmed sub-facts were a shipped defect in plain sight,
+and refuting the framing had made it invisible. Measured by execution rather than by reading:
+
+    $ serial-nexus-ctl load flowtest.toml      # the file contains  flow = "none"
+    Error: parsing flowtest.toml: TOML parse error at line 1, column 1
+    unknown field `flow`, expected one of `name`, `device`, `baud`, `data_bits`, `parity`,
+    `stop_bits`, `flow_control`, `faces`, `arbitration`, `hostward_buffer`,
+    `purge_on_reconnect`, `replay_ring`, `modem`
+
+The key is `flow_control` under `deny_unknown_fields`, with no key alias anywhere in the tree.
+Four operator-facing sites offered `flow = "none"` as **the remedy** — the serial node's open
+failure text (both arms), the `precheck_flow_control` refusal, and P15's consequence — and two
+tests asserted the wrong spelling, pinning it. An operator doing exactly what the refusal said got
+a second error naming a different problem. That is plan §3 rule 11's bar failing on the box that
+prints the message, and it is the failure §15.53 exists to prevent: the refusal was built so
+nobody would meet `serial2`'s bare "failed to apply some or all settings", and then handed them a
+key the parser denies. Twenty-two spellings repaired across five files; the two tests now assert
+`flow_control` and are the tripwire.
+
+**The procedural lesson, which is the one to carry:** *a verifier that refutes the framing of a
+claim must still dispose of the claim's confirmed sub-facts, or the refutation launders them.*
+The finder had the facts right and the label wrong; the verifier had the label right and let the
+facts go. Neither half was wrong on its own account. The fix is not more verifiers — it is that a
+REFUTED verdict has to say what happens to the observations it leaves standing.
+
+**Also found, outside the sweep.** `fuzz/Cargo.lock` has been stale since item 47 landed
+(2026-08-12, `ae36876`): the daemon's `regex-automata` edge never reached it, and this session's
+item 51 added a second (`nix` on `serial_nexus_rpc`). CI's `fuzz-nightly` lane carries a
+"Verify fuzz/Cargo.lock is current" step running `cargo +nightly fetch --locked`, precisely
+because cargo-fuzz takes no `--locked` of its own — so that lane was red-in-waiting for the next
+scheduled run and nobody had seen it, the nightly not having fired since. Refreshed; the diff is
+two lines and `cargo fetch --locked` now exits 0. The gate was right and the lock was wrong,
+which is the outcome a gate is for.
+
+**One process finding, recorded because it is the hazard of running agents concurrently.** A
+fail-first plant survived into the working tree — `open_failure_text`'s two `RtsCtsOutcome` arms
+left merged after a reviewer reproduced the implementer's plant C and did not restore it. It was
+caught by `rustc`'s own `unreachable_patterns` warning on the next workspace build, and would have
+been caught again by `-D warnings`. Two things follow: the plant-and-restore discipline needs the
+restore *verified* (`git diff --stat` on the planted file, which the item-46 agent did and this
+one did not), and a tree several agents are mutating wants its build run between waves rather than
+only at the end. The item-46 agent's answer to the same hazard is the better one and is worth
+copying: it did its plant-and-restore in a `git archive HEAD` scratch copy with its own target
+dir, so a neutered `back_off` could never poison another agent's build and the readings were not
+taken against a moving tree (AGENTS §8/§9).
+
+---
+
+### 3.85 Ten ledger items closed, two of them by declining, and the gates that had been asserting nothing
+
+The same session as §3.84. Every item below carries its disposition in plan §18; this entry
+records what the ledger cannot: the evidence, the surprises, and the two items whose right answer
+was **no**.
+
+**Item 46 — `p3_idle_cost`, answered by measurement and then rebuilt.** The item asked for one
+controlled measurement choosing between "the backoff regressed" and "the cost is genuinely higher,
+re-measure the artifact". The first is **refuted**: on this 20-core box, three healthy samples per
+rung at 1/2/8/16/32 idle fds fit a slope of **0.0728 %/fd** with a **1.194 %** intercept, against
+**0.2004 %/fd** for the same sweep with `back_off`'s body replaced by `let _ = wait;` — a 2.75×
+separation, and the healthy figure reproduces §15.19's recorded ~0.06 %/fd within 20 %. What had
+moved is the **fixed** term, which the artifact never recorded separately: its 2.00 % is a single
+total at 32 fds with no baseline rung, so an absolute ceiling derived from it is dominated by a
+quantity the mechanism under test does not control. That is why 3.50 % fired against a healthy
+3.3–3.6 % with the backoff measurably intact.
+
+The guard now measures **two rungs in one daemon process** — the artifact's `baseline_tty_fds`,
+then grown to `idle_tty_fds` with `add-node` — so the fixed term cancels by construction rather
+than merely similarly, and asserts the marginal cost against a new `per_fd_cpu_percent` with a
+full provenance block (box, date, commit, both sweeps, both fits, the control). `DRIFT_FACTOR`
+stays 1.75; only the figure it multiplies changed. `total_cpu_percent: 2.00` is kept and annotated
+HISTORICAL rather than repurposed. **The decline was not laundered:** the neutered control still
+reddens the guard, at 0.2375 %/fd against the 0.1274 %/fd ceiling, observed.
+
+Two things are worth more than the repair. First, the item's third disposition — "measure under
+the suite's own parallelism and record that as the operating condition" — turned out **unnecessary
+rather than declined**: the marginal form is load-insensitive where the absolute form was not, a
+run at loadavg **12.68** reading 0.0792 %/fd inside the band of runs at loadavg 1.4. Second, the
+coverage this *loses* is named in the guard's own module doc rather than buried: a regression
+inflating the daemon's fixed cost without scaling per fd is now caught only by the 20 % budget.
+Recovering that honestly needs a recorded fixed-cost figure with an era of its own, across more
+than one box — a measurement nobody has taken, explicitly not a number to invent.
+
+**Item 45 — closed by declining, with both alternatives measured.** The item offered a structural
+`validate` refusal for `existing-terminal` or a recorded decision that the schema's silence is
+better; it is the second. **Which shape a §14 deferral gets is decided by where it sits in the
+type system, not by taste.** Entry 14 is a deferred *role* of a shipped kind whose `faces` field
+is the shared two-valued `Facing`, so the schema cannot exclude it and `validate` must — a
+structural refusal for want of an alternative. Entry 15 is a deferred *whole kind*, and a word the
+schema never admits is unreachable by construction where a `validate` refusal is one forgotten
+call away from admitted. Option (A) was built on a scratch tree and costs two things forever:
+serde's internally-tagged error enumerates every variant, so `type = "seriall"` would be answered
+with a list advertising a kind the daemon refuses one stage later; and §7.7 states two fields and
+then "otherwise it behaves as a boundary", so the rest of the field set would be a guess frozen by
+`deny_unknown_fields` while `shape()` would owe `to_model` an endpoint topology the design never
+states — letting an operator's *edges* validate against a shape nobody designed. The handshake the
+item designed still works, inverted: the existing guard pair is now the **tripwire on the
+decline**, planting the variant reddening both at their error-code assertions.
+
+An earlier draft of this decline cited §15.4's merge diamond as the precedent for "unrepresentable
+beats refused". **The review of the change caught it and it is a counterexample:** the one-producer
+invariant is `TargetEndpointOversubscribed`, a `GraphModel::validate` refusal over a config that
+deserializes perfectly. The true precedent was one paragraph up in the same file — §15.8's
+configuration/state split, "state fields simply do not exist on configuration types". Corrected in
+three places, two of them normative. The decline is unaffected; its stated precedent was not.
+
+**Item 27 — closed by declining, and the obligation the decline carries.** The doctor's Markdown
+value grammar is non-injective and stays that way (§15.57). Three measurements decide it: the JSON
+is the artifact of record and the Markdown a view of it — 0 of 1064 Tier-3 scalar leaves carry
+their JSON kind, against 22 `type ==` clauses in the gate, so making the *view* injective buys a
+property nothing reads; the cost lands on immutable evidence, since §16.13 freezes every committed
+report and an escape either mass-edits them or splits the corpus's grammar in two forever; and the
+heuristic recovering 483 of 483 leaf paths is why nothing is broken, **not** why the escape is
+declined, because "recoverable by a heuristic" is not a contract. What a decline of this shape owes
+is that nothing quietly parses the rendering, and §15.57 states that as a rule with the
+`--field-set` message as its enforcement point.
+
+**Item 51 — the hoist found a live defect, which is why two copies is the shape §16.5 bans.** The
+web console's socket-path copy had *two* arms where the policy has three: it never asked whether
+the process was root, so it read `XDG_RUNTIME_DIR` first and handed everyone without a usable one
+the **root** arm `/run/<name>.sock` — a path only a root daemon binds — while the daemon beside it
+sat at `/tmp/<name>-<uid>.sock`. Every unprivileged macOS session, and any stripped service
+environment exporting the variable empty. One implementation now, with the policy split out as a
+pure function of two candidate paths and an existence predicate so both arms are reachable from any
+environment with nothing on disk.
+
+The review of that change found the new unit pin on the wrapper's argument order **vacuous on any
+box that has a socket at the current name** — both sides of the equality read the real filesystem,
+so with the current name present the correct order and the swapped one answer the same path.
+Measured, not argued: with the arguments swapped and `XDG_RUNTIME_DIR` pointing at a directory
+holding `serial-nexus-daemon.sock` the test passed; with neither socket present it failed. Rule
+22's tell, inside a test written to prevent drift. Repaired by pinning the *candidate pair*, which
+is computed before any `exists` call and so has no machine state to depend on.
+
+**Item 52 — five clauses, and a gate that found its own ordering defect.** The macOS arm gained the
+`grant` verb its own contract banned it from lacking; `grant_skipped` rides the JSON on both
+platforms and `hold` emits its promised `up` line before reporting a grant failure; the cycle/hold
+envelope is factored; `scripts/bless` strips capability-carrying files it did not install, derived
+from `REQUIRED_CAPS`; and the `Ready` arm derives its capability line instead of printing the
+pre-§15.55 single-capability form. Six plants, each reddened and restored — two of them proving a
+**matcher** rather than a walker. The gate's own ordering was a finding: the non-vacuity floors
+originally preceded the parity assertion, so the first fail-first run reddened on "only parsed
+seven" instead of on the sentence naming the defect. Floors after, now. One behaviour change is
+named rather than smuggled: `Envelope::up()` re-authorizes every port even after one refuses, where
+`cycle` used to return at the first failure leaving the rest deauthorized while `hold` carried on —
+a divergence nothing in the tree argues for.
+
+**Items 48 and 54 — two gates that had been asserting nothing, and the difference between them.**
+Item 48's macOS doctor gate sat *after* the test step, and a failed step skips the rest of a job, so
+every red test from at least 2026-08-10 hid the one gate that lane gates on. It now sits
+immediately after the build — its only real dependency — and **both** steps carry
+`steps.build.outcome == 'success'`, so the reorder does not move the hiding in the other direction.
+Item 54's hole was wider and quieter: clippy ran on the Linux lane and nowhere else, so
+cfg-gated-only-caller dead code was caught by **no lane at all**. Planting exactly that shape — an
+ungated private fn whose one caller is `#[cfg(target_os = "linux")]` — the three lanes answered
+Linux clippy **exit 0**, `cargo check --target aarch64-apple-darwin` **exit 0**, and
+`cargo clippy --target aarch64-apple-darwin` **exit 101**, naming the unused fn. The Apple
+cross-check now runs clippy on both triples plus the minimal-daemon spelling, which is strictly the
+wider instrument at nearly the same cost. Both are rule 22's class, and they differ in the way
+worth remembering: item 48's gate existed and did not run, item 54's ran and did not look.
+
+**Item 49 — the python3 class, and why the variable is not named for python.** Thirteen tests over
+four files drive a codec child through an external interpreter, and no lane asserted they had
+executed — a runner image dropping python3 would have reported the whole out-of-process extension
+surface green without running a byte of it. `SNX_EXEC_CODEC=required` is the seventh instance of
+the one mechanism, set in CI's Linux lane. The name is the capability, not the tool, and that
+follows the tree rather than taste: `SNX_TLS` gates a tier whose missing tool is `curl`,
+`SNX_WEB_UI` a suite whose missing tool is `node`. A fixture ported to another language would
+leave an `SNX_PYTHON` naming nothing while the battery it gated still existed; rule 11 puts the
+tool's name in the message, on the box printing it. Fail-first both ways: a PATH without python3
+under the variable reddens with the fix-it message; the same PATH without it skips and passes.
+
+**The fuzz crate was outside the one invariant that has a tripwire.** Design §16.3 states the
+containment absolutely — "everything else is `#![forbid(unsafe_code)]`" — and nine crate roots
+carried neither the attribute nor a sanctioned allow: `fuzz/fuzz_targets/*.rs`, each its own root
+via the `[[bin]]` table, in a workspace-excluded crate that therefore inherits no `[lints]`. Worse,
+**both** enforcing gates skipped the directory by name, so an `unsafe` block landing there was
+invisible to the structural gate and to the grep detector alike. The hole was measured, not
+inferred: with an `unsafe` block planted in a fuzz target, re-adding the skip made the gate green
+again. All nine now carry the attribute (verified to compile on stable, and to bite — the compiler
+refuses the planted `unsafe`), both walkers reach the crate, and the crate-root enumeration derives
+the third root shape from the manifest's `[[bin]] path` entries rather than a glob, which is item
+40's doctrine applied to a shape that gate did not know existed.
+
+**Item 29 — a record completed from the history rather than from memory.** The v15 plan asserted
+three shell scripts survived as external-tool wrappers pending §16.11. All three —
+`scripts/lib/wait-for.sh`, `scripts/validate/phase0/license-gate.sh`,
+`scripts/validate/phase8/external-codec.sh` — were deleted in **one commit**, `563fb9c`
+(2026-07-24), which is the §16.11 execution itself and which created their successors in the same
+diff: `itest/tests/p0_license_gate.rs` (new), a rewritten `itest/tests/p8_external_codec.rs`, and
+the `wait_until`/`wait_for` helpers in `itest/src/lib.rs`. The claim was true when written and was
+discharged by the track it was pending on.
+
+---
+
+### 3.86 Four construction items, and two filings the code corrected
+
+Same session as §3.84/§3.85. Items 21, 36, 38 and 53 executed. Each is recorded in plan §18; what
+follows is what the ledger cannot hold — twice, the *filing* was wrong and the tree said so.
+
+**Item 21 — the inventory came before the change, and it corrected the note in both directions.**
+notes §3.55 recorded `exec`'s `discarded_at_teardown` as a floor "because its internal merge stage
+is not reached". True, and understated in one way and overstated in another. The full inventory of
+what an exec node holds targetward at teardown: the per-channel host-facing receivers plus each
+forwarder's in-flight chunk, **already counted**; the internal merged queue `src_rx`, moved by
+value into `pump_child`, which `TaskSet::abort_all` drops unread — **uncounted**, and this is
+§3.31's original defect surviving one stage further in than the fix reached; the chunk
+`pump_child` is mid-`write_all` on — uncounted, no `held` slot existing for a bare receiver; and
+bytes already inside the child's stdin pipe, which are **structurally unreachable and argued not
+to be loss** — the exec codec's obligation ends at the child's stdin exactly as a serial node's
+ends at the device fd, which is the line the serial adoption already draws.
+
+**And the thing §3.55 got wrong, which would have shipped a wrong number:** the merge queue is
+*bidirectional*. `mux_inbox` is a `target_inbox` entry whose forwarder tags chunks with the
+reserved MUX identity, so roughly half of that queue is the raw device stream on its way *into*
+the child. §3.55's sketch — "the merge queue needs only a `TeardownLoss` watch" — would have
+charged hostward bytes to a targetward ledger, which is a conservation error dressed as a
+completeness fix. Recorded because the note is cited from the counter's own documentation.
+
+A new fixture, `tests/ext-codec/deaf.py`, supplies the shape the item named: a child that has
+stopped reading stdin, so the merge stage holds bytes at teardown. `daemon/src/nodes/mod.rs`'s
+`discarded_at_teardown` doc asserted "`exec`'s answer is a floor; every other kind's is exact" and
+became a shipped falsehood the instant the fix landed — corrected in the same change.
+
+**Item 36 — the shape is two streams, and that is a finding rather than a simplification.** A
+golden transcript records the exec child-pipe conversation as two ordered byte streams, `<` for
+what the child writes and `>` for what the daemon writes, never one interleaved log. The exec
+boundary is two pipes polled concurrently (§15.22), so there **is** no defined interleaving;
+pinning one would pin a scheduling artifact and the golden would flake for the reason the item's
+own design note warns about. Records are byte-exact hex with a run-encoded tail, each carrying a
+generated annotation so the file reads as a conversation — which is the gap the item names, since
+golden *vectors* already covered single frames.
+
+The `serial-nexus-sim transcript` mode plays both roles off one file, and two of its properties
+are worth stating because they are not obvious: it is the one sim mode that **cannot print a JSON
+verdict line**, because stdout *is* the envelope pipe, so verdicts go to files and stderr; and it
+**parks rather than exiting**, because an exec child that exits is a crash to the daemon, which
+respawns it — over the evidence. The one-byte mutation the item asks for was caught twice
+independently: by the comparator at the line, and by the replayer at the byte offset
+(`mismatch_offset: 65684`, expected `0x0b` observed `0x0a`), so neither half is trusting the
+other.
+
+**Item 38 — and the four suites it deliberately did not write.** The node guard landed with the
+disjoint-reddening the template asks for: removing `teardown_loss.drain()` from
+`CodecNode::signal_stop` reddens two guards (`discarded_at_teardown: 0` against 8008 owed) and
+leaves the third — the read-only demux, which charges the *running* discard and not the teardown
+ledger — green. The item's "folds review 37's codec guards into the kit surface" clause is
+executed as **one** suite plus four citations rather than five suites, with the reasoning in the
+new file's header: only 37-CODEC-3 had a codec-side property no suite could see; unknown-key
+naming is already `attributes_are_structural`; reserved-identity lifecycle and the mid-chunk
+charge are node properties with existing guards; quoted exec paths is a harness property; and
+37-EXTC-2's partial-frame tolerance is already asserted byte for byte by `fragmentation_tolerance`
+— a negative for it would fail that suite too, so a second one would be one rule spelled twice,
+which is the duplication §16.1 exists to prevent.
+
+**Item 53 — the suite that refuses its own vacuous parameterization.** `resync_is_counted` asserts
+four things in order, and two of them are there because of how this class of counter fails rather
+than because of the happy path: a `demux` call carrying **no bytes** must still report 0, which
+fails a counter that ticks per *call* rather than per unit skipped, before the malformed unit can
+supply an excuse; and a second read must agree with the first, because the daemon re-reads
+`resync_count` on every `state` poll and a reset-on-read counter would report the loss once and
+report 0 forever after. It also panics on an empty malformed unit or a zero expectation — a suite
+parameterized into asserting nothing is rule 22's tell inside the kit written to honour it. The
+kit-honesty negative, `SilentResyncer`, is `GoodFraming` with the override deleted and nothing
+else changed, proven to pass **all eight** other suites and fail only this one; `tinymux` runs it
+from the consumer position, so deleting that counter reddens the consumer-position gate — which
+is the exact deletion the item observed leaves the whole tree green today.

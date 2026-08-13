@@ -13,6 +13,7 @@
 //!     kit::fragmentation_tolerance(MyCodec::new, "console");
 //!     kit::handles_garbage(MyCodec::new, "console");
 //!     kit::bounded_parser_state(MyCodec::new);
+//!     kit::targetward_fragmentation_is_lossless(MyCodec::new, "console");
 //! }
 //! ```
 //!
@@ -362,6 +363,173 @@ pub fn recovers_after_garbage<C: Codec>(make: impl Fn() -> C, channel: &str) {
     );
 }
 
+/// **Resync accounting** (§7.5) — the one [`Codec`] method no other suite here reads.
+///
+/// The daemon surfaces [`Codec::resync_count`] as a codec node's `framing_errors`: it
+/// is the operator's only signal that the line is corrupting frames. The trait's
+/// default is `0`, which is *correct* for a codec over a reliable transport and
+/// silently wrong for a resyncer whose author never overrode it — and nothing else in
+/// this kit can tell those two apart. A codec that drains correctly, recovers
+/// correctly, and never increments passes every other suite here and fails only this
+/// one, while its node reports `framing_errors: 0` on a line that is losing frames.
+///
+/// **Opt-in, like [`recovers_after_garbage`], and parameterized by the author's own
+/// malformed unit.** The kit cannot synthesize one: a codec with its **own** framing
+/// has an undecodable unit only its author can spell — the same escape
+/// [`recovers_after_garbage`] documents for own-framing codecs, taken here as a
+/// parameter instead of a paragraph. Pass the bytes, and the number of resyncs your
+/// own policy owes for exactly those bytes.
+///
+/// ```ignore
+/// // A byte-wise resync over a 4-byte record header: eight undecodable bytes cost
+/// // five drops, and then fewer than a header's worth remain.
+/// kit::resync_is_counted(MyCodec::new, &[0xFF; 8], 5);
+/// ```
+///
+/// **What it deliberately does not assert.** Not that the codec *drained* — one that
+/// counts a resync it never performed passes here and fails [`assert_buffer_bounded`];
+/// not that it *recovered* — that is [`recovers_after_garbage`]; and not that
+/// `expected_count` is right in any absolute sense. The resync policy (drop one byte
+/// and retry, skip one whole unit) is the codec's private business, so the figure is
+/// the author's own statement about their own bytes. What the kit checks is that the
+/// counter starts at zero, that it is a *count of this feed* rather than a constant or
+/// a per-call tick, that it reaches exactly the stated figure, and that reading it does
+/// not reset it — the daemon reads it afresh on every `state` poll, so a
+/// reset-on-read counter reports the loss once and `0` forever after.
+pub fn resync_is_counted<C: Codec>(
+    make: impl Fn() -> C,
+    malformed_unit: &[u8],
+    expected_count: u64,
+) {
+    assert!(
+        !malformed_unit.is_empty(),
+        "give the kit the malformed unit your own framing cannot decode — an empty \
+         one makes this suite assert nothing"
+    );
+    assert!(
+        expected_count > 0,
+        "expected_count must be the non-zero number of resyncs your policy owes for \
+         `malformed_unit`; a suite parameterized with 0 passes whether or not the \
+         codec counts anything"
+    );
+
+    let mut codec = make();
+    assert_eq!(
+        codec.resync_count(),
+        0,
+        "a freshly built codec reports {} resyncs before it has been fed a byte, so \
+         the figure below would not be a count of this feed",
+        codec.resync_count()
+    );
+
+    // A `demux` call over no bytes cannot have skipped any: a codec that ticks the
+    // counter per call rather than per skipped unit fails here, before the malformed
+    // unit can supply it an excuse.
+    let _ = demux_data(&mut codec, &[]);
+    assert_eq!(
+        codec.resync_count(),
+        0,
+        "the codec counted a resync for a `demux` call carrying no bytes: the counter \
+         ticks per call, not per unit skipped"
+    );
+
+    // The refusal itself is not asserted: a codec may salvage and return `Ok`, or
+    // return `Err` (§8 clause 7's emit-before-error). What is asserted is the count.
+    let _ = demux_data(&mut codec, malformed_unit);
+    let counted = codec.resync_count();
+    assert_eq!(
+        counted,
+        expected_count,
+        "the codec resynchronized past {} malformed bytes and counted {counted} of \
+         the {expected_count} resyncs its own policy owes. `resync_count` is what the \
+         daemon reports as a codec node's `framing_errors` (§7.5) — a resyncer that \
+         never increments it drains the line and tells the operator nothing",
+        malformed_unit.len()
+    );
+
+    assert_eq!(
+        codec.resync_count(),
+        counted,
+        "the second read of `resync_count` disagrees with the first: the counter is \
+         consumed by reading it. The daemon reads it once per `state` poll, so a \
+         reset-on-read counter reports the loss to whoever looked first and `0` to \
+         everyone after"
+    );
+}
+
+/// **Targetward fragmentation is lossless** (§8 clause 4, §15.24/§15.27) — the codec
+/// side of the interior's `accepted + discarded == total` accounting (review 37,
+/// 37-CODEC-3).
+///
+/// A targetward write larger than one frame is **fragmented** by the interior on one
+/// shared boundary and handed to `mux` one piece at a time; the largest piece a codec
+/// can be handed for `channel` is [`MAX_FRAME_SIZE`] less the envelope header the
+/// boundary reserves (`1` type byte + `2` channel-length bytes + the identity). If
+/// `mux` refuses that piece, the interior charges the whole undelivered residual and
+/// stops framing the chunk: the accounting stays exact and the bytes are still gone.
+/// So a codec whose own framing unit is *smaller* than the interior's — the common
+/// case for a device protocol with a one- or two-byte length field — owes an internal
+/// fragmentation of its own, never a refusal (§8 clause 4: fragmented, never dropped).
+///
+/// This suite hands the codec exactly that largest piece and asserts it is framed and
+/// decoded back whole. A codec that fragments internally at 1 KiB passes; one that
+/// refuses anything over its own record size fails here — and passes every other suite
+/// in this kit, whose payloads are small enough never to reach its bound.
+///
+/// **What it deliberately does not assert.** Not the interior's *charge* for a refused
+/// piece: that is a node property (the residual is counted, the task survives), proven
+/// against the daemon rather than against the trait. And not that a refusal is
+/// forbidden — a codec may still refuse an event it genuinely cannot carry, an
+/// unconfigured identity being the usual one. What it forbids is refusing a `data`
+/// payload the interior's own fragmenter produced.
+pub fn targetward_fragmentation_is_lossless<C: Codec>(make: impl Fn() -> C, channel: &str) {
+    // The interior's own arithmetic (`frame_payload_cap`): the envelope header it
+    // reserves is the type byte plus the u16 identity length plus the identity.
+    let cap = MAX_FRAME_SIZE.saturating_sub(3 + channel.len()).max(1);
+    let payload = seeded_bytes(23, cap);
+
+    let mut enc = make();
+    let mut wire = Vec::new();
+    enc.mux(&Event::data(channel, payload.clone()), &mut wire)
+        .unwrap_or_else(|e| {
+            panic!(
+                "the codec refused the largest targetward piece the interior can hand \
+                 it ({cap} bytes on {channel:?}): {e}. A codec whose own framing unit \
+                 is smaller fragments internally — §8 clause 4 is fragmented, never \
+                 dropped — because a refusal here is charged as loss and the bytes do \
+                 not arrive"
+            )
+        });
+
+    let mut dec = make();
+    let (got, ok) = demux_data(&mut dec, &wire);
+    assert!(
+        ok,
+        "the codec framed the largest targetward piece and then refused its own \
+         framing on the way back"
+    );
+    let folded = fold_channels(got);
+    let back = folded.get(channel).map(Vec::as_slice).unwrap_or(&[]);
+    assert_eq!(
+        back.len(),
+        payload.len(),
+        "the largest targetward piece ({cap} bytes on {channel:?}) came back as \
+         {} bytes: fragmentation dropped or duplicated a fragment (§8 clause 4)",
+        back.len()
+    );
+    // Reported as the first differing offset rather than with `assert_eq!` on the two
+    // slices: at this size the equality's own message is 128 KiB of hex and the one
+    // fact a reader needs — where reassembly went wrong — is buried in it.
+    if let Some(i) = back.iter().zip(payload.iter()).position(|(a, b)| a != b) {
+        panic!(
+            "the largest targetward piece came back reordered or corrupted at byte \
+             {i} (framed {:#04x}, decoded {:#04x}): a codec that fragments internally \
+             must reassemble in order (§8 clause 4)",
+            payload[i], back[i]
+        );
+    }
+}
+
 /// **Attribute schemas fail structurally** (§8 clause 12) — the one suite that tests
 /// a codec's *configuration* surface rather than its framing.
 ///
@@ -461,6 +629,10 @@ mod tests {
     #[derive(Default)]
     struct GoodFraming {
         buf: Vec<u8>,
+        /// The §7.5 counter the daemon reports as `framing_errors`. Kept here rather
+        /// than only in the reference codec because the negative below is exactly
+        /// this struct *without* the two lines that maintain it.
+        resyncs: u64,
     }
     impl Codec for GoodFraming {
         fn name(&self) -> &str {
@@ -496,6 +668,7 @@ mod tests {
                             4
                         };
                         self.buf.drain(..skip);
+                        self.resyncs += 1;
                     }
                 }
             }
@@ -505,6 +678,23 @@ mod tests {
             crate::encode(event, out)?;
             Ok(())
         }
+        fn resync_count(&self) -> u64 {
+            self.resyncs
+        }
+    }
+
+    /// One well-formed *envelope* frame whose type byte is not one of the four §8
+    /// kinds — the malformed unit [`recovers_after_garbage`] injects, spelled here so
+    /// the resync-accounting suite can be parameterized with it. Its honest length
+    /// prefix costs a length-guided resyncer exactly **one** skip.
+    fn malformed_envelope_frame(channel: &str) -> Vec<u8> {
+        let mut body = vec![0x7f]; // an unknown type byte (the four kinds are 0..=3)
+        body.extend_from_slice(&(channel.len() as u16).to_be_bytes());
+        body.extend_from_slice(channel.as_bytes());
+        body.extend_from_slice(b"unknown-kind payload");
+        let mut out = (body.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(&body);
+        out
     }
 
     #[test]
@@ -522,6 +712,16 @@ mod tests {
         // It resyncs by length guidance, so it also passes the opt-in Err-then-Ok
         // recovery suite: the refused frame is skipped whole and the next one decodes.
         recovers_after_garbage(GoodFraming::default, "console");
+        // …and it *counts* that skip, which is the property `recovers_after_garbage`
+        // cannot see: one malformed frame with an honest length prefix is one resync.
+        resync_is_counted(
+            GoodFraming::default,
+            &malformed_envelope_frame("console"),
+            1,
+        );
+        // Its framing unit is the interior's own, so the largest targetward piece is
+        // one frame and needs no internal fragmentation.
+        targetward_fragmentation_is_lossless(GoodFraming::default, "console");
     }
 
     // A single-channel passthrough (like the external template's codec) also
@@ -556,6 +756,10 @@ mod tests {
         fragmentation_tolerance(Passthrough::default, "console");
         handles_garbage(Passthrough::default, "console");
         bounded_parser_state(Passthrough::default);
+        // A passthrough has no framing unit at all, so the largest targetward piece
+        // is carried as-is — the trivial pass, worth taking because the suite is
+        // owed by every codec that carries `data` and not only by framers.
+        targetward_fragmentation_is_lossless(Passthrough::default, "console");
     }
 
     // --- Deliberately broken codecs: each must FAIL exactly the suite that tests
@@ -856,6 +1060,120 @@ mod tests {
     #[should_panic(expected = "did not recover")]
     fn a_latching_codec_fails_the_recovery_suite() {
         recovers_after_garbage(LatchesOnError::default, "console");
+    }
+
+    /// The silent resyncer: [`GoodFraming`] with the `resync_count` override deleted
+    /// and nothing else changed. It drains, it re-aligns, it recovers the next frame
+    /// — and its node reports `framing_errors: 0` on a line that is losing frames,
+    /// because the trait's default is `0` and the default is indistinguishable from
+    /// an honest zero. This is the gap [`resync_is_counted`] closes, and it is
+    /// invisible to every other suite in the kit.
+    #[derive(Default)]
+    struct SilentResyncer {
+        inner: GoodFraming,
+    }
+    impl Codec for SilentResyncer {
+        fn name(&self) -> &str {
+            "silent-resyncer"
+        }
+        fn demux(
+            &mut self,
+            input: &[u8],
+            emit: &mut dyn FnMut(Event),
+        ) -> Result<(), crate::CodecError> {
+            self.inner.demux(input, emit)
+        }
+        fn mux(&mut self, event: &Event, out: &mut Vec<u8>) -> Result<(), crate::CodecError> {
+            self.inner.mux(event, out)
+        }
+        // No `resync_count`. That one omission is the whole defect.
+    }
+
+    #[test]
+    fn a_silent_resyncer_passes_every_other_suite() {
+        round_trip_identity(SilentResyncer::default, &["console"]);
+        control_event_round_trip(SilentResyncer::default, &["console"]);
+        fragmentation_tolerance(SilentResyncer::default, "console");
+        handles_garbage(SilentResyncer::default, "console");
+        bounded_parser_state(SilentResyncer::default);
+        assert_buffer_bounded(SilentResyncer::default, |c| c.inner.buf.len());
+        recovers_after_garbage(SilentResyncer::default, "console");
+        targetward_fragmentation_is_lossless(SilentResyncer::default, "console");
+    }
+
+    #[test]
+    #[should_panic(expected = "counted 0 of the 1 resyncs")]
+    fn a_silent_resyncer_fails_the_resync_accounting_suite() {
+        resync_is_counted(
+            SilentResyncer::default,
+            &malformed_envelope_frame("console"),
+            1,
+        );
+    }
+
+    /// The codec that drops instead of fragmenting: its own record is 8 KiB, and
+    /// rather than splitting a larger `data` payload across records (§8 clause 4) it
+    /// refuses. Every other suite in this kit uses payloads well under that bound, so
+    /// it conforms by every other measure — while in a graph the interior charges its
+    /// refusal as loss and the bytes never arrive.
+    #[derive(Default)]
+    struct RefusesTheLargestPiece {
+        inner: GoodFraming,
+    }
+    impl RefusesTheLargestPiece {
+        const RECORD: usize = 8192;
+    }
+    impl Codec for RefusesTheLargestPiece {
+        fn name(&self) -> &str {
+            "refuses-the-largest-piece"
+        }
+        fn demux(
+            &mut self,
+            input: &[u8],
+            emit: &mut dyn FnMut(Event),
+        ) -> Result<(), crate::CodecError> {
+            self.inner.demux(input, emit)
+        }
+        fn mux(&mut self, event: &Event, out: &mut Vec<u8>) -> Result<(), crate::CodecError> {
+            if let EventKind::Data(bytes) = &event.kind
+                && bytes.len() > Self::RECORD
+            {
+                return Err(crate::CodecError::Framing(format!(
+                    "payload of {} bytes exceeds this codec's record size {}",
+                    bytes.len(),
+                    Self::RECORD
+                )));
+            }
+            self.inner.mux(event, out)
+        }
+        fn resync_count(&self) -> u64 {
+            self.inner.resync_count()
+        }
+    }
+
+    #[test]
+    fn a_codec_that_refuses_oversize_data_passes_every_other_suite() {
+        // The largest payload any other suite frames is `fragmentation_tolerance`'s
+        // 5000 bytes, comfortably under this codec's 8 KiB record — which is why the
+        // defect needs a suite that asks for the interior's *own* largest piece.
+        round_trip_identity(RefusesTheLargestPiece::default, &["console"]);
+        control_event_round_trip(RefusesTheLargestPiece::default, &["console"]);
+        fragmentation_tolerance(RefusesTheLargestPiece::default, "console");
+        handles_garbage(RefusesTheLargestPiece::default, "console");
+        bounded_parser_state(RefusesTheLargestPiece::default);
+        assert_buffer_bounded(RefusesTheLargestPiece::default, |c| c.inner.buf.len());
+        recovers_after_garbage(RefusesTheLargestPiece::default, "console");
+        resync_is_counted(
+            RefusesTheLargestPiece::default,
+            &malformed_envelope_frame("console"),
+            1,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "refused the largest targetward piece")]
+    fn a_codec_that_refuses_oversize_data_fails_the_fragmentation_suite() {
+        targetward_fragmentation_is_lossless(RefusesTheLargestPiece::default, "console");
     }
 
     // --- Attribute schemas (§8 clause 12). The table type is deliberately not

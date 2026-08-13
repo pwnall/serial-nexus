@@ -285,7 +285,12 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
-    let socket = resolve_socket(cli.socket.clone());
+    // `--socket` when given, else §10's default with the §17.3 rename-window fallback.
+    // The policy is `serial_nexus_rpc`'s, not this file's: `ctl` looking somewhere the
+    // daemon did not bind is the whole failure it can produce, and the copy that used
+    // to sit at the bottom of this file had a byte-identical twin in the web console
+    // (plan §18 item 51, notes §3.72).
+    let socket = serial_nexus_rpc::resolve_client_socket(cli.socket.clone());
 
     // `subscribe` and `tap` are streams, not single request/response — handle them
     // apart from the one-shot verbs below.
@@ -780,6 +785,55 @@ fn render(cmd: &Cmd, result: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Consume the acknowledgement of a streaming verb's opening request and *examine*
+/// it: `Ok(result)` when the open was accepted (`Value::Null` if it carried no
+/// payload), `Err` on a refusal or on an EOF before the ack.
+///
+/// **One helper because it is one rule, learned the expensive way (37-TOOL-2).**
+/// `subscribe_stream` used to discard every Response frame — including the error
+/// reply to its own request — and then block in `read_line`, with no timeout, on a
+/// connection the daemon deliberately holds open for the stream. Against a daemon
+/// that does not answer the verb (a version skew across §15.16's
+/// graceful-degradation boundary) the CLI printed nothing, exited never, and said
+/// nothing about why. `subscribe` and `tap.open` are the only two verbs `ctl` writes
+/// itself rather than through `build_request`, precisely because a stream answers
+/// them — so both are exposed to that shape, and both now read their ack through
+/// these lines. A refusal is the ordinary error path, naming the code like every
+/// other client-side failure; an EOF before the ack is an error rather than a
+/// successful empty stream.
+///
+/// Three details are deliberate:
+///
+/// * **Only a `Response` ends the loop.** A frame that is not one — a stray
+///   notification ahead of the ack — is skipped rather than mistaken for the answer.
+///   Neither daemon path can emit that today (the ack is written before the
+///   connection counts as a subscriber, and before any `tap.data`), so it is
+///   defensive only: one comparison, in exchange for not encoding an ordering
+///   assumption in the client.
+/// * **A malformed line is skipped too, not fatal.** It cannot be *this* request's
+///   answer — a refusal always arrives as a well-formed error Response — and the
+///   streaming loops downstream already pass unrecognized frames through rather than
+///   dying on them.
+/// * **`line` is the caller's buffer**, so the byte loop that follows reuses the one
+///   allocation instead of starting fresh.
+///
+/// `verb` names the request in both messages, which is the entire difference between
+/// the two copies this replaced (plan §18 item 55).
+fn read_ack<R: BufRead>(reader: &mut R, line: &mut String, verb: &str) -> anyhow::Result<Value> {
+    loop {
+        line.clear();
+        if reader.read_line(line)? == 0 {
+            anyhow::bail!("connection closed before the {verb} acknowledgement");
+        }
+        if let Ok(Incoming::Response(resp)) = serde_json::from_str::<Incoming>(line.trim()) {
+            if let Some(err) = resp.error {
+                anyhow::bail!("{verb} failed: {} ({})", err.message, err.code);
+            }
+            return Ok(resp.result.unwrap_or(Value::Null));
+        }
+    }
+}
+
 /// Open the socket, subscribe, and print one JSON notification per line as they
 /// arrive (§10). Exits after `count` notifications, or when the daemon closes
 /// the connection. The subscribe acknowledgement is consumed, not printed, so
@@ -797,29 +851,14 @@ fn subscribe_stream(socket: &Path, count: Option<usize>) -> anyhow::Result<()> {
     let mut printed = 0usize;
     let mut stdout = std::io::stdout().lock();
 
-    // Read the subscribe acknowledgement FIRST, exactly as `tap_stream` does, and
-    // *examine* it. Swallowing every Response frame swallowed the error reply to this
-    // very request too — and a daemon that refuses `subscribe` (a version skew across
-    // the §15.16 graceful-degradation boundary) deliberately keeps the connection open,
-    // so the loop below then blocked in `read_line` on a socket that would never carry
-    // another byte: no output, no exit, no diagnosis (37-TOOL-2). A refusal is now the
-    // ordinary error path, naming the code like every other client-side failure.
+    // Read the subscribe acknowledgement FIRST, before any byte loop (37-TOOL-2 —
+    // [`read_ack`] owns the rule and the reasoning). Its result is discarded: the
+    // payload is `{"subscribed": true}`, and printing it would put a response frame
+    // in a stream that promises `jq` nothing but notifications.
     //
     // Nothing can be lost by reading it here: the daemon writes the ack *before* it
-    // counts the connection as a subscriber, so no notification can precede it. The
-    // stray-frame tolerance is defensive only, as it is in `tap_stream`.
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            anyhow::bail!("connection closed before the subscribe acknowledgement");
-        }
-        if let Ok(Incoming::Response(resp)) = serde_json::from_str::<Incoming>(line.trim()) {
-            if let Some(err) = resp.error {
-                anyhow::bail!("subscribe failed: {} ({})", err.message, err.code);
-            }
-            break;
-        }
-    }
+    // counts the connection as a subscriber, so no notification can precede it.
+    read_ack(&mut reader, &mut line, "subscribe")?;
 
     while printed < limit {
         line.clear();
@@ -997,24 +1036,13 @@ fn tap_stream(
     // open (unknown or non-host-facing endpoint) exits non-zero, and `--bytes 0` is a
     // clean confirmed no-op rather than a silent success (audit finding). The daemon
     // replies to tap.open before it streams any tap.data, so the ack is the first
-    // line; tolerate a stray notification ahead of it defensively.
-    let mut continuity = loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            anyhow::bail!("connection closed before the tap.open acknowledgement");
-        }
-        if let Ok(Incoming::Response(resp)) = serde_json::from_str::<Incoming>(line.trim()) {
-            if let Some(err) = resp.error {
-                anyhow::bail!("tap.open failed: {} ({})", err.message, err.code);
-            }
-            let ack = resp.result.unwrap_or(Value::Null);
-            eprintln!("tap opened: {ack}");
-            // `from_offset` is where this tap's stream begins (plan §11.8) — the anchor the
-            // offset-continuity check below counts from, so a drop before the very
-            // first chunk is visible too (review 32, CTL-2).
-            break TapContinuity::new(ack.get("from_offset").and_then(Value::as_u64));
-        }
-    };
+    // line; [`read_ack`] owns that rule for both streaming verbs.
+    let ack = read_ack(&mut reader, &mut line, "tap.open")?;
+    eprintln!("tap opened: {ack}");
+    // `from_offset` is where this tap's stream begins (plan §11.8) — the anchor the
+    // offset-continuity check below counts from, so a drop before the very first
+    // chunk is visible too (review 32, CTL-2).
+    let mut continuity = TapContinuity::new(ack.get("from_offset").and_then(Value::as_u64));
 
     // A paused tab (§17): hold the tap open without reading for the stall window so
     // the daemon's bounded queue fills and drops with a counter, then exit.
@@ -1095,38 +1123,6 @@ fn call(socket: &Path, method: &str, params: Option<Value>) -> anyhow::Result<Re
         anyhow::bail!("daemon closed the connection without replying");
     }
     Ok(serde_json::from_str(line.trim())?)
-}
-
-/// Mirror the daemon's §10 socket-path policy exactly, then fall back to the
-/// pre-§15.40 default when — and only when — nothing is listening at the current one
-/// (plan §17.3, one release).
-///
-/// The order matters: the current name wins whenever it exists, so a fresh daemon is
-/// never passed over in favour of a stale socket left by an older one. The fallback
-/// only rescues the case where a daemon from before the rename is still running and
-/// the operator has just installed the new CLI.
-fn resolve_socket(override_path: Option<PathBuf>) -> PathBuf {
-    if let Some(p) = override_path {
-        return p;
-    }
-    let current = default_socket(serial_nexus_rpc::DAEMON_NAME);
-    if !current.exists() {
-        let legacy = default_socket(serial_nexus_rpc::LEGACY_DAEMON_NAME);
-        if legacy.exists() {
-            return legacy;
-        }
-    }
-    current
-}
-
-/// The §10 default socket path for a daemon spelled `name`.
-///
-/// One line, because `ctl` looking somewhere the daemon did not bind is the whole
-/// failure this policy can produce — so it is computed by the same function the daemon
-/// binds through (`serial_nexus_rpc::socket`), not by a second copy that agrees today
-/// (notes §3.72).
-fn default_socket(name: &str) -> PathBuf {
-    serial_nexus_rpc::default_socket_path(name).0
 }
 
 #[cfg(test)]

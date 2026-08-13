@@ -18,7 +18,6 @@
 
 mod assets;
 mod bridge;
-mod rpc;
 mod server;
 mod tls;
 mod wsclient;
@@ -27,7 +26,6 @@ mod wsclient;
 // library, not a library with a binary: this surface exists so `main.rs` stays thin
 // and so the fuzz harness below has something to link against. It is not an
 // embedding API and carries no stability promise.
-pub use rpc::resolve_socket;
 pub use server::{ServerConfig, normalize_hosts, run as serve};
 pub use tls::build_config as build_tls_config;
 pub use wsclient::{WsclientArgs, run as wsclient};

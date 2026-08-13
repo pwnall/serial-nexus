@@ -1,4 +1,5 @@
 #![no_main]
+#![forbid(unsafe_code)]
 //! Fuzz the `load` verb's payload — `GraphConfig` deserialization plus
 //! `GraphConfig::validate` (§11: "the entire file is validated … before anything is
 //! created").

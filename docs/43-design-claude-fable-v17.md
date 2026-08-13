@@ -4,11 +4,12 @@
 Tier-3 hardware rig (the tier ladder is §13's) on both kernels, a Linux replug lane driven by the
 repository-carried privileged helper (§15.45, amended by §15.55), and the cross-kernel doctor
 campaigns whose committed artifacts under `docs/doctor/` back every kernel claim below. §1–§14 and
-§17 are normative for the system as built, with **no design-ahead-of-tree surface**: the pattern
-wait on the observation surface (§10, §15.56) was specified this generation ahead of its
-construction — the amend-first order AGENTS §5 requires — and plan §18 item 47 built it the same
-day, so §10's pattern-wait subsection is settled system like the rest. §15–§16 are the decision
-record.
+§17 are normative for the system as built, with **exactly one design-ahead-of-tree surface**: the
+`actual_baud` read-back in a serial node's state (§7.1, decided at §15.58), written here before
+the tree moves — the amend-first order AGENTS §5 requires — and carried as plan §18 item 41. Its
+predecessor is settled: the pattern wait (§10, §15.56) was specified the same way one generation
+back and plan §18 item 47 built it the same day, so §10's pattern-wait subsection is system like
+the rest. §15–§16 are the decision record.
 Measured figures — suite
 counts, gate scopes, wall-clock costs — live in exactly one place, the plan's Status table, and are
 quotable only with the scope recorded there; this document deliberately carries none. What remains
@@ -394,7 +395,7 @@ The assumption is a default, not a constraint:
 1. XON/XOFF and RTS/CTS remain ordinary port attributes. When a port does have flow control
    configured, the kernel pausing transmission surfaces as Busy (see the targetward group
    below), so hardware flow control transparently extends across the graph to remote writers —
-   proven on the wire, not only in the model: over the crossover rig, a `flow = "none"`
+   proven on the wire, not only in the model: over the crossover rig, a `flow_control = "none"`
    transmitter delivers through a CTS stop and an `rts-cts` one never does (notes §3.63).
 2. Whether the driver *honours* a configured mode is measured, never assumed, by the one shared
    predicate `sys::honours_rtscts`; a driver that accepts `CRTSCTS` and silently drops it is
@@ -437,8 +438,11 @@ The assumption is a default, not a constraint:
    input, so no frame can be stranded behind a quiescent origin.
 4. On the wire (§9, protocol v1) channels share one socket with no per-channel flow control, so
    a stalled peer wedges every channel's targetward flow together. Head-of-line blocking is the
-   designed behavior, pinned by test as the SUM of the targetward counters freezing while
-   hostward checksums keep advancing (`itest/tests/p6_head_of_line.rs`) — the sum deliberately,
+   designed behavior, pinned by test as the SUM of the targetward counters freezing while the
+   hostward `delivered_hostward` counters keep advancing (`itest/tests/p6_head_of_line.rs`)
+   — *(this clause read "hostward checksums" until 2026-08-12; that test reads a monotonic byte
+   counter out of `state` and contains no checksum, so the sentence named an instrument the
+   named file does not use)* — the sum deliberately,
    because under a fully stalled peer whichever channel wins the race wedges the shared socket
    and the other can legitimately sit at 0, itself a head-of-line manifestation, so a
    per-channel assertion would have been the wrong pin. A future per-channel-flow-control
@@ -677,7 +681,7 @@ contender is an **origin** (§3): the writer being granted the floor.
 Each edge declares a **write mode**:
 
 1. `never` — the read-only capability. Log edges and spy PTYs; these attachments cannot contend
-   for the lock at all. Taps (§17) are its dynamic form: connection-scoped, read-only attachments
+   for the lock at all. Taps (§10) are its dynamic form: connection-scoped, read-only attachments
    created over the control plane, each with a bounded queue and drop counters per §5, gone when
    their connection closes.
 2. `on-demand` — the default for interactive and programmatic origins (PTY clients, socket
@@ -927,6 +931,16 @@ this section has never contained (notes §3.75).
    node says `waiting` with its device open — exactly what a third party's `open(2)` already
    says — and a signal verb issued in that window is accepted and stays valid into `active`.
 6. Serial nodes leave the graph only by explicit configuration operations.
+7. **The rate the port actually got is reported beside the rate that was asked for.** A serial
+   node's state carries the termios read-back's baud alongside the configured one. Reporting
+   only: no verdict, no fault, no refusal — a driver quantizing to what its clock divisor can
+   express is ordinary, and only the operator knows which margin their device tolerates
+   (§15.58, which records why this is *not* §15.53's refusal). Where a platform cannot report
+   the rate back, the field says so rather than echoing the request: an unknown rendered as an
+   answer is the shape §12's `has_identity_source` exists to prevent, and echoing the ask would
+   make the field agree with itself everywhere and assert nothing. It is a read-back and not a
+   wire measurement — P14's `achieved_baud_floor` is that, and it needs a cross-wired peer.
+   *Specified ahead of the tree (AGENTS §5); plan §18 item 41 is the construction.*
 
 **Ordered release.** Giving back what the node asserted *on the tty* belongs to the port rather
 than to whichever exit path someone remembered:
@@ -986,18 +1000,35 @@ would be degraded here is not an observation but the transport's *contract*.
 
 1. A config asking `rts-cts` on a port whose driver accepts-then-drops the flag is **refused at
    `load` and `add-node`**, in the same before-anything-is-created position as `precheck_codecs`
-   (§11's pre-create precheck contract), and every other node in the config still loads. The
+   (§11's pre-create precheck contract), and **nothing in the config is created** — §11's
+   structural atomicity, which this precheck sits inside. *(This clause read "and every other node
+   in the config still loads" until 2026-08-12. That is the one thing a pre-create precheck cannot
+   do: it returns `Err` out of `load`, so a five-node config with one accept-then-drop port creates
+   zero nodes, not four — §11's "the entire file is validated before anything is created; a
+   structural error creates nothing", and §15.53's own harness assertion that a refused `load`
+   created nothing. The true property the sentence was reaching for is its neighbour: because the
+   check runs before the teardown, a refused `load --replace` leaves the **already-running** graph
+   intact. The false half had also reached an operator-facing string in the doctor's P15 verdict,
+   repaired in the same change.)* The
    refusal is structural and carries `node`, `device`, `resolved_path`, `requested_flow_control`,
-   and `honoured_on_readback` as data, plus two remedies: `flow = "none"` (or `xon-xoff`) for this
+   and `honoured_on_readback` as data, plus two remedies: `flow_control = "none"` (or `xon-xoff`) for this
    port, or an adapter whose driver implements RTS/CTS.
 2. **One predicate, because two callers must not be able to disagree**:
    `serial_nexus_sys::honours_rtscts` is the only implementation. The daemon's pre-check
    consults it, the harness branches on it, and doctor P15 calls it and requires its answer to
    match the read-back P15 takes by hand, reporting `shipped_predicate_agrees` with its own
    `degraded` arm ranked above the finding itself — a report that calls a port fine while `load`
-   refuses it is worse than either verdict alone (§13). Three states and only one refuses:
-   `Ok(false)` refuses, `Err` is *unmeasured* and never a refusal, and an absent device never
-   reaches the check at all — unplugged hardware still just waits (§12).
+   refuses it is worse than either verdict alone (§13). **Four states and only one refuses:**
+   the predicate answers `Ok(RtsCtsOutcome::{Honoured, Refused, AcceptedThenDropped})` or `Err`,
+   only `AcceptedThenDropped` refuses the config, `Err` is *unmeasured* and never a refusal, and
+   an absent device never reaches the check at all — unplugged hardware still just waits (§12).
+   *(This clause enumerated a two-valued `Ok(false)`-refuses predicate until 2026-08-12, and that
+   is exactly how clause 7's contract went unimplemented for a generation: **the design stated
+   both shapes and only one of them was code.** The shipped predicate discarded the `tcsetattr`
+   status and answered on the read-back alone, so an honest refusal was indistinguishable from
+   accept-then-drop and was refused at load, while P15 — which does record the set status — called
+   the same port `supported`. The tree moved to clause 7, which is the contract; this clause moved
+   to match the tree it now describes.)*
 3. The pre-check asks its question through `Resolver::resolve_current_path` — the same call the
    node's open makes — so check and open cannot disagree about *which device* is asked either;
    the naive `Path::exists` form was 100% dead on `add-node`, on every `load` of a `dump`ed
@@ -1209,8 +1240,14 @@ Contract:
    shape that §5's files exception requires (`O_NONBLOCK` is a no-op on regular files); overflow
    follows the configured policy, always with counters.
 2. **A filesystem error faults this node alone.** A filesystem error (ENOSPC included) under the
-   fault policy faults **this node alone**, with the errno in `last_write_error` — the port's
-   other consumers keep flowing (§5's isolation).
+   fault policy faults **this node alone**, with the errno in the node's **fault reason** — the
+   port's other consumers keep flowing (§5's isolation). Under `drop-oldest`, where the node
+   deliberately stays `active`, the same errno lands in the `write_errors` / `last_write_error`
+   pair instead, because that is the only thing separating a disk that rejects every write from a
+   merely slow one. *(This clause named `last_write_error` for the fault policy until 2026-08-12;
+   the tree puts the errno in the fault reason there and leaves the pair null, deliberately and
+   with the reason stated where the code branches — the fault arm's reason string already says it.
+   One errno, two policies, two homes.)*
 3. **Rotation is on demand only.** `serial-nexus-ctl rotate <node>` renames the current file to
    `<name>.NNN` with an incrementing counter — higher is newer, no logrotate-style shifting
    cascade — and reopens fresh at a byte boundary.
@@ -1341,8 +1378,11 @@ serde's unknown-variant error at `INVALID_PARAMS`, because `existing-terminal` i
 variant at all. Both refuse at load with nothing created; only the first says why (§14 entry 15;
 plan §18 item 45). Stated here, not only in §14,
 because this section once read in the present tense while absent from §14 (review 32 DEVR-3).
-§3's "existing-PTY connectors" and §12's "Existing-terminal nodes … pass through as path
-identities" describe this same deferred node type.
+§3's dual-role list ("existing-terminal nodes (§7.7; in the model, refused at load — §14)") and
+§12's "Existing-terminal nodes … pass through as path identities" describe this same deferred node
+type. *(This sentence quoted §3 as saying "existing-PTY connectors" until 2026-08-12; §3 has not
+carried those words since the v16 rewrite, so the pointer sent a reader looking for a phrase that
+is not there.)*
 
 ### 7.8 Map node
 
@@ -1685,7 +1725,7 @@ refused naming the key with nothing created, and it pins the *whole* `info.codec
 check cannot see the list drift. If your build breaks against a new tag, this template broke
 first, on the push that would have broken you.
 
-**Fixtures that must survive every rewrite.** Four Python fixtures under `tests/ext-codec/` and
+**Fixtures that must survive every rewrite.** **Six** Python fixtures under `tests/ext-codec/` and
 one negative pair in the kit are load-bearing — named here, and in the plan's workspace map, so a
 tidier future session cannot simplify them away:
 
@@ -1700,6 +1740,18 @@ tidier future session cannot simplify them away:
   corruption — and its doc says plainly that this is *not* the shape to copy where truncation must
   be reported. Copy the skeleton; copy the teardown shape too unless your codec must report
   truncation.
+- `strict.py` is the `--error-paths` battery's positive control (item 34): it terminates rather
+  than relaying on every injected decode fault, and `passthrough.py` fails all three arms, which
+  is what makes the pair a fail-first proof rather than an assertion. Delete `strict.py` and
+  `a_strict_codec_refuses_every_injected_decode_fault` dies while the permissive fixture stays
+  green — a battery with nothing left to pass it. *(This register said "four" and omitted
+  `strict.py` until 2026-08-12; the fixture shipped with item 34 the same week the register was
+  last rewritten, which is exactly the gap a must-preserve list exists to close.)*
+- `deaf.py` is the only fixture here that is deliberately **inert** rather than deliberately
+  broken: a child that has stopped reading stdin, so the exec node's internal merge stage is
+  holding bytes at teardown. It is a fixture for the daemon's *accounting* (§15.50) rather than
+  for the envelope contract, and it is what makes plan §18 item 21's guard measure a real
+  quantity instead of a zero.
 - The `Hoarder` pair and the other deliberately-broken kit codecs are the kit's own fail-first
   proof (above); deleting one deletes the evidence that a suite bites.
 
@@ -1715,7 +1767,8 @@ the tree's own battery once failed correct codecs until `lag.py` pinned the chec
 
 Further kit and battery capabilities stay filed as plan §18 ledger items, deliberately not promised
 here as existing: **golden transcripts of the daemon boundary** (item 36) and a
-**teardown-conservation suite on a codec node** (item 38). The five this list carried alongside
+**teardown-conservation suite on a codec node** (item 38), and a **resync-accounting suite**
+(item 53). The **six** this list carried alongside
 them shipped 2026-08-12 and are described above and in `docs/codec-authors.md`: the
 attribute-schema suite (item 32), the `Err`-then-`Ok` recovery suite (item 33), the exec battery's
 error paths (item 34), demux-shape exec conformance (item 35, retiring the identity-passthrough
@@ -2783,8 +2836,27 @@ verbs in four places, and these are now the only ones.
   from `GraphConfig::validate` naming the deferral and its section (entry 14); where the schema
   does not admit them at all, the refusal is serde's own unknown-variant error at
   deserialization, which lists the shipped kinds and cites no section (entry 15). The second
-  shape is weaker in what it *says*, not in what it *does*, and §18 item 45 carries the
-  decision about upgrading it (notes §3.75).
+  shape is weaker in what it *says*, not in what it *does*. **Which shape an entry gets is
+  decided by where the deferral sits in the type system, not by taste** — plan §18 item 45,
+  closed as a decline 2026-08-12. A deferred *role* of a shipped kind (entry 14: `faces =
+  "target"` on a serial node) has no other option, because `faces` is the two-valued [`Facing`]
+  every dual-role kind carries and target-facing is legitimate elsewhere — the schema cannot
+  exclude it, so `validate` must. A deferred *whole kind* (entry 15) has the stronger option and
+  takes it: a word the schema never admits is unreachable by construction, where a `validate`
+  refusal is one forgotten call away from admitted. The precedent for preferring the schema is
+  §15.8's configuration/state split, which `core/src/config.rs` states as its own first rule —
+  state fields *do not exist* on configuration types, so the question cannot be asked rather than
+  being asked and refused. (**Not** §15.4's merge diamond, which an earlier draft of this
+  paragraph cited: the one-producer invariant is a `GraphModel::validate` refusal
+  — `TargetEndpointOversubscribed` — so it is an instance of the weaker shape, not the stronger
+  one. Corrected 2026-08-12.) Upgrading entry 15 to entry 14's shape was measured on a scratch
+  tree and costs
+  two things permanently: serde's internally-tagged error enumerates every variant, so a plain
+  typo would be answered with a list advertising a kind the daemon refuses one stage later; and
+  §7.7 states two fields and then "otherwise it behaves as a boundary", so the rest of the field
+  set would be a guess frozen by `deny_unknown_fields`, while `shape()` would owe `to_model` an
+  endpoint topology the design never states — letting an operator's *edges* validate against a
+  shape nobody designed.
 - **accepted-and-waiting** — validation accepts the configuration and the graph loads; the
   instance waits for a missing driver.
 - **graduated** — a driver arrived and the capability shipped; the body sections named in the
@@ -2840,8 +2912,13 @@ verbs in four places, and these are now the only ones.
     error at `INVALID_PARAMS`, listing the node kinds that do exist, with nothing created. It is
     a real refusal and it is now tested (`existing_terminal_is_refused_at_load_listing_the_
     shipped_kinds`), but it is **not** entry 14's structural form: it names no section and cites
-    no deferral. Making it structural is plan §18 item 45, filed rather than done quietly, and
-    the guard asserts today's behaviour so that upgrade reddens it loudly (notes §3.75).
+    no deferral. Making it structural was plan §18 item 45, and the item is **closed as a
+    decline** (2026-08-12): the schema's silence is the stronger refusal for a whole kind, for
+    the reason the vocabulary above now states, and the two costs of the alternative were
+    measured rather than argued. The guard that asserts today's behaviour stays, and it is now
+    the tripwire on the decline rather than a waiting room — planting the variant was measured
+    to redden both guards at their error-code assertions (`-32002` where they demand `-32602`),
+    because the word stops being unknown one stage before the listed-kinds clause is reached.
 
 *§17 follows; §15–§16 are the decision record and read as an appendix — the numbering is stable
 across generations by rule (front matter).*
@@ -2892,8 +2969,14 @@ the ordinary case), and deliberately not a terminal emulator: no grid, no cursor
 alternate screen — a scrollback pane cannot honour state the daemon never sends. It reads decoded
 text and emits render operations, so the byte log behind the export and the OPFS (Origin Private
 File System) record stays the raw device stream (§15.32): the export is a device log, not a
-transcript. The server side uses permissive HTTP and WebSocket crates under the §13 gate; the
-browser link carries base64 chunks relayed from `tap.data`.
+transcript. The server side takes exactly **one** protocol crate under the §13 gate —
+`tokio-tungstenite`, for RFC 6455 framing after the handshake — and hand-rolls every byte of HTTP
+on tokio: head parsing, static-asset routing, the token/Host/Origin gate, and the 101 upgrade,
+matching the daemon's hand-rolled JSON-RPC (§15.13). *(This sentence said "permissive HTTP and
+WebSocket crates" until 2026-08-12, asserting a dependency the tree does not have and hiding the
+fact that the security-relevant surface — the gate and the head parser — is code in this
+repository rather than a vendor's.)* The browser link carries base64 chunks relayed from
+`tap.data`.
 
 Taps open lazily per viewed console and are released a grace interval (a minute) after the
 console stops being watched — watched meaning the console pane showing *and* the tab not hidden:
@@ -2998,7 +3081,9 @@ mode 0600, but a loopback TCP port is reachable by every local user.
 
 Scrollback beyond the ring lives where the viewer lives (§15.32): the client persists each
 console's stream in the browser's OPFS — append-only per-console history
-keyed by the daemon's socket path, the endpoint address and the daemon `instance` nonce, with
+keyed by the **web origin** (a stable `host:port`, standing in for the daemon's socket path — a
+value the daemon never puts on the §10 wire, so no browser client could key on it), the endpoint
+address and the daemon `instance` nonce, with
 the endpoint's offset-space `epoch` (§15.38) stored *beside* the bytes, never folded into the
 key, spliced exactly by the §10 tap offsets so a reload never duplicates ring bytes into the
 stored log. The epoch's placement is load-bearing: keyed by epoch, every graph rebuild
@@ -3075,7 +3160,7 @@ text and the status line names that home. A few entries still carry normative te
   invariant): frozen `docs/doctor/` artifacts, gates, and code cite §15.N by number, so an entry
   cited by immutable evidence is never renumbered, its number never reused; an emptied entry
   becomes a stub. This record keeps the prior generation's numbering through §15.55;
-  §15.56 is this generation's addition.
+  §15.56, §15.57 and §15.58 are this generation's additions.
 - **Refutations are decisions.** A refuted diagnosis or a declined proposal is recorded like an
   adopted design — falsifier (or reason), outcome, status — because refutations are what stop a
   rejected shape from being re-proposed on no new evidence. Silently re-fixing a declined item is
@@ -3083,7 +3168,7 @@ text and the status line names that home. A few entries still carry normative te
   never drift (§15.48 carries the exemplar overturn, notes §3.37 → §3.43).
 
 **Topic index.** "Was this decided, declined, or refuted?" should be one lookup. Every entry
-§15.1–§15.56 appears below, titled at its primary topic (numbers alone on repeats); an entry can
+§15.1–§15.58 appears below, titled at its primary topic (numbers alone on repeats); an entry can
 appear under more than one topic.
 
 - **Graph model and vocabulary** — §15.2 typed endpoints · §15.3 orientation vocabulary ·
@@ -3110,7 +3195,8 @@ appear under more than one topic.
 - **Doctor and measurement doctrine** — §15.17 doctor consolidation · §15.21 rig discovery /
   certificate · §15.44 two digests · §15.46 instrument self-testimony · §15.47 portable
   certificate · §15.49 a zero is a claim · §15.51 P14 maximum-rate search · §15.52 handshake
-  continuity
+  continuity · §15.57 the Markdown rendering is a view, not a format · §15.58 actual
+  baud in node state
 - **Harness and validation doctrine** — §15.31 harness as crate · §15.34 review-26 classes
   become rules · §15.36 flake doctrine · §15.37 · §15.48 provider seam, last-hop physics
 - **Platform and privilege** — §15.13 · §15.30 · §15.45 privileged replug capability ·
@@ -3976,8 +4062,10 @@ declines, and the falsified claim here.
 produced a `faulted` node *after `load` had returned success* — measured, not hypothetical: Apple's
 `IOSerialFamily` does exactly this on an FT232R (P15, notes §3.65 E) while Linux honours the flag
 (`cflag` delta exactly `CRTSCTS`, notes §3.68). The decision — refuse at `load`/`add-node`, before
-anything is created, through the one predicate `serial_nexus_sys::honours_rtscts` with its three
-states — is stated at §7.1/§11, with §7 as the reason rather than an exception: what §7 forbids is
+anything is created, through the one predicate `serial_nexus_sys::honours_rtscts` and its four
+states (`Honoured`, `Refused`, `AcceptedThenDropped`, and `Err` for unmeasured — §7.1 clause 2,
+restated 2026-08-12 when the tree gained the third measured arm the contract had always named)
+— is stated at §7.1/§11, with §7 as the reason rather than an exception: what §7 forbids is
 a kernel difference the operator learns nothing about, which the old behaviour was, and what would
 be degraded is the transport's **contract** — an `rts-cts` edge exists because the far end needs
 the line held, and running without it loses data silently under exactly the conditions it was
@@ -3998,7 +4086,7 @@ proxy); it resolves through `Resolver::resolve_current_path` now, the same call 
 makes (notes §3.68 #1). One doc claim is **falsified by measurement**: "the open it performs is not
 an *extra* toggle" is false — counted with `TIOCGICOUNT` (exact; a 0.5 ms poll loop misses the ~0.7
 ms pulse and did), a `load` of an `rts-cts` node moves the far CTS 2, 2, 2 times against 0, 0, 1 at
-`flow = "none"` and 0, 0, 0 with the pre-check disabled; DTR is inferred, not observed — the rig
+`flow_control = "none"` and 0, 0, 0 with the pre-check disabled; DTR is inferred, not observed — the rig
 leaves it unwired (notes §3.68). And the citation debt: §15.51 carried P15's `question` citation
 because this entry did not exist; notes §3.68 filed and declined the string fix, and notes §3.73
 **overturned that decline**, deliberately moving `probe_set` `82a8e2198e54626a` →
@@ -4170,6 +4258,105 @@ DECLINED, recorded so they are not re-proposed (AGENTS §5):
   one-connection consequence any later admission must weigh, and the allowlist stays a
   deliberate act (§15.34).
 
+### 15.57 The doctor's Markdown is a view, not a format: the value grammar stays non-injective
+
+**Status:** DECIDED — the escape is DECLINED and the Markdown's non-contract is stated instead.
+Plan §18 item 27, which asked for exactly this decision before any renderer change (notes §3.74
+filed it "not fixed" for the same reason).
+
+The defect, stated precisely so the decline is not mistaken for not noticing it. The Markdown
+renderer leaves `", "`, `=`, `[` and `]` unescaped inside *values*, so `{"note":"a","b":"c"}` and
+`{"note":"a, b=c"}` render to the same line. The grammar is therefore non-injective by
+construction: a reader cannot in general recover the observation tree from the rendering, and
+eight distinct JSON values were demonstrated to render byte-identically — `2`/`"2"`,
+`null`/`"null"`, `true`/`"true"` among them (notes §3.74).
+
+**The decision: do not escape.** Three measurements decide it, none of them "it would be work".
+
+1. **The JSON is the artifact of record and the Markdown is a view of it**, which is measured
+   rather than asserted: the Markdown is a pure function of the JSON model minus one field
+   (`generated_unix_ms`), validated at 228 of 228 passive lines and 290 of 291 Tier-3 lines; the
+   reverse fails at 0 of 1064 Tier-3 scalar leaves, none of which carries its JSON kind, against
+   an `expectations/*.jq` gate with 22 `type ==` clauses. Making the *view* injective would not
+   make it the artifact — the kinds are still gone — so the escape buys a property nothing needs
+   and does not buy the one thing that would matter.
+2. **The cost lands on immutable evidence.** §16.13 freezes every committed `docs/doctor/`
+   report, and the era record and the comparability ladder (§13) read across them. An escape
+   changes the rendering of all of them at once, which is either a mass edit of frozen artifacts
+   (forbidden) or a permanent split between reports rendered before and after — a diff hazard in
+   exactly the corpus whose value is that it diffs.
+3. **The practical loss today is zero and is not the argument.** A heuristic parser recovers 483
+   of 483 Tier-3 leaf paths and reproduces the printed digest. That is why nothing is broken; it
+   is *not* why the escape is declined, because "recoverable by a heuristic" is not a contract
+   and must never be quoted as one.
+
+**What is owed instead, and is already in the tree.** The obligation a decline of this shape
+carries is that nothing may quietly depend on parsing the rendering. The enforcement point
+exists and is the one an operator actually meets: `--field-set` handed the Markdown twin used to
+answer with a bare serde error and now names the cause and both remedies, and `--json-out` makes
+the twin available from the *same* run rather than a second measurement of the same box (notes
+§3.74; plan §18 item 43). The rule this entry adds to that: **anything in this repository that
+needs to read a doctor report reads the JSON.** A future consumer that wants to parse the
+Markdown is not a parser bug to fix — it is this decision being overturned, and AGENTS §5 makes
+that a recorded decision naming new evidence.
+
+**Overturned by**, if ever: a consumer that genuinely cannot be given the JSON. The sanctioned
+shape is then a *new* rendering (a third twin) rather than a redefinition of the existing one,
+so the frozen corpus keeps one grammar for its whole life.
+
+
+### 15.58 The rate a port actually got is node state, not only a probe observation
+
+**Status:** DECIDED — contract at §7.1; construction is plan §18 item 41. New design content, so
+it is written here before the tree moves (AGENTS §5).
+
+**The gap, measured rather than supposed.** P14's `adapter-refused` class is a driver accepting a
+rate and landing somewhere else: on the committed 6.18 triple a 4000000 ask returns success with
+`refusal_errno: null` and the port sits at `actual_baud_a: 9600`, `actual_baud_b: 9600`. The
+doctor can see this because it asks — `requested_baud` beside `actual_baud_*` is P14's whole
+instrument. **The daemon cannot**, and neither can an operator: a serial node configured
+`baud = 4000000` on such an adapter reports `active` with the requested figure and nothing else,
+and the first symptom is a link that does not carry bytes. §7.1's own doctrine is that whether a
+driver honours a setting is *measured, never assumed* — stated for flow control (§15.53) and
+enforced there by a pre-check — and the rate is the one termios parameter where the same class of
+silent divergence is already proven to exist in the field.
+
+**What §7.1 gains: reporting, and only reporting.** A serial node's state carries the rate the
+port actually reports beside the rate that was asked for. No verdict, no fault, no refusal.
+
+**Why not a refusal, given §15.53 refuses flow control.** Because the two are not the same fact,
+and treating them alike would be policy without evidence:
+
+- A dropped `CRTSCTS` silently removes a *safety property* — the link runs and loses data under
+  exactly the conditions the mode was configured for. A rate that lands elsewhere breaks the link
+  *loudly and immediately*: nothing round-trips, which is a symptom an operator meets in seconds.
+- Rate divergence is **legitimate and common**. Every driver quantizes to what its clock divisor
+  can express, so "asked 250000, got 250000" and "asked 3062500, got 3000000" are both ordinary,
+  and only the operator knows which margin their device tolerates. There is no threshold this
+  design could pick that would not refuse working configurations somewhere.
+- §15.51 already names the discipline for exactly this reading: `platform-refused` is a fact about
+  the ask surface and never about the wire. A node-state field is that same fact, reported at the
+  node instead of at a probe.
+
+So the rule is §13's reported-never-judged, moved from the doctor to node state: **name the
+divergence, decide nothing.** An operator with the two numbers in `state` can act; a daemon
+guessing a tolerance cannot.
+
+**Where the reading comes from, and what it is not.** The termios read-back after the node's own
+open — the same source `serial2` already uses to verify settings, so it costs no extra syscall
+and no extra open. It is **not** a measurement of the wire: P14's `achieved_baud_floor` is that,
+and it needs a cross-wired peer and a transmission. A driver that lies in its read-back is
+invisible here exactly as it is to `serial2`, and saying so is part of the field's contract
+(§16.13's discipline applied to a state field: a number carries what produced it).
+
+**Absence is a value.** Where a platform cannot report the rate back, the field says so rather
+than echoing the request — the §12 rule that an unknown is never rendered as an answer
+(`has_identity_source`'s shape). Echoing the ask would make the field agree with itself on every
+platform and assert nothing, which is plan §3 rule 22's tell in a state field.
+
+**Validation** (item 41): fail-first against a refusing rate on the rig — the FT232R that P14
+already measured accepting 3000000 and refusing above it is the fixture, so the guard has a real
+divergence to see rather than a synthetic one.
 
 ## 16. Post-completion review: reliability through simplification
 

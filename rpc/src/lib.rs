@@ -36,7 +36,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 pub const DAEMON_NAME: &str = "serial-nexus-daemon";
 
 pub mod socket;
-pub use socket::{SocketOrigin, default_socket_path};
+pub use socket::{SocketOrigin, default_socket_path, resolve_client_socket};
 
 /// The pre-§15.40 spelling of [`DAEMON_NAME`], **accepted on read for one release**
 /// (plan §17.3) and then deleted.
@@ -51,7 +51,10 @@ pub use socket::{SocketOrigin, default_socket_path};
 ///
 /// This constant is the single place the retired name survives in live code; the
 /// `retired_names_appear_only_where_history_lives` meta-gate allows exactly it, so
-/// derive from it rather than repeating it.
+/// derive from it rather than repeating it. The window has two halves that read it: the
+/// client fallback is [`resolve_client_socket`], one implementation for both clients
+/// since plan §18 item 51, so closing that half edits this crate alone; snapshot
+/// adoption is the daemon's and closes there.
 pub const LEGACY_DAEMON_NAME: &str = "serialnexusd";
 
 /// A version marker that serializes as the string `"2.0"` and rejects anything

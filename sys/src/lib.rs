@@ -191,28 +191,98 @@ pub fn set_packet_mode(fd: RawFd, on: bool) -> nix::Result<()> {
     Ok(())
 }
 
-/// Does this port's driver actually *honour* a `CRTSCTS` request, or accept it and
-/// discard it?
+/// What a port's driver did with a `CRTSCTS` request — **three outcomes, because
+/// two of them are indistinguishable from the read-back alone and only one of them
+/// is the defect** (design §7.1 clause 7, §11, §15.53).
+///
+/// §7.1 makes a three-way call: *honour*, *honest refusal*, *accept-then-drop*.
+/// Only the last is a defect — a driver that returns success from `tcsetattr` and
+/// then reads the flag back clear leaves the link running without the flow control
+/// the config asked for, silently, under exactly the conditions it was configured
+/// to survive. A driver that fails the `tcsetattr` outright is **honest**: nothing
+/// silent happens, the node's own open fails loudly with the driver's own error
+/// (`serial2`'s `set_on_file` propagates the `tcsetattr`/`TCSETSW2` errno straight
+/// out of `SerialPort::open`, verified in the pinned 0.2.37 source), and §7.1 does
+/// not refuse such a config at `load`.
+///
+/// [`honours_rtscts`] returned `nix::Result<bool>` until 2026-08-12, which could
+/// not express that: an honest refusal and an accept-then-drop both came back
+/// `Ok(false)`, so the daemon refused both while doctor P15 — which *did* keep
+/// `tcsetattr_ok` — called the same port `supported`. That is the split §7.1 clause
+/// 2 names as worse than either verdict alone, and `shipped_predicate_agrees` could
+/// not catch it because both sides were reading the same half of the measurement.
+///
+/// Deliberately **no `bool` accessor and no two-valued shim.** The two-valued shape
+/// is what let two callers collapse different facts into one answer; a caller that
+/// legitimately only cares about one arm spells that arm out (`== Ok(Honoured)`),
+/// which is one comparison at the call site and says which question it is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtsCtsOutcome {
+    /// The flag reads back set: the driver implements the mode and agrees it did.
+    Honoured,
+    /// `tcsetattr` **failed** and the flag reads back clear. Honest, and not a
+    /// refusal at `load` (§7.1 clause 7) — the failure this produces later is loud.
+    Refused,
+    /// `tcsetattr` reported **success** and the flag still reads back clear. The
+    /// defect: neither honoured nor refused. Measured on Darwin 24.6.0 with an
+    /// FT232R on Apple's `IOSerialFamily` (the `acb5162` macOS triple, 2026-08-05).
+    AcceptedThenDropped,
+}
+
+impl RtsCtsOutcome {
+    /// The three-way rule, as a pure function of the two readings — so it can be
+    /// tested against *injected* readings on a box whose driver can only ever
+    /// produce one of the arms (§9: the arm that does not run here is exactly the
+    /// one a single-kernel, single-adapter session cannot exercise).
+    ///
+    /// **The read-back is asked first, and that ordering is load-bearing.** A port
+    /// whose termios already carried `CRTSCTS` before the interrogation reads the
+    /// flag back set no matter what the set returned, and POSIX lets `tcsetattr`
+    /// return 0 having applied only *some* of the requested changes — so the set's
+    /// status is evidence about the arms only once the flag is known to be clear.
+    /// With the flag clear, `tcsetattr` having failed means the driver said no
+    /// (POSIX: -1 means none of the changes were made), and `tcsetattr` having
+    /// succeeded means it said yes and did nothing.
+    ///
+    /// Shared with doctor P15, which takes its **own** readings by hand and then
+    /// classifies them through this one function: the measurement stays independent
+    /// — that is what `shipped_predicate_agrees` cross-checks — while the *meaning*
+    /// of the three arms exists once, so the report and `load` cannot drift about
+    /// which arm a pair of readings is (§7.1 clause 2, §15.53).
+    pub fn classify(set_ok: bool, honoured_on_readback: bool) -> RtsCtsOutcome {
+        if honoured_on_readback {
+            RtsCtsOutcome::Honoured
+        } else if set_ok {
+            RtsCtsOutcome::AcceptedThenDropped
+        } else {
+            RtsCtsOutcome::Refused
+        }
+    }
+}
+
+/// Does this port's driver *honour* a `CRTSCTS` request, refuse it outright, or
+/// accept it and discard it?
 ///
 /// **One implementation, because two callers must not be able to disagree.** The
 /// daemon refuses a `flow = "rts-cts"` config at load time on a port that answers
-/// `false` here, and the doctor's P15 reports the same reading; if those two
-/// measured it separately, a report could say the port is fine while `load` rejects
-/// it, or worse the reverse.
+/// [`RtsCtsOutcome::AcceptedThenDropped`] here, and the doctor's P15 reports the
+/// same reading; if those two measured it separately, a report could say the port
+/// is fine while `load` rejects it, or worse the reverse (§7.1 clause 2, §15.53).
 ///
 /// The question is not answerable any other way. `tcsetattr` returns **success** on
 /// a driver that drops the flag — measured on Darwin 24.6.0 with an FT232R on
 /// Apple's `IOSerialFamily`, where the request is accepted and the read-back is
 /// clear — so only reading the termios back distinguishes honouring from
-/// discarding. `serial2` relies on the same read-back, which is why such a port
-/// faults a node with `failed to apply some or all settings` (notes §3.65 E).
+/// discarding, and only the `tcsetattr` status distinguishes discarding from an
+/// honest refusal. `serial2` relies on the same read-back, which is why an
+/// accept-then-drop port faults a node with `failed to apply some or all settings`
+/// (notes §3.65 E), and it propagates the errno for the refusing one.
 ///
-/// Restores the termios it found before returning, on every path. `Ok(true)` where
-/// the flag reads back set, `Ok(false)` where the request was accepted and dropped,
-/// and `Err` where the port could not be opened or interrogated at all — which is
-/// **not** the same as "does not honour it" and callers must not collapse the two:
-/// an absent device is a wait, not a refusal.
-pub fn honours_rtscts(path: &std::path::Path) -> nix::Result<bool> {
+/// Restores the termios it found before returning, on every path. `Err` means the
+/// port could not be opened or interrogated at all — which is **not** any of the
+/// three answers and callers must not collapse it into one: an absent or busy
+/// device is *unmeasured*, which §7.1 makes a wait, never a refusal.
+pub fn honours_rtscts(path: &std::path::Path) -> nix::Result<RtsCtsOutcome> {
     use nix::sys::termios::{ControlFlags, SetArg, tcgetattr, tcsetattr};
     // O_NONBLOCK so a port asserting flow control against us cannot block the open,
     // and O_NOCTTY so interrogating a port never makes it this process's terminal.
@@ -224,15 +294,16 @@ pub fn honours_rtscts(path: &std::path::Path) -> nix::Result<bool> {
     let before = tcgetattr(&fd)?;
     let mut want = before.clone();
     want.control_flags |= ControlFlags::CRTSCTS;
-    // A driver that *refuses* is honest and is not what this is looking for; the
-    // reading that matters is the read-back either way, so a failed set is not an
-    // early return.
-    let _ = tcsetattr(&fd, SetArg::TCSANOW, &want);
+    // A failed set is not an early return: it is half the measurement. It is what
+    // separates the honest refusal from the silent drop, and the read-back is
+    // needed either way, so both readings are taken and classified together below.
+    let set = tcsetattr(&fd, SetArg::TCSANOW, &want);
     let after = tcgetattr(&fd);
     // Restore before reporting, so an error on the read-back cannot leave a real
     // adapter reconfigured behind us.
     let _ = tcsetattr(&fd, SetArg::TCSANOW, &before);
-    Ok(after?.control_flags.contains(ControlFlags::CRTSCTS))
+    let honoured = after?.control_flags.contains(ControlFlags::CRTSCTS);
+    Ok(RtsCtsOutcome::classify(set.is_ok(), honoured))
 }
 
 /// Take or release exclusive access on a tty — `TIOCEXCL` so stray processes
@@ -1076,6 +1147,101 @@ mod tests {
             // claim P5's consequence line makes to the operator.
             assert!(matches!(read_icounts(-1), Err(nix::errno::Errno::ENOTSUP)));
         }
+    }
+
+    /// **The three-way rule, against injected readings** (design §7.1 clause 7,
+    /// §15.53; §9).
+    ///
+    /// Every arm ships and at most one of them can be reached by hardware on any
+    /// given box: the rig here is two FT232R adapters whose Linux driver honours
+    /// `CRTSCTS`, Darwin's `IOSerialFamily` accepts-then-drops it on the same
+    /// adapters, and **no driver in reach of this project has been measured
+    /// refusing it outright** — so the refusal arm has no device that can produce
+    /// it and a test driving the real predicate would exercise one third of this
+    /// function and read as covered. The readings are therefore injected, which is
+    /// the same shape `p15_verdict` and `open_failure_text` are split for.
+    ///
+    /// The fourth cell — set failed, flag reads back set — is not a contradiction
+    /// and is asserted rather than left to chance: a port whose termios *already*
+    /// carried `CRTSCTS` reads it back set whatever the set returned, and the flag
+    /// being set on the port is what "honoured" means.
+    #[test]
+    fn the_three_crtscts_outcomes_are_separated_by_the_set_status_not_the_readback() {
+        use RtsCtsOutcome::{AcceptedThenDropped, Honoured, Refused};
+
+        // The flag is set on the port: honoured, whatever the set reported.
+        assert_eq!(RtsCtsOutcome::classify(true, true), Honoured);
+        assert_eq!(
+            RtsCtsOutcome::classify(false, true),
+            Honoured,
+            "a port that already carried CRTSCTS honours the mode; a set that failed \
+             for an unrelated reason does not unset a flag that reads back set"
+        );
+
+        // Flag clear. Now — and only now — the set's own status is the discriminator,
+        // and it is the whole of §7.1's three-way call.
+        assert_eq!(
+            RtsCtsOutcome::classify(true, false),
+            AcceptedThenDropped,
+            "success plus a cleared read-back is the defect: the driver neither \
+             honours the mode nor refuses it, so the link would run without the flow \
+             control the config asked for"
+        );
+        assert_eq!(
+            RtsCtsOutcome::classify(false, false),
+            Refused,
+            "a failed tcsetattr is an HONEST refusal (§7.1 clause 7) and must not be \
+             reported as the silent drop — collapsing the two is what made `load` \
+             refuse a config the design does not refuse"
+        );
+    }
+
+    /// **The predicate answers about the real port on this box**, and it puts the
+    /// termios back — the half of [`honours_rtscts`] the pure test above cannot
+    /// reach (the open, the two sets, the restore), measured on a pty because a pty
+    /// is the one tty every box has (§9: the portable form, not the rig's form).
+    ///
+    /// Linux honours `CRTSCTS` on a pts, so the *answer* asserted here is this
+    /// kernel's and is deliberately not the point; what is asserted is that some
+    /// arm is reached without error and that the port is left as it was found. A
+    /// probe that reconfigures a tty and cannot say it restored it is P15's own
+    /// first-ranked `degraded` arm, and this function is what P15 calls last.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrogating_a_real_tty_answers_and_restores_what_it_found() {
+        use nix::sys::termios::tcgetattr;
+        use std::os::unix::fs::OpenOptionsExt;
+        let master =
+            nix::pty::posix_openpt(nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY)
+                .expect("posix_openpt");
+        nix::pty::grantpt(&master).expect("grantpt");
+        nix::pty::unlockpt(&master).expect("unlockpt");
+        let pts = ptsname(&master).expect("ptsname");
+        let path = std::path::Path::new(&pts);
+
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(path)
+            .expect("open the pts");
+        let before = tcgetattr(&slave).expect("tcgetattr before");
+
+        let answer = honours_rtscts(path).expect("a readable pts is measurable");
+        assert_eq!(
+            answer,
+            RtsCtsOutcome::Honoured,
+            "a Linux pts honours CRTSCTS — an unexpected arm here means the \
+             interrogation, not the kernel, changed"
+        );
+
+        let after = tcgetattr(&slave).expect("tcgetattr after");
+        assert_eq!(
+            before.control_flags, after.control_flags,
+            "the predicate left the tty reconfigured: it must restore the termios it \
+             found on every path, because the daemon and the doctor both call it on \
+             ports an operator owns"
+        );
     }
 
     /// A pty pair built the way `PtyNode::setup` builds one — baseline termios

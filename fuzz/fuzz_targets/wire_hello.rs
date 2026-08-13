@@ -1,4 +1,5 @@
 #![no_main]
+#![forbid(unsafe_code)]
 //! Fuzz the wire handshake decoder (`serial_nexus_codec_api::try_decode_hello`, §9). Arbitrary
 //! bytes must refuse cleanly (bad magic, unsupported version, oversize, truncated,
 //! bad channel id) and never panic. Byte-identity does NOT hold (the decoder ignores

@@ -368,8 +368,26 @@ mod conformance {
                 ),
             ],
         );
+        // The interior fragments a targetward write on its own boundary and hands
+        // this codec one piece at a time — up to ~64 KiB, sixty-four times this
+        // codec's `MAX_RECORD`. A codec with a *smaller* framing unit must fragment
+        // internally rather than refuse (§8 clause 4), which is what `mux`'s
+        // `chunks(MAX_RECORD)` loop is for; this suite is what proves it, and the
+        // template's own `an_oversize_payload_is_fragmented_not_dropped` only ever
+        // asked for two records' worth.
+        kit::targetward_fragmentation_is_lossless(make, "console");
+        // The resync-accounting suite, parameterized by *this codec's own* malformed
+        // unit — the same own-framing escape the note below describes, taken as a
+        // parameter instead of a paragraph. Eight `0xFF` bytes are a record header
+        // whose tag names no configured channel, so the byte-wise resync in `demux`
+        // drops one byte and retries while at least a header's worth remains: 8, 7,
+        // 6, 5 and 4 bytes left is five drops, and then three bytes wait for more.
+        // Five is what this codec's policy costs, and it is the number an operator
+        // reads as `framing_errors` on the node (§7.5).
+        kit::resync_is_counted(make, &[0xFF; 8], 5);
         // NOT `recovers_after_garbage`: that suite injects an *envelope* frame, and
         // this codec has its own framing (§8's corruption recipe — replicate the
-        // pattern with your own malformed unit, which `demux`'s own tests do).
+        // pattern with your own malformed unit, which `demux`'s own tests do, and
+        // which `resync_is_counted` above takes as an argument).
     }
 }

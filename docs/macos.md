@@ -1051,10 +1051,15 @@ are the ones this page enumerates.
 
 Both things this section used to name as future have landed, and the update blocks at
 the top of this page are their record. The **macOS CI lane** runs on every push
-(`.github/workflows/ci.yml`, job `macos`): `cargo build --workspace --locked`, then
-`cargo test --workspace --locked`, then `serial-nexus-doctor --json` gated against
-`expectations/macos.jq` — a real gate rather than a smoke test, since P2 reports
-`degraded` there rather than `unsupported`. One property of that lane is worth keeping
+(`.github/workflows/ci.yml`, job `macos`): `cargo build --workspace --locked`, then the
+doctor run gated against `expectations/macos.jq`, then
+`cargo test --workspace --locked --no-fail-fast` — a real gate rather than a smoke test,
+since P2 reports `degraded` there rather than `unsupported`. **The gate runs before the
+tests as of 2026-08-12** (plan §18 item 48): it sat last until then, and since a failed
+step skips the rest of the job, every red test step from at least 2026-08-10 hid the one
+gate this lane exists to run. The gate needs only the build, so it now sits where its
+real dependency is, and both steps carry `steps.build.outcome == 'success'` so a red gate
+cannot hide the suite either. One property of that lane is worth keeping
 in view because the 2026-07-28 block is what it cost: `cargo test --workspace` stops at
 the first failing test binary, so a red macOS lane reports one failure and says nothing
 about what sits behind it. Reach for `--no-fail-fast` before concluding a single crate

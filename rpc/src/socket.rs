@@ -1,4 +1,5 @@
-//! The §10 default socket path, in one place.
+//! The §10 default socket path — and the client-side choice of *which* socket to
+//! drive — in one place.
 //!
 //! # Why this is a module and not two private functions
 //!
@@ -50,8 +51,30 @@
 //! kind of fact as "what the daemon is called". The policy itself
 //! ([`socket_path_from`]) is pure `std` and would compile in any of the three; only the
 //! two-line wrapper needs `nix` at all.
+//!
+//! # The rename window rides here for the same reason
+//!
+//! [`resolve_client_socket`] is the second half: a client with no `--socket` takes the
+//! current default when it exists and the pre-§15.40 one only when it does not (plan
+//! §17.3). That policy was also implemented **twice** — `ctl` and the web console
+//! carried byte-duplicate copies — which is the same shape as the paragraph above, one
+//! layer up: two clients that must agree about *which* daemon a terminal and a browser
+//! on one machine reach. It is one implementation here now (plan §18 item 51), so
+//! retiring the client fallback edits this crate rather than three.
+//!
+//! The web console is the worked example of why "agrees today" is not a defence. Its
+//! deleted `default_socket` copy had **two** arms where the policy has three: it never
+//! asked whether the process was root, so it read `XDG_RUNTIME_DIR` first and handed
+//! everyone without a usable one the *root* arm `/run/<name>.sock`. An unprivileged
+//! console with the variable unset or exported empty therefore pointed at a path only a
+//! root daemon ever binds, while the daemon beside it was at `/tmp/<name>-<uid>.sock` —
+//! and it said so through the 503 the bridge answers an upgrade with, naming a socket
+//! nothing on that machine will ever create, under a `--help` line promising the
+//! daemon's defaults. That is every unprivileged macOS session (no `XDG_RUNTIME_DIR`,
+//! no `/run`) and any stripped service environment that exports the variable empty
+//! (notes §3.75).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which arm of the §10 policy produced a path.
 ///
@@ -138,6 +161,87 @@ pub fn default_socket_path(name: &str) -> (PathBuf, SocketOrigin) {
         xdg.as_deref(),
         nix::unistd::getuid().as_raw(),
         name,
+    )
+}
+
+/// The §17.3 rename-window policy as a **pure function of the two candidate paths and
+/// an existence predicate**.
+///
+/// Split out from [`resolve_client_socket`] for the same reason [`socket_path_from`] is
+/// split out from [`default_socket_path`], and then one more: the discriminators here
+/// are two *files*, and a test that arranged them for real would have to create them at
+/// the paths this process's own environment derives — which is a fixed pair per box, so
+/// two such tests running in parallel would fight over the same two inodes and one
+/// would see the other's socket. The predicate makes both arms reachable from any
+/// environment, in either order, with nothing on disk.
+fn resolve_client_socket_from(
+    override_path: Option<PathBuf>,
+    current: PathBuf,
+    legacy: PathBuf,
+    exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    // An explicit override is taken **as written**, without asking whether anything is
+    // there. Falling back from a path the operator named would send them to a different
+    // daemon than the one they asked for; a connection error naming their own path is
+    // the correct answer, and the only one they can act on.
+    if let Some(p) = override_path {
+        return p;
+    }
+    // The current name wins whenever it exists, so a fresh daemon is never passed over
+    // in favour of a stale socket inode left by an older one that died without
+    // unlinking. The fallback only rescues the other order: a pre-rename daemon still
+    // running under an operator who has just installed the new client.
+    if !exists(&current) && exists(&legacy) {
+        return legacy;
+    }
+    // Neither present: still the current name, so the connection error names the path a
+    // daemon started now would actually bind.
+    current
+}
+
+/// The control socket a **client** should drive: an explicit override when given, else
+/// the §10 default, falling back to the pre-§15.40 default when — and only when — there
+/// is nothing at the current one (plan §17.3, one release).
+///
+/// One implementation for both clients (plan §18 item 51), because a browser and a
+/// terminal pointed at the same machine must reach the same daemon — and because the
+/// *client* half of the window then closes here, in one crate, rather than in three.
+/// (The window's other half is the daemon adopting a pre-rename state snapshot, and it
+/// stays in the daemon: that is about a file this daemon owns, not about which socket a
+/// client dials. Both halves read [`LEGACY_DAEMON_NAME`](crate::LEGACY_DAEMON_NAME),
+/// which is why the constant lives one level up.)
+///
+/// **"Client" is in the name because the daemon must not call this.** The daemon binds
+/// [`DAEMON_NAME`](crate::DAEMON_NAME) unconditionally: adopting the fallback there
+/// would make a daemon *create* a socket under the retired name whenever a stale inode
+/// from an older release happened to be lying around, which is the opposite of a window
+/// that closes — nothing ever writes that spelling again.
+///
+/// Both candidate paths are computed up front rather than lazily. `default_socket_path`
+/// reads process state and has no side effects, so the extra call costs a `getuid` and
+/// an environment read on the override arm and buys the policy as one expression.
+pub fn resolve_client_socket(override_path: Option<PathBuf>) -> PathBuf {
+    let (current, legacy) = client_socket_candidates();
+    resolve_client_socket_from(override_path, current, legacy, |p| p.exists())
+}
+
+/// The two candidates [`resolve_client_socket`] hands the policy, **in order**:
+/// `(current, legacy)`.
+///
+/// Split out purely so the order can be pinned by a test that reads no filesystem.
+/// The obvious test — compare the wrapper's answer against the policy called with the
+/// same two paths — is *vacuous on any box that has a socket at the current name*,
+/// which is every developer box with a daemon up and every box carrying a stale inode:
+/// with the current name present both the correct order and the swapped one answer the
+/// current path, so the assertion passes identically whether the property holds or not
+/// (plan §3 rule 22's tell). Measured, with the arguments deliberately swapped:
+/// `XDG_RUNTIME_DIR=<dir holding serial-nexus-daemon.sock>` → **ok**; with neither
+/// socket present → FAILED. A pair returned before any `exists` call is asked has no
+/// such state to depend on.
+fn client_socket_candidates() -> (PathBuf, PathBuf) {
+    (
+        default_socket_path(crate::DAEMON_NAME).0,
+        default_socket_path(crate::LEGACY_DAEMON_NAME).0,
     )
 }
 
@@ -232,5 +336,126 @@ mod tests {
         ] {
             assert!(!o.describe().is_empty(), "{o:?} has no description");
         }
+    }
+
+    // ---- The §17.3 rename window, hoisted out of both clients (plan §18 item 51) ----
+
+    /// The two candidates as one `XDG_RUNTIME_DIR` arm would derive them. Both are
+    /// built **from the constants**, never spelled: the retired name has exactly one
+    /// live definition and the `retired_names_appear_only_where_history_lives`
+    /// meta-gate allows exactly that one occurrence, so a literal here would fail it.
+    fn candidates() -> (PathBuf, PathBuf) {
+        (
+            PathBuf::from(format!("/run/user/4242/{}.sock", crate::DAEMON_NAME)),
+            PathBuf::from(format!("/run/user/4242/{}.sock", crate::LEGACY_DAEMON_NAME)),
+        )
+    }
+
+    /// An existence predicate over a fixed set, standing in for the filesystem.
+    fn present(paths: &[&PathBuf]) -> impl Fn(&Path) -> bool {
+        let set: Vec<PathBuf> = paths.iter().map(|p| (*p).clone()).collect();
+        move |p| set.iter().any(|q| q == p)
+    }
+
+    /// **An explicit override is taken as written, unexamined.** Asserted with a path
+    /// that does not exist *and* both defaults present, so a version that validated the
+    /// override and fell back would have every reason here to answer something else —
+    /// which would silently connect the operator to a different daemon than the one
+    /// they named on the command line.
+    #[test]
+    fn an_explicit_socket_override_is_taken_as_written() {
+        let (current, legacy) = candidates();
+        let chosen = PathBuf::from("/nowhere/the-operators-own.sock");
+        assert_eq!(
+            resolve_client_socket_from(
+                Some(chosen.clone()),
+                current.clone(),
+                legacy.clone(),
+                present(&[&current, &legacy])
+            ),
+            chosen
+        );
+    }
+
+    /// **The current name wins whenever it exists** — asserted with the legacy socket
+    /// present too, which is the upgraded box. The ordering this pins down is the one
+    /// a cheaper implementation gets wrong (try legacy first, or prefer whichever
+    /// exists): a stale inode left by an older daemon that died without unlinking would
+    /// then capture every client on the machine.
+    #[test]
+    fn the_current_socket_wins_over_a_stale_pre_rename_one() {
+        let (current, legacy) = candidates();
+        assert_eq!(
+            resolve_client_socket_from(
+                None,
+                current.clone(),
+                legacy.clone(),
+                present(&[&current, &legacy])
+            ),
+            current
+        );
+    }
+
+    /// **The legacy socket is taken only when the current one is absent** — the case
+    /// the window exists for: a pre-rename daemon still running under an operator who
+    /// has just installed the new client.
+    #[test]
+    fn the_pre_rename_socket_is_taken_when_there_is_no_current_one() {
+        let (current, legacy) = candidates();
+        assert_eq!(
+            resolve_client_socket_from(None, current.clone(), legacy.clone(), present(&[&legacy])),
+            legacy
+        );
+    }
+
+    /// **With neither present the client is still pointed at the current name**, so the
+    /// connection error names the path a daemon started now would bind — not a retired
+    /// one the operator would have to recognise before they could act on it.
+    #[test]
+    fn with_no_socket_at_all_the_current_name_is_the_answer() {
+        let (current, legacy) = candidates();
+        assert_eq!(
+            resolve_client_socket_from(None, current.clone(), legacy.clone(), present(&[])),
+            current
+        );
+    }
+
+    /// The public entry point feeds the policy the two default paths, in that order.
+    /// Without this the split above could drift: the pure function's tests all pass
+    /// arguments themselves, so a wrapper that handed the *legacy* path to the
+    /// `current` parameter would leave every one of them green while sending both
+    /// clients to the retired socket.
+    ///
+    /// **Asserted on the candidate pair, not on the wrapper's answer**, and that is the
+    /// whole point of [`client_socket_candidates`] existing. Comparing
+    /// `resolve_client_socket(None)` against the policy called with the same two paths
+    /// reads the real filesystem on both sides, so on a box that has a socket at the
+    /// current name both orders answer the current path and the assertion asserts
+    /// nothing — rule 22's tell, measured in review rather than reasoned about. The
+    /// pair is computed before any `exists` call, so this holds on every box in every
+    /// state.
+    #[test]
+    fn the_client_entry_point_applies_the_policy_to_the_two_defaults() {
+        let current = default_socket_path(crate::DAEMON_NAME).0;
+        let legacy = default_socket_path(crate::LEGACY_DAEMON_NAME).0;
+        assert_ne!(
+            current, legacy,
+            "the two candidates must differ, or the order below is untestable"
+        );
+        assert_eq!(
+            client_socket_candidates(),
+            (current.clone(), legacy.clone()),
+            "the client entry point must hand the policy (current, legacy) in that \
+             order — swapping them sends every client to the retired socket"
+        );
+        assert_eq!(
+            resolve_client_socket(None),
+            resolve_client_socket_from(None, current, legacy, |p| p.exists())
+        );
+
+        // The override arm through the real entry point, which consults neither the
+        // environment nor the filesystem to answer it.
+        let chosen = PathBuf::from("/nowhere/the-operators-own.sock");
+        assert_eq!(resolve_client_socket(Some(chosen.clone())), chosen);
     }
 }

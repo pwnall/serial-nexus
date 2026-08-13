@@ -56,6 +56,7 @@ use crate::cell::CriticalCell;
 use crate::runtime::{self, READ_BUF, SharedFanOut, TargetwardInbox, TeardownLoss};
 use crate::tap::TapFeed;
 use serial_nexus_sys as sys;
+use serial_nexus_sys::RtsCtsOutcome;
 
 /// Re-arm interval (ms) for the serial reader thread's blocking readiness poll.
 /// A live device wakes it far sooner; on teardown the thread observes its stop
@@ -146,7 +147,7 @@ fn waiting_reason(device: &str, resolver: &serial_nexus_core::Resolver) -> Strin
 /// `rts-cts` *and* is already failing, and it consults `sys::honours_rtscts` — the one
 /// predicate §15.53 requires, the same one `load` uses and P15 cross-checks — rather
 /// than pattern-matching `serial2`'s error text, which is not a contract. Anything
-/// other than a definite `Ok(false)` leaves the original error alone: a driver that
+/// other than a definite measurement leaves the original error alone: a driver that
 /// honours the flag failed for some other reason, and an `Err` here means the second
 /// open failed too, which says nothing about flow control.
 /// The message, as a pure function of what was measured.
@@ -154,40 +155,77 @@ fn waiting_reason(device: &str, resolver: &serial_nexus_core::Resolver) -> Strin
 /// Split from [`explain_open_failure`] for the same reason `p15_verdict` is split from
 /// P15: the arm that matters — a driver that accepts `CRTSCTS` and drops it — **cannot
 /// be reached on Linux**, which honours the flag, so a test driving the real predicate
-/// here would exercise only the pass-through and read as covered. `honoured: None` is
-/// *unmeasurable* (the second open failed too) and is deliberately not the same as
-/// `Some(false)`: it says nothing about flow control, so it must not blame it.
+/// here would exercise only the pass-through and read as covered. `measured: None` is
+/// *unmeasurable* (the second open failed too) and is deliberately not the same as any
+/// of the three answers: it says nothing about flow control, so it must not blame it.
+///
+/// **Two arms explain, and they say different things, because the driver did**
+/// (§7.1 clause 7, §15.53). An [`RtsCtsOutcome::AcceptedThenDropped`] port is one
+/// `load` would normally have refused outright, so its sentence says why the refusal
+/// could not fire. An [`RtsCtsOutcome::Refused`] port is one `load` deliberately lets
+/// through — the refusal is honest, and this *is* the loud failure §7.1 counts on
+/// instead — so its sentence must not accuse the driver of accepting and dropping the
+/// request, which would be a false statement about the port in front of the operator.
+/// Before the predicate became three-valued the second arm could not be written at
+/// all: an honest refusal was `Ok(false)`, so either it got the accept-then-drop text
+/// (false) or it got nothing (opaque, §7.1 clause 5).
 fn open_failure_text(
-    honoured: Option<bool>,
+    measured: Option<RtsCtsOutcome>,
     flow: CfgFlow,
     path: &std::path::Path,
     e: &str,
 ) -> String {
-    if flow != CfgFlow::RtsCts || honoured != Some(false) {
+    if flow != CfgFlow::RtsCts {
         return e.to_owned();
     }
     let shown = path.display();
-    format!(
-        "{e} — this port's driver accepts a `CRTSCTS` request and reads the flag back \
-         clear, so `flow = \"rts-cts\"` cannot be honoured on it and `serial2` refuses \
-         the open (§15.53). Normally `load`/`add-node` refuses this config outright, \
-         but the pre-check could not open {shown} to measure it — either the running \
-         graph still held the port, or the device was absent when the config loaded. \
-         Use flow = \"none\" (or xon-xoff) for this port, or attach an adapter whose \
-         driver implements RTS/CTS; `serial-nexus-doctor --port {shown}` reports the \
-         same reading as P15."
-    )
+    // **The remedy names `flow_control`, and that spelling is load-bearing.** Every
+    // message in this family said `flow = "none"` until 2026-08-12 — four shipped
+    // sites, plus two tests that asserted the wrong one and pinned it. The schema key
+    // is `flow_control` under `deny_unknown_fields` and there is no key alias, so an
+    // operator who typed the remedy verbatim got a *second* error naming a different
+    // problem: `unknown field \`flow\`, expected one of \`name\`, \`device\`, \`baud\`,
+    // …`. Measured by running it, not by reading the struct. This is plan §3 rule 11's
+    // bar failing on the box that prints the message, and it is the exact failure
+    // §15.53 exists to prevent — the refusal was built so nobody would meet
+    // `serial2`'s bare "failed to apply some or all settings", and then it handed them
+    // a key the parser denies.
+    match measured {
+        Some(RtsCtsOutcome::AcceptedThenDropped) => format!(
+            "{e} — this port's driver accepts a `CRTSCTS` request and reads the flag back \
+             clear, so `flow_control = \"rts-cts\"` cannot be honoured on it and `serial2` refuses \
+             the open (§15.53). Normally `load`/`add-node` refuses this config outright, \
+             but the pre-check could not open {shown} to measure it — either the running \
+             graph still held the port, or the device was absent when the config loaded. \
+             Use flow_control = \"none\" (or xon-xoff) for this port, or attach an adapter whose \
+             driver implements RTS/CTS; `serial-nexus-doctor --port {shown}` reports the \
+             same reading as P15."
+        ),
+        Some(RtsCtsOutcome::Refused) => format!(
+            "{e} — this port's driver refuses a `CRTSCTS` request outright: `tcsetattr` \
+             fails on it rather than reporting success and leaving the flag clear, so \
+             `flow_control = \"rts-cts\"` cannot be applied here and `serial2` propagates the \
+             driver's own error out of the open. That refusal is honest, which is why \
+             `load`/`add-node` does **not** reject this config for it (§7.1) — the \
+             failure is loud and arrives here instead of a link running silently \
+             without the flow control it asked for. Use flow_control = \"none\" (or xon-xoff) \
+             for this port, or attach an adapter whose driver implements RTS/CTS; \
+             `serial-nexus-doctor --port {shown}` reports the same reading as P15."
+        ),
+        // Honoured, or unmeasurable. Neither says anything about this failure.
+        Some(RtsCtsOutcome::Honoured) | None => e.to_owned(),
+    }
 }
 
 fn explain_open_failure(path: &std::path::Path, params: &OpenParams, e: &std::io::Error) -> String {
     // Only ask when the node actually requested `rts-cts` *and* is already failing:
     // this costs one extra open, on a path that is not going to succeed anyway.
-    let honoured = if params.flow == CfgFlow::RtsCts {
+    let measured = if params.flow == CfgFlow::RtsCts {
         serial_nexus_sys::honours_rtscts(path).ok()
     } else {
         None
     };
-    open_failure_text(honoured, params.flow, path, &e.to_string())
+    open_failure_text(measured, params.flow, path, &e.to_string())
 }
 
 /// An open [`SerialPort`] that owns every **tty-level assertion this node made on it**:
@@ -1471,7 +1509,7 @@ mod tests {
     /// unrelated reason, dressed up as a flow-control problem, is worse than a bare
     /// errno because it sends them to change a setting that was never at fault.
     ///
-    /// `None` is *unmeasurable*, not `Some(false)`: it means the second open failed
+    /// `None` is *unmeasurable*, not a measurement: it means the second open failed
     /// too, which says nothing about `CRTSCTS`. Collapsing the two is the specific
     /// mistake §15.53 names for the `load`-time predicate, and it would be the same
     /// mistake here.
@@ -1480,7 +1518,12 @@ mod tests {
         let p = std::path::Path::new("/dev/cu.usbserial-A");
         let bare = "failed to apply some or all settings";
 
-        let blamed = open_failure_text(Some(false), CfgFlow::RtsCts, p, bare);
+        let blamed = open_failure_text(
+            Some(RtsCtsOutcome::AcceptedThenDropped),
+            CfgFlow::RtsCts,
+            p,
+            bare,
+        );
         assert!(blamed.contains("rts-cts"), "{blamed}");
         assert!(
             blamed.contains("/dev/cu.usbserial-A"),
@@ -1491,7 +1534,7 @@ mod tests {
             "must keep the driver's own error: {blamed}"
         );
         assert!(
-            blamed.contains("flow = \"none\"") && blamed.contains("adapter whose driver"),
+            blamed.contains("flow_control = \"none\"") && blamed.contains("adapter whose driver"),
             "must carry both remedies: {blamed}"
         );
         assert!(
@@ -1500,19 +1543,68 @@ mod tests {
         );
 
         // Every arm that is not a measured drop passes the error through verbatim.
-        for (honoured, flow) in [
-            (Some(true), CfgFlow::RtsCts), // driver honours it — something else broke
-            (None, CfgFlow::RtsCts),       // unmeasurable — says nothing about flow
-            (Some(false), CfgFlow::None),  // node never asked for it
-            (Some(false), CfgFlow::XonXoff), // ...nor for this
+        for (measured, flow) in [
+            // driver honours it — something else broke
+            (Some(RtsCtsOutcome::Honoured), CfgFlow::RtsCts),
+            // unmeasurable — says nothing about flow
+            (None, CfgFlow::RtsCts),
+            // node never asked for it
+            (Some(RtsCtsOutcome::AcceptedThenDropped), CfgFlow::None),
+            (Some(RtsCtsOutcome::AcceptedThenDropped), CfgFlow::XonXoff),
+            (Some(RtsCtsOutcome::Refused), CfgFlow::None),
             (None, CfgFlow::None),
         ] {
             assert_eq!(
-                open_failure_text(honoured, flow, p, bare),
+                open_failure_text(measured, flow, p, bare),
                 bare,
-                "honoured={honoured:?} flow={flow:?} must not blame flow control"
+                "measured={measured:?} flow={flow:?} must not blame flow control"
             );
         }
+    }
+
+    /// **An honest refusal reaching the open gets its own sentence, and it must not
+    /// be the accept-then-drop one** (§7.1 clause 7, §15.53).
+    ///
+    /// This arm exists *because* the design does not refuse such a config at `load`:
+    /// the driver said no, the failure is loud, and it lands here. Two ways to get it
+    /// wrong, both asserted: printing the accept-then-drop text would tell the
+    /// operator their driver silently discarded a request it in fact rejected — a
+    /// false statement about the hardware in front of them — and printing nothing at
+    /// all would make the one fault §7.1 deliberately routes to the open the opaque
+    /// one (§7.1 clause 5, notes §3.72).
+    ///
+    /// No hardware in reach of this project produces this arm — the rig's FT232R
+    /// honours `CRTSCTS` on Linux and accepts-then-drops it on Darwin — so it is
+    /// tested purely, exactly as the drop arm is (§9).
+    #[test]
+    fn an_honest_refusal_is_explained_without_being_accused_of_dropping_the_request() {
+        let p = std::path::Path::new("/dev/ttyS9");
+        let bare = "Invalid argument (os error 22)";
+        let text = open_failure_text(Some(RtsCtsOutcome::Refused), CfgFlow::RtsCts, p, bare);
+
+        assert!(
+            text.contains(bare) && text.contains("/dev/ttyS9"),
+            "must keep the driver's own error and name the port: {text}"
+        );
+        assert!(
+            text.contains("refuses a `CRTSCTS` request outright"),
+            "must say the driver refused, which is the fact that was measured: {text}"
+        );
+        assert!(
+            !text.contains("accepts a `CRTSCTS` request and reads the flag back clear"),
+            "an honest refusal must NOT be reported as the silent drop — that is a \
+             false statement about this port, and it is the exact collapse the \
+             two-valued predicate forced (§7.1 clause 7): {text}"
+        );
+        assert!(
+            text.contains("flow_control = \"none\"") && text.contains("adapter whose driver"),
+            "must carry both remedies: {text}"
+        );
+        assert_ne!(
+            text, bare,
+            "the fault §7.1 deliberately lets through to the open must not be the \
+             opaque one (§7.1 clause 5)"
+        );
     }
 
     /// **"Absent" and "unresolvable here" are different facts.** On a system with no
@@ -1998,6 +2090,83 @@ mod tests {
             modem,
             purge_on_reconnect: true,
         }
+    }
+
+    /// **The claim §7.1 clause 7 rests on, measured rather than read** — a driver
+    /// that *refuses* a requested line setting makes this node's own open fail
+    /// **loudly**, instead of handing back a working port that silently runs
+    /// without what the config asked for.
+    ///
+    /// That claim is the entire reason `flow_precheck_refuses` lets an honest
+    /// refusal through: refusing the config would deny an operator a whole graph
+    /// over a port whose failure was never silent. If it were false — if a refused
+    /// flag produced an `Ok` port — the design's position would be the thing that is
+    /// wrong, not the tree. So it is asserted here, on every `cargo test`, and not
+    /// left as a reading of a pinned dependency's source that a version bump can
+    /// falsify without a word.
+    ///
+    /// **`PARENB` on a pts stands in for `CRTSCTS` on a refusing UART, because
+    /// nothing in reach of this project refuses `CRTSCTS`.** The rig's FT232R
+    /// honours it on Linux and accepts-then-drops it on Darwin (§15.53), so the
+    /// refusal arm has no hardware here at all — but a Linux pts answers a `PARENB`
+    /// request with `EINVAL` and reads the flag back clear, which is the same driver
+    /// answer through the same `serial2` path: `set_on_file`'s `?`, and then the
+    /// read-back comparison that turns a cleared flag into `failed to apply some or
+    /// all settings`. Measured on Linux 7.0.0-29 with serial2 0.2.37: the refused
+    /// setting errors, and the control below opens clean.
+    ///
+    /// The **precondition is asserted, not assumed** (§9): if a platform's pty ever
+    /// starts accepting `PARENB`, this stops measuring a refusal and would pass
+    /// vacuously, so it says so and fails rather than going quietly green.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_line_setting_the_driver_refuses_makes_the_open_fail_instead_of_running_silently() {
+        use nix::sys::termios::{ControlFlags, SetArg, tcgetattr, tcsetattr};
+        let pts = pts_fixture();
+
+        // The precondition: this tty really does refuse the flag, `tcsetattr`
+        // failing and the read-back clear — the honest-refusal shape, not a drop.
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pts.path)
+            .expect("open the pts");
+        let before = tcgetattr(&probe).expect("tcgetattr");
+        let mut want = before.clone();
+        want.control_flags |= ControlFlags::PARENB;
+        let set = tcsetattr(&probe, SetArg::TCSANOW, &want);
+        let held = tcgetattr(&probe)
+            .expect("tcgetattr after")
+            .control_flags
+            .contains(ControlFlags::PARENB);
+        let _ = tcsetattr(&probe, SetArg::TCSANOW, &before);
+        assert!(
+            set.is_err() && !held,
+            "this pty no longer REFUSES PARENB (tcsetattr={set:?}, read_back_set={held}) — \
+             the stand-in for a CRTSCTS-refusing driver is gone and the assertion below \
+             would pass without measuring a refusal (§9)"
+        );
+
+        // The control, first: a setting this tty supports must open cleanly, or the
+        // failure below is explained by the pts rather than by the refusal.
+        let mut params = open_params(ModemLines::default());
+        open_port(&pts.path, &params).expect(
+            "a pts with supported settings must open — without this the subject arm \
+             proves nothing about refusals",
+        );
+
+        // The subject: the refused setting. Loud, not silent.
+        params.parity = CfgParity::Even;
+        let err = open_port(&pts.path, &params).err().expect(
+            "a driver that REFUSED a requested line setting handed back a working \
+             port — the node would run without what the config asked for, silently, \
+             and §7.1 clause 7's reason for not refusing an honest refusal at `load` \
+             would be false",
+        );
+        assert!(
+            !err.to_string().is_empty(),
+            "the failure must carry the driver's own words: {err}"
+        );
     }
 
     /// RV-8: `open_port` takes `TIOCEXCL` and *then* applies the configured modem

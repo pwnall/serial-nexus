@@ -31,6 +31,7 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 
 | Figure | Scope | Date | Commit / record | Caveat |
 |---|---|---|---|---|
+| **967 passing · 0 failed · 7 ignored**, 125 test-result lines | Linux, default CI scope, `--no-fail-fast`, `--nocapture`, **`SNX_EXEC_CODEC=required`** | 2026-08-12 | the v17 alignment-pass session (notes §3.84–§3.86) | **the Linux authority row, and the first fully green one in this record.** 125 result lines over **121 cargo targets** (113 `Running` + 8 doc-test) and **12 self-skips**, measured with `--nocapture`. The **+36** over the 931 row is measured per target rather than estimated, and closes exactly: `serial_nexus_devprep` +6 (item 52), `serial_nexus_rpc` +5 (item 51's hoisted policy, self-tested per §16.5), `serial_nexus_daemon` +4 and `serial_nexus_codec_api` +4 (items 56, 21, 53), `meta_skip_names` +3, `p5_codec_teardown` +3 (item 38) and `p8_daemon_transcript` +3 (item 36) as new files, `serial_nexus_sys` +2 (item 56's tri-state), `p13_teardown_accounting` +2 (item 21), and one each from `meta_gates` (item 52's derived verb-parity gate), `p13_legacy_defaults`, `serial_nexus_doctor` and **`p3_idle_cost`** — the last being item 46's guard passing rather than a new test. `ignored` moved 6 → 7 for a documentation reason: the kit's new suite carries an ```ignore` doc example like its siblings. **The one failure is gone**: `p3_idle_cost` reads **0.0750 %/fd** against its 0.1274 %/fd ceiling *under full suite parallelism*, within 3 % of the 0.0728 %/fd the artifact records from solo runs — which is the evidence that the marginal form is the right instrument, the absolute form having varied by more than that between one box and another. Supersedes the 931 row. |
 | **931 passing · 1 failed · 6 ignored**, 122 test-result lines | Linux, default CI scope, `--no-fail-fast`, `--nocapture` | 2026-08-12 | the item-47 landing (notes §3.83) | **the Linux authority row**, superseding the 894 below. 122 result lines over **118 cargo targets** (110 `Running` + 8 doc-test) and **12 self-skips**, measured with `--nocapture` (notes §3.78). The +37 over the 894 row is exactly this session's new tests, counted rather than estimated: **22** matcher units (`daemon/src/pattern.rs`, a new file), **12** pattern-wait acceptance guards (`itest/tests/p12_pattern_wait.rs`, a new file), **2** hub guards added to `daemon/src/tap.rs` (11 → 13) and **1** devprep capability-fold guard (1 → 2). Both ends were measured in this session, so the delta is quotable. **An earlier row here read 925 and decomposed it as 19+11+1**; that figure was taken before the adversarial review's fixes added six guards, and its decomposition was wrong by one even for its own tree — recorded because a Status row whose arithmetic does not close is exactly what this table's scope discipline exists to prevent. The one failure is `p3_idle_cost::thirty_two_idle_tty_fds_stay_under_the_recorded_cpu_budget` at **4.10 %** against its 3.50 % tripwire: item 46, and **measured not to be this change's** — runs on this tree read 3.70/3.70/3.90/4.10 %, and three runs on the unchanged tree (a `git worktree` at `849fc8e` with its own target dir, same box, same session) read 3.80/4.30/3.90 %, so the two trees sit in one band and the pattern wait adds no idle-path work (it runs inside `TapHub::ingest`, which an idle endpoint never reaches). |
 | **894 passing · 1 failed · 6 ignored**, 121 test-result lines | Linux, default CI scope, `--no-fail-fast` | 2026-08-12 | the v17 landing's gate run (notes, the v17 generation entry) | the one failure is `p3_idle_cost::thirty_two_idle_tty_fds_stay_under_the_recorded_cpu_budget` at **3.80 %** against its 3.50 % tripwire — item 46's recorded signature verbatim (its message prints "38 ticks over 10s"), reproduced in two of this landing's three suite runs (once under deliberate parallel load, once on a quiet box at load 0.33) and absent in the first; the product tree is unchanged by v17 (documents, two meta-gate consts, one harness message string), so this is item 46 resurfacing, never a fresh finding. Supersedes the 890 row as the default-scope authority; the total moved 896 → 901 because the 2026-08-12 rig session's later commits added tests after that row was taken. **Superseded by the 925 row above**, taken later the same day at the same scope, which is the current Linux authority. |
 | **890 passing · 0 failed · 6 ignored**, of which **886 · 0 · 6** are workspace-own | Linux, default CI scope | 2026-08-12 | this session (notes §3.75) | 121 test-result lines over **117 cargo targets** (109 `Running` + 8 doc-test), and **12 self-skips**, measured with `--nocapture` (notes §3.78 — at default capture the count reads 0 because `cargo test` captures a *passing* test's stderr, so "zero SKIP lines" beside a figure taken without it asserts nothing); four passes and two lines are the nested `acme-codec` **and `tinymux-codec`** subprocesses (`p8_external_codec.rs`, which now builds and tests both template crates); rig attached but `SNX_CROSSOVER_A`/`_B` unexported, so `serial_hardware` self-skipped. The `ignored` moved 4 → 6 for a documentation reason, not a coverage one: the two new kit suites carry ```ignore` doc examples like their four siblings. Superseded by the v17 landing row above. |
@@ -181,9 +182,11 @@ artifacts, which only `cargo build` emits.
 
 **Non-crate directories.** `tests/ext-codec/` is *not* a cargo test target: Python exec-codec
 fixtures the harness consumes, including a deliberately broken half-duplex citizen (§8, §15.22)
-— its four fixtures (`passthrough.py`, `passthrough-codec.py`, `lag.py`, `half-duplex.py`) and
+— its **six** fixtures (`passthrough.py`, `passthrough-codec.py`, `lag.py`, `half-duplex.py`,
+`strict.py`, `deaf.py`) and
 the kit's `Hoarder` positive/negative pair are named must-preserve by §8 (a tidier session must
-not simplify them away).
+not simplify them away). *(This line said four and omitted `strict.py` — the `--error-paths`
+positive control shipped with item 34 — until 2026-08-12.)*
 `expectations/` — the doctor gate files `linux.jq`/`macos.jq` (plan §3). `scripts/` — exactly one
 file, `bless` (§15.45); the bash validation suite is retired and deleted, so a "ported from
 `scripts/validate/...`" head comment is provenance, not a path. `packaging/` — systemd unit,
@@ -230,9 +233,13 @@ are version-pinned in the workflow, because `--locked` pins a tool's dependencie
 tool itself.
 
 **CI lanes.** `.github/workflows/ci.yml` is the authority for lane commands (plan §3). Push
-lanes: `check` (fmt; workspace and minimal-daemon clippy; the Apple compile cross-check on
+lanes: `check` (fmt; workspace and minimal-daemon clippy; the Apple cross-check on
 **both** triples, `--all-targets` — neither triple is a superset of the other, and `cargo build`
-compiles no test target, notes §3.71; then `cargo build --workspace --locked` and the full
+compiles no test target, notes §3.71. That cross-check runs **clippy**, not `check`, as of
+2026-08-12 (item 54): lints had run on the Linux lane only, so macOS-only dead code —
+a helper whose one caller is `#[cfg(target_os = "linux")]` — was caught by no lane at all,
+measured against a plant that Linux clippy and the Darwin `cargo check` both passed and the
+Darwin clippy failed; then `cargo build --workspace --locked` and the full
 `cargo test --workspace --locked` — the artifacts the harness boots exist only after the
 build step); `license-gate` (deny plus the planted-crate rejection proof); `doctor`
 (`jq -e -f expectations/linux.jq` over the probe run, report archived; `skipped(no adapter)` is a
@@ -552,6 +559,7 @@ variables (rule 11).
 | `SNX_RIG_FLOW` | The two `rts-cts` end-to-end tests (§15.52) | Skip on a 3-wire bench, printing the measurement | Skip is a failure | Precondition *measured*, not declared: a 3-wire bench is §5's stated assumption, so `SNX_CROSSOVER=required` deliberately does not redden it (notes §3.63) |
 | `SNX_WEB_UI` | Playwright browser suite (§15.37) | Self-skip without node | Skip is a failure | Retries stay 0 (rule 15) |
 | `SNX_LICENSE_GATE` | Licensing-gate lane | Self-skip | Skip is a failure | — |
+| `SNX_EXEC_CODEC` | The out-of-process codec battery (§8, §15.26): thirteen tests over four files that drive a codec child through an external interpreter — `exec-conformance`, the any-language envelope battery, the crash-and-restart guard, the unconfigured-channel counter | Self-skip naming what the provider saw (`python3 not found`) | Skip is a failure (item 49) | Named for the **capability**, not the tool, like every instance beside it — `SNX_TLS`'s absent tool is `curl`, `SNX_WEB_UI`'s is `node`. A fixture ported to another language would leave an `SNX_PYTHON` naming nothing while the battery it gated still existed; the tool's name belongs in the message, on the box printing it (rule 11) |
 | `SNX_SERIAL_PAIR=rig` | Forces `serial_pair_or_rig()` onto hardware (§15.48) — not a required mode | Software wins by default | Forcing with no rig visible is a hard failure, never a silent fallback | Provider printed before transmit |
 
 **Four** further variables are parameters, not gates. `SNX_CROSSOVER_A`/`_B` name the two rig port
@@ -1057,7 +1065,9 @@ is never reused. New items append from 16: carried-forward residuals are items 1
 construction items are 32–44, and items 45 and 46 were filed 2026-08-12 by the alignment pass that
 executed most of 32–44 (notes §3.75, §3.76). Items 47–55 were filed by the v17 revision
 (2026-08-12): item 47 is §15.56's construction, and 48–55 the residuals and hardenings its input
-digest surfaced.
+digest surfaced. Items 56–58 were filed **and executed** by the v17 alignment pass against the
+tree (2026-08-12, notes §3.84) — three defects no prior item covered, numbered because a defect
+this record has no number for is one the next review cannot check was fixed.
 
 **Schema.** An open item states, in order: **State** (open / executed / declined; size S/M/L;
 the session kind where one is needed — this line is the status a landing commit must flip),
@@ -1177,7 +1187,7 @@ dropped. Product-surface deferrals use §14's vocabulary (refused-at-load / acce
     gate set would notice either way. Predates the M4 report; not an arm64 finding.
     **Remainder:** one measured number per Mac, taken the way item 12's guard would take it —
     which is why the two items share a schedule.
-14. **`flow = "xon-xoff"` has no pre-check and no probe.**
+14. **`flow_control = "xon-xoff"` has no pre-check and no probe.**
     **State:** open (S).
     **Evidence:** §15.53 refuses an `rts-cts` config whose driver drops `CRTSCTS`, and P15
     measures it. Software flow control gets neither, and `serial2` verifies `c_iflag` by
@@ -1265,7 +1275,28 @@ Each item below uses the schema with its fields inline.
     step — including the fourth outcome: this test failing on *Linux* over the rig is evidence
     against the conversion itself (the witness fd perturbing the graph — it keeps
     `client_present` true and suppresses the detach purge), with 20-of-20 the baseline.
-21. **`exec`'s teardown figure: floor to total** — **open** (S). Item 2's recorded residual,
+21. **`exec`'s teardown figure: floor to total** — **EXECUTED 2026-08-12** (notes §3.86). The
+    inventory came before the change, and it corrected the filing in both directions. What an exec
+    node holds targetward at teardown: (a) the per-channel host-facing receivers plus each
+    forwarder's in-flight chunk — **already counted**; (b) the internal merged queue `src_rx`,
+    moved by value into `pump_child`, which `TaskSet::abort_all` drops unread — **uncounted**,
+    notes §3.31's original defect surviving one stage further in than the fix reached; (c) the
+    chunk `pump_child` is mid-`write_all` on — uncounted, no `held` slot existing for a bare
+    receiver; (d) bytes already inside the child's stdin pipe — **structurally unreachable and
+    argued not to be loss**: the exec codec's obligation ends at the child's stdin exactly as a
+    serial node's ends at the device fd, which is the line the serial adoption already draws.
+    **The note the item rests on gets one thing wrong, and it matters:** the merge queue is
+    *bidirectional* — `mux_inbox` is a `target_inbox` entry whose forwarder tags chunks with the
+    reserved MUX identity — so roughly half of it is the raw device stream on its way *into* the
+    child, and notes §3.55's "the merge queue needs only a watch" sketch would have charged
+    hostward bytes to a targetward ledger. *Fail-first:* two reverts by notes §3.55's
+    disjoint-reddening method, each against rebuilt binaries, each reddening exactly the two new
+    guards (`discarded_at_teardown: 0` where 44000 is owed) and no others. A new
+    `tests/ext-codec/deaf.py` fixture supplies the shape the item named — a child that has stopped
+    reading stdin, so the merge stage holds bytes at teardown. `daemon/src/nodes/mod.rs`'s
+    `discarded_at_teardown` doc, which asserted "`exec`'s answer is a floor; every other kind's is
+    exact", is corrected in the same change: it became a shipped falsehood the instant the fix
+    landed. The superseded filing follows. Item 2's recorded residual,
     now scheduled. *Evidence:* `exec`'s `discarded_at_teardown` is a floor because its internal
     merge stage is not reached (notes §3.55; named where the counter is documented, §15.50).
     *Validation:* a guard whose child has stopped reading stdin, so the merge stage holds bytes
@@ -1306,11 +1337,19 @@ Each item below uses the schema with its fields inline.
     probe makes it measured. *Validation:* a new probe id is a new instrument and moves
     `probe_set` — the era move deliberate and recorded in `docs/doctor/README.md` (notes
     §3.57's rule); presence-never-answer.
-27. **The Markdown value grammar wants a design note before any fix** — **open** (S; a
-    decision, not an edit). *Evidence:* the doctor's Markdown value grammar is non-injective
-    (`", "`, `=`, `[`, `]` unescaped inside values), and fixing it would rewrite every frozen
-    `.md` artifact (notes §3.74). *Validation:* the decision recorded as a design entry before
-    any renderer change; frozen artifacts never edited either way (§16.13).
+27. **The Markdown value grammar wants a design note before any fix** — **EXECUTED 2026-08-12**
+    as **§15.57**, and the decision is to **decline the escape**. The item asked for a decision,
+    not an edit, and got one: the Markdown is a *view* of the JSON and the JSON is the artifact
+    of record (measured — the rendering is a pure function of the model minus one field, while 0
+    of 1064 Tier-3 scalar leaves carry their JSON kind, against 22 `type ==` clauses in the gate),
+    so making the view injective buys a property nothing reads and does not buy the kinds. The
+    cost lands on immutable evidence: §16.13 freezes every committed report, so an escape either
+    mass-edits frozen artifacts or splits the corpus's grammar in two forever. The obligation the
+    decline carries — that nothing quietly parses the rendering — is discharged by the rule
+    §15.57 states and by the `--field-set` message that already names both remedies. No renderer
+    change; no frozen artifact touched. Overturning it takes a consumer that genuinely cannot be
+    given the JSON, and the sanctioned answer is then a third rendering, never a redefinition of
+    this one.
 28. **The DTR measurements** — **open** (S; needs a rig with DTR wired — the current rig leaves
     it unwired). *Remainder:* (a) the DTR-pulse cost question — whether the pre-check can ask
     from inside the node's own open rather than as a separate toggle (notes §3.68 measured the
@@ -1318,13 +1357,17 @@ Each item below uses the schema with its fields inline.
     (b) The B→A DTR cells' `true`/`stuck-high`/`inverted` arms, and the transposed-read
     blindness notes §3.73 bounds. *Validation:* pre-registered readings before the wire is
     touched; committed captures.
-29. **The tool-wrapper scripts' fate, recorded** — **open** (S; a record to complete, not code
-    to write). *Evidence:* the v15 plan asserted three shell scripts survive as external-tool
-    wrappers pending §16.11; the tree's `scripts/` directory now holds only `bless`, and this
-    pair treats §16.11 as executed (plan §5: the harness is canonical, the bash suite retired).
-    No notes entry records where the three wrappers went. *Validation:* verify their fate in
-    the git history, then record the retirement (or the new home) in the notes, so the v15
-    claim is discharged rather than dropped.
+29. **The tool-wrapper scripts' fate, recorded** — **EXECUTED 2026-08-12**. Answered from the
+    git history rather than from memory, which is what the item asked for. The three were
+    `scripts/lib/wait-for.sh`, `scripts/validate/phase0/license-gate.sh` and
+    `scripts/validate/phase8/external-codec.sh`, and all three were **deleted in one commit** —
+    `563fb9c`, 2026-07-24, "v10 track (§11.7–§11.9, §16.11) + fixes found on the real 7.0 rig",
+    which is the §16.11 execution itself. The same commit created their successors:
+    `itest/tests/p0_license_gate.rs` (new, 77 lines), a rewritten
+    `itest/tests/p8_external_codec.rs`, and the `wait_until`/`wait_for` helpers in
+    `itest/src/lib.rs`. So the v15 claim was true when written and was discharged by the very
+    track it was pending on; nothing was lost and nothing moved elsewhere. `scripts/` holds
+    exactly `bless` (§15.45) and the plan's workspace map already says so.
 30. **Dual-scope figure equivalence** — **open** (S). *Evidence:* the v15 Status line
     attributed a dual-scope 835 to notes §3.68, and v17 finds the attribution unreconciled —
     §3.68's verbatim record reads 830 at gates scope and 834/0 · 833/1 on the rig lane, with no
@@ -1368,7 +1411,25 @@ existing — §8 names them as ledger items.
     battery under its declared mapping and **fails golden without it** — the fail-first proof that
     the mapping is load-bearing. Identity mode is byte-compatible: the map is the identity
     function in every method, and a run with no mapping declares none in its verdict.
-36. **Golden transcripts of the daemon boundary** (L). Replayable byte transcripts of the
+36. **Golden transcripts of the daemon boundary** (L). **EXECUTED 2026-08-12** (notes §3.86).
+    A transcript is the exec-codec child-pipe conversation as **two ordered byte streams** — `<`
+    for what the child writes, `>` for what the daemon writes — never one interleaved log, and
+    that is not a simplification: the exec boundary is two pipes polled concurrently (§15.22), so
+    there *is* no defined interleaving and pinning one would pin a scheduling artifact. Records
+    are byte-exact hex with a run-encoded tail so a near-`MAX_FRAME_SIZE` fragment is one line,
+    each carrying a generated annotation (`data channel="console" payload=65526 B frame=65540 B`)
+    so the file reads as the conversation the item says nothing else gives an author. A new
+    `serial-nexus-sim transcript` mode plays both roles off one file — `--record` to generate,
+    `--verdict` to replay — and it is the one sim mode that cannot print a JSON verdict line,
+    because stdout *is* the envelope pipe; it also parks rather than exiting, an exec child that
+    exits being a crash the daemon respawns over the evidence. Generated against the live daemon,
+    so they cannot drift. *Fail-first:* five plants, each rebuilt and reverted — including the
+    item's own one-byte mutation, which the comparator caught at the line and the replayer caught
+    again at the byte offset (`mismatch_offset: 65684`, expected `0x0b` observed `0x0a`), so the
+    two halves are independently proven rather than one trusting the other. Four scope decisions
+    are written into the transcripts' own headers rather than only into this ledger, each taken
+    because the alternative would have shipped a flaky golden. The superseded filing follows.
+    Replayable byte transcripts of the
     daemon driving a demux (empty-channel in both directions, oversize fragmented, open/close,
     unconfigured-channel counted) plus a sim replay mode; generated by a test against the live
     daemon so they cannot drift. *Evidence:* golden vectors cover single frames; nothing gives
@@ -1379,7 +1440,20 @@ existing — §8 names them as ledger items.
     digit in the frozen table, one digit in the worked `data("", "AB")` example, and one invented
     counter name — each reddened exactly one guard. The doc's §5 TOML loads against a real daemon,
     and stripping its multiplexed `write_mode` is refused naming the edge.
-38. **Codec-node teardown-conservation suite** (M). A conformance test shape asserting
+38. **Codec-node teardown-conservation suite** (M). **EXECUTED 2026-08-12** (notes §3.86) as
+    `itest/tests/p5_codec_teardown.rs`, asserting `discarded_at_teardown` and the conservation
+    equality on a codec node under teardown. *Fail-first:* removing `teardown_loss.drain()` from
+    `CodecNode::signal_stop` reddens two of the three guards with the removal reporting
+    `discarded_at_teardown: 0` where 8008 is owed, and leaves the third — the read-only demux,
+    which charges the *running* discard and not the teardown ledger — green, which is the
+    disjoint-reddening the template asks for. **The "folds review 37's codec guards into the kit
+    surface" clause is executed as one new suite plus four citations, not five new suites, and the
+    reasoning is in the new file's header:** only 37-CODEC-3 had a codec-side property no suite
+    could see; unknown-key naming is already `attributes_are_structural`; reserved-identity
+    lifecycle and the mid-chunk charge are node properties with existing guards; quoted exec paths
+    is a harness property; and 37-EXTC-2's partial-frame tolerance is already asserted byte for
+    byte by `fragmentation_tolerance`, so a second suite would be one rule spelled twice. The
+    superseded filing follows. A conformance test shape asserting
     `discarded_at_teardown` and the conservation equality on a codec node under teardown, so an
     author inherits the loss-accounting promise (§15.50); folds review 37's codec guards into
     the kit surface (mid-chunk refusal with `accepted + discarded == total`, unknown-key naming,
@@ -1436,7 +1510,37 @@ existing — §8 names them as ledger items.
     own section stating §15.45's five bounds rather than a line implying a fourth daemon door.
     Frozen `docs/doctor/` artifacts untouched.
 
-45. **`existing-terminal`'s refusal, made structural** (S; a decision first, then a small patch).
+45. **`existing-terminal`'s refusal, made structural** — **CLOSED AS A DECLINE 2026-08-12.** The
+    item offered two answers and named the second explicitly ("or record the decision that a
+    schema which never admits the word is the better answer and close the item"); that is the one
+    the evidence gives. **Which shape a §14 deferral gets is decided by where it sits in the type
+    system, not by taste:** entry 14 is a deferred *role* of a shipped kind whose `faces` field is
+    the shared two-valued `Facing`, so the schema cannot exclude it and `validate` must refuse it
+    — structural refusal for want of an alternative. Entry 15 is a deferred *whole kind*, and a
+    word the schema never admits is unreachable **by construction**, where a `validate` refusal is
+    one forgotten call away from admitted. The precedent is §15.8's configuration/state split —
+    state fields *do not exist* on configuration types, so the question cannot be asked. *(An
+    earlier draft of this disposition cited §15.4's merge diamond instead; the review of this
+    change caught it, and it is a counterexample rather than a precedent — the one-producer
+    invariant is `TargetEndpointOversubscribed`, a `GraphModel::validate` refusal over a config
+    that deserializes perfectly. Corrected in place; the decline is unaffected, its stated
+    precedent was not.)*
+    *Measured, not argued:* option (A) was built on a scratch tree and costs two things forever —
+    serde's internally-tagged unknown-variant error enumerates every variant, so `type = "seriall"`
+    would be answered with a list advertising `existing-terminal`, a kind the daemon refuses one
+    stage later; and §7.7 states two fields and then "otherwise it behaves as a boundary", so the
+    rest of the field set would be a guess frozen by `deny_unknown_fields` and §15.16's additive
+    promise, while `NodeConfig::shape` would owe `to_model` an endpoint topology the design never
+    states — letting an operator's *edges* validate against a shape nobody designed. The blast
+    radius was also measured: exactly one out-of-core match site (`daemon/src/nodes/mod.rs`).
+    *The handshake the item designed still works, in the other direction:* the existing pair
+    `existing_terminal_is_refused_at_load_listing_the_shipped_kinds` and
+    `a_refused_existing_terminal_disturbs_neither_the_running_graph_nor_the_daemon` is now the
+    **tripwire on the decline** — planting the variant reddens both at their error-code
+    assertions (`-32002` where they demand `-32602`, the word ceasing to be unknown one stage
+    early), observed. Recorded at design §14's vocabulary and entry 15, and in
+    `core/src/config.rs`'s module header where a future reader reaches for the variant.
+    The superseded filing follows.
     Filed 2026-08-12 (notes §3.75) rather than done silently, because it is a change to what an
     operator reads. *Evidence:* §14 entry 15 is *refused-at-load*, and the refusal is real,
     live and now guarded — but it is serde's unknown-variant error at `INVALID_PARAMS`, which
@@ -1451,8 +1555,39 @@ existing — §8 names them as ledger items.
     behaviour, so the upgrade reddens it loudly rather than passing through unnoticed — the
     handshake is deliberate.
 
-46. **`p3_idle_cost` sits too close to its own ceiling under suite parallelism** — **open**
-    (S/M; a measurement and then a decision, not an edit). Filed 2026-08-12 (notes §3.75 §I).
+46. **`p3_idle_cost` sits too close to its own ceiling under suite parallelism** — **EXECUTED
+    2026-08-12.** The controlled measurement was taken and it **refutes the first disposition**:
+    the `ACTIVE_POLL`→`IDLE_POLL` backoff has not regressed. On a 20-core box, 10 s window, three
+    healthy samples per rung at 1/2/8/16/32 fds against two neutered ones at 8/16/32, least
+    squares gives a healthy slope of **0.0728 %/fd** with a **1.194 %** intercept, and a neutered
+    slope of **0.2004 %/fd** — a 2.75× separation, with the healthy figure reproducing §15.19's
+    recorded ~0.06 %/fd within 20 %. What had moved is the **fixed** term, which the artifact
+    never recorded separately: its 2.00 % is a single total at 32 fds with no baseline rung, so
+    an absolute ceiling derived from it is dominated by a quantity the mechanism under test does
+    not control — which is why 3.50 % fired against a healthy 3.3–3.6 % on this box.
+    *What landed:* the guard measures **two rungs in one daemon process** — `load`s the
+    artifact's `baseline_tty_fds`, samples 10 s, grows the same process to `idle_tty_fds` with
+    `add-node` (§11), samples again — so the fixed term cancels by construction rather than
+    merely similarly. Assertion (1), the recorded 20 % budget, is unchanged. Assertion (2) now
+    reads `marginal <= per_fd_cpu_percent × DRIFT_FACTOR`, both derived from the artifact, which
+    gains `baseline_tty_fds`, `per_fd_cpu_percent` and a provenance block (box, date, commit,
+    both sweeps, both fits, the neutered control) — `total_cpu_percent` **kept** and annotated as
+    the historical single-rung record it is, never repurposed. `DRIFT_FACTOR` stays 1.75; only
+    the figure it multiplies changed.
+    *Fail-first:* `back_off`'s body replaced with `let _ = wait;`, workspace rebuilt, guard red at
+    **0.2375 %/fd** against the 0.1274 %/fd ceiling, restored, green — run in a `git archive
+    HEAD` scratch copy because the working tree was mid-edit by concurrent agents, which is
+    AGENTS §9's don't-measure-a-moving-tree rule applied to the measurement itself.
+    *The third disposition turned out unnecessary rather than declined:* the marginal form is
+    load-insensitive where the absolute form was not — a run at loadavg **12.68** read
+    0.0792 %/fd, inside the band of runs at loadavg 1.4 — so there is no separate "under the
+    suite's own parallelism" operating condition left to record. **The decline stands and was
+    not laundered:** the ceiling was not raised; the neutered control still reddens the guard.
+    *Named coverage change, in the guard's own module doc:* a regression inflating the daemon's
+    **fixed** cost without scaling per fd is now caught only by the 20 % budget. Recovering that
+    sensitivity honestly needs a recorded fixed-cost figure with an era of its own, across more
+    than one box — a measurement nobody has taken, not a number to invent. The superseded filing
+    follows. Filed 2026-08-12 (notes §3.75 §I).
     *Evidence:* the guard fails at **3.60 / 5.50 / 4.30 %** of a core under heavy external load,
     reads **2.90–3.20 %** in five solo runs on a quiet box, and still read **3.80 % and red** in
     one of two back-to-back whole-suite runs on that same quiet box — the suite runs targets in
@@ -1518,8 +1653,16 @@ remain **open** and none is promised as existing.
     compile triples, the minimal-daemon clippy and `cargo deny` green with the new dependency
     edge — which, as §15.56 predicted, added **zero** lockfile packages (the `Cargo.lock` diff
     is one line: the daemon's own edge).
-48. **The macOS doctor gate has never executed green** — **HALF DISCHARGED 2026-08-13**; the
-    remainder is placement (S). The measurement now exists: CI run 31657666919, job
+48. **The macOS doctor gate has never executed green** — **EXECUTED 2026-08-12**; both halves
+    now closed. *The placement half, landed this session:* the `macos` job's gate step moved to
+    sit immediately after `cargo build` (which is its only real dependency) and ahead of the test
+    step, and **both** steps now carry `if: !cancelled() && steps.build.outcome == 'success'`, so
+    the reorder does not merely move the hiding in the other direction — a red gate cannot hide
+    the suite either. Both doctor jobs' artifact uploads gained `if: !cancelled()`, because a
+    report that failed its expectation is the one most worth reading and a red `jq -e` used to
+    upload nothing at all. AGENTS §3 and `docs/macos.md`'s roadmap paragraph were corrected in
+    the same commit (rule 21: CI is the authority, the mirrors follow). The measurement half was
+    discharged 2026-08-13 and its record follows unchanged: CI run 31657666919, job
     94315579211, on macOS 26.5.2 / arm64 — the diagnostic printed `arm64`, `ProductVersion:
     26.5.2` and `Mach-O 64-bit executable arm64` for the binary, the doctor produced its JSON
     twin, and `jq -e -f expectations/macos.jq` printed `true` and exited 0. So the ENOEXEC
@@ -1560,7 +1703,28 @@ remain **open** and none is promised as existing.
     excluded — their per-file capability divergence is load-bearing (`p12_web_ws_bounds`'s own
     module doc). *Validation:* existing guards unchanged; no behavior delta, asserted by the
     suite; item 24's leash semantics kept opt-in.
-51. **Client socket-fallback policy hoisted into `serial_nexus_rpc`** — **open** (S).
+51. **Client socket-fallback policy hoisted into `serial_nexus_rpc`** — **EXECUTED 2026-08-12.**
+    One implementation, `rpc::socket::resolve_client_socket`, with the policy split out as a pure
+    function of the two candidate paths and an existence predicate (`resolve_client_socket_from`)
+    so both arms are reachable from any environment with nothing on disk — the two discriminators
+    are *files at paths this box derives*, so a test arranging them for real would have two
+    parallel tests fighting over the same two inodes. Ten unit tests in the rpc crate: the shared
+    helper self-tested, §16.5's rule. `ctl` and `web` re-pointed; `web/src/rpc.rs` deleted rather
+    than left as a re-export, its prose preserved at the new home. Named `resolve_client_socket`
+    and not `resolve_socket` deliberately — the daemon keeps a private `resolve_socket` that must
+    **not** fall back, and a public same-named function in a crate the daemon depends on is an
+    invitation to unify two things that must stay different.
+    **The hoist found a live defect, which is why two copies is the shape §16.5 bans:** the web
+    console's copy had *two* arms where the policy has three — it never asked whether the process
+    was root, so it read `XDG_RUNTIME_DIR` first and handed everyone without a usable one the
+    **root** arm `/run/<name>.sock`. An unprivileged console with the variable unset or exported
+    empty therefore pointed at a path only a root daemon ever binds, and said so through the
+    bridge's 503, naming a socket nothing on that machine will ever create — every unprivileged
+    macOS session, and any stripped service environment that exports the variable empty.
+    *Fail-first:* three plants, each rebuilt and observed — inverted precedence in the pure
+    function; the wrapper's two defaults swapped, which **only** the wrapper-level test caught
+    (the other four new tests stayed green, which is why that test exists); and the client call
+    sites. Plan §17.3's window retirement now edits one crate. The superseded filing follows.
     *Evidence:* `ctl` and `web` carry byte-duplicate implementations of the rename-window
     fallback (current socket name wins; `LEGACY_DAEMON_NAME` only when the current one is
     absent) — the two-copies-that-must-agree shape `rpc::socket`'s own module doc records as
@@ -1568,7 +1732,48 @@ remain **open** and none is promised as existing.
     beside `default_socket_path`, both clients re-pointed; plan §17.3's window retirement then
     edits one crate. *Validation:* behavior identical (the single retired-spelling constant
     stays in rpc; the retired-names meta-gate allowance is untouched).
-52. **devprep follow-ups: parity, reporting, envelope, orphan hygiene** — **open** (S/M).
+52. **devprep follow-ups: parity, reporting, envelope, orphan hygiene** — **EXECUTED 2026-08-12**,
+    all five clauses. No new verb shape, no path argument, no capability: `REQUIRED_CAPS` is
+    untouched and stays the one place the set is written; §15.45's five bounds and §15.55's two
+    residuals are unchanged. (a) A macOS `Grant` variant taking the same argument shape as the
+    Linux arm, which resolves every named adapter **first** — a typo is refused exactly as Linux
+    refuses it, because a verb answering "nothing to do" about a port that does not exist is
+    clean about the wrong thing — then reports that this arm holds no capability to grant *with*
+    and that the callout node's reachability belongs to the machine's device permissions rather
+    than to the re-enumeration. Guarded by a new derived meta-gate,
+    `every_devprep_verb_answers_on_both_platform_arms`, which **parses** both `enum Verb` blocks
+    rather than grepping them (line comments stripped; candidates taken only at the enum's own
+    brace depth, so fields and doc comments cannot read as verbs) and asserts set equality in
+    **both** directions — a verb macOS accepts and Linux does not is the same defect with the
+    platforms swapped. Neither roster is typed; a ninth verb inherits the rule the day it lands.
+    (b) `grant_after_reauthorize` returns a `GrantOutcome` value instead of folding a skip into
+    an empty success, so `grant_skipped` rides the JSON on both platforms and `hold` emits its
+    promised final `up` line before reporting a grant failure. (c) The ~90-line cycle/hold
+    envelope factored, the deliberate differences becoming parameters. (d) `scripts/bless`
+    enumerates `.snx-bin/<profile>/` and strips capability-carrying files it did not just
+    install, the set derived from `REQUIRED_CAPS`. (e) `install`/`install --verify`'s `Ready`
+    arm derives its capability line from `REQUIRED_CAPS` instead of printing the pre-§15.55
+    single-capability form.
+    *Fail-first:* six planted defects, each rebuilt, reddened, restored and re-run green —
+    including two that prove a **matcher** rather than a walker (the orphan matcher reimplemented
+    as the blessed matcher, and a doc comment naming the missing verb, which a grep would have
+    called parity). One ordering finding is recorded because the gate found it about itself: the
+    non-vacuity floors originally preceded the parity assertion, so the first fail-first run
+    reddened on "only parsed seven" instead of on the sentence naming the defect; the floors now
+    follow.
+    *One deliberate behaviour change, named:* `Envelope::up()` re-authorizes **every** port even
+    after one refuses. `cycle` used to return at the first failure leaving the rest deauthorized
+    while `hold` carried on — a divergence nothing in the tree argues for, so the envelope
+    resolves it rather than parameterising an accident. Identical on every single-port path; on a
+    multi-port write failure `cycle` now also puts the remaining devices back.
+    *Unverifiable without root, stated exactly:* clause (d)'s strip could not be exercised
+    against a real capability-carrying file — `sudo` needs a password on this box and user
+    namespaces are blocked — so the matcher is proven and the `setcap` removal is not.
+    **Rig-lane precondition:** `.snx-bin/<profile>/serial-nexus-devprep` is now *Stale* relative
+    to the build, and `blessed_devprep_helper()` only **warns** on a byte mismatch (deliberately —
+    an ordinary relink changes those bytes), so a rig lane run without `scripts/bless` first would
+    silently measure the pre-change helper and report green for code that never ran. The
+    superseded filing follows.
     *Evidence:* the macOS verb enum lacks `grant`, violating the file's own clean-answer parity
     contract (an unknown-subcommand error is exactly what its comment bans); §15.55's
     skip-with-a-note promise is silent in JSON mode (`grant_after_reauthorize` notes only when
@@ -1595,7 +1800,20 @@ remain **open** and none is promised as existing.
     repaired by the 2026-08-12 alignment pass; this informational line is what remains.
     *Validation:* the rig lane (plan §3) is the surface; §15.45's five
     bounds and §15.55's two residuals unchanged — no new verb shape, path, or capability.
-53. **Conformance kit: resync-accounting suite** — **open** (S/M). *Evidence:*
+53. **Conformance kit: resync-accounting suite** — **EXECUTED 2026-08-12** (notes §3.86).
+    `resync_is_counted(make, malformed_unit, expected_count)` in the kit, opt-in and parameterized
+    by the author's own malformed unit — the same own-framing escape `recovers_after_garbage`
+    documents, taken as an argument instead of a paragraph. It asserts four things in order: a
+    fresh codec reports 0; a `demux` carrying no bytes still reports 0 (a counter that ticks per
+    *call* rather than per unit fails here before the malformed unit can supply an excuse); the
+    count after the unit is exactly `expected_count`; and a second read agrees with the first,
+    because the daemon re-reads `resync_count` on every `state` poll and a reset-on-read counter
+    would report the loss once and 0 forever. It refuses its own vacuous parameterization — an
+    empty unit or a zero expectation panics naming why. The kit-honesty negative is
+    `SilentResyncer`: `GoodFraming` with the override deleted and nothing else changed, proven to
+    pass **all eight** other suites and fail only this one. `tinymux` runs it from the consumer
+    position, so deleting its counter reddens the consumer-position gate. The superseded filing
+    follows. *Evidence:*
     `Codec::resync_count()` is the one trait method no kit suite exercises; the shipped
     consumer-position example (`tinymux`) increments and surfaces it, and deleting that
     increment leaves the whole tree green while node state reports `framing_errors: 0` forever
@@ -1608,7 +1826,21 @@ remain **open** and none is promised as existing.
     passing every other suite and failing only this one — and `tinymux` running it from the
     consumer position. *Validation:* the negative codec is the fail-first proof; the tinymux
     counter's deletion reddens the consumer-position gate.
-54. **The macOS lint gap** — **open** (S). *Evidence:* clippy (workspace and minimal-daemon)
+54. **The macOS lint gap** — **EXECUTED 2026-08-12**, by the first of the two remedies the item
+    named. The Linux lane's Apple cross-check now runs **clippy** rather than `cargo check` on
+    both triples — plus the minimal-daemon spelling on each — so it is strictly the wider
+    instrument at nearly the same cost (clippy does everything `check` does and then lints).
+    *Fail-first, executed and read at its error text (rule 17 f):* the item's own class was
+    planted in `sys/src/lib.rs` — an ungated private fn whose one caller is
+    `#[cfg(target_os = "linux")]`, dead off Linux — and the three lanes answered
+    `cargo clippy --workspace` (Linux, the lane that exists) **exit 0**,
+    `cargo check --target aarch64-apple-darwin` (the lane that exists) **exit 0**, and
+    `cargo clippy --target aarch64-apple-darwin` **exit 101**, `error: function
+    'item54_planted_helper' is never used`. So neither pre-existing lane saw it and the new one
+    does; the plant was removed and `sys/src/lib.rs` left byte-identical. All four invocations
+    are green on the unplanted tree, measured the same session. The second remedy (clippy in the
+    `macos` job) is **not** taken and is not owed: it costs macOS runner minutes for a class the
+    Linux lane now catches at Linux prices. The superseded filing follows. *Evidence:* clippy (workspace and minimal-daemon)
     runs only in the ubuntu `check` job and the `macos` job runs no lint, so the
     cfg-gated-only-caller dead-code class is caught solely by hand runs on a Mac — measured
     when the macOS validation session found the gate had never once executed on the platform
@@ -1617,7 +1849,50 @@ remain **open** and none is promised as existing.
     cross-check on the Linux lane, or clippy in the `macos` job — or a recorded decline.
     *Validation:* a planted macOS-only lint violation reddens the chosen lane (read at its
     error text — rule 17 f).
-55. **In-tree comment and dead-code hygiene: the drifted-copy class** — **open** (S/M).
+55. **In-tree comment and dead-code hygiene: the drifted-copy class** — **EXECUTED 2026-08-12**
+    for clauses (b), (c), (d), (e) and the reachable half of (a); **(f) and one paragraph of (a)
+    are carried**, blocked on `daemon/src/nodes/codec.rs` being owned by a concurrent change and
+    refused rather than half-done.
+    (a) `daemon.rs`'s verb enumeration is **deleted**, replaced by a statement of why there is no
+    list: `docs/rpc/` is the registry of record, `dispatch` is the implementation, and
+    `meta_derive`'s verb gate derives both sides from those two — so a prose copy here is ungated
+    *by construction*, the gate's scanner stripping line comments before it looks. The drift was
+    measured rather than quoted: the deleted list named 10 verbs against a real surface of **22**,
+    so **twelve** were missing (`add-node`, `remove-node`, `connect`, `disconnect`, `info`,
+    `ports`, `tap.open`, `tap.close`, `tap.wait`, `send-break`, `set-modem`, `pulse-dtr`) — the
+    item said "nine-plus". The construction-era framings in `nodes/mod.rs` and `pty.rs` were
+    **restated in the present tense** rather than deleted, their surrounding content being
+    load-bearing. `codec.rs`'s "Phase 5 implements the demultiplexer" is carried.
+    (b) `SOCKET_PROBE_TIMEOUT`'s rationale re-attached to the const, naming `prepare_socket` as
+    its one reader and recording that the fusion is why both were misread on sight.
+    (c) Both `core/src/config.rs` sites now point at `GraphConfig::effective_write_mode` with
+    `Wiring::build` and `GraphConfig::validate` named as its two *callers*, and the reason the
+    one-place rule exists (a re-deriving validator misses the promoted shape — review 26 RV-4).
+    (d) Three `File::flush` no-ops and the `ok` flag deleted, the no-op **verified in the std
+    source before deleting** (`sys::fs::unix::File::flush`'s body is `Ok(())`, shared by Linux and
+    Darwin) and `ok` followed to all four of its sites first. §7.3's "flush the queue" is now
+    stated as drain-to-`write(2)` where they stood, with log fsync **named as an amendment path
+    and not taken** (§16.6 scopes durability to the state file on the ground that config mutations
+    are rare; a log at line rate is the opposite case, and the same promise would turn §7.3's
+    bounded teardown wait into a bound on the storage stack).
+    (f) **Refused as a half hoist, with the reason measured.** `UnboundSet` lives in `leg.rs` and
+    `UnconfiguredChannels` in `codec.rs`; sharing needs one type used from both sides, so hoisting
+    from `leg.rs` alone would take the copy count from two to **three**. The deltas a future merge
+    must survive are recorded rather than guessed: caps identical (256 / 64), `TRUNCATION_MARKER`
+    byte-identical, but leg's API is `insert`/`clear` where codec's is `record`/`report_into` with
+    a `bytes` field, a first-sighting WARN and no `clear`; the reported counter names are per-kind
+    and stay so. `exec.rs` is **not** a third copy — it imports codec's.
+    *Fail-first, clause (e):* three plants. Planting the 37-TOOL-2 swallow in `subscribe_stream`
+    reddened its guard; planting the identical defect in `tap_stream` reddened **nothing** across
+    four suites and eleven tests, which is finding 59(a) below; and after extraction one defect in
+    the shared helper reddened **all five guards across both verbs**, which is the "spelled once"
+    property made observable. *Clause (d):* no guard covers the deleted code and none can — the
+    call's body is `Ok(())` and its result was already discarded — stated plainly rather than
+    dressed up; the plausible neighbouring mistake (keep writing into the pre-rotation handle) was
+    planted instead and reddened two `p3_log` guards.
+    *One deletion beyond the filed text:* `perform_rotation`'s `file: &mut File` parameter, whose
+    only use was the deleted flush, so `-D warnings` rejected it once the flush went. Rotation is
+    a rename plus a reopen and never needed the handle. The superseded filing follows.
     *Evidence and remainder, as clauses:* (a) `daemon.rs`'s module-doc verb enumeration has
     drifted nine-plus verbs from `dispatch` — an ungated third copy of the verb index; item
     40(b)'s precedent is deletion, the registry of record living in `docs/rpc`; the
@@ -1637,6 +1912,94 @@ remain **open** and none is promised as existing.
     reuse-not-re-derive intent codec.rs already states. *Validation:* comment-only and
     behavior-preserving throughout; existing guards unchanged; (d)'s alternative (log fsync)
     is named as an amendment path, not taken.
+
+### Items 56–58 — filed and executed by the v17 alignment pass against the tree (2026-08-12)
+
+Three defects the pass found that no prior item covered. All are **executed**; they are filed
+with numbers because a defect this record did not have a number for is a defect the next review
+cannot check was fixed (item 16's lesson).
+
+56. **The three-way CRTSCTS discrimination had a two-valued predicate under it** —
+    **EXECUTED 2026-08-12** (notes §3.84). §7.1 clause 7 and §11 both promise honour / honest
+    refusal / accept-then-drop, and `serial_nexus_sys::honours_rtscts` discarded the `tcsetattr`
+    status, answering on the read-back alone — so an honest refusal was `Ok(false)`,
+    indistinguishable from accept-then-drop, and `precheck_flow_control` refused the config, while
+    P15 (which does record `tcsetattr_ok`) called the same port `Supported` with the sentence
+    "Every named port honoured `CRTSCTS` on read-back". That is §7.1 clause 2's own
+    report-says-fine / load-refuses split, with `shipped_predicate_agrees` blind by construction
+    because both sides read the same half.
+    **Why it survived a generation:** the design stated both shapes and only one was code — clause
+    7 the behaviour, clause 2 a two-valued predicate. A reader checking the tree against clause 2
+    found agreement. *The tree moved to clause 7*: `RtsCtsOutcome::{Honoured, Refused,
+    AcceptedThenDropped}` plus `Err`, read-back asked first (a port already carrying CRTSCTS reads
+    back set whatever the set returned), every caller migrated with no two-valued shim kept —
+    the bool shape is what let two callers collapse different facts into one answer. Clause 2 then
+    moved to describe the tree it now has.
+    **The design's premise was verified by measurement, not by reading**, which is the part worth
+    keeping: clause 7 rests on "an honest refusal makes the node's own open fail loudly". No driver
+    in reach refuses `CRTSCTS` — but a Linux pts refuses `PARENB` through the identical `serial2`
+    code path, and it was measured (`parity=none` → open `Ok`; `parity=even` → open
+    `Err(failed to apply some or all settings)`). That measurement is now a committed guard rather
+    than a source reading a version bump could falsify. Five plants reddened and restored.
+    Neither `probe_set` nor `field_set` moved, proven three ways, so no era row is owed.
+    *Honestly labelled limit:* no device-level fail-first exists for the honest-refusal arm on this
+    bench — measured, not assumed (both rig ports read `honoured_on_readback: true`,
+    `tcsetattr_ok: true`, cflag delta exactly `CRTSCTS`) — so that arm is guarded structurally
+    against injected readings, which is what AGENTS §9 asks when only one arm is reachable.
+
+57. **Four operator-facing remedies named a config key the schema denies** — **EXECUTED
+    2026-08-12** (notes §3.84). The serial node's open failure text (both arms), the
+    `precheck_flow_control` refusal, and P15's consequence all offered `flow = "none"` as **the
+    remedy**; the key is `flow_control` under `deny_unknown_fields` with no key alias anywhere in
+    the tree, so an operator following the refusal got a second error naming a different problem:
+    `unknown field \`flow\`, expected one of \`name\`, \`device\`, \`baud\`, …`. **Proven by
+    execution, not by reading the struct.** Two tests asserted the wrong spelling and pinned it.
+    Rule 11's bar failing on the box that prints the message, and the exact failure §15.53 exists
+    to prevent — the refusal was built so nobody would meet `serial2`'s bare "failed to apply some
+    or all settings", and then handed them a key the parser denies. Twenty-two spellings repaired
+    across five files, the design's two prose shorthands included; the two tests now assert
+    `flow_control` and are the tripwire. **Found inside a REFUTED finding** — the alignment pass's
+    verifier correctly refuted the *framing* (the design never states the key normatively) and let
+    the confirmed sub-facts go. The procedural rule that follows is at notes §3.84: a refutation of
+    a framing must dispose of the observations it leaves standing.
+
+58. **`fuzz/Cargo.lock` had been stale since item 47, and the fuzz-nightly lane was red-in-waiting**
+    — **EXECUTED 2026-08-12** (notes §3.84). The daemon's `regex-automata` edge never reached the
+    excluded crate's lock, and item 51 added a second (`nix` on `serial_nexus_rpc`). CI's
+    `fuzz-nightly` runs `cargo +nightly fetch --locked` for exactly this reason — cargo-fuzz takes
+    no `--locked` of its own — so the next scheduled run would have failed on a lock nobody had
+    looked at since 2026-08-12's landing. Refreshed; the diff is two lines and `cargo fetch
+    --locked` exits 0. The gate was right and the lock was wrong, which is the outcome a gate is
+    for. *Standing consequence:* a change adding a dependency edge to `serial_nexus_daemon`,
+    `serial_nexus_web` or `serial_nexus_rpc` must refresh this lock in the same commit — it is a
+    second lockfile the workspace build never touches.
+
+59. **Item 55's residue: the tap ack guard, the fourth framing, the third ack copy, and (f)** —
+    **open** (S; four independent clauses, none blocked on anything). Filed 2026-08-12 by item
+    55's own execution rather than swept into it, because three of the four are outside that
+    item's filed scope and the fourth is a file-ownership conflict, not a difficulty.
+    *(a) The tap half of the 37-TOOL-2 rule has no guard at all* — **measured, not inferred**:
+    planting the ack-swallow into `tap_stream` alone reddened nothing across `p12_ctl_tap`,
+    `p12_ctl_subscribe`, `p12_tap_replay` and `p8_replay_ring`, eleven tests, all green. Item
+    55(e)'s shared helper now defends the *class* through the subscribe guard, so this is a
+    coverage hole rather than a live defect — but a tap-specific refusal (unknown or
+    non-host-facing endpoint) is still asserted by nothing. The fix is `p12_ctl_subscribe.rs`'s
+    twenty-line stand-in-socket pattern re-pointed at `tap.open`; it needs no daemon.
+    *(b) `core/src/state.rs`'s head carries a fourth construction-era framing* — "Fleshed out with
+    counters per boundary in phase 3; phase 1 establishes only the status vocabulary and the
+    split" — which item 55(a) did not name and which is stale twice over, the counters existing.
+    *(c) After 55(e) the ack rule is spelled twice tree-wide, not once:* `web/src/wsclient.rs`
+    carries a third instance over WebSocket frames. It cannot literally share the `BufRead`-shaped
+    `read_ack`, and it has **already diverged in the observable that matters** — it prints
+    `tap.open failed: {err}`, the whole error object, where `ctl` prints `{message} ({code})`.
+    A decision is owed (unify the message, or record the divergence deliberately), since 55(e)'s
+    premise was that this rule should read the same everywhere.
+    *(d) Item 55's carried clauses:* `codec.rs`'s construction-era framing, and the
+    `UnboundSet`/`UnconfiguredChannels` hoist, which needs one change owning both `leg.rs` and
+    `codec.rs`. The merge deltas are recorded at item 55 so the next attempt does not re-derive
+    them.
+    *Validation:* (a) is fail-first by construction — the planted swallow must redden the new
+    guard; (b) and (c) are comment/decision work; (d) inherits item 55's "no half hoist" rule.
 
 ### Evaluated and deliberately not scheduled — the closing register
 
