@@ -1911,17 +1911,26 @@ mod tests {
     /// **[`process_cpu_nanos`] moves when a process burns CPU and not otherwise**
     /// (§16.5; plan §18 items 12 and 13).
     ///
-    /// Two arms, because either alone is satisfied by a broken implementation: a
-    /// function returning a large constant passes "it moved when we burned", and one
-    /// returning zero passes "it stayed put while we slept". The burn is sized to
-    /// dwarf both kernels' resolution — Linux's tick is 10 ms — so this is not a
-    /// timing assertion, only a claim that the counter is wired to the right field.
+    /// The burn is sized to dwarf both kernels' resolution — Linux's tick is 10 ms —
+    /// so this is not a timing assertion, only a claim that the counter is wired to
+    /// the right field and rises with real work.
     ///
-    /// It samples **this** process because that is the one arm every box can run
-    /// without spawning anything; the callers that matter sample a *child*, which the
-    /// three guards in `itest` exercise against a real daemon.
+    /// **The obvious second arm is deliberately absent, and the reason is a defect
+    /// this test shipped with for one CI run.** It slept 200 ms and asserted the
+    /// counter barely moved — "a sleep costs wall-clock, not CPU" — which passed on a
+    /// quiet developer box and **failed on CI's macOS runner**. The assertion is
+    /// unsound by construction here: `process_cpu_nanos` measures the **process**, and
+    /// `cargo test` runs this unit beside dozens of others in that same process, so a
+    /// neighbour's work lands inside this test's "idle" window. It was measuring the
+    /// harness, not the counter.
+    ///
+    /// The property is real and is asserted where it can be — against a **dedicated
+    /// child** that is genuinely idle: `p9_pty_collapse`'s post-hangup daemon and
+    /// `p12_sim_idle_cpu`'s peerless doubles. Sampling a child is what every caller
+    /// that matters does; this unit covers the one arm a box can run without spawning
+    /// anything, and claims nothing more.
     #[test]
-    fn process_cpu_nanos_rises_with_work_and_holds_still_without_it() {
+    fn process_cpu_nanos_rises_with_work() {
         let pid = std::process::id();
         let t0 = process_cpu_nanos(pid).expect("this process's own CPU time is readable");
 
@@ -1936,16 +1945,6 @@ mod tests {
             "burning CPU moved the counter by {} ns, which is under one Linux clock \
              tick — the field being read is not the process's CPU time",
             t1 - t0
-        );
-
-        // …and it does not run away on its own. A sleep costs wall-clock, not CPU.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let t2 = process_cpu_nanos(pid).expect("still readable");
-        assert!(
-            t2 < t1 + 100_000_000,
-            "a 200 ms sleep added {} ns of CPU; a counter that advances with \
-             wall-clock would make every idle-CPU guard built on this vacuous",
-            t2 - t1
         );
     }
 
