@@ -11948,3 +11948,41 @@ above" is its own message, so shipping the CPU half alone would be a guard whose
 is red. The gate stays and now names the real blocker. **The temptation to ungate anyway was
 concrete** — the CPU assertion *passes*, and taking that as the result would have shipped exactly
 the vacuous green §13's taxonomy exists to catch.
+
+### 3.97 The Darwin run §3.56 was waiting for, and its first pre-registered outcome
+
+Plan §18 item 20, closed by an experiment written down a week before it ran rather than by the
+instrument the item filed.
+
+§3.56 converted seven guards to hold a witness fd open across the measurement, and said plainly
+what it could not claim: *"This does not claim to have fixed `p4_free_for_all` on Darwin; nothing
+here was tested on Darwin, and design §15.48/§9 forbid a root-cause claim on this evidence."* It
+then wrote down three outcomes and what each would license. This session is that Darwin run.
+
+**Held fired.** On the Mac rig at `535594c`, box at load 1.39–1.62: **12 passed, 0 failed of 12**,
+the first at **5.11 s** — the record's own figure for a healthy run. The frozen finding was 12 of
+12 *failing*, losing 5–31 bytes of 32768 with `timed_out: true` on every observation. Same sample
+size, opposite result.
+
+So the sentence §15.48 kept exact — *a stall or a loss, not separated* — separates, and it was a
+**loss**: the writers' last close destroying the tail of a payload the kernel had accepted and the
+daemon had not yet read. §3.29's class, and the reason the byte counter has to be read while the
+client is still open. **The separation instrument item 20 filed is not owed**, because the
+pre-registration asked the question the instrument was to have asked.
+
+**The magnitude the prediction had to assume is now measured on the same hardware in the same
+session.** Held's text reasons from "a 1024-byte Darwin pty buffer"; P10's from-empty rung on this
+box reads a depth of **1024** targetward and **1022** hostward, and P13's shape `a` loses 64 of 64
+to a `waits-then-discards` close taking 600368 µs. In 2026-08-05 that buffer size was an inference
+from someone else's numbers; here it sits in the same triple as the run it explains.
+
+**The confound, named so it cannot quietly strengthen the conclusion.** The failing measurement was
+taken on `BH00L4KU` ↔ `BH00LL8O`, 5-wire. This run is `ABSCDGL6` ↔ `BH00L4KU`, 3-wire, and the tree
+moved a long way between them. A different adapter is a live alternative explanation, and only a
+re-test on the original pair could exclude it — that pair is no longer assembled. What licenses
+"the conversion fixed it" is the **pre-registration**, not this run's own reasoning: the outcome
+was tied to its interpretation before either was known, which is exactly the protection this
+discipline buys and exactly what a post-hoc reading of the same 12 runs would not have.
+
+The fourth outcome §3.56 named — the test failing on *Linux* over the rig, which would be evidence
+against the conversion itself — has not been observed, on this session's Linux rows or any other.

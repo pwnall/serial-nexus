@@ -1399,7 +1399,37 @@ Each item below uses the schema with its fields inline.
     under test, never established prose (§7; notes §3.42, §3.45 A). *Validation:*
     pre-registered falsifiers per kernel; committed fields keep their meanings (512 stays the
     first rung).
-20. **`p4_free_for_all` on Darwin: stall against loss, separated** — **open** (M; shares
+20. **`p4_free_for_all` on Darwin: stall against loss, separated** — **EXECUTED 2026-08-13**
+    (notes §3.97) by the pre-registered experiment rather than by the new instrument the item
+    asked for. **notes §3.56 wrote three outcomes down before the run and the first one
+    fired.** Its "Held" arm reads: *"the test passes on Darwin over the rig, repeatedly. Then
+    the loss was the writers' last close destroying the tail of a payload the kernel had
+    accepted but the daemon had not yet read, which is §3.29's class exactly, and the
+    5–31-byte magnitude fits a 1024-byte Darwin pty buffer draining at 11520 B/s against a
+    ~90 ms residual."* Measured on the Mac rig at `535594c`, box at load 1.39–1.62:
+    **12 passed, 0 failed of 12**, the first run finishing in **5.11 s** — which is the
+    record's own "a healthy run finishes in 5 s". Against the frozen 12 of 12 *failing*, that
+    is a symmetric reversal of the same sample size.
+    **So the licensed sentence resolves, and the item's stall-or-loss question with it: it was
+    a loss**, of §3.29's class, fixed by the witness conversion §3.56 landed and explicitly
+    could not test ("nothing here was tested on Darwin"). This session is the Darwin run that
+    entry was waiting for. **The separation instrument item 20 filed is not owed** — the
+    pre-registration answered the question a new instrument was to have asked, which is what
+    pre-registration is for.
+    *Corroborated from the same session's capture, not from argument:* the prediction names a
+    1024-byte Darwin pty buffer, and P13/P10 on this box read exactly that — a from-empty
+    depth of 1024 targetward and 1022 hostward, with shape `a` losing 64 of 64 to a
+    `waits-then-discards` close. The magnitude the prediction had to assume is now measured on
+    the same hardware in the same session.
+    **The confound is named rather than allowed to strengthen this.** The 12-of-12 failure was
+    taken on the `BH00L4KU` ↔ `BH00LL8O` pair, 5-wire; this run is `ABSCDGL6` ↔ `BH00L4KU`,
+    3-wire, and the tree moved a long way between them. So "the conversion fixed it" is the
+    outcome the pre-registration licenses, **not** a conclusion this run could have reached on
+    its own — a different adapter is a live alternative that only a re-test on the original
+    pair could exclude, and that pair is no longer assembled. Recorded as a bound on the
+    closure, not as a reason to withhold it. The fourth outcome §3.56 named (the test failing
+    on *Linux* over the rig, which would be evidence against the conversion) has not been
+    observed. The superseded filing follows. **Original state:** open (M; shares
     item 4's session). *Evidence:* the frozen record — 12 of 12 failing at the committed 30 s
     deadline losing 5–31 bytes of 32768, every failing observation `timed_out: true`, a healthy
     run finishing in 5 s, against 20 of 20 passing on Linux over the same wire at the same
