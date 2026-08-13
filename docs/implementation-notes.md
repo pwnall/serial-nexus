@@ -11642,3 +11642,48 @@ is the same hang §3.83 recorded at 39 minutes and deliberately left unattribute
 4/4 in isolation in ~4 s, and green in the second full-suite run on the same tree. Process-group
 membership has no bearing on `bind()`, so it is not attributed to this change — and it is not
 closed either.
+
+---
+
+### 3.92 The documented rig lane, whole, and the dual-scope figure that had never been taken
+
+The operator re-blessed the helper, so the replug half — deliberately dropped from the earlier
+lane rather than measured against a stale binary (§3.91's predecessor row) — could run at this
+tree. Checked before starting, because the point of dropping it was that a lane against the wrong
+binary is worse than no lane: `preflight` reads `REPLUG-PREFLIGHT: READY` with an empty
+`bless_problems`, `capabilities --json` answers `blessed: true` **and**
+`can_grant_device_access: true` (the field §3.83 added because nothing in the tree read it), and
+the blessed copy is **md5-identical** to `target/debug/serial-nexus-devprep`. Both adapters
+authorized, no dead-run residue, box at load 0.27.
+
+**999 · 0 · 7**, `--no-fail-fast`. Every hardware test ran and passed: all three replug tests
+including `identity_survives_a_replug_that_renumbers_the_tty`, all five crossover tests, and
+`web_tls_round_trip` under `SNX_TLS=required` — a mode that had existed since item 10 and that **no
+lane had ever demanded** until item 60(a) set it this session. §15.55's `grant` verb is exercised
+for real rather than by unit test, granting on both ports across each re-enumeration; the log
+carries its answer flipping to `["/dev/ttyUSB1","/dev/ttyUSB0"]` mid-lane, which is the renumbering
+replug happening in front of the instrument that exists to survive it. **Item 52's rig surface is
+discharged.**
+
+**Five self-skips, down from thirteen at default scope, and that ratio is the evidence.** A rig row
+whose skip count matches the default-scope run is a default-scope run wearing a rig label — the
+failure the v15 attribution made and could not be caught in. All five are named measurements
+rather than conveniences: the packaging root arm (no root, with both routes measured closed rather
+than assumed), two browser tests on a box with no `node`, and the two `rts-cts` tests printing the
+reading that justifies them — a **3-wire** bench, §15.52's legitimate answer, now confirmed by a
+fifth independent instrument.
+
+**Item 30, closed by the pair rather than by either half.** The item has been open since v15 asked
+for a dual-scope equivalence whose only support was a figure nobody could reconcile to its cited
+session. It now has one: 999 · 0 · 7 at default CI scope and 999 · 0 · 7 on the documented rig lane,
+same tree, same session, same box. Both rows carry their scopes; **no delta is derived across
+them**, because the equivalence *is* the observation and subtracting across scopes is the very
+thing plan §3's figure rule forbids. The unreconcilable 835 stays annotated where it stands —
+superseded, not rehabilitated.
+
+One residue worth recording rather than tidying away: the lane leaves the adapters with their tty
+numbers **swapped** (`3-2.3` → `ttyUSB1`, `3-2.4` → `ttyUSB0`), both authorized. That is the
+renumbering replug's lasting effect and it is harmless on a symmetric crossover — §12's whole
+premise, and the reason `SNX_CROSSOVER_A`/`_B` name identities rather than device nodes. A reader
+who checks the box after a lane and finds the numbers exchanged has found the test working, not a
+dirty rig.
