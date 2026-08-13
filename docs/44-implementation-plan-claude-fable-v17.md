@@ -42,7 +42,8 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 | **931 passing · 1 failed · 6 ignored**, four self-skips | Linux, **rig lane minus `SNX_RIG_FLOW` and `SNX_WEB_UI`** | 2026-08-12 | the item-47 landing (notes §3.83) | **the rig-lane authority row**, superseding the 894 below and equal to this session's default-scope figure. Run against a freshly `scripts/bless`ed helper (the operator ran it mid-session; an earlier lane was discarded rather than recorded, because the helper binary was replaced underneath it). Every hardware test passed — both replug tests including `identity_survives_a_replug_that_renumbers_the_tty`, all five crossover tests, `web_tls_round_trip` under `SNX_TLS=required`. The two named drops are measurements taken *in this run*, not conveniences: the four self-skips are the two `rts-cts` tests, which print the reading that justifies them (`port1 RTS high -> port0 cts:false`, low -> `cts:false` — a **3-wire** bench, §15.52's legitimate answer and the third independent confirmation of it), and the two browser tests, on a box with no `node`. The one failure is `p3_idle_cost` (item 46), unrelated to the rig. **One lane before this one hung** and is recorded rather than quietly re-run — see the note under this table. |
 | **894 passing · 1 failed · 6 ignored**, four self-skips | Linux, **rig lane minus `SNX_RIG_FLOW` and `SNX_WEB_UI`** | 2026-08-12 | this session (notes §3.80) | the rig-lane authority row, and the first green one in this record. Both exclusions are measurements, not conveniences: this box has no `node`, and the bench **measures 3-wire**, which §15.52 makes a legitimate answer — so the two `rts-cts` end-to-end tests skip with their reading printed. The one failure is `p3_idle_cost` (item 46), unrelated to the rig. Every hardware test passed, `identity_survives_a_replug_that_renumbers_the_tty` for the first time ever. **Superseded by the 925 rig row above**, taken later the same day at the same scope. |
 | **835 passing · 0 failed · 4 ignored** | Linux, rig lane — and again at default CI scope, same session | 2026-08-05 | `17c6e87` (notes §3.68) | twice on the full rig lane, once at default CI scope, 835/0/4 each time — the last dual-scope measurement; superseded by the 852 re-measure of 2026-08-07; not the current-tree figure. **Attribution unreconciled (v17):** notes §3.68's verbatim session record reads 830 (gates scope) and 834/0 · 833/1 (rig lane), and no 835 appears in it — the figure survives only as a v15 Status-table quotation (the re-cited-not-re-derived class), so neither the number nor the dual-scope equivalence is attributable to §3.68. Superseded either way. |
-| **959 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** | 2026-08-13 | this session (notes §3.95) | **the macOS authority row for the rig box.** The **+4** over the 955 row is this session's four new guards, counted rather than estimated: `peer_hungup`'s self-test and the Darwin witness guard (item 66), the software-arm `sys` test and the `xon-xoff` rig guard (item 67). **A self-skip count is deliberately not quoted, and the reason is a correction to how this table has been reading them.** Under `--nocapture` the suite's parallel binaries interleave their writes, so a `SKIP` line frequently loses its line start and a `grep -c '^SKIP'` undercounts: two runs of this box at adjacent trees read 105 and 102, and all of the "missing" three are present in the log unanchored. So the figure is ~100–105 and is **not stably countable this way** — which extends notes §3.78 rather than contradicting it (that entry established the count is 0 *without* `--nocapture`; this adds that *with* it, and under parallelism, it is approximate). What the figure is *for* still holds and needs no precision: a macOS default-scope run skips on the order of a hundred device- and Linux-gated tests against Linux's dozen, so the two are not comparable test-for-test and no delta between them is derived. Supersedes the 957 and 955 rows. |
+| **960 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** | 2026-08-13 | this session (notes §3.96) | **the macOS authority row for the rig box.** The **+1** over the 959 row is item 12's `process_cpu_nanos` self-test; `p9_pty_collapse`'s anti-spin guard moved from a self-skip to a **pass** here without changing the count, which is the item's whole point and is invisible in this column — read it in the skip set, not the total. Every caveat on the 959 row applies unchanged. |
+| **959 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** | 2026-08-13 | this session (notes §3.95) | **superseded by the 960 row above.** The **+4** over the 955 row is that session's four new guards, counted rather than estimated: `peer_hungup`'s self-test and the Darwin witness guard (item 66), the software-arm `sys` test and the `xon-xoff` rig guard (item 67). **A self-skip count is deliberately not quoted, and the reason is a correction to how this table has been reading them.** Under `--nocapture` the suite's parallel binaries interleave their writes, so a `SKIP` line frequently loses its line start and a `grep -c '^SKIP'` undercounts: two runs of this box at adjacent trees read 105 and 102, and all of the "missing" three are present in the log unanchored. So the figure is ~100–105 and is **not stably countable this way** — which extends notes §3.78 rather than contradicting it (that entry established the count is 0 *without* `--nocapture`; this adds that *with* it, and under parallelism, it is approximate). What the figure is *for* still holds and needs no precision: a macOS default-scope run skips on the order of a hundred device- and Linux-gated tests against Linux's dozen, so the two are not comparable test-for-test and no delta between them is derived. Supersedes the 957 and 955 rows. |
 | **957 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** | 2026-08-13 | this session (notes §3.94) | item 66's two guards over the 955 row. **Superseded by the 959 row above**, later the same session at the same scope. |
 | **955 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** (MacBookPro15,1, Darwin 24.6.0 / macOS 15.7.8, 12 cores) | 2026-08-13 | this session (notes §3.93) | **superseded by the 959 row above.** The first figure ever taken on this box at a tree whose macOS-only guards pass. 126 result lines over **122 cargo targets** (114 `Running` + 8 doc-test). **This row read "105 self-skips" when written; that figure is withdrawn as a precise count** — see the 959 row for the measurement that found `grep -c '^SKIP'` unstable under `--nocapture` parallelism. The claim it was serving survives unchanged and needs no precision: a macOS default-scope run skips on the order of a hundred device- and Linux-gated tests against Linux's dozen, because the rig is physically attached but `SNX_CROSSOVER_A`/`_B` are unexported at default scope. A macOS default-scope figure is therefore **not** comparable to a Linux one test-for-test, and no delta between them is derived here. **The preceding run at this same tree read 953 · 1+1 · 7** and is kept rather than replaced, because it is the measurement that found the defects: `probes::tests::the_software_readback_reports_unmeasurable_rather_than_answering` (a baseline `Termios` taken off a pty master, which Darwin answers `ENOTTY`) and `both_gates_refuse_an_unsupported_verdict_and_are_shown_able_to` (a report-shaping premise that knew about P12 and not P2) — both item 69, both repaired in the same commit as this row, and both red in CI's `macos` job on every push since they landed. Not the CI arm64 runner and not the M4: three machines, none substituting for another (item 18). |
 | **896 passing · 0 failed · 6 ignored**, 122 test-result lines | **whole workspace (macOS)**, CI `macos-*` arm64 runner | 2026-08-13 | CI run 31657666919, job 94315579211 (notes §3.83) | **the macOS authority row**, superseding the 860 below. No exclusions — the lane runs `cargo test --workspace --locked --no-fail-fast` — on macOS 26.5.2 / arm64. The +36 over the 860 row closes exactly: this session added 37 tests, of which 36 run here (the devprep capability-fold guard is inside the Linux-only platform module). The six device-gated pattern-wait guards run and self-skip, which is why the acceptance battery was deliberately split so six of its twelve need no serial device. Skip count not stated: CI does not pass `--nocapture`, so it cannot be read from that log (notes §3.78). |
@@ -1166,7 +1167,37 @@ dropped. Product-surface deferrals use §14's vocabulary (refused-at-load / acce
     never reads as a wire fact; presence-never-answer over the three-way verdict, with the
     item's own recorded in-place correction — live at §15.51's entry.
 12. **The anti-spin guard is a proxy in space, and the platform it protects is the one it
-    skips.**
+    skips** — **EXECUTED 2026-08-13** (notes §3.96), **and its central prediction is
+    REFUTED**, which is the more valuable half.
+    **The design question the item required first was answered by measurement, not by
+    argument.** `p3_idle_cost` stated in-tree that "there is no portable analogue" to
+    `/proc/<pid>/stat`. That was true of `/proc` and false of the *question*: Darwin answers
+    it with `proc_pid_rusage`, whose `ri_user_time`/`ri_system_time` are already nanoseconds.
+    So the deliverable is `serial_nexus_sys::process_cpu_nanos` — one function, two arms,
+    `unsafe` where §16.3 puts it — with nanoseconds as the shared unit because the Linux tick
+    converts up exactly and rounding the finer answer down to make the kernels look alike
+    would discard resolution neither imposes. `getrusage(RUSAGE_SELF)` and `RUSAGE_CHILDREN`
+    were both evaluated and rejected first: every caller samples a *child that is still
+    running*, which `RUSAGE_CHILDREN` reports as zero.
+    **`p9_pty_collapse`'s guard is ungated and runs on Darwin**, reading 1.7–1.9 % of a core
+    over its 2 s window against a 10 % ceiling (the same ceiling, converted, not re-chosen).
+    **The refutation, pre-registered by the item and taken on the platform it named.** The
+    item's case was that "a regression widening `pty.rs`'s last-close predicate or deleting
+    the latch drain would burn a core and release operator-held write locks on macOS with the
+    suite green". The ungated `|| closed` arm was planted on Darwin, the workspace rebuilt,
+    and the binary confirmed current: **planted 1.81/1.88/1.81 %, unplanted 1.87/1.88/1.81 %
+    — the bands are identical and the plant moves nothing.** So the plant does not spin on
+    *either* kernel, and the guard's own comment (which recorded the same result on Linux) was
+    describing a general property rather than a Linux quirk. The reader's backoff is not
+    defeated by the handler re-firing: the extra work per pass is small and the cadence still
+    relaxes to `IDLE_POLL`. **Recorded as refuted rather than quietly dropped** (AGENTS §9) —
+    what the port buys is not the hazard the item predicted but the removal of a guard that
+    asserted *nothing* off Linux, plus the same instrument for two other files.
+    *Owed, and it is a real remainder rather than a formality:* the property this guard pins
+    is still guarded on both kernels only against regressions that actually raise CPU, and no
+    plant found on either kernel raises it. What bars the ungated arm remains AGENTS invariant
+    16 rule (3) — the collapsed-session write-lock leak — which `p9`'s other two tests assert
+    directly and which is the reason the latch stays. The superseded filing follows.
     **State:** open — a design question first, then the port (S/M).
     **Evidence:** `p9_pty_collapse.rs`'s CPU assertion is a bare self-skip off Linux ("needs
     `/proc/<pid>/stat`"), and on Linux the hazard it guards cannot occur — P6 reads
@@ -1184,7 +1215,30 @@ dropped. Product-surface deferrals use §14's vocabulary (refused-at-load / acce
     **Validation:** fail-first proven **on Darwin**, by planting the ungated arm and watching
     the guard redden there — proving it on Linux is the very substitution this item exists to
     remove.
-13. **Idle CPU on any Mac is unmeasured, and the projection is arithmetic.**
+13. **Idle CPU on any Mac is unmeasured, and the projection is arithmetic** — **MEASURED
+    2026-08-13** (notes §3.96) on the x86_64 Mac, taken exactly the way item 12's guard takes
+    it, since they now share one instrument; **the gating half is carried**, and that split is
+    the item's own finding rather than a shortfall.
+    **The number, on the box the item names:** 3.72 % of a core at 8 idle tty fds and
+    **9.91 %** at 32, each over a 10 s window in one daemon process, giving a marginal
+    **0.2578 %/fd** against the artifact's recorded 0.0728 %/fd — **3.5×**, which is the real
+    `kevent` Darwin pays per pass and not a regression. Box at load 1.41.
+    **The item's own projection was pessimistic by about a factor of two and is corrected
+    here:** it estimated "17–19 % on the Intel box" for 32 fds from P12's per-pass arithmetic;
+    the measurement reads 9.91 %. That is why the item asked for a measurement rather than
+    letting the projection stand.
+    **What it does *not* license, and this is why the guard stays gated off Linux.** Assertion
+    (1), the 20 % recorded budget, **passes on Darwin with room**. Assertion (2) — item 46's
+    marginal drift tripwire — fails, because it multiplies `per_fd_cpu_percent`, a figure
+    measured on another kernel. Ungating on that basis would assert a **Linux ceiling on
+    Darwin**, which is a fresh proxy in space pointing the other way: item 12 exists to remove
+    that shape, not to relocate it. `p3_idle_cost`'s skip message and header now name this
+    measured reason instead of the retired "/proc" one, so the next reader meets the real
+    blocker. *Remainder:* a Darwin `per_fd_cpu_percent` (and baseline) row in
+    `docs/benchmarks/phase3.json` with its own provenance block — box, date, commit, both
+    sweeps — after which assertion (2) can be derived per platform and the gate lifted. One
+    box's reading is not an artifact figure; item 46's own history is the argument for that.
+    The superseded filing follows.
     **State:** open (S) — scheduled together with item 12 or not at all.
     **Evidence:** not a defect and not a measurement. P12's tight window costs 21.4 µs/pass on
     the M4 (the notes §3.72 report) and 23.1–26.6 µs on the x86_64 Mac against 0.72–0.77 µs on
@@ -2681,6 +2735,28 @@ for is one the next review cannot check was fixed — item 16's lesson.
     flipped**: there a re-enumerated FT232R *ate* one bulk packet, here Darwin's *retains* one.
     Same 64-byte USB quantum, opposite direction, different kernel — recorded as an
     observation, with no mechanism claimed for why the two kernels differ.
+
+71. **A sim double stops relaying after a peer close on Darwin, and it is not an exit** —
+    **open** (M). *Evidence, found by lifting `p12_sim_idle_cpu`'s gate once item 12 made the
+    CPU sampler portable, and measured rather than inferred:* on the x86_64 Darwin box both
+    doubles **pass** the CPU budget — §15.36's "sim doubles never busy-wait, idle-CPU
+    asserted" holds there, the `nullmodem` double reading **0.01 s of CPU over a 3 s idle
+    window** — and both then fail the assertion immediately after it, `still_relays`. Checked
+    outside the harness to separate the two candidate causes the guard's own message names:
+    the process **stays alive and paused** (it is still running at the end, having spent
+    0.01 s), and a `ping` written into one link never arrives at the other within 3 s. So it
+    is *stopped relaying*, not *exited*.
+    **Why this blocks the ungating rather than being a side note:** the relay check is the
+    control that keeps the CPU assertion from being vacuous — its own message says "a double
+    that exits instead of pausing would pass the CPU budget above" — so shipping the CPU half
+    alone off Linux would be a guard whose non-vacuity check is red. `p12_sim_idle_cpu` stays
+    gated, with its header and both skip messages now naming **this** measured blocker instead
+    of the retired `/proc` one. *No mechanism is claimed*, though the family is suggestive:
+    every other Darwin difference this session met was a level-versus-edge readiness question
+    (§15.39, P16, and the `POLLHUP` mask), and the sim's pause/resume path is the obvious place
+    to look first. *Validation:* the fix is proven by the existing pair — the CPU budget and
+    `still_relays` both green on Darwin with the gate lifted; a fix that greens only the
+    relay check has not shown the CPU assertion is non-vacuous.
 
 ### Evaluated and deliberately not scheduled — the closing register
 

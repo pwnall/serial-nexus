@@ -92,11 +92,12 @@ use std::time::Duration;
 use serde_json::Value;
 use serial_nexus_itest::{Daemon, Rpc, TempRun, wait_until};
 
-// The CPU sampler and its hand-managed daemon exist only where `/proc/<pid>/stat`
-// does; what only they need is gated with them so the file stays warning-clean on
-// the platforms where the second test is a skip.
-#[cfg(target_os = "linux")]
-use serial_nexus_itest::{RawDaemon, cpu_ticks};
+// The CPU sampler and its hand-managed daemon were gated to Linux until 2026-08-13,
+// because the sampler read `/proc/<pid>/stat`. It reads
+// `serial_nexus_sys::process_cpu_nanos` now, which answers on both kernels of record,
+// so the gate is gone — and it was the wrong way round: the spin this guards can only
+// happen off Linux (plan §18 item 12).
+use serial_nexus_itest::{RawDaemon, cpu_nanos};
 
 /// How many collapsed sessions one run drives. Each is an independent trial of a
 /// race the test wins with high probability (a ~50 µs client session against a
@@ -221,34 +222,38 @@ fn collapsed_client_sessions_still_release_the_write_lock() {
 // ============================================================================
 
 #[test]
-#[cfg(target_os = "linux")]
 fn a_bare_hangup_leaves_the_daemon_cpu_bounded() {
-    // The measurement window, and the ceiling on what the daemon may burn inside
-    // it. Ticks are USER_HZ (100/s on Linux), so a whole core for the window is
-    // 200 ticks; measured here, a post-hangup daemon spends **1**. The ceiling is
-    // therefore 20× the observed cost and still an order of magnitude below a
-    // handler that re-runs `tcsetattr` on every poll.
+    // The measurement window, and the ceiling on what the daemon may burn inside it.
+    // A whole core for the window is 2 s of CPU; measured on Linux, a post-hangup
+    // daemon spends ~10 ms. The ceiling is therefore ~20× the observed cost and still
+    // an order of magnitude below a handler that re-runs `tcsetattr` on every poll.
     //
-    // Recorded from trying to break it: planting the ungated `|| closed` arm (the
-    // shape the `saw_data` latch exists to prevent) did *not* raise this number on
-    // Linux 7.0 — once the last slave closes, the master stops reporting `POLLIN`,
-    // so `closed` is set only in the poll that drains the final bytes and the
-    // handler has no second chance to fire. That is review nit PTY-4 seen from the
-    // other side: the anti-spin argument in `pty.rs`'s comment names a mechanism
-    // this kernel does not exhibit. The guard is kept because it costs one sample
-    // and pins the property the review asked for — a hangup leaves no busy loop
-    // behind — not because it reproduces a historical failure.
+    // **This test was `#[cfg(target_os = "linux")]` until 2026-08-13, and the gate was
+    // backwards** (plan §18 item 12). The hazard it guards *cannot occur* on Linux:
+    // doctor P6 reads `pollin_passes: 0` with `read_outcomes {EIO: 64}` there —
+    // byte-identical on 7.0 and 6.18 — against **64 of 64** `POLLIN|POLLHUP` passes on
+    // Darwin. So a regression widening `pty.rs`'s last-close predicate or deleting the
+    // latch drain would burn a core on a Mac with the suite green, and the one guard
+    // written for it ran only where the mechanism is absent. AGENTS §9's proxy in
+    // space, and the item that filed it called it the sharpest instance in the tree.
+    // The gate is gone because `serial_nexus_sys::process_cpu_nanos` answers on both
+    // kernels; the ceiling below is the same number in the finer unit.
     //
-    // The production kernel now says the same thing: doctor P6 on 6.18 reads
-    // `pollin_passes: 0` over 64 passes, byte-identical to 7.0 (2026-07-27, see
-    // `docs/serial-nexus-doctor.md`). So the mechanism is absent on *both* kernels and
-    // this comment is no longer a 7.0-scoped observation. That does **not** make
-    // the latch removable: what bars the ungated arm is AGENTS invariant 16
-    // rule (3) — the collapsed-session write-lock leak, a correctness property no
-    // probe measures — and P6's `handler_reset_readable_bytes: 1`, identical on
-    // both kernels, keeps the last-close drain load-bearing.
+    // Recorded from trying to break it, and now recorded from both sides: planting the
+    // ungated `|| closed` arm (the shape the `saw_data` latch exists to prevent) did
+    // *not* raise this number on Linux 7.0 — once the last slave closes, the master
+    // stops reporting `POLLIN`, so `closed` is set only in the poll that drains the
+    // final bytes and the handler has no second chance to fire. That is review nit
+    // PTY-4 seen from the other side: the anti-spin argument in `pty.rs`'s comment
+    // names a mechanism that kernel does not exhibit. What bars the ungated arm on
+    // Linux is AGENTS invariant 16 rule (3) — the collapsed-session write-lock leak, a
+    // correctness property no probe measures — and P6's
+    // `handler_reset_readable_bytes: 1`, identical on both kernels, keeps the
+    // last-close drain load-bearing.
     const WINDOW: Duration = Duration::from_secs(2);
-    const MAX_TICKS: u64 = 20;
+    // 200 ms of CPU in a 2 s window: 10 % of one core, the same ceiling the 20-tick
+    // form expressed, converted rather than re-chosen.
+    const MAX_CPU_NANOS: u64 = 200_000_000;
 
     let run = TempRun::new();
     let console = run.join("console");
@@ -300,17 +305,23 @@ fn a_bare_hangup_leaves_the_daemon_cpu_bounded() {
         "client_present did not settle false after the bare hangup"
     );
 
-    let before = cpu_ticks(pid);
+    let before = cpu_nanos(pid);
     // A *measurement window*, not a readiness wait: there is no condition to poll
     // for here — the claim under test is about how little CPU passes while
     // nothing happens, so the window has to elapse.
     std::thread::sleep(WINDOW);
-    let spent = cpu_ticks(pid).saturating_sub(before);
+    let spent = cpu_nanos(pid).saturating_sub(before);
 
+    eprintln!(
+        "a_bare_hangup_leaves_the_daemon_cpu_bounded: {spent} ns of CPU in {WINDOW:?} \
+         ({:.2} % of one core, ceiling {:.2} %)",
+        spent as f64 / (WINDOW.as_secs_f64() * 1e7),
+        MAX_CPU_NANOS as f64 / (WINDOW.as_secs_f64() * 1e7),
+    );
     assert!(
-        spent <= MAX_TICKS,
-        "the daemon burned {spent} clock ticks in {WINDOW:?} after a bare hangup \
-         (ceiling {MAX_TICKS}) — the last-close handler is re-firing every poll \
+        spent <= MAX_CPU_NANOS,
+        "the daemon burned {spent} ns of CPU in {WINDOW:?} after a bare hangup \
+         (ceiling {MAX_CPU_NANOS}) — the last-close handler is re-firing every poll \
          (§7.2, the `saw_data` latch of b8d8ed8)"
     );
     // The daemon is still alive and answering after the window (a spin that also
@@ -321,15 +332,6 @@ fn a_bare_hangup_leaves_the_daemon_cpu_bounded() {
         "the console did not survive the idle window"
     );
     drop(d);
-}
-
-#[test]
-#[cfg(not(target_os = "linux"))]
-fn a_bare_hangup_leaves_the_daemon_cpu_bounded() {
-    eprintln!(
-        "SKIP a_bare_hangup_leaves_the_daemon_cpu_bounded: per-process CPU sampling \
-         needs /proc/<pid>/stat (Linux)"
-    );
 }
 
 // ============================================================================

@@ -114,26 +114,33 @@ pub fn file_len(p: &Path) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 
-/// `utime + stime` of `pid` in clock ticks, read from `/proc/<pid>/stat` (Linux).
+/// Total CPU time (user + system) charged to `pid` so far, in **nanoseconds**.
 ///
-/// The two fields are 14 and 15 (1-based) and the parenthesised `comm` before them may
-/// itself contain spaces — including `)` — so the split starts past the **last** `)`.
-/// That detail is the reason this is shared rather than re-derived: it is invisible
-/// until a process is named something awkward, and it was hand-copied into two test
-/// files before this (review 37, 37-TEST-5).
+/// **This was `cpu_ticks`, Linux-only, until 2026-08-13** (plan §18 items 12 and 13).
+/// It read `/proc/<pid>/stat` directly and `#[cfg(target_os = "linux")]` gated it, and
+/// that gate propagated: all three CPU guards in this harness self-skipped off Linux —
+/// `p9_pty_collapse`'s anti-spin assertion, `p12_sim_idle_cpu`'s §15.36 idle-CPU
+/// tripwire, and `p3_idle_cost`. **The one the gate hurt most is the one whose hazard
+/// only exists off Linux**: doctor P6 reads `pollin_passes: 0` with `read_outcomes
+/// {EIO: 64}` on Linux against Darwin's 64 of 64 `POLLIN|POLLHUP` passes, so a
+/// regression that would burn a core on a Mac was guarded by a test that only ran on
+/// the kernel where it cannot happen — AGENTS §9's proxy in space, at its sharpest.
 ///
-/// Panics if the file cannot be read or parsed: a CPU budget measured against an
-/// unreadable counter is the vacuous pass §5 forbids.
-#[cfg(target_os = "linux")]
-pub fn cpu_ticks(pid: u32) -> u64 {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .unwrap_or_else(|e| panic!("read /proc/{pid}/stat: {e}"));
-    let tail = &stat[stat.rfind(')').expect("comm field is parenthesised") + 1..];
-    let fields: Vec<&str> = tail.split_whitespace().collect();
-    // `tail` starts at field 3 (state), so utime (14) and stime (15) are at 11 and 12.
-    let utime: u64 = fields[11].parse().expect("utime");
-    let stime: u64 = fields[12].parse().expect("stime");
-    utime + stime
+/// The unit moved from clock ticks to nanoseconds because Darwin's `proc_pid_rusage`
+/// answers in nanoseconds and Linux's ticks convert up exactly; rounding the finer
+/// answer down to a 10 ms tick to make the two kernels look alike would discard
+/// resolution neither of them imposes. Every constant that used to be in ticks was
+/// converted at the same time, so no Linux threshold moved.
+///
+/// The `/proc` parse itself lives in `serial_nexus_sys` now — including the detail that
+/// made it worth sharing in the first place (the parenthesised `comm` may contain `)`,
+/// so the split starts past the **last** one; review 37, 37-TEST-5).
+///
+/// Panics if the counter cannot be read: a CPU budget measured against an unreadable
+/// counter is the vacuous pass §5 forbids, and that is true on every platform.
+pub fn cpu_nanos(pid: u32) -> u64 {
+    serial_nexus_sys::process_cpu_nanos(pid)
+        .unwrap_or_else(|e| panic!("read the CPU time of pid {pid}: {e}"))
 }
 
 /// Poll `cond` until it returns true or `timeout` elapses. Returns whether it became

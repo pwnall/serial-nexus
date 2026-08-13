@@ -41,9 +41,20 @@
 //! ceiling is a budget, not a proof of sleeping: a loop that woke ten times a second
 //! doing nothing measurable would clear it.
 //!
-//! Linux-only: per-process CPU sampling needs `/proc/<pid>/stat`. Self-skips
-//! elsewhere, exactly as `p9_pty_collapse`'s sampler does (whose `cpu_ticks` this
-//! deliberately mirrors, field indices and all).
+//! **Still Linux-only, but for a measured reason rather than the one that used to be
+//! written here** (plan §18 items 12 and 71). The old reason — "per-process CPU
+//! sampling needs `/proc/<pid>/stat`" — stopped being true when
+//! `serial_nexus_sys::process_cpu_nanos` gained a Darwin arm. Ungating the file was
+//! then attempted and **measured**, on the Darwin rig box: both doubles pass the CPU
+//! budget comfortably (the `nullmodem` double reads 0.01 s of CPU over a 3 s idle
+//! window — §15.36's invariant *holds* there), and both fail the assertion that comes
+//! straight after it — the double **stops relaying** after a peer close. That control
+//! is not decoration: its own message says "a double that exits instead of pausing
+//! would pass the CPU budget above", so without it the CPU assertion is vacuous. It
+//! is *not* an exit — the process stays alive and paused — which is filed as item 71.
+//! Until that is fixed, ungating here would ship a guard whose own non-vacuity check
+//! is red, so the gate stays and now names the thing it is actually waiting on. The
+//! sampler is `p9_pty_collapse`'s, shared rather than mirrored.
 
 #[cfg(target_os = "linux")]
 use std::io::{Read, Write};
@@ -59,7 +70,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
-use serial_nexus_itest::{Sim, TempRun, bin, cpu_ticks, wait_until};
+use serial_nexus_itest::{Sim, TempRun, bin, cpu_nanos, wait_until};
 
 /// The measurement window, and the ceiling on what a *paused* double may burn
 /// inside it.
@@ -74,7 +85,9 @@ use serial_nexus_itest::{Sim, TempRun, bin, cpu_ticks, wait_until};
 #[cfg(target_os = "linux")]
 const WINDOW: Duration = Duration::from_secs(3);
 #[cfg(target_os = "linux")]
-const MAX_TICKS: u64 = 30;
+// 300 ms of CPU in the 3 s window: 10 % of one core. The `MAX_TICKS: u64 = 30`
+// this replaces meant the same thing in the coarser unit (plan §18 item 12).
+const MAX_CPU_NANOS: u64 = 300_000_000;
 
 /// How long the doubles are told to live. Comfortably past the window plus setup, so
 /// the sampler never measures a process that idled itself out mid-window (a dead
@@ -181,14 +194,14 @@ fn prime(links: &[&PathBuf]) {
     }
 }
 
-/// The double's `utime + stime` over [`WINDOW`], in clock ticks.
+/// The double's user + system CPU over [`WINDOW`], in nanoseconds.
 #[cfg(target_os = "linux")]
-fn idle_ticks(pid: u32) -> u64 {
-    let before = cpu_ticks(pid);
+fn idle_nanos(pid: u32) -> u64 {
+    let before = cpu_nanos(pid);
     // A *measurement window*, not a readiness wait: the claim under test is about
     // how little CPU passes while nothing happens, so the window has to elapse.
     std::thread::sleep(WINDOW);
-    cpu_ticks(pid).saturating_sub(before)
+    cpu_nanos(pid).saturating_sub(before)
 }
 
 /// Write a probe on `writer` and wait for it to come back on `reader` — proof the
@@ -233,11 +246,11 @@ fn the_echo_double_pauses_rather_than_spinning_while_peerless() {
     ]);
     prime(&[&link]);
 
-    let spent = idle_ticks(pid);
+    let spent = idle_nanos(pid);
     assert!(
-        spent <= MAX_TICKS,
-        "the `pty --echo` double burned {spent} clock ticks in {WINDOW:?} while \
-         peerless (ceiling {MAX_TICKS}, a whole core is 300) — the level-triggered \
+        spent <= MAX_CPU_NANOS,
+        "the `pty --echo` double burned {spent} ns of CPU in {WINDOW:?} while \
+         peerless (ceiling {MAX_CPU_NANOS}, a whole core is 3000000000) — the level-triggered \
          POLLHUP is free-running its loop: restore `NO_SLAVE_PAUSE` in the Ok(0) / \
          EIO / POLLHUP arms of `serial-nexus-sim`'s `pty_echo` (§15.36, plan §3 rule 2)"
     );
@@ -273,11 +286,11 @@ fn the_nullmodem_double_pauses_rather_than_spinning_while_peerless() {
     // enough to free-run the shared loop.
     prime(&[&a, &b]);
 
-    let spent = idle_ticks(pid);
+    let spent = idle_nanos(pid);
     assert!(
-        spent <= MAX_TICKS,
-        "the `nullmodem` double burned {spent} clock ticks in {WINDOW:?} while \
-         peerless (ceiling {MAX_TICKS}, a whole core is 300) — the level-triggered \
+        spent <= MAX_CPU_NANOS,
+        "the `nullmodem` double burned {spent} ns of CPU in {WINDOW:?} while \
+         peerless (ceiling {MAX_CPU_NANOS}, a whole core is 3000000000) — the level-triggered \
          POLLHUP is free-running its loop: restore the `NO_SLAVE_PAUSE` on the \
          woke-but-forwarded-nothing arm of `run_nullmodem_inner` (§15.36, plan §3 \
          rule 2)"
@@ -295,7 +308,10 @@ fn the_nullmodem_double_pauses_rather_than_spinning_while_peerless() {
 fn the_echo_double_pauses_rather_than_spinning_while_peerless() {
     eprintln!(
         "SKIP the_echo_double_pauses_rather_than_spinning_while_peerless: \
-         per-process CPU sampling needs /proc/<pid>/stat (Linux)"
+         the CPU half of this guard passes off Linux, but its non-vacuity \
+         control does not — a sim double stops relaying after a peer close \
+         on Darwin (measured; plan §18 item 71), and without that control \
+         the CPU assertion above it is vacuous"
     );
 }
 
@@ -304,6 +320,9 @@ fn the_echo_double_pauses_rather_than_spinning_while_peerless() {
 fn the_nullmodem_double_pauses_rather_than_spinning_while_peerless() {
     eprintln!(
         "SKIP the_nullmodem_double_pauses_rather_than_spinning_while_peerless: \
-         per-process CPU sampling needs /proc/<pid>/stat (Linux)"
+         the CPU half of this guard passes off Linux, but its non-vacuity \
+         control does not — a sim double stops relaying after a peer close \
+         on Darwin (measured; plan §18 item 71), and without that control \
+         the CPU assertion above it is vacuous"
     );
 }

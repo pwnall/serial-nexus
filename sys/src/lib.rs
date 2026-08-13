@@ -528,6 +528,82 @@ pub fn peer_hungup<F: std::os::fd::AsFd>(fd: &F) -> bool {
     poll_ready(fd.as_fd().as_raw_fd(), PollFlags::POLLHUP).contains(PollFlags::POLLHUP)
 }
 
+/// Total CPU time (user + system) charged to `pid` so far, in **nanoseconds**.
+///
+/// **The portable analogue the tree said did not exist** (plan §18 items 12 and 13).
+/// `p3_idle_cost` stated in-tree that "there is no portable analogue" to
+/// `/proc/<pid>/stat`, and on that sentence three CPU guards were gated to Linux —
+/// `p9_pty_collapse`'s anti-spin assertion, `p12_sim_idle_cpu`'s §15.36 idle-CPU
+/// tripwire, and `p3_idle_cost` itself. The sentence was true of *`/proc`*, not of
+/// the question: Darwin answers it with `proc_pid_rusage`, whose `ri_user_time` and
+/// `ri_system_time` are already nanoseconds. Nanoseconds are therefore the shared
+/// unit, and the Linux arm converts up rather than the Darwin arm converting down —
+/// clock ticks are the coarser instrument (10 ms on a `USER_HZ` of 100) and rounding
+/// a measurement to a resolution neither kernel imposes would throw away the finer
+/// answer to make the two look alike.
+///
+/// **What it measures is the *process*, not this one.** `getrusage(RUSAGE_SELF)` is
+/// the wrong instrument for every caller here — they sample a *daemon they spawned* —
+/// and `RUSAGE_CHILDREN` counts only children already reaped, so it reads zero for a
+/// child that is still running, which is exactly the case under test. Both were
+/// evaluated and rejected before this was written.
+///
+/// Same-uid is sufficient on both kernels; no privilege is needed and none is taken.
+pub fn process_cpu_nanos(pid: u32) -> std::io::Result<u64> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        // The `comm` field is parenthesised and may itself contain spaces, so the
+        // split starts after the LAST ')' — the same parse `itest::cpu_ticks` used,
+        // kept byte-for-byte so the Linux numbers this replaces do not move.
+        let tail = &stat[stat.rfind(')').ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "no comm field")
+        })? + 1..];
+        let fields: Vec<&str> = tail.split_whitespace().collect();
+        // `tail` starts at field 3 (state), so utime (14) and stime (15) are at 11, 12.
+        let parse = |i: usize| -> std::io::Result<u64> {
+            fields
+                .get(i)
+                .and_then(|f| f.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("/proc/{pid}/stat has no field {i}"),
+                    )
+                })
+        };
+        let ticks = parse(11)? + parse(12)?;
+        // Safety: `sysconf` takes an int and returns a long; no pointers involved.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        let hz = if hz > 0 { hz as u64 } else { 100 };
+        Ok(ticks.saturating_mul(1_000_000_000 / hz))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `rusage_info_v0` opens with a 16-byte uuid, then `ri_user_time` and
+        // `ri_system_time` as `u64` nanoseconds. Read through a sized buffer rather
+        // than a declared struct because the `rusage_info_v*` family grows with the
+        // OS version and only the leading, stable prefix is wanted here.
+        let mut buf = [0u8; 512];
+        // Safety: `buf` is 512 bytes and outlives the call; `RUSAGE_INFO_V0` (0) asks
+        // the kernel to write `rusage_info_v0`, which is far smaller.
+        let rc = unsafe { libc::proc_pid_rusage(pid as i32, 0, buf.as_mut_ptr().cast()) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let at = |o: usize| u64::from_ne_bytes(buf[o..o + 8].try_into().expect("8 bytes"));
+        Ok(at(16).saturating_add(at(24)))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        let _ = pid;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no per-process CPU source is implemented for this platform",
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SessionLatch — a session *edge*, which is not a readiness source
 // ---------------------------------------------------------------------------
@@ -1830,6 +1906,47 @@ mod tests {
             "the refusal must say what it refused and why: {err}"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// **[`process_cpu_nanos`] moves when a process burns CPU and not otherwise**
+    /// (§16.5; plan §18 items 12 and 13).
+    ///
+    /// Two arms, because either alone is satisfied by a broken implementation: a
+    /// function returning a large constant passes "it moved when we burned", and one
+    /// returning zero passes "it stayed put while we slept". The burn is sized to
+    /// dwarf both kernels' resolution — Linux's tick is 10 ms — so this is not a
+    /// timing assertion, only a claim that the counter is wired to the right field.
+    ///
+    /// It samples **this** process because that is the one arm every box can run
+    /// without spawning anything; the callers that matter sample a *child*, which the
+    /// three guards in `itest` exercise against a real daemon.
+    #[test]
+    fn process_cpu_nanos_rises_with_work_and_holds_still_without_it() {
+        let pid = std::process::id();
+        let t0 = process_cpu_nanos(pid).expect("this process's own CPU time is readable");
+
+        let mut acc = 0u64;
+        for i in 0..60_000_000u64 {
+            acc = acc.wrapping_add(i ^ acc);
+        }
+        assert_ne!(acc, 1, "keep the loop from being optimised away");
+        let t1 = process_cpu_nanos(pid).expect("still readable");
+        assert!(
+            t1 > t0 + 10_000_000,
+            "burning CPU moved the counter by {} ns, which is under one Linux clock \
+             tick — the field being read is not the process's CPU time",
+            t1 - t0
+        );
+
+        // …and it does not run away on its own. A sleep costs wall-clock, not CPU.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let t2 = process_cpu_nanos(pid).expect("still readable");
+        assert!(
+            t2 < t1 + 100_000_000,
+            "a 200 ms sleep added {} ns of CPU; a counter that advances with \
+             wall-clock would make every idle-CPU guard built on this vacuous",
+            t2 - t1
+        );
     }
 
     /// **[`peer_hungup`] on a real pts pair, both arms, each the other's control**

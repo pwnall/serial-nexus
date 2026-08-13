@@ -71,9 +71,23 @@
 //! marginal cost per idle polled fd, so it catches a deleted or weakened backoff
 //! (proved fail-first by neutering `back_off`). It cannot attribute a *passing* figure
 //! to that specific mechanism — any other change that made an idle poll cheap would
-//! also pass — and a ceiling is not a proof of sleeping. Linux-only: per-process CPU
-//! sampling needs `/proc/<pid>/stat`, and there is no portable analogue (the same skip
-//! `p9_pty_collapse` and `p12_sim_idle_cpu` take).
+//! also pass — and a ceiling is not a proof of sleeping.
+//!
+//! **Still Linux-only, and the reason changed from a capability to a calibration on
+//! 2026-08-13** (plan §18 items 12 and 13). The old reason — "there is no portable
+//! analogue" to `/proc/<pid>/stat` — was the sentence three guards were gated on, and
+//! it is retired: `serial_nexus_sys::process_cpu_nanos` answers on both kernels, and
+//! `p9_pty_collapse`'s guard now runs on both. What still gates *this* file is that
+//! **its ceiling is a Linux measurement**. Run once on the x86_64 Darwin rig box with
+//! the gate lifted: 3.72 % of a core at 8 idle tty fds and 9.91 % at 32, a marginal
+//! **0.2578 %/fd** against the artifact's recorded 0.0728 %/fd — 3.5x, which is the
+//! real `kevent` Darwin pays per pass and not a regression. Assertion (1), the 20 %
+//! budget, **passes** there with room. Assertion (2) fails, because it multiplies a
+//! figure measured on another kernel. Ungating without a per-platform
+//! `per_fd_cpu_percent` in `docs/benchmarks/phase3.json` would assert a Linux ceiling
+//! on Darwin — a fresh proxy in space pointing the other way, which is the mistake
+//! item 12 exists to remove rather than relocate. The artifact needs a Darwin row
+//! first; that is item 13's remainder.
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
@@ -81,7 +95,7 @@ mod linux_impl {
     use std::time::Duration;
 
     use serde_json::Value;
-    use serial_nexus_itest::{Daemon, cpu_ticks, wait_until};
+    use serial_nexus_itest::{Daemon, cpu_nanos, wait_until};
 
     /// The measurement window, per rung. Ticks are USER_HZ (100/s on Linux), so a
     /// whole core is 1000 of them here and one tick is 0.1 % — at the sweep's 24-fd
@@ -242,10 +256,10 @@ mod linux_impl {
         settled(&d, c.baseline_fds);
 
         let pid = d.pid();
-        let base_ticks = sample(pid);
+        let base_ns = sample(pid);
 
         // Grow the *same* process to the recorded rung, one `add-node` at a time (§11).
-        // This is the point of the whole shape: the fixed term measured in `base_ticks`
+        // This is the point of the whole shape: the fixed term measured in `base_ns`
         // is this daemon's, on this box, at this instant, so subtracting it leaves the
         // per-fd term and nothing else. `load` cannot do this — it is refused on a
         // non-empty graph unless `replace` is set, and `replace` composes a teardown,
@@ -256,18 +270,21 @@ mod linux_impl {
         }
         settled(&d, c.fds);
 
-        let full_ticks = sample(pid);
+        let full_ns = sample(pid);
 
-        // USER_HZ is 100/s on Linux, so `ticks / window_seconds` is percent of one core.
-        let pct = |ticks: u64| ticks as f64 / WINDOW.as_secs_f64();
-        let (base_percent, full_percent) = (pct(base_ticks), pct(full_ticks));
+        // Percent of one core: nanoseconds of CPU over nanoseconds of wall clock,
+        // times 100 — i.e. `ns / (seconds * 1e7)`. The `ticks / window_seconds` form
+        // this replaces relied on USER_HZ being exactly 100/s, which made the unit
+        // conversion invisible and Linux-only (plan §18 item 12).
+        let pct = |ns: u64| ns as f64 / (WINDOW.as_secs_f64() * 1e7);
+        let (base_percent, full_percent) = (pct(base_ns), pct(full_ns));
         // The marginal cost of one idle fd, with the box's fixed cost differenced out.
         // Clamped at zero rather than signed: a `full` below `base` is a quiet box
         // drifting by a tick or two, and a negative slope has no meaning to report.
         let marginal = (full_percent - base_percent).max(0.0) / (c.fds - c.baseline_fds) as f64;
         eprintln!(
-            "p3_idle_cost: {base_ticks} ticks at {} idle tty fds = {base_percent:.2} %, \
-             {full_ticks} ticks at {} = {full_percent:.2} % (each over {WINDOW:?}, one \
+            "p3_idle_cost: {base_ns} ns at {} idle tty fds = {base_percent:.2} %, \
+             {full_ns} ns at {} = {full_percent:.2} % (each over {WINDOW:?}, one \
              daemon) -> {marginal:.4} %/fd marginal (recorded {} %/fd, ceiling \
              {:.4} %/fd; budget {} % of a core)",
             c.baseline_fds,
@@ -329,13 +346,13 @@ mod linux_impl {
         }
     }
 
-    /// Sample the daemon's CPU across one [`WINDOW`], in USER_HZ ticks.
+    /// Sample the daemon's CPU across one [`WINDOW`], in nanoseconds.
     fn sample(pid: u32) -> u64 {
-        let before = cpu_ticks(pid);
+        let before = cpu_nanos(pid);
         // A *measurement window*, not a readiness wait: the claim under test is how
         // little CPU passes while nothing happens, so the window has to elapse.
         std::thread::sleep(WINDOW);
-        cpu_ticks(pid).saturating_sub(before)
+        cpu_nanos(pid).saturating_sub(before)
     }
 
     /// Every one of the first `n` fds must actually be open before a window starts: a
@@ -375,7 +392,9 @@ fn thirty_two_idle_tty_fds_stay_under_the_recorded_cpu_budget() {
     linux_impl::run(linux_impl::criterion());
     #[cfg(not(target_os = "linux"))]
     eprintln!(
-        "SKIP thirty_two_idle_tty_fds_stay_under_the_recorded_cpu_budget: per-process \
-         CPU sampling needs /proc/<pid>/stat (Linux)"
+        "SKIP thirty_two_idle_tty_fds_stay_under_the_recorded_cpu_budget: the \
+         artifact's per-fd ceiling is a Linux measurement and this box is not Linux \
+         (measured here at 0.2578 %/fd against a recorded 0.0728; see this file's \
+         header and plan §18 item 13)"
     );
 }

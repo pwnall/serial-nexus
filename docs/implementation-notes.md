@@ -11883,3 +11883,68 @@ a byte: the payload arrived byte-exact, behind stale data from an earlier test. 
 re-enumerated FT232R *ate* one bulk packet; here Darwin's *retains* one. Same 64-byte quantum,
 opposite direction, different kernel. Recorded as an observation — **no mechanism is claimed** for
 why the two kernels differ, and one measurement on one adapter pair is not the place to start.
+
+### 3.96 The portable CPU source, and a prediction that did not survive being tested
+
+Plan §18 items 12 and 13, and a new item 71 the work uncovered.
+
+**The blocking design question dissolved on contact.** `p3_idle_cost` stated in-tree that
+"there is no portable analogue" to `/proc/<pid>/stat`, and three CPU guards were gated to Linux on
+that sentence. It was true of `/proc` and false of the *question*: Darwin answers it with
+`proc_pid_rusage`, whose `ri_user_time` and `ri_system_time` are already nanoseconds. So the
+deliverable is `serial_nexus_sys::process_cpu_nanos` — one function, two arms, the `unsafe` where
+§16.3 puts it. Nanoseconds are the shared unit because the Linux tick converts up exactly, and
+rounding the finer answer down to a 10 ms tick to make the two kernels look alike would throw away
+resolution neither of them imposes. `getrusage(RUSAGE_SELF)` and `RUSAGE_CHILDREN` were both
+evaluated and rejected before anything was written: every caller samples a *child that is still
+running*, and `RUSAGE_CHILDREN` counts only children already reaped, so it reads zero exactly in
+the case under test.
+
+**The prediction the item was built on is refuted, and that is the entry's real content.** Item 12
+argued that "a regression widening `pty.rs`'s last-close predicate or deleting the latch drain
+would burn a core and release operator-held write locks on macOS with the suite green" — AGENTS
+§9's proxy in space at its sharpest, and the reason the port was worth doing. The ungated
+`|| closed` arm was planted on Darwin, the workspace rebuilt, the binary confirmed current, and the
+guard read **1.81 / 1.88 / 1.81 %** of a core. The *unplanted* tree, three runs, read **1.87 /
+1.88 / 1.81 %**. The bands are identical. The plant moves nothing here either.
+
+That is worth being precise about, because the first single run looked like a signal: an unplanted
+1.69 % against a planted 1.85 % is a 10 % difference and would have been reportable if the baseline
+had been one sample. Three runs a side put 1.69 at the bottom of the ordinary spread. **One sample
+of a varying quantity is indistinguishable from a difference** — P9/P10's own rule, applied to a
+fail-first rather than to a probe.
+
+So the mechanism is absent on both kernels, and the guard's Linux-scoped comment was describing a
+general property. The reader's backoff is not defeated by the handler re-firing: the extra work per
+pass is small and the cadence still relaxes to `IDLE_POLL`. What the port buys is not the hazard
+the item predicted — it is the removal of a guard that asserted **nothing** off Linux, plus one
+instrument for two other files. What still bars the ungated arm is AGENTS invariant 16 rule (3),
+the collapsed-session write-lock leak, which `p9`'s other two tests assert directly.
+
+**Item 13's number, and a projection corrected by it.** On the x86_64 Mac, at load 1.41: 3.72 % of
+a core at 8 idle tty fds and **9.91 %** at 32, marginal **0.2578 %/fd** against the artifact's
+recorded 0.0728 — 3.5×, which is the real `kevent` Darwin pays per pass. The item projected
+"17–19 % on the Intel box" from P12's per-pass arithmetic; the measurement reads 9.91 %, so the
+projection was pessimistic by about two, which is why the item asked for a measurement.
+
+**And the number does not license lifting `p3_idle_cost`'s gate**, which is the part worth writing
+down. Assertion (1), the 20 % budget, passes on Darwin with room. Assertion (2) — item 46's
+marginal drift tripwire — multiplies `per_fd_cpu_percent`, a figure measured on another kernel.
+Ungating on that basis would assert a **Linux ceiling on Darwin**: a fresh proxy in space pointing
+the other way, which is the shape item 12 exists to remove rather than relocate. The file's header
+and skip message now name that calibration blocker instead of the retired `/proc` one, so the gate
+says what it is actually waiting on — a Darwin row in `docs/benchmarks/phase3.json`.
+
+**Item 71, found by lifting a gate and believing the result.** `p12_sim_idle_cpu` was gated for the
+`/proc` reason alone, so it was ungated wholesale — and both tests failed, *not* on CPU. Both pass
+the CPU budget on Darwin (§15.36's invariant holds; the `nullmodem` double reads 0.01 s over a 3 s
+idle window) and both fail the assertion straight after it: the double **stops relaying** after a
+peer close. Checked outside the harness to separate the two causes the guard's own message names —
+the process stays alive and paused, and a `ping` written into one link never reaches the other. So
+it is stopped relaying, not exited.
+
+That control is not decoration: "a double that exits instead of pausing would pass the CPU budget
+above" is its own message, so shipping the CPU half alone would be a guard whose non-vacuity check
+is red. The gate stays and now names the real blocker. **The temptation to ungate anyway was
+concrete** — the CPU assertion *passes*, and taking that as the result would have shipped exactly
+the vacuous green §13's taxonomy exists to catch.
