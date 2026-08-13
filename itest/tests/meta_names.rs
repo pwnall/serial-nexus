@@ -618,7 +618,17 @@ fn notes_sections(md: &str) -> std::collections::BTreeSet<u32> {
 fn notes_citations_in_code_resolve_to_a_real_section() {
     /// A section number the notes will never define, for planting. Kept as an integer
     /// so no literal citation of it appears anywhere in this file's text.
-    const ABSENT: u32 = 99;
+    ///
+    /// **It was 99 until 2026-08-13, and the notes reached it.** The gate then failed
+    /// in the one direction that is not a false alarm: its plant stopped being a plant,
+    /// the walk found nothing dangling, and the self-test said so — a gate noticing
+    /// that its own premise had expired, which is the behaviour AGENTS §3 asks for and
+    /// the opposite of the vacuous green it exists to prevent. The lesson is about the
+    /// *number*: "the notes will never define this" is a claim with a shelf life when
+    /// the value sits one increment past the current tip, and the record's sections are
+    /// append-only by construction. Moved far out of reach rather than one step ahead,
+    /// so the same expiry is not scheduled for the next generation.
+    const ABSENT: u32 = 99_999;
 
     let root = repo_root();
     let notes =
