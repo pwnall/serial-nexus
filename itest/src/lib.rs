@@ -3029,21 +3029,31 @@ mod tests {
         assert_eq!(file_len(&p), 10);
     }
 
-    #[cfg(target_os = "linux")]
+    /// The wrapper's own guard: [`cpu_nanos`] answers for this process and never goes
+    /// backwards. `serial_nexus_sys` self-tests the *reader*; what this covers is the
+    /// harness's panicking wrapper around it, which is the seam a caller meets.
+    ///
+    /// **Ungated with the reader, and it was `#[cfg(target_os = "linux")]` calling
+    /// `cpu_ticks` until 2026-08-13.** Left behind by that rename it would have been a
+    /// compile error on Linux and invisible on the Mac that made it — the same
+    /// cfg-gated-only-caller class plan §18 item 54 added the Apple clippy cross-check
+    /// for, arriving from the opposite direction. Caught by grepping the tree for the
+    /// deleted name rather than by any gate, which is worth knowing: `cargo build`
+    /// compiles no test target, so nothing local sees it either.
     #[test]
-    fn cpu_ticks_reads_this_process_and_never_goes_backwards() {
+    fn cpu_nanos_reads_this_process_and_never_goes_backwards() {
         let pid = std::process::id();
-        let before = cpu_ticks(pid);
+        let before = cpu_nanos(pid);
         // Burn a little, so the counter has something to move on. Not a timing
-        // assertion: the claim is only that the field is found and is monotone.
+        // assertion: the claim is only that the wrapper answers and is monotone.
         let mut acc = 0u64;
         for i in 0..5_000_000u64 {
             acc = acc.wrapping_add(i);
         }
         assert!(acc > 0);
         assert!(
-            cpu_ticks(pid) >= before,
-            "utime+stime went backwards — the field offsets past the comm field are wrong"
+            cpu_nanos(pid) >= before,
+            "this process's CPU time went backwards"
         );
     }
 
