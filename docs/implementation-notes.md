@@ -12059,3 +12059,39 @@ each rejected candidate fails differently, so all four are written at the code r
 commit messages. And the whole sequence is one lesson: **a test that cannot run has no verdict**,
 and five unrelated mechanisms conspired to make "cannot run" look like "the claim is false". The
 claim was true the entire time.
+
+### 3.100 mach absolute time is nanoseconds only where the timebase is 1/1
+
+`serial_nexus_sys::process_cpu_nanos` shipped in §3.96 with a Darwin arm reading
+`proc_pid_rusage`'s `ri_user_time` and `ri_system_time` and returning them as nanoseconds. Those
+fields are **mach absolute time**. On x86_64 `mach_timebase_info` answers `numer=1 denom=1`, so a
+tick *is* a nanosecond and the arm is exactly right; on Apple Silicon the timebase is 125/3 — a
+tick is ~41.67 ns — and the same code under-reports by about 24×.
+
+**Measured, not read.** The helper's own self-test asserts that a deliberate 60M-iteration burn
+moves the counter by more than one Linux clock tick (10 ms). On the Intel rig box that reads
+hundreds of milliseconds and passes; on CI's arm64 macOS runner a 24× under-count puts the same
+burn right at the 10 ms boundary, and it **failed there** one run after this session made that lane
+green. The timebase on this box was then read directly — `numer=1 denom=1` — which is both the
+explanation and the reason the defect was invisible locally.
+
+The conversion is `ticks × numer / denom` through `u128`, with the timebase read once into a
+`OnceLock`. **The Intel readings are unchanged, and that is the check that the fix is a fix rather
+than a new number**: `p9_pty_collapse` reads 1.87–1.90 % of a core before and after, because the
+conversion is the identity at 1/1. So item 13's 0.2578 %/fd and the 9.91 % at 32 fds stand as
+measured — they were taken on the architecture where the bug does not bite.
+
+*One dependency decision, recorded because it is a deprecation being deliberately used:* `libc`
+marks `mach_timebase_info` deprecated in favour of the `mach2` crate. The symbol is stable and this
+is the libc crate's policy rather than an Apple removal, so the call stays with a function-scoped
+`#[allow(deprecated)]` (the deprecation lands on the struct's fields too, which is why the allow
+cannot sit on the statements). Taking a new dependency into `serial_nexus_sys` to read two `u32`s
+would move the workspace's dependency graph, `cargo deny`, and a second lockfile — item 58's
+standing consequence — for no behaviour.
+
+**The theme, one more time.** This session opened by finding two guards that were correct on the
+box that wrote them and wrong on the platform of record; it closes by having written one of its own
+— correct on x86_64 Darwin, wrong on arm64 Darwin, caught by the lane that exists for exactly that.
+Two Macs are not one platform, and the record already said so in another register: plan §18 item 18
+insists the CI arm64 runner, the M4, and the x86_64 rig box are "three machines, none substituting
+for another".

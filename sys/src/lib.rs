@@ -581,9 +581,9 @@ pub fn process_cpu_nanos(pid: u32) -> std::io::Result<u64> {
     #[cfg(target_os = "macos")]
     {
         // `rusage_info_v0` opens with a 16-byte uuid, then `ri_user_time` and
-        // `ri_system_time` as `u64` nanoseconds. Read through a sized buffer rather
-        // than a declared struct because the `rusage_info_v*` family grows with the
-        // OS version and only the leading, stable prefix is wanted here.
+        // `ri_system_time` as `u64`. Read through a sized buffer rather than a declared
+        // struct because the `rusage_info_v*` family grows with the OS version and only
+        // the leading, stable prefix is wanted here.
         let mut buf = [0u8; 512];
         // Safety: `buf` is 512 bytes and outlives the call; `RUSAGE_INFO_V0` (0) asks
         // the kernel to write `rusage_info_v0`, which is far smaller.
@@ -592,7 +592,48 @@ pub fn process_cpu_nanos(pid: u32) -> std::io::Result<u64> {
             return Err(std::io::Error::last_os_error());
         }
         let at = |o: usize| u64::from_ne_bytes(buf[o..o + 8].try_into().expect("8 bytes"));
-        Ok(at(16).saturating_add(at(24)))
+        let ticks = at(16).saturating_add(at(24));
+
+        // **Those fields are mach absolute time, not nanoseconds, and the difference is
+        // invisible on Intel.** `mach_timebase_info` reads `numer=1 denom=1` on x86_64,
+        // so ticks *are* nanoseconds there and a helper written and measured on an
+        // Intel Mac looks perfect. On Apple Silicon the timebase is 125/3 — a tick is
+        // ~41.67 ns — so the same code under-reports by ~24x. Measured, not read: this
+        // function shipped without the conversion and CI's arm64 macOS runner failed
+        // its self-test on the arm that asserts a deliberate CPU burn exceeds one Linux
+        // clock tick, which a 24x under-count puts right at the boundary (notes §3.100).
+        // One more instance of the session's own theme — correct on the box that wrote
+        // it, wrong on the machine that runs it.
+        // The `#[allow(deprecated)]` is scoped to this one function rather than to the
+        // statements that need it, because the deprecation lands on the struct's
+        // *fields* as well as its name. It is the `libc` crate's own policy ("use the
+        // `mach2` crate"), not an Apple removal — the symbol is stable — and taking a
+        // new dependency into `serial_nexus_sys` to read two `u32`s would move the
+        // workspace's dependency graph, `cargo deny`, and a second lockfile (item 58's
+        // standing consequence) for no behaviour.
+        #[allow(deprecated)]
+        fn mach_timebase() -> (u64, u64) {
+            let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+            // Safety: writes the two `u32`s of a stack-owned struct; no pointers escape.
+            let rc = unsafe { libc::mach_timebase_info(&mut info) };
+            // A failure here would make every reading silently wrong, so fall back to
+            // the identity rather than to a guess: on the platform where the identity
+            // is wrong (arm64) the call does not fail, and on the one where it is right
+            // (x86_64) the fallback is exact.
+            if rc == 0 && info.numer > 0 && info.denom > 0 {
+                (u64::from(info.numer), u64::from(info.denom))
+            } else {
+                (1, 1)
+            }
+        }
+        static TIMEBASE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        let (numer, denom) = *TIMEBASE.get_or_init(mach_timebase);
+        // u128 so the multiply cannot overflow before the divide; a process would need
+        // ~584 years of CPU to trouble the u64 the result goes back into.
+        Ok(
+            u64::try_from(u128::from(ticks) * u128::from(numer) / u128::from(denom))
+                .unwrap_or(u64::MAX),
+        )
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
