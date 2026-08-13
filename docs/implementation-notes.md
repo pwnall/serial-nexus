@@ -11287,3 +11287,21 @@ kit-honesty negative, `SilentResyncer`, is `GoodFraming` with the override delet
 else changed, proven to pass **all eight** other suites and fail only this one; `tinymux` runs it
 from the consumer position, so deleting that counter reddens the consumer-position gate — which
 is the exact deletion the item observed leaves the whole tree green today.
+
+**The rig, half of it.** The crossover half of the lane ran green at the current tree —
+**967 · 0 · 7**, equal to the default-scope figure, with all five crossover tests executing. The
+distinguishing evidence is the self-skip count, which falls **12 → 7**: a rig row whose skip count
+matches the default-scope run is a default-scope run wearing a rig label. Three of the drops are
+measurements — the two `rts-cts` tests print `port1 RTS high -> port0 cts:false` and `false` again
+with RTS low, a **3-wire** bench and §15.52's legitimate answer for the fourth independent time,
+and the two browser tests find no `node`.
+
+**The fourth drop is this session's own doing and is recorded as owed rather than quietly taken.**
+Item 52 changed the privileged helper, so `.snx-bin/<profile>/serial-nexus-devprep` is now *Stale*
+— `preflight` says exactly that and exits 2 — and `scripts/bless` needs a `setcap` this box cannot
+give itself. `blessed_devprep_helper()` only **warns** on a byte mismatch, deliberately, since an
+ordinary relink changes those bytes; so a replug lane run now would have exercised the
+pre-change helper and reported green for code that never ran. That is the failure §3.83 discarded
+a whole lane to avoid, and the right answer is the same one: do not run it. `SNX_REPLUG_DEV` was
+left unset so the three replug tests self-skip visibly instead. **The replug half of the lane, and
+with it item 52's whole rig surface, is owed at this tree once the helper is re-blessed.**
