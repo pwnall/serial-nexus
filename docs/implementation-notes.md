@@ -11986,3 +11986,30 @@ discipline buys and exactly what a post-hoc reading of the same 12 runs would no
 
 The fourth outcome §3.56 named — the test failing on *Linux* over the rig, which would be evidence
 against the conversion itself — has not been observed, on this session's Linux rows or any other.
+
+### 3.98 A Linux-gated call to a function this session deleted, and the check that would have caught it
+
+Item 12's rename retired `itest::cpu_ticks` for `cpu_nanos` and repointed every call site — every
+*visible* one. Its own self-test, `cpu_ticks_reads_this_process_and_never_goes_backwards`, was
+`#[cfg(target_os = "linux")]`, so the Mac that made the change could not compile it and neither
+could `cargo build`, which compiles no test target at all (AGENTS §3's standing note, met here from
+the other side). It would have failed to build on Linux.
+
+**Found by grep, not by a gate**: scanning the tree for each name the session removed —
+`cpu_ticks`, `honours_rtscts`, `RtsCtsOutcome`, `idle_ticks`, `MAX_TICKS` — and reading every hit
+to separate live code from prose. Four of the five were prose-only; the fifth was this.
+
+**This is plan §18 item 54's class arriving from the opposite direction.** That item added an Apple
+clippy cross-check to the Linux lane because "a helper whose one caller is
+`#[cfg(target_os = "linux")]` is dead off Linux and nobody looked". The mirror is a *call site*
+inside a Linux gate that a Mac cannot compile, and the mirror instrument turns out to exist and to
+be cheap: **`cargo check -p <crate> --all-targets --target x86_64-unknown-linux-gnu` runs from a
+Mac for every crate in this workspace except `serial-nexus-web`**, whose `ring` needs a Linux C
+toolchain (`failed to find tool "x86_64-linux-gnu-gcc"`). Measured on all eight crates this session
+touched: clean. AGENTS §3 now says to run it before pushing from a Mac.
+
+**It is a turnaround improvement rather than a coverage hole, and the difference is worth stating
+so nobody files it as the latter.** CI's Linux lane compiles that code on every push, so the defect
+was never going to reach anyone — it was going to redden the next run and cost a round trip. What
+the local cross-check buys is finding it in the thirty seconds before the push instead of the ten
+minutes after, which is exactly what the Apple cross-check buys the Linux lane.
