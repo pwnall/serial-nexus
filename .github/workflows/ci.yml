@@ -83,6 +83,17 @@ jobs:
           rustup toolchain install "$MSRV" --profile minimal --component rustfmt,clippy
           rustup default "$MSRV"
       - uses: Swatinem/rust-cache@v2
+      # **`itest/tests/expectation_gates.rs` needs `jq` and this job never installed it.**
+      # Seventeen synthetic-antecedent guards — the machinery §13's gate design and plan §3
+      # rule 22 both rest on, the ones that prove an expectation clause *can* redden — call
+      # `have_jq()` and return green when it is absent. `platform_expectation()` picks the
+      # file by `cfg!(target_os)`, so `expectations/linux.jq`'s entire clause-level guard set
+      # runs ONLY on a Linux box running the suite, and this is the only such job. It has been
+      # passing because the ubuntu image happens to ship jq; nothing in-tree asserted it, and
+      # a runner image that dropped jq would have turned seven guards green having asserted
+      # nothing — rule 22's own shape, in the file that exists to prevent it.
+      - name: Install jq (expectation_gates.rs's clause guards self-skip without it)
+        run: sudo apt-get update && sudo apt-get install -y jq
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -184,10 +195,24 @@ jobs:
       # the passing output and the not-running output are the same line, and libtest
       # captures a passing test's stderr, so even the SKIP lines are invisible without
       # `--nocapture` (notes §3.78).
+      #
+      # `SNX_TLS=required` for the same reason, and it had the same gap: `web_tls_round_trip`
+      # is the only proof the TLS tier's handshake *works* rather than merely that it binds,
+      # and it carries two silent skip causes (no `curl`; a sandbox that cannot bind
+      # `0.0.0.0:0` with `--tls`). The mechanism has existed since plan §18 item 10 and **no
+      # CI lane ever set it**. This runner has curl and can bind, so a skip here is a lane
+      # that lost a prerequisite, not a laptop without one.
+      #
+      # `--no-fail-fast` for the reason the macOS lane already gives at length: `cargo test
+      # --workspace` stops at the first failing test BINARY, so a red run reports one crate
+      # and says nothing about the ~110 targets behind it. That lesson was written down after
+      # it cost six consecutive macOS pushes (docs/macos.md, 2026-07-28) and reached only the
+      # macOS job; a job that is going to be red anyway costs nothing by being red completely.
       - name: Test (unit + property + serial-nexus-itest integration harness)
         env:
           SNX_EXEC_CODEC: required
-        run: cargo test --workspace --locked
+          SNX_TLS: required
+        run: cargo test --workspace --locked --no-fail-fast
 
   # The licensing gate proven, not assumed (§13). cargo-deny plus the serial-nexus-itest test
   # that proves the gate rejects a banned crate (§16.11 folded the bash script into it;
@@ -349,8 +374,15 @@ jobs:
       # The condition is the other half of the reorder above: a red *gate* must not hide
       # the suite any more than a red suite was allowed to hide the gate. It keys on the
       # build because that is what this step actually needs.
+      # `SNX_EXEC_CODEC=required` here as well as on the Linux lane: the macOS image also
+      # provides python3, so the 13-test out-of-process codec battery must prove it executed
+      # on both platforms rather than only on one. Item 49 built the mechanism and wired the
+      # Linux lane; leaving macOS unset would make the extension surface silently skippable on
+      # exactly the platform this lane exists to cover.
       - name: Build + test (portable core + integration harness; serial tests self-skip)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          SNX_EXEC_CODEC: required
         run: cargo test --workspace --locked --no-fail-fast
       # Both renderings — the Linux lane's reasoning, verbatim (notes §3.74). `!cancelled()`
       # because a report that FAILED its expectation is the one most worth having in hand;

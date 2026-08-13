@@ -1376,7 +1376,37 @@ Each item below uses the schema with its fields inline.
     equivalence has no reconcilable measurement at *any* era. *Validation:* one dual-scope run
     at the current era; both figures land in the plan Status table with their scopes named, and
     no delta is derived across them (plan §3's figure-scope rule).
-31. **The packaging evidence pass** — **open** (S; needs a root box). *Evidence:* PKG-2's
+31. **The packaging evidence pass** — **open**, and **re-scoped 2026-08-12** from "needs a root
+    box" to "needs a root box *for one half*, and a CI job for the regression guard". The
+    re-scope is a decision about where the evidence lives: a measurement taken once on a
+    maintainer's laptop is not a regression guard, and the whole point of this item is claims whose
+    evidence class nobody can see.
+    *Split:* **(a)** the evidence-class pass over `packaging/serial-nexus-daemon.service` and its
+    README — marking each deployment claim *measured* / *man-page* / *unverified* — needs no root
+    and is the item's first validation clause; **(b)** a no-root gate that runs on every push,
+    which is the part that catches regressions *this project can cause*: the unit's directives and
+    the README's claims about them, both derived by parsing rather than hand-kept; **(c)** the
+    `DynamicUser=` mount measurement itself, which needs root and therefore belongs in a CI job
+    that has passwordless sudo, not on a laptop.
+    *Instrument validity, measured before building on it* (§13's own rule, applied to a tool
+    rather than a probe): `systemd-analyze verify` catches an unknown directive (exit 1) and a
+    missing `ExecStart` (exit 1), does **not** catch a bad value (`RestartSec=notanumber` → exit
+    **0**), and exits **1 on the real unit** for an environmental reason — `/usr/local/bin/serial-
+    nexus-daemon` is not installed on a dev box. So its exit status conflates a unit defect with a
+    missing install, and both naive uses are traps: trusting it reddens any box without an install,
+    ignoring it makes the command read as a gate and assert nothing (rule 22's own class). A usable
+    gate stages the unit with the `ExecStart` path stubbed, *then* trusts the exit status, and
+    states the bad-value blind spot rather than letting a reader assume coverage.
+    *Sequencing, deliberately:* the root-gated half lands **self-skipping with its reason printed**,
+    and its `required` mode is switched on only after a CI run proves the runner actually provides
+    systemd as PID 1 — measured, not declared, the way §15.52 made `SNX_RIG_FLOW`'s precondition a
+    measurement. Shipping `required` on an assumption reddens a lane for someone else's runner
+    image. *Declined:* widening the privileged helper to take the measurement locally. It would need
+    root-equivalent capability (starting a unit, reading a foreign process's mount table), and the
+    helper is mode 0700 and invocable by the unprivileged user *by design* — §15.45's narrowness is
+    the safety argument, not a style, and AGENTS §4 makes widening it an amendment rather than a
+    patch. It is also the wrong instrument: the claim under test is systemd's behaviour, which no
+    capability this project holds can make true. The superseded filing follows. *Evidence:* PKG-2's
     `DynamicUser` id-mapped-mount behavior is unmeasured; `packaging/serial-nexus-daemon.service`
     and its README carry deployment claims whose evidence class is unrecorded. *Validation:*
     mark each claim measured versus man-page; the mount behavior measured on a root box when one
@@ -2001,6 +2031,107 @@ cannot check was fixed (item 16's lesson).
     them.
     *Validation:* (a) is fail-first by construction — the planted swallow must redden the new
     guard; (b) and (c) are comment/decision work; (d) inherits item 55's "no half hoist" rule.
+
+### Items 60–64 — the guard audit (2026-08-12)
+
+Filed from an audit that asked of every recorded measure: **is there a guard, and could that
+guard actually fail?** Rule 22's tell was the instrument — would its passing output differ from
+its not-running output. The audit's headline is worth keeping: coverage is **better** than the
+question implied, and roughly a dozen invariants are guarded to a standard the auditor could not
+break by reading (unsafe containment, the `RefCell` and `AsyncFd` bans, the teardown ledger, the
+loss fingerprint, head-of-line, the web bridge's deny-by-default, the derived rosters, the golden
+transcripts, the pattern-wait maxima). What follows is the residue.
+
+60. **Four gates that could not fail, closed** — **EXECUTED 2026-08-12**.
+    (a) **`SNX_TLS=required` was set by no CI lane.** The mechanism has existed since item 10 and
+    `web_tls_round_trip` is the only proof the TLS tier's *handshake* works rather than that it
+    binds — carrying two silent skip causes. Now set on the Linux lane, which has `curl` and can
+    bind, so a skip there is a lane that lost a prerequisite.
+    (b) **The Linux `check` job never installed `jq`**, and it is the only job that runs the suite
+    on Linux. `expectation_gates.rs`'s seventeen synthetic-antecedent guards — the machinery
+    §13's gate design and rule 22 rest on — call `have_jq()` and return green without it, and
+    `platform_expectation()` picks by `cfg!(target_os)`, so `expectations/linux.jq`'s entire
+    clause-level guard set was running *by luck of the runner image*. Install step added.
+    (c) **The Linux lane lacked `--no-fail-fast`** while macOS has it with a comment explaining
+    why it cost six consecutive pushes. Added.
+    (d) **The macOS lane did not set `SNX_EXEC_CODEC=required`**, so item 49's battery was
+    silently skippable on exactly the platform that lane exists to cover. Added.
+    (e) **`REQUIRED_CAPS.len() >= 2` was a floor**, so a third capability — which AGENTS §4 and
+    §15.45 call a design *amendment* — reddened nothing. It is now `assert_eq!` with a message
+    naming the amend-first order, and **fail-first proven**: planting `cap_sys_admin` reddens it
+    (plus three sibling tests), restored byte-identical, 18 passed.
+
+61. **The throughput axis has no guard at its recorded value** — **open** (M; a measurement, then
+    a guard). *Evidence:* `docs/benchmarks/phase3.json` records **183.0 MiB/s** and an exit
+    criterion of **30 MiB/s**; the only test on that axis, `p3_firehose.rs`, streams 256 MiB under
+    a 60 s deadline, so it fails only below **4.27 MiB/s** — 43× under the recorded figure and
+    **7× under the recorded exit criterion**, which means the guard admits a daemon that cannot
+    meet the design's own stated headroom. It never measures or prints elapsed time, so 183 → 20
+    MiB/s is invisible in both the pass and fail paths, and unlike `idle_cost` the throughput
+    block carries **no provenance** — no box, no date, no commit. This is exactly the state
+    `idle_cost` was in before item 46, and the same defect review 37 filed as 37-TEST-3, fixed for
+    one axis of one artifact and not the other. *It also orphans a tripwire:* §5's ring-storage
+    row names this benchmark as its detector, and a `VecDeque<u8>` drain+extend rewrite would
+    clear 4.27 MiB/s comfortably — so **that tripwire is currently upheld by review**.
+    *Remainder:* item 46's shape — time the transfer, print the reading, assert against a factor
+    of a **measured** `throughput` provenance block. The ceiling must be measured before the
+    factor is chosen (AGENTS §8), and the sim source's own rate is the confound to check first.
+
+62. **§16.12's exhaustiveness is per-field, and is already violated** — **open** (S/M).
+    *Evidence:* the promise is "**every** numeric attribute and every wire-riding identifier
+    carries a stated, structurally checked maximum", but enforcement is seven hand-written
+    `range_error(…)` sites inside `GraphConfig::validate()`, each behind an `if let NodeConfig::X
+    { …, .. }` whose `..` means a new field triggers no compiler complaint, plus a property test
+    over a **fixed list of four fields**. The gap has bitten: **`NodeConfig::Pty {
+    advertised_baud: u32 }` has no range check at all** — it rides the wire into `state` and feeds
+    `apply_baseline` → `standard_baud()`, which returns `Option` and silently ignores a nonstandard
+    value. Benign today, a literal violation of the promise, and exactly what an exhaustiveness
+    guard exists to prevent (contrast `Serial { baud }`, which is checked). *Remainder:* a
+    derive-from-code gate in `meta_derive`'s existing style — enumerate `NodeConfig`'s numeric
+    fields from source, require each in a `range_error` site or a named exemption — plus the
+    missing check. *Validation:* the gate reddens on a planted unchecked field; the exemption list
+    is two-sided.
+
+63. **The observation surface has no doc-parity gate, and has drifted** — **open** (M).
+    *Evidence:* §5 says `docs/rpc/observation.md` is "the authoritative per-kind enumeration and
+    **stays so**", and the tree gates the *error-code* table and the *verb index* two ways — but
+    the largest surface is checked only by hand-written per-field tests that cite the doc without
+    reading it. Measured drift: **17 keys the daemon emits appear nowhere under `docs/rpc/`**,
+    including `delivered_hostward` — which the design itself names at §5 as the counter
+    `p6_head_of_line.rs` reads — plus `accepted_targetward`, `client_present`, `reconnect_count`,
+    `identity_kind`, `pts_path`, `modem_lines`, `protocol_version`. This is the drift class that
+    produced §15.54, where the taxonomy had to be corrected because four shipped counters
+    falsified it. *Remainder:* a fifth `meta_derive` gate — enumerate `"key":` literals from the
+    node `state` builders, require each in `docs/rpc/*.md` or a named exemption, floors on both
+    sides.
+
+64. **Second-tier audit residue** — **open** (S each; independent clauses).
+    *(a)* The pattern wait's **active-path cost is unmeasured**: `ScanWindow::scan()` rescans the
+    whole window per chunk on the single runtime thread, `MAX_LOOKBACK` is a scan cost as well as
+    an allocation, and `waits` is iterated per chunk with no cap on its length. Item 46 established
+    only that *idle* cost is unaffected. One test — arm a max-lookback wait on the firehose graph
+    and assert the throughput floor — needs item 61 first.
+    *(b)* §10 clause 7's "an armed wait never affects `discarded_unattached`" is asserted by
+    nothing (`grep` of the battery returns 0). Structurally independent today, so a coverage hole;
+    two lines in the existing ring-off guard. Schedule beside item 59(a).
+    *(c)* The jq **clause-identity** guards are incomplete: seven "identical to the other file"
+    pairs are byte-identical today but only some have identity tests — P9's
+    `zero_timeout_by_fd_state`, P10's `peer_pending` and recheck-ladder, P12's anti-spin (which has
+    *no antecedent and no plant*), and `build.commit`/`build.probe_set` are unheld. **No plant ever
+    hands back a 1-rung ladder**, the exact defect `macos.jq`'s comment says the gate could not
+    previously see.
+    *(d)* **No gate asserts that every probe has a jq clause** — `meta_derive` names this itself as
+    acknowledged-and-unowned, so a probe added with no `.id == "PN"` clause is ungated on both
+    platforms.
+    *(e)* `AppError::ALL` is **hand-kept**: the docs↔registry gate is two-way over `ALL`, not over
+    the enum, so a new variant omitted from it compiles, is emittable, and is silently
+    undocumented.
+    *(f)* §16.6's `atomic_write_replaces_durably` **passes with both `fsync` calls deleted** — it
+    asserts the atomic-write contract, and its own comment concedes it. Either rename it to what it
+    asserts (honest and free) or drive it under `strace` behind a required mode.
+    *(g)* "One shared helper" rules (§16.1's boundary supervisor, §16.4's three purge instances,
+    the one fragmenter) each have every *instance* tested and nothing forbidding a fourth
+    hand-rolled one; §16.11 has nothing stopping a `.sh` reappearing under `scripts/validate/`.
 
 ### Evaluated and deliberately not scheduled — the closing register
 

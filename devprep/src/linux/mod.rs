@@ -1513,11 +1513,33 @@ mod tests {
             "and so is cap_dac_override alone — an intersection would let both \
              half-blessed shapes through the refusal that exists to contain them"
         );
-        // The set is what the fold is over, so a third entry inherits the rule
-        // without a line changing here.
-        assert!(
-            install::REQUIRED_CAPS.len() >= 2,
-            "REQUIRED_CAPS is the set this folds; §15.55 put two in it"
+        // The set is what the fold is over, so a third entry inherits the *fold's*
+        // rule without a line changing here — which is why this assertion is not
+        // about the fold at all.
+        //
+        // **It is `assert_eq!`, not a `>=` floor, and that is the point.** AGENTS §4
+        // and §15.45 make the helper's narrowness the whole safety argument, and say
+        // in terms that "adding a capability is likewise an amendment" — a design
+        // decision with a recorded entry, not a patch. A floor cannot tell an
+        // amendment from a typo: `REQUIRED_CAPS.len() >= 2` passes just as happily
+        // for a set carrying `cap_sys_admin`, and the tripwire that calls a third
+        // capability an amendment would have been enforced by nothing at all. This
+        // was a `>=` until 2026-08-12, found by an audit asking of each recorded
+        // measure whether its guard could actually fail.
+        //
+        // So a third capability reddens here, deliberately and loudly. **The fix is
+        // not to edit this number.** It is to write the §15 amendment first, then
+        // change the constant and this assertion in the same commit as the entry
+        // that authorises it — the amend-first order (AGENTS §5).
+        assert_eq!(
+            install::REQUIRED_CAPS.len(),
+            2,
+            "REQUIRED_CAPS carries {} capabilities; §15.45/§15.55 bound the helper at \
+             TWO (`cap_dac_override` for the sysfs write, `cap_fowner` for the ACL \
+             grant). Adding one is a design amendment, not a patch: write the §15 \
+             entry that authorises it, then change the constant and this assertion \
+             together with it (AGENTS §4, §5).",
+            install::REQUIRED_CAPS.len()
         );
     }
 

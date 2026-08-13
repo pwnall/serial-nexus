@@ -11305,3 +11305,70 @@ pre-change helper and reported green for code that never ran. That is the failur
 a whole lane to avoid, and the right answer is the same one: do not run it. `SNX_REPLUG_DEV` was
 left unset so the three replug tests self-skip visibly instead. **The replug half of the lane, and
 with it item 52's whole rig surface, is owed at this tree once the helper is re-blessed.**
+
+---
+
+### 3.87 The guard audit: asking of every recorded measure whether its guard could actually fail
+
+Prompted by the repo owner, whose ask was broader than any one item: *automated tests that catch
+regressions to every measure that matters*. The audit asked one question of each recorded measure —
+**is there a guard, and could that guard fail?** — with plan §3 rule 22's tell as the instrument:
+would its passing output differ from its not-running output. Read-only, against a tree four other
+agents were writing, so it ran without touching a file.
+
+**The headline is that coverage is better than the question implied**, and that is worth recording
+as loudly as the gaps. Roughly a dozen invariants are guarded to a standard the auditor could not
+break by reading: unsafe containment (matcher plants, walker plants over scratch trees, a >100-root
+non-vacuity floor, a two-sided exception set), the `RefCell` and `AsyncFd` bans, the teardown
+ledger's conservation, the loss fingerprint with its own non-vacuity clause, head-of-line asserted
+on both sides, the web bridge's deny-by-default, the derived rosters, the golden transcripts with
+their one-byte mutation, and the pattern-wait maxima. The meta-gate layer is genuinely adversarial.
+
+**Four gates that could not fail, closed the same session** (item 60). `SNX_TLS=required` was set
+by **no CI lane** — the mechanism has existed since item 10 and nothing ever used it. The Linux
+`check` job — the only job that runs the suite on Linux — **never installed `jq`**, so
+`expectation_gates.rs`'s seventeen synthetic-antecedent guards, the machinery §13's whole gate
+design rests on, were passing by luck of the runner image. The Linux lane lacked `--no-fail-fast`
+while macOS carries it with a comment explaining the six pushes it cost. And the macOS lane did not
+set `SNX_EXEC_CODEC=required`, leaving item 49's battery silently skippable on the platform that
+lane exists to cover.
+
+**The fifth is the one worth dwelling on**, because it is a tripwire that had been enforced by a
+comment. AGENTS §4 and §15.45 say adding a capability to the privileged helper is a **design
+amendment**, not a patch. The only assertion was `REQUIRED_CAPS.len() >= 2` — a *floor*, which
+passes just as happily for a set carrying `cap_sys_admin`. It is now `assert_eq!` with a message
+naming the amend-first order, proven by planting a third capability and watching it redden.
+A floor cannot tell an amendment from a typo, and the narrowness bound is the helper's entire
+safety argument.
+
+**Two live findings that are not gate holes but product ones.** §16.12 promises that *every*
+numeric attribute carries a structurally checked maximum; enforcement is seven hand-written call
+sites behind `if let NodeConfig::X { …, .. }` patterns whose `..` silences the compiler, plus a
+property test over a fixed list of four fields — and the gap has already bitten:
+`NodeConfig::Pty { advertised_baud }` has **no range check at all**, rides the wire into `state`,
+and feeds a `standard_baud()` that returns `Option` and silently ignores a nonstandard value.
+Benign today; a literal violation of the promise, in exactly the way an exhaustiveness guard exists
+to prevent (item 62). And `docs/rpc/observation.md`, which §5 calls the authoritative per-kind
+enumeration that "stays so", is missing **17 keys the daemon emits** — including
+`delivered_hostward`, which the design itself names as the counter `p6_head_of_line.rs` reads. That
+is the drift class that produced §15.54 (item 63).
+
+**The most consequential gap is a guard with 43× of slack.** `phase3.json` records 183.0 MiB/s and
+an exit criterion of 30; `p3_firehose.rs` fails only below **4.27 MiB/s** — seven times *under* the
+recorded criterion, so the guard admits a daemon that cannot meet the design's own headroom
+requirement. It never prints elapsed time, so 183 → 20 MiB/s is invisible in both paths, and the
+throughput block carries no provenance where `idle_cost` now does. This is precisely the state
+`idle_cost` was in before item 46 — the same defect review 37 filed as 37-TEST-3, fixed for one
+axis of one artifact and not the other. It also orphans a tripwire: §5's ring-storage row names
+this benchmark as its detector, and a `VecDeque<u8>` rewrite would clear 4.27 MiB/s comfortably, so
+that row is currently upheld by review (item 61).
+
+**And an instrument-validity finding, before anything was built on it.** The obvious tool for the
+packaging gate is `systemd-analyze verify`. Measured on this box, exit status read directly rather
+than through a pipe: it catches an unknown directive (1) and a missing `ExecStart` (1), does **not**
+catch a bad value (`RestartSec=notanumber` → **0**), and returns **1 on the real unit** because
+`/usr/local/bin/serial-nexus-daemon` is not installed here. So its exit status conflates a unit
+defect with a missing install, and both naive uses are traps — trusting it reddens every dev box,
+ignoring it makes the command read as a gate and assert nothing. Recorded because the temptation
+was to wire it up first and measure later, which is how the five previous assert-nothing checks
+happened.
