@@ -2684,7 +2684,7 @@ for is one the next review cannot check was fixed — item 16's lesson.
     pair that proves the predicate discriminates rather than refuses everything; the harness
     assertion that a refused `load` created **nothing** rides with it, as §15.53 requires.
 68. **The packaging root arm reddened CI on every run it ever had, and its message blamed the
-    wrong subject** — **open in its flip-back half** (S). *Executed 2026-08-13:* the root cause
+    wrong subject** — **EXECUTED 2026-08-13**, flip-back included (notes §3.99). *Executed 2026-08-13:* the root cause
     and the repair. `dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown`
     put its `ReadWritePaths=` probe directories under `std::env::temp_dir()` while the packaged
     unit sets `PrivateTmp=yes`, so the listed path did not exist inside the service's namespace
@@ -2749,11 +2749,15 @@ for is one the next review cannot check was fixed — item 16's lesson.
     and the property under test was never the thing failing — by stage five one of Claim 4's
     two arms is confirmed. A test that cannot run has no verdict, and five different mechanisms
     conspired to make "cannot run" look like "the claim is false".
-    *Remainder:* **the `continue-on-error` line is a step asserting nothing, which AGENTS §3
-    names as a tell, so it is temporary by construction** — one green run at this tree flips it
-    back off, and it has not come yet. *Limit, now smaller but still real:* the shell behaviour
-    is verified on the shell that runs it, and whether the whole arm passes on the runner is
-    not — that is the next run's measurement, as it has been for each stage. *Validation:* the flip-back is the item's
+    **Green, and the escape hatch is gone.** CI run 31695823765: the root arm reads **6 passed,
+    0 failed**, the probe running under `DynamicUser=yes` as `uid=65180`, printing all nine
+    readings — `state_stat=root:777`, `state_real=/var/lib/private/snx-pkg-probe-3041`,
+    `private_list=ok`, `private_stat=root:755`, `host_link=private/…` — with **both** halves of
+    Claim 4 holding. So **plan §18 item 31(c)'s owed measurement has executed for the first
+    time**, `continue-on-error` is removed, and a regression here fails the lane again. The
+    debt is closed on the terms it was taken on: a step that asserts nothing is AGENTS §3's
+    tell, and it was carried as a numbered item rather than left as a comment for exactly this
+    reason. *Validation:* the flip-back is the item's
     close; a run that is still red names its new status word or its new failing assertion
     rather than re-asserting any of the three diagnoses.
 69. **The macOS lane's two Linux-shaped guards, and what they say about coverage** —

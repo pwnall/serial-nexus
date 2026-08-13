@@ -12013,3 +12013,49 @@ so nobody files it as the latter.** CI's Linux lane compiles that code on every 
 was never going to reach anyone — it was going to redden the next run and cost a round trip. What
 the local cross-check buys is finding it in the thirty seconds before the push instead of the ten
 minutes after, which is exactly what the Apple cross-check buys the Linux lane.
+
+### 3.99 Five defects deep, and none of them the subject: the packaging root arm turns green
+
+Plan §18 item 68, closed, and with it item 31(c)'s `DynamicUser=` measurement — owed since the
+packaging track landed and never once executed.
+
+The arm reddened CI on **every run it ever had**. Each fix revealed the next defect, and every one
+was the *probe's* rather than the packaged unit's:
+
+1. **`/tmp` under `PrivateTmp=yes`** — the `ReadWritePaths=` directories named a path that does not
+   exist inside the namespace, so systemd refused to build it: `status=226`, `EXIT_NAMESPACE`,
+   before `ExecStart`. The assertion's message said "This is a finding about the packaged sandbox,
+   not about the probe". It was a finding about the probe, and the message now routes by the
+   systemd status word instead of by assumption.
+2. **`/run/<tag>` colliding with `RuntimeDirectory=<tag>`** — the probe's repair put the scratch
+   tree at the exact path systemd creates and, under `DynamicUser=`, **chowns** to the service
+   user, handing the ownership control to the user whose writes it exists to refuse. It failed
+   *silently*, reporting `listed_write=ok`, which is worse than the 226 it replaced. This item's
+   own first draft had argued the move was safe *because* "`RuntimeDirectory=` already writes into"
+   `/run` — the collision written down as the reassurance.
+3. **`:` is a POSIX special built-in.** A redirection error on one "shall cause the shell to exit",
+   `/bin/sh` is dash on the runner, and the refusal this probe exists to observe therefore killed
+   the script mid-run — `set +e` cannot help. **The probe was dying on its own success.** Verified
+   on dash rather than reasoned: `: >` into a read-only directory exits 2 with no further output,
+   which is CI's signature exactly; `true >` prints the reading and exits 0.
+4. **`2>/tmp/eN` applied after the redirection that failed.** Redirections go left to right, so
+   `> file 2>/tmp/e2` never applies the `2>` and the diagnostic lands on the inherited stderr —
+   `listed_write=fail:` with nothing after the colon, and the message visible in the unit's own
+   stderr all along. Verified on dash again.
+5. **The control on a tree `ProtectSystem=strict` does not refuse.** With the capture fixed, the
+   ownership arm *passed* — the README's claim confirmed — and the control reported
+   `unlisted_write=ok`, because `/run` is writable for services. Moved to
+   `/var/lib/<tag>-scratch`: `/var` is read-only under strict, so the unlisted sibling gets `EROFS`
+   while the listed one, remounted read-write and root-owned 0755, gets `EACCES`. That contrast
+   *is* Claim 4.
+
+**Green:** run 31695823765, 6 passed 0 failed, `uid=65180`, `state_stat=root:777`,
+`state_real=/var/lib/private/…`, `private_list=ok`, `private_stat=root:755`. `continue-on-error` is
+removed and the step gates again.
+
+**Two things worth keeping.** The requirement on that directory turns out to be *exact* — read-only
+under strict, present in the namespace, and not one of the unit's own `*Directory=` trees — and
+each rejected candidate fails differently, so all four are written at the code rather than left in
+commit messages. And the whole sequence is one lesson: **a test that cannot run has no verdict**,
+and five unrelated mechanisms conspired to make "cannot run" look like "the claim is false". The
+claim was true the entire time.
