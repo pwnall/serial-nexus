@@ -2679,13 +2679,29 @@ for is one the next review cannot check was fixed — item 16's lesson.
     own first draft argued the move was safe *because* "`RuntimeDirectory=` already writes
     into" `/run` — the collision written down as the reassurance. Repaired again as
     `/run/<tag>-scratch`: two paths that must never be one, distinguished by their names
-    rather than by a comment. *Remainder:* **the `continue-on-error` line is a step asserting
-    nothing, which AGENTS §3 names as a tell, so it is temporary by construction** — one green
-    run at this tree flips it back off, and it has not come yet. *Honestly labelled limit,
-    unchanged and now twice justified:* neither repair is verified on a real box — this session
-    had no systemd, which is the same reason the arm exists. *Validation:* the flip-back is the
-    item's close; a run that is still red names its new status word or its new failing
-    assertion rather than re-asserting either diagnosis.
+    rather than by a comment.
+    **Third stage, and the message written at the first stage is what found it.** With the
+    scratch tree moved, CI reported `status=2` — and the assertion's own routing table says
+    "usual exit codes at the payload", so nobody re-litigated the namespace. The readings that
+    did arrive are all *correct*: `uid=64190`, `user=snx-pkg-probe-…`, `state_write=ok`,
+    `state_stat=root:777`, `state_real=/var/lib/private/…`, and then
+    `cannot create /run/…-scratch/rw-listed/probe.txt: Permission denied` — which is the
+    README's claim confirmed, the write into a `ReadWritePaths=` directory being refused
+    because the mount flip does not chown. **The probe was dying on its own success.** Cause:
+    the script tested the write with `: > file`, and `:` is a POSIX **special** built-in, for
+    which a redirection error "shall cause the shell to exit". `/bin/sh` is dash on the runner,
+    so the refusal killed the script mid-run and `set +e` could not help. **Verified on dash
+    itself rather than reasoned this time** — this box has `/bin/dash`: `: >` into a read-only
+    directory prints the message, exits **2**, and produces no further output (CI's signature
+    exactly), while `true >` prints `write=denied`, reaches the end, and exits **0**. `true` is
+    a regular built-in. Repaired at both call sites.
+    *Remainder:* **the `continue-on-error` line is a step asserting nothing, which AGENTS §3
+    names as a tell, so it is temporary by construction** — one green run at this tree flips it
+    back off, and it has not come yet. *Limit, now smaller but still real:* the shell behaviour
+    is verified, and whether the whole arm passes on the runner is not — that is the next run's
+    measurement, as it has been for each stage. *Validation:* the flip-back is the item's
+    close; a run that is still red names its new status word or its new failing assertion
+    rather than re-asserting any of the three diagnoses.
 69. **The macOS lane's two Linux-shaped guards, and what they say about coverage** —
     **EXECUTED 2026-08-13** (notes §3.93), filed rather than fixed silently because both are
     instances of a class this ledger already tracks. Found by running the suite on the Mac rig

@@ -1284,6 +1284,16 @@ fn dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown() {
     args.push(format!("ReadWritePaths={}", rw_dir.display()));
     args.push("/bin/sh".to_owned());
     args.push("-c".to_owned());
+    // **`true >` and not `: >`, and dash is why** (plan §18 item 68). `:` is a POSIX
+    // *special* built-in, and a redirection error on a special built-in "shall cause
+    // the shell to exit" — so on Ubuntu, where `/bin/sh` is dash, the very refusal
+    // this probe exists to observe killed the script mid-run and `set +e` could not
+    // help: CI reported `status=2` with `cannot create …: Permission denied` and no
+    // readings past that line. `true` is a regular built-in, so the redirection
+    // failure is just a false exit status, which is what the `if` is there to read.
+    // The write being *denied* is the expected result — it is the README's claim that
+    // `ReadWritePaths` flips the mount without chowning — so the probe was dying
+    // exactly on success.
     args.push(format!(
         r#"set +e
 sd=/var/lib/{tag}
@@ -1293,9 +1303,9 @@ if echo probe > "$sd/probe.txt" 2>/tmp/e1; then printf 'state_write=ok\n'
 else printf 'state_write=fail:%s\n' "$(tr -d '\n' < /tmp/e1)"; fi
 printf 'state_stat=%s\n' "$(stat -c '%U:%a' "$sd" 2>/dev/null || echo none)"
 printf 'state_real=%s\n' "$(readlink -f "$sd" 2>/dev/null || echo none)"
-if : > "{rw}/probe.txt" 2>/tmp/e2; then printf 'listed_write=ok\n'
+if true > "{rw}/probe.txt" 2>/tmp/e2; then printf 'listed_write=ok\n'
 else printf 'listed_write=fail:%s\n' "$(tr -d '\n' < /tmp/e2)"; fi
-if : > "{ro}/probe.txt" 2>/tmp/e3; then printf 'unlisted_write=ok\n'
+if true > "{ro}/probe.txt" 2>/tmp/e3; then printf 'unlisted_write=ok\n'
 else printf 'unlisted_write=fail:%s\n' "$(tr -d '\n' < /tmp/e3)"; fi
 if ls /var/lib/private > /dev/null 2>/tmp/e4; then printf 'private_list=ok\n'
 else printf 'private_list=fail:%s\n' "$(tr -d '\n' < /tmp/e4)"; fi
