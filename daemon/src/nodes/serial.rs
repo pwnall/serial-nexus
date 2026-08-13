@@ -51,7 +51,7 @@ use serial2::{CharSize, FlowControl, Parity, SerialPort, Settings, StopBits};
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
-use crate::boundary::{BlockingReader, TaskSet};
+use crate::boundary::{BlockingWorker, TaskSet};
 use crate::cell::CriticalCell;
 use crate::runtime::{self, READ_BUF, SharedFanOut, TargetwardInbox, TeardownLoss};
 use crate::tap::TapFeed;
@@ -393,7 +393,7 @@ pub struct SerialNode {
     resolver: Resolver,
     params: OpenParams,
     shared: Rc<CriticalCell<SerialShared>>,
-    reader_slot: Rc<CriticalCell<BlockingReader>>,
+    reader_slot: Rc<CriticalCell<BlockingWorker>>,
     /// Bytes read from the port and discarded because nothing was attached to
     /// consume them (§5). Shared with the reader thread, hence atomic.
     discarded_unattached: Arc<AtomicU64>,
@@ -490,7 +490,7 @@ impl SerialNode {
                 signal_gone: Rc::new(Notify::new()),
                 signal_in_flight: None,
             })),
-            reader_slot: Rc::new(CriticalCell::new(BlockingReader::default())),
+            reader_slot: Rc::new(CriticalCell::new(BlockingWorker::default())),
             discarded_unattached: Arc::new(AtomicU64::new(0)),
             purged_reconnect: Arc::new(AtomicU64::new(0)),
             teardown_loss: TeardownLoss::default(),
@@ -685,7 +685,7 @@ struct SuperviseCtx {
     /// hostward chunk here while a tap or ring wants it. `None` only in unit tests.
     tap_feed: Option<TapFeed>,
     shared: Rc<CriticalCell<SerialShared>>,
-    reader_slot: Rc<CriticalCell<BlockingReader>>,
+    reader_slot: Rc<CriticalCell<BlockingWorker>>,
     discarded: Arc<AtomicU64>,
     purged: Arc<AtomicU64>,
     /// Why the current reader (or writer) gave up, for the `Waiting` reason.
@@ -967,19 +967,19 @@ fn arm_reader(port: &Rc<ExclusivePort>, ctx: &SuperviseCtx) -> std::io::Result<A
     let _ = cause.take();
     // The boundary-supervisor library owns the stop flag, the loss `Notify`, and
     // the join handle (§16.1 loss-notify + join-then-transition); we supply the
-    // node-specific reader body.
+    // node-specific reader body. `arm` hands back the `Notify` it minted for *this*
+    // reader, so the supervisor cannot await a departed reader's signal.
     ctx.reader_slot.with_mut(|slot| {
         slot.arm(format!("serial-rx-{}", ctx.name), move |stop, lost| {
             reader_thread(fd, hostward, tap_feed, discarded, stop, lost, cause)
-        })?;
-        Ok(slot.lost())
+        })
     })
 }
 
 /// Stop the current reader thread and join it within the poll-timeout bound. On
 /// the loss path the thread has already exited, so this returns at once; on
 /// teardown of a live device it costs at most one poll interval.
-fn stop_join_reader(reader_slot: &Rc<CriticalCell<BlockingReader>>) {
+fn stop_join_reader(reader_slot: &Rc<CriticalCell<BlockingWorker>>) {
     reader_slot.with_mut(|slot| slot.stop_join());
 }
 
@@ -1703,7 +1703,7 @@ mod tests {
                 signal_gone: Rc::new(Notify::new()),
                 signal_in_flight: None,
             })),
-            reader_slot: Rc::new(CriticalCell::new(BlockingReader::default())),
+            reader_slot: Rc::new(CriticalCell::new(BlockingWorker::default())),
             discarded: Arc::new(AtomicU64::new(0)),
             purged: Arc::new(AtomicU64::new(0)),
         }

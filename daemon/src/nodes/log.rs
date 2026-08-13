@@ -32,7 +32,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver as StdReceiver, RecvTimeoutError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle as ThreadHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -40,7 +39,7 @@ use serial_nexus_core::Chunk;
 use serial_nexus_core::config::{NodeConfig, OverflowPolicy};
 use serial_nexus_core::{NodeState, NodeStatus};
 
-use crate::boundary::TaskSet;
+use crate::boundary::{BlockingWorker, TaskSet, ThreadSpawn, spawn_named};
 use crate::runtime::{DropCounters, EdgeInbox};
 
 /// Upper bound on in-memory queued log bytes before the overflow policy fires
@@ -139,7 +138,11 @@ pub struct LogNode {
     /// (§16.1, SIMPB-10) — a log's `Drop` is a genuine teardown (it must flush and
     /// join a blocking writer thread), so the two halves are deliberately distinct.
     tasks: TaskSet,
-    writer: Option<ThreadHandle<()>>,
+    /// The blocking writer thread (§16.1, plan §18 item 42). Its stop flag is
+    /// **not** the worker's: a `Condvar::wait` cannot be woken by an `AtomicBool`,
+    /// so this writer is told to close through `Queue::closed` under the same mutex
+    /// it waits on. [`BlockingWorker::stop_join`] is therefore not usable here.
+    writer: BlockingWorker,
     /// Signalled by the writer when it exits, so teardown can bound its flush
     /// wait without an unbounded `join()`.
     writer_done: Option<StdReceiver<()>>,
@@ -149,33 +152,13 @@ pub struct LogNode {
     stop_signalled_at: Option<Instant>,
 }
 
-/// How [`LogNode::create`] starts its blocking writer thread.
-///
-/// A **seam, not a second code path**: production passes [`spawn_writer`] and the
-/// CONC-3 guard passes a refusing stand-in, so both run the whole of
-/// [`LogNode::create_with_spawner`] — the file open, the pessimistic queue, the
-/// `apply_spawn` verdict, and everything after. That distinction is the finding:
-/// CONC-3's defect was a `.spawn(…).expect(…)` written *inline in `create`*, which
-/// panicked out of `startup_load`, and a guard that can only call the handler the
-/// fix introduced cannot fail against it (review-32 audit).
-type WriterSpawn = fn(String, WriterBody) -> std::io::Result<ThreadHandle<()>>;
-
-/// The writer thread's body, boxed so [`WriterSpawn`] can be a plain function
-/// pointer. One allocation per log node, at creation.
-type WriterBody = Box<dyn FnOnce() + Send + 'static>;
-
-/// The production [`WriterSpawn`]: a named OS thread, exactly as before.
-fn spawn_writer(name: String, body: WriterBody) -> std::io::Result<ThreadHandle<()>> {
-    std::thread::Builder::new().name(name).spawn(body)
-}
-
 impl LogNode {
     pub fn create(config: &NodeConfig) -> LogNode {
-        Self::create_with_spawner(config, spawn_writer)
+        Self::create_with_spawner(config, spawn_named)
     }
 
-    /// [`LogNode::create`], with the thread-spawn injected (see [`WriterSpawn`]).
-    fn create_with_spawner(config: &NodeConfig, spawn: WriterSpawn) -> LogNode {
+    /// [`LogNode::create`], with the thread-spawn injected (see [`ThreadSpawn`]).
+    fn create_with_spawner(config: &NodeConfig, spawn: ThreadSpawn) -> LogNode {
         let NodeConfig::Log {
             name,
             directory,
@@ -253,7 +236,7 @@ impl LogNode {
             shared: shared.clone(),
             ingest_counters: Arc::new(DropCounters::default()),
             tasks: TaskSet::default(),
-            writer: None,
+            writer: BlockingWorker::default(),
             writer_done: None,
             stop_signalled_at: None,
         };
@@ -262,17 +245,20 @@ impl LogNode {
         // node keeps no writer, and the pump (started later) drops-and-counts.
         if let Some(file) = file {
             let (done_tx, done_rx) = sync_channel::<()>(1);
-            let spawned = spawn(format!("log-{name}"), {
+            let armed = node.writer.arm_with(spawn, format!("log-{name}"), {
                 let shared = shared.clone();
                 let dir = directory.clone();
                 let fname = filename.clone();
                 let padding = rotation_padding(config);
-                Box::new(move || {
+                // The `stop` flag the worker hands over is unused here: this writer
+                // waits on a `Condvar` and is told to close through `Queue::closed`
+                // under the same mutex, which an `AtomicBool` cannot do.
+                move |_stop| {
                     writer_loop(&shared, dir, fname, padding, file);
                     let _ = done_tx.send(());
-                })
+                }
             });
-            apply_spawn(&mut node, done_rx, spawned);
+            apply_spawn(&mut node, done_rx, armed);
         }
         node
     }
@@ -383,15 +369,9 @@ impl LogNode {
         // it rather than block teardown indefinitely (§7.3).
         if let Some(done) = self.writer_done.take() {
             match done.recv_timeout(remaining) {
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
-                    if let Some(w) = self.writer.take() {
-                        let _ = w.join();
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    // Detach the wedged writer; the process owns it until exit.
-                    self.writer = None;
-                }
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => self.writer.join(),
+                // Detach the wedged writer; the process owns it until exit.
+                Err(RecvTimeoutError::Timeout) => self.writer.detach(),
             }
         }
     }
@@ -411,16 +391,11 @@ impl LogNode {
 /// set so the pump drops-and-counts instead of filling a queue nobody drains.
 ///
 /// Factored out of [`LogNode::create`] for readability; the `spawn` that reaches
-/// it is injectable ([`WriterSpawn`]), so the guard drives the real `create`
+/// it is injectable ([`ThreadSpawn`]), so the guard drives the real `create`
 /// rather than this handler.
-fn apply_spawn(
-    node: &mut LogNode,
-    done_rx: StdReceiver<()>,
-    spawned: std::io::Result<ThreadHandle<()>>,
-) {
-    match spawned {
-        Ok(w) => {
-            node.writer = Some(w);
+fn apply_spawn(node: &mut LogNode, done_rx: StdReceiver<()>, armed: std::io::Result<()>) {
+    match armed {
+        Ok(()) => {
             node.writer_done = Some(done_rx);
             // The queue has a consumer now; enqueue may queue rather than shed.
             node.shared.q.lock().unwrap().writer_gone = false;
@@ -438,7 +413,7 @@ fn apply_spawn(
 
 impl Drop for LogNode {
     fn drop(&mut self) {
-        if !self.tasks.is_empty() || self.writer.is_some() {
+        if !self.tasks.is_empty() || self.writer.is_armed() {
             self.teardown();
         }
     }
@@ -1010,7 +985,7 @@ mod tests {
             status.reason()
         );
         assert!(
-            node.writer.is_none(),
+            !node.writer.is_armed(),
             "a scan-faulted node starts no writer"
         );
         // The operation that would do the damage is refused for as long as the fault
@@ -1151,9 +1126,12 @@ mod tests {
         assert_eq!(q.dropped_bytes, 6, "every orphaned byte is counted once");
     }
 
-    /// A [`WriterSpawn`] that refuses with the `EAGAIN` `pthread_create` returns
+    /// A [`ThreadSpawn`] that refuses with the `EAGAIN` `pthread_create` returns
     /// under `RLIMIT_NPROC`, dropping the body unrun.
-    fn refuse_spawn(_name: String, _body: WriterBody) -> std::io::Result<ThreadHandle<()>> {
+    fn refuse_spawn(
+        _name: String,
+        _body: Box<dyn FnOnce() + Send + 'static>,
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
         Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
     }
 
@@ -1161,7 +1139,7 @@ mod tests {
     // (§15.8) — it faults the node, it does not panic the daemon out of
     // `startup_load`.
     //
-    // Driven through the real `LogNode::create` (via its [`WriterSpawn`] seam), not
+    // Driven through the real `LogNode::create` (via its [`ThreadSpawn`] seam), not
     // through `apply_spawn`. That is the whole point: the defect was a
     // `.spawn(…).expect(…)` *inside* `create`, so a guard aimed at the handler the
     // fix introduced could not have failed against the shipped code — the gap the
@@ -1183,7 +1161,7 @@ mod tests {
             refuse_spawn,
         );
 
-        assert!(node.writer.is_none(), "no writer may be recorded");
+        assert!(!node.writer.is_armed(), "no writer may be recorded");
         assert!(
             node.writer_done.is_none(),
             "teardown must have nothing to wait on"
@@ -1214,7 +1192,7 @@ mod tests {
         let tmp = unique_dir("conc3-ok");
         let mut node = LogNode::create(&log_config(&tmp, "app.log", OverflowPolicy::DropOldest));
 
-        assert!(node.writer.is_some(), "the writer thread is recorded");
+        assert!(node.writer.is_armed(), "the writer thread is recorded");
         assert!(node.writer_done.is_some());
         assert!(!node.shared.q.lock().unwrap().writer_gone);
         // The queue really is open for business, and the writer really is draining
@@ -1243,7 +1221,7 @@ mod tests {
             "app.log",
             OverflowPolicy::DropOldest,
         ));
-        assert!(node.writer.is_none(), "a faulted open starts no writer");
+        assert!(!node.writer.is_armed(), "a faulted open starts no writer");
         let mut q = node.shared.q.lock().unwrap();
         assert!(q.writer_gone);
         assert!(!enqueue(&mut q, Chunk::from_static(b"hello")));
@@ -1390,7 +1368,7 @@ mod tests {
             "app.log",
             OverflowPolicy::DropOldest,
         ));
-        assert!(node.writer.is_none(), "a faulted open starts no writer");
+        assert!(!node.writer.is_armed(), "a faulted open starts no writer");
         {
             let mut q = node.shared.q.lock().unwrap();
             q.queued_bytes = 10;

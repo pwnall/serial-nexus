@@ -11372,3 +11372,47 @@ defect with a missing install, and both naive uses are traps — trusting it red
 ignoring it makes the command read as a gate and assert nothing. Recorded because the temptation
 was to wire it up first and measure later, which is how the five previous assert-nothing checks
 happened.
+
+---
+
+### 3.88 The boundary worker unified, and the meta-gate that caught the orchestrator
+
+**Item 42, executed.** `boundary::BlockingReader` → `BlockingWorker` — the name review 32's SIMP-3
+proposed, not an invented one. The loss counter is optional *structurally* rather than by
+convention: `arm` mints the `Notify` and returns it, `arm_quiet` mints none, and the `lost()`
+accessor is gone, so "this worker has nothing to signal" became a fact about which method the
+caller used. All three call sites rebased. Details and the fail-first table are at plan §18 item 42.
+
+**The part worth recording is the third call site, because the armchair case against it was
+strong and wrong.** The log writer looks like the one that should not unify: its stop is
+`Queue::closed` under a mutex and a `Condvar`, which an `AtomicBool` cannot wake; its join is
+bounded-with-detach (§7.3) rather than `join()`; its spawn is injected for CONC-3. Three real
+divergences, each an argument for leaving it alone. Measured instead of argued: `log.rs` −50/+31,
+`boundary.rs` +40 — and the three additions (`arm_with`, `is_armed`, `detach`) turned out to be
+**general primitives rather than per-caller parameters**, `detach` being a bounded-wait primitive
+the library had simply never grown. Net +21 lines for one type instead of three. The lesson is
+§16.1's, arriving from the other direction: the divergences that look like reasons not to unify
+are sometimes the missing primitives.
+
+**Fail-first for a behaviour-preserving refactor is a different shape**, and this is the clearest
+instance the record has. There is no new property to prove, so the proof owed is that the
+*existing* guards still bite. Three defects planted in the unified worker, each caught by a
+pre-existing guard: a `join` that silently becomes a detach; an `arm` returning a different
+`Notify` than the thread received — caught at both altitudes, the boundary unit test *and*
+`p7_unplug`, which is the pair that says the signal is wired end to end and not merely minted; and
+a stop flag `signal_stop` never sets. **The third is caught only as a deadlock**, which is the
+finding: `cargo test` has no per-test timeout, so in CI that class is a job timeout with no failing
+test name — the one thing AGENTS §8 says to capture verbatim, missing exactly when it is needed.
+Filed as item 64(h).
+
+**And the meta-gate caught the orchestrator.** `retired_names_appear_only_where_history_lives` went
+red on `docs/44-…-v17.md:1395 -> nexus-daemon` — my own prose, from the guard-audit commit. I had
+line-wrapped `/usr/local/bin/serial-nexus-daemon` across a break, leaving `nexus-daemon` at the
+start of the next line: the pre-§15.40 spelling, reintroduced by typography rather than by
+intent. §15.40's whole point is that the retired vocabulary is un-reintroducible, and a scanner
+that folds lines is why. Two things follow. The gate is right and the fix was to rewrap, not to
+widen the allowance — that would have been silently re-fixing a decision. And the process failure
+is mine: I ran the meta-gates before that edit and not after, so the commit went out red and the
+next agent's report is what surfaced it. **Run the gates between the last edit and the commit, not
+between the last-but-one and the commit** — the rule is obvious and I broke it inside the same
+session that filed four gates for asserting nothing.

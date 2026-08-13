@@ -34,7 +34,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::thread::JoinHandle as ThreadHandle;
 use std::time::{Duration, Instant};
 
 use nix::fcntl::{OFlag, open};
@@ -64,7 +63,7 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
 
 use serial_nexus_core::lock::{Arbitration, WriteMode};
 
-use crate::boundary::TaskSet;
+use crate::boundary::{BlockingWorker, TaskSet};
 use crate::cell::CriticalCell;
 use crate::runtime::{
     ACTIVE_POLL, DropCounters, EdgeInbox, Handoff, LossCounter, READ_BUF, SharedTargetEdge,
@@ -139,11 +138,16 @@ pub struct PtyNode {
     present: Arc<AtomicBool>,
     /// The blocking hostward writer thread (§15.19): a fast consumer receives at
     /// line rate rather than the poll path's ~1 MB/s.
-    writer: Option<ThreadHandle<()>>,
-    /// Set on teardown to stop the writer thread at its next recv timeout — the
-    /// sync teardown can't rely on the aborted async pump dropping its sender,
-    /// since the runtime isn't running while teardown blocks on the join.
-    writer_stop: Arc<AtomicBool>,
+    ///
+    /// The stop flag, the join handle, the EAGAIN-faults-the-node spawn and the
+    /// re-arm precondition are the boundary library's (§16.1, plan §18 item 42);
+    /// this used to be a hand-rolled second copy of all four, kept out of the
+    /// library only because the library minted a loss `Notify` a writer has nothing
+    /// to put in (notes §3.21). [`BlockingWorker::arm_quiet`] is that clause closed.
+    /// The stop flag is what ends the thread at its next recv timeout: the sync
+    /// teardown can't rely on the aborted async pump dropping its sender, since the
+    /// runtime isn't running while teardown blocks on the join.
+    writer: BlockingWorker,
     /// This node's own loss counters (§5), the ones that are not shared with the
     /// serial reader. Kept together so the reader task carries one handle rather
     /// than one per counter (see [`Losses`]).
@@ -192,8 +196,7 @@ impl PtyNode {
             pts_path: None,
             symlink_installed: false,
             present: Arc::new(AtomicBool::new(false)),
-            writer: None,
-            writer_stop: Arc::new(AtomicBool::new(false)),
+            writer: BlockingWorker::default(),
             loss: Rc::new(Losses::default()),
             counters: Arc::new(DropCounters::default()),
             client_termios: Rc::new(CriticalCell::new(None)),
@@ -394,21 +397,19 @@ impl PtyNode {
             let fd = master.as_raw_fd();
             let present = self.present.clone();
             let counters = self.counters.clone();
-            let stop = self.writer_stop.clone();
-            match std::thread::Builder::new()
-                .name(format!("pty-tx-{}", self.name))
-                .spawn(move || writer_thread(fd, present, counters, stop, brx))
-            {
-                Ok(w) => self.writer = Some(w),
-                Err(e) => {
-                    // Thread/PID exhaustion (EAGAIN) is an environmental failure
-                    // (§15.8): fault the node rather than panicking the runtime
-                    // thread, matching setup()/apply_perms/the set_nonblocking path.
-                    // The reader and pump tasks spawned above are aborted by teardown.
-                    self.status.set(NodeStatus::Faulted {
-                        reason: format!("spawn pty writer thread: {e}"),
-                    });
-                }
+            // `arm_quiet`: this half has no device loss to report — a client leaving
+            // the slave is *presence*, which the sibling reader task observes — so no
+            // loss `Notify` is minted for nobody to await (§16.1, item 42).
+            if let Err(e) = self.writer.arm_quiet(format!("pty-tx-{}", self.name), {
+                move |stop| writer_thread(fd, present, counters, stop, brx)
+            }) {
+                // Thread/PID exhaustion (EAGAIN) is an environmental failure
+                // (§15.8): fault the node rather than panicking the runtime
+                // thread, matching setup()/apply_perms/the set_nonblocking path.
+                // The reader and pump tasks spawned above are aborted by teardown.
+                self.status.set(NodeStatus::Faulted {
+                    reason: format!("spawn pty writer thread: {e}"),
+                });
             }
         }
     }
@@ -461,7 +462,9 @@ impl PtyNode {
     /// the writer thread. Teardown calls this on every node first, so the daemon
     /// pays the join latency once rather than once per node.
     pub fn signal_stop(&mut self) {
-        self.writer_stop.store(true, Ordering::Relaxed);
+        // Order preserved exactly (item 42 is a refactor, not a behavior change):
+        // the writer's stop flag first, the async tasks second.
+        self.writer.signal_stop();
         self.tasks.abort_all();
     }
 
@@ -470,11 +473,10 @@ impl PtyNode {
         // thread before dropping the master so its fd stays valid throughout. The
         // stop flag (not the pump's sender drop) is what ends the thread, since
         // the runtime can't run the pump to completion while teardown blocks here.
-        // Idempotent after `signal_stop`.
+        // Idempotent after `signal_stop`, and idempotent in itself —
+        // [`BlockingWorker::join`] takes the handle.
         self.signal_stop();
-        if let Some(w) = self.writer.take() {
-            let _ = w.join();
-        }
+        self.writer.join();
         self.master = None;
         if self.symlink_installed {
             let _ = std::fs::remove_file(&self.path);

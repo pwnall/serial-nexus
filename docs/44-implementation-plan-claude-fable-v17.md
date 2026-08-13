@@ -1391,8 +1391,8 @@ Each item below uses the schema with its fields inline.
     *Instrument validity, measured before building on it* (§13's own rule, applied to a tool
     rather than a probe): `systemd-analyze verify` catches an unknown directive (exit 1) and a
     missing `ExecStart` (exit 1), does **not** catch a bad value (`RestartSec=notanumber` → exit
-    **0**), and exits **1 on the real unit** for an environmental reason — `/usr/local/bin/serial-
-    nexus-daemon` is not installed on a dev box. So its exit status conflates a unit defect with a
+    **0**), and exits **1 on the real unit** for an environmental reason: the daemon binary
+    the unit names is not installed on a dev box. So its exit status conflates a unit defect with a
     missing install, and both naive uses are traps: trusting it reddens any box without an install,
     ignoring it makes the command read as a gate and assert nothing (rule 22's own class). A usable
     gate stages the unit with the `ExecStart` path stubbed, *then* trusts the exit status, and
@@ -1520,7 +1520,35 @@ existing — §8 names them as ledger items.
     reporting only, no verdict or fault change. *Evidence:* P14's `adapter-refused` class — a
     4 Mbaud ask silently landing at 9600, with no errno — is visible to the doctor and
     invisible in node state. *Validation:* fail-first against a refusing rate on the rig.
-42. **`boundary::BlockingReader` unification** (M). Rename, optional loss counter, rebase
+42. **`boundary::BlockingReader` unification** — **EXECUTED 2026-08-12** (notes §3.88).
+    `BlockingReader` → **`BlockingWorker`**, the name the record itself proposed (review 32's
+    SIMP-3) rather than an invented one. The loss counter is optional **structurally**, not by
+    convention: `arm` mints the `Notify` and *returns* it, `arm_quiet` mints none, and the
+    `lost()` accessor is gone — so "this worker has nothing to signal" is now a fact about which
+    method you called, and the serial supervisor can no longer await a *previous* reader's signal
+    (which it never did, but only by call ordering). All three call sites rebased.
+    **The log third was measured rather than declined**, and the armchair case against it was
+    strong: the log's stop is `Queue::closed` under a mutex and `Condvar`, which an `AtomicBool`
+    cannot wake; its join is bounded-with-detach (§7.3), not `join()`; its spawn is injected. The
+    measurement said otherwise — `log.rs` −50/+31, `boundary.rs` +40, of which the three additions
+    (`arm_with`, `is_armed`, `detach`) are **general primitives rather than per-caller parameters**,
+    `detach` being a bounded-wait primitive the library simply lacked. Net +21 lines for one type
+    instead of three.
+    **Join-after-abort ordering is byte-identical at all nine entry points** (`signal_stop` /
+    `teardown` / `Drop` × serial / pty / log), written down before the change and checked after —
+    including the pty's deliberate flag-before-tasks order, which is the *reverse* of serial's and
+    was preserved rather than "fixed".
+    *Fail-first:* three defects planted in the unified worker, each caught by a **pre-existing**
+    guard, which is the proof a behaviour-preserving refactor actually owes — D1 (join silently
+    becomes detach) by `signal_stop_returns_before_the_thread_exits_and_join_waits_for_it`; D2
+    (`arm` returns a different `Notify` than the thread got) at both altitudes, the boundary unit
+    guard *and* `p7_unplug::unplug_faults_serial_and_leaves_pty_client_attached`; D3 (a stop flag
+    `signal_stop` never sets) by both stop guards — **but only as a deadlock**, which is item 64(h)
+    below.
+    *One honest cost, stated at the field:* `BlockingWorker::stop_join` is not usable on the log
+    worker, whose `signal_stop` sets a flag `writer_drain` never reads. The hazard predates the
+    unification — today's `w.join()` blocks forever too if `q.closed` was not set first — but the
+    shared name now needs the caveat. The superseded filing follows. Rename, optional loss counter, rebase
     `serial.rs`/`pty.rs`/log on it, preserving join-after-abort ordering — §16.1's recipe
     (notes §3.21) followed as written. *Validation:* existing boundary guards unchanged; no
     behavior delta, asserted by test.
@@ -2129,6 +2157,18 @@ transcripts, the pattern-wait maxima). What follows is the residue.
     *(f)* §16.6's `atomic_write_replaces_durably` **passes with both `fsync` calls deleted** — it
     asserts the atomic-write contract, and its own comment concedes it. Either rename it to what it
     asserts (honest and free) or drive it under `strace` behind a required mode.
+    *(h)* **A broken stop-flag propagation is caught only as a hang.** Item 42 measured it: three
+    boundary guards deadlock rather than fail, and `cargo test` has no per-test timeout, so in CI
+    that is a job timeout with **no failing test name** — the one thing AGENTS §8 says to capture
+    verbatim, absent. A bounded wait in
+    `blocking_reader_stop_join_ends_a_running_thread` and
+    `signal_stop_returns_before_the_thread_exits_and_join_waits_for_it` would make the class redden
+    with a name.
+    *(i)* **The pty's writer-spawn failure path has no guard at all** — `pty.rs` faults the node on
+    `spawn pty writer thread: {e}`, a §15.8 environmental-failure arm, while the log's identical arm
+    has both a unit guard and an itest. Found by item 42 and reported rather than fixed, that item's
+    scope being "no behaviour delta, no new coverage". Now cheap: `arm_with` is the seam and is
+    already public.
     *(g)* "One shared helper" rules (§16.1's boundary supervisor, §16.4's three purge instances,
     the one fragmenter) each have every *instance* tested and nothing forbidding a fourth
     hand-rolled one; §16.11 has nothing stopping a `.sh` reappearing under `scripts/validate/`.

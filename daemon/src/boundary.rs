@@ -18,9 +18,10 @@
 //! * **concurrent halves** → [`race3`]: run the directions as
 //!   concurrently-polled futures and return the first *session-ending* outcome —
 //!   deadlock-free by construction, since a parked half never blocks its sibling.
-//! * **loss notification + join-then-transition** → [`BlockingReader`]: a hostward
-//!   reader on a dedicated blocking thread (§15.19) that pulses a loss [`Notify`]
-//!   on device loss and is joined before the supervisor transitions (fd-reuse-safe).
+//! * **loss notification + join-then-transition** → [`BlockingWorker`]: a boundary
+//!   half on a dedicated blocking thread (§15.19), in either direction, that may
+//!   pulse a loss [`Notify`] and is joined before the supervisor transitions
+//!   (fd-reuse-safe).
 //! * **back off, retry** → [`Backoff`]: the reconnect/restart backoff, reset on a
 //!   good connection.
 //! * **a node's tasks die with the node** → [`TaskSet`]: the spawned-task half of
@@ -136,53 +137,111 @@ impl Backoff {
     }
 }
 
-/// A hostward reader on a dedicated blocking thread (§15.19) with the two signals
-/// its supervisor needs: a loss [`Notify`] the thread pulses on device loss
-/// (POLLHUP/EOF/error), and a stop flag plus join handle so the supervisor joins
-/// the thread *before* dropping the fd it reads — the fd must outlive the thread or
-/// a reused fd races the next open (§7.1 fd-reuse). This is the "notify on loss,
-/// join before transition" pair (§16.1), of which the serial reader is the archetype.
+/// One half of a boundary on a dedicated blocking thread (§15.19), with the signals
+/// its supervisor needs: a stop flag plus join handle so the supervisor joins the
+/// thread *before* dropping the fd it works on — the fd must outlive the thread or a
+/// reused fd races the next open (§7.1 fd-reuse) — and, for a half that can observe
+/// the environment going away, a loss [`Notify`] the thread pulses on device loss
+/// (POLLHUP/EOF/error). This is the "notify on loss, join before transition" pair
+/// (§16.1), of which the serial reader is the archetype.
+///
+/// **Direction-neutral, and the loss signal is opt-in** (plan §18 item 42, notes
+/// §3.21). The type was `BlockingReader` and every arming minted a loss `Notify`,
+/// which is why the pty's hostward *writer* thread — same stop flag, same join
+/// handle, same EAGAIN-faults-the-node spawn, but with no device loss to report and
+/// no supervisor awaiting one — stayed a hand-rolled second copy. [`Self::arm`] is
+/// the loss-reporting form and hands the caller the `Notify` it minted, so a
+/// supervisor cannot accidentally await a *previous* reader's signal;
+/// [`Self::arm_quiet`] mints none at all, which is what makes the loss signal
+/// optional structurally rather than by convention.
 #[derive(Default)]
-pub struct BlockingReader {
+pub struct BlockingWorker {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
-    lost: Arc<Notify>,
 }
 
-impl BlockingReader {
+/// How a [`BlockingWorker`] starts its thread. A **seam, not a second code path**:
+/// production passes [`spawn_named`] and the CONC-3 guard passes a refusing
+/// stand-in, so the guard drives the whole of the caller's construction. That
+/// distinction is the finding: CONC-3's defect was a `.spawn(…).expect(…)` written
+/// inline, and a guard that can only call the handler the fix introduced cannot fail
+/// against it.
+pub type ThreadSpawn =
+    fn(String, Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<JoinHandle<()>>;
+
+/// The production [`ThreadSpawn`]: a named OS thread.
+pub fn spawn_named(
+    name: String,
+    body: Box<dyn FnOnce() + Send + 'static>,
+) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new().name(name).spawn(body)
+}
+
+impl BlockingWorker {
     /// Spawn `body` on a named blocking thread, handing it the stop flag (poll it
-    /// each iteration; exit promptly when set) and the loss `Notify` (pulse it on
-    /// device loss, then return). Any previously-armed reader must already be joined
-    /// via [`Self::stop_join`]. Returns the OS error if the thread cannot be spawned
+    /// each iteration; exit promptly when set) and a freshly-minted loss `Notify`
+    /// (pulse it on device loss, then return). The same `Notify` is returned, for the
+    /// supervisor to await. Any previously-armed worker must already be joined via
+    /// [`Self::stop_join`]. Returns the OS error if the thread cannot be spawned
     /// (e.g. `EAGAIN` under a thread/PID limit), for the caller to fault the node
     /// rather than panic its supervisor.
     pub fn arm(
         &mut self,
         name: String,
         body: impl FnOnce(Arc<AtomicBool>, Arc<Notify>) + Send + 'static,
+    ) -> std::io::Result<Arc<Notify>> {
+        let lost = Arc::new(Notify::new());
+        let lost_c = lost.clone();
+        self.arm_quiet(name, move |stop| body(stop, lost_c))?;
+        Ok(lost)
+    }
+
+    /// [`Self::arm`] for a half with no device loss to report — the pty's hostward
+    /// writer, whose environment (the client on the slave) coming and going is
+    /// presence, not loss, and is already observed by its sibling reader task. No
+    /// `Notify` is minted, so "this worker has nothing to signal" is a fact about the
+    /// call rather than an unread field.
+    pub fn arm_quiet(
+        &mut self,
+        name: String,
+        body: impl FnOnce(Arc<AtomicBool>) + Send + 'static,
+    ) -> std::io::Result<()> {
+        self.arm_with(spawn_named, name, body)
+    }
+
+    /// [`Self::arm_quiet`] over an injected [`ThreadSpawn`].
+    pub fn arm_with(
+        &mut self,
+        spawn: ThreadSpawn,
+        name: String,
+        body: impl FnOnce(Arc<AtomicBool>) + Send + 'static,
     ) -> std::io::Result<()> {
         debug_assert!(
             self.handle.is_none(),
-            "arm called on an un-joined reader; call stop_join first"
+            "arm called on an un-joined worker; call stop_join first"
         );
         let stop = Arc::new(AtomicBool::new(false));
-        let lost = Arc::new(Notify::new());
-        let (stop_c, lost_c) = (stop.clone(), lost.clone());
-        let handle = std::thread::Builder::new()
-            .name(name)
-            .spawn(move || body(stop_c, lost_c))?;
+        let stop_c = stop.clone();
+        let handle = spawn(name, Box::new(move || body(stop_c)))?;
         self.stop = stop;
-        self.lost = lost;
         self.handle = Some(handle);
         Ok(())
     }
 
-    /// The loss signal the current reader pulses, for the supervisor to await.
-    pub fn lost(&self) -> Arc<Notify> {
-        self.lost.clone()
+    /// Whether a worker is armed and not yet joined — for a `Drop` deciding between
+    /// a no-op and a full teardown.
+    pub fn is_armed(&self) -> bool {
+        self.handle.is_some()
     }
 
-    /// Ask the current reader to stop, and return immediately — the cheap,
+    /// Forget the worker without joining it. `join` has no timeout, so a caller with
+    /// a *bounded* wait (§7.3's flush bound) needs a way to give up on a wedged
+    /// thread; the thread then lives until the process exits.
+    pub fn detach(&mut self) {
+        self.handle = None;
+    }
+
+    /// Ask the current worker to stop, and return immediately — the cheap,
     /// non-blocking half of teardown (BND-1).
     ///
     /// Teardown used to be `stop_join` per node inside one critical section on the
@@ -190,25 +249,25 @@ impl BlockingReader {
     /// daemon for the *sum* of every node's stop latency (each bounded by one poll
     /// interval, but paid serially). Splitting the signal from the join lets the
     /// caller signal *all* nodes first and then join them, paying the latency once
-    /// rather than N times. Nothing is joined here, so the fd this reader is
-    /// reading must stay alive until [`Self::join`] has run (§7.1 fd-reuse).
+    /// rather than N times. Nothing is joined here, so the fd this worker is
+    /// working on must stay alive until [`Self::join`] has run (§7.1 fd-reuse).
     pub fn signal_stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    /// Join the current reader thread, if any — the blocking half of teardown. Must
-    /// run before the fd the reader holds is dropped (fd-reuse-safe). On the loss
+    /// Join the current worker thread, if any — the blocking half of teardown. Must
+    /// run before the fd the worker holds is dropped (fd-reuse-safe). On the loss
     /// path the thread has already exited, so this returns at once; otherwise it
-    /// costs at most one reader poll interval *after* [`Self::signal_stop`].
+    /// costs at most one worker poll interval *after* [`Self::signal_stop`].
     pub fn join(&mut self) {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
 
-    /// Signal the current reader to stop and join it (fd-reuse-safe) — the thin
+    /// Signal the current worker to stop and join it (fd-reuse-safe) — the thin
     /// composition of [`Self::signal_stop`] and [`Self::join`], for a caller that is
-    /// tearing down exactly one reader and has nothing to overlap the wait with.
+    /// tearing down exactly one worker and has nothing to overlap the wait with.
     pub fn stop_join(&mut self) {
         self.signal_stop();
         self.join();
@@ -355,19 +414,19 @@ mod tests {
         assert_eq!(b.next_interval(), 0);
     }
 
-    // --- blocking reader: loss notify + join-then-transition --------------------
+    // --- blocking worker: loss notify + join-then-transition --------------------
 
     #[tokio::test]
     async fn blocking_reader_pulses_loss_then_joins_cleanly() {
-        let mut r = BlockingReader::default();
-        r.arm("test-loss".into(), |_stop, lost| {
-            lost.notify_one(); // device loss
-        })
-        .expect("arm reader");
-        // `lost()` is read after `arm` (as the supervisor does), so it observes the
-        // reader's own signal. The pulse is durable — notify_one leaves a permit for
-        // a later waiter.
-        let lost = r.lost();
+        let mut r = BlockingWorker::default();
+        // `arm` hands back the very `Notify` it gave the thread, so the supervisor
+        // structurally cannot await a *previous* reader's signal. The pulse is
+        // durable — notify_one leaves a permit for a later waiter.
+        let lost = r
+            .arm("test-loss".into(), |_stop, lost| {
+                lost.notify_one(); // device loss
+            })
+            .expect("arm worker");
         tokio::time::timeout(Duration::from_secs(2), lost.notified())
             .await
             .expect("loss signal delivered");
@@ -376,14 +435,36 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_reader_stop_join_ends_a_running_thread() {
-        let mut r = BlockingReader::default();
+        let mut r = BlockingWorker::default();
         r.arm("test-stop".into(), |stop, _lost| {
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(1));
             }
         })
-        .expect("arm reader");
+        .expect("arm worker");
         r.stop_join(); // sets the flag, the thread exits, join succeeds
+    }
+
+    #[tokio::test]
+    async fn a_quiet_worker_gets_the_stop_flag_and_no_loss_signal() {
+        // The pty writer's shape (item 42): same flag, same join, no `Notify` minted.
+        // `arm_quiet`'s body cannot name a loss signal, which is the whole point — the
+        // absence is in the type, not in a field the caller remembers not to read.
+        let mut w = BlockingWorker::default();
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_thread = ran.clone();
+        w.arm_quiet("test-quiet".into(), move |stop| {
+            ran_thread.store(true, Ordering::Relaxed);
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+        .expect("arm quiet worker");
+        w.stop_join();
+        assert!(
+            ran.load(Ordering::Relaxed),
+            "the body ran and observed stop"
+        );
     }
 
     #[tokio::test]
@@ -391,7 +472,7 @@ mod tests {
         // BND-1: the two halves must be separable — `signal_stop` returns while the
         // thread is still winding down (so a caller can signal N nodes and pay the
         // latency once), and `join` is what actually waits.
-        let mut r = BlockingReader::default();
+        let mut r = BlockingWorker::default();
         let exited = Arc::new(AtomicBool::new(false));
         let exited_thread = exited.clone();
         r.arm("test-split".into(), move |stop, _lost| {
@@ -484,12 +565,12 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[tokio::test]
-    #[should_panic(expected = "un-joined reader")]
+    #[should_panic(expected = "un-joined worker")]
     async fn arm_without_stop_join_trips_the_precondition() {
         // Re-arming without an intervening `stop_join` would silently detach the
-        // previous reader (the fd-reuse hazard the module claims to make
+        // previous worker (the fd-reuse hazard the module claims to make
         // unrepresentable); the debug_assert catches it in debug/test builds.
-        let mut r = BlockingReader::default();
+        let mut r = BlockingWorker::default();
         r.arm("first".into(), |_stop, _lost| {}).expect("arm first");
         // No `stop_join` here: the second arm must trip the precondition rather
         // than drop the still-joinable handle.
