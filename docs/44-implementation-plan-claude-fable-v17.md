@@ -1686,7 +1686,16 @@ Each item below uses the schema with its fields inline.
     each run rather than asserted, so a stricter systemd is noticed rather than contradicted), and
     a *value* change on a well-formed directive. **(c)** exists and self-skips naming the
     precondition that failed; its `required` mode is set nowhere until a CI run proves a runner is
-    systemd-as-PID-1 with passwordless root. *Remaining:* that switch, and the four `unverified`
+    systemd-as-PID-1 with passwordless root.
+    **(c) EXECUTED 2026-08-13** (item 68, notes §3.99). CI run 31695823765's root arm reads
+    **6 passed, 0 failed**: the probe runs under `DynamicUser=yes` as `uid=65180`, prints all
+    nine readings — `state_stat=root:777`, `state_real=/var/lib/private/…`, `private_list=ok`,
+    `private_stat=root:755` — and both halves of Claim 4 hold, so PKG-2's `DynamicUser`
+    id-mapped-mount behaviour is **measured** and the step gates rather than reports. It took
+    five successive probe defects to get there, none of them the packaged unit's, which is item
+    68's record and the reason that item exists separately from this one. *Remaining:* the four
+    `unverified` rows, whose machinery the root arm already has. The superseded line follows.
+    *Remaining:* that switch, and the four `unverified`
     rows, whose machinery the root arm already has.
     *Split:* **(a)** the evidence-class pass over `packaging/serial-nexus-daemon.service` and its
     README — marking each deployment claim *measured* / *man-page* / *unverified* — needs no root
