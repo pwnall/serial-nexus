@@ -16,10 +16,13 @@
 //!
 //! # What holds the privilege, and what bounds it
 //!
-//! This binary is blessed with **one** file capability, `CAP_DAC_OVERRIDE`, on a
-//! copy installed at `.snx-bin/<profile>/` (see [`install`]). That capability is a
-//! large grant — it bypasses every DAC check on the system — so what bounds it is
-//! this binary's narrowness, asserted by construction:
+//! This binary is blessed with the **two** file capabilities named once in
+//! [`install::REQUIRED_CAPS`] — `cap_dac_override` for the `root:root 0644` sysfs
+//! write, and `cap_fowner` for the POSIX ACL that hands the invoking user back the
+//! tty the reauthorization recreated (§15.55) — on a copy installed at
+//! `.snx-bin/<profile>/` (see [`install`]). The first is a large grant — it bypasses
+//! every DAC check on the system — so what bounds them is this binary's narrowness,
+//! asserted by construction:
 //!
 //! * **argv only.** It reads no environment variable, so there is no `LD_PRELOAD`
 //!   or config-file path into a capability-holding process.
@@ -38,7 +41,16 @@
 //! * **the device must be a non-hub serial adapter**, or the write is refused.
 //!
 //! Adding a verb that accepts a filesystem path would dissolve every one of those
-//! bounds at once. That is a design amendment (§15.45), never a patch.
+//! bounds at once. That is a design amendment (§15.45), never a patch. Adding a
+//! **capability** widens the blast radius the same way and is likewise an amendment:
+//! [`install::REQUIRED_CAPS`] is the one place the set is written, so a third entry
+//! is a visible, reviewable edit rather than a `setcap` line someone typed.
+//!
+//! §15.55 is that amendment executed the *other* way, and is worth reading as the
+//! worked example: the `grant` verb was added without adding a path. It takes the
+//! same kernel-verified port *name*, derives the device nodes itself, grants to
+//! `getuid()` and never to an argv uid, and never opens the node — so each of the
+//! five bounds above survives it intact.
 
 mod install;
 mod sysfs;
@@ -228,12 +240,48 @@ enum Unhardened {
 /// capability into its effective set itself at any moment, no further privilege
 /// required, so it is a blessed process for this purpose. `install_verb` refuses on
 /// exactly the same pair for exactly the same reason.
+///
+/// **`held` is the state of *any* required capability, not of one named bit**
+/// (2026-08-12). This branch keyed on `CAP_DAC_OVERRIDE` alone, from before
+/// §15.55 added `cap_fowner`, so a copy carrying only the second capability held
+/// privilege and was *not* refused when the no-`exec` bound could not be
+/// established. Unreachable through the sanctioned path — `field_grants_required_caps`
+/// demands every name, so `install --verify` calls such a copy `Unblessed` and
+/// `scripts/bless` always applies the derived full set — but §15.45's narrowness is
+/// a standing tripwire and "unreachable today" is the argument that stops being true
+/// when the set next grows. [`caps_held`] now folds the whole set.
 fn unhardened_disposition(held: CapState) -> Unhardened {
     if held.permitted || held.effective {
         Unhardened::Refuse
     } else {
         Unhardened::Report
     }
+}
+
+/// The union of every capability in [`install::REQUIRED_CAPS`], as one [`CapState`]:
+/// permitted if any is permitted, effective if any is effective.
+///
+/// A *union* rather than an intersection, deliberately. The question this answers is
+/// "does this process hold privilege the bounds are there to contain", and one
+/// capability is enough to make it yes — an intersection would let a half-blessed
+/// copy through the very refusal that exists because a blessed copy must be bounded.
+fn caps_held() -> CapState {
+    fold_cap_states(
+        install::REQUIRED_CAPS
+            .iter()
+            .map(|(_, bit)| caps::capability_state(*bit)),
+    )
+}
+
+/// The pure half of [`caps_held`], split out for the same reason
+/// [`unhardened_disposition`] is: the state it folds cannot be produced by an
+/// unprivileged test, so the *fold* is asserted directly rather than through a proxy
+/// that would pass for the wrong reason (AGENTS §9).
+fn fold_cap_states(states: impl Iterator<Item = CapState>) -> CapState {
+    states.fold(CapState::NONE, |acc, c| CapState {
+        permitted: acc.permitted || c.permitted,
+        effective: acc.effective || c.effective,
+    })
 }
 
 pub fn main() {
@@ -255,8 +303,14 @@ pub fn main() {
     // at `execve` and this binary never `exec`s, so nothing below can acquire the
     // capability after this branch.
     let held = caps::capability_state(CAP_DAC_OVERRIDE);
+    // The *bounds* question is about privilege of any kind, so it folds the whole
+    // required set; `held` above stays the state of `cap_dac_override` specifically,
+    // because that is the capability the sysfs write needs and the one
+    // `capabilities` reports by name. Two different questions, deliberately not one
+    // variable (see [`caps_held`]).
+    let any_held = caps_held();
     if let Err(reason) = &hardening {
-        match unhardened_disposition(held) {
+        match unhardened_disposition(any_held) {
             Unhardened::Refuse => {
                 // A blessed copy that cannot harden itself does not run. Not a
                 // warning: the reason this binary may carry a root-equivalent
@@ -276,11 +330,30 @@ pub fn main() {
                 // is stated rather than papered over, because the honest bound is "no
                 // blessed copy this process can *see* runs unhardened", and no
                 // unprivileged reading of a capability can promise more than that.
+                // The names are *derived*, not typed: this branch now fires on any
+                // required capability, so a hardcoded `cap_dac_override` would be
+                // false on precisely the copy the union check was added to catch —
+                // one blessed `cap_fowner` alone. Plan §3 rule 11's bar for a skip
+                // message ("never false on the box printing it") applies at least as
+                // strongly to a refusal.
+                let held_names: Vec<&str> = install::REQUIRED_CAPS
+                    .iter()
+                    .filter(|(_, bit)| {
+                        let c = caps::capability_state(*bit);
+                        c.permitted || c.effective
+                    })
+                    .map(|(name, _)| *name)
+                    .collect();
                 eprintln!(
-                    "serial-nexus-devprep: refusing to run: this copy holds cap_dac_override \
+                    "serial-nexus-devprep: refusing to run: this copy holds {} \
                      but cannot establish PR_SET_NO_NEW_PRIVS — {reason}. §15.45 requires that \
                      bound on a blessed copy. Strip the capability (`sudo setcap -r <path>`) \
-                     or run the unblessed copy from target/<profile>/."
+                     or run the unblessed copy from target/<profile>/.",
+                    if held_names.is_empty() {
+                        "a required capability".to_owned()
+                    } else {
+                        held_names.join(",")
+                    }
                 );
                 std::process::exit(exit::REFUSED);
             }
@@ -312,7 +385,10 @@ pub fn main() {
             profile,
             verify,
             print_setcap,
-        } => install_verb(&profile, verify, print_setcap, held),
+            // The union, not `held`: this refusal exists to keep `Command::new`
+            // away from a process carrying *any* capability (§15.45's no-`exec`
+            // bound), not only from one carrying `cap_dac_override`.
+        } => install_verb(&profile, verify, print_setcap, any_held),
         Verb::Preflight { profile, json } => preflight(&profile, json, held),
     };
     std::process::exit(code);
@@ -366,7 +442,15 @@ fn report_capabilities(held: CapState, no_new_privs: bool, json: bool) -> i32 {
                 "cap_dac_override_effective": held.effective,
                 "cap_fowner_effective": fowner.effective,
                 "can_grant_device_access": fowner.effective,
-                "blessed": held.effective,
+                // **The whole set, not the first capability** (§15.55). This field is
+                // what an external consumer of this JSON reaches for first, and it
+                // used to answer `true` for a copy holding `cap_dac_override` alone —
+                // while `install --verify` on the same file said `Unblessed` and
+                // `preflight` exited BLOCKED_ON_BLESS. One binary must not carry two
+                // definitions of "blessed", and the pre-§15.55 one is not the
+                // survivor. The per-capability fields above stay exact, so nothing
+                // that needs the finer answer loses it.
+                "blessed": held.effective && fowner.effective,
                 "no_new_privs": no_new_privs,
             })
         );
@@ -1104,6 +1188,47 @@ mod tests {
             Unhardened::Refuse,
             "the kernel does not produce effective-without-permitted, but if it ever \
              appeared it is privilege, and privilege refuses"
+        );
+    }
+
+    /// The bounds question folds **every** required capability, so a copy carrying
+    /// only the second one is still a blessed process (§15.45, §15.55).
+    ///
+    /// **Fail-first, recorded.** Before 2026-08-12 `main` read
+    /// `capability_state(CAP_DAC_OVERRIDE)` alone, so this case — `cap_fowner` held,
+    /// `cap_dac_override` not — folded to `NONE` and took the `Report` arm: a
+    /// capability-carrying process continuing unhardened. Reverting `caps_held` to
+    /// the single bit turns the second assertion below red, which is the fail-first
+    /// proof; the first two assertions pass either way and are what pins the fold's
+    /// *shape* rather than only its new case.
+    #[test]
+    fn the_bounds_question_folds_every_required_capability_not_just_the_first() {
+        let none = CapState::NONE;
+        let held = CapState {
+            permitted: true,
+            effective: true,
+        };
+        assert_eq!(
+            fold_cap_states([none, none].into_iter()),
+            CapState::NONE,
+            "no capability anywhere is an unblessed process"
+        );
+        assert_eq!(
+            fold_cap_states([none, held].into_iter()),
+            held,
+            "cap_fowner alone is still privilege: the union, never the first entry"
+        );
+        assert_eq!(
+            fold_cap_states([held, none].into_iter()),
+            held,
+            "and so is cap_dac_override alone — an intersection would let both \
+             half-blessed shapes through the refusal that exists to contain them"
+        );
+        // The set is what the fold is over, so a third entry inherits the rule
+        // without a line changing here.
+        assert!(
+            install::REQUIRED_CAPS.len() >= 2,
+            "REQUIRED_CAPS is the set this folds; §15.55 put two in it"
         );
     }
 }

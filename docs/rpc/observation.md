@@ -6,7 +6,7 @@ from every configuration type: the fields here simply do not exist in `dump`.
 
 Methods on this page: [`state`](#state), [`subscribe`](#subscribe),
 [`info`](#info), [`ports`](#ports), [`tap.open`](#tapopen),
-[`tap.close`](#tapclose). This page also
+[`tap.close`](#tapclose), [`tap.wait`](#tapwait). This page also
 documents the [notification stream](#notifications) — the `state`/`lock` pair
 `subscribe` opens plus the per-tap `tap.data`/`tap.closed` — and the
 [`LockSnapshot`](#locksnapshot) shape shared by `state`, the `lock`
@@ -17,7 +17,8 @@ notification, and the arbitration verbs.
 ## `state`
 
 Report the observed status of every node, every host-facing endpoint's tap/ring
-accounting, and every open tap — a point-in-time snapshot.
+accounting, every open tap and every armed pattern wait — a point-in-time
+snapshot.
 
 ### Params
 
@@ -25,13 +26,14 @@ None.
 
 ### Result
 
-Three arrays, all present unconditionally (empty ones are `[]`, never omitted):
+Four arrays, all present unconditionally (empty ones are `[]`, never omitted):
 
 | Field | Type | Description |
 | --- | --- | --- |
 | `nodes` | array | one object per node, in graph order |
 | `taps` | array | one object per open [tap](#taps), across every connection |
 | `endpoints` | array | one object per **host-facing** endpoint — each carries a tap hub, whether or not a ring is configured on it. Sorted by endpoint, so `state` reads the same twice running |
+| `waits` | array | one object per armed [pattern wait](#tapwait), across every connection |
 
 Each node object carries:
 
@@ -63,6 +65,7 @@ Each object in `endpoints`:
 | `endpoint` | string | the host-facing endpoint display (e.g. `usb0`, `mux/console`) |
 | `feed_dropped` | integer | hostward bytes this endpoint's producer→hub feed did not carry (§5): the hub fell behind the producer under a firehose, **or** nothing was listening at all — on a `replay_ring = 0` endpoint that is the whole window between one `tap.close` and the next `tap.open`, so such an endpoint accumulates this counter while untapped. See [the offset contract](#tapdata-notification) |
 | `taps` | integer | how many taps are currently open on it |
+| `waits` | integer | how many [pattern waits](#tapwait) are currently armed on it. An armed wait makes the endpoint mirror exactly as an open tap does, so a `taps: 0` endpoint with `waits: 1` is being observed |
 
 Each object in `taps`:
 
@@ -72,6 +75,18 @@ Each object in `taps`:
 | `endpoint` | string | the endpoint it observes |
 | `dropped` | integer | bytes dropped toward *this* tap because its connection's bounded queue was full — a slow viewer costs only its own counter (§5, §17) |
 | `feed_dropped` | integer | its endpoint's `feed_dropped`, mirrored here for convenience |
+
+Each object in `waits` (§10 clause 7 — an armed wait is visible for its lifetime,
+as a tap is, because an observer an operator cannot see is one they cannot account
+for):
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `wait` | integer | the wait id, daemon-unique and never reused — it shares one allocator with `tap` ids, so an id on the observation surface names exactly one observer |
+| `endpoint` | string | the endpoint it watches |
+| `patterns` | array of string | the pattern names it is watching for, in the caller's order. Names only: the pattern bytes are the caller's, and `state` is readable by anyone who can reach the socket |
+| `bytes_scanned` | integer | stream bytes it has observed so far |
+| `gaps` | integer | how many feed gaps have reset its lookback window |
 
 `feed_dropped` is reported per *endpoint* rather than only per tap because since
 §15.32 every host-facing endpoint carries a ring whether or not anyone is
@@ -215,7 +230,7 @@ where it happens") makes one family of them meaningful everywhere. Per kind:
 
 ```console
 $ serial-nexus-ctl state          # one line per node: "<name>  <status> (reason)"
-$ serial-nexus-ctl --json state   # the raw {"endpoints":…,"nodes":…,"taps":…} object
+$ serial-nexus-ctl --json state   # the raw {"endpoints":…,"nodes":…,"taps":…,"waits":…} object
 ```
 
 The rendered form prints nodes only; `--json` is the way to reach the timestamp,
@@ -231,7 +246,7 @@ None beyond the transport-level codes.
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"state"}' | nc -N -U "$SOCK" | jq .result
 {
   "endpoints": [
-    { "endpoint": "usb0", "feed_dropped": 0, "taps": 1 }
+    { "endpoint": "usb0", "feed_dropped": 0, "taps": 1, "waits": 0 }
   ],
   "nodes": [
     {
@@ -249,7 +264,8 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"state"}' | nc -N -U "$SOCK" |
   ],
   "taps": [
     { "tap": 1, "endpoint": "usb0", "dropped": 0, "feed_dropped": 0 }
-  ]
+  ],
+  "waits": []
 }
 ```
 
@@ -342,7 +358,7 @@ None beyond the transport-level codes.
 ```console
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"subscribe"}' | nc -U "$SOCK"
 {"jsonrpc":"2.0","id":1,"result":{"subscribed":true}}
-{"jsonrpc":"2.0","method":"state","params":{"nodes":[ ... ], "taps": [], "endpoints": [ ... ]}}
+{"jsonrpc":"2.0","method":"state","params":{"nodes":[ ... ], "taps": [], "endpoints": [ ... ], "waits": []}}
 {"jsonrpc":"2.0","method":"lock","params":{"endpoint":"usb0","lock":{ ... }}}
 ```
 
@@ -529,7 +545,7 @@ emitted:
 ### `state` notification
 
 A **full state snapshot**, identical in shape to the [`state`](#state) result
-(`{ "nodes": […], "taps": […], "endpoints": […] }`). It is emitted on a periodic
+(`{ "nodes": […], "taps": […], "endpoints": […], "waits": […] }`). It is emitted on a periodic
 tick (currently every 200 ms) and is the *floor* for observability — status
 transitions and counter snapshots are always visible here even if a finer signal
 is missed. State snapshots are cumulative, so a subscriber that falls behind and
@@ -537,7 +553,7 @@ drops one loses nothing. The tick is built only while at least one connection is
 actually subscribed, so it costs nothing on a daemon nobody is watching.
 
 ```json
-{"jsonrpc":"2.0","method":"state","params":{"nodes":[ ... ],"taps":[ ... ],"endpoints":[ ... ]}}
+{"jsonrpc":"2.0","method":"state","params":{"nodes":[ ... ],"taps":[ ... ],"endpoints":[ ... ],"waits":[ ... ]}}
 ```
 
 ### `lock` notification
@@ -721,6 +737,204 @@ expected Y` rather than being swallowed.)
 
 `--stall-ms` holds the tap open without reading, to exercise the bounded-queue
 drop path.
+
+---
+
+## The pattern wait
+
+### `tap.wait`
+
+Park until one of up to eight named byte patterns appears on a host-facing
+endpoint's hostward stream, the deadline expires, or the graph drops the endpoint
+(§10 *The pattern wait*, §15.56). It is a **waiting verb** on §15.20's machinery:
+it occupies this connection's one waiting slot, a request pipelined behind it is
+refused with [`-32006`](README.md#error-codes) while the wait and this
+connection's taps and subscription all keep running, and closing the connection
+cancels it.
+
+It is also a **spy**: arming, matching, timing out and cancelling a wait leave the
+replay ring, the tap counters and the graph exactly as a never-issued wait would
+have. The one thing an armed wait does change is that its endpoint starts
+mirroring — an armed wait observes even on an endpoint with no ring and no open
+tap — and it is [visible in `state`](#state) for its lifetime, as a tap is.
+
+**Why the daemon matches, rather than you.** Everything below a matcher was
+already here — offset-stamped taps, exact-splice replay, the ring — so a client
+*can* do this over [`tap.open`](#tapopen), and the recipe for that is
+[below](#doing-it-client-side). What it cannot do is scan deeper than its own
+bounded tap channel can be handed, and what it must re-derive every time is
+reassembly across frame boundaries, replay-splice handling, gap discipline, and
+telling a timeout from a teardown. This verb is those rules written once.
+
+#### Params
+
+| Param | Type | Description |
+| --- | --- | --- |
+| `endpoint` | string | the host-facing endpoint to watch (`usb0`, `mux/console`) |
+| `patterns` | array | 1 to 8 [pattern objects](#pattern-objects); the first to appear wins |
+| `timeout_ms` | integer | **required** — give up after this long. Maximum 3600000. Required rather than optional because a wait holds this connection's one waiting slot until it settles, and because a deadline that was never stated cannot be reported as one |
+| `replay` | bool | *optional*, default `false` — scan the endpoint's replay ring (§5) before arming on the live stream, so a pattern that appeared just **before** this call still matches |
+| `lookback` | integer | *optional*, default 4096, maximum 65536 — how many bytes of already-seen stream a match may span |
+| `context` | integer | *optional*, default 128, maximum 4096 — how many bytes of surrounding context a match reports |
+
+Every one of these is range-checked, and the patterns compiled, **before anything
+is armed**: a refused request leaves the endpoint exactly as it found it, mirror
+flag included.
+
+##### Pattern objects
+
+Each entry of `patterns` carries a `name` and **exactly one** of `literal` or
+`regex` — the kind is structural rather than a `kind: "literal"` string, so a
+misspelling is a refusal that names the field instead of a silent
+reinterpretation of your bytes.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | what the result reports fired. 1 to 256 bytes, and distinct within one call — the result names one pattern, so two patterns sharing a name would make the answer unreadable |
+| `literal` | string | base64 of an arbitrary byte string, matched verbatim. Any byte is legal, including regex metacharacters and bytes that are not valid UTF-8 |
+| `regex` | string | base64 of a bytes-oriented regular expression's **source**. The source is text (regex syntax is), but what it matches is not: Unicode mode is off, `.` means "any byte but newline", and `\xNN` reaches any byte. A source that is not valid UTF-8 is refused rather than mangled |
+
+Both forms ride the wire base64-encoded for the same reason
+[`tap.data`](#tapdata-notification) does: console output is not guaranteed UTF-8,
+and neither is a pattern over it. 1024 bytes is the maximum for either.
+
+The engine is **linear-time and non-backtracking**, and that is a requirement
+rather than an implementation note: patterns compile and match on the daemon's
+runtime thread — the thread that runs every console — so an exponential-backtracking
+engine would be an operator-reachable denial of service. `(a+)+b` against a
+megabyte of `a` is answered promptly here. The compiled program is capped, so a
+counted-repetition bomb (`(?:a{1000}){1000}`) is refused at compile with
+`-32602`, not paid for at match time.
+
+#### Result
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `endpoint` | string | echoed |
+| `matched` | object \| null | the match, or `null` when the deadline expired first |
+| `timed_out` | bool | `true` exactly when `matched` is `null` |
+| `bytes_scanned` | integer | stream bytes this wait observed, replay seed included |
+| `gaps` | integer | how many times a producer→hub feed gap (see [the offset contract](#tapdata-notification)) reset the lookback window |
+| `gap_bytes` | integer | how many bytes those gaps totalled |
+| `from_offset` | integer | the endpoint offset the scan began at: the oldest ring byte scanned with `replay`, otherwise the live edge at arming |
+| `epoch` | integer | which offset space `from_offset` and any match offset count in (§15.38) — the same value [`tap.open`](#tapopen) reports |
+| `replay_scanned` | integer | ring bytes the replay seed covered; `0` without `replay`, or with no ring |
+
+`matched`, when present:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `pattern` | string | the `name` of the pattern that fired |
+| `offset` | integer | the endpoint offset of the match's first byte, in the same space `tap.data` reports |
+| `end_offset` | integer | one past the match's last byte |
+| `context` | string | base64 of up to `context` bytes around the match |
+| `context_offset` | integer | the endpoint offset of `context`'s first byte, so you can place it without inferring it |
+
+**A deadline is an answer, not an error.** Expiry returns a normal result with
+`timed_out: true` and the counters above — "no pattern appeared within the
+deadline" is exactly the thing a caller asked to find out, and reporting it as an
+error would make every caller's success path a `catch`. Read `gaps` beside it: a
+`matched: null` over a stream with holes in it is a weaker claim than one over a
+whole stream, and this is where the difference is stated.
+
+**Matching is exact where the hub is exact.** The matcher consumes the endpoint's
+hub stream directly, with no bounded queue between hub and matcher, so a byte the
+hub ingested is a byte matched and **a pattern split across `tap.data` frame
+boundaries matches by construction**. The one lossy hop on the way in — the
+producer→hub feed, which must never backpressure the device (§5) — is handled by
+resetting the lookback window when a gap arrives: bytes on either side of a hole
+were never adjacent in the stream, so a match is never allowed to span them. That
+costs some true negatives and cannot manufacture a positive, and the `gaps` /
+`gap_bytes` counters say when it happened.
+
+**Replay inclusion is splice-exact.** With `replay: true` the ring snapshot is
+scanned and the live matcher armed inside one critical section — the same
+mechanism that makes [`tap.open --replay`](#tapopen) exact — so the ring→live seam
+can neither hide a match nor report one twice. The matcher reads **the ring
+itself**, not a tap channel's budgeted copy, so the whole configured ring depth is
+scanned even when it is deeper than `lookback`; `lookback` bounds only how far a
+*later* match may reach back into what is retained.
+
+#### Errors
+
+| Code | When |
+| --- | --- |
+| `-32602` | the endpoint is unknown or not host-facing; `timeout_ms` missing; any maximum exceeded; a malformed, un-decodable, duplicate-named, or uncompilable pattern |
+| `-32006` | another waiting verb is already parked on this connection (§15.20) |
+| `-32008` | the graph dropped the endpoint while this wait was parked — `teardown`, `load --replace`, `remove-node`. `data` carries the same scan and gap counters the result would have |
+
+`-32008` is deliberately **not** a timeout. A timeout claims the stream was
+watched for the whole deadline and stayed silent; this says the stream stopped
+existing. Collapsing them would let a caller retry forever against an endpoint
+that is gone — the same discrimination [`tap.closed`](#tapclosed-notification)
+makes for a tap, applied to a wait.
+
+There is no `tap.wait` notification, by design: a match delivered as a
+notification would reach every [`subscribe`](#subscribe) consumer on the daemon,
+so the result rides the parked request's own reply and nothing else (§15.56).
+
+#### CLI
+
+```console
+$ serial-nexus-ctl tap-wait console --pattern login='login:' --timeout-ms 30000
+console: matched "login" at offset 4211 (5183 byte(s) scanned)
+
+$ serial-nexus-ctl tap-wait console --pattern prompt='[#$] $' --regex --replay --timeout-ms 5000
+console: no match before the deadline (912 byte(s) scanned)
+
+$ serial-nexus-ctl --json tap-wait console --pattern err=ERROR --timeout-ms 1000
+{
+  "bytes_scanned": 4096,
+  "endpoint": "console",
+  "epoch": 3,
+  "from_offset": 131072,
+  "gap_bytes": 0,
+  "gaps": 0,
+  "matched": null,
+  "replay_scanned": 0,
+  "timed_out": true
+}
+```
+
+`--json` prints the whole result object — on both outcomes — *before* the process
+exits with the verdict, so a caller gets the counters **and** the exit status.
+
+`serial-nexus-ctl tap-wait` spells patterns as `<name>=<text>` and base64-encodes
+them for you (so the CLI reaches only the bytes a shell argument can carry; the
+RPC surface reaches all 256). **Its exit status is the verdict — `0` matched, `1`
+the deadline expired, `2` the wait could not run** — which is `grep(1)`'s scheme,
+for the tool that asks `grep`'s question:
+
+```console
+$ serial-nexus-ctl tap-wait console --pattern up='boot complete' --timeout-ms 60000 \
+    && serial-nexus-ctl send console --line 'uname -a'
+```
+
+Match context goes to **stderr**, so stdout stays the one verdict line a script
+reads — the same split `serial-nexus-ctl tap` makes for its gap notices.
+
+#### Doing it client-side
+
+The verb exists because this is easy to get subtly wrong, but the offset contract
+below is public and a client that wants its own matcher is entitled to one. The
+recipe, and the four places copies of it have gone wrong:
+
+1. **`tap.open --replay`, then reassemble.** Concatenate `tap.data` payloads in
+   arrival order; do **not** match per frame. A chunk boundary falls wherever the
+   device happened to stop talking, so `login:` arrives as `lo` + `gin:` often
+   enough to matter.
+2. **Anchor on `from_offset`, and check `epoch`.** The first live frame carries
+   `from_offset + replay_bytes`. If `epoch` differs from the one you stored, the
+   offset space restarted beneath you (a hub rebuild) and your frontier means
+   nothing — re-anchor rather than splice.
+3. **Treat a non-zero `gap_before` as a discontinuity.** Bytes are missing before
+   that chunk. Concatenating across it lets a pattern match bytes that were never
+   adjacent, which is a false positive your log will never explain.
+4. **Bound your buffer, and time out on your own clock.** Keep a fixed lookback
+   window rather than the whole session, and remember that a `tap.open` that
+   returns `replay_truncated > 0` means your channel was handed less ring than
+   exists — which is the one gap no client-side matcher can close, because the
+   daemon-side matcher reads the ring itself.
 
 ---
 

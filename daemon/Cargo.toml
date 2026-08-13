@@ -38,6 +38,10 @@ tracing.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 
+# The pattern wait's matcher (§10, §15.56). Default features carry the `meta`
+# searcher, whose every strategy is linear in the haystack.
+regex-automata.workspace = true
+
 serial2.workspace = true
 nix = { workspace = true, features = ["term", "fs", "poll", "ioctl", "process", "signal", "user"] }
 libc.workspace = true

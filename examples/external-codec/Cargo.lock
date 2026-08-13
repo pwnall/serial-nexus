@@ -501,6 +501,7 @@ dependencies = [
  "futures",
  "libc",
  "nix",
+ "regex-automata",
  "serde",
  "serde_json",
  "serial-nexus-codec-api",

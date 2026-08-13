@@ -116,6 +116,44 @@ enum Cmd {
         #[arg(long)]
         stall_ms: Option<u64>,
     },
+    /// Park until a byte pattern appears on an endpoint's hostward stream (§10 the
+    /// pattern wait). The daemon matches; this is a thin presentation layer.
+    ///
+    /// **Exit codes are the verdict** — `0` matched, `1` the deadline expired with
+    /// no match, `2` the wait could not run. That is `grep(1)`'s scheme, for the
+    /// tool that asks `grep`'s question, and it is deliberately *not* plan §18 item
+    /// 47's originally-filed "0 matched, 2 timed out, 1 error": `2` is already
+    /// clap's usage-error code on this binary, so a script could not tell "no match"
+    /// from "you misspelled a flag". Putting the failure-to-run at `2` collides with
+    /// clap harmlessly (both mean "this did not run") and agrees with `serial-nexus-doctor`,
+    /// whose `1` is likewise a verdict and whose `2` is likewise an operational
+    /// failure.
+    TapWait {
+        /// The host-facing endpoint to watch (e.g. `usb0` or `mux/ch2`).
+        endpoint: String,
+        /// A pattern to wait for, as `<name>=<text>`; repeatable, up to eight.
+        /// Matched as a literal byte string unless `--regex` is given.
+        #[arg(long = "pattern", required = true)]
+        patterns: Vec<String>,
+        /// Treat every `--pattern` value as a bytes-oriented regular expression
+        /// rather than a literal.
+        #[arg(long)]
+        regex: bool,
+        /// Scan the endpoint's replay ring before the live stream, so a pattern that
+        /// appeared just *before* this call still matches (§5, §10).
+        #[arg(long)]
+        replay: bool,
+        /// Give up after this many milliseconds. Required: a wait with no deadline
+        /// holds the connection's one waiting slot forever (§15.20).
+        #[arg(long)]
+        timeout_ms: u64,
+        /// How many bytes of already-seen stream a match may span.
+        #[arg(long)]
+        lookback: Option<u64>,
+        /// How many bytes of surrounding context the result reports.
+        #[arg(long)]
+        context: Option<u64>,
+    },
     /// Rotate a log node's file on demand.
     Rotate { node: String },
     /// Assert a serial break on a node for `--ms` milliseconds (§7.1).
@@ -198,9 +236,22 @@ enum Cmd {
     Shutdown,
 }
 
+/// The exit code a *failure* takes for this verb.
+///
+/// `1` everywhere, except the pattern wait, where `1` is already spoken for: it is
+/// the verdict "the deadline expired with no match" (`grep`'s scheme — see
+/// [`Cmd::TapWait`]). A wait that could not run answers `2`, which is what
+/// `serial-nexus-doctor` and clap both already use for "this did not run", so the
+/// three agree rather than each meaning something different on the same binary.
+fn failure_exit_code(is_tap_wait: bool) -> i32 {
+    if is_tap_wait { 2 } else { 1 }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let json = cli.json;
+    // Captured before `run` consumes `cli`: the failure code depends on the verb.
+    let is_tap_wait = matches!(cli.cmd, Cmd::TapWait { .. });
     match run(cli) {
         Ok(()) => Ok(()),
         // A *client-side* failure — an unreadable file, a TOML parse error, a socket
@@ -219,9 +270,17 @@ fn main() -> anyhow::Result<()> {
                 }
             });
             println!("{}", serde_json::to_string_pretty(&envelope)?);
-            std::process::exit(1);
+            std::process::exit(failure_exit_code(is_tap_wait));
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            if is_tap_wait {
+                // `Err` out of `main` would exit 1, which for this verb means "no
+                // match" rather than "it did not run".
+                eprintln!("error: {e:#}");
+                std::process::exit(failure_exit_code(true));
+            }
+            Err(e)
+        }
     }
 }
 
@@ -263,7 +322,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 eprintln!("{}", serde_json::to_string_pretty(&data)?);
             }
         }
-        std::process::exit(1);
+        std::process::exit(failure_exit_code(matches!(cli.cmd, Cmd::TapWait { .. })));
     }
     let result = response.result.unwrap_or(Value::Null);
 
@@ -271,6 +330,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         render(&cli.cmd, &result)?;
+    }
+    // The pattern wait's answer *is* its exit status, so it never falls through to
+    // the shared `Ok(())` (§10 clause 6: a deadline is a result, not an error — the
+    // rendering above already printed it either way). Rendered first, exited second,
+    // so `--json` and the human form both reach stdout before the process leaves.
+    if matches!(cli.cmd, Cmd::TapWait { .. }) {
+        let timed_out = result
+            .get("timed_out")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        std::process::exit(if timed_out { 1 } else { 0 });
     }
     Ok(())
 }
@@ -313,6 +383,53 @@ fn build_request(cmd: &Cmd) -> anyhow::Result<(&'static str, Option<Value>)> {
         Cmd::Ports => ("ports", None),
         Cmd::Subscribe { .. } => unreachable!("subscribe is handled before dispatch"),
         Cmd::Tap { .. } => unreachable!("tap is handled before dispatch"),
+        Cmd::TapWait {
+            endpoint,
+            patterns,
+            regex,
+            replay,
+            timeout_ms,
+            lookback,
+            context,
+        } => {
+            // Deliberately on the one-shot `call()` path rather than a third
+            // early-return like `tap`/`subscribe`: `call` already holds its write
+            // half open across the read (§15.20 clause 4 requires that of any client
+            // that parks) and has no read timeout, so it parks correctly as it
+            // stands — and staying on it is what gives the verb `--json`, the
+            // daemon-error rendering and the socket fallback for free. A third
+            // early-return would have had to re-derive all three.
+            let mut out = Vec::with_capacity(patterns.len());
+            for p in patterns {
+                let (name, text) = p.split_once('=').ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--pattern must be `<name>=<text>`, got {p:?}; the name is what the \
+                         result reports fired"
+                    )
+                })?;
+                // The wire carries bytes, base64-encoded, because console output is
+                // not guaranteed UTF-8 and neither is a pattern over it (§10). A
+                // shell argument is text, so this is the one lossy step in the CLI's
+                // presentation — and it is the caller's own bytes, unchanged.
+                let encoded = serial_nexus_rpc::base64_encode(text.as_bytes());
+                out.push(if *regex {
+                    json!({ "name": name, "regex": encoded })
+                } else {
+                    json!({ "name": name, "literal": encoded })
+                });
+            }
+            (
+                "tap.wait",
+                Some(json!({
+                    "endpoint": endpoint,
+                    "patterns": out,
+                    "replay": replay,
+                    "timeout_ms": timeout_ms,
+                    "lookback": lookback,
+                    "context": context,
+                })),
+            )
+        }
         Cmd::Rotate { node } => ("rotate", Some(json!({ "node": node }))),
         Cmd::SendBreak { node, ms } => ("send-break", Some(json!({ "node": node, "ms": ms }))),
         Cmd::SetModem { node, dtr, rts } => (
@@ -624,6 +741,39 @@ fn render(cmd: &Cmd, result: &Value) -> anyhow::Result<()> {
             println!("tore down {n} node(s)");
         }
         Cmd::Shutdown => println!("shutdown requested"),
+        Cmd::TapWait { endpoint, .. } => {
+            let scanned = result
+                .get("bytes_scanned")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let gaps = result.get("gaps").and_then(Value::as_u64).unwrap_or(0);
+            // The gap count rides *every* rendering, matched or not. A "no match"
+            // over a stream with holes in it is a weaker answer than one over a whole
+            // stream, and §10 clause 4 makes saying so part of the contract rather
+            // than something a caller has to ask `--json` for.
+            let scope = if gaps == 0 {
+                format!("{scanned} byte(s) scanned")
+            } else {
+                format!("{scanned} byte(s) scanned, {gaps} gap(s) in the stream")
+            };
+            match result.get("matched") {
+                Some(m) if !m.is_null() => {
+                    let name = m.get("pattern").and_then(Value::as_str).unwrap_or("?");
+                    let offset = m.get("offset").and_then(Value::as_u64).unwrap_or(0);
+                    println!("{endpoint}: matched {name:?} at offset {offset} ({scope})");
+                    // Context to stderr, so stdout stays the verdict line a script
+                    // reads — the same split `tap` makes for its gap notices.
+                    if let Some(ctx) = m
+                        .get("context")
+                        .and_then(Value::as_str)
+                        .and_then(serial_nexus_rpc::base64_decode)
+                    {
+                        eprintln!("context: {}", String::from_utf8_lossy(&ctx));
+                    }
+                }
+                _ => println!("{endpoint}: no match before the deadline ({scope})"),
+            }
+        }
         Cmd::Subscribe { .. } => unreachable!("subscribe is handled before dispatch"),
         Cmd::Tap { .. } => unreachable!("tap is handled before dispatch"),
     }

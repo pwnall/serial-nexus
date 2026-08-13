@@ -12,9 +12,10 @@ Methods on this page: [`lock`](#lock), [`unlock`](#unlock), [`send`](#send). The
 [`LockSnapshot`](observation.md#locksnapshot) that `state` and notifications
 report is documented on the observation page.
 
-> **The two waiting verbs, and the rules that come with them.** `lock` with
-> `wait` and `send` are the only verbs that can suspend, and a connection runs
-> **one of them at a time**. A request pipelined onto a connection whose waiting
+> **The waiting verbs, and the rules that come with them.** `lock` with `wait`
+> and `send` are the two on this page; the observation page's
+> [`tap.wait`](observation.md#tapwait) is the third, and the rules below govern
+> all three. A connection runs **one of them at a time**. A request pipelined onto a connection whose waiting
 > verb is still parked is answered `-32006` (`a waiting verb is already in flight
 > on this connection; only one is supported at a time — open a second connection,
 > or retry once it resolves`), carrying that request's own `id`; the parked verb

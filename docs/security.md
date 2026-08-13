@@ -526,8 +526,13 @@ re-enumerate a device for real means writing `0` then `1` to that device's USB
 it.** The privilege lives on a copy that the tool's own `install` verb places at
 `.snx-bin/<profile>/` — project-local, gitignored, mode `0700` applied *before* the
 capability (`devprep/src/linux/install.rs`, `BLESSED_MODE = 0o700`) — and it is
-conferred by a single `sudo setcap cap_dac_override+ep …` that the tool **prints and
-never runs**. The capability is proven, never assumed, and it self-invalidates: any
+conferred by a single `sudo setcap` whose capability set the tool **derives and
+prints, and never runs** (`install --print-setcap`; the set is `REQUIRED_CAPS` in
+`devprep/src/linux/install.rs`). Every command the tool *shows, runs and verifies*
+derives from that constant. One **informational** line still does not — `install
+--verify`'s success message prints the pre-§15.55 spelling — which is filed as
+plan §18 item 52 and named here rather than glossed, because a security document
+that claims a completeness it does not have is the defect it is warning about. The capability is proven, never assumed, and it self-invalidates: any
 write to the file clears `security.capability`, so a rebuilt copy is an unprivileged
 copy. CI never blesses anything. A checkout that moves loses the capability, which
 is the point — the alternative designs, a udev rule granting the `dialout` group
@@ -540,7 +545,17 @@ and confers nothing).
 is the binary's narrowness, asserted by construction (`devprep/src/linux/mod.rs`,
 `devprep/src/linux/sysfs.rs`):
 
-- **One capability, and no other.** `setcap cap_dac_override+ep`, nothing else.
+- **Two capabilities, and no others (§15.55).** `cap_dac_override` for the
+  `root:root 0644` sysfs `authorized` write, and `cap_fowner` for the POSIX ACL that
+  hands the invoking user back the tty node the reauthorization destroyed and
+  recreated. The set is written in exactly one place — `REQUIRED_CAPS` in
+  `devprep/src/linux/install.rs` — and every command the tool shows, runs and
+  verifies derives from it, so this document cannot drift from the binary a third
+  time. Adding a capability widens the blast radius exactly as a path-accepting verb
+  would, and is likewise a design amendment rather than a patch. It is *not*
+  `cap_chown`: chown is a strictly larger grant (it lets a process give files away,
+  not merely take them) and would destroy the node's ownership instead of adding one
+  ACL entry beside it.
 - **argv only.** It reads no environment variable, so there is no `LD_PRELOAD` or
   config-file path into a capability-holding process.
 - **No `exec` while blessed.** `PR_SET_NO_NEW_PRIVS` makes that a kernel guarantee
@@ -551,7 +566,13 @@ is the binary's narrowness, asserted by construction (`devprep/src/linux/mod.rs`
 - **No path parameter.** The device argument is a USB port *name* like `3-1`,
   validated against an alphabet of digits, `-` and `.` with no `..` component, and
   joined to a compile-time root — so no caller-supplied byte ever reaches `open(2)`
-  as a path.
+  as a path. This is the bound the `grant` verb (§15.55) stresses hardest, and it
+  holds: `grant` takes the same port *name*, derives the tty nodes itself from
+  `sysfs::ttys(port)`, names its beneficiary from the kernel (`getuid()`, never an
+  argv uid — a `--uid` flag on a capability-carrying binary would let any caller hand
+  privilege to any account), and sets the ACL with `setxattr` without ever opening
+  the node. That is why §15.55 is an amendment executed the *other* way: it adds a
+  verb without adding a path.
 - **The kernel confirms the filesystem.** `fstatfs` must report `SYSFS_MAGIC` before
   any write, which a `starts_with` on a canonicalized path cannot establish.
 - **Non-hub serial adapters only.** A device whose `bDeviceClass` reads `09` — a USB

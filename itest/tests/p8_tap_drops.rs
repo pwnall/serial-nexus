@@ -293,8 +293,13 @@ replay_ring = 0
     assert_eq!(
         st["endpoints"],
         json!([
-            { "endpoint": "usb0", "feed_dropped": 0, "taps": 0 },
-            { "endpoint": "usb1", "feed_dropped": 0, "taps": 0 },
+            // `waits` joined this object with the pattern wait (§10 clause 7): an
+            // armed wait is an observer, so an endpoint reports how many are watching
+            // it exactly as it reports its taps. Asserted by *equality* on purpose —
+            // this guard pins the whole object, so a field appearing here is a
+            // deliberate, reviewed edit rather than something that slips in.
+            { "endpoint": "usb0", "feed_dropped": 0, "taps": 0, "waits": 0 },
+            { "endpoint": "usb1", "feed_dropped": 0, "taps": 0, "waits": 0 },
         ]),
         "state must report each host endpoint's feed-loss counter with no tap open \
          (DM-5), sorted so two reads agree: {st}"

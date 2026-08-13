@@ -28,6 +28,7 @@ mod cell;
 mod control;
 mod daemon;
 mod nodes;
+mod pattern;
 mod registry;
 mod runtime;
 mod tap;

@@ -4,9 +4,11 @@
 Tier-3 hardware rig (the tier ladder is §13's) on both kernels, a Linux replug lane driven by the
 repository-carried privileged helper (§15.45, amended by §15.55), and the cross-kernel doctor
 campaigns whose committed artifacts under `docs/doctor/` back every kernel claim below. §1–§14 and
-§17 are normative for the system as built, with exactly one design-ahead-of-tree surface: the
-pattern wait on the observation surface (§10, §15.56), specified this generation and carried as
-plan §18 item 47 — the amend-first order AGENTS §5 requires. §15–§16 are the decision record.
+§17 are normative for the system as built, with **no design-ahead-of-tree surface**: the pattern
+wait on the observation surface (§10, §15.56) was specified this generation ahead of its
+construction — the amend-first order AGENTS §5 requires — and plan §18 item 47 built it the same
+day, so §10's pattern-wait subsection is settled system like the rest. §15–§16 are the decision
+record.
 Measured figures — suite
 counts, gate scopes, wall-clock costs — live in exactly one place, the plan's Status table, and are
 quotable only with the scope recorded there; this document deliberately carries none. What remains
@@ -906,9 +908,13 @@ this section has never contained (notes §3.75).
    two — cheap, portable, and free of libudev's LGPL linkage) until *the same identity*
    reappears. A different adapter squatting on the old path is not adopted (§12). The poll
    paces *reappearance* only — disconnect is never polled for: a destroyed tty fails the
-   in-flight read at once, so a real unplug moves the node off `active` in single-digit
-   milliseconds, an order of magnitude inside the read-poll budget (measured on the replug
-   lane, notes §3.54).
+   in-flight read at once, so a real unplug moves the node off `active` in **2–3 ms**,
+   measured 3 runs on the replug lane against a 200 ms `READ_POLL_TIMEOUT_MS` re-arm — the
+   figure, rather than a ratio, because the two readings a ratio invites fusing are
+   different observables: notes §3.54 measures *this* one (the node leaving `active`),
+   while the 1.2–2.0 ms elsewhere in the record is the `poll` revents readback after the
+   sysfs write. Nor is either the 200 µs–5 ms cadence AGENTS §6 quotes: that is the *pty*
+   node's active-to-idle backoff, a third node and a third budget.
 4. Reopening reapplies configured termios, retakes `TIOCEXCL`, restores modem lines, and by
    default purges origin backlogs accumulated during the outage — the device likely
    power-cycled, and twenty minutes of buffered commands must not fire into its boot prompt —
@@ -1951,10 +1957,9 @@ host-facing endpoint; `tap.close` or the connection dropping detaches it.
 
 `tap.wait <endpoint>` is a waiting verb on the observation surface: it parks until one of its
 named patterns matches the endpoint's hostward stream, its deadline expires, or the endpoint is
-torn down. **Specified this generation, not yet in the tree**: plan §18 item 47 carries the
-construction and §15.56 the decision record — the amend-first order (AGENTS §5) — and until that
-item lands the verb answers the standard method-not-found, like any capability a daemon lacks
-(the version-skew rule above). The contract:
+torn down. **Specified this generation ahead of its construction, and built the same day**: the
+amend-first order (AGENTS §5) ran its full course — §15.56 is the decision record, plan §18 item
+47 the construction, and the verb now answers on the wire. The contract:
 
 1. **A wait is §15.20's machinery, unchanged.** It suspends between transitions holding
    nothing, counts against the one-waiting-verb-per-connection rule, is cancelled by
@@ -2010,8 +2015,7 @@ item lands the verb answers the standard method-not-found, like any capability a
 
 The verb surface, grouped by semantics: configuration (`load`, `load --replace`, `dump`,
 `add-node`, `remove-node [--cascade]`, `connect`, `disconnect`; `set-attribute` remains deferred,
-§14); observation (`state`, `subscribe`, `info`, `ports`, `tap.open`/`tap.close`, and —
-specified this generation, construction at plan §18 item 47 — `tap.wait`);
+§14); observation (`state`, `subscribe`, `info`, `ports`, `tap.open`/`tap.close`, `tap.wait`);
 arbitration (`lock [--steal] [--wait] [--lease]`, `unlock`, `send`); logging (`rotate`); serial
 signals (`send-break`, `set-modem`, `pulse-dtr`); lifecycle (`teardown`, `shutdown`).
 `serial-nexus-ctl` is a thin presentation layer over that surface — deliberately nothing more.
@@ -4111,9 +4115,9 @@ previously-working `cycle` red.
 
 ### 15.56 The observation surface gains a pattern wait: match daemon-side, once
 
-**Status:** LIVE — contract at §10 (The pattern wait); **design ahead of tree**: plan §18
-item 47 carries the construction, and nothing here is promised as existing before that item's
-landing.
+**Status:** LIVE and EXECUTED — contract at §10 (The pattern wait); built at plan §18 item 47
+(2026-08-12, notes §3.83). This entry was written one revision ahead of the tree, as AGENTS §5
+requires; it no longer is, and every decision below is implemented rather than promised.
 
 The capability: park until a byte pattern appears on an endpoint's hostward stream, with a
 deadline, optional replay-ring inclusion, and a result that names which pattern fired and at

@@ -8,8 +8,9 @@
 //! on every rebuild. The stable copy is touched only by `install`.
 //!
 //! **This module is the only place in the crate that spawns a process, and it is
-//! unreachable from a blessed process**: `main` refuses `install` when the
-//! capability is held, so `CAP_DAC_OVERRIDE` and `Command::new` never coexist.
+//! unreachable from a blessed process**: `main` refuses `install` when **any**
+//! capability in [`REQUIRED_CAPS`] is held, so no file capability and
+//! `Command::new` ever coexist.
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -37,8 +38,13 @@ pub const BLESSED_MODE: u32 = 0o700;
 /// How the installed copy compares to the freshly-built one.
 #[derive(Debug, PartialEq, Eq)]
 pub enum InstallState {
-    /// Installed, byte-identical to the build, mode `0700`, and carrying
-    /// `cap_dac_override` with the effective bit.
+    /// Installed, byte-identical to the build, mode `0700`, and carrying **every**
+    /// capability in [`REQUIRED_CAPS`] with the effective bit.
+    ///
+    /// Not `cap_dac_override` alone: [`field_grants_required_caps`] requires the
+    /// whole set, and its own test pins that half a set does not read as blessed.
+    /// This doc said otherwise until 2026-08-12 — the same contradicts-itself-one-
+    /// screen-apart shape the §15.55 alignment pass repaired in `sys/src/caps.rs`.
     Ready,
     /// Nothing at the stable path yet.
     Absent,
@@ -84,14 +90,31 @@ pub fn getcap_field(line: &str) -> Option<&str> {
     field.contains('=').then_some(field)
 }
 
-/// The capabilities a blessed copy must carry, and why each is there.
+/// The capabilities a blessed copy must carry, and why each is there — **the one
+/// place the set is written** (§15.45, §15.55; AGENTS §4). Adding an entry is a
+/// design amendment, not a patch.
 ///
 /// `cap_dac_override` writes `authorized` in sysfs (`root:root 0644`);
 /// `cap_fowner` sets a POSIX ACL on a tty node the invoking user does not own
 /// (§15.55). Both are required: a copy holding only the first can replug but
 /// cannot hand back access to the node it just recreated, which is the shape the
 /// rig lane failed on.
-pub const REQUIRED_CAPS: &[&str] = &["cap_dac_override", "cap_fowner"];
+///
+/// Each entry carries **both** representations the tree needs — the `setcap` name
+/// and the `linux/capability.h` bit — because they were two lists before, and two
+/// lists that must agree is the shape that let the no-`exec`-while-blessed refusal
+/// key on `cap_dac_override` alone while `field_grants_required_caps` required
+/// both: a copy blessed with only `cap_fowner` carried a capability and was not
+/// refused. One list, two projections, and the drift is unrepresentable.
+pub const REQUIRED_CAPS: &[(&str, u32)] = &[
+    ("cap_dac_override", serial_nexus_sys::caps::CAP_DAC_OVERRIDE),
+    ("cap_fowner", serial_nexus_sys::caps::CAP_FOWNER),
+];
+
+/// Just the `setcap` names, in order — the projection every command string uses.
+pub fn required_cap_names() -> Vec<&'static str> {
+    REQUIRED_CAPS.iter().map(|(name, _)| *name).collect()
+}
 
 /// Whether a capability field grants **every** capability in [`REQUIRED_CAPS`]
 /// *effectively*.
@@ -110,7 +133,7 @@ pub fn field_grants_required_caps(field: &str) -> bool {
         .split(',')
         .map(|n| n.trim_start_matches('+'))
         .collect();
-    let all_named = REQUIRED_CAPS.iter().all(|want| present.contains(want));
+    let all_named = REQUIRED_CAPS.iter().all(|(want, _)| present.contains(want));
     all_named && flags.contains('e') && flags.contains('p')
 }
 
@@ -193,7 +216,7 @@ pub fn install(repo_root: &Path, profile: &str) -> io::Result<PathBuf> {
 pub fn setcap_command(blessed: &Path) -> String {
     format!(
         "sudo setcap {}+ep {}",
-        REQUIRED_CAPS.join(","),
+        required_cap_names().join(","),
         blessed.display()
     )
 }

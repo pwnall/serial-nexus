@@ -65,6 +65,14 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 /// * `load` — it replaces the entire graph in one call, which is a different act
 ///   from editing it. The editor page composes the incremental verbs instead.
 /// * `teardown`, `shutdown` — daemon lifecycle. The ask was graph editing.
+/// * `tap.wait` — the pattern wait (§10, §15.56), excluded **at introduction and for
+///   a stated reason**, not by oversight. A parked wait occupies its connection's one
+///   waiting slot (§15.20), and the browser page holds exactly one daemon connection;
+///   an admitted wait would therefore answer every other page verb — every
+///   `tap.open`, every `send`, every graph edit — with the in-flight refusal for its
+///   whole duration, which on a 30-second wait is a 30-second dead console. Admitting
+///   it later is a deliberate act that must first say what it does about that: a
+///   second connection per page, or a bounded deadline the bridge enforces.
 ///
 /// `set-attribute` is absent because it does not exist (§14). If it lands, admitting
 /// it here is a deliberate act, exactly as admitting these was.
@@ -505,7 +513,14 @@ mod tests {
         // refused is daemon lifecycle plus whole-graph replacement — and
         // `set-attribute`, which does not exist and must not be admitted by
         // anticipation (§14). These are the ones a compromised page must not reach.
-        for m in ["load", "teardown", "shutdown", "set-attribute"] {
+        // `tap.wait` rides this list for a different reason from the other four, and
+        // that is why it is asserted rather than merely absent: it is a *real* §10
+        // verb the daemon answers, excluded at introduction because a parked wait
+        // would hold the page's one connection's one waiting slot and refuse every
+        // other page verb for its duration (§10 clause 8, §15.56). An absence proves
+        // nothing about intent — a verb nobody added and a verb deliberately kept out
+        // look identical in a list — so the intent is pinned here.
+        for m in ["load", "teardown", "shutdown", "set-attribute", "tap.wait"] {
             let req = format!("{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"{m}\"}}");
             let v = rejection(&req);
             assert_eq!(v["id"], 3, "the rejection keeps the id for correlation");

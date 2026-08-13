@@ -19,8 +19,9 @@
 __pycache__/
 
 # The capability-blessed copy of `serial-nexus-devprep` (design §15.45). Installed by
-# `serial-nexus-devprep install`, restricted to mode 0700, and blessed with
-# `cap_dac_override+ep` by one `sudo setcap`. Never committed: a capability-carrying
+# `serial-nexus-devprep install`, restricted to mode 0700, and blessed by the one
+# `sudo setcap` the helper prints — the set is derived, never spelled here, because
+# this comment held a stale copy of it once already. Never committed: a capability-carrying
 # binary is machine state, the kernel strips the blessing on any rewrite anyway, and
 # each checkout must own its own copy rather than share one.
 /.snx-bin

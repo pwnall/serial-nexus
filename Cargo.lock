@@ -1033,6 +1033,7 @@ dependencies = [
  "libc",
  "nix",
  "proptest",
+ "regex-automata",
  "serde",
  "serde_json",
  "serial-nexus-codec-api",

@@ -1552,6 +1552,131 @@ impl Subscription {
     }
 }
 
+/// A control connection that can **park** — the harness's client for waiting verbs
+/// (`tap.wait`, `lock --wait`, a contended `send`).
+///
+/// [`Rpc::call`] cannot model one, for two independent reasons: it sets a 30 s read
+/// timeout and *panics* on expiry (by design — a transport failure must be loud), and
+/// it closes the connection after one exchange. A parked verb needs the opposite of
+/// both: an unbounded, caller-chosen deadline, and the write half held open for the
+/// whole wait, because §15.20 cancels a waiting verb on connection EOF and a
+/// half-close is indistinguishable from a killed client at read time.
+///
+/// It also keeps the connection *usable* while a verb is parked, which is what makes
+/// it the client for the two things a parked wait must be tested against: pipelining
+/// a second request behind it (refused with `-32006`, both surviving) and watching
+/// `tap.data` keep flowing past it (CTRLW-1). Lines that are not the response being
+/// waited for are stashed rather than dropped — see [`Self::take_pending`] — because
+/// a helper that silently ate notifications would make "the stream kept flowing" and
+/// "the stream stopped" look identical, which is the shape plan §3 rule 22 is about.
+///
+/// One helper rather than the per-file `LockWaiter` copies that preceded it (plan §18
+/// item 50's class): §16.5 makes assertion helpers shared and self-tested.
+pub struct WaitConn {
+    stream: UnixStream,
+    buf: Vec<u8>,
+    next_id: i64,
+    pending: Vec<Value>,
+}
+
+impl WaitConn {
+    /// Open a control connection and hold both halves.
+    pub fn connect(socket: &Path) -> WaitConn {
+        let stream = UnixStream::connect(socket)
+            .unwrap_or_else(|e| panic!("connect {}: {e}", socket.display()));
+        WaitConn {
+            stream,
+            buf: Vec::new(),
+            next_id: 1,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Send one request and return its id. Does **not** wait for the reply, which is
+    /// the whole point: the caller decides when, and how long, to wait.
+    pub fn send(&mut self, method: &str, params: Value) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut req = serde_json::Map::new();
+        req.insert("jsonrpc".into(), json!("2.0"));
+        req.insert("id".into(), json!(id));
+        req.insert("method".into(), json!(method));
+        if !params.is_null() {
+            req.insert("params".into(), params);
+        }
+        let line = format!("{}\n", Value::Object(req));
+        self.stream
+            .write_all(line.as_bytes())
+            .unwrap_or_else(|e| panic!("write `{method}`: {e}"));
+        self.stream.flush().expect("flush request");
+        id
+    }
+
+    /// Read lines until the response carrying `id` arrives, or `timeout` elapses.
+    ///
+    /// Returns the whole response object — `result` *or* `error` — because a parked
+    /// verb's interesting outcomes live on both sides and a helper that unwrapped one
+    /// would force every error assertion through a second path. Everything read on the
+    /// way (notifications, another request's reply) is stashed for
+    /// [`Self::take_pending`].
+    pub fn response(&mut self, id: i64, timeout: Duration) -> Option<Value> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let line = self.read_line_until(deadline)?;
+            let v: Value = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("control line is not JSON: {e}; raw={line:?}"));
+            if v.get("id").and_then(Value::as_i64) == Some(id) {
+                return Some(v);
+            }
+            self.pending.push(v);
+        }
+    }
+
+    /// Read whatever arrives next within `timeout`, response or notification.
+    pub fn next_line(&mut self, timeout: Duration) -> Option<Value> {
+        if !self.pending.is_empty() {
+            return Some(self.pending.remove(0));
+        }
+        let line = self.read_line_until(Instant::now() + timeout)?;
+        Some(
+            serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("control line is not JSON: {e}; raw={line:?}")),
+        )
+    }
+
+    /// Everything read while waiting for some other response — the notifications a
+    /// test asserts kept flowing past a parked verb.
+    pub fn take_pending(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Cancel every verb parked on this connection by closing it — §15.20's
+    /// cancel-on-disconnect, which the daemon must observe.
+    pub fn cancel(self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    fn read_line_until(&mut self, deadline: Instant) -> Option<String> {
+        loop {
+            if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=pos).collect();
+                return Some(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            self.stream.set_read_timeout(Some(deadline - now)).ok();
+            let mut tmp = [0u8; 8192];
+            match self.stream.read(&mut tmp) {
+                Ok(0) => return None,
+                Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                Err(_) => return None, // WouldBlock/TimedOut/closed
+            }
+        }
+    }
+}
+
 /// A cross-wired serial pair — the two ends are each other's target (the no-target
 /// doctrine). Backed by a `serial-nexus-sim nullmodem` (two crossed pts), which is **lossless**
 /// — byte-exact behavior tests require that. It is deliberately Linux-only:
@@ -1917,7 +2042,28 @@ pub fn blessed_devprep_helper() -> Result<PathBuf, String> {
             path.display()
         )
     })?;
-    if json["cap_dac_override_effective"] == serde_json::Value::Bool(true) {
+    // **The whole capability set, not the first bit** (§15.55). This read
+    // `cap_dac_override_effective` alone until 2026-08-12, so a copy blessed with
+    // only that capability — a pre-§15.55 blessing, or a hand-typed `setcap` —
+    // passed as blessed here, and the rig lane then proceeded to `cycle`, whose
+    // grant step silently did nothing (it prints its note only outside `--json`,
+    // plan §18 item 52), and every test that opened the recreated node failed
+    // `Permission denied`: notes §3.79's eight-failure signature, which §15.55
+    // exists to remove. `can_grant_device_access` is the field that answers the
+    // question the caller is really asking, and nothing read it.
+    let can_replug = json["cap_dac_override_effective"] == serde_json::Value::Bool(true);
+    let can_grant = json["can_grant_device_access"] == serde_json::Value::Bool(true);
+    if can_replug && !can_grant {
+        return Err(format!(
+            "{} is blessed for the replug but not for the access grant \
+             (`cap_dac_override` yes, `cap_fowner` no — §15.55). A cycle would succeed \
+             and leave every recreated node root:dialout, so the tests that follow would \
+             fail `Permission denied` for a reason that has nothing to do with them. \
+             Re-run `scripts/bless`, which applies the derived full set.",
+            path.display()
+        ));
+    }
+    if can_replug {
         // Blessed — but is it the *current* helper? The capability check cannot
         // tell: a copy blessed before an edit is fully functional and runs the old
         // code, so a test would silently measure a helper that no longer exists in

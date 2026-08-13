@@ -64,6 +64,15 @@ serial2 = "0.2"
 nix = { version = "0.31", default-features = false }
 libc = "0.2"
 
+# The pattern wait's matcher (§10, §15.56): a linear-time, non-backtracking engine,
+# because patterns compile and match on the runtime thread that runs every console,
+# where a backtracking engine would be an operator-reachable denial of service. This
+# whole family — regex-automata, aho-corasick, memchr, regex-syntax — was already in
+# the lockfile transitively (tracing-subscriber → matchers) under permissive
+# licenses, so the matcher adds **zero** new lockfile packages; what it adds is the
+# new *direct* dependency edge §15.56 records as the reviewed decision.
+regex-automata = "0.4"
+
 # Property testing (dev-dependency in serial-nexus-core / serial-nexus-codec-api).
 proptest = "1"
 

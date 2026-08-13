@@ -69,6 +69,7 @@ pub mod app_errors {
     pub const HAS_EDGES: i64 = AppError::HasEdges.code();
     pub const DEVICE_ABSENT: i64 = AppError::DeviceAbsent.code();
     pub const EDGE_INBOX_FULL: i64 = AppError::EdgeInboxFull.code();
+    pub const ENDPOINT_GONE: i64 = AppError::EndpointGone.code();
 }
 
 #[derive(Default)]
@@ -607,6 +608,14 @@ impl Daemon {
             // The stream itself is served by the connection task (control.rs);
             // dispatch just acknowledges the subscription (§10).
             "subscribe" => Ok(json!({ "subscribed": true })),
+            // The pattern wait (§10, §15.56). Unlike `tap.open`/`tap.close` — which
+            // control.rs handles before dispatch because they need the *connection's*
+            // outbound tap channel — a wait needs nothing connection-scoped: it
+            // observes through the hub and answers on its own reply. Landing here is
+            // therefore what makes it a waiting verb on §15.20's machinery for free:
+            // the connection's one in-flight slot, the pipelined-request refusal, and
+            // cancel-on-EOF all come from the lane it runs in.
+            "tap.wait" => self.tap_wait(params).await,
             "rotate" => self.rotate(params),
             "send-break" => self.send_break(params).await,
             "set-modem" => self.set_modem(params),
@@ -1497,6 +1506,14 @@ impl Daemon {
             // nobody can reach is not. Reported here where it is always reachable, and
             // still mirrored onto each tap for compatibility.
             let mut endpoints = Vec::new();
+            // Armed pattern waits (§10 clause 7: "visible in `state` for its
+            // lifetime, as taps are"). A separate array rather than a field on the
+            // tap objects, because a wait is not a tap: it opens no channel, drops no
+            // bytes, and belongs to no `tap.close`. What it shares with a tap is that
+            // it observes — which is why it appears here at all, and why an operator
+            // reading a quiet console can tell "nobody is watching" from "something
+            // is watching and has seen nothing".
+            let mut waits = Vec::new();
             // Sorted, so `state` reads the same twice running rather than in
             // `HashMap` order.
             let mut hubs: Vec<_> = st.tap_hubs.iter().collect();
@@ -1507,6 +1524,7 @@ impl Daemon {
                     "endpoint": endpoint,
                     "feed_dropped": snap.feed_dropped,
                     "taps": snap.taps.len(),
+                    "waits": snap.waits.len(),
                 }));
                 for (id, dropped) in snap.taps {
                     taps.push(json!({
@@ -1516,8 +1534,17 @@ impl Daemon {
                         "feed_dropped": snap.feed_dropped,
                     }));
                 }
+                for w in snap.waits {
+                    waits.push(json!({
+                        "wait": w.id,
+                        "endpoint": endpoint,
+                        "patterns": w.patterns,
+                        "bytes_scanned": w.bytes_scanned,
+                        "gaps": w.gaps,
+                    }));
+                }
             }
-            json!({ "nodes": nodes, "taps": taps, "endpoints": endpoints })
+            json!({ "nodes": nodes, "taps": taps, "endpoints": endpoints, "waits": waits })
         })
     }
 
@@ -1581,6 +1608,153 @@ impl Daemon {
             });
             Ok((result, crate::tap::OpenTap { tap_id, hub }))
         })
+    }
+
+    /// `tap.wait` (§10 *The pattern wait*, §15.56): park until one of the caller's
+    /// named byte patterns appears on `endpoint`'s hostward stream, the deadline
+    /// expires, or the graph drops the endpoint.
+    ///
+    /// **A wait is §15.20's machinery, unchanged** (§10 clause 1). It reaches this
+    /// function through the ordinary dispatch lane, so it becomes the connection's
+    /// one in-flight verb for free: a request pipelined behind it is refused with
+    /// [`AppError::WaitInFlight`] while the wait, this connection's taps and its
+    /// subscription all keep running, and connection EOF cancels it by dropping this
+    /// future. It suspends between transitions holding nothing — [`CriticalCell`]
+    /// makes that a compile-shape fact, since neither `with_mut` below can contain
+    /// the `.await`.
+    ///
+    /// **Expiry never consumes, trivially, because the wait is a spy** (§10 clause
+    /// 1). Arming, matching, timing out and cancelling leave the ring, the tap
+    /// counters and the graph exactly as a never-issued wait would have; the only
+    /// thing an armed wait changes is the hub's `active` flag, which is what makes it
+    /// *observe* (§10 clause 7) and which [`WaitGuard`] restores on every exit path.
+    ///
+    /// **The two outcomes are different kinds on purpose** (§10 clause 6): a
+    /// deadline answers a **result** with `timed_out: true` beside the scan and gap
+    /// counters, because "no pattern appeared within the deadline" is an answer and a
+    /// verdict never leaves a deadline unnamed (plan §3); a teardown answers an
+    /// **error**, because the stream the caller asked about stopped existing and a
+    /// timeout would claim it was watched throughout.
+    async fn tap_wait(&self, params: Option<Value>) -> Result<Value, RpcError> {
+        // Every maximum, checked before anything is armed (§10 clause 2, §16.12) —
+        // including the compile, whose ceiling is the one an operator input could
+        // otherwise choose (§7.1's range-check-before-assert shape).
+        let spec = parse_wait_params(&params)?;
+        let matcher = crate::pattern::Matcher::compile(&spec.patterns)
+            .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+
+        let (hub, id) = self.state.with_mut(|st| {
+            let hub = st.tap_hubs.get(&spec.endpoint).cloned().ok_or_else(|| {
+                RpcError::invalid_params(format!(
+                    "no host-facing endpoint {:?} to wait on",
+                    spec.endpoint
+                ))
+            })?;
+            // One allocator with `tap.open`, deliberately: an id on the observation
+            // surface then names exactly one observer, whichever kind it is, and is
+            // never reused within a daemon's life.
+            let id = st.next_tap_id.get();
+            st.next_tap_id.set(id + 1);
+            Ok::<_, RpcError>((hub, id))
+        })?;
+
+        // The ring scan and the live arming, in one critical section (§10 clause 5).
+        let armed =
+            hub.with_mut(|h| h.arm_wait(id, matcher, spec.lookback, spec.context, spec.replay));
+        let rx = match armed {
+            crate::tap::Armed::AlreadyMatched {
+                matched,
+                accounting,
+            } => {
+                return Ok(wait_result(
+                    &spec.endpoint,
+                    Some(&matched),
+                    &accounting,
+                    false,
+                ));
+            }
+            crate::tap::Armed::Parked(rx) => rx,
+        };
+        // Armed from here on: the guard disarms on **every** path out of this
+        // function, including the one that runs no code in it — the connection
+        // dropping this future (§15.20 cancel-on-disconnect).
+        let guard = WaitGuard { hub, id };
+
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(spec.timeout_ms);
+        let mut rx = rx;
+        tokio::select! {
+            // **`biased`, and the settled arm first.** Without it `select!` picks at
+            // random among arms ready in the same poll, so a match the hub delivered
+            // *before* the deadline could be answered `timed_out: true` — a wrong
+            // verdict, not merely a late one, and the caller has no way to tell. With
+            // the bias, a value already in the channel always wins, and because both
+            // halves run on the one runtime thread there is no window left: the hub
+            // cannot fire between this poll and the timeout arm's body.
+            biased;
+
+            end = &mut rx => match end {
+                Ok(crate::tap::WaitEnd::Matched { matched, accounting }) => {
+                    Ok(wait_result(&spec.endpoint, Some(&matched), &accounting, false))
+                }
+                Ok(crate::tap::WaitEnd::Closed { reason, accounting }) => {
+                    Err(RpcError::new(
+                        app_errors::ENDPOINT_GONE,
+                        format!(
+                            "endpoint {:?} went away while waiting ({})",
+                            spec.endpoint,
+                            reason.as_str()
+                        ),
+                    )
+                    .with_data(wait_accounting_json(&accounting)))
+                }
+                // The hub dropped its sender without sending — it was destroyed
+                // without a `detach_all`, which the three removal paths all run. Not
+                // reachable today; answered rather than swallowed, because a wait
+                // that returns nothing is the one failure a caller cannot diagnose.
+                Err(_) => Err(RpcError::new(
+                    app_errors::ENDPOINT_GONE,
+                    format!("endpoint {:?} went away while waiting", spec.endpoint),
+                )),
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                // Disarm *here* rather than leaving it to the guard, because the
+                // result needs the accounting the disarm returns.
+                match guard.disarm() {
+                    Some(accounting) => {
+                        Ok(wait_result(&spec.endpoint, None, &accounting, true))
+                    }
+                    // `None` means the wait had already left the hub — it matched, or
+                    // `detach_all` swept it. The outcome is then sitting in the
+                    // channel, so **take it** rather than reporting a timeout: the
+                    // `biased` arm above makes this unreachable on one thread, and it
+                    // is handled anyway because the alternative is the one answer that
+                    // is worse than any error — a `timed_out: true` with zeroed
+                    // counters, which claims both that nothing matched and that
+                    // nothing was scanned, neither of which is true.
+                    None => match rx.try_recv() {
+                        Ok(crate::tap::WaitEnd::Matched { matched, accounting }) => Ok(
+                            wait_result(&spec.endpoint, Some(&matched), &accounting, false),
+                        ),
+                        Ok(crate::tap::WaitEnd::Closed { reason, accounting }) => Err(
+                            RpcError::new(
+                                app_errors::ENDPOINT_GONE,
+                                format!(
+                                    "endpoint {:?} went away while waiting ({})",
+                                    spec.endpoint,
+                                    reason.as_str()
+                                ),
+                            )
+                            .with_data(wait_accounting_json(&accounting)),
+                        ),
+                        Err(_) => Err(RpcError::new(
+                            app_errors::ENDPOINT_GONE,
+                            format!("endpoint {:?} went away while waiting", spec.endpoint),
+                        )),
+                    },
+                }
+            }
+        }
     }
 
     /// `info` (§10/§15.26): the daemon's capability surface — its version, the wire
@@ -2380,6 +2554,36 @@ impl Drop for WaiterGuard {
     }
 }
 
+/// A parked `tap.wait`'s registration on its hub. Dropping it disarms the wait —
+/// on the deadline, on connection EOF (which drops the dispatch future without
+/// running a line of this verb), and on any early return — so §15.20's
+/// cancel-on-disconnect and §10 clause 1's "expiry never consumes" are properties of
+/// the type rather than of remembering.
+///
+/// Idempotent by construction: [`crate::tap::TapHub::disarm`] answers `None` for a
+/// wait that already fired or was swept by `detach_all`, so the guard racing the hub
+/// costs nothing and cannot double-remove.
+struct WaitGuard {
+    hub: crate::tap::SharedTapHub,
+    id: u64,
+}
+
+impl WaitGuard {
+    /// Disarm now and take the accounting — the deadline path, which needs the
+    /// counters for its result.
+    fn disarm(&self) -> Option<crate::tap::WaitAccounting> {
+        self.hub.with_mut(|h| h.disarm(self.id))
+    }
+}
+
+impl Drop for WaitGuard {
+    fn drop(&mut self) {
+        self.hub.with_mut(|h| {
+            h.disarm(self.id);
+        });
+    }
+}
+
 /// A `send`'s transient origin registration. While armed, dropping it removes the
 /// synthetic origin (releasing the lock if it held it) and wakes the next waiter —
 /// so a `send` that times out or whose connection drops leaves no phantom origin
@@ -2729,6 +2933,176 @@ fn bool_param(params: &Option<Value>, key: &str) -> Result<Option<bool>, RpcErro
     }
 }
 
+/// Parse and range-check a `tap.wait` request (§10 clause 2, §16.12).
+///
+/// **Everything is checked here, before anything is armed** — the shape §7.1 calls
+/// range-check-before-assert. A wait that armed first and validated second would
+/// have flipped its endpoint's mirror on for a request it was about to refuse, which
+/// is a counter moving for a verb that never ran.
+///
+/// The two pattern kinds are structural — a pattern object carries exactly one of
+/// `literal` or `regex` — rather than a `kind` string beside a `pattern` field. A
+/// misspelled `kind` in the string form is a silent reinterpretation of the caller's
+/// bytes; here it is a refusal that names the field.
+fn parse_wait_params(params: &Option<Value>) -> Result<crate::pattern::WaitSpec, RpcError> {
+    use crate::pattern::{
+        DEFAULT_CONTEXT, DEFAULT_LOOKBACK, MAX_CONTEXT, MAX_LOOKBACK, MAX_PATTERNS, MAX_WAIT_MS,
+        PatternKind, PatternSpec, checked, min_lookback,
+    };
+
+    let endpoint = str_param(params, "endpoint")?.to_owned();
+    let replay = bool_param(params, "replay")?.unwrap_or(false);
+
+    // The deadline is **required**, deliberately. A pattern wait occupies its
+    // connection's one waiting slot (§15.20 clause 5) and answers a *typed* expiry
+    // (§10 clause 6), so a wait with no stated deadline is a wait that can hold that
+    // slot forever and can never produce the `timed_out: true` half of its own
+    // contract. `lock --wait` may go without one because a lock is eventually
+    // granted by someone; a console may simply never say the word.
+    let timeout_ms = u64_param(params, "timeout_ms")?.ok_or_else(|| {
+        RpcError::invalid_params(
+            "'timeout_ms' is required: a pattern wait answers a typed deadline (§10), and a \
+             wait with none would hold this connection's one waiting slot forever",
+        )
+    })?;
+    let timeout_ms = checked("timeout_ms", timeout_ms, MAX_WAIT_MS)
+        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let context = checked(
+        "context",
+        u64_param(params, "context")?.unwrap_or(DEFAULT_CONTEXT as u64),
+        MAX_CONTEXT as u64,
+    )
+    .map_err(|e| RpcError::invalid_params(e.to_string()))? as usize;
+
+    let raw = params
+        .as_ref()
+        .and_then(|p| p.get("patterns"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "'patterns' must be an array of 1 to {MAX_PATTERNS} pattern objects"
+            ))
+        })?;
+    let mut patterns = Vec::with_capacity(raw.len());
+    for (i, p) in raw.iter().enumerate() {
+        let name = p
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params(format!("patterns[{i}] has no 'name' string")))?
+            .to_owned();
+        let (kind, encoded) = match (p.get("literal"), p.get("regex")) {
+            (Some(v), None) => (PatternKind::Literal, v),
+            (None, Some(v)) => (PatternKind::Regex, v),
+            (Some(_), Some(_)) => {
+                return Err(RpcError::invalid_params(format!(
+                    "patterns[{i}] ({name:?}) carries both 'literal' and 'regex'; a pattern is one \
+                     or the other"
+                )));
+            }
+            (None, None) => {
+                return Err(RpcError::invalid_params(format!(
+                    "patterns[{i}] ({name:?}) carries neither 'literal' nor 'regex'"
+                )));
+            }
+        };
+        // Both ride the wire base64-encoded, because console output is not
+        // guaranteed UTF-8 and neither is a pattern over it (§10 clause 2).
+        let encoded = encoded.as_str().ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "patterns[{i}] ({name:?}) '{}' must be a base64 string",
+                kind.as_str()
+            ))
+        })?;
+        let bytes = serial_nexus_rpc::base64_decode(encoded).ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "patterns[{i}] ({name:?}) '{}' is not valid base64",
+                kind.as_str()
+            ))
+        })?;
+        patterns.push(PatternSpec { name, kind, bytes });
+    }
+
+    // The lookback is checked **after** the patterns, because its floor is derived
+    // from them: a window shorter than a pattern cannot hold that pattern, and the
+    // clause-4 cross-frame guarantee would then be silently false rather than merely
+    // narrow (see `min_lookback`). Both ends are refused here, before anything arms.
+    let lookback = checked(
+        "lookback",
+        u64_param(params, "lookback")?.unwrap_or(DEFAULT_LOOKBACK as u64),
+        MAX_LOOKBACK as u64,
+    )
+    .map_err(|e| RpcError::invalid_params(e.to_string()))? as usize;
+    let floor = min_lookback(&patterns);
+    if lookback < floor {
+        return Err(RpcError::invalid_params(
+            crate::pattern::PatternError::LookbackTooSmall {
+                value: lookback,
+                min: floor,
+            }
+            .to_string(),
+        ));
+    }
+
+    Ok(crate::pattern::WaitSpec {
+        endpoint,
+        patterns,
+        replay,
+        lookback,
+        context,
+        timeout_ms,
+    })
+}
+
+/// The scan and gap counters, shared by the timeout *result* and the teardown
+/// *error*'s `data` — one shape, so a caller reads the same fields whichever way its
+/// wait ended (§10 clause 6).
+fn wait_accounting_json(a: &crate::tap::WaitAccounting) -> Value {
+    json!({
+        "bytes_scanned": a.bytes_scanned,
+        "gaps": a.gaps,
+        "gap_bytes": a.gap_bytes,
+        "from_offset": a.from_offset,
+        "epoch": a.epoch,
+        "replay_scanned": a.replay_scanned,
+    })
+}
+
+/// Build a `tap.wait` result (§10 clause 6).
+///
+/// `matched` is `null` on expiry rather than the reply being an error, because a
+/// deadline is an answer (§15.56's result-shaped-timeout decision), and it rides
+/// **the parked request's reply** rather than a notification, because a match
+/// broadcast on the notification stream would reach every `subscribe` consumer
+/// (§15.56's decline).
+fn wait_result(
+    endpoint: &str,
+    matched: Option<&crate::pattern::PatternMatch>,
+    accounting: &crate::tap::WaitAccounting,
+    timed_out: bool,
+) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("endpoint".into(), json!(endpoint));
+    obj.insert("timed_out".into(), json!(timed_out));
+    obj.insert(
+        "matched".into(),
+        match matched {
+            None => Value::Null,
+            Some(m) => json!({
+                "pattern": m.pattern,
+                "offset": m.offset,
+                "end_offset": m.end_offset,
+                // Base64, like every other console-byte payload on this surface
+                // (§10 clause 2): the context is a slice of a stream the design
+                // explicitly does not assume is text.
+                "context": serial_nexus_rpc::base64_encode(&m.context),
+                "context_offset": m.context_offset,
+            }),
+        },
+    );
+    merge_into(&mut obj, wait_accounting_json(accounting));
+    Value::Object(obj)
+}
+
 /// Extract the required `origin` string from an `unlock` request's params.
 fn origin_param(params: &Option<Value>) -> Result<&str, RpcError> {
     str_param(params, "origin")
@@ -3036,7 +3410,7 @@ mod tests {
         assert_eq!(state["taps"], json!([]), "no tap is open");
         assert_eq!(
             state["endpoints"],
-            json!([{ "endpoint": "usb0", "feed_dropped": 4096, "taps": 0 }]),
+            json!([{ "endpoint": "usb0", "feed_dropped": 4096, "taps": 0, "waits": 0 }]),
             "the endpoint's own loss must be reachable without a tap"
         );
     }

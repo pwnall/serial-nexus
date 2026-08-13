@@ -332,7 +332,7 @@ pub enum AppError {
     /// `add-node` by raw path/serial with the device absent (§12).
     DeviceAbsent,
     /// A request arrived on a connection whose waiting verb (`lock --wait`,
-    /// `send`) is still parked. §15.20 runs one waiting verb per connection; the
+    /// `send`, `tap.wait`) is still parked. §15.20 runs one waiting verb per connection; the
     /// pipelined request is refused so the wait survives, because the alternative
     /// the review found was silence — the connection died with no reply to either
     /// request, taking a web console's subscription and taps with it (CTRL-1).
@@ -344,6 +344,16 @@ pub enum AppError {
     /// which are properties of the request or the graph rather than of the moment
     /// (37-DATA-1).
     EdgeInboxFull,
+    /// A parked `tap.wait` ended because the graph dropped its endpoint —
+    /// `teardown`, `load --replace`, `remove-node` (§10 *The pattern wait*, clause
+    /// 6). Deliberately **not** the deadline: expiry is a typed *result*
+    /// (`timed_out: true`), because "no pattern appeared within the deadline" is an
+    /// answer about a stream that was watched throughout, while this says the stream
+    /// stopped existing. Collapsing the two would let a caller retry a wait on an
+    /// endpoint that is gone, forever. `data` carries the same scan and gap counters
+    /// the timeout result does, so the caller learns how much of the stream the
+    /// abandoned wait did cover.
+    EndpointGone,
 }
 
 impl AppError {
@@ -356,6 +366,7 @@ impl AppError {
         AppError::DeviceAbsent,
         AppError::WaitInFlight,
         AppError::EdgeInboxFull,
+        AppError::EndpointGone,
     ];
 
     /// The numeric code, offset from [`error_codes::APP_ERROR_BASE`].
@@ -369,6 +380,7 @@ impl AppError {
                 AppError::DeviceAbsent => 5,
                 AppError::WaitInFlight => 6,
                 AppError::EdgeInboxFull => 7,
+                AppError::EndpointGone => 8,
             }
     }
 
@@ -382,6 +394,7 @@ impl AppError {
             AppError::DeviceAbsent => "device absent",
             AppError::WaitInFlight => "waiting verb in flight",
             AppError::EdgeInboxFull => "edge inbox full",
+            AppError::EndpointGone => "endpoint gone",
         }
     }
 
@@ -406,6 +419,9 @@ impl AppError {
             }
             AppError::EdgeInboxFull => {
                 "`connect` refused: the target-facing endpoint has not drained the hostward receivers of its earlier edges yet. Transient — nothing changed, retry"
+            }
+            AppError::EndpointGone => {
+                "a parked `tap.wait` ended because the graph dropped its endpoint (`teardown`, `load --replace`, `remove-node`) — distinct from the deadline, which is a typed *result* (`timed_out: true`) rather than an error; `data` carries the scan and gap counters the wait did cover"
             }
         }
     }

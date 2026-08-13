@@ -12,9 +12,15 @@ append-only and never reused, and plan §18 carries each item's state, evidence,
 Of items 16–46: **23, 32, 33, 34, 35, 37, 39, 40, 43 and 44 were executed 2026-08-12** by the
 alignment pass that ran the v16 pair against the *tree* (notes §3.75; 460 clauses checked,
 nineteen deviations confirmed and repaired, two refuted), which also filed items 45 and 46; the
-rest remain open. **The v17 revision (2026-08-12) files items 47–55**: item 47 is the pattern wait
-(§10, §15.56) — the one design-ahead-of-tree construction item — and 48–55 are the residuals
-and hardenings its input digest surfaced; all are open at filing.
+rest remain open. **The v17 revision (2026-08-12) filed items 47–55**: item 47 was the pattern
+wait (§10, §15.56) — the one design-ahead-of-tree construction item — and 48–55 are the
+residuals and hardenings its input digest surfaced. **Item 47 was executed later the same day**
+(notes §3.83), so the design is no longer ahead of the tree at any surface; one of its filed
+clauses deviated with the reason recorded (the CLI's exit-code numbering — see the item).
+48–55 remain open. The same session ran the v17 pair against the *tree* and repaired six
+confirmed deviations (notes §3.82) — four narrative sites still promising the pre-§15.55
+one-capability bound, plus one over-stated plan rule and one design figure — and closed the
+narrowness hole those sites pointed at.
 The two-test whole-suite flake the Linux figure used to be quoted beside is closed (notes §3.70):
 a re-enumerated FT232R eats the first 64 bytes — one USB bulk packet — of the first traffic that
 crosses afterwards, every daemon-side counter reads 0, and it was never a product defect.
@@ -25,10 +31,12 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 
 | Figure | Scope | Date | Commit / record | Caveat |
 |---|---|---|---|---|
-| **894 passing · 1 failed · 6 ignored**, 121 test-result lines | Linux, default CI scope, `--no-fail-fast` | 2026-08-12 | the v17 landing's gate run (notes, the v17 generation entry) | the one failure is `p3_idle_cost::thirty_two_idle_tty_fds_stay_under_the_recorded_cpu_budget` at **3.80 %** against its 3.50 % tripwire — item 46's recorded signature verbatim (its message prints "38 ticks over 10s"), reproduced in two of this landing's three suite runs (once under deliberate parallel load, once on a quiet box at load 0.33) and absent in the first; the product tree is unchanged by v17 (documents, two meta-gate consts, one harness message string), so this is item 46 resurfacing, never a fresh finding. Supersedes the 890 row as the default-scope authority; the total moved 896 → 901 because the 2026-08-12 rig session's later commits added tests after that row was taken. The Linux authority row. |
+| **931 passing · 1 failed · 6 ignored**, 122 test-result lines | Linux, default CI scope, `--no-fail-fast`, `--nocapture` | 2026-08-12 | the item-47 landing (notes §3.83) | **the Linux authority row**, superseding the 894 below. 122 result lines over **118 cargo targets** (110 `Running` + 8 doc-test) and **12 self-skips**, measured with `--nocapture` (notes §3.78). The +37 over the 894 row is exactly this session's new tests, counted rather than estimated: **22** matcher units (`daemon/src/pattern.rs`, a new file), **12** pattern-wait acceptance guards (`itest/tests/p12_pattern_wait.rs`, a new file), **2** hub guards added to `daemon/src/tap.rs` (11 → 13) and **1** devprep capability-fold guard (1 → 2). Both ends were measured in this session, so the delta is quotable. **An earlier row here read 925 and decomposed it as 19+11+1**; that figure was taken before the adversarial review's fixes added six guards, and its decomposition was wrong by one even for its own tree — recorded because a Status row whose arithmetic does not close is exactly what this table's scope discipline exists to prevent. The one failure is `p3_idle_cost::thirty_two_idle_tty_fds_stay_under_the_recorded_cpu_budget` at **4.10 %** against its 3.50 % tripwire: item 46, and **measured not to be this change's** — runs on this tree read 3.70/3.70/3.90/4.10 %, and three runs on the unchanged tree (a `git worktree` at `849fc8e` with its own target dir, same box, same session) read 3.80/4.30/3.90 %, so the two trees sit in one band and the pattern wait adds no idle-path work (it runs inside `TapHub::ingest`, which an idle endpoint never reaches). |
+| **894 passing · 1 failed · 6 ignored**, 121 test-result lines | Linux, default CI scope, `--no-fail-fast` | 2026-08-12 | the v17 landing's gate run (notes, the v17 generation entry) | the one failure is `p3_idle_cost::thirty_two_idle_tty_fds_stay_under_the_recorded_cpu_budget` at **3.80 %** against its 3.50 % tripwire — item 46's recorded signature verbatim (its message prints "38 ticks over 10s"), reproduced in two of this landing's three suite runs (once under deliberate parallel load, once on a quiet box at load 0.33) and absent in the first; the product tree is unchanged by v17 (documents, two meta-gate consts, one harness message string), so this is item 46 resurfacing, never a fresh finding. Supersedes the 890 row as the default-scope authority; the total moved 896 → 901 because the 2026-08-12 rig session's later commits added tests after that row was taken. **Superseded by the 925 row above**, taken later the same day at the same scope, which is the current Linux authority. |
 | **890 passing · 0 failed · 6 ignored**, of which **886 · 0 · 6** are workspace-own | Linux, default CI scope | 2026-08-12 | this session (notes §3.75) | 121 test-result lines over **117 cargo targets** (109 `Running` + 8 doc-test), and **12 self-skips**, measured with `--nocapture` (notes §3.78 — at default capture the count reads 0 because `cargo test` captures a *passing* test's stderr, so "zero SKIP lines" beside a figure taken without it asserts nothing); four passes and two lines are the nested `acme-codec` **and `tinymux-codec`** subprocesses (`p8_external_codec.rs`, which now builds and tests both template crates); rig attached but `SNX_CROSSOVER_A`/`_B` unexported, so `serial_hardware` self-skipped. The `ignored` moved 4 → 6 for a documentation reason, not a coverage one: the two new kit suites carry ```ignore` doc examples like their four siblings. Superseded by the v17 landing row above. |
 | **852 passing · 0 failed · 4 ignored**, of which **850 · 0 · 4** are workspace-own | Linux, default CI scope | 2026-08-07 | v15 Status re-measure; no sha recorded | 116 test-result lines over 114 cargo targets; its "zero SKIP lines" is **withdrawn** — it was taken at default capture, where the count is 0 whatever skipped (notes §3.78). Two passes and two lines are the nested `acme-codec` subprocess (`p8_external_codec.rs`). Superseded by the row above; kept because the delta between them was measured in one session at one scope. |
-| **894 passing · 1 failed · 6 ignored**, four self-skips | Linux, **rig lane minus `SNX_RIG_FLOW` and `SNX_WEB_UI`** | 2026-08-12 | this session (notes §3.80) | the rig-lane authority row, and the first green one in this record. Both exclusions are measurements, not conveniences: this box has no `node`, and the bench **measures 3-wire**, which §15.52 makes a legitimate answer — so the two `rts-cts` end-to-end tests skip with their reading printed. The one failure is `p3_idle_cost` (item 46), unrelated to the rig. Every hardware test passed, `identity_survives_a_replug_that_renumbers_the_tty` for the first time ever. |
+| **931 passing · 1 failed · 6 ignored**, four self-skips | Linux, **rig lane minus `SNX_RIG_FLOW` and `SNX_WEB_UI`** | 2026-08-12 | the item-47 landing (notes §3.83) | **the rig-lane authority row**, superseding the 894 below and equal to this session's default-scope figure. Run against a freshly `scripts/bless`ed helper (the operator ran it mid-session; an earlier lane was discarded rather than recorded, because the helper binary was replaced underneath it). Every hardware test passed — both replug tests including `identity_survives_a_replug_that_renumbers_the_tty`, all five crossover tests, `web_tls_round_trip` under `SNX_TLS=required`. The two named drops are measurements taken *in this run*, not conveniences: the four self-skips are the two `rts-cts` tests, which print the reading that justifies them (`port1 RTS high -> port0 cts:false`, low -> `cts:false` — a **3-wire** bench, §15.52's legitimate answer and the third independent confirmation of it), and the two browser tests, on a box with no `node`. The one failure is `p3_idle_cost` (item 46), unrelated to the rig. **One lane before this one hung** and is recorded rather than quietly re-run — see the note under this table. |
+| **894 passing · 1 failed · 6 ignored**, four self-skips | Linux, **rig lane minus `SNX_RIG_FLOW` and `SNX_WEB_UI`** | 2026-08-12 | this session (notes §3.80) | the rig-lane authority row, and the first green one in this record. Both exclusions are measurements, not conveniences: this box has no `node`, and the bench **measures 3-wire**, which §15.52 makes a legitimate answer — so the two `rts-cts` end-to-end tests skip with their reading printed. The one failure is `p3_idle_cost` (item 46), unrelated to the rig. Every hardware test passed, `identity_survives_a_replug_that_renumbers_the_tty` for the first time ever. **Superseded by the 925 rig row above**, taken later the same day at the same scope. |
 | **835 passing · 0 failed · 4 ignored** | Linux, rig lane — and again at default CI scope, same session | 2026-08-05 | `17c6e87` (notes §3.68) | twice on the full rig lane, once at default CI scope, 835/0/4 each time — the last dual-scope measurement; superseded by the 852 re-measure of 2026-08-07; not the current-tree figure. **Attribution unreconciled (v17):** notes §3.68's verbatim session record reads 830 (gates scope) and 834/0 · 833/1 (rig lane), and no 835 appears in it — the figure survives only as a v15 Status-table quotation (the re-cited-not-re-derived class), so neither the number nor the dual-scope equivalence is attributable to §3.68. Superseded either way. |
 | **860 passing · 0 failed · 6 ignored** | **whole workspace (macOS)**, CI `macos-*` arm64 runner | 2026-08-12 | CI run 31605283603, job 94144842458 (notes §3.76) | the macOS authority row, and the first green macOS lane in this record. No exclusions — CI runs `cargo test --workspace --locked --no-fail-fast`. The skip count is **not stated**: CI does not pass `--nocapture`, so it cannot be read from that log (notes §3.78). The preceding run read 859 · 1 · 6 at the same tree; its one failure is `a_client_clearing_extproc_has_it_re_asserted_so_changes_keep_surfacing`, which asserted Linux's EXTPROC retention on both kernels and is repaired in the same commit as this row; it is the *pre-fix* reading, kept because it is the measurement that found the defect. Not the x86_64 rig box — three machines, none substituting for another (plan §18 item 18). |
 | **760 passing · 1 failed · 4 ignored** | macOS, gate scope **plus** `--exclude serial-nexus-devprep` | 2026-08-05 | `60b9d0f` (notes §3.65) | not the documented scope — quote it with both exclusions. Superseded by the row above; its one failure was the `rts-cts` platform gap §15.53 has since turned into an assertion of refusal. |
@@ -38,6 +46,19 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 104 versus 106 `Running` lines because they were taken at different eras, not because either was
 wrong. Measured once on this tree: **109 `Running` + 8 doc-test = 117 cargo targets**, against 121
 `test result:` lines. The four-line gap is the nested template subprocesses.
+
+**One rig lane hung and is recorded, not buried.** Between the two rig runs above, a lane stalled
+39 minutes on `p6_outage::outage_faults_then_purges_then_recovers_byte_clean` — the receiving leg
+sat `waiting` with "peer disconnected; awaiting reconnect" and `reconnect_count: 2` while the box
+idled at load 0.19. It is recorded because a lane that is killed and re-run without a note is
+indistinguishable from a lane that never hung. **Not attributed to the pattern wait**, and the
+attribution is measured rather than asserted: the same test passed in the same session's
+default-scope run on the same binaries, passed in the preceding rig lane, and passes **5 of 5**
+in isolation at full rig scope (~4 s each); nothing in the change touches `leg.rs` or the outage
+path. The shape points at whole-suite parallelism around loopback port reuse — this file's own
+sibling test is named `a_refused_listen_bind_retries_until_the_address_frees` — which is a
+pre-existing harness hazard, not a finding this session can close. Neither is it dismissed: one
+unreproduced hang is exactly the evidence AGENTS §8 says not to reason from.
 
 Two rows need sentences no cell can hold. The equivalence claim: a dual-scope equality was
 recorded only at the 835 era (row three), and v17 finds even that attribution unreconciled with
@@ -424,9 +445,13 @@ on each rule is what stops re-litigation.
     than a missing one, because it is counted as coverage (AGENTS §3's "prove the matcher").
     Spellings include every *verdict arm* a clause can meet — `supported`, `degraded`, `skipped`
     — not only textual variants (notes §3.64: `degraded` was the third spelling, and the one a
-    real rig produces); and a walker's skip list is a matcher too — directories are skipped by
-    the is-a-checkout predicate (a `.git` entry exists: a worktree leaves a file, a clone a
-    directory), never by name lists.
+    real rig produces); and a walker's skip list is a matcher too — a **nested checkout** is
+    skipped by the is-a-checkout predicate (a `.git` entry exists: a worktree leaves a file, a
+    clone a directory), never by a name list that has to guess where worktrees get put. Build
+    outputs are a separate, static skip set and are correctly named there (`SKIP_DIRS`,
+    `itest/tests/meta_names.rs`); the rule bans guessing at *checkouts* by name, not the fixed
+    set — an absolute "never by name lists" would read as a licence to delete `SKIP_DIRS` and
+    re-red every gate on `target/`.
 11. Every skip class gets a required mode — one mechanism, mirrored, never reinvented — and a
     skip message names what the provider actually saw and must never be false on the box printing
     it (notes §3.35). The instances are enumerated in the required-mode table below; the roster's
@@ -1449,33 +1474,49 @@ existing — §8 names them as ledger items.
 The v17 revision's filings (2026-08-12): item 47 is the pattern wait's construction — the one
 design-ahead-of-tree surface, amended first per AGENTS §5 — and 48–55 are what the revision's
 input digest surfaced: two vacuous-green risks, one gate that has never executed, four
-consolidation debts, and a lint gap. All are **open**; none is promised as existing.
+consolidation debts, and a lint gap. Item 47 is **executed** (2026-08-12; notes §3.83); 48–55
+remain **open** and none is promised as existing.
 
-47. **The pattern wait: `tap.wait`** — **open** (M/L; the one design-ahead-of-tree item).
+47. **The pattern wait: `tap.wait`** — **EXECUTED 2026-08-12** (notes §3.83). The design is no
+    longer ahead of the tree: §10's contract and §15.56's decision record are both implemented,
+    and the verb answers on the wire instead of `method not found`.
     *Evidence:* the contract is §10 (The pattern wait); the decision record and its declines are
     §15.56; the client-side and daemon-side mechanics were surveyed against the tree at filing
     (the waiting-verb machinery, the hub/ring register path, and the four existing tap
-    consumers). *Remainder, as clauses:* (a) the daemon matcher — a linear-time,
-    non-backtracking engine with bounded compile size, §16.12 maxima on every field checked
-    before anything is armed, matcher fed from the hub with no lossy intervening queue, ring
-    scan and live arming in one critical section, gap-resets-window semantics, teardown sweep
-    with the typed closed outcome; (b) the rpc additions through the one registry with §16.8's
-    two-way docs test; (c) the `serial-nexus-ctl` verb through the existing one-shot path
-    (`call()` parks; Ctrl-C is §15.20's cancel-on-disconnect), with a documented multi-value
-    exit — 0 matched, 2 timed out, 1 error — the doctor's exit-code precedent; (d) the
-    `docs/rpc/observation.md` section (the schema authority) plus the client-recipe paragraph
-    beside the offset contract, converting §15.56's recipe alternative into permanent client
-    guidance; (e) a harness `WaitConn` helper — `Rpc::call`'s 30 s read-timeout panic cannot
-    host a parked wait — and the five acceptance tests: a pattern split across two data frames
-    matches; with replay, a pattern wholly inside the ring before the wait began matches;
-    deadline expiry is a typed timeout distinct from teardown; the result names the pattern and
-    its offset; the verb is reachable over RPC and via ctl. Each guard fail-first per rule 17.
+    consumers). *What landed, against the filed clauses:* (a) the daemon matcher —
+    `daemon/src/pattern.rs`, a `regex-automata` meta automaton (linear-time in the haystack in
+    every strategy it picks) with the compiled program capped at `MAX_COMPILED_BYTES`, one
+    automaton over the whole pattern set so leftmost-wins is deterministic, literals escaped
+    byte-wise into that same automaton so there is one engine and one set of limits, all seven
+    §16.12 maxima checked before anything is armed, the matcher living **inside** `TapHub` so it
+    is fed with no queue between hub and matcher, ring scan and live arming in one
+    `arm_wait` critical section, gap-resets-window in `ScanWindow::feed`, and the teardown sweep
+    in `TapHub::detach_all`; (b) `AppError::EndpointGone` (`-32008`) through the one registry,
+    the two-way README table row asserted by `docs_rpc_table_matches_the_registry`; (c) the
+    `serial-nexus-ctl tap-wait` verb on the existing one-shot path — `call()` does park, as
+    filed, because it holds its write half open and sets no read timeout — with a multi-value
+    exit; (d) the `docs/rpc/observation.md` section plus *Doing it client-side*, the recipe
+    §15.56 promised beside the verb; (e) the harness `WaitConn` in `itest/src/lib.rs` and the
+    battery in `itest/tests/p12_pattern_wait.rs` — twelve guards, six of which need no serial
+    device and so run on **every** platform, with a per-guard fail-first table in its module doc
+    and four of those reverts executed and recorded rather than asserted.
+    **One clause deviated, deliberately and with the reason recorded** (notes §3.83): the exit
+    codes are **0 matched, 1 timed out, 2 could not run**, not the "0 matched, 2 timed out,
+    1 error" filed here. Two independent reasons, both discovered against the tree rather than
+    reasoned from the filing: `2` is already clap's usage-error code on that binary, so a script
+    could not have told "no match" from "you misspelled a flag"; and the doctor precedent this
+    clause cites actually puts the *verdict* at 1 and the *operational failure* at 2, so the
+    filed numbering inverted the precedent it named. The landed scheme is `grep(1)`'s, for the
+    tool that asks `grep`'s question, and it agrees with both the doctor and clap.
     *Declined (at §15.56, not re-arguable here):* deliver-path matching, backtracking engines,
     text patterns, unbounded lookback, broadcast delivery, web-bridge admission at
-    introduction. *Validation:* the acceptance battery above; the `-32006` interplay guard (a
-    parked wait refuses a pipelined verb while taps and subscription keep flowing — the
-    `p12_control_streams` shape); state visibility asserted; the minimal-daemon clippy and
-    `cargo deny` green with the new dependency edge.
+    introduction — **all still declined**, and the last is visible in the tree as the absence of
+    `tap.wait` from the web bridge's allowlist. *Validation, as run:* the eleven-guard battery;
+    the `-32006` interplay guard; `state` visibility asserted for an armed wait's lifetime *and*
+    its disarm; the maxima refused with nothing armed, one case per dimension; both Apple
+    compile triples, the minimal-daemon clippy and `cargo deny` green with the new dependency
+    edge — which, as §15.56 predicted, added **zero** lockfile packages (the `Cargo.lock` diff
+    is one line: the daemon's own edge).
 48. **The macOS doctor gate has never executed green** — **open** (S; a measurement first).
     *Evidence:* the gate's first-ever execution (notes §3.77) failed 2.5 s in with
     `cannot execute binary file` (ENOEXEC) on `target/debug/serial-nexus-doctor`, on a runner
@@ -1532,10 +1573,17 @@ consolidation debts, and a lint gap. All are **open**; none is promised as exist
     devprep verb) enumerating `.snx-bin/<profile>/` and stripping or deleting
     capability-carrying files it did not just install, the set derived from `REQUIRED_CAPS`,
     never a hand-kept list; and the last hand-written spellings of the capability set retired in
-    favour of derivation — the `status` verb's `ready` line still prints the pre-§15.55
-    single-capability form (the operator-facing setcap *instruction* in the harness and the
-    bless header comment were repaired at the v17 landing; the informational status line is
-    this item's). *Validation:* the rig lane (plan §3) is the surface; §15.45's five
+    favour of derivation — `install`/`install --verify`'s `Ready` arm
+    (`devprep/src/linux/mod.rs`, the `println!` reading `ready (mode 0700, cap_dac_override
+    +ep)`) still prints the pre-§15.55 single-capability form, and must derive from
+    `REQUIRED_CAPS` instead (this evidence line named the `status` verb until 2026-08-12; that
+    verb prints no capability line at all, so an implementer grepping `fn status` found
+    nothing — corrected in place rather than re-filed). The operator-facing setcap
+    *instruction* in the harness and the bless header comment were repaired at the v17
+    landing, and the four narrative sites that still promised a one-capability bound
+    (`docs/security.md`, `sys/src/caps.rs`, `devprep/src/linux/mod.rs`, `.gitignore`) were
+    repaired by the 2026-08-12 alignment pass; this informational line is what remains.
+    *Validation:* the rig lane (plan §3) is the surface; §15.45's five
     bounds and §15.55's two residuals unchanged — no new verb shape, path, or capability.
 53. **Conformance kit: resync-accounting suite** — **open** (S/M). *Evidence:*
     `Codec::resync_count()` is the one trait method no kit suite exercises; the shipped

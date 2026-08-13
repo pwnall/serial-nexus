@@ -10618,3 +10618,315 @@ capability does not follow it: `.snx-bin/<profile>/serial-nexus-replug` still ho
 installs and re-blesses the new name, and the stale copy should be deleted — a blessed binary
 nothing references is exactly the kind of thing §15.45's narrowness argument does not want
 lying around.
+
+### 3.82 The §15.55 amendment reached the design and stopped: four sites still promised one capability
+
+**Found by the v17 alignment pass** (2026-08-12), which ran the v16→v17 diff against the *tree*
+rather than against the documents. The v17 landing had folded §15.55's two-capability amendment
+into the four sites its own change list named — design §5's tripwire row, §15.45's status line,
+§12's privileged-mechanism sentence, plan §2's devprep row — and the list was not the set. Four
+more sites still stated the retired bound, and one of them is the security document.
+
+**The four, most serious first.**
+
+1. **`docs/security.md`** enumerated the privileged helper's bounds and made "**One capability,
+   and no other.** `setcap cap_dac_override+ep`, nothing else" the *first* of them. This is the
+   page an auditor reads to learn what contains `CAP_DAC_OVERRIDE`, and it promised a bound the
+   tree does not have — while printing a `setcap` command the helper's own `--verify` rejects
+   (`field_grants_required_caps` requires every name in `REQUIRED_CAPS`, and there is a test
+   pinning that half a set is not the set). AGENTS §2's rule is that a stale claim is a defect;
+   a stale claim in the security narrative is the worst instance of it, because the reader
+   cannot check it against code they were sent to trust.
+2. **`sys/src/caps.rs`** contradicted itself one screen apart: `CAP_DAC_OVERRIDE`'s doc said
+   "the one capability the replug helper is blessed with", and `CAP_FOWNER`'s, fourteen lines
+   later, said "the second capability the replug helper carries". Both were written in good
+   faith; the first simply predates the amendment.
+3. **`devprep/src/linux/mod.rs`**'s module doc — the file `docs/security.md` names as the
+   authority for the bounds — opened its narrowness argument with "blessed with **one** file
+   capability", bolded. Its five bounds were all correct; only the count was wrong.
+4. **`.gitignore`** carried `cap_dac_override+ep` in a comment.
+
+**Repaired, and repaired so the class cannot recur.** Every site now derives or points rather
+than spelling: the security doc names `REQUIRED_CAPS` as the one place the set is written and
+states that adding a capability is an amendment, `caps.rs` names the bits and defers the set,
+the module doc links `install::REQUIRED_CAPS`, and the `.gitignore` comment says "the one
+`sudo setcap` the helper prints" instead of quoting it — with a note that it held a stale copy
+once already.
+
+**And one hole the audit found beside them, closed with a fail-first guard.** The
+no-`exec`-while-blessed refusal in `main` read `capability_state(CAP_DAC_OVERRIDE)` alone — one
+bit, from before §15.55 — while `field_grants_required_caps` required both names. So a copy
+blessed with only `cap_fowner` carried privilege and was **not** refused when
+`PR_SET_NO_NEW_PRIVS` could not be established. Unreachable through the sanctioned path
+(`install --verify` calls such a copy `Unblessed`, and `scripts/bless` always applies the
+derived full set), which is why this is recorded as a narrowness hole rather than a live
+defect — but "unreachable today" is the argument that stops being true when the set next grows,
+and §15.45's narrowness is a standing tripwire.
+
+The fix makes the drift unrepresentable rather than merely fixing it: `REQUIRED_CAPS` is now
+`&[(&str, u32)]` — the `setcap` name and the `linux/capability.h` bit in one entry — with
+`required_cap_names()` as the projection every command string uses and `caps_held()` folding the
+whole set for the bounds question. Two lists that must agree became one list with two
+projections. The union is deliberate and is stated at the fold: the question is "does this
+process hold privilege the bounds exist to contain", and one capability is enough to make it
+yes; an intersection would let both half-blessed shapes through the refusal. Guard:
+`the_bounds_question_folds_every_required_capability_not_just_the_first`, whose middle assertion
+(`cap_fowner` held, `cap_dac_override` not) is exactly what the old single-bit read got wrong.
+
+**Two prose defects in the normative pair, repaired where they stood.** Plan §3 rule 10's new
+walker clause said skip lists are keyed on the is-a-checkout predicate "never by name lists" —
+absolutely, while `meta_names.rs` legitimately keeps a static `SKIP_DIRS` for build outputs. The
+substance was right and the wording was a licence to delete `SKIP_DIRS` and re-red every gate on
+`target/`; it is narrowed to *nested checkouts*. And design §7.1's disconnect-latency sentence
+said a real unplug lands "an order of magnitude inside the read-poll budget" when the committed
+measurement — 1.2–2.0 ms, 3 of 3, against a 200 ms re-arm — is **two** orders; corrected, with
+the warning not to fuse that budget with the 200 µs–5 ms *pty* cadence AGENTS §6 quotes, which
+is a different node.
+
+**One ledger defect.** Plan §18 item 52's evidence line sent an implementer to "the `status`
+verb's `ready` line". `status` prints no capability line at all; the stale spelling is in
+`install`/`install --verify`'s `Ready` arm. An implementer would have grepped `fn status` and
+found nothing. Corrected in place — the item is still open, and only its evidence moved.
+
+**What the audit did *not* find is worth recording too.** Every other clause v17 changed in
+design §1–§14/§17 and plan §1–§3 checks out against the tree, including the four the landing
+flagged as most at risk: P5's fourth discovery arm byte-for-byte, the corrected doctor-gate
+spellings against both CI lanes, §15.51's `platform-refused` exemplar against the `42eac2a`
+triple, and §15.44's withdrawn register (those figures appear nowhere but the register itself).
+The four filename-keyed code sites all point at v17. So the drift was not general: it was one
+amendment, one incomplete propagation list, and the sites nobody thought to grep.
+
+### 3.83 The pattern wait, built: one matcher where four clients had three
+
+**Plan §18 item 47 executed** (2026-08-12) — the one design-ahead-of-tree surface, closed. §10's
+*The pattern wait* and §15.56 were specified at the v17 revision and the tree answered
+`method not found`; it now answers.
+
+**What it is.** `tap.wait <endpoint>` parks until one of up to eight named byte patterns appears
+on the endpoint's hostward stream, its deadline expires, or the graph drops the endpoint. The
+motivation §15.56 records was measured, not imagined: four independent tap consumers in this
+tree, three hand-rolled reassembly implementations among them, each re-deriving frame
+reassembly, replay-splice handling, gap discipline and timeout-versus-teardown discrimination.
+This is §16.1's move — encode the subtle rules once — applied to the observation surface.
+
+**Where each contract clause lives, because the mapping is the whole design.**
+
+* **The matcher is a new module, `daemon/src/pattern.rs`**, holding everything decidable without
+  the graph: the maxima, the compile, and the rolling window. `regex-automata`'s meta engine,
+  whose every search strategy is linear in the haystack — its one backtracking strategy is the
+  *bounded* backtracker, which memoizes precisely so it stays linear, never the exponential
+  kind. Literals are escaped byte-wise (`\xNN` for every byte, no exceptions) into the **same**
+  automaton rather than matched by a second engine, so there is one engine, one compile budget,
+  and one leftmost rule. `nfa_size_limit` is §10 clause 3's bounded compile size, and it earns
+  its keep: `(?:a{1000}){1000}` is refused at compile with `-32602` rather than paid for on the
+  thread that runs every console.
+* **The armed wait lives inside `TapHub`**, not beside it. §10 clause 4 requires the matcher to
+  consume the hub stream with no lossy queue between hub and matcher, and a matcher fed through
+  a bounded channel like a tap's would have made "no match" mean "no match, unless the channel
+  was full" — which is not an answer. `TapHub::ingest` feeds every armed wait in the same
+  synchronous critical section that fans the chunk out to the taps.
+* **Arming is one critical section** (`TapHub::arm_wait`): ring snapshot scanned, live matcher
+  armed, nothing on the thread between them — the `tap.open` register pattern, so §10 clause 5's
+  splice-exactness is a single-thread fact rather than a lock. The ring is read **as the ring**,
+  so the configured depth is scanned even when it is deeper than `lookback`; `lookback` bounds
+  only how far a *later* match may reach back into what is retained.
+* **A gap resets the window** (`ScanWindow::feed`). Bytes either side of a feed-hop hole were
+  never adjacent, so leaving them adjacent would let the *loss* manufacture a match. Clearing
+  costs some true negatives and cannot invent a positive, and the `gaps`/`gap_bytes` counters
+  ride every result so a `matched: null` says how strong it is.
+* **Two outcomes, two kinds** (§10 clause 6). Expiry is a **result** — `timed_out: true` beside
+  the counters — because a deadline is an answer and a verdict never leaves one unnamed. A
+  teardown is a **typed error**, `AppError::EndpointGone` (`-32008`), because the stream stopped
+  existing and a timeout would claim it was watched throughout.
+* **It is a waiting verb for free.** `tap.wait` lands in the ordinary `dispatch` lane rather than
+  in `control.rs` beside `tap.open`/`tap.close`, because unlike those it needs nothing
+  connection-scoped. That one placement decision buys §15.20's whole contract: the connection's
+  one in-flight slot, the `-32006` refusal of a pipelined request, and cancel-on-EOF (dropping
+  the dispatch future drops `WaitGuard`, which disarms).
+* **Expiry never consumes, trivially, because the wait is a spy.** The only thing an armed wait
+  changes is the hub's `active` flag — which is what makes it *observe* (§10 clause 7: an armed
+  wait on a ring-off, untapped endpoint still observes) — and `WaitGuard` restores it on every
+  exit path, including the one that runs no code in the verb at all.
+
+**One filed clause deviated, and the reason is a collision the filing could not have seen.**
+Item 47 asked for "0 matched, 2 timed out, 1 error — the doctor's exit-code precedent". Two
+things are wrong with that, both visible only against the tree. `2` is already **clap's**
+usage-error code on `serial-nexus-ctl`, so a script could not have distinguished "no match" from
+"you misspelled a flag" — and clap's 2 arrives before any daemon contact. And the doctor
+precedent the clause cites puts the *verdict* at 1 (`unsupported`) and the *operational failure*
+at 2, so the filed numbering inverted the very scheme it named. What landed is `grep(1)`'s — **0
+matched, 1 no match, 2 could not run** — which is the convention for the tool that asks `grep`'s
+question, agrees with the doctor, and makes clap's 2 a harmless synonym rather than a
+collision. Plan §18 item 47 carries the deviation with this reasoning.
+
+**Verification, and the four reverts that were executed rather than asserted.** Twelve guards
+in `itest/tests/p12_pattern_wait.rs`. Six need no serial device — every host-facing endpoint has
+a tap hub at load even while its serial node sits `waiting` on an absent device — so the typed
+expiry, the typed teardown, the maxima, `state` visibility, the `-32006` interplay and the CLI's
+non-match exit all run on **every** platform, which matters for a macOS lane that has no
+software null modem. The matching guards use a `sim pty --echo` driven by `send`, so the bytes
+and their timing are the test's, not a seeded double's.
+
+Rule 17 wants fail-first proof against the unfixed tree, and "the unfixed tree" for a new verb
+is trivially `-32601` everywhere, which proves nothing about any individual guard. So three
+reverts were performed in place (AGENTS §8: revert the specific fix, never stash) and the
+results recorded in the file's own module doc:
+
+1. Dropping `!self.waits.is_empty()` from `TapHub::refresh_active` → the ring-off/untapped guard
+   reddens with `bytes_scanned: 0` on a console that was talking the whole time. Exactly the
+   failure §10 clause 7 exists to prevent.
+2. Feeding the matcher per-chunk instead of through `ScanWindow`'s rolling buffer → the
+   cross-frame guard reddens. The pattern `A\nB` spans the newline `send` appends, and the guard
+   proves the two frames were separate by watching a tap before emitting the second half —
+   without that proof it could have passed on one coalesced frame and asserted nothing.
+3. Deleting the armed-wait sweep from `TapHub::detach_all` → **the interesting one, and it
+   corrected a claim I had already written.** I expected the wait to ride its deadline out and
+   answer `timed_out`. It does not: dropping the hub drops the `oneshot` sender, so
+   `tap_wait`'s `Err(_)` arm still answers `-32008`. What is lost is the *reason string* and the
+   accounting. So the sweep is what makes the teardown outcome informative, not what makes it
+   typed — and the module doc says so now, because a fail-first table that states an outcome
+   nobody ran is the same class of claim as a gate that asserts nothing.
+
+**One defect found by reasoning rather than by a test, and worth stating because no guard in
+the battery would have caught it.** `tokio::select!` picks at *random* among arms ready in the
+same poll unless told otherwise. The wait's two arms are "the hub delivered an outcome" and
+"the deadline fired", so a match the hub had already delivered could be answered
+`timed_out: true` — a wrong verdict rather than a late one, and the caller cannot tell. Worse,
+the timeout arm then found `disarm()` returning `None` (the wait had already left the hub) and
+fell back to zeroed accounting, so the reply claimed both that nothing matched *and* that
+nothing was scanned. Fixed two ways: `biased;` with the settled arm first, which closes the
+window entirely because both halves run on the one runtime thread and the hub cannot fire
+between that poll and the timeout arm's body; and, on the `None` path, taking the outcome out of
+the channel instead of inventing a timeout. The zero-filled fallback is gone. This is the class
+a test finds only by losing a race, which is to say not reliably — the reason it is recorded
+here rather than left to the guard that does not exist.
+
+**A process finding worth more than the guards.** The first fail-first attempt ran
+`cargo test -p serial-nexus-itest` after reverting `daemon/src/tap.rs` — and the test **passed**,
+in 0.03 s, with nothing recompiled. The itest crate spawns the daemon *binary* by path; building
+the test crate does not rebuild it. A revert had been made, a test had been run, and the run had
+measured the unmodified binary. That is plan §3 rule 22's own class — a check whose passing
+output is identical to its not-running output — arriving in the fail-first procedure itself,
+which is the last place it would be noticed. Every revert here was re-run with an explicit
+`cargo build --workspace` first, and the three results above are from those runs.
+
+**Dependency reality, confirmed rather than assumed.** §15.56 predicted the matcher would add
+zero lockfile packages, `regex-automata` and its family already being present transitively
+(tracing-subscriber → matchers). Measured: the `Cargo.lock` diff for this change is **one line**
+— the daemon's own edge. Both Apple compile triples, the minimal-daemon clippy, and
+`cargo deny check licenses bans sources` are green with it.
+
+**The adversarial review, and the four defects it found that I did not.** Six independent
+lenses over the finished change — matcher arithmetic, cancel-safety, contract conformance, test
+quality, docs-versus-code, and the alignment repairs — each told to find defects and to report a
+clean lens as clean. (The verify half of the harness died on a session quota; the findings below
+were therefore verified by hand, and the two that could be settled by execution were settled that
+way rather than by a second opinion.) It earned its keep four times:
+
+1. **The replay scan ran across an unobserved hole, and matched things the console never said.**
+   The ring stores bytes and nothing else, so a feed-hop hole leaves no trace in it: `lo` and
+   `gin: ` sit adjacent in the snapshot having never been adjacent on the wire. `feed` had the
+   gap-reset discipline; `seed` had none, and scanned the raw snapshot. **Proven by execution**,
+   not argued: with the fix reverted, the daemon reports `matched: {pattern:"p", offset:0}` for
+   `login:` against a ring that only ever held `lo` and `gin: ` either side of a 4096-byte hole.
+   On a *gating* verb that is the worst failure available — a caller sends a password to a device
+   that never printed the prompt. The hub now remembers where the newest hole is (`ring_gap`),
+   trims the snapshot to start after it, reports the trimmed extent as `replay_scanned`, and
+   counts the hole in `gaps`/`gap_bytes` so a `matched: null` still states its own strength. I had
+   reasoned about the live path's gap discipline and simply never asked the same question of the
+   seed path.
+2. **A wait was charged for every byte lost before it existed.** `ingest` hands the same
+   `gap_before` to every registered wait, and on a ring-off, untapped endpoint — §10 clause 7's
+   *headline* shape — the feed is inactive, so the endpoint's entire history sits on
+   `feed_dropped` and arming is what turns the mirror on. The first chunk therefore handed a
+   fresh wait a gap of megabytes, and the verdict claimed a scan holed by the endpoint's whole
+   life when everything from `from_offset` on was scanned contiguously: §10 clause 4 inverted.
+   `tap.open` solves the identical problem by handing the client a baseline to subtract (TAP-4);
+   a wait has no such field and no client to do the subtracting, so it is credited at arming.
+3. **`lookback: 0` silently voided the cross-frame guarantee.** §16.12's rule is about maxima and
+   I applied it only upward. A window shorter than the pattern cannot hold the pattern, so the
+   verb would answer `timed_out: true` — with `gaps: 0` asserting a whole scan — for a string
+   that was on the wire. There is now a floor: the longest *literal*'s length, exact for literals
+   and stated as unavailable for regexes (`a{1000}` is a six-byte source, so the daemon cannot
+   size it and the docs say the caller must).
+4. **The empty pattern was refused with a reason that was false** — "is 0 bytes, over the
+   1024-byte maximum" — because it shared the over-length error. A refusal whose stated reason is
+   the opposite of the truth is worse than one with no reason, and it is the same class as the
+   messages plan §3 rule 11 governs.
+
+The review also found four documentation defects that mattered more than they look, all of the
+same shape — **the change updated the record and left the specification behind**:
+
+- **The design still said the pattern wait was not in the tree**, in four places (the front
+  matter's "exactly one design-ahead-of-tree surface", §10's "Specified this generation, not yet
+  in the tree … the verb answers the standard method-not-found", the verb surface's parenthetical,
+  and §15.56's own Status header), while AGENTS §2 and plan §18 item 47 — edited in the same
+  change — said it had landed. Two normative documents contradicting each other in one commit,
+  and AGENTS §5's amend-first order makes the *design* the document that has to stop being ahead.
+  Repaired at all four.
+- **Three sites enumerated the waiting verbs as exactly two.** `arbitration.md`'s "The two
+  waiting verbs", README's "One in-flight *waiting* verb per connection" list, and — the one with
+  teeth — README's "Do not use `-N` with a verb that waits", whose list of verbs that happens to
+  did not include the one verb that *always* parks.
+- **Every worked `state` example in the docs was stale**, including two in the file that added
+  the `waits` array.
+- **Two of my own alignment repairs over-claimed.** `docs/security.md` gained "nothing in the
+  tree spells it by hand" — false, and plan §18 item 52, edited in the same change, says so. And
+  the §7.1 latency repair imported the *wrong measurement*: it cited notes §3.54 while quoting
+  1.2–2.0 ms, which is a different observable (the `poll` revents readback) from a different
+  entry; §3.54's own figure for the node leaving `active` is 2–3 ms. Fixing a citation defect by
+  introducing one is worth recording plainly.
+
+Plus three more, each fixed: the no-`exec` refusal message hardcoded `cap_dac_override` in the
+one branch the union check newly made reachable (a `cap_fowner`-only copy was told it held a
+capability `getcap` would not show); `capabilities --json` answered `"blessed": true` for a
+half-blessed copy while `install --verify` on the same file said `Unblessed`; and the harness's
+`blessed_devprep_helper` proved half the blessing — it read `cap_dac_override_effective` and
+never `can_grant_device_access`, which is the field that exists for exactly that question and
+which nothing in the tree read. A rig box with a pre-§15.55 blessing would have passed that
+check, cycled, silently skipped the grant, and failed every following test with
+`Permission denied` — notes §3.79's signature, reintroduced through the back door.
+
+**One assertion of mine was vacuous and is gone rather than weakened.** The expiry guard asserted
+`feed_dropped == 0` "a spy charges no loss" on a fixture whose device is *absent*, so no hostward
+byte can exist and the assertion passes identically whether the property holds or not — plan §3
+rule 22's own tell, inside the battery written to honour it. It is deleted, with the reason and
+the fixture it would need stated where it stood.
+
+**Still declined, and visible as such:** deliver-path matching, backtracking engines, patterns
+over decoded text, unbounded lookback, and broadcast delivery. Web-bridge admission is the one
+that needed more than an absence: a verb nobody added and a verb deliberately kept out look
+identical in an allowlist, so `tap.wait` is now named in `bridge.rs`'s "what is deliberately
+absent, and why" list *with the consequence that decides it* — the browser page holds one daemon
+connection, and a parked wait would answer every other page verb with the in-flight refusal for
+its whole duration — and it rides the refusal test's loop, so the exclusion is asserted rather
+than assumed. The allowlist was already fail-safe, so nothing was reachable; what was missing
+was the record of intent (§15.34's "the allowlist stays a deliberate act").
+
+**The rig.** Run on the two-FT232R crossover box after the operator re-blessed the helper:
+**931 · 1 · 6**, equal to the default-scope figure, with every hardware test passing — both
+replug tests including `identity_survives_a_replug_that_renumbers_the_tty`, all five crossover
+tests, and `web_tls_round_trip` under `SNX_TLS=required`. The lane dropped `SNX_RIG_FLOW` and
+`SNX_WEB_UI`, both by measurement rather than convenience: the two `rts-cts` tests printed the
+reading that justifies their skip (`port1 RTS high -> port0 cts:false`, and `false` again with
+RTS low — a 3-wire bench, §15.52's legitimate answer, now confirmed by a third independent
+instrument), and this box has no `node`.
+
+**A rig lane hung once, and the honest handling of that is part of this record.** Between two
+green lanes, one stalled 39 minutes on
+`p6_outage::outage_faults_then_purges_then_recovers_byte_clean`: the receiving leg sat `waiting`
+with "peer disconnected; awaiting reconnect" and `reconnect_count: 2`, the daemon answering
+`state` normally, on a box at load 0.19. Attribution was **measured, not argued** — the same test
+passed at default scope on the same binaries minutes earlier, passed in the preceding rig lane,
+and passes 5 of 5 in isolation at full rig scope in ~4 s each; the change touches no line of
+`leg.rs` or the outage path. The likely mechanism is whole-suite parallelism around loopback port
+reuse, which this very file already has a test for
+(`a_refused_listen_bind_retries_until_the_address_frees`). So: not this change's, not closed, and
+not swept — one unreproduced hang is precisely the evidence AGENTS §8 forbids reasoning from, in
+either direction. The lane was re-run whole and read 931 · 1 · 6.
+
+One procedural note, because it is the kind of thing that quietly corrupts a figure: an earlier
+rig lane was **discarded rather than recorded**. It had started against the previous blessed
+helper, and `scripts/bless` replaced that binary underneath it mid-run, so the lane would have
+exercised two different helper binaries. The rig was checked clean first (`authorized=1` on both
+ports — AGENTS §8's dead-run residue) and the lane re-run whole.

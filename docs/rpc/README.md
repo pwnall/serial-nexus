@@ -16,7 +16,7 @@ directory documents that surface method by method.
 | Page | Methods |
 | --- | --- |
 | [configuration.md](configuration.md) | `load`, `add-node`, `remove-node`, `connect`, `disconnect`, `dump` |
-| [observation.md](observation.md) | `state`, `subscribe`, `info`, `ports`, `tap.open`, `tap.close` (+ the `state` / `lock` / `tap.data` / `tap.closed` notifications and `LockSnapshot`) |
+| [observation.md](observation.md) | `state`, `subscribe`, `info`, `ports`, `tap.open`, `tap.close`, `tap.wait` (+ the `state` / `lock` / `tap.data` / `tap.closed` notifications and `LockSnapshot`) |
 | [arbitration.md](arbitration.md) | `lock`, `unlock`, `send` |
 | [logging.md](logging.md) | `rotate` |
 | [serial-signals.md](serial-signals.md) | `send-break`, `set-modem`, `pulse-dtr` |
@@ -50,8 +50,8 @@ mutations are serialized daemon-side, so many clients may connect at once.
   1048576-byte limit"`, `id: null`) and the connection is closed, so one client
   cannot grow the shared daemon's read buffer without bound. The cap sits far
   above any real verb, including a `load`'s inline graph JSON.
-* **One in-flight *waiting* verb per connection.** `lock --wait` and `send` may
-  suspend; while one is parked, a second request pipelined onto the same
+* **One in-flight *waiting* verb per connection.** `lock --wait`, `send` and
+  `tap.wait` may suspend; while one is parked, a second request pipelined onto the same
   connection is answered `-32006` — with its own `id` — and the parked verb is
   left intact and still answers later. The wait is one *arm* of the connection's
   select rather than a pause on it, so `subscribe` and `tap.data` notifications
@@ -67,7 +67,7 @@ mutations are serialized daemon-side, so many clients may connect at once.
 ```
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"endpoints":[],"nodes":[],"taps":[]}}
+{"jsonrpc":"2.0","id":1,"result":{"endpoints":[],"nodes":[],"taps":[],"waits":[]}}
 ```
 
 ```json
@@ -105,7 +105,7 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"state"}' | nc -N -U "$SOCK" |
 {
   "jsonrpc": "2.0",
   "id": 1,
-  "result": { "endpoints": [], "nodes": [], "taps": [] }
+  "result": { "endpoints": [], "nodes": [], "taps": [], "waits": [] }
 }
 ```
 
@@ -120,7 +120,10 @@ default — and is handy for interactive sessions.
 **Do not use `-N` with a verb that waits or streams.** Because end-of-file
 cancels an in-flight waiting verb (§15.20), a `lock --wait` or a `send` that must
 queue behind a holder gets *no reply at all* under `-N` — the half-close reads as
-a disconnected client. Likewise `subscribe` holds the connection open to stream
+a disconnected client. The same is true of every
+[`tap.wait`](observation.md#tapwait), which parks by definition: under `-N` it is
+cancelled the instant it is sent and answers nothing, so a hand-run pattern wait
+must keep both halves open. Likewise `subscribe` holds the connection open to stream
 notification lines (feed them to `jq -c` line by line), and `-N` ends it right
 after the acknowledgement. For those, keep the write half open: plain `nc -U`, or
 `socat -,ignoreeof UNIX-CONNECT:$SOCK`.
@@ -136,7 +139,8 @@ $ serial-nexus-ctl --json state
 {
   "endpoints": [],
   "nodes": [],
-  "taps": []
+  "taps": [],
+  "waits": []
 }
 ```
 
@@ -194,6 +198,7 @@ object with structured detail.
 | `-32005` | device absent | `add-node` by raw path or serial number, but the device is not present so its identity cannot be captured (§12) |
 | `-32006` | waiting verb in flight | a request was pipelined behind an in-flight waiting verb on the same connection; §15.20 runs one at a time, and the wait, its taps and its subscription are all left intact |
 | `-32007` | edge inbox full | `connect` refused: the target-facing endpoint has not drained the hostward receivers of its earlier edges yet. Transient — nothing changed, retry |
+| `-32008` | endpoint gone | a parked `tap.wait` ended because the graph dropped its endpoint (`teardown`, `load --replace`, `remove-node`) — distinct from the deadline, which is a typed *result* (`timed_out: true`) rather than an error; `data` carries the scan and gap counters the wait did cover |
 
 The `-32002` row's "always" is worth reading twice, because it was not always true:
 every path that refuses a configuration — `load`, `add-node`, `connect`, and the

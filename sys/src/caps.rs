@@ -7,17 +7,20 @@
 //! parses `/proc/self/status` — but it lives beside the hardening calls so that
 //! everything this workspace knows about Linux capabilities is one file.
 //!
-//! Nothing here grants privilege. `CAP_DAC_OVERRIDE` reaches the helper from the
-//! *file* capability `setcap` applied to the installed copy; these functions only
-//! observe that state and shrink what the process can do afterwards.
+//! Nothing here grants privilege. Both capabilities below reach the helper from the
+//! *file* capabilities `setcap` applied to the installed copy; these functions only
+//! observe that state and shrink what the process can do afterwards. The set itself
+//! is written in exactly one place — `REQUIRED_CAPS` in
+//! `devprep/src/linux/install.rs` — and this module names the bits, never the set.
 
 /// Bit number of `CAP_DAC_OVERRIDE` in the capability bitmasks (`linux/capability.h`).
 ///
-/// This is the one capability the replug helper is blessed with, and it is a large
-/// grant: it bypasses every DAC permission check on read and write, so a process
-/// holding it can write `/etc/shadow`. The helper's narrowness — argv-only, no
-/// environment, no `exec`, one kernel-verified sysfs write — is what bounds it, not
-/// the capability itself (§15.45).
+/// The **first of the two** capabilities the replug helper is blessed with (§15.55;
+/// [`CAP_FOWNER`] is the other), and by far the larger grant: it bypasses every DAC
+/// permission check on read and write, so a process holding it can write
+/// `/etc/shadow`. The helper's narrowness — argv-only, no environment, no `exec`, one
+/// kernel-verified sysfs write — is what bounds it, not the capability itself
+/// (§15.45).
 pub const CAP_DAC_OVERRIDE: u32 = 1;
 
 /// Bit number of `CAP_FOWNER` in the capability bitmasks (`linux/capability.h`).
