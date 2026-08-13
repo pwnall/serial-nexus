@@ -217,9 +217,50 @@ fn prime_the_wire_once(p0: &str, p1: &str) {
                  bytes at all and every measurement below would be meaningless",
                 path.display()
             );
+
+            // **Then wait for the priming traffic to FINISH, which is not the same
+            // question and cost this a real failure on macOS** (plan §18 item 70).
+            // The assertion above is satisfied by the *first* byte, so the primer used
+            // to drop its daemon with most of a KiB still in flight — and this
+            // function's own closing comment claimed the opposite ("no primed byte can
+            // land in a capture under test"). On Darwin 24.6.0 the adapter hands the
+            // residue to the *next* reader: `crossover_rig_map_node_both_directions`
+            // failed 4 of 4 with **62 bytes** — one FTDI bulk packet's payload, 64
+            // minus the two status bytes — prepended to its own correct output, and
+            // those 62 bytes are a *contiguous slice of this function's seed-9001
+            // stream* (found at offsets 833 and 789 of the 1 KiB), which is how the
+            // attribution was made rather than guessed.
+            //
+            // **Quiescence, not a byte count.** Waiting for 1024 would hang on exactly
+            // the kernel this primer exists for: where the leading packet is *eaten*
+            // the log never reaches 1024. Stability is the portable question, and it
+            // is the same one on a kernel that drops bytes and one that retains them.
+            let mut last = 0u64;
+            let mut stable = 0;
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+                let now = file_len(&path);
+                if now == last {
+                    stable += 1;
+                    if stable >= 3 {
+                        break;
+                    }
+                } else {
+                    stable = 0;
+                    last = now;
+                }
+            }
+            eprintln!(
+                "primed {} with {last} B, quiet for {}00 ms",
+                path.display(),
+                stable
+            );
         }
-        // The primer's own graph, logs and run dir go away with it; the measured tests
-        // each boot their own, so no primed byte can land in a capture under test.
+        // The primer's own graph, logs and run dir go away with it, and the wait above
+        // is what makes the rest of this sentence true rather than merely intended:
+        // the measured tests each boot their own graph, so no primed byte can land in
+        // a capture under test.
         drop(d);
     });
 }
@@ -765,6 +806,114 @@ fn crossover_rig_rts_crosses_to_the_far_ports_cts() {
 /// 10). The identical scenario with port0 at `flow_control = "none"` must deliver
 /// the payload *while CTS is low* — so a green first half cannot be explained by a
 /// rig that was slow, a log that was buffered, or a send that never happened.
+/// **`xon-xoff` is refused at `load` on a driver that drops it** — the second mode's
+/// arm of §7.1's flow-control contract, added once a dropping driver was measured
+/// (§15.61, plan §18 item 67).
+///
+/// The structure is deliberately the same as the `rts-cts` test's opening arms, and
+/// for the same reason: which promise the daemon owes depends on what the driver in
+/// front of it does, so the test measures first and then asserts the promise that
+/// driver is owed. All three arms ship:
+///
+/// * **accept-then-drop → refused at `load`, nothing created.** This is the arm the
+///   rig takes on Darwin 24.6.0: `IOSerialFamily` on an FT232R returns success from
+///   `tcsetattr` and reads `c_iflag` back `0x0` → `0x0` (notes §3.93).
+/// * **honoured → the config loads.** `ftdi_sio` on Linux takes this arm (`0x5` →
+///   `0x1405`), and so does a pts on either kernel. **This arm is what stops the
+///   refusal being a rule that refuses everything** — a refusal proven only against
+///   ports it refuses is not proven at all (AGENTS §9).
+/// * **honest refusal → loads, and faults loudly at the node's own open**, exactly as
+///   `rts-cts` does. No driver this project has measured takes it.
+///
+/// Both of the first two arms are reachable from one box: this rig's FT232R drops the
+/// request while a pts beside it honours it, which is the discrimination §15.61 rests
+/// on and the reason the entry could be written from a single-kernel session.
+#[test]
+fn xon_xoff_is_refused_at_load_exactly_where_the_driver_drops_it() {
+    let Some((p0, p1)) = crossover_ports() else {
+        skip_no_rig("xon_xoff_is_refused_at_load_exactly_where_the_driver_drops_it");
+        return;
+    };
+    let _rig = rig_guard();
+    eprintln!("crossover rig (xon-xoff pre-check): {p0} <-> {p1}");
+
+    let measured = serial_nexus_sys::honours_flow_control(
+        std::path::Path::new(&p0),
+        serial_nexus_sys::FlowMode::XonXoff,
+    );
+    let d = Daemon::start();
+    let run_dir = d.run().path().to_path_buf();
+    let inj0 = d.run().join("inj0");
+    let inj1 = d.run().join("inj1");
+    let cfg = flow_cfg(
+        &p0,
+        &p1,
+        115_200,
+        ("xon-xoff", "none"),
+        &run_dir,
+        &inj0,
+        &inj1,
+    );
+
+    match measured {
+        Ok(serial_nexus_sys::FlowOutcome::AcceptedThenDropped) => {
+            eprintln!("{p0}: driver accepts xon-xoff and drops it — asserting the load refusal");
+            let err = d.rpc().load_toml(&cfg, false).expect_err(
+                "a driver that drops IXON/IXOFF must make this config a REFUSAL at load, \
+                 not a node that faults later (§15.61)",
+            );
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("xon-xoff") && msg.contains(&p0),
+                "the refusal must name the flow control and the port: {msg}"
+            );
+            assert!(
+                !msg.contains("rts-cts"),
+                "the refusal must be about the mode the config asked for, not about the \
+                 one this check used to be the only one for: {msg}"
+            );
+            assert!(
+                d.rpc().node("port0").is_none(),
+                "a refused load must create nothing: {:?}",
+                d.rpc().node("port0")
+            );
+        }
+        Ok(serial_nexus_sys::FlowOutcome::Honoured) => {
+            eprintln!("{p0}: driver honours xon-xoff — asserting the config LOADS");
+            d.rpc().load_toml(&cfg, false).expect(
+                "a port that honours IXON/IXOFF must not be refused — a refusal rule that \
+                 fires on a honouring driver refuses everything and proves nothing",
+            );
+            assert_ne!(
+                d.rpc().node_status("port0"),
+                "faulted",
+                "the driver honours the mode; the node must not fault for it"
+            );
+        }
+        Ok(serial_nexus_sys::FlowOutcome::Refused) => {
+            eprintln!("{p0}: driver REFUSES xon-xoff outright — asserting the honest-refusal path");
+            d.rpc().load_toml(&cfg, false).expect(
+                "an honest refusal is not the defect §7.1 clause 7 refuses — the config \
+                 must load and the failure must arrive loudly at the node's own open",
+            );
+            let node = d.rpc().node("port0").expect("the node was created");
+            assert_eq!(
+                d.rpc().node_status("port0"),
+                "faulted",
+                "an xon-xoff node on a refusing driver must fault at open rather than run \
+                 silently without the flow control it asked for: {node:?}"
+            );
+        }
+        Err(e) => {
+            // Unmeasured is never a refusal (§7.1 clause 2). Printed rather than
+            // silently passed, so a lane that stopped measuring is visible.
+            eprintln!(
+                "SKIP xon_xoff_is_refused_at_load_exactly_where_the_driver_drops_it: {p0} could not be interrogated ({e})"
+            );
+        }
+    }
+}
+
 #[test]
 fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
     let Some((p0, p1)) = crossover_ports() else {
@@ -795,8 +944,11 @@ fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
     //   driver measured by this project takes this arm; it ships unexecuted, like
     //   the arm above did before a Mac ran it.
     // * honoured → the real flow-control test below. Linux + FT232R takes this one.
-    let measured = serial_nexus_sys::honours_rtscts(std::path::Path::new(&p0));
-    if measured == Ok(serial_nexus_sys::RtsCtsOutcome::Refused) {
+    let measured = serial_nexus_sys::honours_flow_control(
+        std::path::Path::new(&p0),
+        serial_nexus_sys::FlowMode::RtsCts,
+    );
+    if measured == Ok(serial_nexus_sys::FlowOutcome::Refused) {
         eprintln!("{p0}: driver REFUSES rts-cts outright — asserting the honest-refusal path");
         let d = Daemon::start();
         let run_dir = d.run().path().to_path_buf();
@@ -838,7 +990,7 @@ fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
         );
         return;
     }
-    if measured == Ok(serial_nexus_sys::RtsCtsOutcome::AcceptedThenDropped) {
+    if measured == Ok(serial_nexus_sys::FlowOutcome::AcceptedThenDropped) {
         eprintln!("{p0}: driver accepts rts-cts and drops it — asserting the load refusal instead");
         let d = Daemon::start();
         let run_dir = d.run().path().to_path_buf();

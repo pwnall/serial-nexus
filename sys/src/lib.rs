@@ -205,7 +205,7 @@ pub fn set_packet_mode(fd: RawFd, on: bool) -> nix::Result<()> {
 /// out of `SerialPort::open`, verified in the pinned 0.2.37 source), and §7.1 does
 /// not refuse such a config at `load`.
 ///
-/// [`honours_rtscts`] returned `nix::Result<bool>` until 2026-08-12, which could
+/// [`honours_flow_control`] returned `nix::Result<bool>` until 2026-08-12, which could
 /// not express that: an honest refusal and an accept-then-drop both came back
 /// `Ok(false)`, so the daemon refused both while doctor P15 — which *did* keep
 /// `tcsetattr_ok` — called the same port `supported`. That is the split §7.1 clause
@@ -216,8 +216,37 @@ pub fn set_packet_mode(fd: RawFd, on: bool) -> nix::Result<()> {
 /// is what let two callers collapse different facts into one answer; a caller that
 /// legitimately only cares about one arm spells that arm out (`== Ok(Honoured)`),
 /// which is one comparison at the call site and says which question it is asking.
+/// Which flow-control mode a [`honours_flow_control`] interrogation is about.
+///
+/// The two arms differ in exactly one thing — which flag in which termios word is
+/// set and read back — which is why they are a parameter rather than two functions
+/// (§15.61, §16.5). Everything else about the measurement, including
+/// [`FlowOutcome::classify`]'s three-way rule, is mode-independent and is not
+/// duplicated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RtsCtsOutcome {
+pub enum FlowMode {
+    /// Hardware handshaking: `CRTSCTS` in `c_cflag`.
+    RtsCts,
+    /// Software handshaking: `IXON | IXOFF` in `c_iflag`. `serial2`'s
+    /// `FlowControl::XonXoff` sets both and clears `CRTSCTS`, and verifies the
+    /// **whole** `c_iflag` word by read-back — which is why a driver that drops
+    /// them faults the node's own open exactly as a dropped `CRTSCTS` does.
+    XonXoff,
+}
+
+impl FlowMode {
+    /// The spelling `core::config`'s `flow_control` key uses, for messages that an
+    /// operator has to be able to paste back into a config.
+    pub fn config_spelling(self) -> &'static str {
+        match self {
+            FlowMode::RtsCts => "rts-cts",
+            FlowMode::XonXoff => "xon-xoff",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowOutcome {
     /// The flag reads back set: the driver implements the mode and agrees it did.
     Honoured,
     /// `tcsetattr` **failed** and the flag reads back clear. Honest, and not a
@@ -229,7 +258,7 @@ pub enum RtsCtsOutcome {
     AcceptedThenDropped,
 }
 
-impl RtsCtsOutcome {
+impl FlowOutcome {
     /// The three-way rule, as a pure function of the two readings — so it can be
     /// tested against *injected* readings on a box whose driver can only ever
     /// produce one of the arms (§9: the arm that does not run here is exactly the
@@ -249,13 +278,13 @@ impl RtsCtsOutcome {
     /// — that is what `shipped_predicate_agrees` cross-checks — while the *meaning*
     /// of the three arms exists once, so the report and `load` cannot drift about
     /// which arm a pair of readings is (§7.1 clause 2, §15.53).
-    pub fn classify(set_ok: bool, honoured_on_readback: bool) -> RtsCtsOutcome {
+    pub fn classify(set_ok: bool, honoured_on_readback: bool) -> FlowOutcome {
         if honoured_on_readback {
-            RtsCtsOutcome::Honoured
+            FlowOutcome::Honoured
         } else if set_ok {
-            RtsCtsOutcome::AcceptedThenDropped
+            FlowOutcome::AcceptedThenDropped
         } else {
-            RtsCtsOutcome::Refused
+            FlowOutcome::Refused
         }
     }
 }
@@ -265,7 +294,7 @@ impl RtsCtsOutcome {
 ///
 /// **One implementation, because two callers must not be able to disagree.** The
 /// daemon refuses a `flow = "rts-cts"` config at load time on a port that answers
-/// [`RtsCtsOutcome::AcceptedThenDropped`] here, and the doctor's P15 reports the
+/// [`FlowOutcome::AcceptedThenDropped`] here, and the doctor's P15 reports the
 /// same reading; if those two measured it separately, a report could say the port
 /// is fine while `load` rejects it, or worse the reverse (§7.1 clause 2, §15.53).
 ///
@@ -282,8 +311,21 @@ impl RtsCtsOutcome {
 /// port could not be opened or interrogated at all — which is **not** any of the
 /// three answers and callers must not collapse it into one: an absent or busy
 /// device is *unmeasured*, which §7.1 makes a wait, never a refusal.
-pub fn honours_rtscts(path: &std::path::Path) -> nix::Result<RtsCtsOutcome> {
-    use nix::sys::termios::{ControlFlags, SetArg, tcgetattr, tcsetattr};
+/// **Both modes, one implementation** (§7.1 clause 2, §15.61). The mode is a
+/// parameter because the only thing that differs between them is which flag in which
+/// termios word is set and read back; the open, the restore, the "a failed set is
+/// half the measurement" rule and [`FlowOutcome::classify`]'s three-way meaning are
+/// mode-independent, and copying them per mode is the two-copies-that-must-agree
+/// shape §16.5 bans — the one that let the daemon and P15 answer differently about a
+/// port in the first place.
+///
+/// `XonXoff` mirrors what `serial2`'s `FlowControl::XonXoff` does — set `IXON|IXOFF`,
+/// clear `CRTSCTS` — because the question this predicate answers is whether *the
+/// node's own open* would fault, and `serial2` compares the whole `c_iflag` word by
+/// read-back. Asking a different question than the one the product asks would make
+/// this a proxy (AGENTS §9).
+pub fn honours_flow_control(path: &std::path::Path, mode: FlowMode) -> nix::Result<FlowOutcome> {
+    use nix::sys::termios::{ControlFlags, InputFlags, SetArg, tcgetattr, tcsetattr};
     // O_NONBLOCK so a port asserting flow control against us cannot block the open,
     // and O_NOCTTY so interrogating a port never makes it this process's terminal.
     let fd = nix::fcntl::open(
@@ -293,7 +335,13 @@ pub fn honours_rtscts(path: &std::path::Path) -> nix::Result<RtsCtsOutcome> {
     )?;
     let before = tcgetattr(&fd)?;
     let mut want = before.clone();
-    want.control_flags |= ControlFlags::CRTSCTS;
+    match mode {
+        FlowMode::RtsCts => want.control_flags |= ControlFlags::CRTSCTS,
+        FlowMode::XonXoff => {
+            want.input_flags |= InputFlags::IXON | InputFlags::IXOFF;
+            want.control_flags &= !ControlFlags::CRTSCTS;
+        }
+    }
     // A failed set is not an early return: it is half the measurement. It is what
     // separates the honest refusal from the silent drop, and the read-back is
     // needed either way, so both readings are taken and classified together below.
@@ -302,8 +350,17 @@ pub fn honours_rtscts(path: &std::path::Path) -> nix::Result<RtsCtsOutcome> {
     // Restore before reporting, so an error on the read-back cannot leave a real
     // adapter reconfigured behind us.
     let _ = tcsetattr(&fd, SetArg::TCSANOW, &before);
-    let honoured = after?.control_flags.contains(ControlFlags::CRTSCTS);
-    Ok(RtsCtsOutcome::classify(set.is_ok(), honoured))
+    let after = after?;
+    // Both flags are required for `XonXoff`: a driver honouring one and dropping the
+    // other still fails `serial2`'s whole-word comparison, so a predicate reading
+    // either alone would call a port fine that the node's open refuses.
+    let honoured = match mode {
+        FlowMode::RtsCts => after.control_flags.contains(ControlFlags::CRTSCTS),
+        FlowMode::XonXoff => after
+            .input_flags
+            .contains(InputFlags::IXON | InputFlags::IXOFF),
+    };
+    Ok(FlowOutcome::classify(set.is_ok(), honoured))
 }
 
 /// Take or release exclusive access on a tty — `TIOCEXCL` so stray processes
@@ -1205,12 +1262,12 @@ mod tests {
     /// being set on the port is what "honoured" means.
     #[test]
     fn the_three_crtscts_outcomes_are_separated_by_the_set_status_not_the_readback() {
-        use RtsCtsOutcome::{AcceptedThenDropped, Honoured, Refused};
+        use FlowOutcome::{AcceptedThenDropped, Honoured, Refused};
 
         // The flag is set on the port: honoured, whatever the set reported.
-        assert_eq!(RtsCtsOutcome::classify(true, true), Honoured);
+        assert_eq!(FlowOutcome::classify(true, true), Honoured);
         assert_eq!(
-            RtsCtsOutcome::classify(false, true),
+            FlowOutcome::classify(false, true),
             Honoured,
             "a port that already carried CRTSCTS honours the mode; a set that failed \
              for an unrelated reason does not unset a flag that reads back set"
@@ -1219,14 +1276,14 @@ mod tests {
         // Flag clear. Now — and only now — the set's own status is the discriminator,
         // and it is the whole of §7.1's three-way call.
         assert_eq!(
-            RtsCtsOutcome::classify(true, false),
+            FlowOutcome::classify(true, false),
             AcceptedThenDropped,
             "success plus a cleared read-back is the defect: the driver neither \
              honours the mode nor refuses it, so the link would run without the flow \
              control the config asked for"
         );
         assert_eq!(
-            RtsCtsOutcome::classify(false, false),
+            FlowOutcome::classify(false, false),
             Refused,
             "a failed tcsetattr is an HONEST refusal (§7.1 clause 7) and must not be \
              reported as the silent drop — collapsing the two is what made `load` \
@@ -1235,7 +1292,7 @@ mod tests {
     }
 
     /// **The predicate answers about the real port on this box**, and it puts the
-    /// termios back — the half of [`honours_rtscts`] the pure test above cannot
+    /// termios back — the half of [`honours_flow_control`] the pure test above cannot
     /// reach (the open, the two sets, the restore), measured on a pty because a pty
     /// is the one tty every box has (§9: the portable form, not the rig's form).
     ///
@@ -1265,10 +1322,11 @@ mod tests {
             .expect("open the pts");
         let before = tcgetattr(&slave).expect("tcgetattr before");
 
-        let answer = honours_rtscts(path).expect("a readable pts is measurable");
+        let answer =
+            honours_flow_control(path, FlowMode::RtsCts).expect("a readable pts is measurable");
         assert_eq!(
             answer,
-            RtsCtsOutcome::Honoured,
+            FlowOutcome::Honoured,
             "a Linux pts honours CRTSCTS — an unexpected arm here means the \
              interrogation, not the kernel, changed"
         );
@@ -1279,6 +1337,67 @@ mod tests {
             "the predicate left the tty reconfigured: it must restore the termios it \
              found on every path, because the daemon and the doctor both call it on \
              ports an operator owns"
+        );
+    }
+
+    /// **The software mode's arm on a real tty, and it is portable where the
+    /// hardware one is not** (§15.61, plan §18 item 67).
+    ///
+    /// A pts honours `IXON|IXOFF` on both kernels of record — measured on Darwin
+    /// 24.6.0 (`c_iflag` `0x2b02` → `0x2f02`, the delta being exactly `IXOFF` over an
+    /// already-set `IXON`) and expected on Linux, where a pts is the same
+    /// software-flow-capable tty. **That makes this a `Honoured` arm on a box whose
+    /// real serial port is `AcceptedThenDropped`, which is the whole point**: the two
+    /// live side by side on the Darwin rig box, so the predicate is shown to
+    /// *discriminate* rather than to refuse everything. A refusal rule proven only
+    /// against ports it refuses is not proven.
+    ///
+    /// If this ever reads something else on Linux, the reading is new information
+    /// about that kernel and belongs in the record — not a reason to relax the
+    /// assertion.
+    ///
+    /// The restore check reads **both** flag words, which is item 14's recorded
+    /// lesson: a check reading `c_cflag` alone would certify a port left with `IXON`
+    /// asserted, and this predicate is the one thing that writes to an operator's
+    /// port on every `load`.
+    #[test]
+    fn the_software_arm_answers_on_a_real_tty_and_restores_both_flag_words() {
+        use nix::sys::termios::tcgetattr;
+        use std::os::unix::fs::OpenOptionsExt;
+        let master =
+            nix::pty::posix_openpt(nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY)
+                .expect("posix_openpt");
+        nix::pty::grantpt(&master).expect("grantpt");
+        nix::pty::unlockpt(&master).expect("unlockpt");
+        let pts = ptsname(&master).expect("ptsname");
+        let path = std::path::Path::new(&pts);
+
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(path)
+            .expect("open the pts");
+        let before = tcgetattr(&slave).expect("tcgetattr before");
+
+        let answer =
+            honours_flow_control(path, FlowMode::XonXoff).expect("a readable pts is measurable");
+        assert_eq!(
+            answer,
+            FlowOutcome::Honoured,
+            "a pts honoured IXON|IXOFF on both kernels of record when this was \
+             written; a different arm here is a kernel reading worth recording, not \
+             an assertion to loosen"
+        );
+
+        let after = tcgetattr(&slave).expect("tcgetattr after");
+        assert_eq!(
+            (before.input_flags, before.control_flags),
+            (after.input_flags, after.control_flags),
+            "the predicate left the tty reconfigured. Both words are compared \
+             deliberately: the software arm writes `c_iflag` and clears CRTSCTS in \
+             `c_cflag`, so a restore check reading either alone would certify a port \
+             this call had left changed"
         );
     }
 

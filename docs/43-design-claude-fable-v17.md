@@ -1011,10 +1011,20 @@ would be degraded here is not an observation but the transport's *contract*.
    intact. The false half had also reached an operator-facing string in the doctor's P15 verdict,
    repaired in the same change.)* The
    refusal is structural and carries `node`, `device`, `resolved_path`, `requested_flow_control`,
-   and `honoured_on_readback` as data, plus two remedies: `flow_control = "none"` (or `xon-xoff`) for this
-   port, or an adapter whose driver implements RTS/CTS.
+   and `honoured_on_readback` as data, plus two remedies: `flow_control = "none"` for this
+   port, or an adapter whose driver implements the mode. **The clause said "`flow_control =
+   "none"` (or `xon-xoff`)" and "implements RTS/CTS" until 2026-08-13, and the parenthetical was
+   wrong in the worst place:** the driver that gives this refusal its founding measurement drops
+   `IXON`/`IXOFF` too (§15.61), so the advice sent an operator from a structural refusal into
+   exactly the late fault the refusal exists to prevent. **Since that measurement the clause
+   applies to `xon-xoff` as well** — same position, same structural atomicity, same three-way
+   predicate — and the refusal names the mode it is about.
 2. **One predicate, because two callers must not be able to disagree**:
-   `serial_nexus_sys::honours_rtscts` is the only implementation. The daemon's pre-check
+   `serial_nexus_sys::honours_flow_control` is the only implementation, **for both modes** — it
+   takes the mode as a parameter rather than being copied per mode, since the three-way
+   classification is already a pure function of two booleans and only *which flag in which
+   termios word* differs (§15.61; it was `honours_rtscts` and answered for one mode until
+   2026-08-13). The daemon's pre-check
    consults it, the harness branches on it, and doctor P15 calls it and requires its answer to
    match the read-back P15 takes by hand, reporting `shipped_predicate_agrees` with its own
    `degraded` arm ranked above the finding itself — a report that calls a port fine while `load`
@@ -1054,7 +1064,18 @@ would be degraded here is not an observation but the transport's *contract*.
    notes §3.68). A board that auto-resets on DTR takes one extra reset per `load` of an
    `rts-cts` node; removing it would mean asking from inside the node's own open, past where
    "nothing is created" holds — a filed design question, not a patch.
-7. Per-mode measurement status: `rts-cts` is measured on both kernels — Linux honours the flag
+7. Per-mode measurement status. **Both modes are now measured on both kernels, and both are
+   refused where the driver drops them (§15.61, 2026-08-13).** `xon-xoff`'s Darwin arm is the
+   FT232R on `IOSerialFamily` accepting `IXON|IXOFF` and reading `c_iflag` back `0x0` → `0x0` —
+   a delta of nothing, `tcsetattr_ok: true`, 6 of 6 (the `b346188` macOS triple) — against
+   `ftdi_sio` honouring it `0x5` → `0x1405` on the same two adapters. So the sentence this
+   clause carried until then, *"that mode is unmeasured rather than known-good"*, is discharged
+   by measurement rather than by argument, and the refusal follows §15.53's reasoning unchanged:
+   `serial2` verifies `c_iflag` by read-back exactly as it verifies `c_cflag`, so the node would
+   fail its own open with the bare `failed to apply some or all settings`. The discrimination is
+   proven rather than assumed — a Darwin **pts** honours the same request (`0x2b02` → `0x2f02`)
+   and is not refused. The superseded per-mode status follows.
+   `rts-cts` is measured on both kernels — Linux honours the flag
    (`cflag` delta exactly `CRTSCTS`; the `7cf0338` Linux triple — a committed doctor artifact,
    the citation convention is §13's — 2026-08-05, and the Linux 6.18
    field report at `3e23c52` agree) and Darwin's `IOSerialFamily` accepts-then-drops it on the
@@ -4394,6 +4415,62 @@ moved `probe_set` for a **wording** change, spending a second era boundary where
 two are folded together at P16's landing, in one commit — the widened `question`, the software
 reading folded into P15's verdict, and P16's arrival — so the archive gains one boundary rather
 than two.
+
+### 15.61 The flow-control refusal covers both modes, because one driver drops both
+
+**Status:** DECIDED — extends §15.53 (which is annotated, not rewritten); restated at §7.1's
+flow-control clauses 1, 2 and 7. Construction is plan §18 item 67.
+
+**This is a conditional decline being paid off, not a decline being reversed.** Plan §18 item 14
+declined extending the refusal to `xon-xoff` in exactly these words: *"the refusal follows only if
+a dropping driver is found — extending §15.53 to a mode nobody has measured would be policy
+without evidence."* The condition named the evidence, and the evidence arrived: on Darwin 24.6.0,
+Apple's `IOSerialFamily` on an FT232R accepts `IXON|IXOFF` (`tcsetattr` returns success with a null
+error) and reads `c_iflag` back **`0x0` → `0x0`** — a delta of nothing — on both ports of the rig,
+6 of 6 across three captures, with `serial2_readback_would_fault: true` (notes §3.93; the
+`b346188` macOS triple). The same two adapters one kernel away read `0x5` → `0x1405` under
+`ftdi_sio`, a delta of exactly the two flags. **So the driver that gave §15.53 its founding
+measurement drops the software mode the same way it drops the hardware one**, and the mode §7.1
+clause 7 called "unmeasured rather than known-good" is now measured and not good.
+
+**The decision is the same decision, for the same reason.** `serial2` verifies `c_iflag` by
+read-back exactly as it verifies `c_cflag`, so a node configured `flow_control = "xon-xoff"` on
+such a port fails its own open with the bare `failed to apply some or all settings` — the late,
+uninformative fault §15.53 exists to convert into an early, structural refusal. Nothing about the
+argument is new; only the second mode's evidence was missing, and the entry that declined without
+it was right to.
+
+**What changes.**
+
+1. **The predicate generalizes rather than being copied.** One implementation still answers for
+   both modes — the two-copies-that-must-agree shape §16.5 bans is the failure mode here, and the
+   three-way classification (`Honoured` / `Refused` / `AcceptedThenDropped`, plus `Err` for
+   unmeasured) is already a pure function of two booleans and mode-independent. Only *which flag in
+   which termios word* is set and read back differs, so that is the parameter. §7.1 clause 2's "one
+   predicate, because two callers must not be able to disagree" is unchanged in force and widened
+   in subject.
+2. **Only `AcceptedThenDropped` refuses, for either mode.** An honest refusal stays honest (the
+   node's own open fails loudly), `Err` stays *unmeasured* and never refuses, and an absent device
+   still never reaches the check — §12's `waiting` node. The refusal names the mode it is about.
+3. **A remedy that was wrong on the platform of record is corrected.** §7.1 clause 1 and the
+   shipped refusal offered `flow_control = "none"` **(or `xon-xoff`)** as the remedy for a dropped
+   `rts-cts`. On this rig the same driver drops both, so that parenthetical sent an operator from a
+   refusal straight into a late fault — advice that is worst exactly where the refusal fires. The
+   remedy is `flow_control = "none"`, or an adapter whose driver implements the mode.
+
+**What does not change, stated because a widening is where scope creeps.** No new capability, no
+new verb, no change to *when* the check runs (still before anything is created, §11), and no change
+to the two paths that still reach `faulted` — a `--replace` on a port the running graph holds, and
+an adapter arriving after load — whose repairs stay declined with the reasons §15.53 records. The
+DTR-toggle cost §7.1 clause 6 states now applies to `xon-xoff` nodes too, which is a widening of a
+recorded cost rather than a new one: the pre-check's open is the same open.
+
+**The bound on the evidence, kept sharp.** One driver on two kernels is what is measured. This
+refuses a mode a port *demonstrably* drops; it does not assert that any other driver drops it, and
+a port that honours the mode is not refused — which is not a hope, because both arms are
+reachable on one box: a Darwin **pts** honours `IXON|IXOFF` (`c_iflag` `0x2b02` → `0x2f02`) while
+the FT232R beside it drops them. That pair is the discrimination proof, and it is what keeps this
+from being a rule that refuses everything and calls it safety.
 
 ### 15.60 The Darwin pty buffer is a capacity, not a watermark — settled by a rung that already shipped
 

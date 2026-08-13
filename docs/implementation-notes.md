@@ -11810,3 +11810,76 @@ Linux's reason and leaving step 4 unexercised.
 
 *Owed, and stated rather than implied:* the reddening of step 4 has been proven on Darwin only.
 Both new guards run and pass on Linux, but this session had one box.
+
+### 3.95 A conditional decline paid off, and a primer that left its own payload on the wire
+
+Plan §18 items 67 and 70, and they are unrelated except that one session found both — the first
+by reading a measurement, the second by running the rig binary that measurement licensed.
+
+**Item 67: the refusal extended, design first.** §15.61 was written before the tree moved, which
+is the order AGENTS §5 requires and the order item 26 was once blocked on. What made it writable
+is that item 14's decline was **conditional and said so** — "the refusal follows only if a dropping
+driver is found" — and §3.93 found one. Extending it is therefore the decision the decline asked
+for, not a reversal of it, and the distinction matters enough that both this entry and the item say
+it in the same words.
+
+**The predicate generalized rather than being copied.** `honours_rtscts` →
+`honours_flow_control(path, FlowMode)`, `RtsCtsOutcome` → `FlowOutcome`. The three-way
+classification was already a pure function of two booleans; only *which flag in which termios word*
+differs, so that is the parameter and everything else is written once. This is §16.5's rule applied
+to the one function in the tree with a recorded history of the failure it prevents: two copies of
+this question are how the daemon and P15 came to answer differently about one port (item 56).
+
+**Both arms on one box, which is the part that makes it a refusal rather than a prohibition.** The
+rig's FT232R drops `IXON|IXOFF` — `c_iflag` `0x0` → `0x0`, `tcsetattr` reporting success — and is
+refused at `load` with nothing created. A Darwin **pts** honours the same request — `0x2b02` →
+`0x2f02`, the delta being exactly `IXOFF` over an already-set `IXON` — and is not refused. Both
+assertions ship: the rig guard takes whichever arm the driver in front of it produces, and the
+`sys` self-test pins the honouring arm on a tty every box has. A rule proven only against ports it
+refuses has not been shown to discriminate, and this session had a box that could show it.
+
+**Three shipped strings were wrong the moment the second mode was measured**, and all three are
+the same defect wearing different clothes — prose that outlived the tree it described. (a) The
+remedy offered `flow_control = "none"` *(or `xon-xoff`)* for a dropped `rts-cts`; on the platform
+of record the same driver drops both, so the refusal's own advice led to the late fault the
+refusal exists to prevent. (b) `open_failure_text` described the software mode in `CRTSCTS`'s
+words, which would have explained a failure with a measurement of a different flag. (c) P15's
+`does_not_license` told every future reader that a `flow_control = "xon-xoff"` config "is refused
+at neither `load` nor `add-node` whatever it says" — §7.1 clause 2's report-says-fine /
+load-refuses split, in the direction that misleads hardest.
+
+**The fail-first arrived unasked, which is the best kind.** Two pre-existing daemon guards reddened
+on the behaviour change, one of them a table listing `(AcceptedThenDropped, XonXoff)` under "node
+never asked for it" — the exact expectation §15.61 overturns. The entry moved to its own assertion
+rather than being deleted, so the new behaviour is now pinned where the old one was.
+
+---
+
+**Item 70: the primer, and an attribution taken before a diagnosis was offered.** The rig binary
+came back with `crossover_rig_map_node_both_directions` failing. Before theorising, the tree was
+reverted: a clean `git worktree` at `e5a305f` with its own target dir failed **4 of 4**. So it was
+pre-existing, and nothing this session did needed defending.
+
+**The evidence identifies the bytes rather than characterising them.** The failure is 62 bytes
+prepended to the test's own correct output — and 62 is one FTDI bulk packet's payload, 64 minus the
+two status bytes, the same quantum §3.70 measured. Those 62 bytes are a **contiguous slice of
+`prime_the_wire_once`'s seed-9001 stream**, found at offsets 833 and 789 of the 1 KiB in two
+separate failures (62 of 62 and 62 of 63 bytes matching). The primer waited for
+`file_len(&path) > 0` — satisfied by the *first* byte — then dropped its daemon with most of a KiB
+still in flight, and the adapter handed the remainder to the next reader.
+
+**The function's own closing comment claimed this was impossible:** "no primed byte can land in a
+capture under test". It is the session's recurring shape one more time — a sentence stating an
+intention in the grammar of a mechanism — and it is now true because the code establishes it rather
+than because the comment says so.
+
+**Quiescence, not a byte count.** Waiting for 1024 bytes would hang on precisely the kernel this
+primer exists for: where the leading packet is *eaten*, the log never reaches 1024. Stability is
+the portable question and reads the same on a kernel that drops bytes and one that retains them.
+4 of 4 red before, 3 of 3 green after, 7 of 7 for the whole rig binary.
+
+**No product defect, and this is §3.70 with the sign flipped.** The daemon neither lost nor invented
+a byte: the payload arrived byte-exact, behind stale data from an earlier test. There, a
+re-enumerated FT232R *ate* one bulk packet; here Darwin's *retains* one. Same 64-byte quantum,
+opposite direction, different kernel. Recorded as an observation — **no mechanism is claimed** for
+why the two kernels differ, and one measurement on one adapter pair is not the place to start.

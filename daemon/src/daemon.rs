@@ -438,6 +438,12 @@ struct FlowPrecheckTarget<'a> {
     /// The port behind `device` *right now*, resolved exactly as the node's own
     /// open resolves it.
     path: std::path::PathBuf,
+    /// Which mode this node asked for, and therefore which one to interrogate. Both
+    /// `rts-cts` and `xon-xoff` are refused where the driver drops them (§15.61);
+    /// carrying the mode is what keeps the refusal message about the mode the
+    /// operator actually configured rather than about the one this check used to be
+    /// the only one for.
+    mode: serial_nexus_sys::FlowMode,
 }
 
 /// Which port, if any, [`Daemon::precheck_flow_control`] must ask about this node.
@@ -498,13 +504,20 @@ fn flow_precheck_target<'a>(
     else {
         return None;
     };
-    if *flow_control != FlowControl::RtsCts {
-        return None;
-    }
+    // Both handshaking modes are interrogated; `none` is the only one with nothing to
+    // ask about (§15.61). Spelled as a match rather than as `!= FlowControl::None` so
+    // a future mode has to be dispositioned here instead of silently inheriting an
+    // interrogation that may not fit it.
+    let mode = match flow_control {
+        FlowControl::RtsCts => serial_nexus_sys::FlowMode::RtsCts,
+        FlowControl::XonXoff => serial_nexus_sys::FlowMode::XonXoff,
+        FlowControl::None => return None,
+    };
     Some(FlowPrecheckTarget {
         name,
         device,
         path: resolver.resolve_current_path(device)?,
+        mode,
     })
 }
 
@@ -516,8 +529,8 @@ fn flow_precheck_target<'a>(
 /// driver that returns success from `tcsetattr` and reads the flag back clear. The
 /// other two do not, for different reasons that must not be collapsed:
 ///
-/// * [`RtsCtsOutcome::Honoured`] — the mode works here; nothing to refuse.
-/// * [`RtsCtsOutcome::Refused`] — the driver said **no**, and that is honest.
+/// * [`FlowOutcome::Honoured`] — the mode works here; nothing to refuse.
+/// * [`FlowOutcome::Refused`] — the driver said **no**, and that is honest.
 ///   §7.1 clause 7: "a driver that *refuses* the flag outright is honest and is not
 ///   refused here; only accept-then-drop is the defect". Refusing it would deny an
 ///   operator a whole config over a port whose failure is already loud — `serial2`
@@ -537,10 +550,10 @@ fn flow_precheck_target<'a>(
 /// split §7.1 clause 2 calls worse than either verdict alone, and no amount of
 /// cross-checking could find it: `shipped_predicate_agrees` compared the two sides'
 /// read-backs, which were the half that agreed.
-fn flow_precheck_refuses(measured: Option<serial_nexus_sys::RtsCtsOutcome>) -> bool {
+fn flow_precheck_refuses(measured: Option<serial_nexus_sys::FlowOutcome>) -> bool {
     matches!(
         measured,
-        Some(serial_nexus_sys::RtsCtsOutcome::AcceptedThenDropped)
+        Some(serial_nexus_sys::FlowOutcome::AcceptedThenDropped)
     )
 }
 
@@ -730,7 +743,7 @@ impl Daemon {
     /// **It costs a real extra line toggle, and that is measured rather than argued
     /// away** (notes §3.68). This comment used to say the open was "not an *extra*
     /// toggle" because the node was about to open the same port anyway. That is
-    /// false: [`serial_nexus_sys::honours_rtscts`] performs a *complete*
+    /// false: [`serial_nexus_sys::honours_flow_control`] performs a *complete*
     /// open→configure→restore→close cycle that finishes before the node's own open
     /// begins, and on Linux the last close of a tty whose termios has `HUPCL` lowers
     /// DTR and RTS (`tty_port_shutdown` → `tty_port_lower_dtr_rts`).
@@ -759,8 +772,12 @@ impl Daemon {
         nodes: &[serial_nexus_core::config::NodeConfig],
     ) -> Result<(), RpcError> {
         for nc in nodes {
-            let Some(FlowPrecheckTarget { name, device, path }) =
-                flow_precheck_target(&self.resolver, nc)
+            let Some(FlowPrecheckTarget {
+                name,
+                device,
+                path,
+                mode,
+            }) = flow_precheck_target(&self.resolver, nc)
             else {
                 continue;
             };
@@ -768,19 +785,24 @@ impl Daemon {
             // an `Err` is a port that could not be opened or interrogated, which
             // §7.1 makes a wait rather than a refusal. The three measured answers
             // stay separate all the way into the decision below.
-            if !flow_precheck_refuses(serial_nexus_sys::honours_rtscts(&path).ok()) {
+            if !flow_precheck_refuses(serial_nexus_sys::honours_flow_control(&path, mode).ok()) {
                 continue;
             }
             let shown = path.display();
+            let asked = mode.config_spelling();
+            let flags = match mode {
+                serial_nexus_sys::FlowMode::RtsCts => "the flag",
+                serial_nexus_sys::FlowMode::XonXoff => "the flags",
+            };
             return Err(structural_error(
                 &format!(
                     "node {name:?}: device {device} (currently {shown}) does not \
-                     honour rts-cts flow control — its driver accepts the request \
-                     and reads the flag back clear, so the link would run without \
+                     honour {asked} flow control — its driver accepts the request \
+                     and reads {flags} back clear, so the link would run without \
                      the flow control this config asks for. Refused here rather \
-                     than faulting the node at open. Use flow_control = \"none\" (or \
-                     xon-xoff) for this port, or attach an adapter whose driver \
-                     implements RTS/CTS; `serial-nexus-doctor --port {shown}` \
+                     than faulting the node at open. Use flow_control = \"none\" for \
+                     this port, or attach an adapter whose driver implements \
+                     {asked}; `serial-nexus-doctor --port {shown}` \
                      reports the same reading as P15."
                 ),
                 Some(json!({
@@ -790,7 +812,7 @@ impl Daemon {
                     // `device` string — §12 configs name an identity, and the
                     // port behind it renumbers across a replug.
                     "resolved_path": shown.to_string(),
-                    "requested_flow_control": "rts-cts",
+                    "requested_flow_control": asked,
                     "honoured_on_readback": false,
                 })),
             ));
@@ -3279,11 +3301,30 @@ mod tests {
             "an absent adapter must not be interrogated — it comes up waiting"
         );
 
-        // And the check stays scoped to the mode that asked for it: no open, and so
-        // no DTR toggle, for a node that never requested rts-cts.
+        // And the check stays scoped to the modes that asked for it: no open, and so
+        // no DTR toggle, for a node that requested no handshaking at all.
         assert!(
             flow_precheck_target(&r, &serial_node("raw:/dev/null", "none")).is_none(),
-            "only an rts-cts config may cause the pre-check to open a port"
+            "only a handshaking config may cause the pre-check to open a port"
+        );
+
+        // **Each handshaking mode is interrogated about itself** (§15.61). Asking
+        // about `CRTSCTS` on an `xon-xoff` node would refuse — or clear — a config on
+        // a measurement of a different flag, which is the proxy AGENTS §9 bans; the
+        // mode travels with the target so it cannot happen by omission.
+        let hard_node = serial_node("raw:/dev/null", "rts-cts");
+        let hard = flow_precheck_target(&r, &hard_node)
+            .expect("an rts-cts node on a present device is a target");
+        assert_eq!(hard.mode, serial_nexus_sys::FlowMode::RtsCts);
+        let soft_node = serial_node("raw:/dev/null", "xon-xoff");
+        let soft = flow_precheck_target(&r, &soft_node).expect(
+            "an xon-xoff node on a present device is a target too, since §15.61 — a \
+             dropping driver was found and the decline it was conditional on was paid off",
+        );
+        assert_eq!(
+            soft.mode,
+            serial_nexus_sys::FlowMode::XonXoff,
+            "the xon-xoff node must be interrogated about IXON/IXOFF, not about CRTSCTS"
         );
     }
 
@@ -3305,7 +3346,7 @@ mod tests {
     /// and nothing in the tree could tell.
     #[test]
     fn only_an_accept_then_drop_reading_refuses_the_config() {
-        use serial_nexus_sys::RtsCtsOutcome::{AcceptedThenDropped, Honoured, Refused};
+        use serial_nexus_sys::FlowOutcome::{AcceptedThenDropped, Honoured, Refused};
 
         assert!(
             flow_precheck_refuses(Some(AcceptedThenDropped)),

@@ -56,7 +56,7 @@ use crate::cell::CriticalCell;
 use crate::runtime::{self, READ_BUF, SharedFanOut, TargetwardInbox, TeardownLoss};
 use crate::tap::TapFeed;
 use serial_nexus_sys as sys;
-use serial_nexus_sys::RtsCtsOutcome;
+use serial_nexus_sys::FlowOutcome;
 
 /// Re-arm interval (ms) for the serial reader thread's blocking readiness poll.
 /// A live device wakes it far sooner; on teardown the thread observes its stop
@@ -144,7 +144,7 @@ fn waiting_reason(device: &str, resolver: &serial_nexus_core::Resolver) -> Strin
 /// and creates nothing.
 ///
 /// Bounded on purpose. It costs an extra open only when the node actually asked for
-/// `rts-cts` *and* is already failing, and it consults `sys::honours_rtscts` — the one
+/// `rts-cts` *and* is already failing, and it consults `sys::honours_flow_control` — the one
 /// predicate §15.53 requires, the same one `load` uses and P15 cross-checks — rather
 /// than pattern-matching `serial2`'s error text, which is not a contract. Anything
 /// other than a definite measurement leaves the original error alone: a driver that
@@ -160,9 +160,9 @@ fn waiting_reason(device: &str, resolver: &serial_nexus_core::Resolver) -> Strin
 /// of the three answers: it says nothing about flow control, so it must not blame it.
 ///
 /// **Two arms explain, and they say different things, because the driver did**
-/// (§7.1 clause 7, §15.53). An [`RtsCtsOutcome::AcceptedThenDropped`] port is one
+/// (§7.1 clause 7, §15.53). An [`FlowOutcome::AcceptedThenDropped`] port is one
 /// `load` would normally have refused outright, so its sentence says why the refusal
-/// could not fire. An [`RtsCtsOutcome::Refused`] port is one `load` deliberately lets
+/// could not fire. An [`FlowOutcome::Refused`] port is one `load` deliberately lets
 /// through — the refusal is honest, and this *is* the loud failure §7.1 counts on
 /// instead — so its sentence must not accuse the driver of accepting and dropping the
 /// request, which would be a false statement about the port in front of the operator.
@@ -170,14 +170,21 @@ fn waiting_reason(device: &str, resolver: &serial_nexus_core::Resolver) -> Strin
 /// all: an honest refusal was `Ok(false)`, so either it got the accept-then-drop text
 /// (false) or it got nothing (opaque, §7.1 clause 5).
 fn open_failure_text(
-    measured: Option<RtsCtsOutcome>,
+    measured: Option<FlowOutcome>,
     flow: CfgFlow,
     path: &std::path::Path,
     e: &str,
 ) -> String {
-    if flow != CfgFlow::RtsCts {
-        return e.to_owned();
-    }
+    // Both handshaking modes explain themselves; `none` has nothing to explain. The
+    // wording differs because the driver's answer does — `CRTSCTS` is one flag in
+    // `c_cflag`, `IXON|IXOFF` are two in `c_iflag` — and a message that said "the
+    // flag" about a two-flag mode would be describing a different measurement than
+    // the one taken (§15.61).
+    let (asked, requested, flags, implements) = match flow {
+        CfgFlow::RtsCts => ("rts-cts", "a `CRTSCTS`", "the flag", "RTS/CTS"),
+        CfgFlow::XonXoff => ("xon-xoff", "an `IXON|IXOFF`", "the flags", "XON/XOFF"),
+        CfgFlow::None => return e.to_owned(),
+    };
     let shown = path.display();
     // **The remedy names `flow_control`, and that spelling is load-bearing.** Every
     // message in this family said `flow = "none"` until 2026-08-12 — four shipped
@@ -191,39 +198,46 @@ fn open_failure_text(
     // `serial2`'s bare "failed to apply some or all settings", and then it handed them
     // a key the parser denies.
     match measured {
-        Some(RtsCtsOutcome::AcceptedThenDropped) => format!(
-            "{e} — this port's driver accepts a `CRTSCTS` request and reads the flag back \
-             clear, so `flow_control = \"rts-cts\"` cannot be honoured on it and `serial2` refuses \
+        Some(FlowOutcome::AcceptedThenDropped) => format!(
+            "{e} — this port's driver accepts {requested} request and reads {flags} back \
+             clear, so `flow_control = \"{asked}\"` cannot be honoured on it and `serial2` refuses \
              the open (§15.53). Normally `load`/`add-node` refuses this config outright, \
              but the pre-check could not open {shown} to measure it — either the running \
              graph still held the port, or the device was absent when the config loaded. \
-             Use flow_control = \"none\" (or xon-xoff) for this port, or attach an adapter whose \
-             driver implements RTS/CTS; `serial-nexus-doctor --port {shown}` reports the \
+             Use flow_control = \"none\" for this port, or attach an adapter whose \
+             driver implements {implements}; `serial-nexus-doctor --port {shown}` reports the \
              same reading as P15."
         ),
-        Some(RtsCtsOutcome::Refused) => format!(
-            "{e} — this port's driver refuses a `CRTSCTS` request outright: `tcsetattr` \
-             fails on it rather than reporting success and leaving the flag clear, so \
-             `flow_control = \"rts-cts\"` cannot be applied here and `serial2` propagates the \
+        Some(FlowOutcome::Refused) => format!(
+            "{e} — this port's driver refuses {requested} request outright: `tcsetattr` \
+             fails on it rather than reporting success and leaving {flags} clear, so \
+             `flow_control = \"{asked}\"` cannot be applied here and `serial2` propagates the \
              driver's own error out of the open. That refusal is honest, which is why \
              `load`/`add-node` does **not** reject this config for it (§7.1) — the \
              failure is loud and arrives here instead of a link running silently \
-             without the flow control it asked for. Use flow_control = \"none\" (or xon-xoff) \
-             for this port, or attach an adapter whose driver implements RTS/CTS; \
+             without the flow control it asked for. Use flow_control = \"none\" \
+             for this port, or attach an adapter whose driver implements {implements}; \
              `serial-nexus-doctor --port {shown}` reports the same reading as P15."
         ),
         // Honoured, or unmeasurable. Neither says anything about this failure.
-        Some(RtsCtsOutcome::Honoured) | None => e.to_owned(),
+        Some(FlowOutcome::Honoured) | None => e.to_owned(),
     }
 }
 
 fn explain_open_failure(path: &std::path::Path, params: &OpenParams, e: &std::io::Error) -> String {
-    // Only ask when the node actually requested `rts-cts` *and* is already failing:
-    // this costs one extra open, on a path that is not going to succeed anyway.
-    let measured = if params.flow == CfgFlow::RtsCts {
-        serial_nexus_sys::honours_rtscts(path).ok()
-    } else {
-        None
+    // Only ask when the node actually requested a handshaking mode *and* is already
+    // failing: this costs one extra open, on a path that is not going to succeed
+    // anyway. The mode asked about is the one configured — asking about `CRTSCTS` on
+    // an `xon-xoff` node would explain the failure with a measurement of something
+    // else (§15.61).
+    let measured = match params.flow {
+        CfgFlow::RtsCts => {
+            serial_nexus_sys::honours_flow_control(path, serial_nexus_sys::FlowMode::RtsCts).ok()
+        }
+        CfgFlow::XonXoff => {
+            serial_nexus_sys::honours_flow_control(path, serial_nexus_sys::FlowMode::XonXoff).ok()
+        }
+        CfgFlow::None => None,
     };
     open_failure_text(measured, params.flow, path, &e.to_string())
 }
@@ -1519,7 +1533,7 @@ mod tests {
         let bare = "failed to apply some or all settings";
 
         let blamed = open_failure_text(
-            Some(RtsCtsOutcome::AcceptedThenDropped),
+            Some(FlowOutcome::AcceptedThenDropped),
             CfgFlow::RtsCts,
             p,
             bare,
@@ -1545,14 +1559,17 @@ mod tests {
         // Every arm that is not a measured drop passes the error through verbatim.
         for (measured, flow) in [
             // driver honours it — something else broke
-            (Some(RtsCtsOutcome::Honoured), CfgFlow::RtsCts),
+            (Some(FlowOutcome::Honoured), CfgFlow::RtsCts),
             // unmeasurable — says nothing about flow
             (None, CfgFlow::RtsCts),
-            // node never asked for it
-            (Some(RtsCtsOutcome::AcceptedThenDropped), CfgFlow::None),
-            (Some(RtsCtsOutcome::AcceptedThenDropped), CfgFlow::XonXoff),
-            (Some(RtsCtsOutcome::Refused), CfgFlow::None),
+            // node never asked for any handshaking
+            (Some(FlowOutcome::AcceptedThenDropped), CfgFlow::None),
+            (Some(FlowOutcome::Refused), CfgFlow::None),
             (None, CfgFlow::None),
+            // …and the software mode's non-blaming arms, which are the same three
+            // shapes as `rts-cts`'s above (§15.61).
+            (Some(FlowOutcome::Honoured), CfgFlow::XonXoff),
+            (None, CfgFlow::XonXoff),
         ] {
             assert_eq!(
                 open_failure_text(measured, flow, p, bare),
@@ -1560,6 +1577,35 @@ mod tests {
                 "measured={measured:?} flow={flow:?} must not blame flow control"
             );
         }
+
+        // **`(AcceptedThenDropped, XonXoff)` moved out of the table above, and the
+        // move is the point.** It sat there as "node never asked for it", which was
+        // true while §15.53 covered `rts-cts` alone; since §15.61 an `xon-xoff` node
+        // on a dropping port is refused at `load` for the same reason and explained
+        // here for the same reason when the pre-check could not run. This assertion
+        // caught the behaviour change by reddening on the old expectation, which is
+        // the handshake a guard is for.
+        let soft = open_failure_text(
+            Some(FlowOutcome::AcceptedThenDropped),
+            CfgFlow::XonXoff,
+            p,
+            bare,
+        );
+        assert!(
+            soft.contains("accepts an `IXON|IXOFF` request and reads the flags back clear")
+                && soft.contains("flow_control = \"xon-xoff\""),
+            "an xon-xoff node on a dropping port must be explained in its own terms, \
+             naming the flags it asked for rather than CRTSCTS: {soft}"
+        );
+        assert!(
+            !soft.contains("CRTSCTS"),
+            "the software arm must not describe the hardware flag — that would explain \
+             this failure with a measurement of something else: {soft}"
+        );
+        assert!(
+            soft.contains("flow_control = \"none\"") && soft.contains("adapter whose driver"),
+            "must carry both remedies: {soft}"
+        );
     }
 
     /// **An honest refusal reaching the open gets its own sentence, and it must not
@@ -1580,7 +1626,7 @@ mod tests {
     fn an_honest_refusal_is_explained_without_being_accused_of_dropping_the_request() {
         let p = std::path::Path::new("/dev/ttyS9");
         let bare = "Invalid argument (os error 22)";
-        let text = open_failure_text(Some(RtsCtsOutcome::Refused), CfgFlow::RtsCts, p, bare);
+        let text = open_failure_text(Some(FlowOutcome::Refused), CfgFlow::RtsCts, p, bare);
 
         assert!(
             text.contains(bare) && text.contains("/dev/ttyS9"),

@@ -42,8 +42,9 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 | **931 passing · 1 failed · 6 ignored**, four self-skips | Linux, **rig lane minus `SNX_RIG_FLOW` and `SNX_WEB_UI`** | 2026-08-12 | the item-47 landing (notes §3.83) | **the rig-lane authority row**, superseding the 894 below and equal to this session's default-scope figure. Run against a freshly `scripts/bless`ed helper (the operator ran it mid-session; an earlier lane was discarded rather than recorded, because the helper binary was replaced underneath it). Every hardware test passed — both replug tests including `identity_survives_a_replug_that_renumbers_the_tty`, all five crossover tests, `web_tls_round_trip` under `SNX_TLS=required`. The two named drops are measurements taken *in this run*, not conveniences: the four self-skips are the two `rts-cts` tests, which print the reading that justifies them (`port1 RTS high -> port0 cts:false`, low -> `cts:false` — a **3-wire** bench, §15.52's legitimate answer and the third independent confirmation of it), and the two browser tests, on a box with no `node`. The one failure is `p3_idle_cost` (item 46), unrelated to the rig. **One lane before this one hung** and is recorded rather than quietly re-run — see the note under this table. |
 | **894 passing · 1 failed · 6 ignored**, four self-skips | Linux, **rig lane minus `SNX_RIG_FLOW` and `SNX_WEB_UI`** | 2026-08-12 | this session (notes §3.80) | the rig-lane authority row, and the first green one in this record. Both exclusions are measurements, not conveniences: this box has no `node`, and the bench **measures 3-wire**, which §15.52 makes a legitimate answer — so the two `rts-cts` end-to-end tests skip with their reading printed. The one failure is `p3_idle_cost` (item 46), unrelated to the rig. Every hardware test passed, `identity_survives_a_replug_that_renumbers_the_tty` for the first time ever. **Superseded by the 925 rig row above**, taken later the same day at the same scope. |
 | **835 passing · 0 failed · 4 ignored** | Linux, rig lane — and again at default CI scope, same session | 2026-08-05 | `17c6e87` (notes §3.68) | twice on the full rig lane, once at default CI scope, 835/0/4 each time — the last dual-scope measurement; superseded by the 852 re-measure of 2026-08-07; not the current-tree figure. **Attribution unreconciled (v17):** notes §3.68's verbatim session record reads 830 (gates scope) and 834/0 · 833/1 (rig lane), and no 835 appears in it — the figure survives only as a v15 Status-table quotation (the re-cited-not-re-derived class), so neither the number nor the dual-scope equivalence is attributable to §3.68. Superseded either way. |
-| **957 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** | 2026-08-13 | this session (notes §3.94) | **the macOS authority row for the rig box.** The **+2** over the 955 row below is item 66's two new guards, counted rather than estimated: `serial_nexus_sys`'s `peer_hungup` self-test and `itest`'s Darwin witness guard. Same scope, same box, same session, one commit later; every caveat on the 955 row still applies and is not repeated here. Supersedes it. |
-| **955 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** (MacBookPro15,1, Darwin 24.6.0 / macOS 15.7.8, 12 cores) | 2026-08-13 | this session (notes §3.93) | **superseded by the 957 row above**, taken later the same session at the same scope. The first figure ever taken on this box at a tree whose macOS-only guards pass. 126 result lines over **122 cargo targets** (114 `Running` + 8 doc-test) and **105 self-skips**. **Read the skip count before comparing this to anything:** 105 against the Linux authority row's **13** at the same scope is the honest measure of how much of this suite is device- or Linux-gated on a Mac — the rig is physically attached but `SNX_CROSSOVER_A`/`_B` are unexported at default scope, so every serial test self-skips by design. A macOS default-scope figure is therefore **not** comparable to a Linux one test-for-test, and no delta between them is derived here. **The preceding run at this same tree read 953 · 1+1 · 7** and is kept rather than replaced, because it is the measurement that found the defects: `probes::tests::the_software_readback_reports_unmeasurable_rather_than_answering` (a baseline `Termios` taken off a pty master, which Darwin answers `ENOTTY`) and `both_gates_refuse_an_unsupported_verdict_and_are_shown_able_to` (a report-shaping premise that knew about P12 and not P2) — both item 69, both repaired in the same commit as this row, and both red in CI's `macos` job on every push since they landed. Not the CI arm64 runner and not the M4: three machines, none substituting for another (item 18). |
+| **959 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** | 2026-08-13 | this session (notes §3.95) | **the macOS authority row for the rig box.** The **+4** over the 955 row is this session's four new guards, counted rather than estimated: `peer_hungup`'s self-test and the Darwin witness guard (item 66), the software-arm `sys` test and the `xon-xoff` rig guard (item 67). **A self-skip count is deliberately not quoted, and the reason is a correction to how this table has been reading them.** Under `--nocapture` the suite's parallel binaries interleave their writes, so a `SKIP` line frequently loses its line start and a `grep -c '^SKIP'` undercounts: two runs of this box at adjacent trees read 105 and 102, and all of the "missing" three are present in the log unanchored. So the figure is ~100–105 and is **not stably countable this way** — which extends notes §3.78 rather than contradicting it (that entry established the count is 0 *without* `--nocapture`; this adds that *with* it, and under parallelism, it is approximate). What the figure is *for* still holds and needs no precision: a macOS default-scope run skips on the order of a hundred device- and Linux-gated tests against Linux's dozen, so the two are not comparable test-for-test and no delta between them is derived. Supersedes the 957 and 955 rows. |
+| **957 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** | 2026-08-13 | this session (notes §3.94) | item 66's two guards over the 955 row. **Superseded by the 959 row above**, later the same session at the same scope. |
+| **955 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** (MacBookPro15,1, Darwin 24.6.0 / macOS 15.7.8, 12 cores) | 2026-08-13 | this session (notes §3.93) | **superseded by the 959 row above.** The first figure ever taken on this box at a tree whose macOS-only guards pass. 126 result lines over **122 cargo targets** (114 `Running` + 8 doc-test). **This row read "105 self-skips" when written; that figure is withdrawn as a precise count** — see the 959 row for the measurement that found `grep -c '^SKIP'` unstable under `--nocapture` parallelism. The claim it was serving survives unchanged and needs no precision: a macOS default-scope run skips on the order of a hundred device- and Linux-gated tests against Linux's dozen, because the rig is physically attached but `SNX_CROSSOVER_A`/`_B` are unexported at default scope. A macOS default-scope figure is therefore **not** comparable to a Linux one test-for-test, and no delta between them is derived here. **The preceding run at this same tree read 953 · 1+1 · 7** and is kept rather than replaced, because it is the measurement that found the defects: `probes::tests::the_software_readback_reports_unmeasurable_rather_than_answering` (a baseline `Termios` taken off a pty master, which Darwin answers `ENOTTY`) and `both_gates_refuse_an_unsupported_verdict_and_are_shown_able_to` (a report-shaping premise that knew about P12 and not P2) — both item 69, both repaired in the same commit as this row, and both red in CI's `macos` job on every push since they landed. Not the CI arm64 runner and not the M4: three machines, none substituting for another (item 18). |
 | **896 passing · 0 failed · 6 ignored**, 122 test-result lines | **whole workspace (macOS)**, CI `macos-*` arm64 runner | 2026-08-13 | CI run 31657666919, job 94315579211 (notes §3.83) | **the macOS authority row**, superseding the 860 below. No exclusions — the lane runs `cargo test --workspace --locked --no-fail-fast` — on macOS 26.5.2 / arm64. The +36 over the 860 row closes exactly: this session added 37 tests, of which 36 run here (the devprep capability-fold guard is inside the Linux-only platform module). The six device-gated pattern-wait guards run and self-skip, which is why the acceptance battery was deliberately split so six of its twelve need no serial device. Skip count not stated: CI does not pass `--nocapture`, so it cannot be read from that log (notes §3.78). |
 | **860 passing · 0 failed · 6 ignored** | **whole workspace (macOS)**, CI `macos-*` arm64 runner | 2026-08-12 | CI run 31605283603, job 94144842458 (notes §3.76) | the first green macOS lane in this record. **Superseded by the 896 row above**, taken 2026-08-13 at the same scope. No exclusions — CI runs `cargo test --workspace --locked --no-fail-fast`. The skip count is **not stated**: CI does not pass `--nocapture`, so it cannot be read from that log (notes §3.78). The preceding run read 859 · 1 · 6 at the same tree; its one failure is `a_client_clearing_extproc_has_it_re_asserted_so_changes_keep_surfacing`, which asserted Linux's EXTPROC retention on both kernels and is repaired in the same commit as this row; it is the *pre-fix* reading, kept because it is the measurement that found the defect. Not the x86_64 rig box — three machines, none substituting for another (plan §18 item 18). |
 | **760 passing · 1 failed · 4 ignored** | macOS, gate scope **plus** `--exclude serial-nexus-devprep` | 2026-08-05 | `60b9d0f` (notes §3.65) | not the documented scope — quote it with both exclusions. Superseded by the row above; its one failure was the `rts-cts` platform gap §15.53 has since turned into an assertion of refusal. |
@@ -2541,7 +2542,40 @@ for is one the next review cannot check was fixed — item 16's lesson.
     check passed vacuously on one of them; the guard asserts the property the product promises
     (the pair is gone) rather than a path lookup that answers it only on Linux (AGENTS §9).
 67. **The `xon-xoff` refusal: §15.53 extended, now that a dropping driver is measured** —
-    **open** (M; design amendment first, per AGENTS §5). *Evidence:* item 14's decline was
+    **EXECUTED 2026-08-13** (§15.61; notes §3.95), design amended first as AGENTS §5 requires:
+    §15.61 written, §7.1's flow-control clauses 1, 2 and 7 restated, and only then the tree.
+    **The predicate generalized rather than being copied**: `honours_rtscts` →
+    `honours_flow_control(path, FlowMode)`, `RtsCtsOutcome` → `FlowOutcome`, one
+    implementation for both modes because the only difference is which flag in which termios
+    word is written and read back — the three-way classification was already a pure function
+    of two booleans. Copying it per mode is the two-copies-that-must-agree shape §16.5 bans,
+    and that shape is not hypothetical here: it is how the daemon and P15 came to answer
+    differently about one port in the first place (item 56).
+    **Both arms are proven on one box, which is what makes this a discrimination rather than a
+    blanket refusal.** The rig's FT232R is refused (`c_iflag` `0x0` → `0x0` with `tcsetattr`
+    reporting success) and a Darwin **pts** beside it is not (`0x2b02` → `0x2f02`, honoured) —
+    so the new rig guard `xon_xoff_is_refused_at_load_exactly_where_the_driver_drops_it`
+    asserts the refusal *and* the non-refusal, each against real hardware, and a `sys`
+    self-test asserts the honouring arm on a tty every box has. A refusal rule proven only
+    against ports it refuses is not proven.
+    **Three defects the change surfaced, all repaired:** (a) the remedy string offered
+    `flow_control = "none"` **(or `xon-xoff`)** for a dropped `rts-cts`, which on the platform
+    of record sends the operator from a structural refusal into the exact late fault the
+    refusal prevents — the same driver drops both; (b) `open_failure_text` described the
+    software mode's failure in `CRTSCTS`'s words until it was parameterized, which would have
+    explained a failure with a measurement of a different flag; (c) P15's shipped
+    `does_not_license` string told the reader that nothing in the daemon consults the software
+    reading and that such a config is "refused at neither `load` nor `add-node`" — true when
+    written and false the moment this landed, which is §7.1 clause 2's split in its most
+    misleading direction.
+    *Fail-first, and it arrived unasked:* two pre-existing daemon guards reddened on the
+    behaviour change — one whose table listed `(AcceptedThenDropped, XonXoff)` under "node
+    never asked for it", which is precisely the expectation §15.61 overturns. That is the
+    handshake a guard is for, and the table entry moved to its own assertion rather than being
+    deleted. *Owed:* the honouring **serial** arm is measured on a pts and on Linux's
+    `ftdi_sio` through the committed captures, not by a rig guard executing on Linux — this
+    session had one box. The superseded filing follows. **Original state:** open (M; design
+    amendment first, per AGENTS §5). *Evidence:* item 14's decline was
     **conditional** — "the refusal follows only if a dropping driver is found" — and the
     condition is met: Darwin's `IOSerialFamily` accepts `IXON|IXOFF` (`tcsetattr_ok: true`,
     `tcsetattr_error: null`) and reads back `c_iflag` `0x0` → `0x0`, a delta of nothing, with
@@ -2619,6 +2653,34 @@ for is one the next review cannot check was fixed — item 16's lesson.
     shape item 12 is open for, and evidence that the shape recurs rather than being one guard's
     accident. (b) is worse than (a) in the way that matters: (a) fails loudly, while (b) fails
     with a message that sends the next reader to audit two files that had not drifted.
+
+70. **The rig primer left its own payload on the wire, and its comment said it could not** —
+    **EXECUTED 2026-08-13** (notes §3.95). Found by running the rig binary on the Mac, and
+    **pre-existing**: `crossover_rig_map_node_both_directions` failed **4 of 4** at
+    `e5a305f` in a clean `git worktree` with its own target dir — the attribution taken by
+    reverting to an unchanged tree rather than by reasoning, AGENTS §8's rule applied before
+    any diagnosis was offered.
+    *Evidence, and it is complete rather than plausible:* the failure is **62 bytes** of
+    unexpected data prepended to the test's own correct output, and 62 is one FTDI bulk
+    packet's payload (64 minus the two status bytes). Those 62 bytes are a **contiguous slice
+    of `prime_the_wire_once`'s own seed-9001 stream** — located at offsets 833 and 789 of the
+    1 KiB in two separate failures, matching 62 of 62 and 62 of 63 bytes — so the residue is
+    identified rather than inferred. The primer waited for `file_len(&path) > 0`, which the
+    **first** byte satisfies, then dropped its daemon with most of a KiB still in flight; the
+    adapter handed the remainder to the next reader. **Its own closing comment asserted the
+    opposite** — "no primed byte can land in a capture under test" — which is the recurring
+    shape of this session: a sentence describing an intention as though it were a mechanism.
+    *The fix waits for quiescence, not for a byte count, and the distinction is load-bearing:*
+    waiting for 1024 would hang on exactly the kernel this primer exists for, where the
+    leading packet is **eaten** and the log never reaches 1024. Stability is the same question
+    on a kernel that drops bytes and one that retains them. *Fail-first:* 4 of 4 red at the
+    unchanged tree, 3 of 3 green at the fixed one, then 7 of 7 for the whole rig binary.
+    *Not a product defect, and the record says so in the same words notes §3.70 used for its
+    Linux sibling:* the daemon neither lost nor invented a byte — the payload arrived
+    byte-exact, behind stale data from an earlier test. **This is §3.70's finding with the sign
+    flipped**: there a re-enumerated FT232R *ate* one bulk packet, here Darwin's *retains* one.
+    Same 64-byte USB quantum, opposite direction, different kernel — recorded as an
+    observation, with no mechanism claimed for why the two kernels differ.
 
 ### Evaluated and deliberately not scheduled — the closing register
 

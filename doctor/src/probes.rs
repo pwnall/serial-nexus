@@ -53,7 +53,7 @@ use serial2::{CharSize, FlowControl, Parity, SerialPort, Settings, StopBits};
 
 use crate::report::{EnvCheck, Probe, Status};
 use serial_nexus_sys as sys;
-use serial_nexus_sys::RtsCtsOutcome;
+use serial_nexus_sys::FlowOutcome;
 
 const CUSTOM_BAUD: u32 = 250_000;
 
@@ -7086,7 +7086,7 @@ struct FlowReadback {
     cflag_after: u64,
     /// The whole point: `CRTSCTS` present in the read-back.
     honoured: bool,
-    /// Does `serial_nexus_sys::honours_rtscts` — the predicate the daemon's `load`
+    /// Does `serial_nexus_sys::honours_flow_control` — the predicate the daemon's `load`
     /// consults — agree with the reading beside it, **as an arm of §7.1's three-way
     /// call rather than as a read-back**? `None` when that predicate could not run
     /// (an unreadable port is not a disagreement). A `false` here means the report
@@ -7153,11 +7153,18 @@ const P15_SOFT_ASKS: &str = "Does this port honour a requested SOFTWARE flow-con
 
 /// What a software-flow-control reading does **not** license, printed beside it.
 ///
-/// §7.1 clause 7 and plan §18 item 14: `xon-xoff` has no `load`-time pre-check,
-/// and the ledger item declines adding one until a dropping driver is actually
-/// found. So this reading moves no verdict and refuses no config; it exists so
-/// that "unmeasured, not known-good" stops being the honest statement.
-const P15_SOFT_DOES_NOT_LICENSE: &str = "reported, never judged: nothing in the daemon consults this reading, and a `flow_control = \"xon-xoff\"` config is refused at neither `load` nor `add-node` whatever it says. §15.53's refusal covers `rts-cts` only, and extending it to a mode no artifact had measured would be policy without evidence (plan §18 item 14). What a `silently_dropped: true` here would mean is that such a node faults late, at its own open, with `serial2`'s bare `failed to apply some or all settings` — the outcome the `rts-cts` refusal exists to prevent.";
+/// **This string said the opposite until 2026-08-13, and it was true when written.**
+/// It read "nothing in the daemon consults this reading, and a `flow_control =
+/// "xon-xoff"` config is refused at neither `load` nor `add-node` whatever it says",
+/// because plan §18 item 14 declined the pre-check *until a dropping driver was
+/// actually found*. One was found — on the FT232R this probe runs against, `c_iflag`
+/// `0x0` → `0x0` with `tcsetattr` reporting success — so the decline's own condition
+/// was met and §15.53 was extended (§15.61, item 67). The daemon now consults the
+/// same predicate for this mode that it has always consulted for `rts-cts`, so the
+/// sentence had to move with the tree rather than outlive it: a report telling an
+/// operator that nothing refuses their config, while `load` refuses it, is §7.1
+/// clause 2's split in its most misleading direction.
+const P15_SOFT_DOES_NOT_LICENSE: &str = "measured and now consulted: since §15.61 the daemon refuses a `flow_control = \"xon-xoff\"` config at `load`/`add-node` on a port whose driver accepts the request and reads `IXON`/`IXOFF` back clear — the same three-way predicate, the same before-anything-is-created position, and the same one arm refusing (accept-then-drop; an honest `tcsetattr` failure is not refused, and an unmeasurable port waits). So `silently_dropped: true` here predicts a structural refusal rather than the late open failure with `serial2`'s bare `failed to apply some or all settings` that it used to predict. What this reading still does NOT license is a claim about any other driver: it is one port's answer, taken now, and a port that honours the mode is not refused.";
 
 impl FlowReadback {
     fn observations(&self) -> serde_json::Value {
@@ -7245,7 +7252,7 @@ fn p15_readback(path: &PathBuf) -> Result<FlowReadback, String> {
 
     // **The daemon's refusal and this report must never disagree.** The daemon
     // rejects a `flow_control = "rts-cts"` config at load time on a port that answers
-    // `AcceptedThenDropped` to `sys::honours_rtscts`; if P15 measured the same thing
+    // `AcceptedThenDropped` to `sys::honours_flow_control`; if P15 measured the same thing
     // by its own code path, a drift between the two would let a report call a port
     // fine while `load` refuses it. So the shipped predicate is called here and its
     // answer is required to match the one this probe just read by hand — an operator
@@ -7262,15 +7269,15 @@ fn p15_readback(path: &PathBuf) -> Result<FlowReadback, String> {
     // that turns two readings into an arm is shared, so a disagreement here is
     // about the *port*, never about the meaning of the arms.
     let honoured = after.control_flags.contains(ControlFlags::CRTSCTS);
-    let by_hand = RtsCtsOutcome::classify(set.is_ok(), honoured);
-    let shipped = serial_nexus_sys::honours_rtscts(path);
+    let by_hand = FlowOutcome::classify(set.is_ok(), honoured);
+    let shipped = serial_nexus_sys::honours_flow_control(path, serial_nexus_sys::FlowMode::RtsCts);
     let agrees = match &shipped {
         Ok(v) => Some(*v == by_hand),
         Err(_) => None,
     };
 
     // **The software half, on the same open** (plan §18 item 14). It runs *after*
-    // `honours_rtscts` for the same reason the restore check does — that call is
+    // `honours_flow_control` for the same reason the restore check does — that call is
     // an external write to this port — and before the final baseline verification,
     // so the last read below covers this write too.
     //
@@ -7281,9 +7288,9 @@ fn p15_readback(path: &PathBuf) -> Result<FlowReadback, String> {
     // else would measure a request the daemon never makes.
     let soft = p15_soft_readback(&fd, &before);
 
-    // **`honours_rtscts` and the software pass are the probe's last writes to this
+    // **`honours_flow_control` and the software pass are the probe's last writes to this
     // port, so the baseline has to be re-read after them** (notes §3.68).
-    // `honours_rtscts` opens the same tty a second time, sets `CRTSCTS`, and
+    // `honours_flow_control` opens the same tty a second time, sets `CRTSCTS`, and
     // restores — and it cannot verify its own restore, because it closes the fd it
     // would need to re-read through. Deciding `baseline_restored` before that call
     // published a `true` about a port whose final reconfiguration nothing had
@@ -7472,7 +7479,7 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
         return (
             Status::Degraded,
             format!(
-                "**This report and the daemon would answer differently about {}.**                  `serial_nexus_sys::honours_rtscts` is the predicate `load` consults to                  refuse a `flow_control = \"rts-cts\"` config, and it disagreed with the read-back                  this probe took by hand on the same port. Neither reading can be trusted                  until they are reconciled: a report that calls a port fine while `load`                  refuses it — or the reverse — is worse than either verdict on its own.{}",
+                "**This report and the daemon would answer differently about {}.**                  `serial_nexus_sys::honours_flow_control` is the predicate `load` consults to                  refuse a `flow_control = \"rts-cts\"` config, and it disagreed with the read-back                  this probe took by hand on the same port. Neither reading can be trusted                  until they are reconciled: a report that calls a port fine while `load`                  refuses it — or the reverse — is worse than either verdict on its own.{}",
                 disagreeing
                     .iter()
                     .map(|r| r.port.as_str())
@@ -7579,7 +7586,7 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
 /// the decision was taken against a committed artifact rather than a red test (§7).
 ///
 /// **The decision is made, and this doc comment used to outlive it.** §15.53 / notes
-/// §3.67: the daemon consults `sys::honours_rtscts` — the one predicate, which this
+/// §3.67: the daemon consults `sys::honours_flow_control` — the one predicate, which this
 /// probe also calls and cross-checks as `shipped_predicate_agrees` — and **refuses**
 /// an *accept-then-drop* config at `load`/`add-node`, before anything is created. Not
 /// degrade: the thing degraded would be the transport's contract rather than an
@@ -7630,7 +7637,7 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
 ///
 /// Opt-in behind `--port` like P3/P5/P11/P14, and it restores the termios it
 /// found, checked rather than assumed — **by the probe's last read of the port,
-/// after both writes and after `honours_rtscts`'s own**.
+/// after both writes and after `honours_flow_control`'s own**.
 pub fn p15_flow_control_readback(ports: &[PathBuf]) -> Probe {
     let mut p = Probe::new(
         "P15",
