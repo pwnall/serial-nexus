@@ -364,12 +364,30 @@ fn both_gates_refuse_an_unsupported_verdict_and_are_shown_able_to() {
     for name in ["expectations/linux.jq", "expectations/macos.jq"] {
         let expectation = repo_root().join(name);
 
-        // Shape the live report for this file. P12 is the one probe whose expected
-        // word differs by platform — `skipped` on Linux (the retained packet P7
-        // measures carries §6 there), `supported`/`degraded` on Darwin — so a run
-        // from either box needs that one cell moved to satisfy the other's file.
+        // Shape the live report for this file. **Two** probes have an expected word
+        // that differs by platform, and both differences are design content rather
+        // than drift:
+        //
+        //   P12 — `skipped` on Linux (the retained packet P7 measures carries §6
+        //         there), `supported`/`degraded` on Darwin (§15.39).
+        //   P2  — `supported` on Linux (presence-gated output has no fallback, §7.2),
+        //         `degraded` on Darwin, which `docs/macos.md` names as *the expected
+        //         macOS answer* for §7.2's BSD arm.
+        //
         // Nothing else is touched: a shaping that had to rewrite measurements would
         // mean this guard was testing a fixture rather than a report.
+        //
+        // **P2 was missing until 2026-08-13, and its absence made this guard a proxy
+        // in space** (AGENTS §9) — the exact class plan §18 item 12 exists for. From
+        // a Linux box the honest report satisfies `linux.jq` outright, so only the
+        // `macos.jq` arm ever shaped anything and P12 alone sufficed; from a Darwin
+        // box the P2 clause refused every candidate and the guard panicked on its own
+        // precondition, blaming a drift that had not happened ("the two files have
+        // drifted in some clause other than P12"). Measured rather than reasoned:
+        // splitting `linux.jq` into its 33 top-level conjuncts and evaluating each
+        // against this box's P12-shaped report, **exactly one fails** —
+        // `(any(.probes[]; .id == "P2" and .status == "supported"))` — so the premise
+        // needed one more cell, not a smaller scope (notes §3.93).
         let shaped = if gate_accepts(&expectation, &report) {
             report.clone()
         } else {
@@ -379,7 +397,8 @@ fn both_gates_refuse_an_unsupported_verdict_and_are_shown_able_to() {
             );
             let linuxish = jq_filter(
                 r#"(.probes[] | select(.id=="P12")) |= (.status="skipped"
-                     | .reason="serial-nexus-sys's SessionLatch is inert on this platform")"#,
+                     | .reason="serial-nexus-sys's SessionLatch is inert on this platform")
+                   | (.probes[] | select(.id=="P2")) |= (.status="supported" | del(.reason))"#,
                 &report,
             );
             [darwinish, linuxish]
@@ -387,10 +406,15 @@ fn both_gates_refuse_an_unsupported_verdict_and_are_shown_able_to() {
                 .find(|c| gate_accepts(&expectation, c))
                 .unwrap_or_else(|| {
                     panic!(
-                        "{name} rejects this box's honest report even with P12 shaped either \
-                         way, so the plants below would prove nothing. The two files have \
-                         drifted in some clause other than P12 and this guard has to learn \
-                         the new difference rather than be deleted."
+                        "{name} rejects this box's honest report even with P2 and P12 shaped \
+                         either way, so the plants below would prove nothing. The two files \
+                         differ in some clause beyond those two and this guard has to learn \
+                         the new difference rather than be deleted. Do not read this as \
+                         drift on sight: it said exactly this on every Mac until 2026-08-13, \
+                         when the answer turned out to be a third platform-expected verdict \
+                         word (P2) that the shaping did not know about. Split the file into \
+                         its top-level conjuncts and evaluate each against the shaped report \
+                         — the failing one names the difference."
                     )
                 })
         };

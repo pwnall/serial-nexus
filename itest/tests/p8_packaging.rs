@@ -1233,7 +1233,19 @@ fn dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown() {
 
     // --- Setup ------------------------------------------------------------------
     let tag = format!("snx-pkg-probe-{}", std::process::id());
-    let base = std::env::temp_dir().join(&tag);
+    // **Not `std::env::temp_dir()`, and the reason is the unit under test.** The
+    // packaged unit sets `PrivateTmp=yes`, which gives the service a *private*
+    // `/tmp` and `/var/tmp`; a `ReadWritePaths=` naming a path under either one
+    // therefore names a path that does not exist inside the namespace, and systemd
+    // fails mount-namespace setup before `ExecStart` — `status=226`, `EXIT_NAMESPACE`.
+    // That is exactly what CI's packaging job reported on every run from the arm's
+    // landing (2026-08-13) until this line changed: the probe unit "did not run",
+    // and the assertion below blamed the packaged sandbox for what was the probe's
+    // own choice of scratch directory. `/run` is not privatised by `PrivateTmp=`,
+    // exists in the namespace, and is the same tree `RuntimeDirectory=` already
+    // writes into under this unit's `ProtectSystem=strict` — so `ReadWritePaths=`
+    // has something real to re-mount read-write, which is the mechanism under test.
+    let base = PathBuf::from("/run").join(&tag);
     let rw_dir = base.join("rw-listed");
     let ro_dir = base.join("rw-unlisted");
     std::fs::create_dir_all(&rw_dir).expect("create the ReadWritePaths probe directory");
@@ -1305,8 +1317,17 @@ printf 'private_stat=%s\n' "$(stat -c '%U:%a' /var/lib/private 2>/dev/null || ec
     assert!(
         out.status.success(),
         "the probe unit — the packaged unit's own [Service] directives, with the \
-         three *Directory= names changed — did not run. This is a finding about the \
-         packaged sandbox, not about the probe.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+         three *Directory= names changed — did not run.\n\
+         **Read the systemd status word before attributing this.** The first version \
+         of this message asserted it was 'a finding about the packaged sandbox, not \
+         about the probe', and on its first CI run that was wrong: `status=226` is \
+         `EXIT_NAMESPACE`, systemd failing to build the mount namespace, and the \
+         cause was the probe putting its `ReadWritePaths=` directories under `/tmp` \
+         while the unit sets `PrivateTmp=yes` (notes §3.93). A sandbox finding and a \
+         probe defect land in the same place here, so the status word is what \
+         separates them: 226 points at the namespace (paths, mounts — suspect the \
+         probe first), 216/`EXIT_GROUP` at `SupplementaryGroups=`, usual exit codes \
+         at the payload.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let r = probe_readings(&stdout);
     assert!(

@@ -5,6 +5,73 @@ the one every mechanism is specified against; macOS is supported where plain
 POSIX carries the design, and degrades — never crashes, never silently misbehaves
 — everywhere the design leans on a Linux-only facility.
 
+## Update — 2026-08-13 at `b346188`: the era's macOS capture, two Linux-shaped guards found, and three pre-registrations answered
+
+Same box (MacBookPro15,1, Darwin 24.6.0 / macOS 15.7.8, x86_64, 12 cores), tree clean at
+`b346188`. **The rig is the same cross-wired FT232R pair the current Linux rows were taken on**
+(`ABSCDGL6` ↔ `BH00L4KU`), same 3-wire cable — so this and
+`linux-7.0-2026-08-13-8c00078-dirty-p16-tier3` are the first Darwin/Linux pair in the record with
+`probe_set`, adapters, cable and wiring all held fixed. Full reading in notes §3.93.
+
+**The rig proven on the wire first**, per the protocol §3.45 set: `SNX_CROSSOVER=required` with
+both ports named, `serial_hardware.rs` **6 passed** in 19.88 s, 32768 bytes byte-exact each way at
+250000 baud. P5's handshake block reads `3-wire: no handshake lines carried` on all eight
+crossings, and `rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes` prints "driver
+accepts rts-cts and drops it — asserting the load refusal instead", which is §15.53's shipped
+behaviour meeting the driver it was written for.
+
+**Six committed captures, one build, gate executed on all six.** Passive triple and Tier-3 triple,
+`--json-out` on each, `jq -e -f expectations/macos.jq` exit 0 every time — plan §18 item 18's
+capture half, discharged. **This capture is the first macOS artifact in `docs/doctor/` to print
+`Topology: **Tier 3**`**, which is §3.49's pre-registration holding: the tier line is in P5's
+consequence exactly where the Linux artifacts carry it, with `icounter` and `deliberate_mismatch`
+named as unmeasurable on this kernel rather than listed bare. P5 still reads `degraded`, which is
+the honest direction §3.42 established.
+
+**Three pre-registered readings, all answered.**
+
+- **`SlaveWitness::prove_open` is unsound here** (item 26's first branch, item 66 filed).
+  `path_still_resolves` reads `true` on **both** sides of the master's close — Darwin's devfs nodes
+  persist where Linux unlinks `/dev/pts/N` — so `shipped_prove_open_would_refuse` never moves and
+  `stat_comparison_can_tell` is `false`. The seven guards notes §3.56 converted are held here by
+  the compile-time borrow alone. `poll_can_tell` is `true` in the same row: `POLLHUP` 6–16 µs after
+  the close, `read(2)` answering `eof`, quiet through 200 tight and 64 paced passes before it.
+- **`IOSerialFamily` drops `IXON`/`IXOFF` exactly as it drops `CRTSCTS`** (item 14's owed Darwin
+  arm; item 67 filed). Both ports, 6 of 6: `tcsetattr_ok: true`, `c_iflag` `0x0` → `0x0`,
+  `serial2_readback_would_fault: true`. Against `ftdi_sio` honouring it (`0x5` → `0x1405`) on the
+  same two adapters. Item 14's decline was **conditional** on a dropping driver being found; one is.
+- **A reader arriving inside a pts close-wait ends it** (item 22's second kernel). Shape `a` — no
+  reader — pays **600368 µs** and loses all 64 bytes; a reader arriving inside that window returns
+  the close in **14 µs** with 64 of 64 recovered. So the ~600 ms is what a reader that *never*
+  arrives costs, not a floor. That narrows notes §3.29's reader-stall hypothesis for the `p8_map`
+  CI red: a stall long enough to matter is a reader that does not arrive at all.
+
+**Two macOS-only test defects, found by running the suite here and red in CI's `macos` job on
+every push since they landed** (plan §18 item 69). Both are **proxies in space** in AGENTS §9's
+sense — guards written on Linux by sessions that could not run them here, which is the shape item
+12 is open for.
+
+1. `probes::tests::the_software_readback_reports_unmeasurable_rather_than_answering` took its
+   baseline `Termios` off a **pty master**. Linux answers `tcgetattr` there; **Darwin answers
+   ENOTTY**, so the test died in its own setup. Repaired by reading the *slave*, which is a
+   terminal on both kernels and what every other pty test in that module already does.
+2. `both_gates_refuse_an_unsupported_verdict_and_are_shown_able_to` assumed "the one
+   cross-platform difference is P12", so it could shape a report for the other platform's
+   expectation file only from Linux. From a Mac it panicked on its own precondition and **blamed a
+   drift that had not happened**. Measured rather than reasoned: splitting `linux.jq` into its 33
+   top-level conjuncts and evaluating each against the P12-shaped Darwin report, **exactly one
+   fails** — `(any(.probes[]; .id == "P2" and .status == "supported"))`, §7.2's BSD arm, which this
+   page already names as the expected macOS answer for P2. The premise needed one more cell, not a
+   smaller scope.
+
+**955 passing · 0 failed · 7 ignored** at default CI scope with `--no-fail-fast --nocapture`, 126
+result lines over 122 cargo targets. The run before the two repairs read 953 · 2 · 7 and is kept in
+the Status table, because it is the measurement that found them. **105 self-skips**, against the
+Linux authority row's 13 at the same scope: the rig is attached but `SNX_CROSSOVER_A`/`_B` are
+unexported at default scope, so every serial test skips by design — which is why a macOS
+default-scope figure is not comparable to a Linux one test-for-test, and no delta between them is
+derived anywhere.
+
 ## Update — 2026-08-05 hardware validation at `1a9a8fc`: both §3.44 experiments answered, and one converted test goes red on the rig
 
 Same box (MacBookPro15,1, Darwin 24.6.0 / macOS 15.7.8, x86_64, 12 cores), same cross-wired FT232R

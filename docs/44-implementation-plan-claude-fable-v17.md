@@ -42,6 +42,7 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 | **931 passing · 1 failed · 6 ignored**, four self-skips | Linux, **rig lane minus `SNX_RIG_FLOW` and `SNX_WEB_UI`** | 2026-08-12 | the item-47 landing (notes §3.83) | **the rig-lane authority row**, superseding the 894 below and equal to this session's default-scope figure. Run against a freshly `scripts/bless`ed helper (the operator ran it mid-session; an earlier lane was discarded rather than recorded, because the helper binary was replaced underneath it). Every hardware test passed — both replug tests including `identity_survives_a_replug_that_renumbers_the_tty`, all five crossover tests, `web_tls_round_trip` under `SNX_TLS=required`. The two named drops are measurements taken *in this run*, not conveniences: the four self-skips are the two `rts-cts` tests, which print the reading that justifies them (`port1 RTS high -> port0 cts:false`, low -> `cts:false` — a **3-wire** bench, §15.52's legitimate answer and the third independent confirmation of it), and the two browser tests, on a box with no `node`. The one failure is `p3_idle_cost` (item 46), unrelated to the rig. **One lane before this one hung** and is recorded rather than quietly re-run — see the note under this table. |
 | **894 passing · 1 failed · 6 ignored**, four self-skips | Linux, **rig lane minus `SNX_RIG_FLOW` and `SNX_WEB_UI`** | 2026-08-12 | this session (notes §3.80) | the rig-lane authority row, and the first green one in this record. Both exclusions are measurements, not conveniences: this box has no `node`, and the bench **measures 3-wire**, which §15.52 makes a legitimate answer — so the two `rts-cts` end-to-end tests skip with their reading printed. The one failure is `p3_idle_cost` (item 46), unrelated to the rig. Every hardware test passed, `identity_survives_a_replug_that_renumbers_the_tty` for the first time ever. **Superseded by the 925 rig row above**, taken later the same day at the same scope. |
 | **835 passing · 0 failed · 4 ignored** | Linux, rig lane — and again at default CI scope, same session | 2026-08-05 | `17c6e87` (notes §3.68) | twice on the full rig lane, once at default CI scope, 835/0/4 each time — the last dual-scope measurement; superseded by the 852 re-measure of 2026-08-07; not the current-tree figure. **Attribution unreconciled (v17):** notes §3.68's verbatim session record reads 830 (gates scope) and 834/0 · 833/1 (rig lane), and no 835 appears in it — the figure survives only as a v15 Status-table quotation (the re-cited-not-re-derived class), so neither the number nor the dual-scope equivalence is attributable to §3.68. Superseded either way. |
+| **955 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** (MacBookPro15,1, Darwin 24.6.0 / macOS 15.7.8, 12 cores) | 2026-08-13 | this session (notes §3.93) | **the macOS authority row for the rig box**, and the first figure ever taken there at a tree whose macOS-only guards pass. 126 result lines over **122 cargo targets** (114 `Running` + 8 doc-test) and **105 self-skips**. **Read the skip count before comparing this to anything:** 105 against the Linux authority row's **13** at the same scope is the honest measure of how much of this suite is device- or Linux-gated on a Mac — the rig is physically attached but `SNX_CROSSOVER_A`/`_B` are unexported at default scope, so every serial test self-skips by design. A macOS default-scope figure is therefore **not** comparable to a Linux one test-for-test, and no delta between them is derived here. **The preceding run at this same tree read 953 · 1+1 · 7** and is kept rather than replaced, because it is the measurement that found the defects: `probes::tests::the_software_readback_reports_unmeasurable_rather_than_answering` (a baseline `Termios` taken off a pty master, which Darwin answers `ENOTTY`) and `both_gates_refuse_an_unsupported_verdict_and_are_shown_able_to` (a report-shaping premise that knew about P12 and not P2) — both item 69, both repaired in the same commit as this row, and both red in CI's `macos` job on every push since they landed. Not the CI arm64 runner and not the M4: three machines, none substituting for another (item 18). |
 | **896 passing · 0 failed · 6 ignored**, 122 test-result lines | **whole workspace (macOS)**, CI `macos-*` arm64 runner | 2026-08-13 | CI run 31657666919, job 94315579211 (notes §3.83) | **the macOS authority row**, superseding the 860 below. No exclusions — the lane runs `cargo test --workspace --locked --no-fail-fast` — on macOS 26.5.2 / arm64. The +36 over the 860 row closes exactly: this session added 37 tests, of which 36 run here (the devprep capability-fold guard is inside the Linux-only platform module). The six device-gated pattern-wait guards run and self-skip, which is why the acceptance battery was deliberately split so six of its twelve need no serial device. Skip count not stated: CI does not pass `--nocapture`, so it cannot be read from that log (notes §3.78). |
 | **860 passing · 0 failed · 6 ignored** | **whole workspace (macOS)**, CI `macos-*` arm64 runner | 2026-08-12 | CI run 31605283603, job 94144842458 (notes §3.76) | the first green macOS lane in this record. **Superseded by the 896 row above**, taken 2026-08-13 at the same scope. No exclusions — CI runs `cargo test --workspace --locked --no-fail-fast`. The skip count is **not stated**: CI does not pass `--nocapture`, so it cannot be read from that log (notes §3.78). The preceding run read 859 · 1 · 6 at the same tree; its one failure is `a_client_clearing_extproc_has_it_re_asserted_so_changes_keep_surfacing`, which asserted Linux's EXTPROC retention on both kernels and is repaired in the same commit as this row; it is the *pre-fix* reading, kept because it is the measurement that found the defect. Not the x86_64 rig box — three machines, none substituting for another (plan §18 item 18). |
 | **760 passing · 1 failed · 4 ignored** | macOS, gate scope **plus** `--exclude serial-nexus-devprep` | 2026-08-05 | `60b9d0f` (notes §3.65) | not the documented scope — quote it with both exclusions. Superseded by the row above; its one failure was the `rts-cts` platform gap §15.53 has since turned into an assertion of refusal. |
@@ -1210,7 +1211,23 @@ dropped. Product-surface deferrals use §14's vocabulary (refused-at-load / acce
     pass *does* reach the verdict is `baseline_restored`, now covering **both** flag words — a
     restore check reading `c_cflag` alone would have certified a port left with `IXON` asserted.
     Corroborated from outside the probe: `stty` on both ports after a full Tier-3 run reads
-    `-crtscts -ixoff -ixon -ixany`. *Owed:* the Darwin arm — `IOSerialFamily` accepts-then-drops
+    `-crtscts -ixoff -ixon -ixany`.
+    **The owed Darwin arm was measured 2026-08-13 (notes §3.93), and it met the decline's stated
+    condition.** On the *same two adapters and the same cable*, one kernel away: both ports read
+    `tcsetattr_ok: true` with `tcsetattr_error: null`, `c_iflag` `0x0` → `0x0` — **a delta of
+    nothing** — `ixon_on_readback: false`, `ixoff_on_readback: false`, `silently_dropped: true`,
+    **`serial2_readback_would_fault: true`**, `baseline_restored: true`; reproduced **6 of 6**
+    across three runs and two ports, against `ftdi_sio`'s `0x5` → `0x1405` on that same hardware.
+    **So `IOSerialFamily` drops `IXON`/`IXOFF` exactly as it drops `CRTSCTS`, and a dropping
+    driver is found.** The *Declined* line below reads "the refusal follows only if a dropping
+    driver is found"; that is a **conditional** decline whose condition was named in advance and
+    is now measured true, so extending §15.53 is the recorded decision the decline asked for and
+    **not** a silent re-fix of a declined item (AGENTS §5). The extension is filed as **item 67**
+    rather than executed inside this item, whose scope was the measurement. What the decline
+    still refuses is unchanged and worth keeping: a refusal on a port nobody has measured. The
+    line "**§15.53 stays un-extended**, exactly as the item's *Declined* line requires: one driver
+    on one kernel is not a dropping driver found" was true when written and is superseded by the
+    second kernel, not by an argument. *Owed:* the Darwin arm — `IOSerialFamily` accepts-then-drops
     `CRTSCTS` on this same rig, and whether it does the same to `IXON`/`IXOFF` is unmeasured,
     which is precisely why the decline stands. The superseded filing follows.
     **State:** open (S).
@@ -1262,8 +1279,23 @@ Each item below uses the schema with its fields inline.
     feasibility claim conditional on what P5 measures that day. *Validation:* rig-gated with a
     `required` spelling (plan §3 rule 11); reported-never-judged where wiring may legitimately
     be absent (§15.52's pattern).
-18. **The macOS capture and suite run owed at the current tree** — **open in its capture half
-    only** (S, Mac rig session). *Suite half executed 2026-08-12* (notes §3.76): CI's `macos` job
+18. **The macOS capture and suite run owed at the current tree** — **EXECUTED 2026-08-13**
+    (notes §3.93), both halves. *The capture half, taken this session:* six committed artifacts
+    from one clean build on the x86_64 Mac rig box — a passive triple and a Tier-3 triple,
+    `b3461886e27a`, era `4317ea5ac187f506`, with `jq -e -f expectations/macos.jq` **executed**
+    against all six and exit 0 on every one. The era row in `docs/doctor/README.md` is updated and
+    the scope is quoted with its exclusions. **The rig was proven on the wire before it was used**
+    (`serial_hardware.rs` 6 passed, 32768 bytes byte-exact each way at 250000 baud), which is the
+    protocol §3.45 set and the reason a capture from this box is evidence rather than output.
+    **The capture is worth more than the item asked for, for a reason the item could not have
+    known:** it was taken on the *same two adapters and the same cable* as the current Linux rows,
+    so this is the first Darwin/Linux pair in the record where `probe_set`, adapters, cable and
+    wiring are all held fixed and only the kernel differs. Three items are answered off it —
+    26's pre-registered reading, 22's remaining kernel, and 14's owed Darwin arm — and two of
+    those answers file new work (items 66 and 67). *One thing the item's debt cannot buy any
+    more, recorded rather than tidied:* `e79f5fcd86a2e5f0` closed with no Darwin capture ever
+    taken in it, so **that** era's macOS half is unobtainable rather than pending. The superseded
+    filing follows. *Suite half executed 2026-08-12* (notes §3.76): CI's `macos` job
     ran the **whole workspace** at this tree and read 859 passed · 1 failed · 6 ignored (860 · 0 · 6
     on the re-run once the guard below was repaired), with the one failure being a guard that asserted Linux's EXTPROC retention on both
     kernels and is repaired in the same commit. The figure and its scope are in the Status table.
@@ -1274,7 +1306,31 @@ Each item below uses the schema with its fields inline.
     `macos-26-arm64` image — three machines, none substituting for another; the run above is the
     CI runner, which is item 8's machine and not item 15's. *Validation:* the documented scope
     quoted with its exclusions; the era row in `docs/doctor/README.md` updated.
-19. **P10's drain ladder: both kernels' bounds** — **open** (S, one rig visit per kernel).
+19. **P10's drain ladder: both kernels' bounds** — **EXECUTED in its Darwin half 2026-08-13**
+    (§15.60; notes §3.93); **the Linux half stays open** (S, one rig visit).
+    **The item asked for a rung that already shipped.** The pre-registered next step was "a rung
+    below 128"; the ladder is `[512, 1, 128, 900]` and the `1` rung — the *strongest* member of
+    that family — landed in `f8315cc`, the same commit whose notes §3.52 pre-registered the step.
+    So no code was written: the answer was read off committed artifacts, and the transferable
+    finding is the stale pre-registration itself (§15.60 carries the rule).
+    **The answer, which is what the item was for:** on Darwin `topped_up_bytes` **equals**
+    `drained_bytes` at every rung — 512→512, 1→1, 128→128, 900→900 — with the from-empty rung
+    republishing the whole depth (1024 targetward, 1022 hostward), `rungs_refusing: 0`,
+    `watermark_threshold_le: null`, in both directions of all three runs. The `D = 1` rung is the
+    discriminator: a watermark republishing only below threshold `T` predicts that draining **one
+    byte** from a full queue republishes **nothing**, for every `T ≤ C − 1`. One byte drained, one
+    byte republished. **Every watermark below capacity is refuted and the survivor is the capacity
+    reading**; the empty→nonempty reservation is refuted from the other end by the from-empty
+    rung's zero shortfall. What is *not* settled is the **mechanism** — the two-queue XNU source
+    read stays a hypothesis under test (§7; notes §3.42), a capacity reading being consistent with
+    it and not evidence for it. *One Linux observation recorded rather than folded in:* this
+    item's own *Evidence* line says the Linux top-up is "measured drain-size independent", which
+    is what the current-era triple's runs 2 and 3 say (9728 at every rung) and not what run 1 says
+    (1536 at the first rung, 2560 at the rest, with an anomalous first-rung refill). The deviation
+    tracks the **first rung**, not the drain size — a warm-up shape. Filed at §15.60 as an open
+    observation for the next Linux session, **not** as a falsification: one run of a quantity known
+    to vary is not a refutation. Neither digest moved and no era row is owed. The superseded
+    filing follows. *Original state:* **open** (S, one rig visit per kernel).
     *Evidence:* on Linux the ladder is bounded by its largest rung — 900 bytes against a
     ~15360-byte capacity — so no watermark bound is recoverable there, and the top-up is
     measured drain-size independent, refuting the ladder's own "writable iff occupancy < T"
@@ -1326,8 +1382,19 @@ Each item below uses the schema with its fields inline.
     merge stage is not reached (notes §3.55; named where the counter is documented, §15.50).
     *Validation:* a guard whose child has stopped reading stdin, so the merge stage holds bytes
     at teardown; fail-first per notes §3.55's disjoint-reddening method.
-22. **P13's missing shape: a reader arriving during the close-wait** — **HALF EXECUTED
-    2026-08-13** (notes §3.89): the shape exists and is measured on **Linux only**; "measured on
+22. **P13's missing shape: a reader arriving during the close-wait** — **EXECUTED 2026-08-13**
+    (notes §3.89 for the shape, §3.93 for the second kernel). **The Darwin arm is the one the
+    shape was built for, and it separates the two readings the item named.** On the kernel that
+    `waits-then-discards`, shape `a` — no reader — pays **600368 µs** and loses all 64 bytes,
+    while a reader arriving *inside* that window ends it: `close_microseconds` **14**,
+    `arrived_before_close_returned: true`, `bytes_recovered_by_arriving_reader` 64 of 64,
+    identical across all three runs. **So the ~600 ms is what a reader that never arrives costs,
+    not a floor the close pays regardless.** That bears directly on the reader-stall hypothesis
+    for the macOS red (notes §3.29, item 8's `p8_map` pin): a stall long enough to matter has to
+    be a reader that does not arrive at all, not one that arrives late — the arrival collapses
+    the close by a factor of ~43000. The Linux half stays what it was, **a control proving itself
+    inert** on a `retains` kernel, which is what made it trustworthy as an instrument here. The
+    superseded filing follows: the shape exists and is measured on **Linux only**; "measured on
     both kernels" is the remainder. `e_reader_arrives_during_close_wait` uses a reader thread
     **already spinning** on an `AtomicBool` when the close is entered — not spawned, not sleeping,
     either of which would be structurally unable to land inside Linux's µs-wide window and would
@@ -1422,6 +1489,22 @@ Each item below uses the schema with its fields inline.
     *One design-invariant correction on the way:* the first draft reached for
     `BorrowedFd::borrow_raw`, which is `unsafe` — the same §16.3 wall that sent this question to
     the doctor in the first place. `AsFd` does it with a real lifetime instead of a promised one.
+    **The pre-registered Darwin readings were answered 2026-08-13** (notes §3.93), and the first
+    branch is the one that fired — recorded before the measurement precisely so this sentence
+    could not be written afterwards. `path_still_resolves` reads `true` on **both** sides of the
+    master's close, `fstat_on_the_held_fd_answers` stays `true` throughout, so
+    `shipped_prove_open_would_refuse` never moves off `false` and `stat_comparison_can_tell` is
+    **`false`**. **`SlaveWitness::prove_open` is unsound on Darwin, measured rather than
+    predicted**, and notes §3.56's seven converted guards are held there by the compile-time
+    borrow alone. The other instrument answers in the same row: `poll_can_tell` is `true`, quiet
+    through 200 tight and 64 paced passes while the master is open, `POLLHUP` **6–16 µs** after it
+    closes with a following `read(2)` answering `eof`. So the item's own conditional resolves:
+    **the portable upgrade is a `serial_nexus_sys` `poll` helper rather than an argument**, and it
+    is filed as item 66 rather than folded in here, this item's scope having been the probe. The
+    two branches that did **not** fire are kept as the record of what was risked: `path_still_resolves:
+    false` there would have **refuted** the prediction and been recorded as such (AGENTS §9), and
+    `poll_can_tell: false` would have meant neither instrument is portable and the witness argument
+    needed re-deriving rather than re-coding. The superseded filing follows.
     *Pre-registered Darwin readings*, so the interpretation is not chosen after the fact:
     `path_still_resolves: true` after the close makes `prove_open` **unsound on Darwin** and leaves
     notes §3.56's seven converted guards held by the compile-time borrow alone — with `poll_can_tell`
@@ -2393,6 +2476,100 @@ transcripts, the pattern-wait maxima). What follows is the residue.
     teardown that would have reaped the child. The tests therefore never exercise the daemon's real
     teardown path on this axis. Letting `shutdown` land first would have contained this leak; it
     would also add a wait to ~284 call sites, which is why it was not done blind.
+
+### Items 66–69 — filed by the macOS session (2026-08-13)
+
+Filed by the session that took the era's macOS capture (notes §3.93). Two are the work its
+pre-registered readings licensed (66, 67); two are defects the same session found by running the
+suite and reading CI (68, 69). All four are numbered because a defect this record has no number
+for is one the next review cannot check was fixed — item 16's lesson.
+
+66. **`SlaveWitness::prove_open` is unsound on Darwin: the portable upgrade** — **open** (S/M).
+    *Evidence:* measured, not predicted, and pre-registered by item 26 before it was taken —
+    `path_still_resolves` reads `true` on **both** sides of the master's close on Darwin 24.6.0,
+    `fstat_on_the_held_fd_answers` stays `true`, `shipped_prove_open_would_refuse` never moves off
+    `false`, and `stat_comparison_can_tell` is `false` (three runs,
+    `docs/doctor/macos-24.6.0-2026-08-13-b346188-tier3*.json`). Linux reads the same cells
+    `true` → `false` and `stat_comparison_can_tell: true`, so the shipped comparison is sound
+    there and inert as a control. The seven guards notes §3.56 converted are therefore held on
+    Darwin **by the compile-time borrow alone** — the witness argument's other half is absent on
+    the platform where it was supposed to be the addition. *Remainder:* the upgrade item 26's
+    conditional names — a `poll(POLLHUP)` liveness check behind a `serial_nexus_sys` helper
+    (§16.3 puts the `unsafe` there and nowhere else), matching the instrument that measured it
+    (P16 polls the held slave fd), with `prove_open` re-pointed at it. The measured margin is
+    generous: `POLLHUP` arrives 6–16 µs after the close on Darwin and 1 µs on Linux, against a
+    quiet window that stayed quiet through 200 tight and 64 paced passes on both. *Declined
+    in advance:* keeping the `stat` comparison as a Linux-only arm beside the poll — two
+    instruments where one answers on both kernels is the two-copies-that-must-agree shape
+    §16.5 exists to ban, and the tell is that only one of them has ever been able to fail here.
+    *Validation:* fail-first **on both kernels**, since this is the item that exists because a
+    check passed vacuously on one of them; the guard asserts the property the product promises
+    (the pair is gone) rather than a path lookup that answers it only on Linux (AGENTS §9).
+67. **The `xon-xoff` refusal: §15.53 extended, now that a dropping driver is measured** —
+    **open** (M; design amendment first, per AGENTS §5). *Evidence:* item 14's decline was
+    **conditional** — "the refusal follows only if a dropping driver is found" — and the
+    condition is met: Darwin's `IOSerialFamily` accepts `IXON|IXOFF` (`tcsetattr_ok: true`,
+    `tcsetattr_error: null`) and reads back `c_iflag` `0x0` → `0x0`, a delta of nothing, with
+    `serial2_readback_would_fault: true`, on both ports, 6 of 6, against `ftdi_sio` honouring it
+    (`0x5` → `0x1405`) on **the same two adapters** one kernel away. So a node configured
+    `flow_control = "xon-xoff"` on such a port faults at its own open with `serial2`'s bare
+    `failed to apply some or all settings` — precisely the outcome §15.53's refusal exists to
+    prevent, now demonstrated for the second of the two modes. *Remainder:* (a) the design
+    amendment — a new §15 entry extending §15.53's refusal to the software mode, and §7.1's
+    flow-control clause 7 restated, its sentence "`xon-xoff` has no pre-check and no probe —
+    unmeasured rather than known-good" having been overtaken by measurement. (b) A software
+    analogue of `honours_rtscts`'s tri-state in `serial_nexus_sys`, read-back asked **first**
+    for item 56's recorded reason (a port already carrying the flag reads back set whatever the
+    set returned). (c) `precheck_flow_control` extended, with the remedy text spelling
+    `flow_control` and not `flow` — item 57's twenty-two-site repair is the tripwire, and this
+    is the change most likely to reintroduce it. **(d) A remedy string that is now wrong on the
+    platform of record, and would get worse:** §7.1 clause 1 offers `flow_control = "none"` (or
+    `xon-xoff`) as the remedy for a dropped `rts-cts`, and on Darwin `xon-xoff` is dropped by the
+    same driver — so the refusal currently points the operator at a second mode that fails the
+    same way. *Validation:* fail-first on **both** arms — a dropping port (this rig) must be
+    refused, and a honouring port (the Linux rig, same adapters) must **not** be, which is the
+    pair that proves the predicate discriminates rather than refuses everything; the harness
+    assertion that a refused `load` created **nothing** rides with it, as §15.53 requires.
+68. **The packaging root arm reddened CI on every run it ever had, and its message blamed the
+    wrong subject** — **open in its flip-back half** (S). *Executed 2026-08-13:* the root cause
+    and the repair. `dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown`
+    put its `ReadWritePaths=` probe directories under `std::env::temp_dir()` while the packaged
+    unit sets `PrivateTmp=yes`, so the listed path did not exist inside the service's namespace
+    and systemd refused to build it — `status=226`, `EXIT_NAMESPACE`, before `ExecStart`. The
+    probe's own assertion said "This is a finding about the packaged sandbox, not about the
+    probe"; it was a finding about the probe, and the message is corrected to route by the
+    systemd status word rather than by assumption. Directories moved to `/run/<tag>`, which
+    `PrivateTmp=` does not privatise and which `RuntimeDirectory=` already writes into under
+    this unit's `ProtectSystem=strict`. **The CI step also did not do what its own name says:**
+    it is called "reporting only" and gated, which is plan §18 item 31's sequencing inverted —
+    it now carries `continue-on-error: true`. *Remainder:* **that line is a step asserting
+    nothing, which AGENTS §3 names as a tell, so it is temporary by construction** — one green
+    run at this tree flips it back off. *Honestly labelled limit:* the repair is reasoned from
+    `systemd.exec(5)`'s `PrivateTmp=` semantics and the observed 226, and **is not verified on a
+    real box** — this session had no systemd, which is the same reason the arm exists. The next
+    CI run is the measurement. *Validation:* the flip-back is the item's close; a run that is
+    still red names its new status word rather than re-asserting this diagnosis.
+69. **The macOS lane's two Linux-shaped guards, and what they say about coverage** —
+    **EXECUTED 2026-08-13** (notes §3.93), filed rather than fixed silently because both are
+    instances of a class this ledger already tracks. Found by running the suite on the Mac rig
+    box; both had reddened CI's `macos` job on every push since they landed. (a)
+    `probes::tests::the_software_readback_reports_unmeasurable_rather_than_answering` took its
+    baseline `Termios` off a **pty master**, which Linux answers and Darwin refuses with
+    `ENOTTY` — so the test died in its own setup on the platform of record. Repaired by reading
+    the *slave*, a terminal on both kernels, which is what every other pty test in that module
+    already does. (b) `both_gates_refuse_an_unsupported_verdict_and_are_shown_able_to` assumed
+    "the one cross-platform difference is P12" and so could shape a report for the other
+    platform's file only from Linux; from a Mac it panicked on its own precondition, **blaming a
+    drift that had not happened**. Measured rather than reasoned: splitting `linux.jq` into its
+    33 top-level conjuncts and evaluating each against the P12-shaped Darwin report, **exactly
+    one fails** — P2 must be `supported`, §7.2's BSD arm, which `docs/macos.md` already names as
+    the expected macOS answer. So the premise needed one more cell, not a smaller scope, and the
+    guard now genuinely exercises both files from either box. *The class, which is the reason
+    this is an item and not a commit message:* both are **proxies in space** in AGENTS §9's
+    sense, and both were written on Linux by sessions that could not run them here — the same
+    shape item 12 is open for, and evidence that the shape recurs rather than being one guard's
+    accident. (b) is worse than (a) in the way that matters: (a) fails loudly, while (b) fails
+    with a message that sends the next reader to audit two files that had not drifted.
 
 ### Evaluated and deliberately not scheduled — the closing register
 

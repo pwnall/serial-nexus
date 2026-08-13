@@ -10697,10 +10697,23 @@ mod tests {
     /// JSON from a driver that dropped the request. Driven through a descriptor
     /// that is not a terminal at all, with a real `Termios` taken from a pty, so
     /// both syscalls fail the way they would on a port that vanished mid-probe.
+    ///
+    /// **The baseline comes off the *slave*, and that is a portability fact rather
+    /// than a style choice.** This test took it off the `PtyMaster` until
+    /// 2026-08-13 and so was Linux-only by accident: Linux answers `tcgetattr` on a
+    /// `/dev/ptmx` master, Darwin answers **ENOTTY**, and the test died in its own
+    /// setup on the platform of record — `panicked at … the master has a termios:
+    /// ENOTTY`, in CI's macOS lane and on the x86_64 rig box alike. The slave is a
+    /// terminal on both kernels, which is why every other pty test in this module
+    /// already reaches for `ptsname` (notes §3.93). Strictly wider: the arm under
+    /// test is unchanged and still runs on Linux exactly as before.
     #[test]
     fn the_software_readback_reports_unmeasurable_rather_than_answering() {
         let master = new_master().expect("a pty master opens");
-        let baseline = tcgetattr(&master).expect("the master has a termios");
+        let pts = sys::ptsname(&master).expect("the master names its slave");
+        let slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())
+            .expect("the pts slave opens");
+        let baseline = tcgetattr(&slave).expect("the slave has a termios");
         let not_a_tty = std::fs::File::open("/dev/null").expect("/dev/null opens");
 
         let r = p15_soft_readback(&not_a_tty, &baseline);

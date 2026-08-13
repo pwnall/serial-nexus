@@ -11687,3 +11687,71 @@ renumbering replug's lasting effect and it is harmless on a symmetric crossover 
 premise, and the reason `SNX_CROSSOVER_A`/`_B` name identities rather than device nodes. A reader
 who checks the box after a lane and finds the numbers exchanged has found the test working, not a
 dirty rig.
+
+### 3.93 The macOS capture at the current era: two pre-registered readings held, and a decline's condition was met
+
+The rig moved to the Mac. Same two adapters the `4317ea5ac187f506` Linux rows were taken on
+(`ABSCDGL6` ↔ `BH00L4KU`), same 3-wire crossover cable, now on MacBookPro15,1 / Darwin 24.6.0 /
+macOS 15.7.8 / x86_64, 12 cores. **That sameness is the point and it was not available before:**
+same `probe_set`, same adapters, same cable, same wiring, one kernel apart. A cell that moves
+across this pair is a kernel fact, and for the first time in this record nothing else is free to
+have moved with it.
+
+**The rig was proven on the wire before it was used**, per the protocol §3.45 set: `SNX_CROSSOVER=required`
+with both ports named, `serial_hardware.rs` **6 passed** in 19.88 s, 32768 bytes byte-exact each way at
+250000 baud, and P5's own handshake block reading `3-wire: no handshake lines carried` on all
+eight crossings — a **sixth** independent confirmation of the bench §3.80 re-measured. Then six
+captures on a quiet box: passive triple, Tier-3 triple, `--json-out` on each, and
+`jq -e -f expectations/macos.jq` **executed** against all six rather than inspected. Exit 0 on
+every one.
+
+**Plan §18 item 18's capture half is discharged**, and with it the standing "the macOS half is
+owed" line in `docs/doctor/README.md`. One thing that debt cannot now be paid in full is recorded
+rather than tidied: `e79f5fcd86a2e5f0` closed with no Darwin capture ever taken in it, so *that*
+era's macOS half is **unobtainable**, not pending — the same shape as the never-taken passive half
+of the era-closing `8c00078-dirty` triple.
+
+**Item 26's pre-registered Darwin reading fired, as written.** The item named three outcomes in
+advance so the interpretation could not be chosen afterwards, and the first is what came back:
+`path_still_resolves` reads `true` on **both** sides of the master's close, `fstat_on_the_held_fd_answers`
+stays `true` throughout, so `shipped_prove_open_would_refuse` never moves off `false` and
+`stat_comparison_can_tell` is **`false`**. **`itest`'s shipped `SlaveWitness::prove_open` is unsound
+on this kernel — measured, not predicted**, and the seven guards §3.56 converted are held here by
+the compile-time borrow alone. Beside it the other instrument answers: `poll_can_tell_a_live_pair_from_a_dead_one`
+is `true`, the held slave fd quiet through all 200 tight passes and all 64 paced ones while the
+master is open, then `POLLHUP` **6–16 µs** after it closes with a following `read(2)` answering
+`eof`. So the item's own conditional resolves to its first branch: **the portable upgrade is a
+`serial_nexus_sys` `poll` helper rather than an argument.** P16 was placed after P8/P9/P10 because
+its paced arm parks inside `poll(2)`; on this kernel that arm costs 395–443 ms against Linux's
+~328 ms, which is a cost note and not a finding.
+
+**Item 22's shape becomes the measurement it was built to be.** On Linux, `waits-then-discards`
+being absent, `e_reader_arrives_during_close_wait` was a control proving itself inert. Here the
+kernel parks: shape `a` — no reader — pays **600368 µs** and loses all 64 bytes. A reader arriving
+*inside* that window ends it: `close_microseconds` **14**, `arrived_before_close_returned: true`,
+`bytes_recovered_by_arriving_reader` **64 of 64**, in all three runs. **So the ~600 ms is what a
+reader that never arrives costs, not a floor the close pays regardless** — which is exactly the
+discrimination the item filed the shape to make, and it bears directly on the reader-stall
+hypothesis §3.29 could only predict: a stall long enough to matter has to be a reader that does not
+arrive at all, not one that arrives late.
+
+**Item 14's decline had a stated condition, and the condition is met.** The decline read: "the
+refusal follows only if a dropping driver is found — extending §15.53 to a mode nobody has measured
+would be policy without evidence." Both ports on this bench: `tcsetattr_ok: true` with
+`tcsetattr_error: null`, `c_iflag` `0x0` → `0x0` — **a delta of nothing** — `ixon_on_readback: false`,
+`ixoff_on_readback: false`, `silently_dropped: true`, **`serial2_readback_would_fault: true`**,
+`baseline_restored: true`. Reproduced **6 of 6** across three runs and two ports, against
+`ftdi_sio`'s `0x5` → `0x1405` on the *same two adapters* one kernel away. A dropping driver is
+found. **This is not a decline being silently re-fixed** (AGENTS §5): it is a conditional decline
+whose condition was named in advance and has now been measured true, so overturning it is the
+recorded decision the item asked for, with the evidence it asked for.
+
+**§3.49's other pre-registration held in the same line.** It required that the next macOS capture
+print `Topology: **Tier 3**` "with the two counter items named as unmeasurable on this kernel
+rather than listed bare". It does both: the tier line is printed in P5's consequence exactly where
+the Linux artifacts carry it, and `icounter` on each port plus the pair's `deliberate_mismatch` are
+attributed to `TIOCGICOUNT` being Linux-only, with "that is the platform, not the rig: re-seating a
+cable cannot change it". P5 still reads `degraded`, which is the honest direction §3.42 established
+— the tier is printed *beside* the declined items, not instead of them. `docs/doctor/README.md`'s
+standing "`Tier 3` appears nowhere in any macOS artifact" paragraph named its own expiry and is
+corrected in place; it stands unchanged for the rows below the new triple.

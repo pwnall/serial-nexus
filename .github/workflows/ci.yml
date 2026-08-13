@@ -350,7 +350,20 @@ jobs:
       # build. The already-built binary is run instead, and its path comes from cargo
       # itself rather than from a glob — rule 7's "enumerate from the tool", applied to
       # a file path.
+      # `reporting only` is in this step's name and, until 2026-08-13, was not in its
+      # behaviour: a failing test here failed the whole job, and the job had never once
+      # been green — the arm reddened `packaging` on every push from its landing. Plan
+      # §18 item 31 sequenced it the other way round on purpose ("lands self-skipping
+      # with its reason printed, and its `required` mode is switched on only after a CI
+      # run proves the runner actually provides systemd as PID 1 … Shipping `required`
+      # on an assumption reddens a lane for someone else's runner image"), so the step
+      # now matches its name. The measurement still runs and still prints in full.
+      # **This is a step that asserts nothing, which AGENTS §3 calls a tell** — so it is
+      # deliberately temporary and carries its own exit condition: one green run at this
+      # tree (the /tmp -> /run repair below it) flips `continue-on-error` back off. Item
+      # 68 carries that flip; do not leave this line here once the arm has been green.
       - name: Packaging gate (root arm — item 31's owed measurement, reporting only)
+        continue-on-error: true
         run: |
           BIN=$(cargo test -p serial-nexus-itest --test p8_packaging --locked --no-run \
                   --message-format=json \

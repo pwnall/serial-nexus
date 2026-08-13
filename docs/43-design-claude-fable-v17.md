@@ -3863,6 +3863,10 @@ P8/P9/P12 stay on the fallback, **measured not to need it, each for a different 
 §3.41; P12 must never get a re-assert — its a/b/c shape contrast *is* the instrument). Repairing
 all six at once on single-kernel evidence was **declined** as AGENTS §7's forbidden one-way
 decision. The Darwin 1024/1022 asymmetry has a measurement, not a decisive one (plan §18).
+*(Annotated 2026-08-13, §15.60: that last sentence was true when written and the ladder that
+makes it false had already shipped — the decisive rung is `D = 1`, and it is in the constant
+this entry itself spells. Read §15.60 for what the Darwin ladder settles and what it leaves
+open; nothing here is rewritten, and the rung list is unchanged.)*
 Two further refutation chains are register entries here, because AGENTS §9 makes them
 load-bearing: *"Darwin's P7 degrade is an artifact of the lost baseline"* — REFUTED: the degrade
 is genuine, produced by the last-close flush P13 measures, with `silence_cause` discriminating
@@ -4390,6 +4394,56 @@ moved `probe_set` for a **wording** change, spending a second era boundary where
 two are folded together at P16's landing, in one commit — the widened `question`, the software
 reading folded into P15's verdict, and P16's arrival — so the archive gains one boundary rather
 than two.
+
+### 15.60 The Darwin pty buffer is a capacity, not a watermark — settled by a rung that already shipped
+
+**Status:** LIVE — annotates §15.46's closing sentence; §15.49 is untouched and P10's status does
+not move. The measurement is plan §18 item 19's Darwin half.
+
+**The finding about the record comes first, because it is the transferable one.** Item 19's
+pre-registered next step was "a rung below 128", carried in the ledger and in notes §3.52 as owed
+work. It was **never owed**: the ladder is `[512, 1, 128, 900]` and the `1` rung — the strongest
+member of that family, not merely one below 128 — shipped in `f8315cc`, *the same commit whose
+notes pre-registered the step*. The pre-registration was stale on arrival and stayed in the ledger
+for a generation, so a session scheduling item 19 would have written code to add an experiment the
+binary was already running. The rule that follows is §13's instrument-validity rule pointed at the
+ledger instead of at a probe: **before building a pre-registered instrument, check whether it is
+already in the constant** — a pre-registration is a statement about a tree that has since moved.
+
+**What the ladder settles.** On Darwin 24.6.0, both directions, all three runs of the `b346188`
+triple, `topped_up_bytes` **equals** `drained_bytes` at every rung: 512→512, 1→1, 128→128,
+900→900, and the from-empty rung republishes the whole depth (1024 targetward, 1022 hostward).
+`rungs_refusing` is 0 and `watermark_threshold_le` is null. The `D = 1` rung is what makes this
+decisive rather than suggestive, and the argument is one line: a watermark model republishing only
+once occupancy falls below a threshold `T` predicts that draining a **single byte** from a full
+queue republishes **nothing**, for every `T ≤ C − 1`. One byte was drained and one byte was
+republished. So every watermark strictly below capacity is refuted, and the only survivor of that
+family is `T = C`, which *is* the capacity reading. The reservation variant charged at the
+empty→nonempty transition is refuted by the same rows from the other end: the from-empty rung
+republishes the full depth with no shortfall. **This is what §15.46 called "a measurement, not a
+decisive one", and it is now decisive** — for this kernel, on this hardware.
+
+**What it does not settle, stated so nobody reads more off it.** (a) It bounds the *behaviour*, not
+the *mechanism*: the two-queue XNU source read (a `TTYHOG`-guarded input bound beside a
+`TTYCLSIZE`-sized output queue) remains a hypothesis under test, exactly as §7 and notes §3.42
+have it — a capacity reading is consistent with it and does not establish it. (b) It says nothing
+about Linux, where the ladder is bounded by its largest rung (900 against ~15360 recoverable) and
+no watermark bound is recoverable at all — the two kernels are answered by different instruments
+and the pair must not be diffed into a single sentence. (c) **One Linux observation is recorded
+here rather than folded in, because it sits against a claim this record already carries:** the
+current-era Linux triple's top-ups are uniform within runs 2 and 3 (9728 at every rung) but read
+1536 at the first rung and 2560 at the rest in run 1, whose first-rung refill is also anomalous
+(15872 against 13824). Plan §18 item 19's *Evidence* line and notes §3.53 (ii) both say the Linux
+top-up is "measured drain-size independent". That is what runs 2 and 3 say; run 1 does not, and
+the deviation tracks the **first rung** rather than the drain size, which is a warm-up shape and
+not drain dependence. Recorded as an open observation for the next Linux session, **not** as a
+falsification — one run of a quantity known to vary is not a refutation (P9/P10's own three-sample
+rule), and calling it one here would be the mistake this document keeps cataloguing.
+
+**No instrument moves.** The rung list is unchanged, `probe_set` and `field_set` are untouched, and
+no era row is owed — which is precisely why this entry exists: the answer came from reading
+committed artifacts rather than from taking a new measurement, and an answer nobody wrote down is
+one the next session pays for again.
 
 ## 16. Post-completion review: reliability through simplification
 
