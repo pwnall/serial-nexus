@@ -1512,19 +1512,34 @@ impl OpenWitness for SlaveWitness {
     ///    exactly what §12's replug renumbering does to `ttyUSB0`/`ttyUSB1` — and the
     ///    old check could not see it, since the fd is still perfectly valid.
     ///
-    /// **The residual, stated rather than papered over.** This proves the path still
-    /// resolves to the device the fd holds. It does **not** prove the pty's *master* is
-    /// open on a kernel whose slave nodes are not per-allocation directory entries:
-    /// Darwin's `/dev/ttysNNN` are persistent devfs nodes, so step 2 is expected to stay
-    /// `Ok` there after a master close and the check degrades to step 1's tautology plus
-    /// the borrow. That is unmeasured here — this box is Linux — and it is why the
-    /// sentence says "expected" (§7: no one-way claim on single-kernel evidence). The
-    /// instrument that would close it portably is `poll(POLLHUP)` on the fd, and this
-    /// crate cannot issue it: `poll(2)` needs an `unsafe` call and `unsafe` lives only
-    /// in `serial_nexus_sys` (AGENTS.md invariant 3 / §16.3) — the same wall
-    /// `p12_pty_setup` records for `FIONREAD`. A doctor probe is the right home for it
-    /// if it is ever wanted (§7's P6–P11 pattern), not a `libc` call smuggled into the
-    /// harness.
+    /// 4. **The peer hangup**, `serial_nexus_sys::peer_hungup` — the arm that closes
+    ///    the residual the three above used to leave, added 2026-08-13 once the
+    ///    residual stopped being a prediction and became a measurement (plan §18 item
+    ///    66; notes §3.93). It runs **after** steps 2 and 3 on purpose: where the path
+    ///    arm can fire it is the more specific diagnosis (it names the unlinked node),
+    ///    so Linux keeps its message and this arm is the backstop for the kernels where
+    ///    step 2 structurally cannot answer.
+    ///
+    /// **The residual this used to carry, and how it was closed.** The three stat steps
+    /// prove the path still resolves to the device the fd holds. They do **not** prove
+    /// the pty's *master* is open on a kernel whose slave nodes are not per-allocation
+    /// directory entries — and Darwin is such a kernel. That was written here as an
+    /// expectation, with §7 forbidding a one-way claim on single-kernel evidence; P16
+    /// then measured it (§15.59) and the prediction was **right**: on Darwin 24.6.0
+    /// `path_still_resolves` reads `true` on *both* sides of the master's close,
+    /// `stat_comparison_can_tell` is `false`, and this check degraded to step 1's
+    /// tautology plus the borrow, exactly as feared. The same probe measured the
+    /// instrument that fixes it — `poll_can_tell_a_live_pair_from_a_dead_one` is `true`
+    /// on both kernels — so step 4 is that instrument, reached through
+    /// `serial_nexus_sys` because `poll(2)` needs `unsafe` and `unsafe` lives only there
+    /// (AGENTS §4 / §16.3). The paragraph that used to end "a doctor probe is the right
+    /// home for it if it is ever wanted" got its doctor probe; this is what it bought.
+    ///
+    /// **What step 4 does not do**, so nobody reads more into a green witness: on a
+    /// *serial* fd it never fires, because a serial port's peer is a wire and cannot
+    /// hang up — measured on the rig box, both while the far end was open and after it
+    /// closed. A serial witness is therefore held by steps 1–3 exactly as before, which
+    /// is why adding this arm to a witness shared by pty and serial callers is safe.
     fn prove_open(&mut self) -> Result<(), String> {
         let held = self
             .file
@@ -1548,6 +1563,18 @@ impl OpenWitness for SlaveWitness {
                  (adopted as {}), the path now resolves to {live}. The descriptor is \
                  valid and useless — something replaced the node underneath it (a \
                  replaced pty node, or a replug renumbering a tty, §12)",
+                self.path.display(),
+                self.adopted_as
+            ));
+        }
+        if serial_nexus_sys::peer_hungup(&self.file) {
+            return Err(format!(
+                "the fd is still open and {} still resolves to it, but the far end has \
+                 hung up: poll(POLLHUP) fires on the held descriptor. For a pty that is \
+                 the *master* having closed — the pair is gone underneath a slave whose \
+                 node is still on the filesystem, which is what a kernel with persistent \
+                 devfs entries looks like (Darwin) and what the three checks above \
+                 structurally cannot see there. It was {} when this witness was taken",
                 self.path.display(),
                 self.adopted_as
             ));
@@ -3149,6 +3176,85 @@ mod tests {
             "the refusal did not name the mechanism: {why}"
         );
         drop(run);
+    }
+
+    /// **The Darwin counterpart of the guard above, and the reason step 4 exists.**
+    ///
+    /// The Linux test asserts that a closed master is caught *because the node is
+    /// unlinked*. Off Linux that premise is false — Darwin's `/dev/ttysNNN` are
+    /// persistent devfs entries — so this test asserts the same product property
+    /// through the arm that can answer here, and asserts the platform fact underneath
+    /// it in the same run rather than citing it: **the path still resolves** after the
+    /// master closes, and the witness is refused anyway.
+    ///
+    /// That pairing is what makes this more than a second copy. If the path stopped
+    /// resolving on some future Darwin, the first assertion fails and tells the reader
+    /// the kernel changed, instead of this test quietly passing for Linux's reason and
+    /// leaving step 4 unexercised — which is exactly the vacuity §13's taxonomy warns
+    /// about and what the three stat checks did here until 2026-08-13.
+    ///
+    /// The pty comes from the sim's own `pty` double rather than [`serial_echo`],
+    /// which is Linux-only for a reason that does not apply here: it is gated because
+    /// `serial2` cannot open a macOS pts as a *serial port* (`ENOTTY`), and nothing
+    /// below asks it to — this test needs a pty pair and a master it can close.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn a_witness_on_a_pty_whose_master_closed_is_refused_where_the_node_outlives_the_pair() {
+        let run = TempRun::new();
+        let device = run.join("serialdev");
+        let sim = Sim::spawn(
+            &[
+                "pty",
+                "--echo",
+                "--link",
+                &device.to_string_lossy(),
+                "--timeout-ms",
+                "600000",
+            ],
+            Some(&device),
+        );
+        let target = std::fs::read_link(&device).expect("the sim's link points somewhere");
+        let mut w = attach_slave(&device);
+        w.prove_open().expect("a live sim pty proves open");
+
+        drop(sim);
+
+        // Wait on the *product property* — the witness refusing — rather than on a
+        // sleep. The hangup is measured at 6-16 µs here, so this returns immediately on
+        // a healthy tree and the bound only exists so a loaded box reports the real
+        // answer instead of a scheduling artifact.
+        assert!(
+            wait_until(Duration::from_secs(10), || w.prove_open().is_err()),
+            "the master closed and the witness still proved open — on this kernel that \
+             leaves every guard built on it asserting nothing"
+        );
+        let why = w
+            .prove_open()
+            .expect_err("the wait above already established this");
+
+        // The platform fact the arm exists for, asserted rather than cited. On Linux
+        // this would fail — which is why that kernel gets its own test and this one is
+        // gated off it.
+        assert!(
+            target.exists(),
+            "{} was unlinked when the master closed, so this kernel behaves the way \
+             Linux does and the stat comparison could have caught it — this test is \
+             then asserting the wrong thing and the Linux guard is the right one",
+            target.display()
+        );
+
+        // …and the fd is still perfectly good, which is what makes steps 1-3 blind.
+        assert!(
+            w.file.metadata().is_ok(),
+            "fstat stopped answering on the held fd, so the refusal below might be \
+             about the descriptor rather than about the peer"
+        );
+
+        assert!(
+            why.contains("the far end has hung up"),
+            "the refusal did not come from the hangup arm, which is the only one that \
+             can answer on this kernel: {why}"
+        );
     }
 
     /// A path that does not name the fd's device is a harness defect, and it dies at

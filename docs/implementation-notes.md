@@ -11755,3 +11755,58 @@ cable cannot change it". P5 still reads `degraded`, which is the honest directio
 — the tier is printed *beside* the declined items, not instead of them. `docs/doctor/README.md`'s
 standing "`Tier 3` appears nowhere in any macOS artifact" paragraph named its own expiry and is
 corrected in place; it stands unchanged for the rows below the new triple.
+
+### 3.94 The witness gets its portable arm, and the mask that would have made it useless
+
+Plan §18 item 66, executed the same day it was filed. `SlaveWitness::prove_open`'s own doc had
+carried the residual for a generation — "Darwin's `/dev/ttysNNN` are persistent devfs nodes, so
+step 2 is expected to stay `Ok` there … That is unmeasured here — this box is Linux" — and named
+the instrument that would close it: `poll(POLLHUP)`, reached through `serial_nexus_sys` because
+`unsafe` lives only there. P16 measured the residual (§3.93), the prediction held, and this is the
+paragraph's own prescription filled.
+
+**Added, not swapped, and the brief that said "replace" was wrong about that.** The stat comparison
+sees a thing `poll` cannot: a node *replaced* underneath a still-valid descriptor, which is §12's
+replug renumbering — `a_witness_is_refused_once_its_path_names_a_different_device` is that arm and
+it is not about hangups at all. `poll` sees a thing the stat comparison cannot see on Darwin. So
+there are two arms with two messages, and the hangup runs **last**: where the path arm can fire it
+gives the more specific diagnosis, so Linux keeps "the node was unlinked" and the new arm is the
+backstop for kernels where step 2 structurally cannot answer. Nothing about the existing Linux
+guard changed, which is the check that the addition is an addition.
+
+**The implementation turned on one measurement, and it is the kind that only appears on the
+platform of record.** POSIX says `POLLHUP` is set in `revents` whatever the caller requested.
+Linux does that. **Darwin gates it on the requested mask.** A helper written and self-tested on
+Linux with an empty mask therefore passes there and is *silently dead* on the one platform whose
+persistent devfs nodes make the helper necessary — the session's recurring shape, arriving one more
+time in the fix for it.
+
+It was measured three ways rather than read once. P9 already ships the cell —
+`hangup_delivered_to_a_mask_that_requested_nothing`, `true` on Linux 7.0.0-29 and **`false`** on
+Darwin 24.6.0 in this era's committed captures. An independent `posix_openpt` poll from outside the
+tree reproduced it: after the master's close, an empty-mask poll of the slave answers `none` while
+a `POLLHUP`-requesting poll of the same fd answers `POLLHUP`. And the planted empty mask reddens
+the new self-test **here**, where it would not on Linux. *(The same measurement clears P16: its
+`p16_window` requests `POLLHUP`, so its quiet arms are controls rather than vacuous on Darwin —
+worth checking rather than assuming, since a window polling an empty mask would have read "quiet"
+on this kernel no matter what the fd was doing.)* The rule is now spelled once, in the helper's
+doc, instead of being available to be re-derived wrongly at each call site.
+
+**Why adding this to a witness shared by pty and serial callers is safe — measured, not argued.**
+A real FT232R port on the rig reports `none` both while the far end is open and after it closes,
+with the mask requested either way: a serial port's peer is a wire and cannot hang up. So the new
+arm cannot fire on the serial witnesses in `p4_purge`, `p4_exclusivity`, `p4_free_for_all` and
+`p6_outage`; they are held by steps 1–3 exactly as before. That is P16's own `does_not_license`
+sentence checked against the hardware it disclaims, which is the only way a disclaimer earns its
+keep.
+
+**Fail-first, both halves, each restored md5-identical.** The mask planted back to empty reddens
+the `sys` self-test. Step 4 disabled reddens the new Darwin witness guard, whose message names the
+consequence rather than the symptom: "the master closed and the witness still proved open — on this
+kernel that leaves every guard built on it asserting nothing." The Darwin guard asserts the
+**platform fact in the same run as the product property** — the path still resolves after the
+master closes — so a future Darwin that started unlinking reports that instead of passing for
+Linux's reason and leaving step 4 unexercised.
+
+*Owed, and stated rather than implied:* the reddening of step 4 has been proven on Darwin only.
+Both new guards run and pass on Linux, but this session had one box.

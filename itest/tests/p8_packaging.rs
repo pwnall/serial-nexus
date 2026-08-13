@@ -1245,7 +1245,17 @@ fn dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown() {
     // exists in the namespace, and is the same tree `RuntimeDirectory=` already
     // writes into under this unit's `ProtectSystem=strict` — so `ReadWritePaths=`
     // has something real to re-mount read-write, which is the mechanism under test.
-    let base = PathBuf::from("/run").join(&tag);
+    //
+    // **`-scratch`, and the suffix is load-bearing.** `service_properties` renames the
+    // unit's three `*Directory=` values to `tag`, so `RuntimeDirectory=<tag>` makes
+    // systemd create — and, under `DynamicUser=yes`, **chown** — `/run/<tag>` for the
+    // service's dynamic user. Putting the probe directories inside that path handed
+    // their ownership to the very user whose writes this test is trying to refuse, and
+    // the ownership control died silently: the first CI run after the `/tmp` repair got
+    // past `EXIT_NAMESPACE` and then reported `listed_write=ok` on a directory it had
+    // just created root-owned 0755. Two different paths that must not be one, so they
+    // are spelled differently rather than kept apart by a comment.
+    let base = PathBuf::from("/run").join(format!("{tag}-scratch"));
     let rw_dir = base.join("rw-listed");
     let ro_dir = base.join("rw-unlisted");
     std::fs::create_dir_all(&rw_dir).expect("create the ReadWritePaths probe directory");

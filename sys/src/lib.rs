@@ -433,6 +433,44 @@ pub fn poll_blocking(
     fds[0].revents().unwrap_or_else(nix::poll::PollFlags::empty)
 }
 
+/// Has the far end hung up on this tty-family fd? A zero-timeout `poll(2)` asking
+/// exactly that and nothing else.
+///
+/// **Why this exists as a named question rather than a `poll_ready` call at the
+/// caller: the mask is load-bearing, and it is load-bearing on one kernel only.**
+/// POSIX says `POLLHUP` is reported in `revents` whatever the caller requested, and
+/// Linux does that — but **Darwin gates it on the requested mask**, measured rather
+/// than read: P9 ships the cell `hangup_delivered_to_a_mask_that_requested_nothing`,
+/// which reads `true` on Linux 7.0.0-29 and **`false`** on Darwin 24.6.0 in the
+/// committed captures of the `4317ea5ac187f506` era, and an independent poll of a
+/// `posix_openpt` pair on the Darwin rig box reproduces it exactly: after the
+/// master's close, an empty-mask poll of the slave answers `none` while a
+/// `POLLHUP`-requesting poll of the same fd answers `POLLHUP` (notes §3.93).
+///
+/// So a helper written and self-tested on Linux with an empty mask passes there and
+/// is **silently dead on Darwin** — the one platform whose persistent devfs nodes
+/// make this question necessary at all (§15.59, plan §18 item 66). Spelling the mask
+/// once, here, is what keeps that trap out of every caller.
+///
+/// **What a `true` does and does not license.** It means this descriptor's peer has
+/// gone: for a pts slave, the master closed. It says nothing about whether any
+/// *process* on the other side is alive, and **nothing at all about a serial fd**,
+/// whose peer is a wire and cannot hang up this way — measured on the rig box, where
+/// a real FT232R port answers `none` both while the far end is open and after it
+/// closes, with the mask requested either way. A serial witness therefore never sees
+/// this fire, which is why adding it to a shared witness is safe rather than merely
+/// convenient.
+///
+/// Takes `AsFd` rather than a `RawFd` deliberately: the borrow keeps the descriptor
+/// alive across the call as a compile-time fact instead of the promise
+/// [`poll_ready`]'s safety comment has to make (§15.59 records the same correction
+/// being made inside P16).
+pub fn peer_hungup<F: std::os::fd::AsFd>(fd: &F) -> bool {
+    use nix::poll::PollFlags;
+    use std::os::fd::AsRawFd;
+    poll_ready(fd.as_fd().as_raw_fd(), PollFlags::POLLHUP).contains(PollFlags::POLLHUP)
+}
+
 // ---------------------------------------------------------------------------
 // SessionLatch — a session *edge*, which is not a readiness source
 // ---------------------------------------------------------------------------
@@ -1673,6 +1711,62 @@ mod tests {
             "the refusal must say what it refused and why: {err}"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// **[`peer_hungup`] on a real pts pair, both arms, each the other's control**
+    /// (§16.5: a shared helper is self-tested; plan §18 item 66).
+    ///
+    /// The negative arm is not decoration. A helper that answered `true`
+    /// unconditionally would satisfy the positive arm alone, and a helper that
+    /// answered `false` unconditionally would satisfy the negative one — so neither
+    /// is evidence without the other, which is the shape P16 uses for the same
+    /// question in the doctor.
+    ///
+    /// **This test is portable in form and bites on Darwin in particular.** Both
+    /// assertions hold on Linux whatever mask the helper requests, because Linux
+    /// reports `POLLHUP` unrequested; on Darwin the positive arm fails outright if
+    /// the mask stops naming `POLLHUP`. That asymmetry is the point rather than a
+    /// weakness — it is the regression this helper exists to make impossible, and it
+    /// is stated here so a future reader does not "simplify" the mask on the platform
+    /// where doing so is free.
+    #[test]
+    fn peer_hungup_is_absent_while_the_master_is_open_and_present_after_it_closes() {
+        use nix::fcntl::{OFlag, open};
+        use nix::pty::{grantpt, posix_openpt, unlockpt};
+        use nix::sys::stat::Mode;
+
+        let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY).expect("posix_openpt");
+        grantpt(&master).expect("grantpt");
+        unlockpt(&master).expect("unlockpt");
+        let pts = ptsname(&master).expect("ptsname");
+        // Blocking, as `itest`'s `attach_slave` opens it — the fd shape the witness
+        // this helper serves actually holds.
+        let slave = std::fs::File::from(
+            open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty()).expect("open pts"),
+        );
+
+        assert!(
+            !peer_hungup(&slave),
+            "a slave whose master is still open reported a hangup — the negative arm \
+             is what makes the positive one mean anything"
+        );
+
+        drop(master);
+        // The hangup is delivered in single-digit microseconds on both kernels of
+        // record (P16: 1 µs on Linux 7.0.0-29, 6–16 µs on Darwin 24.6.0), so a short
+        // bounded wait is generous rather than tuned; it exists so a loaded box
+        // reports the real answer instead of a scheduling artifact.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !peer_hungup(&slave) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            peer_hungup(&slave),
+            "the master closed and the held slave never reported POLLHUP. On Darwin \
+             the first thing to check is the requested mask: this kernel gates the \
+             hangup on it (P9's `hangup_delivered_to_a_mask_that_requested_nothing` \
+             reads false there), so an empty mask makes this helper silently useless"
+        );
     }
 }
 

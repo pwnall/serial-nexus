@@ -42,7 +42,8 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 | **931 passing · 1 failed · 6 ignored**, four self-skips | Linux, **rig lane minus `SNX_RIG_FLOW` and `SNX_WEB_UI`** | 2026-08-12 | the item-47 landing (notes §3.83) | **the rig-lane authority row**, superseding the 894 below and equal to this session's default-scope figure. Run against a freshly `scripts/bless`ed helper (the operator ran it mid-session; an earlier lane was discarded rather than recorded, because the helper binary was replaced underneath it). Every hardware test passed — both replug tests including `identity_survives_a_replug_that_renumbers_the_tty`, all five crossover tests, `web_tls_round_trip` under `SNX_TLS=required`. The two named drops are measurements taken *in this run*, not conveniences: the four self-skips are the two `rts-cts` tests, which print the reading that justifies them (`port1 RTS high -> port0 cts:false`, low -> `cts:false` — a **3-wire** bench, §15.52's legitimate answer and the third independent confirmation of it), and the two browser tests, on a box with no `node`. The one failure is `p3_idle_cost` (item 46), unrelated to the rig. **One lane before this one hung** and is recorded rather than quietly re-run — see the note under this table. |
 | **894 passing · 1 failed · 6 ignored**, four self-skips | Linux, **rig lane minus `SNX_RIG_FLOW` and `SNX_WEB_UI`** | 2026-08-12 | this session (notes §3.80) | the rig-lane authority row, and the first green one in this record. Both exclusions are measurements, not conveniences: this box has no `node`, and the bench **measures 3-wire**, which §15.52 makes a legitimate answer — so the two `rts-cts` end-to-end tests skip with their reading printed. The one failure is `p3_idle_cost` (item 46), unrelated to the rig. Every hardware test passed, `identity_survives_a_replug_that_renumbers_the_tty` for the first time ever. **Superseded by the 925 rig row above**, taken later the same day at the same scope. |
 | **835 passing · 0 failed · 4 ignored** | Linux, rig lane — and again at default CI scope, same session | 2026-08-05 | `17c6e87` (notes §3.68) | twice on the full rig lane, once at default CI scope, 835/0/4 each time — the last dual-scope measurement; superseded by the 852 re-measure of 2026-08-07; not the current-tree figure. **Attribution unreconciled (v17):** notes §3.68's verbatim session record reads 830 (gates scope) and 834/0 · 833/1 (rig lane), and no 835 appears in it — the figure survives only as a v15 Status-table quotation (the re-cited-not-re-derived class), so neither the number nor the dual-scope equivalence is attributable to §3.68. Superseded either way. |
-| **955 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** (MacBookPro15,1, Darwin 24.6.0 / macOS 15.7.8, 12 cores) | 2026-08-13 | this session (notes §3.93) | **the macOS authority row for the rig box**, and the first figure ever taken there at a tree whose macOS-only guards pass. 126 result lines over **122 cargo targets** (114 `Running` + 8 doc-test) and **105 self-skips**. **Read the skip count before comparing this to anything:** 105 against the Linux authority row's **13** at the same scope is the honest measure of how much of this suite is device- or Linux-gated on a Mac — the rig is physically attached but `SNX_CROSSOVER_A`/`_B` are unexported at default scope, so every serial test self-skips by design. A macOS default-scope figure is therefore **not** comparable to a Linux one test-for-test, and no delta between them is derived here. **The preceding run at this same tree read 953 · 1+1 · 7** and is kept rather than replaced, because it is the measurement that found the defects: `probes::tests::the_software_readback_reports_unmeasurable_rather_than_answering` (a baseline `Termios` taken off a pty master, which Darwin answers `ENOTTY`) and `both_gates_refuse_an_unsupported_verdict_and_are_shown_able_to` (a report-shaping premise that knew about P12 and not P2) — both item 69, both repaired in the same commit as this row, and both red in CI's `macos` job on every push since they landed. Not the CI arm64 runner and not the M4: three machines, none substituting for another (item 18). |
+| **957 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** | 2026-08-13 | this session (notes §3.94) | **the macOS authority row for the rig box.** The **+2** over the 955 row below is item 66's two new guards, counted rather than estimated: `serial_nexus_sys`'s `peer_hungup` self-test and `itest`'s Darwin witness guard. Same scope, same box, same session, one commit later; every caveat on the 955 row still applies and is not repeated here. Supersedes it. |
+| **955 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** (MacBookPro15,1, Darwin 24.6.0 / macOS 15.7.8, 12 cores) | 2026-08-13 | this session (notes §3.93) | **superseded by the 957 row above**, taken later the same session at the same scope. The first figure ever taken on this box at a tree whose macOS-only guards pass. 126 result lines over **122 cargo targets** (114 `Running` + 8 doc-test) and **105 self-skips**. **Read the skip count before comparing this to anything:** 105 against the Linux authority row's **13** at the same scope is the honest measure of how much of this suite is device- or Linux-gated on a Mac — the rig is physically attached but `SNX_CROSSOVER_A`/`_B` are unexported at default scope, so every serial test self-skips by design. A macOS default-scope figure is therefore **not** comparable to a Linux one test-for-test, and no delta between them is derived here. **The preceding run at this same tree read 953 · 1+1 · 7** and is kept rather than replaced, because it is the measurement that found the defects: `probes::tests::the_software_readback_reports_unmeasurable_rather_than_answering` (a baseline `Termios` taken off a pty master, which Darwin answers `ENOTTY`) and `both_gates_refuse_an_unsupported_verdict_and_are_shown_able_to` (a report-shaping premise that knew about P12 and not P2) — both item 69, both repaired in the same commit as this row, and both red in CI's `macos` job on every push since they landed. Not the CI arm64 runner and not the M4: three machines, none substituting for another (item 18). |
 | **896 passing · 0 failed · 6 ignored**, 122 test-result lines | **whole workspace (macOS)**, CI `macos-*` arm64 runner | 2026-08-13 | CI run 31657666919, job 94315579211 (notes §3.83) | **the macOS authority row**, superseding the 860 below. No exclusions — the lane runs `cargo test --workspace --locked --no-fail-fast` — on macOS 26.5.2 / arm64. The +36 over the 860 row closes exactly: this session added 37 tests, of which 36 run here (the devprep capability-fold guard is inside the Linux-only platform module). The six device-gated pattern-wait guards run and self-skip, which is why the acceptance battery was deliberately split so six of its twelve need no serial device. Skip count not stated: CI does not pass `--nocapture`, so it cannot be read from that log (notes §3.78). |
 | **860 passing · 0 failed · 6 ignored** | **whole workspace (macOS)**, CI `macos-*` arm64 runner | 2026-08-12 | CI run 31605283603, job 94144842458 (notes §3.76) | the first green macOS lane in this record. **Superseded by the 896 row above**, taken 2026-08-13 at the same scope. No exclusions — CI runs `cargo test --workspace --locked --no-fail-fast`. The skip count is **not stated**: CI does not pass `--nocapture`, so it cannot be read from that log (notes §3.78). The preceding run read 859 · 1 · 6 at the same tree; its one failure is `a_client_clearing_extproc_has_it_re_asserted_so_changes_keep_surfacing`, which asserted Linux's EXTPROC retention on both kernels and is repaired in the same commit as this row; it is the *pre-fix* reading, kept because it is the measurement that found the defect. Not the x86_64 rig box — three machines, none substituting for another (plan §18 item 18). |
 | **760 passing · 1 failed · 4 ignored** | macOS, gate scope **plus** `--exclude serial-nexus-devprep` | 2026-08-05 | `60b9d0f` (notes §3.65) | not the documented scope — quote it with both exclusions. Superseded by the row above; its one failure was the `rts-cts` platform gap §15.53 has since turned into an assertion of refusal. |
@@ -2484,7 +2485,41 @@ pre-registered readings licensed (66, 67); two are defects the same session foun
 suite and reading CI (68, 69). All four are numbered because a defect this record has no number
 for is one the next review cannot check was fixed — item 16's lesson.
 
-66. **`SlaveWitness::prove_open` is unsound on Darwin: the portable upgrade** — **open** (S/M).
+66. **`SlaveWitness::prove_open` is unsound on Darwin: the portable upgrade** — **EXECUTED
+    2026-08-13** (notes §3.94), as `serial_nexus_sys::peer_hungup` plus a fourth step in
+    `prove_open`. **Added, not swapped**, and the brief that said "replace" was wrong about
+    that: the stat comparison catches something `poll` cannot see — a node *replaced*
+    underneath a still-valid fd, which is §12's replug renumbering — while `poll` catches
+    what the stat comparison cannot see on Darwin. Two arms, two failure modes, two
+    messages; the hangup arm runs **last** so Linux keeps the more specific "the node was
+    unlinked" diagnosis and the new arm is the backstop where step 2 structurally cannot
+    answer.
+    **One measurement decided the implementation, and it is the kind that only shows up on
+    the platform of record.** POSIX says `POLLHUP` is delivered whatever the caller
+    requested; Linux does that, and **Darwin gates it on the requested mask** — so a helper
+    written and self-tested on Linux with an empty mask passes there and is *silently dead*
+    on the only platform that needs it. Measured three ways rather than read: P9 already
+    ships the cell (`hangup_delivered_to_a_mask_that_requested_nothing`, `true` on Linux,
+    `false` on Darwin, in the committed captures of this era), an independent poll of a
+    `posix_openpt` pair on the rig box reproduced it from outside the tree, and the planted
+    empty mask reddens the new self-test **here and would not on Linux**. The rule is spelled
+    once, in the helper, so it cannot be re-derived wrongly by a caller.
+    *Also measured, and it is why adding this to a shared witness is safe rather than merely
+    convenient:* a real serial fd **never** reports `POLLHUP` — checked on the rig with the
+    far end open and after it closed, mask requested both times — so the arm cannot fire on
+    the serial witnesses in `p4_purge`, `p4_exclusivity`, `p4_free_for_all` and `p6_outage`,
+    which keep being held by steps 1–3 exactly as before. That is P16's own
+    `does_not_license` sentence, confirmed against the hardware it disclaims.
+    *Fail-first, both halves, each restored byte-identical:* the mask planted back to empty
+    reddens `peer_hungup_is_absent_while_the_master_is_open_and_present_after_it_closes`;
+    the fourth step disabled reddens the new Darwin witness guard with the message that
+    names the consequence ("on this kernel that leaves every guard built on it asserting
+    nothing"). The Darwin guard asserts the **platform fact in the same run as the product
+    property** — the path still resolves after the master closes — so if a future Darwin
+    started unlinking, it reports that rather than passing for Linux's reason.
+    *Owed:* the Linux half of the fail-first for step 4 specifically. Both new guards run on
+    Linux and pass there, but the arm's *reddening* has been proven on Darwin only, this box
+    being the only one this session had. The superseded filing follows. **Original state:** open (S/M).
     *Evidence:* measured, not predicted, and pre-registered by item 26 before it was taken —
     `path_still_resolves` reads `true` on **both** sides of the master's close on Darwin 24.6.0,
     `fstat_on_the_held_fd_answers` stays `true`, `shipped_prove_open_would_refuse` never moves off
@@ -2538,17 +2573,31 @@ for is one the next review cannot check was fixed — item 16's lesson.
     and systemd refused to build it — `status=226`, `EXIT_NAMESPACE`, before `ExecStart`. The
     probe's own assertion said "This is a finding about the packaged sandbox, not about the
     probe"; it was a finding about the probe, and the message is corrected to route by the
-    systemd status word rather than by assumption. Directories moved to `/run/<tag>`, which
-    `PrivateTmp=` does not privatise and which `RuntimeDirectory=` already writes into under
-    this unit's `ProtectSystem=strict`. **The CI step also did not do what its own name says:**
-    it is called "reporting only" and gated, which is plan §18 item 31's sequencing inverted —
-    it now carries `continue-on-error: true`. *Remainder:* **that line is a step asserting
+    systemd status word rather than by assumption. Directories moved out of `/tmp`, which
+    `PrivateTmp=` privatises, into `/run` — which it does not. **The CI step also did not do
+    what its own name says:** it is called "reporting only" and gated, which is plan §18 item
+    31's sequencing inverted — it now carries `continue-on-error: true`.
+    **The measurement that repair was labelled for was taken the same day (CI run
+    31689537882) and it moved the failure one stage forward, which is the point of labelling
+    it.** `EXIT_NAMESPACE` is gone: the probe unit **runs**, prints its readings, and fails a
+    *later* assertion — `listed_write=ok` on a directory the test had just created root-owned
+    0755, where the README's claim (`ReadWritePaths` only flips the mount, it does not chown)
+    predicts a refusal. **The second cause was the repair's own, and it is the more
+    instructive one.** `service_properties` renames the unit's three `*Directory=` values to
+    `tag`, so `RuntimeDirectory=<tag>` had systemd create — and, under `DynamicUser=yes`,
+    **chown** — `/run/<tag>`, the exact path the repair had just moved the probe directories
+    into. The ownership control was handed to the very user whose writes it exists to refuse,
+    and it died **silently**, which is strictly worse than the 226 it replaced. This item's
+    own first draft argued the move was safe *because* "`RuntimeDirectory=` already writes
+    into" `/run` — the collision written down as the reassurance. Repaired again as
+    `/run/<tag>-scratch`: two paths that must never be one, distinguished by their names
+    rather than by a comment. *Remainder:* **the `continue-on-error` line is a step asserting
     nothing, which AGENTS §3 names as a tell, so it is temporary by construction** — one green
-    run at this tree flips it back off. *Honestly labelled limit:* the repair is reasoned from
-    `systemd.exec(5)`'s `PrivateTmp=` semantics and the observed 226, and **is not verified on a
-    real box** — this session had no systemd, which is the same reason the arm exists. The next
-    CI run is the measurement. *Validation:* the flip-back is the item's close; a run that is
-    still red names its new status word rather than re-asserting this diagnosis.
+    run at this tree flips it back off, and it has not come yet. *Honestly labelled limit,
+    unchanged and now twice justified:* neither repair is verified on a real box — this session
+    had no systemd, which is the same reason the arm exists. *Validation:* the flip-back is the
+    item's close; a run that is still red names its new status word or its new failing
+    assertion rather than re-asserting either diagnosis.
 69. **The macOS lane's two Linux-shaped guards, and what they say about coverage** —
     **EXECUTED 2026-08-13** (notes §3.93), filed rather than fixed silently because both are
     instances of a class this ledger already tracks. Found by running the suite on the Mac rig
