@@ -179,6 +179,36 @@ and (all(.probes[]; . as $p | ($p.id != "P15") or ($p.status | startswith("skipp
          and (.value.honoured_on_readback | type == "boolean")
          and (.value.tcsetattr_ok | type == "boolean")
          and (.value.baseline_restored | type == "boolean")))))
+# **P15's SOFTWARE half** (plan §18 item 14). `xon-xoff` had no pre-check and no
+# probe, and `serial2` verifies `c_iflag` by read-back exactly as it verifies
+# `c_cflag` — so a driver that accepted `IXON`/`IXOFF` and reported them clear would
+# fault a node with the same bare error §15.53's refusal exists to prevent, and no
+# artifact on any kernel said whether one does. The reading rides on P15's open, so
+# `probe_set` does not move and `field_set` does (announced by hand in
+# `docs/doctor/README.md`, §13). Identical in both expectation files, deliberately:
+# the interesting arm is a driver that drops the request, and a clause that only ran
+# where the flags ARE honoured could never catch it — the same reasoning the hardware
+# clause above carries.
+#
+# **Presence and type, never the answer**, per the ledger item: the item declines
+# extending §15.53 to a mode nobody had measured, so a clause pinning
+# `honoured_on_readback: true` would encode the very policy the item refused to
+# write, and would redden every honest adapter that answers otherwise. What it does
+# refuse is a non-answer wearing an answer's clothes: `measured` is required either
+# way, and the reading cells are required exactly when it is `true`. The population
+# is required to be non-empty, because an `all` over zero ports is the vacuous pass
+# this file's P4 clause already exists to prevent.
+and (all(.probes[]; . as $p | ($p.id != "P15") or ($p.status | startswith("skipped")) or
+      (($p.observations | map(select(.value | type == "object")) | length) > 0
+       and ($p.observations | map(select(.value | type == "object")) | all(
+             (.value.software_flow_control | type == "object")
+             and (.value.software_flow_control.asks | type == "string")
+             and (.value.software_flow_control.measured | type == "boolean")
+             and ((.value.software_flow_control.measured | not)
+                  or ((.value.software_flow_control.tcsetattr_ok | type == "boolean")
+                      and (.value.software_flow_control.honoured_on_readback | type == "boolean")
+                      and (.value.software_flow_control.silently_dropped | type == "boolean")
+                      and (.value.software_flow_control.serial2_readback_would_fault | type == "boolean"))))))))
 # P12 (session-boundary edge, §15.39) is inert on Linux by design — the retained
 # `TIOCPKT_IOCTL` packet carries §6's detach-release here, which is P7's subject —
 # so `skipped` is the *expected* answer and the clause is presence-only. It is
@@ -209,6 +239,28 @@ and (all(.probes[]; . as $p | ($p.id != "P12") or
 # content: the first is the answer, the second is what separates `discards` from
 # `waits-then-discards`, which no other probe in this set can tell apart.
 and (any(.probes[]; .id == "P13" and (.status == "supported" or .status == "degraded")))
+# **P13's fifth shape: a reader arriving during the close-wait** (plan §18 item 22).
+# The four shapes before it all fix the reader's state *before* the close, so none of
+# them can produce the arrival the failing macOS run inhabits (notes §3.29): a reader
+# showing up inside a ~600 ms Darwin close-wait, which is what the daemon's own
+# 200 us-5 ms cadence does on every healthy run. Identical in both expectation files.
+#
+# Presence and type only — `arrived_before_close_returned` is a race this kernel may
+# legitimately win or lose, and pinning it would be this file asserting the thing the
+# shape measures. What is gated is that the row can be READ: the boolean, the
+# `reading` word that says which way it went, and the sentence stating what the row
+# does not license. Nothing else in the gate set can notice a shape that quietly
+# stopped running — the verdict does not degrade when a non-`a` shape errors, and an
+# errored shape's value is a string, which this clause's `type == "object"` guard
+# turns into a failure rather than a jq error on a bare index.
+and (all(.probes[]; . as $p | ($p.id != "P13") or
+      ($p.observations | any(.key == "e_reader_arrives_during_close_wait"
+         and (.value | type == "object")
+         and (.value.bytes_recovered_by_arriving_reader | type == "number")
+         and (.value.reader_arrival | type == "object")
+         and (.value.reader_arrival.arrived_before_close_returned | type == "boolean")
+         and (.value.reader_arrival.reading | type == "string")
+         and (.value.reader_arrival.does_not_license | type == "string")))))
 # P14 (maximum-rate search, §15.51) is opt-in behind `--port` *and* needs a
 # cross-paired rig, so `skipped` is the expected answer on every passive run and
 # on every box with one adapter. `degraded` is admissible and is not a
@@ -250,13 +302,54 @@ and (all(.probes[]; . as $p | ($p.id != "P14") or ($p.status == "skipped")
 and (all(.probes[]; . as $p | ($p.id != "P14") or ($p.status != "supported")
       or ((([$p.observations[] | select(.key == "max_reliable_baud") | .value] | last) != null)
           and (([$p.observations[] | select(.key == "ceiling_kind") | .value] | last) != null))))
+# P16 (slave-witness liveness, §15.59) is a pty probe and needs no hardware, so it
+# must MEASURE on every lane — `supported` or `degraded`, never `skipped`: a skip
+# here would mean the probe compiled out on a box that can run it, which is exactly
+# the silent regression a presence-only clause waves through. A probe error degrades
+# (`measurement_failed`), which is the arm that reddens the content clause below.
+# Identical in both expectation files.
+and (any(.probes[]; .id == "P16" and (.status == "supported" or .status == "degraded")))
+# **And both of P16's arms must be present, with the answer left free.** The probe
+# exists because `itest`'s `SlaveWitness::prove_open` establishes liveness through a
+# `(st_dev, st_ino, st_rdev)` comparison that works on Linux — the kernel unlinks
+# `/dev/pts/N` at the master's close — and is *expected* to degrade on Darwin's
+# persistent devfs nodes. Which of the two instruments can tell a live pair from a
+# dead one is the kernel's answer and is never pinned here; what is gated is that
+# both arms ran and both readings are readable.
+#
+# The quiet arm is a ZERO, so it is gated with its witnesses (§15.49): the pass
+# count and the elapsed microseconds, because a hangup count of 0 over a window
+# nobody sized is not a measurement. `poll_can_tell_a_live_pair_from_a_dead_one` and
+# `stat_comparison_can_tell` are the two answers a reader compares, and
+# `does_not_license` is the bound printed beside them.
+and (all(.probes[]; . as $p | ($p.id != "P16") or
+      (($p.observations | any(.key == "quiet_window_tight"
+             and (.value.passes | type == "number") and (.value.passes > 0)
+             and (.value.hangup_passes | type == "number")
+             and (.value.elapsed_us | type == "number")))
+       and ($p.observations | any(.key == "quiet_window_paced"
+             and (.value.passes | type == "number") and (.value.passes > 0)
+             and (.value.hangup_passes | type == "number")
+             and (.value.elapsed_us | type == "number")))
+       and ($p.observations | any(.key == "hangup_after_master_closed"
+             and (.value.hangup_delivered | type == "boolean")
+             and (.value.microseconds_to_hangup | type == "number")))
+       and ($p.observations | any(.key == "stat_comparison_while_master_open"
+             and (.value.shipped_prove_open_would_refuse | type == "boolean")))
+       and ($p.observations | any(.key == "stat_comparison_after_master_closed"
+             and (.value.shipped_prove_open_would_refuse | type == "boolean")))
+       and ($p.observations | any(.key == "poll_can_tell_a_live_pair_from_a_dead_one"
+             and (.value | type == "boolean")))
+       and ($p.observations | any(.key == "stat_comparison_can_tell"
+             and (.value | type == "boolean")))
+       and ($p.observations | any(.key == "does_not_license" and (.value | type == "string"))))))
 # And the clause that makes the ones above worth having: a kernel-diff probe that
 # RAN must carry measurements. A verdict word cannot be diffed, so a probe whose
 # observations went empty would pass every clause above while making the 6.18 run
 # useless. (`skipped` is exempt — it measured nothing by definition, and its
 # `reason` says why.)
 and (all(.probes[]; . as $p
-      | ((["P6","P7","P8","P9","P10","P12","P13","P14"] | index($p.id)) == null)
+      | ((["P6","P7","P8","P9","P10","P12","P13","P14","P16"] | index($p.id)) == null)
       or ($p.status == "skipped")
       or (($p.observations | length) > 0)))
 # And the clause that closes the hole the 2026-07-27 6.18 run walked through: an

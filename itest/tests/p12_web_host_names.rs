@@ -23,14 +23,12 @@
 //! No daemon and no serial device: the Host gate runs before the token gate and long
 //! before anything reaches the control socket, and the assets answer without one (§5).
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use serial_nexus_itest::{TempRun, bin, wait_until};
+use serial_nexus_itest::{TempRun, WebServer, bin, wait_until};
 
 /// The fixed per-session token; nothing here turns on its value.
 const TOKEN: &str = "webs2token0123456789abcdef";
@@ -40,79 +38,6 @@ const TOKEN: &str = "webs2token0123456789abcdef";
 const DECLARED: &str = "console.lab:8443";
 /// …and the same name as a browser's Host header carries it.
 const AS_SENT: &str = "console.lab:8443";
-
-// ---------------------------------------------------------------- child process ----
-
-/// A `serial-nexus-web` child whose printed bootstrap URL is scanned for the OS-chosen
-/// port. Killed on drop.
-struct WebServer {
-    child: Child,
-    port: u16,
-}
-
-impl WebServer {
-    /// Spawn the server with the given extra arguments appended.
-    fn spawn(socket: &Path, xdg: &Path, extra: &[&str]) -> WebServer {
-        let socket_str = socket.to_string_lossy().into_owned();
-        let mut args: Vec<String> = ["--bind", "127.0.0.1:0", "--token", TOKEN, "--socket"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        args.push(socket_str);
-        args.extend(extra.iter().map(|s| s.to_string()));
-        let mut child = Command::new(bin("serial-nexus-web"))
-            .args(&args)
-            .env("XDG_RUNTIME_DIR", xdg)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn serial-nexus-web");
-        // Drained for the child's whole life: the tracing subscriber writes to stdout
-        // too, and a pipe whose read end we dropped would take the server down on its
-        // next log line.
-        let stdout = child.stdout.take().expect("piped serial-nexus-web stdout");
-        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = lines.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(l) => sink.lock().unwrap().push(l),
-                    Err(_) => break,
-                }
-            }
-        });
-        let mut port = None;
-        let found = wait_until(Duration::from_secs(10), || {
-            for l in lines.lock().unwrap().iter() {
-                if let Some(rest) = l.split("http://").nth(1)
-                    && let Some(authority) = rest.split('/').next()
-                    && let Some((_, p)) = authority.rsplit_once(':')
-                    && let Ok(n) = p.trim().parse::<u16>()
-                {
-                    port = Some(n);
-                    return true;
-                }
-            }
-            false
-        });
-        assert!(
-            found,
-            "serial-nexus-web never printed its bound http URL; saw {:?}",
-            lines.lock().unwrap()
-        );
-        WebServer {
-            child,
-            port: port.expect("a port once the URL line was found"),
-        }
-    }
-}
-
-impl Drop for WebServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 // ------------------------------------------------------------------ HTTP helpers ----
 
@@ -169,11 +94,17 @@ fn jar(head: &str) -> String {
 #[test]
 fn an_operator_host_written_with_a_port_is_accepted_end_to_end() {
     let run = TempRun::new();
-    let web = WebServer::spawn(&run.socket(), run.path(), &["--host", DECLARED]);
+    let web = WebServer::start(
+        "127.0.0.1:0",
+        TOKEN,
+        &run.socket(),
+        run.path(),
+        &["--host", DECLARED],
+    );
 
     // The bootstrap URL, opened under the declared name — the operator's very first
     // request, and the one that used to 403 with the flag set exactly as documented.
-    let (code, head) = get(web.port, &format!("/?token={TOKEN}"), AS_SENT, None);
+    let (code, head) = get(web.port(), &format!("/?token={TOKEN}"), AS_SENT, None);
     assert_eq!(
         code, 302,
         "the bootstrap URL 403s under the name it was told to serve (--host {DECLARED}, \
@@ -183,19 +114,19 @@ fn an_operator_host_written_with_a_port_is_accepted_end_to_end() {
     assert!(!cookies.is_empty(), "the bootstrap set no cookie:\n{head}");
 
     // …and so does everything after it.
-    let (code, head) = get(web.port, "/app.js", AS_SENT, Some(&cookies));
+    let (code, head) = get(web.port(), "/app.js", AS_SENT, Some(&cookies));
     assert_eq!(code, 200, "the console's assets under {AS_SENT}:\n{head}");
 
     // The port genuinely is not this gate's business: it answers "is this a name we
     // serve", and Origin is what pins the port, against the request's own authority
     // (§15.29). So the same name on another port is still served…
-    let (code, _) = get(web.port, "/app.js", "console.lab:9999", Some(&cookies));
+    let (code, _) = get(web.port(), "/app.js", "console.lab:9999", Some(&cookies));
     assert_eq!(code, 200, "the Host gate matches names, not ports");
     // …and the loopback defaults keep working beside the declared name.
     let (code, _) = get(
-        web.port,
+        web.port(),
         "/app.js",
-        &format!("127.0.0.1:{}", web.port),
+        &format!("127.0.0.1:{}", web.port()),
         Some(&cookies),
     );
     assert_eq!(code, 200, "the localhost family is always served");
@@ -203,7 +134,7 @@ fn an_operator_host_written_with_a_port_is_accepted_end_to_end() {
     // What must still be refused is a name nobody declared: the gate is what stops a
     // page that rebinds DNS to 127.0.0.1 from being answered under its own name.
     for host in ["evil.example", "evil.example:8443", "notconsole.lab"] {
-        let (code, _) = get(web.port, "/app.js", host, Some(&cookies));
+        let (code, _) = get(web.port(), "/app.js", host, Some(&cookies));
         assert_eq!(
             code, 403,
             "Host {host:?} was never declared and must be refused (§15.29)"

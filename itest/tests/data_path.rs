@@ -182,10 +182,10 @@ b = "console"
             "client",
             "--path",
             tty_s.as_str(),
-            "--hold-ms",
-            "60000",
-            "--timeout-ms",
-            "65000",
+            // Caller-owned hold (plan §18 item 25): presence must fall because the
+            // `drop` below closed the slave, which a timer that expired first would
+            // make indistinguishable.
+            "--hold-stdin-eof",
         ],
         None,
     );
@@ -249,10 +249,10 @@ path = "{tty}"
             "client",
             "--path",
             tty_s.as_str(),
-            "--hold-ms",
-            "60000",
-            "--timeout-ms",
-            "65000",
+            // Caller-owned hold (plan §18 item 25): presence must fall because the
+            // `drop` below closed the slave, which a timer that expired first would
+            // make indistinguishable.
+            "--hold-stdin-eof",
         ],
         None,
     );

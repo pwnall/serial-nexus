@@ -35,15 +35,12 @@
 //! `p8_web.rs`: the close-frame assertion needs a reader that hands back the *opcode*,
 //! which `p8_web`'s message-level client folds away.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use serial_nexus_itest::{TempRun, bin, daemon_answers, wait_until};
+use serial_nexus_itest::{RawDaemon, TempRun, WebServer};
 
 /// Distinct per-server tokens, so "the right console answered" is a byte-level fact
 /// rather than an inference. Same length, since the token compare is length-sensitive.
@@ -52,121 +49,11 @@ const TOKEN_B: &str = "bbbbtoken0123456789abcdef";
 
 // ---------------------------------------------------------------- child processes --
 
-/// A `serial-nexus-web` child whose printed bootstrap URL is scanned for the OS-chosen
-/// port. Killed on drop.
-struct WebServer {
-    child: Child,
-    port: u16,
-}
-
-impl WebServer {
-    /// Spawn `serial-nexus-web --bind 127.0.0.1:0 --token <token> --socket <socket>` and
-    /// wait for the `http://…` line it prints right after binding.
-    fn spawn(token: &str, socket: &Path, xdg: &Path) -> WebServer {
-        let socket_str = socket.to_string_lossy().into_owned();
-        let mut child = Command::new(bin("serial-nexus-web"))
-            .args([
-                "--bind",
-                "127.0.0.1:0",
-                "--token",
-                token,
-                "--socket",
-                &socket_str,
-            ])
-            .env("XDG_RUNTIME_DIR", xdg)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn serial-nexus-web");
-        // Drained for the child's whole life, not just until the URL appears: the
-        // tracing subscriber writes to stdout too, and a pipe whose read end we dropped
-        // would take the server down on its next log line.
-        let stdout = child.stdout.take().expect("piped serial-nexus-web stdout");
-        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = lines.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(l) => sink.lock().unwrap().push(l),
-                    Err(_) => break,
-                }
-            }
-        });
-        let mut port = None;
-        let found = wait_until(Duration::from_secs(10), || {
-            for l in lines.lock().unwrap().iter() {
-                if let Some(rest) = l.split("http://").nth(1)
-                    && let Some(authority) = rest.split('/').next()
-                    && let Some((_, p)) = authority.rsplit_once(':')
-                    && let Ok(n) = p.trim().parse::<u16>()
-                {
-                    port = Some(n);
-                    return true;
-                }
-            }
-            false
-        });
-        assert!(
-            found,
-            "serial-nexus-web never printed its bound http URL; saw {:?}",
-            lines.lock().unwrap()
-        );
-        WebServer {
-            child,
-            port: port.expect("a port once the URL line was found"),
-        }
-    }
-}
-
-impl Drop for WebServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// A `serial-nexus-daemon` this test owns outright, so it can be **killed mid-session** — the
-/// event WEB-4 is about. [`serial_nexus_itest::Daemon`] deliberately keeps its child private
-/// and shuts down cleanly on drop, which is the one thing this must not do.
-struct OwnedDaemon {
-    child: Child,
-    run: TempRun,
-}
-
-impl OwnedDaemon {
-    fn start() -> OwnedDaemon {
-        let run = TempRun::new();
-        let socket = run.socket();
-        let child = Command::new(bin("serial-nexus-daemon"))
-            .arg("--socket")
-            .arg(&socket)
-            .arg("--state-file")
-            .arg(run.state_file())
-            .env("XDG_RUNTIME_DIR", run.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn serial-nexus-daemon");
-        let ready = wait_until(Duration::from_secs(10), || {
-            socket.exists() && daemon_answers(&socket)
-        });
-        assert!(ready, "daemon never answered `info` within 10s");
-        OwnedDaemon { child, run }
-    }
-
-    /// SIGKILL and reap, so the web server's daemon connection dies without a
-    /// courtesy close — the routine "the operator restarted serial-nexus-daemon" event.
-    fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for OwnedDaemon {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
+// The daemon below is a [`RawDaemon`], owned outright so it can be **killed
+// mid-session** — the event WEB-4 is about. [`serial_nexus_itest::Daemon`] keeps its
+// child private and shuts down cleanly on drop, which is the one thing this must not do;
+// `RawDaemon::kill` is the SIGKILL-and-reap that leaves the web server's connection to
+// die without a courtesy close, the routine "the operator restarted the daemon" event.
 
 // ------------------------------------------------------------------- HTTP helpers --
 
@@ -430,21 +317,21 @@ impl Ws {
 #[test]
 fn two_web_consoles_keep_their_own_sessions_in_one_cookie_jar() {
     let run = TempRun::new();
-    let a = WebServer::spawn(TOKEN_A, &run.socket(), run.path());
-    let b = WebServer::spawn(TOKEN_B, &run.socket(), run.path());
-    assert_ne!(a.port, b.port, "the OS gave two ephemeral ports");
+    let a = WebServer::start("127.0.0.1:0", TOKEN_A, &run.socket(), run.path(), &[]);
+    let b = WebServer::start("127.0.0.1:0", TOKEN_B, &run.socket(), run.path(), &[]);
+    assert_ne!(a.port(), b.port(), "the OS gave two ephemeral ports");
 
     // Each bootstrap URL sets a cookie named for *its* listener, so the two occupy
     // different (name, domain, path) entries. Before the fix both were `nexus_session`
     // on domain 127.0.0.1 path /, and the second store overwrote the first.
-    let cookie_a = bootstrap_cookie(a.port, TOKEN_A);
-    let cookie_b = bootstrap_cookie(b.port, TOKEN_B);
+    let cookie_a = bootstrap_cookie(a.port(), TOKEN_A);
+    let cookie_b = bootstrap_cookie(b.port(), TOKEN_B);
     assert_eq!(
         cookie_a,
-        format!("nexus_session_{}={TOKEN_A}", a.port),
+        format!("nexus_session_{}={TOKEN_A}", a.port()),
         "the cookie is named for the listener that set it"
     );
-    assert_eq!(cookie_b, format!("nexus_session_{}={TOKEN_B}", b.port));
+    assert_eq!(cookie_b, format!("nexus_session_{}={TOKEN_B}", b.port()));
     assert_ne!(
         cookie_a.split('=').next(),
         cookie_b.split('=').next(),
@@ -456,7 +343,7 @@ fn two_web_consoles_keep_their_own_sessions_in_one_cookie_jar() {
     // guaranteed by RFC 6265 §5.4 for equal paths, so both orders are asserted.
     let jar = format!("{cookie_a}; {cookie_b}");
     let jar_reversed = format!("{cookie_b}; {cookie_a}");
-    for (name, port) in [("A", a.port), ("B", b.port)] {
+    for (name, port) in [("A", a.port()), ("B", b.port())] {
         for header in [jar.as_str(), jar_reversed.as_str()] {
             assert_eq!(
                 status(port, "/app.js", &[("Cookie", header)]),
@@ -472,7 +359,7 @@ fn two_web_consoles_keep_their_own_sessions_in_one_cookie_jar() {
     // *alone* is still (correctly) unauthorized on A — the point is that a real jar
     // never has to be in that state.
     assert_eq!(
-        status(a.port, "/app.js", &[("Cookie", cookie_b.as_str())]),
+        status(a.port(), "/app.js", &[("Cookie", cookie_b.as_str())]),
         401,
         "B's token must not authorize A — the isolation is by name, not by luck"
     );
@@ -483,7 +370,7 @@ fn two_web_consoles_keep_their_own_sessions_in_one_cookie_jar() {
     // `/app.js` still returned 200 — a console that renders and never connects.
     let planted = format!("{}=bogus; {cookie_a}", cookie_a.split('=').next().unwrap());
     for target in ["/app.js", "/ws"] {
-        let code = status(a.port, target, &[("Cookie", planted.as_str())]);
+        let code = status(a.port(), target, &[("Cookie", planted.as_str())]);
         assert_ne!(
             code, 401,
             "a planted cookie must not shadow the session on {target} (got {code})"
@@ -497,10 +384,11 @@ fn two_web_consoles_keep_their_own_sessions_in_one_cookie_jar() {
 /// daemon connection ends, instead of being left open over a dead daemon.
 #[test]
 fn a_bridged_websocket_closes_when_the_daemon_goes_away() {
-    let mut daemon = OwnedDaemon::start();
-    let web = WebServer::spawn(TOKEN_A, &daemon.run.socket(), daemon.run.path());
-    let cookie = bootstrap_cookie(web.port, TOKEN_A);
-    let mut ws = Ws::connect(web.port, &cookie);
+    let run = TempRun::new();
+    let mut daemon = RawDaemon::start(&run);
+    let web = WebServer::start("127.0.0.1:0", TOKEN_A, &run.socket(), run.path(), &[]);
+    let cookie = bootstrap_cookie(web.port(), TOKEN_A);
+    let mut ws = Ws::connect(web.port(), &cookie);
 
     // Prove the bridge is live before killing anything, so a Close frame afterwards is
     // unambiguously the daemon's departure and not a failed setup.
@@ -570,10 +458,10 @@ fn a_websocket_upgrade_is_refused_before_the_101_when_the_daemon_is_down() {
         !socket.exists(),
         "the scenario is a daemon that is not there"
     );
-    let web = WebServer::spawn(TOKEN_A, &socket, run.path());
-    let cookie = bootstrap_cookie(web.port, TOKEN_A);
+    let web = WebServer::start("127.0.0.1:0", TOKEN_A, &socket, run.path(), &[]);
+    let cookie = bootstrap_cookie(web.port(), TOKEN_A);
 
-    let (code, response) = ws_upgrade(web.port, &cookie);
+    let (code, response) = ws_upgrade(web.port(), &cookie);
     assert_ne!(
         code, 101,
         "the handshake completed over a daemon that was never reached: the page renders \
@@ -597,7 +485,7 @@ fn a_websocket_upgrade_is_refused_before_the_101_when_the_daemon_is_down() {
     // The console itself still loads, so the operator sees the refusal in a page rather
     // than a blank window: the assets never needed the daemon.
     assert_eq!(
-        status(web.port, "/app.js", &[("Cookie", cookie.as_str())]),
+        status(web.port(), "/app.js", &[("Cookie", cookie.as_str())]),
         200,
         "a daemon-down console must still serve its own assets"
     );
@@ -605,7 +493,7 @@ fn a_websocket_upgrade_is_refused_before_the_101_when_the_daemon_is_down() {
     // And the refusal is about the daemon, not a blanket rejection of the route: an
     // upgrade that is not one still gets its own answer.
     assert_eq!(
-        status(web.port, "/ws", &[("Cookie", cookie.as_str())]),
+        status(web.port(), "/ws", &[("Cookie", cookie.as_str())]),
         400,
         "a GET /ws without the RFC 6455 headers is a bad request, not a daemon report"
     );
@@ -653,12 +541,13 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// was full when the authenticated probes ran.
 #[test]
 fn a_pre_authentication_flood_cannot_deny_an_authenticated_client_a_new_connection() {
-    let daemon = OwnedDaemon::start();
-    let web = WebServer::spawn(TOKEN_A, &daemon.run.socket(), daemon.run.path());
-    let cookie = bootstrap_cookie(web.port, TOKEN_A);
+    let run = TempRun::new();
+    let _daemon = RawDaemon::start(&run);
+    let web = WebServer::start("127.0.0.1:0", TOKEN_A, &run.socket(), run.path(), &[]);
+    let cookie = bootstrap_cookie(web.port(), TOKEN_A);
 
     // An authenticated session, established and proven live before the flood starts.
-    let mut ws = Ws::connect(web.port, &cookie);
+    let mut ws = Ws::connect(web.port(), &cookie);
     assert!(
         info_round_trips(&mut ws, 11),
         "the bridge must answer before the flood, or nothing after it means anything"
@@ -670,7 +559,7 @@ fn a_pre_authentication_flood_cannot_deny_an_authenticated_client_a_new_connecti
     let started = Instant::now();
     let mut silent: Vec<TcpStream> = Vec::with_capacity(FLOOD);
     for i in 0..FLOOD {
-        let s = TcpStream::connect(("127.0.0.1", web.port))
+        let s = TcpStream::connect(("127.0.0.1", web.port()))
             .unwrap_or_else(|e| panic!("connect silent peer {i}: {e}"));
         s.set_read_timeout(Some(Duration::from_millis(20))).ok();
         silent.push(s);
@@ -680,7 +569,7 @@ fn a_pre_authentication_flood_cannot_deny_an_authenticated_client_a_new_connecti
     // Repeated, so a single lucky accept cannot carry the assertion. Under the defect
     // every one of these was a connection reset before a byte of the head was read.
     for attempt in 0..5 {
-        let code = http_head(web.port, "/app.js", &[("Cookie", cookie.as_str())]).map(|(c, _)| c);
+        let code = http_head(web.port(), "/app.js", &[("Cookie", cookie.as_str())]).map(|(c, _)| c);
         assert_eq!(
             code,
             Some(200),
@@ -693,7 +582,7 @@ fn a_pre_authentication_flood_cannot_deny_an_authenticated_client_a_new_connecti
     }
     // …including a new WebSocket, which is the connection a reload actually depends on
     // (`app.js` has no reconnect, so a dropped bridge means reloading the page).
-    let mut fresh = Ws::connect(web.port, &cookie);
+    let mut fresh = Ws::connect(web.port(), &cookie);
     assert!(
         info_round_trips(&mut fresh, 13),
         "a NEW bridge opened during the flood must work, not just an old one"

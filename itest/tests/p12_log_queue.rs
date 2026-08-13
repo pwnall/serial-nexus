@@ -58,12 +58,12 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
 use serial_nexus_itest::{
-    Daemon, Rpc, Sim, TempRun, bin, daemon_answers, file_len, serial_echo, wait_until,
+    Daemon, KillOnDrop, Rpc, Sim, TempRun, bin, daemon_answers, file_len, serial_echo, wait_until,
 };
 
 /// One 8 KiB echo round-trip through the console pty: client → console → serial →
@@ -338,16 +338,9 @@ b = "cap"
     );
 }
 
-/// A hand-managed `serial-nexus-daemon`, SIGKILLed and reaped on drop. `Daemon` cannot be used
-/// here: this test must wrap the binary in a shell that lowers `RLIMIT_NPROC` first, and
-/// `Daemon::start_with_args` (rightly) owns the command line.
-struct KillOnDrop(Child);
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+// The daemon here is a hand-managed child under the shared [`KillOnDrop`] guard, not a
+// `Daemon` and not a `RawDaemon`: this test must wrap the binary in a shell that lowers
+// `RLIMIT_NPROC` first, and both of those (rightly) own the command line.
 
 /// CONC-3, end to end: a daemon that **cannot spawn** the log's writer thread still comes
 /// up, and reports the refusal as that node's state (§15.8 — environmental failure changes

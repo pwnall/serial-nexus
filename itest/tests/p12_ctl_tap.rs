@@ -52,8 +52,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use serial_nexus_itest::{
-    Daemon, Rpc, Sim, TempRun, bin, daemon_answers, seeded_bytes, serial_echo, sha256_hex,
-    wait_until,
+    Daemon, RawDaemon, Rpc, Sim, TempRun, bin, seeded_bytes, serial_echo, sha256_hex, wait_until,
 };
 
 /// How long a `tap.closed` may take to reach the child and end it. Generous: the
@@ -208,23 +207,6 @@ fn ctl_tap_exits_on_tap_closed_rather_than_blocking_forever() {
     );
 }
 
-/// A daemon on `run`'s fixed socket and state file, hand-managed because this test
-/// must **kill** it mid-stream. `Daemon` reaps its child only on drop, and dropping it
-/// would take the CLI's socket away with the wrong ceremony (a graceful `shutdown`
-/// first), which is the path the sibling tests already cover.
-fn spawn_daemon(run: &TempRun) -> Child {
-    Command::new(bin("serial-nexus-daemon"))
-        .arg("--socket")
-        .arg(run.socket())
-        .arg("--state-file")
-        .arg(run.state_file())
-        .env("XDG_RUNTIME_DIR", run.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serial-nexus-daemon")
-}
-
 /// 37-TOOL-1 — a clean connection EOF short of the `--bytes` budget is a **short read**,
 /// and must exit non-zero like the `tap.closed` route it is indistinguishable from.
 ///
@@ -246,14 +228,12 @@ fn spawn_daemon(run: &TempRun) -> Child {
 #[test]
 fn ctl_tap_exits_nonzero_when_the_connection_dies_short_of_its_bytes_budget() {
     let run = TempRun::new();
-    let mut daemon = spawn_daemon(&run);
+    // A [`RawDaemon`] rather than the harness `Daemon`, because this test must **kill**
+    // the daemon mid-stream: `Daemon` reaps only on drop, and dropping it would take the
+    // CLI's socket away with the wrong ceremony (a graceful `shutdown` first), which is
+    // the path the sibling tests already cover.
+    let mut daemon = RawDaemon::start(&run);
     let sock = run.socket();
-    assert!(
-        wait_until(Duration::from_secs(10), || sock.exists()
-            && daemon_answers(&sock)),
-        "daemon never answered `info` on {}",
-        sock.display()
-    );
     let rpc = Rpc::new(&sock);
     rpc.load_toml(&absent_cfg(&run), false).expect("load graph");
 
@@ -269,8 +249,8 @@ fn ctl_tap_exits_nonzero_when_the_connection_dies_short_of_its_bytes_budget() {
 
     // The crash. Reaped here so the socket's peer is provably gone before the wait
     // below, rather than at some later drop.
-    daemon.kill().expect("kill the daemon");
-    daemon.wait().expect("reap the daemon");
+    daemon.child().kill().expect("kill the daemon");
+    daemon.child().wait().expect("reap the daemon");
 
     let capped_status = wait_exit(&mut capped, EXIT_BOUND);
     let unbounded_status = wait_exit(&mut unbounded, EXIT_BOUND);
@@ -424,5 +404,140 @@ hostward_buffer = 8192
     assert!(
         !notices.contains("tap gap"),
         "a lossless capture raised a discontinuity notice: {notices:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 37-TOOL-2, the **tap** half (plan §18 item 59(a)).
+// ---------------------------------------------------------------------------
+
+/// **A refused `tap.open` must exit, naming the code** — the rule `read_ack` owns for
+/// both streaming verbs, guarded on the tap side for the first time.
+///
+/// The sibling guard in `p12_ctl_subscribe.rs` has pinned the `subscribe` side since
+/// 37-TOOL-2. The tap side had nothing, and that is **measured rather than inferred**:
+/// planting the ack-swallow into `tap_stream` alone reddened nothing across
+/// `p12_ctl_tap`, `p12_ctl_subscribe`, `p12_tap_replay` and `p8_replay_ring` — eleven
+/// tests, all green (plan §18 item 55's own execution). The shared helper defends the
+/// *class*, but a tap-specific refusal — an unknown or non-host-facing endpoint, §10 —
+/// was asserted by nothing at all, so a `tap_stream` that stopped reading its ack would
+/// ship with the suite green.
+///
+/// The stand-in is `p12_ctl_subscribe.rs`'s, re-pointed: twenty lines of Unix socket
+/// that answer the one request with a JSON-RPC error and then hold the connection open,
+/// writing nothing — which is exactly what the real control plane does with a tap
+/// connection, and what turns a swallowed ack into a hang rather than an EOF. No
+/// daemon, no timing, and no way to arrange it with a shipped one, since the shipped
+/// daemon implements `tap.open`.
+///
+/// The refusal is spelled as a *version skew* (`-32601 method not found`) rather than
+/// as an endpoint error for the same reason the subscribe guard is: it is the case the
+/// real daemon cannot produce, and it is the one §15.16's graceful-degradation boundary
+/// makes reachable in the field. The endpoint-error arm rides the real daemon in
+/// [`ctl_tap_exits_naming_the_code_when_the_daemon_refuses_the_endpoint`] below.
+///
+/// Fail-first (2026-08-12): with `read_ack`'s call swallowed in `tap_stream` — the
+/// `let ack = read_ack(..)?` replaced by an unexamined read — this fails with
+/// "`serial-nexus-ctl tap` never exited against a daemon that refused the open".
+#[test]
+fn ctl_tap_exits_naming_the_code_when_the_daemon_refuses_the_open() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+
+    let run = TempRun::new();
+    let sock = run.join("skew.sock");
+
+    let listener = UnixListener::bind(&sock).expect("bind the stand-in socket");
+    let held = std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut writer = stream.try_clone().expect("clone the stand-in connection");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            return;
+        }
+        let id = serde_json::from_str::<serde_json::Value>(line.trim())
+            .ok()
+            .and_then(|v| v.get("id").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        let refusal = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":\
+             {{\"code\":-32601,\"message\":\"method not found: tap.open\"}}}}\n"
+        );
+        let _ = writer.write_all(refusal.as_bytes());
+        let _ = writer.flush();
+        // Hold the connection open exactly as the daemon would for a live tap. The CLI
+        // must not be waiting on it; if it is, `wait_exit` below kills it and this fails.
+        let mut sink = String::new();
+        let _ = reader.read_line(&mut sink);
+    });
+
+    let (out, err) = (run.join("skew.bin"), run.join("skew.err"));
+    let mut child = spawn_ctl_tap(&sock, &["usb0"], &out, &err);
+    let status = wait_exit(&mut child, EXIT_BOUND);
+    assert!(
+        status.is_some(),
+        "`serial-nexus-ctl tap` never exited against a daemon that refused the open — \
+         it is still blocked in read_line on a connection that will never carry another \
+         byte (37-TOOL-2, the tap half)"
+    );
+    assert!(
+        !status.expect("exited").success(),
+        "a refused `tap.open` exited 0: a script cannot tell it from an empty capture"
+    );
+
+    let diagnosis =
+        String::from_utf8(std::fs::read(&err).expect("read diagnosis")).expect("stderr is utf-8");
+    assert!(
+        diagnosis.contains("-32601"),
+        "the refusal does not name the code the daemon returned: {diagnosis:?}"
+    );
+    assert_eq!(
+        std::fs::read(&out).expect("read capture").len(),
+        0,
+        "a refused tap wrote bytes to the capture stream"
+    );
+
+    // Let the stand-in's connection go with the CLI's exit.
+    drop(held);
+}
+
+/// The arm the **shipped daemon** can produce: `tap.open` on an endpoint that does not
+/// exist is refused, and the CLI exits naming it rather than hanging or exiting 0.
+///
+/// This is §10's tap-specific refusal — "unknown or non-host-facing endpoint" — which
+/// the class-level helper cannot stand in for, because the class-level helper never
+/// learns which verb it is refusing. It needs a daemon but no graph and no device, so
+/// it runs on every platform.
+#[test]
+fn ctl_tap_exits_naming_the_code_when_the_daemon_refuses_the_endpoint() {
+    let d = Daemon::start();
+    let run = d.run();
+    let (out, err) = (run.join("absent.bin"), run.join("absent.err"));
+    let mut child = spawn_ctl_tap(&d.socket(), &["no-such-endpoint"], &out, &err);
+
+    let status = wait_exit(&mut child, EXIT_BOUND);
+    assert!(
+        status.is_some(),
+        "`serial-nexus-ctl tap no-such-endpoint` never exited: the refusal in its ack \
+         was not read"
+    );
+    assert!(
+        !status.expect("exited").success(),
+        "a tap of an endpoint that does not exist exited 0"
+    );
+
+    let diagnosis =
+        String::from_utf8(std::fs::read(&err).expect("read diagnosis")).expect("stderr is utf-8");
+    assert!(
+        diagnosis.contains("tap.open") && diagnosis.contains("no-such-endpoint"),
+        "the refusal names neither the verb nor the endpoint it refused: {diagnosis:?}"
+    );
+    assert_eq!(
+        std::fs::read(&out).expect("read capture").len(),
+        0,
+        "a refused tap wrote bytes to the capture stream"
     );
 }

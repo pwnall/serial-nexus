@@ -1027,10 +1027,20 @@ cargo test -p serial-nexus-itest --test serial_hardware -- --nocapture   # runs 
 **CI gate.** The Linux lane runs `serial-nexus-doctor --json | jq -e -f
 expectations/linux.jq`. The macOS lane runs, and gates on, the
 `expectations/macos.jq` counterpart — the *looser* profile this page describes, and
-looser clause by clause rather than wholesale, because "nothing may report
-`unsupported`" stopped being the right shape once the probe set grew past P5. What
-it requires today: a well-formed report carrying all **thirteen** probes, each with a
-status; P2, P6 and P7 — the POSIX pty mechanisms — not `unsupported` (either verdict
+looser clause by clause rather than wholesale. **The sentence that stood here until
+2026-08-13 was wrong, and it had become a rationale for a hole:** it said "nothing may
+report `unsupported`" had "stopped being the right shape once the probe set grew past
+P5". What actually happened is that the summary clause enforcing it was never written
+into this file at all — `expectations/linux.jq` carries `(.summary.unsupported == 0)`
+and this one carried a bare `(.summary != null)`, while its own head comment claimed,
+in text copied from its Linux sibling, that unsupported stayed a gate failure through
+the summary clause. Six probes' clauses were bare presence checks with no status
+constraint, so an `unsupported` verdict on any of them passed the file. Measured on a
+Darwin-shaped report and repaired the same day (plan §18 item 60's class; notes §3.89):
+the clause is now the leading one, and per-probe looseness means a probe may be
+`supported`, `degraded` or `skipped` — **never `unsupported`**, which is the same
+stop condition Linux has. What it requires today: a well-formed report carrying every
+probe in the roster, each with a status; P2, P6 and P7 — the POSIX pty mechanisms — not `unsupported` (either verdict
 word is fine, and `degraded` is the *expected* macOS answer for P2, §7.2's BSD arm);
 P8 `supported` **or** `skipped`, because `epoll(7)` does not exist here, so it is
 unmeasurable rather than broken, and the data plane is forbidden from using epoll
@@ -1042,8 +1052,11 @@ the retained packet, so `skipped` is the expected Linux answer and would be a re
 failure on a Mac; **P13 `supported` or `degraded`**, presence-and-status only and
 deliberately never a required policy word — pinning `waits-then-discards` would make
 a kernel that changed its mind fail the lane instead of reporting the change, which
-is the opposite of what a kernel-diff probe is for; and P1, P3, P4, P5 and P11 *any* status,
-EXTPROC being unverified and the by-id and driver-counter mechanisms Linux-only. The
+is the opposite of what a kernel-diff probe is for; and P1, P3, P4, P5, P11 and P15
+any status **except `unsupported`** — EXTPROC being unverified and the by-id and
+driver-counter mechanisms Linux-only, none of which is a reason to admit the one word
+that means "this build cannot answer". *(This clause read "*any* status" until
+2026-08-13, which is what the missing summary clause made true in practice.)* The
 `linux.jq` gate is the template it is modeled on, and the deltas this one tolerates
 are the ones this page enumerates.
 

@@ -32,50 +32,11 @@
 //! * Needs a software serial device (a sim pts), so the test is Linux-only and
 //!   SKIPs on macOS (`serial_echo()` -> `None`), per the harness serial doctrine.
 
-use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use serial_nexus_itest::{Rpc, Sim, TempRun, bin, serial_echo, wait_until};
-
-/// A daemon child SIGKILLed and reaped on drop, so a panicking test never leaks a
-/// daemon (mirrors `p3_log.rs`). Hand-managed because this test needs `--dev-root`,
-/// which `Daemon::start` does not thread through.
-struct KillOnDrop(Child);
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Spawn `serial-nexus-daemon` on `run`'s socket + state file, rooted at `dev_root` for
-/// device-identity resolution (§12 fixture seam). The empty graph is populated by
-/// RPC below.
-fn spawn_daemon(run: &TempRun, dev_root: &Path) -> Child {
-    Command::new(bin("serial-nexus-daemon"))
-        .arg("--socket")
-        .arg(run.socket())
-        .arg("--state-file")
-        .arg(run.state_file())
-        .arg("--dev-root")
-        .arg(dev_root)
-        .env("XDG_RUNTIME_DIR", run.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serial-nexus-daemon")
-}
-
-/// Wait until a daemon is actually listening on `sock` (bounded poll, no bare
-/// sleep, §5) — the restart-safe replacement for `test -S`.
-fn wait_socket(sock: &Path) -> bool {
-    wait_until(Duration::from_secs(10), || {
-        UnixStream::connect(sock).is_ok()
-    })
-}
+use serial_nexus_itest::{RawDaemon, Rpc, Sim, TempRun, serial_echo, wait_until};
 
 /// Build the fixture for one USB tty interface: the sysfs `idVendor`/`serial`/…
 /// tree, the class/tty `device` link, and the `by-id` entry (§12). Faithful to
@@ -165,11 +126,9 @@ fn unplug_faults_serial_and_leaves_pty_client_attached() {
     std::fs::create_dir_all(dev_node.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&device, &dev_node).unwrap();
 
-    let _daemon = KillOnDrop(spawn_daemon(&run, &root));
-    assert!(
-        wait_socket(&run.socket()),
-        "daemon control socket never appeared"
-    );
+    let _daemon = RawDaemon::builder(&run)
+        .args(&["--dev-root", &root.to_string_lossy()])
+        .start();
     let rpc = Rpc::new(run.socket());
 
     let con = run.join("con");
@@ -222,8 +181,9 @@ b = "con"
             &con_str,
             "--set-baud",
             "115200",
-            "--hold-ms",
-            "60000",
+            // Caller-owned hold (plan §18 item 25): the client holds the slave for as
+            // long as this test does, not for a timer's worth.
+            "--hold-stdin-eof",
         ],
         None,
     );

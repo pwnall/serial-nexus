@@ -38,13 +38,12 @@
 //! where that is unavailable (macOS: a pty cannot be a `serial2` device — `ENOTTY`).
 
 use std::io::Read;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use serial_nexus_itest::{Rpc, Sim, TempRun, bin, serial_echo, wait_until};
+use serial_nexus_itest::{KillOnDrop, RawDaemon, Rpc, Sim, TempRun, bin, serial_echo, wait_until};
 
 const USBDIR: &str = "1-1";
 const DEVNAME: &str = "ttyUSB0";
@@ -59,41 +58,6 @@ const OURS_BYID: &str = "usb-FTDI_OURS-if00";
 /// `/dev` name. Its identity (`usb:0403:6001:SQUATTER:00`) never matches ours.
 const SQUATTER_SERIAL: &str = "SQUATTER";
 const SQUATTER_BYID: &str = "usb-FTDI_SQUATTER-if00";
-
-/// A child SIGKILLed and reaped on drop, so a panicking test never leaks it.
-struct KillOnDrop(Child);
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Spawn `serial-nexus-daemon` on `run`'s socket + state file, rooted at the fixture
-/// `dev_root` (§12: `sys_root` is `<dev-root>/sys`) — the seam that lets the resolver
-/// walk fixture by-id/sysfs trees unprivileged. `Daemon::start` cannot pass
-/// `--dev-root`, so the daemon is hand-managed (mirrors `p7_unplug`/`p7_replug`).
-fn spawn_daemon(run: &TempRun, dev_root: &Path) -> Child {
-    Command::new(bin("serial-nexus-daemon"))
-        .arg("--socket")
-        .arg(run.socket())
-        .arg("--state-file")
-        .arg(run.state_file())
-        .arg("--dev-root")
-        .arg(dev_root)
-        .env("XDG_RUNTIME_DIR", run.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serial-nexus-daemon")
-}
-
-/// Wait until a daemon is actually accepting on `sock` (bounded poll, no bare sleep).
-fn wait_socket(sock: &Path) -> bool {
-    wait_until(Duration::from_secs(10), || {
-        UnixStream::connect(sock).is_ok()
-    })
-}
 
 /// Build the fixture for one USB tty interface: the sysfs `idVendor`/`serial`/… tree,
 /// the class/tty `device` link, and the `by-id` entry (§12). Faithful to
@@ -202,11 +166,9 @@ fn squatter_on_same_dev_path_is_refused_and_receives_nothing() {
     make_usb_iface(&root, USBDIR, OURS_SERIAL, DEVNAME, IFACE, OURS_BYID);
     let ours = spawn_ours_device(&dev_node);
 
-    let _daemon = KillOnDrop(spawn_daemon(&run, &root));
-    assert!(
-        wait_socket(&run.socket()),
-        "daemon control socket never appeared"
-    );
+    let _daemon = RawDaemon::builder(&run)
+        .args(&["--dev-root", &root.to_string_lossy()])
+        .start();
     let rpc = Rpc::new(run.socket());
 
     let cfg = format!(

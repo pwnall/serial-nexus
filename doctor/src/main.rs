@@ -242,6 +242,16 @@ fn main() {
     probe_list.push(probes::p9_poll_granularity());
     probe_list.push(probes::p10_pty_buffer_depth());
 
+    // P16 — can a held pts slave fd tell that its master has gone (§15.59)? Passive
+    // like P1/P2/P6..P13: it opens a pty and no device.
+    //
+    // **Placed after P8/P9/P10 on purpose.** Its quiet arm spends 64 × 5 ms parked
+    // in `poll(2)`, which is the very syscall P9 is timing the granularity of, and a
+    // probe that warmed or perturbed that measurement would move a figure the tuning
+    // constants are read against — for no reason, since nothing here depends on
+    // running earlier. Before P11 because it is passive and those are opt-in.
+    probe_list.push(probes::p16_slave_witness_liveness());
+
     // P11 — real-port line-state ioctls. Opt-in behind --port exactly like P3/P5:
     // it opens a real device (which toggles DTR), though it transmits nothing and
     // leaves the port's settings untouched. `p11_line_state` reports the skip

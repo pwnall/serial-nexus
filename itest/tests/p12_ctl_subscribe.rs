@@ -34,7 +34,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use serial_nexus_itest::{Daemon, TempRun, bin};
+use serial_nexus_itest::{Daemon, KillOnDrop, TempRun, bin};
 
 /// How long a refusal may take to reach the child and end it. Generous: the failure
 /// this guards is *unbounded*, so a slow runner cannot make it a false pass.
@@ -76,15 +76,6 @@ fn spawn_ctl_subscribe(socket: &Path, args: &[&str], out: &Path, err: &Path) -> 
         .stderr(Stdio::from(stderr))
         .spawn()
         .expect("spawn serial-nexus-ctl subscribe")
-}
-
-/// A child SIGKILLed and reaped on drop, so a panicking test never leaks one.
-struct KillOnDrop(Child);
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 /// 37-TOOL-2 — a refused `subscribe` must exit, naming the code.

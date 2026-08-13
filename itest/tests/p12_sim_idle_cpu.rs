@@ -52,14 +52,14 @@ use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::sync::mpsc;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
-use serial_nexus_itest::{TempRun, bin, cpu_ticks, wait_until};
+use serial_nexus_itest::{Sim, TempRun, bin, cpu_ticks, wait_until};
 
 /// The measurement window, and the ceiling on what a *paused* double may burn
 /// inside it.
@@ -82,30 +82,18 @@ const MAX_TICKS: u64 = 30;
 #[cfg(target_os = "linux")]
 const DOUBLE_TIMEOUT_MS: &str = "60000";
 
-/// A `serial-nexus-sim` child SIGKILLed and reaped on drop, so a panicking test never leaks
-/// one. Hand-managed rather than `Sim` because this test needs the double's **pid**
-/// to sample its CPU, which `Sim` does not expose.
+/// Spawn a `serial-nexus-sim` double with `args`, returning the killed-on-drop child and
+/// its pid. `Sim::pid` is what makes this the shared double rather than a local copy.
+///
+/// The double is **leashed** (§15.43), and that is not incidental to what this file
+/// measures: the leash's watch thread sits blocked in `read(2)` on stdin, so if it were
+/// ever rewritten as a poll loop these two idle-CPU budgets are what would redden —
+/// §15.31's no-busy-waiting rule, enforced on the leash as well as on the doubles.
 #[cfg(target_os = "linux")]
-struct KillOnDrop(Child);
-#[cfg(target_os = "linux")]
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Spawn `serial-nexus-sim` with `args`, returning the reaped-on-drop child and its pid.
-#[cfg(target_os = "linux")]
-fn spawn_double(args: &[&str]) -> (KillOnDrop, u32) {
-    let child = Command::new(bin("serial-nexus-sim"))
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serial-nexus-sim");
-    let pid = child.id();
-    (KillOnDrop(child), pid)
+fn spawn_double(args: &[&str]) -> (Sim, u32) {
+    let sim = Sim::spawn(args, None);
+    let pid = sim.pid();
+    (sim, pid)
 }
 
 /// Open a pts the way a client does (never adopting it as this process's

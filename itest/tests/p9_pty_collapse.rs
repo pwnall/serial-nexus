@@ -90,17 +90,13 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-#[cfg(target_os = "linux")]
-use serial_nexus_itest::daemon_answers;
 use serial_nexus_itest::{Daemon, Rpc, TempRun, wait_until};
 
 // The CPU sampler and its hand-managed daemon exist only where `/proc/<pid>/stat`
 // does; what only they need is gated with them so the file stays warning-clean on
 // the platforms where the second test is a skip.
 #[cfg(target_os = "linux")]
-use serial_nexus_itest::{bin, cpu_ticks};
-#[cfg(target_os = "linux")]
-use std::process::Child;
+use serial_nexus_itest::{RawDaemon, cpu_ticks};
 
 /// How many collapsed sessions one run drives. Each is an independent trial of a
 /// race the test wins with high probability (a ~50 µs client session against a
@@ -224,19 +220,6 @@ fn collapsed_client_sessions_still_release_the_write_lock() {
 // 2 — a bare hangup does not spin the runtime (the `saw_data` latch).
 // ============================================================================
 
-/// A daemon child SIGKILLed and reaped on drop, so a panicking test never leaks
-/// one. Hand-managed because this test needs the daemon's **pid** to sample its
-/// CPU, which `Daemon` does not expose.
-#[cfg(target_os = "linux")]
-struct KillOnDrop(Child);
-#[cfg(target_os = "linux")]
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 #[test]
 #[cfg(target_os = "linux")]
 fn a_bare_hangup_leaves_the_daemon_cpu_bounded() {
@@ -269,28 +252,14 @@ fn a_bare_hangup_leaves_the_daemon_cpu_bounded() {
 
     let run = TempRun::new();
     let console = run.join("console");
-    let child = Command::new(bin("serial-nexus-daemon"))
-        .arg("--socket")
-        .arg(run.socket())
-        .arg("--state-file")
-        .arg(run.state_file())
-        .env("XDG_RUNTIME_DIR", run.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serial-nexus-daemon");
-    let pid = child.id();
-    let d = KillOnDrop(child);
-    // Wait until the daemon *answers*, not merely until its socket inode appears
-    // (AGENTS.md §6, T7): under a full-suite run the inode can be visible before the
-    // daemon is serving, and the next RPC then fails with ENOENT out of nowhere.
-    assert!(
-        wait_until(Duration::from_secs(10), || {
-            run.socket().exists() && daemon_answers(&run.socket())
-        }),
-        "daemon never answered on its control socket"
-    );
-    let rpc = Rpc::new(run.socket());
+    // A [`RawDaemon`] rather than the harness `Daemon`, because this test needs the
+    // daemon's **pid** to sample its CPU. `RawDaemon::start` waits until the daemon
+    // *answers*, not merely until its socket inode appears (AGENTS.md §6, T7): under a
+    // full-suite run the inode can be visible before the daemon is serving, and the
+    // next RPC then fails with ENOENT out of nowhere.
+    let d = RawDaemon::start(&run);
+    let pid = d.pid();
+    let rpc = d.rpc();
     rpc.load_toml(&cfg(&run), false).expect("load graph");
     assert!(
         rpc.wait_status("console", "active", Duration::from_secs(10)),

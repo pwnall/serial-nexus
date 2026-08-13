@@ -61,14 +61,85 @@ is still the first lawful cross-kernel Linux comparison this repository has. But
 capture from a current binary joins them, and P1–P14 must not be diffed across the
 boundary without the mismatch stated (§15.44 — the unequal direction is a verdict, and
 here it is announcing a real instrument change). **The Linux half of the new era is
-committed** — the six `2b44c17` rows at the top of the index, passive and Tier-3 triples
+committed** — the six `2b44c17` rows, passive and Tier-3 triples
 from one clean build, with `jq -e` *executed* against both halves rather than inspected.
 The macOS half and a 6.18 capture are owed.
+*(Read "everything indexed below is a closed era" as **everything below the `2b44c17`
+rows**. The `e79f5fcd86a2e5f0` era ran until 2026-08-13 and took a second Linux
+binary before it closed — the `8c00078-dirty` triple — and the paragraphs below are
+its whole story: one `field_set`-only move inside it, then the `probe_set` move that
+closed it.)*
+
+**Two moves landed on 2026-08-13, and only the second one is an era boundary.**
+That distinction is the point of having two digests, so it is spelled out rather
+than left to the fingerprints.
+
+**Move one: `field_set` only, and the era did NOT move.** Plan §18 items 14 and 22
+each added observation **keys** to an existing probe — P15 gained a
+software-flow-control (`IXON`/`IXOFF`) block per port, P13 gained a fifth shape,
+`e_reader_arrives_during_close_wait` — and neither touched a `question` string. So
+`probe_set` stayed `e79f5fcd86a2e5f0` (era law clause 4: cells added under
+unchanged questions close nothing) while `field_set` moved: Tier-3
+`fc01990f2e38876e` → `c4ed6e7ef3f8088f`, passive `141e256d40c1e83e` →
+`544dca850580d430`. The `8c00078-dirty` triple is that move's artifact and it is an
+**era-mate** of the `2b44c17` rows: diff them on the intersection, which is every
+cell both carry.
+
+Two things about that move the digests cannot say:
+
+1. **Which cells appeared.** P13 gained one top-level key
+   (`e_reader_arrives_during_close_wait`) carrying seventeen leaves, of which
+   `bytes_recovered_by_arriving_reader` and the whole `reader_arrival` block are new
+   shapes of cell rather than new instances of an old one. The other four P13
+   shapes are **unchanged** — no `bytes_recovered_by_arriving_reader: 0` was stamped on
+   them, deliberately, because a structurally-zero cell on four shapes costs every
+   future intersection and buys nothing. P15 gained thirteen leaves per named
+   port, all under `software_flow_control`.
+2. **What the new cells do not license.** Both blocks say so in their own output —
+   `does_not_license` on P13's arrival row and on P15's software block — because
+   nothing in the gate set reads prose and a bound that lives only here is a bound
+   the next reader will not meet (§13's gate-blind-spot rule).
+
+**Move two: a new fingerprint era, `e79f5fcd86a2e5f0` → `4317ea5ac187f506`,
+carrying two changes deliberately folded into one boundary** (design §15.59).
+
+- **P16 is why it moved.** A new probe id is a new question and a new question is a
+  new instrument, so the digest moves and this era closes — the recorded kind of
+  move, not a drifted one. P16 asks whether a held pts **slave** fd can tell that
+  its master has gone: `poll(POLLHUP)` while the master is open, where it must stay
+  quiet, and again after it closes, where it must fire. Beside it, the `stat`
+  comparison `itest`'s `SlaveWitness::prove_open` performs, mirrored step for step,
+  so a report says what the *shipped* check would have done here rather than what
+  the probe thinks of it.
+- **P15's `question` widening rode with it, in the same commit.** The string now
+  names both flow-control kinds instead of `CRTSCTS` alone, and P15's verdict
+  degrades on a silently-dropped software request. That widening was **deliberately
+  held back** from move one: correcting a `question` moves `probe_set` (era law
+  clause 3), and spending a boundary on a *wording* change while P16's real
+  instrument change was already owed would have closed two eras where one would do.
+  Folding them cost the archive one boundary instead of two, and it is the whole
+  reason move one shipped with a header narrower than its body for one commit.
+  (What the daemon does is unchanged: no `xon-xoff` pre-check, no refusal at
+  `load` — plan §18 item 14's decline stands.)
+
+So a capture from `4317ea5ac187f506` and one from `e79f5fcd86a2e5f0` must not be
+diffed field by field without the mismatch stated, **including for P1–P14**, whose
+questions did not move: the unequal direction of `probe_set` is a verdict, and here
+it is announcing a real instrument change (§15.44).
 
 ## Index
 
 | File | Kernel / box | Binary | Probe set | Field set | Rig | Verdicts |
 |---|---|---|---|---|---|---|
+| [`linux-7.0-2026-08-13-8c00078-dirty-p16-tier3.json`](linux-7.0-2026-08-13-8c00078-dirty-p16-tier3.json) | 7.0.0-29-generic, Ubuntu 26.04 — the dev box, load 1.78 before, 1.26 after (20 cores). **The first artifact of the `4317ea5ac187f506` era**, opened by P16 (§15.59) with P15's `question` widening folded into the same boundary. **P16's Linux reading, and it is a two-instrument answer.** The held slave fd is quiet in all 200 back-to-back passes (93–107 µs) and all 64 paced passes (~328 ms) while the master is open, then `POLLHUP` arrives **1 µs** after it closes — `revents` `POLLERR|POLLHUP`, a following `read(2)` answering `eof` — identical in all three runs. So `poll_can_tell_a_live_pair_from_a_dead_one` is `true`, and each arm is the other's control: the quiet window is the negative arm the firing one needs, and vice versa. Beside it, `stat_comparison_can_tell` is **also** `true`: after the master's close `fstat_on_the_held_fd_answers: true` while `path_still_resolves: false`, which is the `/dev/pts/N` unlink notes §3.60 measured by hand, now in an artifact. **On this kernel the harness's shipped comparison is sound and P16 is a control proving it so.** The row this probe exists for is the one where those two booleans **disagree** — `poll` `true`, `stat` `false` — and that is Darwin's expected shape and is owed. Note the filename's `-p16` segment: this triple shares a UTC day *and* a `commit` with the era-closing triple below, and only the instrument differs, so neither existing convention could tell them apart (see the naming paragraph at the foot of this file) | `8c00078466c2-dirty` | **`4317ea5ac187f506`** | `c83ba6dd08faf8e3` | **Tier 3** — the cross-wired FT232R pair (`ABSCDGL6` ↔ `BH00L4KU`), **3-wire, measured**: P5's handshake block reads `3-wire: no handshake lines carried` on all eight crossings | 25 supported · 1 degraded · 0 unsupported · 1 skipped |
+| [`linux-7.0-2026-08-13-8c00078-dirty-p16-tier3-2.json`](linux-7.0-2026-08-13-8c00078-dirty-p16-tier3-2.json) | ” — second sequential run, same box | ” | ” | ” | ” | ” |
+| [`linux-7.0-2026-08-13-8c00078-dirty-p16-tier3-3.json`](linux-7.0-2026-08-13-8c00078-dirty-p16-tier3-3.json) | ” — third sequential run. All three share a `field set`, and P16's reading is identical across them down to the microsecond (plan §3 rule 14: three runs, because the quantity varies) | ” | ” | ” | ” | ” |
+| [`linux-7.0-2026-08-13-8c00078-dirty-p16-passive-1.json`](linux-7.0-2026-08-13-8c00078-dirty-p16-passive-1.json) | ” — **the passive half of the same binary**, so this era has both halves from one build at its opening and `jq -e` was *executed* against both rather than inspected. Fourth committed instance of the §5 folding declination: same `probe set` as the Tier-3 rows, different `field set`, one binary. P16 runs identically here — it needs no `--port`, which is the point of putting a pty question in a pty probe | `8c00078466c2-dirty` | **`4317ea5ac187f506`** | `49da8ea5ad078d90` | none (passive; the adapters are attached but unnamed, so P3/P5/P11/P14/P15 skip) | 19 supported · 1 degraded · 0 unsupported · 6 skipped |
+| [`linux-7.0-2026-08-13-8c00078-dirty-p16-passive-2.json`](linux-7.0-2026-08-13-8c00078-dirty-p16-passive-2.json) | ” — second sequential run | ” | ” | ” | ” | ” |
+| [`linux-7.0-2026-08-13-8c00078-dirty-p16-passive-3.json`](linux-7.0-2026-08-13-8c00078-dirty-p16-passive-3.json) | ” — third sequential run | ” | ” | ” | ” | ” |
+| [`linux-7.0-2026-08-13-8c00078-dirty-tier3.json`](linux-7.0-2026-08-13-8c00078-dirty-tier3.json) | 7.0.0-29-generic, Ubuntu 26.04 — the dev box, load 1.21 before, 1.96 after (20 cores). **The first artifact carrying plan §18 items 14 and 22, and the last of the `e79f5fcd86a2e5f0` era** — an era-mate of the `2b44c17` rows rather than an era-opener: same `probe_set`, moved `field_set`, for the reasons in the paragraph above. The era closed hours later with P16 (§15.59); the `-p16` rows at the top of this index are the other side of that boundary, and this triple must not be diffed against them field by field without the mismatch stated. **Read three things off it.** (a) **P13's fifth shape**, `e_reader_arrives_during_close_wait` — a reader that arrives *while the kernel is inside its close-wait*, which is the shape notes §3.29's unexplained macOS red inhabits and which the four committed shapes structurally cannot produce. Here it is a **control proving itself inert**, in P12's sense: this kernel `retains`, so an arriving reader changes no byte count, and what the row shows is that the instrument works — the reader wins the race 3 of 3 across this triple, first `read(2)` at 0–1 µs against a close returning in 3–7 µs, 64 of 64 recovered, terminal `EIO`. On Darwin, where the close parks for ~600 ms, the same row is the measurement: whether the arrival ends the wait with the bytes, or whether the close still pays its full timeout — which is the difference between "a lost microsecond race" and "a reader stalled for 601 ms". **That capture is owed.** (b) **P15's software half**: `ftdi_sio` **honours** `IXON`/`IXOFF` on both ports, `c_iflag` `0x5` → `0x1405`, a delta of exactly the two flags, `serial2_readback_would_fault: false`, `baseline_restored: true`. That is the first artifact on any kernel to answer the question plan §18 item 14 filed as *unmeasured, not known-good* — and it answers it for one driver on one kernel, which is why the item's decline (no `load`-time refusal without a dropping driver) is unchanged by it. (c) **The `commit` stamp reads `-dirty` and the filename says so.** Three sessions were editing this tree concurrently, so `doctor/build.rs` could not stamp a clean sha and the same-binary claim (§15.44 rung 2) is **not** available for this row. What *is* available and was checked: `git diff a2054a9 8c00078 -- doctor/ core/ sys/ rpc/ codec-api/ Cargo.lock` is **empty**, so the only source difference between this capture and the pre-change capture it is diffed against is the change itself — the same-source rung, scoped to the one pair it was taken for. The `group:dialout` environment check reads `degraded` (this box reaches the adapters through an ACL rather than through group membership), which is why the totals below carry a degraded where the `2b44c17` rows do not | `8c00078466c2-dirty` | **`e79f5fcd86a2e5f0`** | `c4ed6e7ef3f8088f` | **Tier 3** — the cross-wired FT232R pair (`ABSCDGL6` ↔ `BH00L4KU`), **3-wire, measured**: P5's handshake block reads `3-wire: no handshake lines carried` on all eight crossings. A different pair from the 5-wire `BH00LL8O` ↔ `BH00L4KU` rig every row below was taken on — read P5's own handshake line, never this column's memory | 24 supported · 1 degraded · 0 unsupported · 1 skipped |
+| [`linux-7.0-2026-08-13-8c00078-dirty-tier3-2.json`](linux-7.0-2026-08-13-8c00078-dirty-tier3-2.json) | ” — second sequential run, same box | ” | ” | ” | ” | ” |
+| [`linux-7.0-2026-08-13-8c00078-dirty-tier3-3.json`](linux-7.0-2026-08-13-8c00078-dirty-tier3-3.json) | ” — third sequential run. All three share a `field set`, and the arriving-reader row reads the same way in all three (plan §3 rule 14: three runs, because the quantity varies). **The passive half of this binary was never taken and now cannot be** — the era closed with P16 before it was, so this triple's counterpart is the `-p16` passive triple at the top of the index, on the other side of a `probe_set` boundary. Recorded rather than quietly dropped: it is the cost of taking a rig capture and an instrument change in one session, and the next such move should take both halves before the boundary | ” | ” | ” | ” | ” |
 | [`linux-7.0-2026-08-07-2b44c17-tier3.json`](linux-7.0-2026-08-07-2b44c17-tier3.json) | 7.0.0-29-generic, Ubuntu 26.04 — the dev box, load 0.20–0.27. **The first artifact of the `e79f5fcd86a2e5f0` era**, and the capture the era boundary above owes. The era opened because P15's `question` cited §15.51, P14's section, against design §15.53 which is P15's own entry (notes §3.73). **Three things here are new cells rather than new numbers.** P9 publishes its within-group order control for the first time — `order_control_says: excludes-warmup-above-tolerance` with both groups `flat` and the fitted `order_control_tolerance_x100: 150` beside them, so the threshold can be re-derived rather than re-argued (notes §3.74); read `flat` as "nothing exceeded the resolution", **not** as a strong pass, since no committed Linux group has ever discriminated. P5's handshake carries **eight** crossings against the previous six — `dtr_b_to_dcd_a` and `dtr_b_to_ri_a` were asserted by the verdict and never measured — and the pre-registered reading held exactly, both `false`, verdict unchanged. And **no probe carries a duplicate observation key**, which every artifact below this row does for P14 (27 observations, 24 distinct): `Probe::observe` replaces in place now, so `max_reliable_baud` appears once, with its measured value, in the placeholder's position | `2b44c1700d17` | **`e79f5fcd86a2e5f0`** | `5d99bdc231f8376d` | **Tier 3** — the cross-wired FT232R pair (`BH00LL8O` ↔ `BH00L4KU`), 5-wire, RTS/CTS both ways, both ports named | 25 supported · 0 degraded · 0 unsupported · 1 skipped |
 | [`linux-7.0-2026-08-07-2b44c17-tier3-2.json`](linux-7.0-2026-08-07-2b44c17-tier3-2.json) | ” — second sequential run, same box | ” | ” | ” | ” | ” |
 | [`linux-7.0-2026-08-07-2b44c17-tier3-3.json`](linux-7.0-2026-08-07-2b44c17-tier3-3.json) | ” — third sequential run. All three share a `field set`, and P9's order-control reading is identical across them | ” | ” | ” | ” | ” |
@@ -141,7 +212,17 @@ beside `macos-24.6.0-2026-08-05-tier3` — and the trailing `-2`/`-3` index is r
 for sequential runs of *one* binary in one session. The two conventions have to be
 kept apart because they mean opposite things: `-2` asserts "same instrument, run
 again, so a difference is noise", and that is exactly the claim a same-day capture
-from a *different* binary must not make. The 08-05 macOS pair is the case that forced
+from a *different* binary must not make.
+
+**A third segment joined them on 2026-08-13, for a case neither covers.** The
+`-p16` rows share a UTC day *and* a `commit` with the era-closing triple below
+them — the tree was uncommitted through both captures, so `doctor/build.rs` stamped
+the same `<sha>-dirty` on each — and what separates them is the **instrument**:
+`e79f5fcd86a2e5f0` against `4317ea5ac187f506`. The sha segment cannot say that
+(it is identical), and `-2`/`-3` would say the opposite of the truth. So a capture
+taken across a `probe_set` boundary from an indistinguishable build carries a short
+name for the move that opened the era. Prefer a clean commit and let the sha do this
+work; the segment exists because a dirty tree cannot. The 08-05 macOS pair is the case that forced
 the rule — same box, same rig, same kernel, same `probe_set` fingerprint, and a P10
 whose body changed between them, which is precisely the difference a fingerprint
 cannot see. **One triple in this directory predates the rule and does not follow it**:

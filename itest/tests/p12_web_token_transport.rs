@@ -35,90 +35,16 @@
 //! `p12_web_session.rs` keeps its own: what each asserts needs a different slice of
 //! the response.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serial_nexus_itest::{Daemon, bin, wait_until};
+use serial_nexus_itest::{Daemon, WebServer};
 
 /// The fixed per-session token, so "this exact string leaked" is a byte-level fact.
 const TOKEN: &str = "webs1token0123456789abcdef";
 
 // ---------------------------------------------------------------- child process ----
-
-/// A `serial-nexus-web` child whose printed bootstrap URL is scanned for the OS-chosen
-/// port. Killed on drop.
-struct WebServer {
-    child: Child,
-    port: u16,
-}
-
-impl WebServer {
-    fn spawn(token: &str, socket: &Path, xdg: &Path) -> WebServer {
-        let socket_str = socket.to_string_lossy().into_owned();
-        let mut child = Command::new(bin("serial-nexus-web"))
-            .args([
-                "--bind",
-                "127.0.0.1:0",
-                "--token",
-                token,
-                "--socket",
-                &socket_str,
-            ])
-            .env("XDG_RUNTIME_DIR", xdg)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn serial-nexus-web");
-        // Drained for the child's whole life: the tracing subscriber writes to stdout
-        // too, and a pipe whose read end we dropped would take the server down on its
-        // next log line.
-        let stdout = child.stdout.take().expect("piped serial-nexus-web stdout");
-        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = lines.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(l) => sink.lock().unwrap().push(l),
-                    Err(_) => break,
-                }
-            }
-        });
-        let mut port = None;
-        let found = wait_until(Duration::from_secs(10), || {
-            for l in lines.lock().unwrap().iter() {
-                if let Some(rest) = l.split("http://").nth(1)
-                    && let Some(authority) = rest.split('/').next()
-                    && let Some((_, p)) = authority.rsplit_once(':')
-                    && let Ok(n) = p.trim().parse::<u16>()
-                {
-                    port = Some(n);
-                    return true;
-                }
-            }
-            false
-        });
-        assert!(
-            found,
-            "serial-nexus-web never printed its bound http URL; saw {:?}",
-            lines.lock().unwrap()
-        );
-        WebServer {
-            child,
-            port: port.expect("a port once the URL line was found"),
-        }
-    }
-}
-
-impl Drop for WebServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 // ------------------------------------------------------------------ HTTP helpers ----
 
@@ -290,8 +216,8 @@ fn replayed_to(jar: &[StoredCookie], request_path: &str) -> Vec<String> {
 #[test]
 fn the_session_token_is_not_replayed_to_paths_outside_the_websocket_upgrade() {
     let d = Daemon::start();
-    let web = WebServer::spawn(TOKEN, &d.socket(), d.run().path());
-    let jar = bootstrap(web.port);
+    let web = WebServer::start("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
+    let jar = bootstrap(web.port());
 
     // Two cookies, and the session cookie first: `p8_web.rs` and `p12_web_session.rs`
     // both read *the* `Set-Cookie`, and the one that authorizes everything is the one
@@ -304,9 +230,9 @@ fn the_session_token_is_not_replayed_to_paths_outside_the_websocket_upgrade() {
     );
     let session = &jar[0];
     let asset = &jar[1];
-    assert_eq!(session.name, format!("nexus_session_{}", web.port));
+    assert_eq!(session.name, format!("nexus_session_{}", web.port()));
     assert_eq!(session.value, TOKEN);
-    assert_eq!(asset.name, format!("nexus_assets_{}", web.port));
+    assert_eq!(asset.name, format!("nexus_assets_{}", web.port()));
     assert_ne!(
         asset.value, TOKEN,
         "the everywhere-replayed cookie must not carry the token"
@@ -362,7 +288,7 @@ fn the_session_token_is_not_replayed_to_paths_outside_the_websocket_upgrade() {
     // cookie scoped anywhere else is a console that renders and never connects.
     assert!(path_matches(&session.path, "/ws"));
     assert_eq!(
-        ws_status(web.port, &session.pair()),
+        ws_status(web.port(), &session.pair()),
         101,
         "the path-scoped session cookie must still open the WebSocket"
     );
@@ -374,21 +300,21 @@ fn the_session_token_is_not_replayed_to_paths_outside_the_websocket_upgrade() {
 #[test]
 fn the_asset_credential_opens_the_assets_and_never_the_websocket() {
     let d = Daemon::start();
-    let web = WebServer::spawn(TOKEN, &d.socket(), d.run().path());
-    let jar = bootstrap(web.port);
+    let web = WebServer::start("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
+    let jar = bootstrap(web.port());
     let session = jar[0].pair();
     let asset = jar[1].pair();
 
     // The credential a sibling port harvests: assets, yes — capability, no.
     for target in ["/", "/app.js", "/app.css"] {
         assert_eq!(
-            status(web.port, target, &asset),
+            status(web.port(), target, &asset),
             200,
             "the asset credential must serve {target}, or the console cannot boot"
         );
     }
     assert_eq!(
-        ws_status(web.port, &asset),
+        ws_status(web.port(), &asset),
         401,
         "the asset credential must not open the WebSocket — the bridge behind it can \
          add an exec codec (docs/security.md)"
@@ -399,15 +325,18 @@ fn the_asset_credential_opens_the_assets_and_never_the_websocket() {
     // knows nothing about paths or the bound port (§17).
     let unscoped = format!("nexus_session={TOKEN}");
     for cookie in [&session, &unscoped] {
-        assert_eq!(status(web.port, "/app.js", cookie), 200, "{cookie}");
-        assert_eq!(ws_status(web.port, cookie), 101, "{cookie}");
+        assert_eq!(status(web.port(), "/app.js", cookie), 200, "{cookie}");
+        assert_eq!(ws_status(web.port(), cookie), 101, "{cookie}");
     }
 
     // And neither route is open to a peer holding nothing, or holding a guess.
-    let forged = format!("nexus_assets_{}=00000000000000000000000000000000", web.port);
+    let forged = format!(
+        "nexus_assets_{}=00000000000000000000000000000000",
+        web.port()
+    );
     for cookie in ["", forged.as_str()] {
-        assert_eq!(status(web.port, "/app.js", cookie), 401, "{cookie:?}");
-        assert_eq!(ws_status(web.port, cookie), 401, "{cookie:?}");
+        assert_eq!(status(web.port(), "/app.js", cookie), 401, "{cookie:?}");
+        assert_eq!(ws_status(web.port(), cookie), 401, "{cookie:?}");
     }
 }
 

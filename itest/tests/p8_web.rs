@@ -70,13 +70,14 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use serial_nexus_itest::{Daemon, Sim, TempRun, bin, serial_echo, sha256_hex, wait_until};
+use serial_nexus_itest::{
+    Daemon, KillOnDrop, Sim, TempRun, WebServer, bin, serial_echo, sha256_hex, wait_until,
+};
 
 /// The fixed per-session bearer token (the bash's `TOK`). Overriding the random
 /// default keeps the test deterministic (`--token`, §15.29).
@@ -97,89 +98,6 @@ const MAX_PRE_AUTH_CONNECTIONS: usize = 32;
 /// Mirrors `web/src/server.rs`'s `HEAD_TIMEOUT`: how long a peer has to
 /// deliver a complete request head before the connection is released.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// A child killed and reaped on drop, so a panicking test never leaks a process.
-struct Kill(Child);
-impl Drop for Kill {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// A running `serial-nexus-web` server whose stdout is drained into a shared buffer, so
-/// the bound `http(s)://…` URL (printed once, right after binding) can be scanned for
-/// the OS-chosen ephemeral port. Killed on drop.
-struct WebServer {
-    child: Child,
-    lines: Arc<Mutex<Vec<String>>>,
-}
-
-impl WebServer {
-    /// Spawn `serial-nexus-web --bind <bind> --token <TOKEN> --socket <socket> <extra>`
-    /// with `XDG_RUNTIME_DIR = xdg` and a stdout reader thread. `extra` carries any
-    /// TLS flags.
-    fn spawn(bind: &str, socket: &Path, xdg: &Path, extra: &[&str]) -> Self {
-        let socket_str = socket.to_string_lossy().into_owned();
-        let mut args: Vec<&str> = vec!["--bind", bind, "--token", TOKEN, "--socket", &socket_str];
-        args.extend_from_slice(extra);
-        let mut child = Command::new(bin("serial-nexus-web"))
-            .args(&args)
-            .env("XDG_RUNTIME_DIR", xdg)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn serial-nexus-web");
-        let stdout = child.stdout.take().expect("piped serial-nexus-web stdout");
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let sink = lines.clone();
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => sink.lock().unwrap().push(l),
-                    Err(_) => break,
-                }
-            }
-        });
-        WebServer { child, lines }
-    }
-
-    /// Wait for the printed `scheme://…` URL line and return it (trimmed), or `None`.
-    fn wait_url(&self, scheme: &str, timeout: Duration) -> Option<String> {
-        let needle = format!("{scheme}://");
-        let mut found = None;
-        wait_until(timeout, || {
-            let guard = self.lines.lock().unwrap();
-            for l in guard.iter() {
-                if let Some(i) = l.find(needle.as_str()) {
-                    found = Some(l[i..].trim().to_string());
-                    return true;
-                }
-            }
-            false
-        });
-        found
-    }
-
-    /// The bound port parsed from the printed `scheme://host:port/…` URL.
-    fn port(&self, scheme: &str, timeout: Duration) -> Option<u16> {
-        parse_port(&self.wait_url(scheme, timeout)?)
-    }
-
-    /// Whether the server process has already exited — used to tell "this environment
-    /// cannot bind what the test needs" (a skip) from "the server is broken" (a fail).
-    fn exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
-    }
-}
-
-impl Drop for WebServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 /// Parse the port from a `scheme://host:port/rest` URL (loopback IPv4 forms only,
 /// which is all this server prints).
@@ -752,9 +670,9 @@ fn web_http_security_gates() {
     // Pure HTTP: the token/Host gates and asset serving never touch the daemon, so
     // this runs on every platform. A live daemon still backs the socket for realism.
     let d = Daemon::start();
-    let server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path(), &[]);
+    let server = WebServer::spawn("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
     let port = server
-        .port("http", Duration::from_secs(10))
+        .port_for("http", Duration::from_secs(10))
         .expect("web server never printed its bound http URL");
 
     // (1) no token → 401.
@@ -859,9 +777,9 @@ path = "{console}"
         rpc.node("console")
     );
 
-    let server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path(), &[]);
+    let server = WebServer::spawn("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
     let port = server
-        .port("http", Duration::from_secs(10))
+        .port_for("http", Duration::from_secs(10))
         .expect("web server never printed its bound http URL");
 
     // `state` via the WS bridge lists the console, and the list matches the daemon's
@@ -922,9 +840,9 @@ b = "c1"
         a = d.run().join("c1").display(),
     );
     rpc.load_toml(&cfg, false).expect("load");
-    let server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path(), &[]);
+    let server = WebServer::spawn("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
     let port = server
-        .port("http", Duration::from_secs(10))
+        .port_for("http", Duration::from_secs(10))
         .expect("web server never printed its bound http URL");
 
     let ws_dump = wsclient_rpc(port, "dump", Duration::from_secs(15))
@@ -981,9 +899,9 @@ b = "m/raw"
         a = d.run().join("c1").display(),
     );
     rpc.load_toml(&cfg, false).expect("load");
-    let server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path(), &[]);
+    let server = WebServer::spawn("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
     let port = server
-        .port("http", Duration::from_secs(10))
+        .port_for("http", Duration::from_secs(10))
         .expect("web server never printed its bound http URL");
 
     let status_via_bridge = |name: &str| -> String {
@@ -1047,9 +965,9 @@ path = "{a}"
         a = d.run().join("c1").display(),
     );
     rpc.load_toml(&cfg, false).expect("load");
-    let server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path(), &[]);
+    let server = WebServer::spawn("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
     let port = server
-        .port("http", Duration::from_secs(10))
+        .port_for("http", Duration::from_secs(10))
         .expect("web server never printed its bound http URL");
 
     // Refused at the bridge, whatever the daemon would have done with them.
@@ -1090,9 +1008,9 @@ targetward = []
         false,
     )
     .expect("load");
-    let server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path(), &[]);
+    let server = WebServer::spawn("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
     let port = server
-        .port("http", Duration::from_secs(10))
+        .port_for("http", Duration::from_secs(10))
         .expect("web server never printed its bound http URL");
 
     let logdir = d.run().join("weblogs");
@@ -1184,9 +1102,9 @@ fn web_ws_frame_cannot_smuggle_a_second_request() {
     // the second being `teardown`. Needs no serial device; runs everywhere.
     let d = Daemon::start();
     let before = two_console_graph(&d);
-    let server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path(), &[]);
+    let server = WebServer::spawn("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
     let port = server
-        .port("http", Duration::from_secs(10))
+        .port_for("http", Duration::from_secs(10))
         .expect("web server never printed its bound http URL");
 
     let cookie = cookie_header();
@@ -1248,9 +1166,9 @@ fn web_ws_frame_cannot_smuggle_a_shutdown() {
     // unambiguous (a dead daemon vs. an emptied graph).
     let d = Daemon::start();
     let before = two_console_graph(&d);
-    let server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path(), &[]);
+    let server = WebServer::spawn("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
     let port = server
-        .port("http", Duration::from_secs(10))
+        .port_for("http", Duration::from_secs(10))
         .expect("web server never printed its bound http URL");
 
     let cookie = cookie_header();
@@ -1292,9 +1210,9 @@ fn web_origin_is_validated_against_the_requests_own_host() {
     // Host (not the bound port) so SSH forwarding of the loopback default keeps working
     // (§17). Needs no serial device; runs everywhere.
     let d = Daemon::start();
-    let server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path(), &[]);
+    let server = WebServer::spawn("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
     let port = server
-        .port("http", Duration::from_secs(10))
+        .port_for("http", Duration::from_secs(10))
         .expect("web server never printed its bound http URL");
     let host = format!("127.0.0.1:{port}");
     let sibling = format!("http://127.0.0.1:{}", port.wrapping_add(1));
@@ -1397,9 +1315,9 @@ fn web_pre_auth_connections_are_capped_and_time_out() {
     let run = TempRun::new();
     // No daemon: nothing here reaches `/ws`, and the gates run before the socket is
     // ever touched.
-    let server = WebServer::spawn("127.0.0.1:0", &run.socket(), run.path(), &[]);
+    let server = WebServer::spawn("127.0.0.1:0", TOKEN, &run.socket(), run.path(), &[]);
     let port = server
-        .port("http", Duration::from_secs(10))
+        .port_for("http", Duration::from_secs(10))
         .expect("web server never printed its bound http URL");
 
     // Flood well past the cap with peers that connect and send nothing.
@@ -1526,9 +1444,9 @@ b = "console"
         "console pty symlink never appeared"
     );
 
-    let server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path(), &[]);
+    let server = WebServer::spawn("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
     let port = server
-        .port("http", Duration::from_secs(10))
+        .port_for("http", Duration::from_secs(10))
         .expect("web server never printed its bound http URL");
 
     // Start the headless WS tap on usb0 first, capturing its decoded stdout in a
@@ -1557,7 +1475,7 @@ b = "console"
         let _ = BufReader::new(ws_stdout).read_to_end(&mut buf);
         buf
     });
-    let mut ws = Kill(ws_child);
+    let mut ws = KillOnDrop(ws_child);
 
     // The server's bridge opened a daemon tap on usb0; wait for it to register.
     assert!(
@@ -1648,13 +1566,14 @@ fn web_tls_tier_binds_and_secures_key() {
 
     let server = WebServer::spawn(
         "127.0.0.1:0",
+        TOKEN,
         &run.socket(),
         run.path(),
         &["--tls", "--tls-cert", &cert_str, "--tls-key", &key_str],
     );
     // The TLS server prints an https URL once it is listening (§15.29 tier 2).
     let url = server
-        .wait_url("https", Duration::from_secs(15))
+        .url_for("https", Duration::from_secs(15))
         .expect("TLS server never printed its https URL");
     assert!(
         parse_port(&url).is_some(),
@@ -1683,6 +1602,7 @@ fn web_tls_tier_binds_and_secures_key() {
     let nl_key_str = nl_key.to_string_lossy().into_owned();
     let nl_server = WebServer::spawn(
         "0.0.0.0:0",
+        TOKEN,
         &nl_run.socket(),
         nl_run.path(),
         &[
@@ -1695,7 +1615,7 @@ fn web_tls_tier_binds_and_secures_key() {
     );
     assert!(
         nl_server
-            .wait_url("https", Duration::from_secs(15))
+            .url_for("https", Duration::from_secs(15))
             .is_some(),
         "--tls should permit a non-loopback bind (§15.29 tier 2)"
     );
@@ -1739,11 +1659,12 @@ fn web_tls_round_trip() {
     // listener still answers on 127.0.0.1, so no external interface is required.
     let mut server = WebServer::spawn(
         "0.0.0.0:0",
+        TOKEN,
         &d.socket(),
         run.path(),
         &["--tls", "--tls-cert", &cert_str, "--tls-key", &key_str],
     );
-    let Some(port) = server.port("https", Duration::from_secs(15)) else {
+    let Some(port) = server.port_for("https", Duration::from_secs(15)) else {
         assert!(
             server.exited(),
             "the TLS server neither printed an https URL nor exited — it is broken, \

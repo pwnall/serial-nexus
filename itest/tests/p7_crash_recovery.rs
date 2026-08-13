@@ -29,77 +29,34 @@
 //!   probe, which need a device.
 //! * **Hand-managed daemon lifecycle.** A hard kill + restart on the SAME
 //!   socket/state-file cannot be expressed with `Daemon::start` (fresh temp dir per
-//!   call), so — like `p3_log` — the daemon is spawned directly with fixed paths and a
-//!   `KillOnDrop` guard, and readiness is a bounded `UnixStream::connect` poll (not
-//!   `test -S`, which would spuriously match the stale socket the hard kill leaves).
+//!   call), so — like `p3_log` — the daemon is a `RawDaemon` on fixed paths, killed on
+//!   drop, whose readiness wait is a bounded connect-and-answer probe (not `test -S`,
+//!   which would spuriously match the stale socket the hard kill leaves).
 //! * **The device sim is restarted fresh** across the daemon kill (as the bash does):
 //!   a real adapter releases its fd on the daemon's death, but the sim's held pty
 //!   master would keep the crashed daemon's `TIOCEXCL` alive on the pts — a sim-only
 //!   artifact — so the old sim is killed and a fresh one is spawned at the same path.
 
-use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use serial_nexus_itest::{Rpc, Sim, TempRun, bin, serial_echo, wait_until};
+use serial_nexus_itest::{RawDaemon, Rpc, Sim, TempRun, serial_echo, wait_until};
 
-/// A child that is SIGKILLed and reaped on drop, so a panicking test never leaks a
-/// daemon or a sim device.
-struct KillOnDrop(Child);
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Spawn `serial-nexus-daemon` on `run`'s fixed socket + state file (the persisted-config
-/// path policy, §11/§15.9). Reusing the same paths across two spawns is how the restart
-/// is exercised: the fresh daemon reclaims the leftover socket and recovers the
-/// persisted config at startup (§10).
-fn spawn_daemon(run: &TempRun) -> Child {
-    Command::new(bin("serial-nexus-daemon"))
-        .arg("--socket")
-        .arg(run.socket())
-        .arg("--state-file")
-        .arg(run.state_file())
-        .env("XDG_RUNTIME_DIR", run.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serial-nexus-daemon")
-}
-
-/// Spawn a `serial-nexus-sim pty --echo` software serial device at the fixed `path` and wait
-/// for its device symlink to appear. The stand-in for a plugged-in echo adapter.
-fn spawn_device(path: &Path) -> KillOnDrop {
-    let child = Command::new(bin("serial-nexus-sim"))
-        .args(["pty", "--echo"])
-        .arg("--link")
-        .arg(path)
-        .args(["--timeout-ms", "600000"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serial-nexus-sim pty --echo device");
-    assert!(
-        wait_until(Duration::from_secs(5), || path.exists()),
-        "device never appeared at {}",
-        path.display()
-    );
-    KillOnDrop(child)
-}
-
-/// Wait until a daemon is actually listening on `sock` (a bound listener accepts the
-/// connection; a leftover stale socket file refuses it). Bounded poll — the
-/// restart-safe replacement for `test -S`, which would spuriously match the stale
-/// socket file the hard kill leaves behind.
-fn wait_socket(sock: &Path) -> bool {
-    wait_until(Duration::from_secs(10), || {
-        UnixStream::connect(sock).is_ok()
-    })
+/// Spawn a `serial-nexus-sim pty --echo` software serial device at the fixed `path` and
+/// wait for its device symlink to appear. The stand-in for a plugged-in echo adapter.
+fn spawn_device(path: &Path) -> Sim {
+    Sim::spawn(
+        &[
+            "pty",
+            "--echo",
+            "--link",
+            &path.to_string_lossy(),
+            "--timeout-ms",
+            "600000",
+        ],
+        Some(path),
+    )
 }
 
 /// The sorted node names from `state` (the portable replacement for
@@ -148,11 +105,7 @@ fn kill_dash_9_then_restart_auto_recovers_graph_and_data_plane() {
 
     // ---- boot: device + daemon, then load the serial+pty graph ------------------
     let device = spawn_device(&dev);
-    let mut daemon = KillOnDrop(spawn_daemon(&run));
-    assert!(
-        wait_socket(&run.socket()),
-        "daemon 1 control socket never appeared"
-    );
+    let mut daemon = RawDaemon::start(&run);
     let rpc = Rpc::new(run.socket());
 
     let cfg = format!(
@@ -201,8 +154,8 @@ filename = "cap.log"
     );
 
     // ---- kill -9 (SIGKILL) and restart -----------------------------------------
-    daemon.0.kill().expect("SIGKILL daemon 1");
-    daemon.0.wait().expect("reap daemon 1");
+    daemon.child().kill().expect("SIGKILL daemon 1");
+    daemon.child().wait().expect("reap daemon 1");
 
     // The device stays "plugged in" across a daemon restart, but the sim's held master
     // would keep the crashed daemon's TIOCEXCL alive on the pts (a sim-only artifact),
@@ -211,11 +164,7 @@ filename = "cap.log"
     let _ = std::fs::remove_file(&dev);
     let _ = std::fs::remove_file(&con);
     let _device2 = spawn_device(&dev);
-    let _daemon2 = KillOnDrop(spawn_daemon(&run));
-    assert!(
-        wait_socket(&run.socket()),
-        "daemon 2 control socket never came back"
-    );
+    let _daemon2 = RawDaemon::start(&run);
 
     // ---- the graph auto-recovered from the persisted state file (no reload) ------
     assert!(

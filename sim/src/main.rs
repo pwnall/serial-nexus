@@ -50,8 +50,115 @@ use serial_nexus_sys::ptsname;
 #[derive(Parser)]
 #[command(name = "serial-nexus-sim", about = "serial_nexus test double (§3)")]
 struct Cli {
+    /// Stop when stdin reaches EOF (§15.43's leash, the sim's arm of it). For a
+    /// harness that spawns the double with a pipe on stdin and holds the write end:
+    /// the kernel closes that end however the harness dies, including a SIGKILL where
+    /// none of its own cleanup runs, so the double cannot outlive it. **Off by
+    /// default, and that is the only safe default** — a double run from a shell with
+    /// `< /dev/null`, or by anything that hands it a null stdin, is at EOF from the
+    /// first instant and would exit before it did anything.
+    ///
+    /// Must precede the subcommand. Refused with `transcript`, whose stdin *is* the
+    /// daemon's envelope pipe (§7.6): a leash reading it would eat the conversation.
+    #[arg(long)]
+    exit_on_stdin_eof: bool,
     #[command(subcommand)]
     mode: Mode,
+}
+
+// --- the stdin-EOF leash (§15.43) ------------------------------------------
+
+/// The one stdin-EOF watch this process has.
+///
+/// One, not one per waiter: two threads reading the same pipe would race for the
+/// bytes and neither would see the close reliably. The leash (`--exit-on-stdin-eof`)
+/// and the caller-owned hold (`client --hold-stdin-eof`) are both waiters on this,
+/// and either may be armed without the other.
+struct StdinEof {
+    seen: std::sync::Mutex<bool>,
+    woken: std::sync::Condvar,
+}
+
+impl StdinEof {
+    /// Block until stdin reaches EOF. Returns immediately if it already has.
+    fn wait(&self) {
+        let mut seen = self.seen.lock().expect("stdin-eof mutex");
+        while !*seen {
+            seen = self.woken.wait(seen).expect("stdin-eof condvar");
+        }
+    }
+}
+
+/// Start (once) the reader thread and return the watch.
+///
+/// A blocked `read` costs nothing and ends exactly when the writer closes, so this is
+/// not a poll loop (§15.31's no-busy-waiting rule for the doubles). Anything actually
+/// written is noise, not a protocol: the only event reported is the close. A stdin
+/// that cannot be read is as good as gone — failing closed there would leave precisely
+/// the orphan this exists to prevent.
+fn stdin_eof_watch() -> &'static Arc<StdinEof> {
+    static WATCH: std::sync::OnceLock<Arc<StdinEof>> = std::sync::OnceLock::new();
+    WATCH.get_or_init(|| {
+        let watch = Arc::new(StdinEof {
+            seen: std::sync::Mutex::new(false),
+            woken: std::sync::Condvar::new(),
+        });
+        let signal = watch.clone();
+        thread::Builder::new()
+            .name("stdin-eof-watch".to_owned())
+            .spawn(move || {
+                let stdin = std::io::stdin();
+                let mut handle = stdin.lock();
+                let mut byte = [0u8; 1];
+                loop {
+                    match handle.read(&mut byte) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                *signal.seen.lock().expect("stdin-eof mutex") = true;
+                signal.woken.notify_all();
+            })
+            .expect("spawn the stdin EOF watch thread");
+        watch
+    })
+}
+
+/// Device symlinks this process published, removed before a leashed exit.
+///
+/// The ordinary exit paths unlink what they published (`run_pty`, `run_nullmodem`);
+/// the leash exits from another thread and would skip them, leaving a dangling node
+/// path behind. §15.43's contract is "no more residue than a SIGTERM", and this is
+/// what keeps that literally true for the sim.
+static PUBLISHED_LINKS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Record a symlink this process published, so a leashed exit can remove it.
+fn publish_link(path: &Path) {
+    PUBLISHED_LINKS
+        .lock()
+        .expect("published-links mutex")
+        .push(path.to_path_buf());
+}
+
+/// Arm the leash: on stdin EOF, unpublish and stop.
+fn arm_stdin_eof_leash() {
+    let watch = stdin_eof_watch().clone();
+    thread::Builder::new()
+        .name("stdin-eof-leash".to_owned())
+        .spawn(move || {
+            watch.wait();
+            for link in PUBLISHED_LINKS
+                .lock()
+                .expect("published-links mutex")
+                .iter()
+            {
+                let _ = std::fs::remove_file(link);
+            }
+            std::process::exit(0);
+        })
+        .expect("spawn the stdin EOF leash thread");
 }
 
 #[derive(Subcommand)]
@@ -179,8 +286,25 @@ struct ClientArgs {
     set_baud: Option<u32>,
     /// After any exchange, keep the slave open this long (ms) before exiting, so
     /// a subscriber can observe the client-present/termios state.
-    #[arg(long)]
+    ///
+    /// A timer, so it is only right where the *caller runs this client to
+    /// completion* and the hold length is the thing being asked for. Where the
+    /// caller instead holds the double open across an observation of its own,
+    /// `--hold-stdin-eof` is the shape to use: a timer there is §9's proxy in time,
+    /// and one that expires early turns the observation vacuous rather than red.
+    #[arg(long, conflicts_with = "hold_stdin_eof")]
     hold_ms: Option<u64>,
+    /// After any exchange, keep the slave open until **stdin reaches EOF** — the
+    /// caller-owned hold (§15.45's `hold` shape, plan §18 item 25).
+    ///
+    /// The hold's length belongs to the caller, who closes the pipe (or dies, which
+    /// the kernel turns into the same close) when its observation is finished. That
+    /// removes the expiring-timer vacuity `p4_exclusivity` was measured to have —
+    /// a locked-out writer whose `--hold-ms` elapsed early has had its backlog
+    /// purged at its own detach, so "a non-holder's bytes never reached the device"
+    /// then passes because there was nothing left to leak (notes §3.56).
+    #[arg(long)]
+    hold_stdin_eof: bool,
     /// Receive exactly this many hostward bytes (e.g. `512MiB`), checksum them
     /// incrementally, and report — the fast sink for the firehose test. Does not
     /// send. Mutually exclusive with `--drain`.
@@ -460,6 +584,17 @@ struct TcpProxyArgs {
 
 fn main() {
     let cli = Cli::parse();
+    if cli.exit_on_stdin_eof {
+        if matches!(cli.mode, Mode::Transcript(_)) {
+            eprintln!(
+                "serial-nexus-sim: --exit-on-stdin-eof is refused with `transcript` — that \
+                 mode's stdin is the daemon's envelope pipe (§7.6), and the leash would \
+                 consume the conversation it exists to record"
+            );
+            std::process::exit(2);
+        }
+        arm_stdin_eof_leash();
+    }
     let verdict = match cli.mode {
         // `transcript` is the one mode that cannot honour the "single JSON verdict
         // line on stdout" convention: it stands where a codec child stands, so its
@@ -694,6 +829,7 @@ fn run_pty_inner(a: &PtyArgs) -> anyhow::Result<Value> {
     if let Some(link) = &a.link {
         let _ = std::fs::remove_file(link);
         std::os::unix::fs::symlink(&pts, link)?;
+        publish_link(link);
     }
 
     let result = if a.echo {
@@ -753,6 +889,7 @@ fn nullmodem_master(link: &std::path::Path) -> anyhow::Result<PtyMaster> {
     apply_raw_pair(&master, &pts)?;
     let _ = std::fs::remove_file(link);
     std::os::unix::fs::symlink(&pts, link)?;
+    publish_link(link);
     Ok(master)
 }
 
@@ -1072,8 +1209,13 @@ fn run_client_inner(a: &ClientArgs) -> anyhow::Result<Value> {
         .map_err(|_| anyhow::anyhow!("reader thread panicked"))??;
     let received = &got.bytes;
 
-    // Keep the slave open so a subscriber can observe our presence/termios.
-    if let Some(ms) = a.hold_ms {
+    // Keep the slave open so a subscriber can observe our presence/termios. Two
+    // shapes, and which one a call site wants is decided by who owns the length:
+    // `--hold-stdin-eof` hands it to the caller (no timer to expire under load),
+    // `--hold-ms` keeps it here for the callers that run this client to completion.
+    if a.hold_stdin_eof {
+        stdin_eof_watch().wait();
+    } else if let Some(ms) = a.hold_ms {
         thread::sleep(Duration::from_millis(ms));
     }
 
@@ -1504,6 +1646,7 @@ fn run_mux_inner(a: &MuxArgs) -> anyhow::Result<Value> {
     apply_raw_pair(&master, &pts)?;
     let _ = std::fs::remove_file(link);
     std::os::unix::fs::symlink(&pts, link)?;
+    publish_link(link);
 
     // Two-phase feed handshake (plan §3 — presence is not readiness). When a primer
     // is configured, first wait for the clients to be present (`--prime-file`) and
@@ -3372,18 +3515,41 @@ fn run_transcript(a: &TranscriptArgs) {
         // stderr is the exec node's diagnostic channel (§7.6) — it is logged, and it
         // is the only channel this mode has that is not the envelope pipe.
         eprintln!("serial-nexus-sim transcript: {e:#}");
-        // Park rather than exit: see the `Mode::Transcript` arm in `main`.
-        park_transcript();
+        // Park rather than exit: see the `Mode::Transcript` arm in `main`. Nothing
+        // holds a `StdinLock` here — `run_transcript_inner` returned, dropping its —
+        // so this is the one call site that takes the lock itself.
+        park_transcript(&mut std::io::stdin().lock());
     }
 }
 
 /// Sit on stdin until the daemon closes it (node teardown), then return. Never a
 /// sleep loop: a blocked `read` costs nothing and ends exactly when the boundary
 /// does (§15.31's no-busy-waiting rule for the doubles).
-fn park_transcript() {
-    let mut stdin = std::io::stdin().lock();
+///
+/// **Takes the caller's reader; never calls `std::io::stdin()` itself.** `Stdin` is
+/// backed by a plain `Mutex<BufReader<StdinRaw>>` — *not* the `ReentrantLock` that
+/// backs `Stdout` and `Stderr` — so a second `stdin().lock()` on a thread that
+/// already holds one is a self-deadlock: `futex(FUTEX_WAIT_BITSET_PRIVATE, 2, NULL)`,
+/// forever, before the first `read`. Both parking call sites below are inside a
+/// function whose `StdinLock` is still alive, so a `park_transcript()` that locked
+/// for itself hung there instead of reading, ignored the EOF that is its whole
+/// termination condition, and outlived the daemon as an orphan on ppid 1. Measured:
+/// three per run of `p8_daemon_transcript`, with the suite green each time.
+///
+/// A read interrupted by a signal is resumed rather than treated as the end: EINTR
+/// is not the boundary closing, and returning on it would exit a child whose exit is
+/// a crash to the daemon (§7.6). Any other error *does* end the park — a loop that
+/// retried a persistent `EBADF` would be the busy-wait §15.31 forbids.
+fn park_transcript(stdin: &mut impl Read) {
     let mut buf = [0u8; 4096];
-    while matches!(stdin.read(&mut buf), Ok(n) if n > 0) {}
+    loop {
+        match stdin.read(&mut buf) {
+            Ok(0) => return, // the daemon closed our stdin: the node is gone
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
 }
 
 fn run_transcript_inner(a: &TranscriptArgs) -> anyhow::Result<()> {
@@ -3495,7 +3661,7 @@ fn record_transcript(
             " (stdin reached EOF before the end marker)"
         }
     );
-    park_transcript();
+    park_transcript(&mut stdin);
     Ok(())
 }
 
@@ -3549,7 +3715,7 @@ fn replay_transcript(expected: &[u8], verdict_path: &Path) -> anyhow::Result<()>
                     // Park with the verdict standing. Exiting would be a crash to the
                     // daemon, which would restart us and replay from byte zero,
                     // overwriting the diagnosis with a second identical one.
-                    park_transcript();
+                    park_transcript(&mut stdin);
                     return Ok(());
                 }
                 matched += 1;

@@ -69,15 +69,13 @@
 //! `a_refused_connection_drains_what_it_refused_before_closing` is where that assumption
 //! is turned into an assertion.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use serial_nexus_itest::{Daemon, bin, wait_until};
+use serial_nexus_itest::{Daemon, WebServer};
 
 /// The fixed per-session token, so the cookie below is a byte-level fact.
 const TOKEN: &str = "webs4token0123456789abcdef";
@@ -90,97 +88,6 @@ const WS_MAX_MESSAGE: usize = 1 << 20;
 const WS_MAX_FRAME: usize = 256 * 1024;
 
 // ---------------------------------------------------------------- child process ----
-
-/// A `serial-nexus-web` child whose printed bootstrap URL is scanned for the OS-chosen
-/// port. Killed on drop.
-struct WebServer {
-    child: Child,
-    port: u16,
-    /// Everything the child has written to stdout, where its tracing subscriber writes.
-    ///
-    /// Kept rather than dropped after the port is scraped, because the operator-facing
-    /// half of a size cap is a **log line**: a bound nobody can see being enforced is a
-    /// bound nobody can tell is still there. Asserting on it is what stops the `warn!`
-    /// being deleted with this suite green — the same argument 37-WEBS-4 made about the
-    /// caps themselves.
-    logs: Arc<Mutex<Vec<String>>>,
-}
-
-impl WebServer {
-    fn spawn(token: &str, socket: &Path, xdg: &Path) -> WebServer {
-        let socket_str = socket.to_string_lossy().into_owned();
-        let mut child = Command::new(bin("serial-nexus-web"))
-            .args([
-                "--bind",
-                "127.0.0.1:0",
-                "--token",
-                token,
-                "--socket",
-                &socket_str,
-            ])
-            .env("XDG_RUNTIME_DIR", xdg)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn serial-nexus-web");
-        // Drained for the child's whole life: the tracing subscriber writes to stdout
-        // too, and a pipe whose read end we dropped would take the server down on its
-        // next log line.
-        let stdout = child.stdout.take().expect("piped serial-nexus-web stdout");
-        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = lines.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(l) => sink.lock().unwrap().push(l),
-                    Err(_) => break,
-                }
-            }
-        });
-        let mut port = None;
-        let found = wait_until(Duration::from_secs(10), || {
-            for l in lines.lock().unwrap().iter() {
-                if let Some(rest) = l.split("http://").nth(1)
-                    && let Some(authority) = rest.split('/').next()
-                    && let Some((_, p)) = authority.rsplit_once(':')
-                    && let Ok(n) = p.trim().parse::<u16>()
-                {
-                    port = Some(n);
-                    return true;
-                }
-            }
-            false
-        });
-        assert!(
-            found,
-            "serial-nexus-web never printed its bound http URL; saw {:?}",
-            lines.lock().unwrap()
-        );
-        WebServer {
-            child,
-            port: port.expect("a port once the URL line was found"),
-            logs: lines,
-        }
-    }
-
-    /// Wait, bounded, for a stdout line containing `needle`.
-    ///
-    /// Polled rather than read once: the refusal is logged by the server on its own
-    /// schedule, and the client observes the closed socket first — so a single look is a
-    /// race the server usually loses.
-    fn logged(&self, needle: &str) -> bool {
-        wait_until(Duration::from_secs(10), || {
-            self.logs.lock().unwrap().iter().any(|l| l.contains(needle))
-        })
-    }
-}
-
-impl Drop for WebServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 /// Open the bootstrap URL and return the `name=value` pair a browser would replay for
 /// the session cookie — the first `Set-Cookie`, which is the one that authorizes `/ws`.
@@ -616,9 +523,9 @@ fn a_frame_over_the_cap_is_refused_and_its_request_never_reaches_the_daemon() {
     let d = Daemon::start();
     let logs = d.run().join("weblogs");
     std::fs::create_dir_all(&logs).expect("mkdir");
-    let web = WebServer::spawn(TOKEN, &d.socket(), d.run().path());
-    let cookie = bootstrap_cookie(web.port);
-    let mut ws = Ws::connect(web.port, &cookie);
+    let web = WebServer::start("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
+    let cookie = bootstrap_cookie(web.port());
+    let mut ws = Ws::connect(web.port(), &cookie);
 
     // Live first, or nothing after it means anything.
     ws.send_text(r#"{"jsonrpc":"2.0","id":1,"method":"info"}"#)
@@ -670,7 +577,7 @@ fn a_frame_over_the_cap_is_refused_and_its_request_never_reaches_the_daemon() {
         );
     }
     assert!(
-        web.logged(REFUSAL_LOG),
+        web.logged(REFUSAL_LOG, Duration::from_secs(10)),
         "the server refused an over-cap frame and said nothing about it: an operator \
          watching this daemon cannot tell a tripped security cap from an idle browser \
          disconnect"
@@ -689,9 +596,9 @@ fn a_fragmented_message_over_the_cap_is_refused_and_never_reaches_the_daemon() {
     let d = Daemon::start();
     let logs = d.run().join("weblogs");
     std::fs::create_dir_all(&logs).expect("mkdir");
-    let web = WebServer::spawn(TOKEN, &d.socket(), d.run().path());
-    let cookie = bootstrap_cookie(web.port);
-    let mut ws = Ws::connect(web.port, &cookie);
+    let web = WebServer::start("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
+    let cookie = bootstrap_cookie(web.port());
+    let mut ws = Ws::connect(web.port(), &cookie);
 
     ws.send_text(r#"{"jsonrpc":"2.0","id":1,"method":"info"}"#)
         .expect("write the liveness probe");
@@ -753,7 +660,7 @@ fn a_fragmented_message_over_the_cap_is_refused_and_never_reaches_the_daemon() {
         );
     }
     assert!(
-        web.logged(REFUSAL_LOG),
+        web.logged(REFUSAL_LOG, Duration::from_secs(10)),
         "the server refused an over-cap message and said nothing about it: an operator \
          watching this daemon cannot tell a tripped security cap from an idle browser \
          disconnect"
@@ -805,9 +712,9 @@ fn a_refused_connection_drains_what_it_refused_before_closing() {
     let d = Daemon::start();
     let logs = d.run().join("weblogs");
     std::fs::create_dir_all(&logs).expect("mkdir");
-    let web = WebServer::spawn(TOKEN, &d.socket(), d.run().path());
-    let cookie = bootstrap_cookie(web.port);
-    let mut ws = Ws::connect(web.port, &cookie);
+    let web = WebServer::start("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
+    let cookie = bootstrap_cookie(web.port());
+    let mut ws = Ws::connect(web.port(), &cookie);
 
     ws.send_text(r#"{"jsonrpc":"2.0","id":1,"method":"info"}"#)
         .expect("write the liveness probe");

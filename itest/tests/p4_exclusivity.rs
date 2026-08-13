@@ -259,6 +259,12 @@ fn exclusive_write_lock_is_byte_exact() {
         "lock ptya not acquired: {acq:?}"
     );
 
+    // The hold is **caller-owned** (`--hold-stdin-eof`, plan §18 item 25): each writer
+    // keeps its slave open until this test closes the pipe `Sim` holds — which the
+    // `drop(pb)` / `drop(ps)` below do, and which the kernel does for us if this process
+    // dies without unwinding. It was a `--hold-ms 20000` timer against a
+    // `--timeout-ms 25000`, and the vacuity that bought is measured, not imagined: see
+    // the witness paragraph below the sink.
     let mut pb = Sim::spawn(
         &[
             "client",
@@ -268,10 +274,7 @@ fn exclusive_write_lock_is_byte_exact() {
             "seeded:512",
             "--seed",
             "7",
-            "--hold-ms",
-            "20000",
-            "--timeout-ms",
-            "25000",
+            "--hold-stdin-eof",
         ],
         None,
     );
@@ -284,10 +287,7 @@ fn exclusive_write_lock_is_byte_exact() {
             "seeded:512",
             "--seed",
             "9",
-            "--hold-ms",
-            "20000",
-            "--timeout-ms",
-            "25000",
+            "--hold-stdin-eof",
         ],
         None,
     );
@@ -369,16 +369,18 @@ fn exclusive_write_lock_is_byte_exact() {
     //
     //  * `holder_session`, for the reason above;
     //  * `pb` and `ps`, the locked-out writers — **and that check is not decorative.**
-    //    They are held by `--hold-ms 20000` against a `--timeout-ms 25000`, which is a
-    //    timer, i.e. §9's proxy in time. If either expired before the holder finished
+    //    They used to be held by a `--hold-ms 20000` timer against a `--timeout-ms
+    //    25000`, i.e. §9's proxy in time. If either expired before the holder finished
     //    streaming, its buffered bytes would be purged at its own detach and this
     //    test's whole claim — "a non-holder's buffered bytes never reach the device" —
     //    would pass because there was nothing left to leak. That is a vacuous pass no
     //    counter in the graph can distinguish from a real one, and it gets louder the
-    //    slower the box. `Sim`'s witness answers `try_wait`, so an expired hold is now
-    //    a named failure. (The timer itself stays: the sim's slave is held by a
-    //    subprocess this harness cannot leash without a sim-side stdin-EOF hold, which
-    //    is out of scope here and recorded in notes §3.56.)
+    //    slower the box; notes §3.56 measured it, by shortening the holds to 1000 ms.
+    //    The timer is now **gone**, not merely widened: `--hold-stdin-eof` gives the
+    //    hold's length to this test, which owns the pipe (plan §18 item 25, the shape
+    //    §15.45's `hold` verb already proved). The witness stays and stays load-bearing
+    //    — it is what would report a double that died for some *other* reason (a panic,
+    //    an OOM kill) while its counter was being read.
     let sink = observed_while_open(
         &mut [&mut holder_session, &mut pb, &mut ps],
         "the device's byte count under an exclusive lock",

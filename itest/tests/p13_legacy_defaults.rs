@@ -41,11 +41,11 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use serial_nexus_itest::{Rpc, TempRun, bin, daemon_answers, wait_until};
+use serial_nexus_itest::{KillOnDrop, Rpc, TempRun, bin, wait_daemon_ready, wait_until};
 
 /// The pre-rename spelling, from its single definition — never repeated here, so this
 /// file costs the `retired_names_appear_only_where_history_lives` allowance one
@@ -53,39 +53,44 @@ use serial_nexus_itest::{Rpc, TempRun, bin, daemon_answers, wait_until};
 const LEGACY: &str = serial_nexus_rpc::LEGACY_DAEMON_NAME;
 const CURRENT: &str = serial_nexus_rpc::DAEMON_NAME;
 
-/// A daemon child killed on drop. The harness's `Daemon` always passes explicit
-/// `--socket` and `--state-file`, which is exactly what these tests must *not* do:
-/// the whole subject is what the daemon derives when it is given neither.
-struct Bare(Child);
-
-impl Drop for Bare {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
+/// A daemon killed on drop and leashed to this process (§15.43). Not a `RawDaemon`
+/// and not the harness's `Daemon`: both always pass explicit `--socket` and
+/// `--state-file`, which is exactly what these tests must *not* do — the whole subject
+/// is what the daemon derives when it is given neither.
+struct Bare {
+    _child: KillOnDrop,
+    /// The write end of the daemon's stdin pipe, held and never written to.
+    _leash: std::process::ChildStdin,
 }
 
 /// Spawn `serial-nexus-daemon` with `XDG_RUNTIME_DIR` pointed at `run` and whatever
 /// `extra` flags the test needs, then wait until the socket at `sock_name` answers.
 fn spawn(run: &TempRun, sock_name: &str, extra: &[&str]) -> (Bare, Rpc) {
     let socket = run.join(sock_name);
-    let child = Command::new(bin(CURRENT))
+    let mut child = Command::new(bin(CURRENT))
+        .arg("--exit-on-stdin-eof")
         .args(extra)
         .env("XDG_RUNTIME_DIR", run.path())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn daemon");
-    let ready = wait_until(Duration::from_secs(10), || {
-        socket.exists() && daemon_answers(&socket)
-    });
+    let leash = child
+        .stdin
+        .take()
+        .expect("the daemon was spawned with a piped stdin");
+    let bare = Bare {
+        _child: KillOnDrop(child),
+        _leash: leash,
+    };
     assert!(
-        ready,
+        wait_daemon_ready(&socket),
         "daemon never answered on {} (present: {})",
         socket.display(),
         socket.exists()
     );
-    (Bare(child), Rpc::new(socket))
+    (bare, Rpc::new(socket))
 }
 
 /// A pty-only graph: no device, no hardware, and it survives a dump/load round trip.

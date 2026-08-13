@@ -6,8 +6,32 @@
 # /dev/serial/by-id tree, no TIOCGICOUNT driver counters, unverified EXTPROC). So
 # this gate is deliberately LENIENT — it checks that the doctor produced a
 # well-formed report and that the portable mechanisms did not regress, while letting
-# the Linux-only probes skip/degrade/report unsupported without failing CI:
+# the Linux-only probes **skip or degrade** without failing CI:
 #
+#   - Nothing may be `unsupported`, exactly as on Linux. §13 gives that word one
+#     meaning on every platform — a design premise contradicted with no fallback,
+#     a stop condition that asks for an amendment rather than a workaround — and a
+#     kernel that merely *differs* is `degraded` with the observation named (§7).
+#     "Best-effort" widens which probes may skip or degrade here; it does not give
+#     the word a second, softer meaning on this lane.
+#     <!-- ANNOTATION 2026-08-12 (§5). This clause did not exist. The file opened
+#          with a bare `(.summary != null)` while the sentence above read "…report
+#          unsupported without failing CI" and the P14 paragraph below read
+#          "`unsupported` stays a gate failure through the summary clause" — the
+#          second copied verbatim from `expectations/linux.jq`, where it is true.
+#          Measured before the repair, against a Darwin-shaped report on the Linux
+#          box: `jq -e -f expectations/macos.jq` exited **0** with P1, P3, P4, P5
+#          or P11 forced to `unsupported`, and 0 with P15 forced to `unsupported`
+#          on a run that named a port (a passive run's P15 was refused, but by the
+#          per-port presence clause rather than by any status clause — a presence
+#          clause doing a status clause's job by accident). `expectations/linux.jq`
+#          exited 1 on all six. This was a hole in the FILE and not live blindness:
+#          the doctor binary itself exits 1 on any `unsupported`, the lane
+#          redirects rather than tees, and `itest/tests/meta_gates.rs` asserts
+#          `summary.unsupported == 0` in portable Rust on both platforms. What was
+#          missing is the assertion AGENTS §3 names as the macOS gate. The clause
+#          cannot redden an honest lane: a report carrying an `unsupported` probe
+#          already fails the job at the doctor's own exit code, one step earlier. -->
 #   - The report is structurally sound: a summary object and all fifteen probes
 #     (P1..P15) present, each carrying a status. (`>= 15` rather than `== 15`
 #     because P3 emits one probe per --port.)
@@ -16,14 +40,34 @@
 #     Presence-gated output has no fallback (§7.2), so a genuine macOS regression
 #     here is worth surfacing.
 #   - P1 (EXTPROC/TIOCPKT), P3 (serial fit / TIOCGICOUNT), P4 (by-id resolution),
-#     and P5 (rig certification) may be any status on macOS — EXTPROC is unverified
-#     and degrades to the poll-only backstop, and the by-id/counter mechanisms are
-#     Linux-only (the deferred IOKit resolver, §12/§14, is their macOS home).
+#     and P5 (rig certification) may be `supported`, `degraded` or `skipped` on
+#     macOS — EXTPROC is unverified and degrades to the poll-only backstop, and the
+#     by-id/counter mechanisms are Linux-only (the deferred IOKit resolver,
+#     §12/§14, is their macOS home). Their clauses are presence-only for that
+#     reason, and the summary clause above is what keeps `unsupported` out of them:
+#     P5 in particular *can* reach it (a rig that did not deliver the bytes it was
+#     handed, §15.21), which is a stop condition on this platform exactly as it is
+#     on the other.
 #   - P6 (post-hangup pty readiness) and P7 (collapsed-session evidence) are pty
-#     probes and portable, so they must not be `unsupported` — but either verdict
-#     word is fine, and `degraded` is a genuinely likely macOS answer (§7.2's BSD
-#     arm applies the baseline termios through the slave, which is exactly the
-#     mechanism P7 measures). Their numbers are the point on this platform too.
+#     probes and portable, so they must be `supported` or `degraded` — either
+#     verdict word is fine, and `degraded` is a genuinely likely macOS answer
+#     (§7.2's BSD arm applies the baseline termios through the slave, which is
+#     exactly the mechanism P7 measures). Their numbers are the point on this
+#     platform too.
+#     <!-- ANNOTATION 2026-08-12 (§5). These two clauses read `.status !=
+#          "unsupported"`, which admits `skipped` — the one word every conditional
+#          clause in this file exempts, including the "a probe that RAN must carry
+#          measurements" clause at the bottom. Neither probe constructs
+#          `Status::skipped` today, so this was latent rather than live; it is the
+#          same §13 defect notes §3.75 repaired for P8/P9/P10, left standing here
+#          because those two were spelled by exclusion instead of by enumeration.
+#          Measured before the repair: a P6 or P7 forced to `skipped` passed the
+#          whole file at exit 0. Tightened to `expectations/linux.jq`'s spelling,
+#          which is exact rather than stricter — those are the only two words
+#          either probe can produce. -->
+#   - P15 (flow-control honouring) may be `supported`, `degraded` or `skipped` as
+#     well; its own clauses below gate the per-port readings rather than the
+#     verdict word, and the summary clause keeps `unsupported` out of it.
 #   - P8 (epoll vs read(2)) is **Linux-only and must be allowed to skip**:
 #     `epoll(7)` does not exist here, `serial-nexus-sys`'s stub answers ENOTSUP, and the
 #     data plane is forbidden from using epoll anyway (invariant 1), so nothing is
@@ -50,21 +94,22 @@
 #     answer. Recorded because an expectation that was measured and held is as
 #     load-bearing as one that was refuted (§9) — the arm must not be read later as
 #     dead code merely because it has never fired.
-#   - P11 (real-port line-state ioctls) may be any status: it is opt-in behind
-#     --port (so the CI run skips), and on a named macOS port it is `degraded` by
-#     design, because TIOCGICOUNT is Linux-only and the serial node omits the
-#     counters rather than faulting (§5, §13).
+#   - P11 (real-port line-state ioctls) may be `supported`, `degraded` or
+#     `skipped`: it is opt-in behind --port (so the CI run skips), and on a named
+#     macOS port it is `degraded` by design, because TIOCGICOUNT is Linux-only and
+#     the serial node omits the counters rather than faulting (§5, §13).
 #
 # The macOS CI lane runs this with `jq -e`, unguarded, so a failing clause FAILS the
 # job — the check has been gating since the §15.30 hands-on macOS pass, not
 # informational as this comment said while it was still awaiting one. What keeps that
 # honest rather than brittle is the leniency above: the clauses assert structure and
-# the portable mechanisms, and every Linux-only probe is free to skip, degrade or
-# report unsupported. Widen a clause here rather than un-gating the step (§13).
+# the portable mechanisms, and every Linux-only probe is free to skip or degrade.
+# Widen a clause here rather than un-gating the step (§13).
 #
 # Evaluates to `true` (exit 0) only when every clause below holds.
 
-(.summary != null)
+(.summary.unsupported == 0)
+and (.summary != null)
 and (.probes | length >= 15)
 and (all(.probes[]; .status != null))
 and (any(.probes[]; .id == "P1"))
@@ -110,8 +155,8 @@ and (all(.probes[]; . as $p | ($p.id != "P5")
       or (($p.observations | any((.key | endswith(" cert"))
              and (.value | type == "string") and (.value | startswith("rate_ladder")))) | not)
       or ($p.observations | any((.key | endswith(" handshake")) and (.value | type == "string")))))
-and (any(.probes[]; .id == "P6" and .status != "unsupported"))
-and (any(.probes[]; .id == "P7" and .status != "unsupported"))
+and (any(.probes[]; .id == "P6" and (.status == "supported" or .status == "degraded")))
+and (any(.probes[]; .id == "P7" and (.status == "supported" or .status == "degraded")))
 and (any(.probes[]; .id == "P8" and (.status == "supported" or .status == "skipped")))
 and (any(.probes[]; .id == "P9" and (.status == "supported" or .status == "skipped")))
 # P9's mask column must MEASURE its own framing, and this lane is where that stopped being
@@ -173,6 +218,36 @@ and (all(.probes[]; . as $p | ($p.id != "P15") or ($p.status | startswith("skipp
          and (.value.honoured_on_readback | type == "boolean")
          and (.value.tcsetattr_ok | type == "boolean")
          and (.value.baseline_restored | type == "boolean")))))
+# **P15's SOFTWARE half** (plan §18 item 14). `xon-xoff` had no pre-check and no
+# probe, and `serial2` verifies `c_iflag` by read-back exactly as it verifies
+# `c_cflag` — so a driver that accepted `IXON`/`IXOFF` and reported them clear would
+# fault a node with the same bare error §15.53's refusal exists to prevent, and no
+# artifact on any kernel said whether one does. The reading rides on P15's open, so
+# `probe_set` does not move and `field_set` does (announced by hand in
+# `docs/doctor/README.md`, §13). Identical in both expectation files, deliberately:
+# the interesting arm is a driver that drops the request, and a clause that only ran
+# where the flags ARE honoured could never catch it — the same reasoning the hardware
+# clause above carries.
+#
+# **Presence and type, never the answer**, per the ledger item: the item declines
+# extending §15.53 to a mode nobody had measured, so a clause pinning
+# `honoured_on_readback: true` would encode the very policy the item refused to
+# write, and would redden every honest adapter that answers otherwise. What it does
+# refuse is a non-answer wearing an answer's clothes: `measured` is required either
+# way, and the reading cells are required exactly when it is `true`. The population
+# is required to be non-empty, because an `all` over zero ports is the vacuous pass
+# this file's P4 clause already exists to prevent.
+and (all(.probes[]; . as $p | ($p.id != "P15") or ($p.status | startswith("skipped")) or
+      (($p.observations | map(select(.value | type == "object")) | length) > 0
+       and ($p.observations | map(select(.value | type == "object")) | all(
+             (.value.software_flow_control | type == "object")
+             and (.value.software_flow_control.asks | type == "string")
+             and (.value.software_flow_control.measured | type == "boolean")
+             and ((.value.software_flow_control.measured | not)
+                  or ((.value.software_flow_control.tcsetattr_ok | type == "boolean")
+                      and (.value.software_flow_control.honoured_on_readback | type == "boolean")
+                      and (.value.software_flow_control.silently_dropped | type == "boolean")
+                      and (.value.software_flow_control.serial2_readback_would_fault | type == "boolean"))))))))
 # P12 (session-boundary edge, §15.39) is the mechanism that carries §6's
 # detach-release on THIS platform — Darwin destroys the readable packet P7 measures
 # — so unlike every clause above it, macOS is where P12 is load-bearing and Linux is
@@ -222,6 +297,28 @@ and (all(.probes[]; . as $p | ($p.id != "P12") or
 # that changed its mind fail the lane instead of reporting the change, which is the
 # opposite of what this probe is for. Read the numbers, diff them, then decide.
 and (any(.probes[]; .id == "P13" and (.status == "supported" or .status == "degraded")))
+# **P13's fifth shape: a reader arriving during the close-wait** (plan §18 item 22).
+# The four shapes before it all fix the reader's state *before* the close, so none of
+# them can produce the arrival the failing macOS run inhabits (notes §3.29): a reader
+# showing up inside a ~600 ms Darwin close-wait, which is what the daemon's own
+# 200 us-5 ms cadence does on every healthy run. Identical in both expectation files.
+#
+# Presence and type only — `arrived_before_close_returned` is a race this kernel may
+# legitimately win or lose, and pinning it would be this file asserting the thing the
+# shape measures. What is gated is that the row can be READ: the boolean, the
+# `reading` word that says which way it went, and the sentence stating what the row
+# does not license. Nothing else in the gate set can notice a shape that quietly
+# stopped running — the verdict does not degrade when a non-`a` shape errors, and an
+# errored shape's value is a string, which this clause's `type == "object"` guard
+# turns into a failure rather than a jq error on a bare index.
+and (all(.probes[]; . as $p | ($p.id != "P13") or
+      ($p.observations | any(.key == "e_reader_arrives_during_close_wait"
+         and (.value | type == "object")
+         and (.value.bytes_recovered_by_arriving_reader | type == "number")
+         and (.value.reader_arrival | type == "object")
+         and (.value.reader_arrival.arrived_before_close_returned | type == "boolean")
+         and (.value.reader_arrival.reading | type == "string")
+         and (.value.reader_arrival.does_not_license | type == "string")))))
 # P14 (maximum-rate search, §15.51) is opt-in behind `--port` *and* needs a
 # cross-paired rig, so `skipped` is the expected answer on every passive run and
 # on every box with one adapter. `degraded` is admissible and is not a
@@ -263,13 +360,56 @@ and (all(.probes[]; . as $p | ($p.id != "P14") or ($p.status == "skipped")
 and (all(.probes[]; . as $p | ($p.id != "P14") or ($p.status != "supported")
       or ((([$p.observations[] | select(.key == "max_reliable_baud") | .value] | last) != null)
           and (([$p.observations[] | select(.key == "ceiling_kind") | .value] | last) != null))))
+# P16 (slave-witness liveness, §15.59) is a pty probe and needs no hardware, so it
+# must MEASURE on every lane — `supported` or `degraded`, never `skipped`: a skip
+# here would mean the probe compiled out on a box that can run it, which is exactly
+# the silent regression a presence-only clause waves through. A probe error degrades
+# (`measurement_failed`), which is the arm that reddens the content clause below.
+# Identical in both expectation files — and **this lane is the one the probe was
+# built for**: the `stat` comparison it measures is the one `itest`'s witness fds
+# rest on, and Darwin's persistent devfs nodes are the reason it might not work.
+and (any(.probes[]; .id == "P16" and (.status == "supported" or .status == "degraded")))
+# **And both of P16's arms must be present, with the answer left free.** The probe
+# exists because `itest`'s `SlaveWitness::prove_open` establishes liveness through a
+# `(st_dev, st_ino, st_rdev)` comparison that works on Linux — the kernel unlinks
+# `/dev/pts/N` at the master's close — and is *expected* to degrade on Darwin's
+# persistent devfs nodes. Which of the two instruments can tell a live pair from a
+# dead one is the kernel's answer and is never pinned here; what is gated is that
+# both arms ran and both readings are readable.
+#
+# The quiet arm is a ZERO, so it is gated with its witnesses (§15.49): the pass
+# count and the elapsed microseconds, because a hangup count of 0 over a window
+# nobody sized is not a measurement. `poll_can_tell_a_live_pair_from_a_dead_one` and
+# `stat_comparison_can_tell` are the two answers a reader compares, and
+# `does_not_license` is the bound printed beside them.
+and (all(.probes[]; . as $p | ($p.id != "P16") or
+      (($p.observations | any(.key == "quiet_window_tight"
+             and (.value.passes | type == "number") and (.value.passes > 0)
+             and (.value.hangup_passes | type == "number")
+             and (.value.elapsed_us | type == "number")))
+       and ($p.observations | any(.key == "quiet_window_paced"
+             and (.value.passes | type == "number") and (.value.passes > 0)
+             and (.value.hangup_passes | type == "number")
+             and (.value.elapsed_us | type == "number")))
+       and ($p.observations | any(.key == "hangup_after_master_closed"
+             and (.value.hangup_delivered | type == "boolean")
+             and (.value.microseconds_to_hangup | type == "number")))
+       and ($p.observations | any(.key == "stat_comparison_while_master_open"
+             and (.value.shipped_prove_open_would_refuse | type == "boolean")))
+       and ($p.observations | any(.key == "stat_comparison_after_master_closed"
+             and (.value.shipped_prove_open_would_refuse | type == "boolean")))
+       and ($p.observations | any(.key == "poll_can_tell_a_live_pair_from_a_dead_one"
+             and (.value | type == "boolean")))
+       and ($p.observations | any(.key == "stat_comparison_can_tell"
+             and (.value | type == "boolean")))
+       and ($p.observations | any(.key == "does_not_license" and (.value | type == "string"))))))
 # ...and a probe that RAN must carry the numbers, which is the whole reason the
 # clauses above stay presence-and-status only. `linux.jq` has always asserted this;
 # macOS did not, so a P13 whose observations went empty reported `supported` and
 # sailed through the one lane whose answer is interesting. A verdict word cannot be
 # diffed. `skipped` is exempt (P8 here) — it did not run, so it owes nothing.
 and (all(.probes[]; . as $p
-      | ((["P6","P7","P8","P9","P10","P12","P13","P14"] | index($p.id)) == null)
+      | ((["P6","P7","P8","P9","P10","P12","P13","P14","P16"] | index($p.id)) == null)
       or ($p.status == "skipped")
       or (($p.observations | length) > 0)))
 # Provenance, same as `linux.jq` and for the same reason: a report that cannot say

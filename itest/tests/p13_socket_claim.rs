@@ -26,55 +26,23 @@
 //! `daemon/src/lib.rs` in place — the second daemon binds, never exits, and the test
 //! fails at `expect("the second daemon kept running…")`.
 
-use std::io::Read;
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use serial_nexus_itest::{TempRun, bin, daemon_answers, wait_until};
+use serial_nexus_itest::{RawDaemon, TempRun};
 
-/// A daemon child killed and reaped on drop, so a panicking assertion never leaks one.
-struct KillOnDrop(Child);
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
+/// Spawn a daemon on `run`'s socket and state file, stderr piped so a refusal's
+/// diagnostic is readable. Deliberately **not** waited for: the second daemon here is
+/// expected never to become ready.
+fn spawn(run: &TempRun) -> RawDaemon {
+    RawDaemon::builder(run).stderr_piped().spawn()
 }
 
-/// Spawn `serial-nexus-daemon` on `run`'s socket and state file, stderr piped so a
-/// refusal's diagnostic is readable. Does not wait for readiness: the second daemon here
-/// is expected never to become ready.
-fn spawn(run: &TempRun) -> KillOnDrop {
-    KillOnDrop(
-        Command::new(bin("serial-nexus-daemon"))
-            .arg("--socket")
-            .arg(run.socket())
-            .arg("--state-file")
-            .arg(run.state_file())
-            .env("XDG_RUNTIME_DIR", run.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn serial-nexus-daemon"),
-    )
-}
-
-/// Wait for `child` to exit within `timeout`, returning its exit code and stderr.
+/// Wait for `daemon` to exit within `timeout`, returning its exit code and stderr.
 /// `None` means it was still running — which, for a daemon that must refuse, is the
 /// failure this file is about.
-fn wait_exit(child: &mut KillOnDrop, timeout: Duration) -> Option<(Option<i32>, String)> {
-    let mut status = None;
-    wait_until(timeout, || {
-        status = child.0.try_wait().expect("try_wait");
-        status.is_some()
-    });
-    let status = status?;
-    let mut stderr = String::new();
-    if let Some(mut e) = child.0.stderr.take() {
-        let _ = e.read_to_string(&mut stderr);
-    }
-    Some((status.code(), stderr))
+fn wait_exit(daemon: &mut RawDaemon, timeout: Duration) -> Option<(Option<i32>, String)> {
+    let status = daemon.wait_exit(timeout)?;
+    Some((status.code(), daemon.stderr_to_string()))
 }
 
 /// **A second daemon refuses a claimed path even when the socket is gone from it.**
@@ -85,8 +53,7 @@ fn a_claimed_socket_path_refuses_a_second_daemon_after_its_socket_is_unlinked() 
 
     let mut first = spawn(&run);
     assert!(
-        wait_until(Duration::from_secs(10), || socket.exists()
-            && daemon_answers(&socket)),
+        first.wait_ready(),
         "the first daemon never answered on {}",
         socket.display()
     );
@@ -126,7 +93,7 @@ fn a_claimed_socket_path_refuses_a_second_daemon_after_its_socket_is_unlinked() 
 
     // The first daemon is untouched by all of this — it is still the owner.
     assert_eq!(
-        first.0.try_wait().expect("try_wait on the first daemon"),
+        first.try_wait(),
         None,
         "the first daemon died while the second was refused"
     );

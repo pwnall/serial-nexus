@@ -37,12 +37,11 @@
 //! itself** — §16.11 lifts the "the harness may not invoke cargo" constraint — so it is
 //! self-contained and the dedicated bash CI job retires with the script.
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
-use serial_nexus_itest::{Rpc, TempRun, wait_until};
+use serial_nexus_itest::{KillOnDrop, Rpc, TempRun, wait_daemon_ready};
 
 /// The excluded template workspace root (`examples/external-codec/`), derived from this
 /// crate's compile-time manifest dir (`itest/` — the directory, §15.40) → the workspace root.
@@ -63,22 +62,6 @@ fn template_target() -> PathBuf {
 
 fn acme_daemon_bin() -> PathBuf {
     template_target().join("debug").join("acme-daemon")
-}
-
-/// A child that is SIGKILLed and reaped on drop, so a panicking test never leaks the
-/// custom daemon.
-struct KillOnDrop(Child);
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_socket(sock: &Path) -> bool {
-    wait_until(Duration::from_secs(10), || {
-        std::os::unix::net::UnixStream::connect(sock).is_ok()
-    })
 }
 
 fn codecs_contains(codecs: &Value, name: &str) -> bool {
@@ -160,9 +143,13 @@ fn external_codec_template_builds_and_serves_acme_alongside_builtins() {
             .spawn()
             .expect("spawn acme-daemon"),
     );
+    // `RawDaemon` cannot boot this one — it is a *different* binary, the out-of-tree
+    // template's own daemon — but readiness is the same question, so it is asked with
+    // the same shared answer rather than a local `test -S` substitute. It is also the
+    // one daemon in this suite with no §15.43 leash: the flag is the consumer's to add.
     assert!(
-        wait_socket(&socket),
-        "acme-daemon control socket never appeared at {}",
+        wait_daemon_ready(&socket),
+        "acme-daemon control socket never answered at {}",
         socket.display()
     );
     let rpc = Rpc::new(socket);

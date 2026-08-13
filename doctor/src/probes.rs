@@ -1508,6 +1508,33 @@ enum CloseShape {
     /// they *do not* differ is one where a held fd buys nothing, and seven guards
     /// in `itest` would need their argument rewritten rather than their code.
     NoReaderSecondFdHeld,
+    /// As `NoReader`, but **a reader arrives while the kernel is inside its
+    /// close-wait** — after `close(2)` has been entered on the slave and before it
+    /// has returned.
+    ///
+    /// **This is the shape the failing macOS test inhabits, and no other shape
+    /// covers it** (plan §18 item 22; notes §3.29). The four above all fix the
+    /// reader's state *before* the close: `b` drains and then closes, `a`/`c`/`d`
+    /// never read at all. On a kernel that returns from the close immediately
+    /// (Linux `retains`, or any kernel that discards promptly) that distinction is
+    /// invisible, because there is no window to arrive in. On one that **waits**
+    /// — XNU's `ptsclose` → `ttylclose` → `ttywflush` → `ttywait` parks up to
+    /// `t_timeout`, measured at 600104 µs on Darwin 24.6.0 with no reader — the
+    /// window is ~0.6 s wide and the daemon's reader cadence (200 µs–5 ms) lands
+    /// inside it on every healthy run. What that arrival buys is precisely what
+    /// notes §3.29 could only *predict*: whether the close returns early with the
+    /// bytes recovered, or whether it still pays the whole timeout.
+    ///
+    /// **The instrument states its own applicability**, because a reader that
+    /// arrives after the close has already returned measured nothing. The reader
+    /// is a thread already spinning on an `AtomicBool` when the close is entered,
+    /// so the arrival is a cache-line and a syscall away rather than a thread
+    /// spawn away, and both timestamps come off one `Instant` epoch:
+    /// `arrived_before_close_returned` says whether the race was won, and
+    /// `reading` says what the row licenses when it was not. A kernel that never
+    /// waits will win it or lose it by microseconds and either answer is honest —
+    /// what the row must never do is report an arrival it did not make.
+    ReaderArrivesDuringCloseWait,
 }
 
 impl CloseShape {
@@ -1517,7 +1544,72 @@ impl CloseShape {
             CloseShape::ReaderDrains => "b_reader_drains_before_close",
             CloseShape::NoReaderNonblocking => "c_no_reader_nonblocking_slave",
             CloseShape::NoReaderSecondFdHeld => "d_no_reader_second_fd_held",
+            CloseShape::ReaderArrivesDuringCloseWait => "e_reader_arrives_during_close_wait",
         }
+    }
+}
+
+/// When the arriving reader of [`CloseShape::ReaderArrivesDuringCloseWait`] got
+/// there, relative to the close it was racing.
+///
+/// Every field is measured against one `Instant` epoch taken before the reader
+/// thread is armed, so the two threads' readings are comparable without assuming
+/// anything about clock domains.
+struct ArrivalTiming {
+    /// µs from the instant the close was **entered** to the reader's first
+    /// `read(2)` on the master. Not the read's completion: the question is when
+    /// the reader showed up, and a kernel that hands the bytes over instantly and
+    /// one that parks are both "arrived".
+    first_read_offset_us: u64,
+    /// µs from the same instant to the close's **return**. Equal to the shape's
+    /// `close_microseconds`; carried inside the block too so the ordering can be
+    /// re-derived from the arrival cells alone.
+    close_returned_us: u64,
+    /// Did the reader's first read enter before the close returned? The
+    /// discriminator, and the whole reason the block carries a `reading`.
+    arrived_before_close_returned: bool,
+    /// What the arriving reader recovered, packet-mode control bytes already
+    /// subtracted.
+    bytes_recovered: u64,
+    /// How that drain ended (`EAGAIN` / `EIO` / `eof` / …).
+    terminal: String,
+    /// µs the arming handshake cost — the reader signalling that it is spinning,
+    /// before the close is entered. A witness on the instrument rather than on
+    /// the kernel: an arming cost near the close's own duration would mean the
+    /// race was decided by thread scheduling and not by the kernel's policy.
+    arm_us: u64,
+}
+
+impl ArrivalTiming {
+    /// What this row licenses, in the instrument's own words (§13's
+    /// self-testimony rule 3: an instrument states what its reading does *not*
+    /// license).
+    fn reading(&self) -> &'static str {
+        if self.arrived_before_close_returned {
+            "arrived-inside-the-close-window"
+        } else {
+            "lost-the-race"
+        }
+    }
+
+    fn does_not_license(&self) -> &'static str {
+        if self.arrived_before_close_returned {
+            "the bytes and the close time here belong to a reader that arrived INSIDE the close; they say nothing about a reader that never arrives — that is shape `a`"
+        } else {
+            "the close returned before the reader's first read, so this row observed no arrival inside the close window and licenses NOTHING about one. On a kernel whose close does not wait there is no window to arrive in, which is a legitimate reason to read this and not a defect."
+        }
+    }
+
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "arrived_before_close_returned": self.arrived_before_close_returned,
+            "reading": self.reading(),
+            "does_not_license": self.does_not_license(),
+            "reader_first_read_offset_us": self.first_read_offset_us,
+            "close_returned_us": self.close_returned_us,
+            "reader_terminal_read": self.terminal,
+            "reader_arm_microseconds": self.arm_us,
+        })
     }
 }
 
@@ -1529,6 +1621,15 @@ struct CloseResult {
     close_us: u64,
     /// Bytes the master recovered *before* the close (0 for the no-reader shapes).
     bytes_before: u64,
+    /// Bytes the *arriving* reader recovered — 0 for every shape but `e`, the only
+    /// one that has a second reader at all.
+    ///
+    /// Deliberately **not** called "recovered during the close": that would be a
+    /// wrong cell on exactly the run where the row is least trustworthy, since a
+    /// reader that lost the race recovered its bytes *after* the close returned.
+    /// `reader_arrival.arrived_before_close_returned` is the cell that says which
+    /// of the two happened, and it is the one to read first.
+    bytes_during: u64,
     /// Bytes the master recovered *after* the close.
     bytes_after: u64,
     /// How the master's post-close drain ended (`eof` / `EIO` / …).
@@ -1541,21 +1642,49 @@ struct CloseResult {
     /// measurement window opened. Reported, not assumed: Linux queues one
     /// `TIOCPKT_IOCTL` control byte and a BSD may queue a termios struct behind it.
     baseline_packet_bytes: u64,
+    /// Present only for [`CloseShape::ReaderArrivesDuringCloseWait`]: when the
+    /// arriving reader got there, and what it recovered.
+    arrival: Option<ArrivalTiming>,
 }
 
 impl CloseResult {
+    /// Everything the master got back, wherever in the close it got it.
+    ///
+    /// Split out rather than spelled at each site because shape `e` recovers its
+    /// payload in a *third* place — during the close — and a total that summed
+    /// only before and after would publish `bytes_lost: 64` beside a reader that
+    /// recovered all 64. A wrong cell is worse than a missing one (§13).
+    fn recovered(&self) -> u64 {
+        self.bytes_before + self.bytes_during + self.bytes_after
+    }
+
     fn observations(&self, written: u64) -> serde_json::Value {
-        serde_json::json!({
+        let recovered = self.recovered();
+        let mut v = serde_json::json!({
             "bytes_written_by_slave": written,
             "bytes_recovered_before_close": self.bytes_before,
             "bytes_recovered_after_close": self.bytes_after,
-            "bytes_recovered_total": self.bytes_before + self.bytes_after,
-            "bytes_lost": written.saturating_sub(self.bytes_before + self.bytes_after),
+            "bytes_recovered_total": recovered,
+            "bytes_lost": written.saturating_sub(recovered),
             "close_microseconds": self.close_us,
             "terminal_read": self.terminal,
             "slave_termios_mode": self.slave_mode,
             "baseline_packet_bytes": self.baseline_packet_bytes,
-        })
+        });
+        // The arrival cells exist only on the shape that has an arriving reader.
+        // Stamping `bytes_recovered_by_arriving_reader: 0` on the other four would add a
+        // leaf path to every one of them for a number that is structurally zero —
+        // cost paid by every cross-era intersection, information bought: none.
+        if let Some(a) = &self.arrival
+            && let Some(o) = v.as_object_mut()
+        {
+            o.insert(
+                "bytes_recovered_by_arriving_reader".to_owned(),
+                serde_json::json!(self.bytes_during),
+            );
+            o.insert("reader_arrival".to_owned(), a.observations());
+        }
+        v
     }
 }
 
@@ -1567,6 +1696,11 @@ const P13_PAYLOAD: usize = 64;
 /// measured on Linux, and two below Darwin's `t_timeout` (60 ticks), so neither
 /// kernel lands near the boundary.
 const P13_WAIT_THRESHOLD_US: u64 = 1_000;
+/// How long either side of shape `e`'s arming handshake will spin before giving
+/// up and letting the timestamps report the loss. Two orders of magnitude above
+/// Darwin's measured 600 ms close-wait, so a legitimate wait is never cut short,
+/// and finite so a wedged close cannot turn this diagnostic into a spinner.
+const P13_ARRIVAL_SPIN_CAP: Duration = Duration::from_secs(60);
 
 /// What does this kernel do with bytes a pts client wrote and the master has not
 /// read, when the client closes?
@@ -1605,7 +1739,19 @@ const P13_WAIT_THRESHOLD_US: u64 = 1_000;
 /// **Cost.** Microseconds on a kernel that retains or flushes. On one that waits,
 /// shapes `a` and `c` each pay their timeout once — up to ~0.6 s apiece on
 /// Darwin — which is the price of measuring the thing that matters and is paid
-/// only where the answer is interesting.
+/// only where the answer is interesting. Shape `e` pays *nothing extra there* and
+/// that is its point: a reader inside the window is what a waiting kernel is
+/// waiting for.
+///
+/// **The five shapes, and why the fifth was added** (plan §18 item 22). Four of
+/// them fix the reader's state before the close — `b` drains first, `a`/`c`/`d`
+/// never read — so between them they cannot produce a reader that arrives *while*
+/// the kernel is inside its close-wait. That is the shape notes §3.29's
+/// unexplained macOS red inhabits: the daemon's reader runs a 200 µs–5 ms cadence
+/// against a ~600 ms Darwin close-wait, so on every healthy run it arrives inside,
+/// and the question the record could only answer by prediction is whether the
+/// arrival ends the wait with the bytes recovered. `e` measures it, and reports
+/// whether it managed to arrive at all rather than assuming it did.
 pub fn p13_last_close_disposition() -> Probe {
     let p = Probe::new(
         "P13",
@@ -1617,6 +1763,7 @@ pub fn p13_last_close_disposition() -> Probe {
         CloseShape::ReaderDrains,
         CloseShape::NoReaderNonblocking,
         CloseShape::NoReaderSecondFdHeld,
+        CloseShape::ReaderArrivesDuringCloseWait,
     ];
     let mut p = p;
     let mut results: Vec<(CloseShape, CloseResult)> = Vec::new();
@@ -1646,7 +1793,7 @@ pub fn p13_last_close_disposition() -> Probe {
         );
     };
 
-    let recovered = bare.bytes_before + bare.bytes_after;
+    let recovered = bare.recovered();
     // **The reference-count reading, and it is the comparison a reader would not
     // otherwise make.** Shape `d` is shape `a` with a second fd on the same pts
     // held across the writer's close, so the pair isolates the *last*-close edge
@@ -1665,10 +1812,33 @@ pub fn p13_last_close_disposition() -> Probe {
     let ref_count = match held {
         Some(h) => format!(
             " **The last-close reference count** is measured too, by holding a second fd on the same pts across the writer's close (`d_no_reader_second_fd_held` against `a_no_reader_blocking_slave`): {} of {P13_PAYLOAD} byte(s) survive with the witness held against {} without it, and the terminal read is `{}` against `{}`. Compare the two rows rather than reading either alone — that pair is the whole measurement, and if *neither* the bytes nor the terminal move on some kernel, a held fd buys nothing there and the harness rule that depends on it (notes §3.56) is resting on nothing.",
-            h.bytes_before + h.bytes_after,
-            bare.bytes_before + bare.bytes_after,
+            h.recovered(),
+            bare.recovered(),
             h.terminal,
             bare.terminal,
+        ),
+        None => String::new(),
+    };
+
+    // **The arriving-reader reading** (plan §18 item 22). Shape `e` is shape `a`
+    // with a reader that shows up *inside* the close rather than before it or
+    // never — the shape notes §3.29's unexplained macOS red actually inhabits, and
+    // the one none of the four above can produce. Its sentence leads with whether
+    // the arrival happened at all, because a row that lost the race licenses
+    // nothing and must not be read as an answer (§13, §15.49).
+    let arriving = results
+        .iter()
+        .find(|(s, _)| matches!(s, CloseShape::ReaderArrivesDuringCloseWait))
+        .and_then(|(_, r)| r.arrival.as_ref().map(|a| (r, a)));
+    let arrival_note = match arriving {
+        Some((r, a)) if a.arrived_before_close_returned => format!(
+            " **A reader that arrives *during* the close** (`e_reader_arrives_during_close_wait`) got its first `read(2)` in {} µs after the close was entered and before it returned, recovered {} of {P13_PAYLOAD} byte(s) there, and the close then took {} µs against {} µs with no reader at all. On a kernel whose close waits for a reader, that difference is the whole finding: it is the daemon's own reader cadence (200 µs–5 ms) landing inside the wait, and a run where the close still pays its full timeout means the reader stalled — a daemon-side event, not a kernel one (notes §3.29).",
+            a.first_read_offset_us, a.bytes_recovered, r.close_us, bare.close_us,
+        ),
+        Some((_, a)) => format!(
+            " **The arriving-reader shape did not observe an arrival** (`e_reader_arrives_during_close_wait`): the close returned {} µs after it was entered and the reader's first `read(2)` came {} µs after that, so nothing in that row licenses a claim about a reader inside the close window. That is the expected reading on a kernel whose close does not wait — there is no window to arrive in — and it is reported rather than suppressed, because a shape that silently stopped asking its question is the failure this probe set exists to avoid (§13).",
+            a.close_returned_us,
+            a.first_read_offset_us.saturating_sub(a.close_returned_us),
         ),
         None => String::new(),
     };
@@ -1677,7 +1847,7 @@ pub fn p13_last_close_disposition() -> Probe {
     let drained_note = match drained {
         Some(d) => format!(
             " With a master that drains before the close, {} of {P13_PAYLOAD} byte(s) are recovered and the close takes {} µs — the healthy-reader case, and the one the daemon is in.",
-            d.bytes_before + d.bytes_after,
+            d.recovered(),
             d.close_us
         ),
         None => String::new(),
@@ -1707,7 +1877,7 @@ pub fn p13_last_close_disposition() -> Probe {
     p.verdict(
             Status::Supported,
             &format!(
-                "This kernel **{policy}** bytes a pts client wrote but the master never read: with no reader, {recovered} of {P13_PAYLOAD} byte(s) survive the last close and `close(2)` takes {} µs (terminal read `{}`).{drained_note} Numbers, not a verdict — every policy is legitimate and the daemon is correct under each (§7.2 drains before finalizing a close, §5 accounts what it reads). Read it for two things: a cross-kernel diff, and the reason a harness reads a byte counter while its client is still open rather than after (notes §3.29). A `waits-then-*` kernel additionally means a lost byte implies a reader stalled for the whole timeout, not a lost microsecond race.{ref_count}",
+                "This kernel **{policy}** bytes a pts client wrote but the master never read: with no reader, {recovered} of {P13_PAYLOAD} byte(s) survive the last close and `close(2)` takes {} µs (terminal read `{}`).{drained_note} Numbers, not a verdict — every policy is legitimate and the daemon is correct under each (§7.2 drains before finalizing a close, §5 accounts what it reads). Read it for two things: a cross-kernel diff, and the reason a harness reads a byte counter while its client is still open rather than after (notes §3.29). A `waits-then-*` kernel additionally means a lost byte implies a reader stalled for the whole timeout, not a lost microsecond race.{ref_count}{arrival_note}",
                 bare.close_us, bare.terminal
             ),
         )
@@ -1823,9 +1993,14 @@ fn p13_shape(shape: CloseShape) -> anyhow::Result<CloseResult> {
 
     // The measurement. `drop` is not timed reliably enough to trust here, so the
     // close is explicit and bracketed.
-    let t0 = Instant::now();
-    drop(slave);
-    let close_us = t0.elapsed().as_micros() as u64;
+    let (close_us, bytes_during, arrival) = match shape {
+        CloseShape::ReaderArrivesDuringCloseWait => p13_close_with_arriving_reader(slave, fd),
+        _ => {
+            let t0 = Instant::now();
+            drop(slave);
+            (t0.elapsed().as_micros() as u64, 0, None)
+        }
+    };
 
     std::thread::sleep(PTY_SETTLE);
     let (raw_after, reads_after, _, terminal) = read_available(fd, &mut buf, 64);
@@ -1840,11 +2015,442 @@ fn p13_shape(shape: CloseShape) -> anyhow::Result<CloseResult> {
     Ok(CloseResult {
         close_us,
         bytes_before,
+        bytes_during,
         bytes_after,
         terminal,
         slave_mode,
         baseline_packet_bytes,
+        arrival,
     })
+}
+
+/// Close the slave with a reader arriving **inside** the close, and time both.
+///
+/// Returns the close's own duration, what the arriving reader recovered, and the
+/// arrival block.
+///
+/// **Why a spinning thread rather than a sleeping one.** The window this is trying
+/// to land inside is the kernel's, and it is 600104 µs wide on Darwin and ~7–20 µs
+/// wide on Linux. A reader that sleeps, or that is *spawned* at the close, cannot
+/// land inside the second of those at all — so the shape would be structurally
+/// inert on the platform of record and could only ever report the other kernel's
+/// answer, which is §13's vacuity taxonomy 2 (a discriminator that cannot fire).
+/// The reader is therefore already running and spinning on an `AtomicBool` before
+/// the close is entered, and the arming handshake's own cost is reported
+/// (`reader_arm_microseconds`) so a reader that was *not* ready in time is visible
+/// rather than inferred.
+///
+/// **Both spins are bounded.** A `close(2)` that never returns would otherwise
+/// leave the reader spinning a core forever, and the doctor is a diagnostic that
+/// must not become the fault it is diagnosing (§15.36's never-busy-wait rule
+/// applied to this binary). Each side gives up after [`P13_ARRIVAL_SPIN_CAP`] and
+/// proceeds; the timestamps then say plainly that the race was lost.
+fn p13_close_with_arriving_reader(
+    slave: std::os::fd::OwnedFd,
+    fd: RawFd,
+) -> (u64, u64, Option<ArrivalTiming>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let epoch = Instant::now();
+    let armed = AtomicBool::new(false);
+    let closing = AtomicBool::new(false);
+
+    std::thread::scope(|s| {
+        let reader = s.spawn(|| {
+            let mut rbuf = [0u8; 4096];
+            armed.store(true, Ordering::Release);
+            let give_up = Instant::now() + P13_ARRIVAL_SPIN_CAP;
+            while !closing.load(Ordering::Acquire) && Instant::now() < give_up {
+                std::hint::spin_loop();
+            }
+            let at = epoch.elapsed().as_micros() as u64;
+            let (bytes, reads, _, terminal) = read_available(fd, &mut rbuf, 64);
+            // One packet-mode control byte per read is not client data — the same
+            // correction every other drain in this probe applies.
+            (at, bytes.saturating_sub(reads), terminal)
+        });
+
+        let give_up = Instant::now() + P13_ARRIVAL_SPIN_CAP;
+        while !armed.load(Ordering::Acquire) && Instant::now() < give_up {
+            std::hint::spin_loop();
+        }
+        let armed_at = epoch.elapsed().as_micros() as u64;
+
+        let close_entered = epoch.elapsed().as_micros() as u64;
+        closing.store(true, Ordering::Release);
+        drop(slave);
+        let close_returned = epoch.elapsed().as_micros() as u64;
+
+        // **A reader that never ran must not read as one that arrived.** The
+        // fallback timestamp is `u64::MAX`, not `0`: a zero here would be *earlier*
+        // than the close's return and would publish `arrived_before_close_returned:
+        // true` beside a byte count of zero — an instrument reporting an arrival it
+        // did not observe, which is the one failure this shape exists to avoid.
+        let (first_read_at, bytes_recovered, terminal) =
+            reader
+                .join()
+                .unwrap_or((u64::MAX, 0, "reader thread panicked".to_owned()));
+
+        let timing = ArrivalTiming {
+            first_read_offset_us: first_read_at.saturating_sub(close_entered),
+            close_returned_us: close_returned.saturating_sub(close_entered),
+            arrived_before_close_returned: first_read_at < close_returned,
+            bytes_recovered,
+            terminal,
+            arm_us: armed_at,
+        };
+        (
+            close_returned.saturating_sub(close_entered),
+            bytes_recovered,
+            Some(timing),
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// P16 — can a held pts slave fd tell that its master has gone? (§15.59)
+// ---------------------------------------------------------------------------
+
+/// Back-to-back zero-timeout passes in the quiet window. The same count P12's
+/// tight window uses, for the same reason: it is a number six committed artifacts
+/// already carry, so a reader comparing the two windows is comparing like with
+/// like.
+const P16_TIGHT_PASSES: u32 = 200;
+/// Passes in the paced window, at the PTY node's own `IDLE_POLL`. "No hangup in
+/// back-to-back syscalls" and "no hangup at the mechanism's cadence" are different
+/// claims (§15.49 clause 3), and the second is the one the harness's usage
+/// resembles.
+const P16_PACED_PASSES: u32 = 64;
+const P16_PACE: Duration = Duration::from_millis(5);
+/// How long the post-close arm will wait for `POLLHUP`. Generous by two orders of
+/// magnitude against the microseconds Linux takes, because a kernel that delivers
+/// the hangup late is a *finding* and a probe that gave up early would report it
+/// as an absence.
+const P16_HANGUP_WAIT: Duration = Duration::from_millis(500);
+
+/// One sampling window on the held slave fd: how many passes, over what wall
+/// clock, and how many of them saw `POLLHUP`.
+///
+/// The wall clock is in **microseconds** because that is the unit of the loop's
+/// true cost — a millisecond field over a 200-pass tight window prints `0` and
+/// witnesses nothing (§15.49 clause 1).
+struct P16Window {
+    passes: u32,
+    hangups: u32,
+    elapsed_us: u64,
+    /// Every distinct `revents` label the window saw, so a kernel that answers
+    /// with some *other* bit is visible rather than folded into "not POLLHUP".
+    revents: BTreeMap<String, u64>,
+}
+
+impl P16Window {
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "passes": self.passes,
+            "hangup_passes": self.hangups,
+            "elapsed_us": self.elapsed_us,
+            "revents_seen": self.revents,
+        })
+    }
+}
+
+/// Poll the held slave for `POLLHUP` `passes` times, pausing `pause` between them.
+///
+/// Takes the fd as a borrow rather than a `RawFd`: `BorrowedFd::borrow_raw` is an
+/// `unsafe` fn and `unsafe` lives only in `serial_nexus_sys` (§16.3), which is the
+/// same wall that sent this question to the doctor in the first place. `AsFd`
+/// costs nothing and keeps the lifetime real instead of promised.
+fn p16_window<Fd: AsFd>(fd: &Fd, passes: u32, pause: Duration) -> P16Window {
+    let borrowed = fd.as_fd();
+    let mut w = P16Window {
+        passes: 0,
+        hangups: 0,
+        elapsed_us: 0,
+        revents: BTreeMap::new(),
+    };
+    let t0 = Instant::now();
+    for _ in 0..passes {
+        let mut fds = [PollFd::new(borrowed, PollFlags::POLLHUP)];
+        let revents = match poll(&mut fds, PollTimeout::ZERO) {
+            Ok(_) => fds[0].revents().unwrap_or_else(PollFlags::empty),
+            Err(_) => PollFlags::empty(),
+        };
+        w.passes += 1;
+        if revents.contains(PollFlags::POLLHUP) {
+            w.hangups += 1;
+        }
+        *w.revents.entry(revents_label(revents)).or_insert(0) += 1;
+        if !pause.is_zero() {
+            std::thread::sleep(pause);
+        }
+    }
+    w.elapsed_us = t0.elapsed().as_micros() as u64;
+    w
+}
+
+/// What the harness's three-step `prove_open` comparison can see, measured rather
+/// than reasoned about.
+///
+/// The three steps are mirrored exactly (`itest/src/lib.rs`'s `SlaveWitness`):
+/// `fstat` on the held fd, `stat` on the path it was opened through, and the
+/// `(st_dev, st_ino, st_rdev)` triple compared between them. They are reported
+/// separately because they fail independently and because step 1 is the one the
+/// record already measured to be a tautology (notes §3.60).
+struct P16StatReading {
+    fstat_answers: bool,
+    path_resolves: bool,
+    /// `None` when the path did not resolve — there is nothing to compare against,
+    /// and a `false` there would read as "a different device" rather than "no
+    /// device".
+    identity_matches: Option<bool>,
+}
+
+impl P16StatReading {
+    fn take(file: &std::fs::File, path: &str) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        let held = file.metadata().ok();
+        let live = std::fs::metadata(path).ok();
+        let triple = |m: &std::fs::Metadata| (m.dev(), m.ino(), m.rdev());
+        P16StatReading {
+            fstat_answers: held.is_some(),
+            path_resolves: live.is_some(),
+            identity_matches: match (&held, &live) {
+                (Some(h), Some(l)) => Some(triple(h) == triple(l)),
+                _ => None,
+            },
+        }
+    }
+
+    /// Would the shipped `prove_open` **refuse** this witness? That is the whole
+    /// question the harness asks, expressed as the disjunction its code computes:
+    /// the fd's own `fstat` failed, or the path stopped resolving, or the path
+    /// resolves to some other device.
+    fn prove_open_would_refuse(&self) -> bool {
+        !self.fstat_answers || !self.path_resolves || self.identity_matches == Some(false)
+    }
+
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "fstat_on_the_held_fd_answers": self.fstat_answers,
+            "path_still_resolves": self.path_resolves,
+            "device_identity_matches": self.identity_matches,
+            "shipped_prove_open_would_refuse": self.prove_open_would_refuse(),
+        })
+    }
+}
+
+/// Everything one run of P16 measured.
+struct P16Result {
+    tight: P16Window,
+    paced: P16Window,
+    stat_while_open: P16StatReading,
+    /// The post-close arm: did `POLLHUP` arrive, and how long after the master's
+    /// close.
+    hangup_after_close: bool,
+    hangup_after_us: u64,
+    hangup_revents: String,
+    stat_after_close: P16StatReading,
+    /// What a `read(2)` on the slave answered once the master was gone — a second
+    /// witness on the same event, in the vocabulary P6/P13 already report.
+    read_after_close: String,
+}
+
+impl P16Result {
+    /// Can `poll(POLLHUP)` tell a live pair from a dead one **here**? Both arms,
+    /// because either alone is uninformative: a fd that reports `POLLHUP` always
+    /// answers "dead" correctly and "alive" wrongly.
+    fn poll_can_tell(&self) -> bool {
+        self.hangup_after_close && self.tight.hangups == 0 && self.paced.hangups == 0
+    }
+
+    /// Can the shipped `stat`-comparison tell? Same two-armed shape: it must
+    /// **not** refuse a witness whose master is open, and it must refuse one whose
+    /// master has gone.
+    fn stat_can_tell(&self) -> bool {
+        !self.stat_while_open.prove_open_would_refuse()
+            && self.stat_after_close.prove_open_would_refuse()
+    }
+}
+
+/// **P16 — can a held pts slave fd tell that its master has gone?** (§15.59)
+///
+/// **Why this is a probe and not a paragraph.** `itest`'s `SlaveWitness::prove_open`
+/// is the enforcement behind notes §3.56's seven converted guards: it establishes
+/// that a held slave is still live by comparing `(st_dev, st_ino, st_rdev)` against
+/// a fresh `stat` of the path the fd was opened through. That works **on Linux**
+/// because the kernel unlinks `/dev/pts/N` at the *master's* close — measured
+/// (notes §3.60), `fstat(fd)` `Ok(020600)` beside `stat(path)` `ENOENT` on one
+/// closed pair. On Darwin, whose `/dev/ttysNNN` are persistent devfs nodes, the
+/// same comparison is **expected to degrade** to step 1's tautology plus the
+/// compile-time borrow. Expected, never measured: §7 forbids exactly that shape of
+/// one-way claim, and notes §3.60 named this probe as the instrument that would
+/// close it. `poll(POLLHUP)` is the portable candidate, and `itest` may not issue
+/// it — `unsafe` lives only in `serial_nexus_sys` (§16.3) — so the doctor is its
+/// home.
+///
+/// **Two arms, and each is the other's control** (§15.49). The quiet arm polls the
+/// held slave while the master is **open**, where `POLLHUP` must be absent; the
+/// firing arm polls the same fd through the same mask after the master closes,
+/// where it must arrive. A probe with only the second would report a hangup that
+/// was never absent — the reading is "this fd says dead", which is worthless
+/// without "and it said alive a moment ago" — and one with only the first would be
+/// a zero with no witness. Both windows are wall-clocked in microseconds, and the
+/// quiet arm runs twice: back-to-back and at the PTY node's own 5 ms cadence,
+/// because those are different claims.
+///
+/// **It reports both instruments side by side and judges neither kernel.** The
+/// `stat` comparison is mirrored step for step from the harness, so a report says
+/// what the shipped check *would have done* on this kernel rather than what this
+/// probe thinks of it. `poll_can_tell` and `stat_can_tell` are the two answers; a
+/// kernel where the second is `false` is `degraded` with the observation named,
+/// which is §7's rule and not a complaint about Darwin.
+///
+/// Passive: it needs no `--port` and opens no device but a pty. Cost ~0.33 s, the
+/// paced window's 64 × 5 ms.
+pub fn p16_slave_witness_liveness() -> Probe {
+    let p = Probe::new(
+        "P16",
+        "pts slave-witness liveness",
+        "Does a held pts slave fd report POLLHUP once the master closes, and stay quiet while it is open (§15.59)?",
+    );
+    match p16_inner() {
+        Ok(r) => p16_verdict(p, &r),
+        Err(e) => measurement_failed(
+            p,
+            &e,
+            "Whether a held pts slave fd can tell that its master has gone is unmeasured on this kernel, so `itest`'s witness-fd argument (notes §3.56) stays resting on the `stat` comparison alone.",
+        ),
+    }
+}
+
+fn p16_inner() -> anyhow::Result<P16Result> {
+    let master = new_master()?;
+    let pts = sys::ptsname(&master)?;
+    apply_pty_baseline(&master, &pts)?;
+
+    // The witness, opened exactly as `itest::attach_slave` opens it: blocking and
+    // `O_NOCTTY`. Blocking deliberately — P13 measures an `O_NONBLOCK` slave losing
+    // its queued bytes unconditionally on Darwin, so a witness opened non-blocking
+    // would arm the hazard it is held to disarm (notes §3.56), and a probe that
+    // measured some *other* fd's behaviour would answer a question nobody asked.
+    let slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())?;
+    let slave = std::fs::File::from(slave);
+
+    // Arm A, the negative control: the master is open, so the hangup must be
+    // absent. Taken before anything closes, and both windows run on the same fd
+    // through the same mask the firing arm will use.
+    let tight = p16_window(&slave, P16_TIGHT_PASSES, Duration::ZERO);
+    let paced = p16_window(&slave, P16_PACED_PASSES, P16_PACE);
+    let stat_while_open = P16StatReading::take(&slave, &pts);
+
+    // The edge under test.
+    drop(master);
+
+    // Arm B: the same fd, the same mask. Bounded rather than one-shot, because a
+    // kernel that delivers the hangup a millisecond later is a finding and a
+    // one-shot poll would file it as an absence.
+    let t0 = Instant::now();
+    let mut fds = [PollFd::new(slave.as_fd(), PollFlags::POLLHUP)];
+    let timeout = PollTimeout::try_from(P16_HANGUP_WAIT).unwrap_or(PollTimeout::NONE);
+    let revents = match poll(&mut fds, timeout) {
+        Ok(_) => fds[0].revents().unwrap_or_else(PollFlags::empty),
+        Err(_) => PollFlags::empty(),
+    };
+    let hangup_after_us = t0.elapsed().as_micros() as u64;
+
+    let stat_after_close = P16StatReading::take(&slave, &pts);
+    let mut buf = [0u8; 256];
+    let (_, _, _, read_after_close) = read_available(slave.as_raw_fd(), &mut buf, 4);
+
+    Ok(P16Result {
+        tight,
+        paced,
+        stat_while_open,
+        hangup_after_close: revents.contains(PollFlags::POLLHUP),
+        hangup_after_us,
+        hangup_revents: revents_label(revents),
+        stat_after_close,
+        read_after_close,
+    })
+}
+
+/// Fold P16's measurement into a verdict and a consequence.
+///
+/// Split out and pure over the result so both arms are testable on a box that can
+/// only produce one of them (§9): the interesting `degraded` shapes are a kernel
+/// where the hangup never arrives and one where the quiet arm was not quiet, and
+/// neither is reachable on the platform of record.
+fn p16_verdict(p: Probe, r: &P16Result) -> Probe {
+    let p = p
+        .observe("quiet_window_tight", r.tight.observations())
+        .observe("quiet_window_paced", r.paced.observations())
+        .observe("stat_comparison_while_master_open", r.stat_while_open.observations())
+        .observe(
+            "hangup_after_master_closed",
+            serde_json::json!({
+                "hangup_delivered": r.hangup_after_close,
+                "microseconds_to_hangup": r.hangup_after_us,
+                "revents": r.hangup_revents,
+                "read_after_close": r.read_after_close,
+            }),
+        )
+        .observe("stat_comparison_after_master_closed", r.stat_after_close.observations())
+        .observe("poll_can_tell_a_live_pair_from_a_dead_one", r.poll_can_tell())
+        .observe("stat_comparison_can_tell", r.stat_can_tell())
+        .observe(
+            "does_not_license",
+            "this measures whether a held slave fd can observe its MASTER going away. It says nothing about whether the process on the other side is alive, and nothing about a serial fd, whose peer is a wire and cannot hang up this way (§15.59).",
+        );
+
+    // The control first, because a quiet arm that was not quiet makes the firing
+    // arm unreadable: "this fd reports a hangup" is not a measurement if it
+    // reported one while the master was open (§15.49's control rule).
+    if r.tight.hangups > 0 || r.paced.hangups > 0 {
+        return p.verdict(
+            Status::Degraded,
+            &format!(
+                "**The negative control fired**: this kernel reported `POLLHUP` on a held pts slave in {} of {} back-to-back passes and {} of {} paced passes **while the master was still open**, so the post-close reading below cannot be read as a liveness signal — an fd that always says `hangup` answers \"dead\" correctly and \"alive\" wrongly. `itest`'s witness argument (notes §3.56) must keep resting on the `stat` comparison here, whose own two-armed reading is `stat_comparison_can_tell: {}`.",
+                r.tight.hangups, r.tight.passes, r.paced.hangups, r.paced.passes, r.stat_can_tell()
+            ),
+        );
+    }
+
+    let stat_note = if r.stat_can_tell() {
+        format!(
+            " The **shipped `stat` comparison also tells them apart here**: `itest`'s `SlaveWitness::prove_open` would accept the witness while the master is open and refuse it afterwards — the path stops resolving ({}) or resolves to a different device. That is the Linux-shaped answer, and it is why the harness's seven converted guards (notes §3.56) are enforced rather than merely borrowed on this kernel.",
+            if r.stat_after_close.path_resolves {
+                "no — the node persisted"
+            } else {
+                "yes"
+            }
+        )
+    } else {
+        format!(
+            " **The shipped `stat` comparison cannot tell them apart here**, and that is this probe's whole reason for existing (§15.59). After the master closed, `fstat` on the held fd answers `{}`, the path still resolves `{}`, and the identity triple matches `{:?}` — so `SlaveWitness::prove_open` would return `Ok` on a witness whose pair is gone, degrading to the compile-time borrow it also carries. `poll(POLLHUP)` is the instrument that does tell, and this row is the measurement that says so rather than the prediction notes §3.60 had to leave standing.",
+            r.stat_after_close.fstat_answers,
+            r.stat_after_close.path_resolves,
+            r.stat_after_close.identity_matches
+        )
+    };
+
+    if !r.hangup_after_close {
+        return p.verdict(
+            Status::Degraded,
+            &format!(
+                "**`POLLHUP` did not arrive on a held pts slave after its master closed** — {} µs of waiting, `revents` `{}`, and a following `read(2)` answering `{}`. So the portable liveness instrument §15.59 proposes does not work on this kernel, and a witness fd cannot learn here that its pair has gone by polling. That is an observation about this kernel and not a failure (§7); what it costs is the portable half of the argument.{stat_note}",
+                r.hangup_after_us, r.hangup_revents, r.read_after_close
+            ),
+        );
+    }
+
+    p.verdict(
+        Status::Supported,
+        &format!(
+            "A held pts slave fd **can** tell that its master has gone, on this kernel, through `poll(POLLHUP)`: quiet in all {} back-to-back passes over {} µs and all {} paced passes over {} µs while the master was open, then `POLLHUP` {} µs after it closed (`revents` `{}`, a following `read(2)` answering `{}`). Both arms are the other's control, which is what makes either readable — a zero with no witness is not a measurement, and a hangup that was never absent is not a signal (§15.49).{stat_note} Read it beside `itest`'s `SlaveWitness::prove_open`, which is the check this measures rather than judges.",
+            r.tight.passes, r.tight.elapsed_us, r.paced.passes, r.paced.elapsed_us,
+            r.hangup_after_us, r.hangup_revents, r.read_after_close
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -6487,10 +7093,71 @@ struct FlowReadback {
     /// and the daemon would answer differently about the same port, which is worse
     /// than either answer.
     shipped_predicate_agrees: Option<bool>,
-    /// Set back to what it was, and checked. A probe that reconfigures a real
-    /// port and cannot say it restored it is a probe nobody should run twice.
+    /// Set back to what it was, and checked — **both flag words**, by the probe's
+    /// last read of the port. A probe that reconfigures a real port and cannot say
+    /// it restored it is a probe nobody should run twice.
     restored: bool,
+    /// The **software** half of the same question, taken through the same open and
+    /// the same restore (plan §18 item 14). `Err` carries why it could not be
+    /// taken: unmeasurable is data, not absence (§15.47).
+    soft: Result<SoftFlowReadback, String>,
 }
+
+/// One port's answer to "did the *software* flow-control mode I asked for take?".
+///
+/// **Why this rides on P15 rather than taking a probe id of its own.** It is the
+/// same open, the same restore and one more flag pair (plan §18 item 14): a
+/// second probe would have to re-open a port P11 has just promised to leave
+/// alone, and would double the reconfiguration this one already performs.
+///
+/// It shipped one commit ahead of the `question` string that describes it, and
+/// that gap was deliberate and is now closed (§15.59). While it stood, the block's
+/// own `asks` cell carried the sub-question so a reader of the JSON never had to
+/// infer it from the header — kept, because a self-describing block is worth
+/// having whether or not the header agrees with it. The reasoning for the delay is
+/// worth keeping too: an era boundary refuses every cross-era diff, and spending
+/// one on a wording change while P16's real instrument change was already owed
+/// would have closed two eras where one would do.
+struct SoftFlowReadback {
+    /// Did `tcsetattr` report success? Same discriminator as the hardware half:
+    /// with the flags reading back clear, a failed set is an honest refusal and a
+    /// successful one is the accept-then-drop defect.
+    tcsetattr_ok: bool,
+    tcsetattr_error: Option<String>,
+    iflag_before: u64,
+    iflag_after: u64,
+    /// The two flags, read back **separately**, because a driver may take one and
+    /// drop the other and `serial2`'s `FlowControl::XonXoff` sets both.
+    ixon: bool,
+    ixoff: bool,
+    /// The property the *product* promises, not a proxy for it (AGENTS §9):
+    /// `serial2` compares the whole `c_iflag` word it asked for against the one it
+    /// reads back (`Settings::matches_requested`), so this — not the two flags
+    /// alone — is what decides whether the serial node's open turns into
+    /// `failed to apply some or all settings` on a `faulted` node.
+    iflag_matches_request: bool,
+}
+
+impl SoftFlowReadback {
+    fn honoured(&self) -> bool {
+        self.ixon && self.ixoff
+    }
+
+    fn silently_dropped(&self) -> bool {
+        self.tcsetattr_ok && !self.honoured()
+    }
+}
+
+/// The sub-question the software block answers, in the report itself.
+const P15_SOFT_ASKS: &str = "Does this port honour a requested SOFTWARE flow-control mode (IXON|IXOFF) on read-back, or accept the request and silently drop it?";
+
+/// What a software-flow-control reading does **not** license, printed beside it.
+///
+/// §7.1 clause 7 and plan §18 item 14: `xon-xoff` has no `load`-time pre-check,
+/// and the ledger item declines adding one until a dropping driver is actually
+/// found. So this reading moves no verdict and refuses no config; it exists so
+/// that "unmeasured, not known-good" stops being the honest statement.
+const P15_SOFT_DOES_NOT_LICENSE: &str = "reported, never judged: nothing in the daemon consults this reading, and a `flow_control = \"xon-xoff\"` config is refused at neither `load` nor `add-node` whatever it says. §15.53's refusal covers `rts-cts` only, and extending it to a mode no artifact had measured would be policy without evidence (plan §18 item 14). What a `silently_dropped: true` here would mean is that such a node faults late, at its own open, with `serial2`'s bare `failed to apply some or all settings` — the outcome the `rts-cts` refusal exists to prevent.";
 
 impl FlowReadback {
     fn observations(&self) -> serde_json::Value {
@@ -6504,8 +7171,47 @@ impl FlowReadback {
             "shipped_predicate_agrees": self.shipped_predicate_agrees,
             "silently_dropped": self.tcsetattr_ok && !self.honoured,
             "baseline_restored": self.restored,
+            "software_flow_control": match &self.soft {
+                Ok(s) => serde_json::json!({
+                    "asks": P15_SOFT_ASKS,
+                    "measured": true,
+                    "requested": "xon-xoff (IXON|IXOFF set, CRTSCTS cleared — serial2's FlowControl::XonXoff transform)",
+                    "tcsetattr_ok": s.tcsetattr_ok,
+                    "tcsetattr_error": s.tcsetattr_error,
+                    "iflag_before_hex": format!("{:#x}", s.iflag_before),
+                    "iflag_after_hex": format!("{:#x}", s.iflag_after),
+                    "ixon_on_readback": s.ixon,
+                    "ixoff_on_readback": s.ixoff,
+                    "honoured_on_readback": s.honoured(),
+                    "silently_dropped": s.silently_dropped(),
+                    "serial2_readback_would_fault": !s.iflag_matches_request,
+                    "does_not_license": P15_SOFT_DOES_NOT_LICENSE,
+                }),
+                Err(e) => serde_json::json!({
+                    "asks": P15_SOFT_ASKS,
+                    "measured": false,
+                    "unmeasurable_here": e,
+                    "does_not_license": P15_SOFT_DOES_NOT_LICENSE,
+                }),
+            },
         })
     }
+}
+
+/// Widen a termios flag word to `u64` for the report, portably.
+///
+/// **`tcflag_t` is `u32` on Linux and `u64` on Darwin**, so a cast is *required* on
+/// one platform and *redundant* on the other — and clippy is correct both times:
+/// `as u64` trips `unnecessary_cast` on Darwin, `u64::from` trips
+/// `useless_conversion` there, and dropping the widening breaks Linux. A generic
+/// bound is the one spelling that is right everywhere and needs no `#[allow]`,
+/// because the conversion is resolved per target rather than written down.
+///
+/// Found by the Darwin lint cross-check (plan §18 item 54) within hours of that gate
+/// landing — the *second* live instance of the class it was added for, and one no
+/// Linux lane and no `cargo check --target` could have seen.
+fn flag_bits<T: Into<u64>>(bits: T) -> u64 {
+    bits.into()
 }
 
 /// Ask one port for `CRTSCTS` and read it back, then put it back as it was.
@@ -6563,29 +7269,161 @@ fn p15_readback(path: &PathBuf) -> Result<FlowReadback, String> {
         Err(_) => None,
     };
 
-    // **`honours_rtscts` is the probe's *last* write to this port, so the baseline
-    // has to be re-read after it** (notes §3.68). It opens the same tty a second
-    // time, sets `CRTSCTS`, and restores — and it cannot verify its own restore,
-    // because it closes the fd it would need to re-read through. Deciding
-    // `baseline_restored` before that call published a `true` about a port whose
-    // final reconfiguration nothing had checked, on the one kernel where the write
-    // takes effect. This fd is still open, so the re-read costs one `tcgetattr`
-    // and makes the field describe the port as this probe actually leaves it.
+    // **The software half, on the same open** (plan §18 item 14). It runs *after*
+    // `honours_rtscts` for the same reason the restore check does — that call is
+    // an external write to this port — and before the final baseline verification,
+    // so the last read below covers this write too.
+    //
+    // The transform is `serial2::FlowControl::XonXoff` applied to the baseline
+    // this probe found, spelled out rather than delegated: `c_iflag |=
+    // IXON|IXOFF` and `c_cflag &= !CRTSCTS`, which is exactly what the serial
+    // node's open performs for `flow_control = "xon-xoff"`. Asking for anything
+    // else would measure a request the daemon never makes.
+    let soft = p15_soft_readback(&fd, &before);
+
+    // **`honours_rtscts` and the software pass are the probe's last writes to this
+    // port, so the baseline has to be re-read after them** (notes §3.68).
+    // `honours_rtscts` opens the same tty a second time, sets `CRTSCTS`, and
+    // restores — and it cannot verify its own restore, because it closes the fd it
+    // would need to re-read through. Deciding `baseline_restored` before that call
+    // published a `true` about a port whose final reconfiguration nothing had
+    // checked, on the one kernel where the write takes effect. This fd is still
+    // open, so the re-read costs one `tcgetattr` and makes the field describe the
+    // port as this probe actually leaves it.
+    //
+    // **Both flag words, since 2026-08-12**: the software pass writes `c_iflag`,
+    // and a restore check that read `c_cflag` alone would certify a port this
+    // probe had left with `IXON` asserted. The strengthening is deliberate and
+    // costs no extra syscall.
     let restored = restored_after_own_write
         && tcgetattr(&fd)
-            .map(|t| t.control_flags == before.control_flags)
+            .map(|t| t.control_flags == before.control_flags && t.input_flags == before.input_flags)
             .unwrap_or(false);
 
     Ok(FlowReadback {
         port: path.display().to_string(),
         tcsetattr_ok: set.is_ok(),
         tcsetattr_error: set.err().map(|e| e.to_string()),
-        cflag_before: before.control_flags.bits() as u64,
-        cflag_after: after.control_flags.bits() as u64,
+        cflag_before: flag_bits(before.control_flags.bits()),
+        cflag_after: flag_bits(after.control_flags.bits()),
         honoured,
         shipped_predicate_agrees: agrees,
         restored,
+        soft,
     })
+}
+
+/// Ask one already-open port for `IXON|IXOFF` and read it back, then put the
+/// termios back as it was.
+///
+/// Takes the baseline the caller already read rather than re-reading it, so both
+/// halves of P15 restore to the *same* witness and a single final `tcgetattr`
+/// verifies both (§13: the restore claim is verified by the probe's last read).
+///
+/// **The restore runs before any error is inspected**, exactly as the hardware
+/// half's does (notes §3.68): a `?` between the set and the restore is how a
+/// probe leaves a real adapter reconfigured and then reports `skipped`, which is
+/// the word that exempts every conditional gate clause.
+fn p15_soft_readback<Fd: AsFd>(
+    fd: &Fd,
+    before: &nix::sys::termios::Termios,
+) -> Result<SoftFlowReadback, String> {
+    use nix::sys::termios::InputFlags;
+
+    let mut want = before.clone();
+    want.input_flags |= InputFlags::IXON | InputFlags::IXOFF;
+    want.control_flags &= !ControlFlags::CRTSCTS;
+
+    let set = tcsetattr(fd, SetArg::TCSANOW, &want);
+    let after = tcgetattr(fd);
+    let _ = tcsetattr(fd, SetArg::TCSANOW, before);
+
+    let after = after.map_err(|e| format!("tcgetattr after xon-xoff: {e}"))?;
+    Ok(SoftFlowReadback {
+        tcsetattr_ok: set.is_ok(),
+        tcsetattr_error: set.err().map(|e| e.to_string()),
+        iflag_before: flag_bits(before.input_flags.bits()),
+        iflag_after: flag_bits(after.input_flags.bits()),
+        ixon: after.input_flags.contains(InputFlags::IXON),
+        ixoff: after.input_flags.contains(InputFlags::IXOFF),
+        iflag_matches_request: after.input_flags == want.input_flags,
+    })
+}
+
+/// The software-flow-control sentence appended to every arm that measured a port.
+///
+/// **The verdict now answers for this reading, and that changed at P16's landing**
+/// (§15.59). A probe's verdict speaks for the question its `question` string asks;
+/// P15's named `CRTSCTS` alone while the probe reported both, so between plan §18
+/// item 14 and this commit the software reading was carried, stated and
+/// deliberately *not* judged — the only honest arrangement while the header asked
+/// a narrower question than the body answered. §15.59 folded the two moves into
+/// one `probe_set` boundary: the `question` now names both kinds, so a `supported`
+/// verdict over a silently-dropped software request would be the probe answering
+/// `supported` to a question it answered *no* to. [`p15_verdict`] therefore
+/// degrades on it — ranked below the hardware drop, because that one has a shipped
+/// consequence (`load` refuses, §15.53) and this one deliberately has none.
+///
+/// **What did not change is the daemon.** Plan §18 item 14's decline stands: no
+/// `xon-xoff` pre-check, no refusal at `load`, nothing in the product consults
+/// this cell. A `degraded` here reports a driver difference (§7's rule) and does
+/// not enact a policy, and every arm below says so in as many words.
+///
+/// The sentence is not optional decoration: `expectations/*.jq` reads
+/// observations and never `.consequence`, and the digests read `(id, question)`
+/// and leaf paths — so an operator-facing finding that lives only in a cell is a
+/// finding nobody reads (§13's gate-blind-spot rule). The drop arm therefore leads
+/// with the defect and names the ports.
+fn p15_soft_note(rows: &[FlowReadback]) -> String {
+    let dropped: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.soft.as_ref().is_ok_and(|s| s.silently_dropped()))
+        .map(|r| r.port.as_str())
+        .collect();
+    let refused: Vec<&str> = rows
+        .iter()
+        .filter(|r| {
+            r.soft
+                .as_ref()
+                .is_ok_and(|s| !s.tcsetattr_ok && !s.honoured())
+        })
+        .map(|r| r.port.as_str())
+        .collect();
+    let unmeasured: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.soft.is_err())
+        .map(|r| r.port.as_str())
+        .collect();
+    let honoured = rows.len() - dropped.len() - refused.len() - unmeasured.len();
+
+    let mut out = String::new();
+    if !dropped.is_empty() {
+        out.push_str(&format!(
+            " **SOFTWARE flow control: {} named port(s) ACCEPTED an `IXON|IXOFF` request and then reported it clear** ({}) — measured on the same open (plan §18 item 14). `serial2` verifies `c_iflag` by read-back exactly as it verifies `c_cflag`, so a `flow_control = \"xon-xoff\"` node on such a port does **not** get §15.53's refusal at `load` — that refusal covers `rts-cts` only — and instead faults at its own open with the bare `failed to apply some or all settings` the refusal exists to prevent. **This degrades the verdict and refuses nothing**: since §15.59 widened this probe's question to name both flow-control kinds, a `supported` here would be answering `supported` to a question this port answered no to — but the daemon is unchanged, no pre-check consults this cell, and plan §18 item 14's decline stands until a design decision is taken on the evidence this row now supplies (`serial2_readback_would_fault` is the cell that decides the node's fate, because it compares the whole `c_iflag` word rather than the two flags alone).",
+            dropped.len(),
+            dropped.join(", ")
+        ));
+    }
+    if !refused.is_empty() {
+        out.push_str(&format!(
+            " **SOFTWARE flow control: {} named port(s) REFUSED `IXON|IXOFF` outright** ({}) — `tcsetattr` failed rather than reporting success over a clear flag, which is the honest answer and the one nothing needs to act on.",
+            refused.len(),
+            refused.join(", ")
+        ));
+    }
+    if honoured > 0 {
+        out.push_str(&format!(
+            " Software flow control (`xon-xoff`, `IXON|IXOFF`) was measured on the same open and {honoured} of {} named port(s) honoured it on read-back. The verdict answers for this half too since §15.59 widened the question — but the *daemon* does not: no pre-check consults it and no config is refused on it (plan §18 item 14's decline, unchanged).",
+            rows.len()
+        ));
+    }
+    if !unmeasured.is_empty() {
+        out.push_str(&format!(
+            " Software flow control could not be read back on {} — the cell says so rather than reading as an answer (unmeasurable is data, §15.47).",
+            unmeasured.join(", ")
+        ));
+    }
+    out
 }
 
 /// Fold the per-port readings into a verdict. Pure, so both readings are tested
@@ -6634,12 +7472,13 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
         return (
             Status::Degraded,
             format!(
-                "**This report and the daemon would answer differently about {}.**                  `serial_nexus_sys::honours_rtscts` is the predicate `load` consults to                  refuse a `flow_control = \"rts-cts\"` config, and it disagreed with the read-back                  this probe took by hand on the same port. Neither reading can be trusted                  until they are reconciled: a report that calls a port fine while `load`                  refuses it — or the reverse — is worse than either verdict on its own.",
+                "**This report and the daemon would answer differently about {}.**                  `serial_nexus_sys::honours_rtscts` is the predicate `load` consults to                  refuse a `flow_control = \"rts-cts\"` config, and it disagreed with the read-back                  this probe took by hand on the same port. Neither reading can be trusted                  until they are reconciled: a report that calls a port fine while `load`                  refuses it — or the reverse — is worse than either verdict on its own.{}",
                 disagreeing
                     .iter()
                     .map(|r| r.port.as_str())
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                p15_soft_note(rows)
             ),
         );
     }
@@ -6657,12 +7496,42 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
         .iter()
         .filter(|r| !r.tcsetattr_ok && !r.honoured)
         .collect();
+
+    // **The software half now moves this verdict, ranked below the hardware one**
+    // (§15.59). Until P16's landing the `question` string named `CRTSCTS` alone, so
+    // the software reading was carried and stated and deliberately not judged —
+    // the only honest arrangement while the header asked less than the body
+    // answered. The widened question changes exactly that: `supported` over a
+    // silently-dropped `IXON|IXOFF` request would be answering `supported` to a
+    // question this port answered no to.
+    //
+    // Ranked *below* the `CRTSCTS` drop because that finding has a shipped
+    // consequence an operator acts on — §15.53 refuses the config at `load` — and
+    // this one has none by decision (plan §18 item 14's decline). The more
+    // actionable finding leads, which is the same ordering rule the restore and
+    // daemon-disagreement arms above follow.
+    let soft_dropped: Vec<&FlowReadback> = rows
+        .iter()
+        .filter(|r| r.soft.as_ref().is_ok_and(|s| s.silently_dropped()))
+        .collect();
+    if dropped.is_empty() && !soft_dropped.is_empty() {
+        return (
+            Status::Degraded,
+            format!(
+                "**The hardware half of this question is fine here and the software half is not.** `CRTSCTS` is honoured or honestly refused on every named port, and {} of them accepted an `IXON|IXOFF` request and then reported it clear. The detail, and the bound on what it licenses, follow.{}",
+                soft_dropped.len(),
+                p15_soft_note(rows)
+            ),
+        );
+    }
+
     if dropped.is_empty() && refused.is_empty() {
         return (
             Status::Supported,
             format!(
-                "Every named port ({}) honoured `CRTSCTS` on read-back, so a `flow_control = \"rts-cts\"` edge configures here and the driver agrees it did. `serial2` verifies settings by reading them back, so this is exactly the check the serial node's open performs.",
-                rows.len()
+                "Every named port ({}) honoured `CRTSCTS` on read-back, so a `flow_control = \"rts-cts\"` edge configures here and the driver agrees it did. `serial2` verifies settings by reading them back, so this is exactly the check the serial node's open performs.{}",
+                rows.len(),
+                p15_soft_note(rows)
             ),
         );
     }
@@ -6670,27 +7539,29 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
         return (
             Status::Supported,
             format!(
-                "**{} of {} named port(s) REFUSED the `CRTSCTS` request outright** ({}); the rest honoured it on read-back. A refusal is `tcsetattr` *failing* rather than reporting success and leaving the flag clear, and it is the honest answer: nothing about the request was silently discarded. **A `flow_control = \"rts-cts\"` config on such a port is therefore NOT refused at `load`/`add-node` (§7.1, §15.53)** — only the accept-then-drop driver is, because only that one would leave a link running without the flow control it asked for. The node's own open fails instead, loudly, carrying the driver's own error plus the flag, the port and both remedies: `flow_control = \"none\"` (or `xon-xoff`) for this port, or an adapter whose driver implements RTS/CTS. Read this beside `honoured_on_readback` and `tcsetattr_ok` in the cells below: those two together are the three-way discrimination this probe exists to make, and `silently_dropped` is `false` here.",
+                "**{} of {} named port(s) REFUSED the `CRTSCTS` request outright** ({}); the rest honoured it on read-back. A refusal is `tcsetattr` *failing* rather than reporting success and leaving the flag clear, and it is the honest answer: nothing about the request was silently discarded. **A `flow_control = \"rts-cts\"` config on such a port is therefore NOT refused at `load`/`add-node` (§7.1, §15.53)** — only the accept-then-drop driver is, because only that one would leave a link running without the flow control it asked for. The node's own open fails instead, loudly, carrying the driver's own error plus the flag, the port and both remedies: `flow_control = \"none\"` (or `xon-xoff`) for this port, or an adapter whose driver implements RTS/CTS. Read this beside `honoured_on_readback` and `tcsetattr_ok` in the cells below: those two together are the three-way discrimination this probe exists to make, and `silently_dropped` is `false` here.{}",
                 refused.len(),
                 rows.len(),
                 refused
                     .iter()
                     .map(|r| r.port.as_str())
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                p15_soft_note(rows)
             ),
         );
     }
     (
         Status::Degraded,
         format!(
-            "**{} named port(s) ACCEPTED a `CRTSCTS` request and then reported it clear** ({}). `tcsetattr` returned success and `tcgetattr` read the flag back unset, so the driver neither honours the mode nor refuses it. **What the daemon does about it is decided and shipped (§15.53, notes §3.67): a node configured with `flow_control = \"rts-cts\"` on such a port is REFUSED at `load`/`add-node`, before anything is created** — not faulted later, and not silently run without the flow control it asked for. The refusal names the node, the device, the resolved path and the read-back, and offers two remedies: `flow_control = \"none\"` (or `xon-xoff`) for this port, or an adapter whose driver implements RTS/CTS. `serial-nexus-doctor --port <this port>` reports the same reading the daemon consults, and `shipped_predicate_agrees` below says whether the two agree on this box. The refusal is structural and creates **nothing** — §11's load is atomic, so a five-node file with one such port creates zero nodes, not four; what survives is the *running* graph, because the pre-check runs before any teardown, so a refused `load --replace` leaves what is already up untouched. Measured on Darwin 24.6.0 / macOS 15.7.8 with an FT232R on Apple's IOSerialFamily driver: `CCTS_OFLOW` alone, `CRTS_IFLOW` alone, both together, a blocking open and the `/dev/tty.*` node all behave identically, while a **pty on the same box honours the flag** — so it is the serial driver and not the tty layer. The wire is not the suspect either: RTS↔CTS crossing is independently proven on that rig. **Two paths still reach a `faulted` node rather than the refusal**, both because the pre-check could not open the port to measure it: a `load --replace` on a port the running graph already holds (filed, notes §3.68 (5a)), and an adapter that arrives *after* the config loads. On those the node's own open fails, and the fault now carries this same reading and remedy instead of `serial2`'s bare `failed to apply some or all settings`.",
+            "**{} named port(s) ACCEPTED a `CRTSCTS` request and then reported it clear** ({}). `tcsetattr` returned success and `tcgetattr` read the flag back unset, so the driver neither honours the mode nor refuses it. **What the daemon does about it is decided and shipped (§15.53, notes §3.67): a node configured with `flow_control = \"rts-cts\"` on such a port is REFUSED at `load`/`add-node`, before anything is created** — not faulted later, and not silently run without the flow control it asked for. The refusal names the node, the device, the resolved path and the read-back, and offers two remedies: `flow_control = \"none\"` (or `xon-xoff`) for this port, or an adapter whose driver implements RTS/CTS. `serial-nexus-doctor --port <this port>` reports the same reading the daemon consults, and `shipped_predicate_agrees` below says whether the two agree on this box. The refusal is structural and creates **nothing** — §11's load is atomic, so a five-node file with one such port creates zero nodes, not four; what survives is the *running* graph, because the pre-check runs before any teardown, so a refused `load --replace` leaves what is already up untouched. Measured on Darwin 24.6.0 / macOS 15.7.8 with an FT232R on Apple's IOSerialFamily driver: `CCTS_OFLOW` alone, `CRTS_IFLOW` alone, both together, a blocking open and the `/dev/tty.*` node all behave identically, while a **pty on the same box honours the flag** — so it is the serial driver and not the tty layer. The wire is not the suspect either: RTS↔CTS crossing is independently proven on that rig. **Two paths still reach a `faulted` node rather than the refusal**, both because the pre-check could not open the port to measure it: a `load --replace` on a port the running graph already holds (filed, notes §3.68 (5a)), and an adapter that arrives *after* the config loads. On those the node's own open fails, and the fault now carries this same reading and remedy instead of `serial2`'s bare `failed to apply some or all settings`.{}",
             dropped.len(),
             dropped
                 .iter()
                 .map(|r| r.port.as_str())
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            p15_soft_note(rows)
         ),
     )
 }
@@ -6734,13 +7605,37 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
 /// new id (the append-only rule above P13), which moves `probe_set` into a new era
 /// deliberately, exactly as P14 did.
 ///
+/// **The software half rides here** (plan §18 item 14). `xon-xoff` had no
+/// pre-check and no probe: `serial2` verifies `c_iflag` by read-back exactly as it
+/// verifies `c_cflag`, so a driver that accepted `IXON`/`IXOFF` and read them back
+/// clear would fault a node with the same bare error §15.53's refusal exists to
+/// prevent — and no artifact on any kernel said whether one does. It does now. The
+/// reading is taken on **this** open, with **this** restore, and one more flag
+/// pair, which is what makes it an observation rather than a second probe.
+///
+/// **It landed in two steps, and the second is the one to read** (§15.59). At
+/// 2026-08-13 the reading shipped under a `question` string still naming `CRTSCTS`
+/// alone, so it moved `field_set` and not `probe_set` and it deliberately did not
+/// move the verdict — the only honest arrangement while the header asked less than
+/// the body answered, and a wording change is not worth an era boundary of its own.
+/// At P16's landing the two were folded into **one** `probe_set` move: the
+/// `question` now names both flow-control kinds and [`p15_verdict`] degrades on a
+/// silently-dropped software request, ranked below the `CRTSCTS` drop because that
+/// one has a shipped consequence and this one has none. **The daemon is
+/// unchanged** — plan §18 item 14's decline stands, no pre-check consults the cell,
+/// and no config is refused on it; the verdict reports a driver difference (§7)
+/// and enacts nothing. The other route by which the software pass moves the
+/// verdict is `baseline_restored`, which covers both flag words: a port left with
+/// `IXON` asserted is worse than any unanswered question.
+///
 /// Opt-in behind `--port` like P3/P5/P11/P14, and it restores the termios it
-/// found, checked rather than assumed.
+/// found, checked rather than assumed — **by the probe's last read of the port,
+/// after both writes and after `honours_rtscts`'s own**.
 pub fn p15_flow_control_readback(ports: &[PathBuf]) -> Probe {
     let mut p = Probe::new(
         "P15",
         "real-port flow-control honouring",
-        "Does a named port honour a requested hardware flow-control mode (CRTSCTS) on read-back, or accept the request and silently drop it (§7.1, §15.53)?",
+        "Does a named port honour a requested flow-control mode — hardware (CRTSCTS) or software (IXON/IXOFF) — on read-back, or accept the request and silently drop it (§7.1, §15.53)?",
     );
     let mut rows: Vec<FlowReadback> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -8563,6 +9458,371 @@ mod tests {
         );
     }
 
+    /// **P13's fifth shape reports whether it arrived, rather than assuming it
+    /// did** (plan §18 item 22).
+    ///
+    /// Executed on whatever box runs this, and deliberately *not* pinning the race:
+    /// `arrived_before_close_returned` is the kernel's answer, and on one whose
+    /// close does not wait there may be no window to arrive in at all. What is
+    /// asserted is that the row is internally coherent — the word matches the
+    /// boolean, the two timestamps order the way the boolean says, and the byte
+    /// accounting adds up — because a row that contradicted itself would be the
+    /// §13 failure the shape exists to avoid, and no gate reads prose.
+    ///
+    /// Measured on Linux 7.0.0-29 over five consecutive passive runs: the arriving
+    /// reader wins **5 of 5**, its first `read(2)` entering 0–1 µs after the close
+    /// against a close that returns in 2–6 µs, recovering 64 of 64 with a terminal
+    /// `EIO`. So the discriminator fires on the platform of record rather than only
+    /// on the kernel the shape was written for, which is what keeps it out of §13's
+    /// vacuity taxonomy 2.
+    #[test]
+    fn p13_arrival_shape_says_whether_it_arrived_rather_than_assuming_it_did() {
+        let r = p13_shape(CloseShape::ReaderArrivesDuringCloseWait)
+            .expect("the arriving-reader shape runs");
+        let a = r
+            .arrival
+            .as_ref()
+            .expect("the arriving-reader shape must carry its timing block");
+
+        assert_eq!(
+            a.arrived_before_close_returned,
+            a.reading() == "arrived-inside-the-close-window",
+            "the word and the boolean disagree — a reader of the JSON would take \
+             the word: {} vs {}",
+            a.reading(),
+            a.arrived_before_close_returned
+        );
+        if a.arrived_before_close_returned {
+            assert!(
+                a.first_read_offset_us <= a.close_returned_us,
+                "the row says the reader arrived before the close returned, and the \
+                 timestamps say the opposite: first read at {} us, close returned at {} us",
+                a.first_read_offset_us,
+                a.close_returned_us
+            );
+            assert_eq!(
+                a.bytes_recovered, r.bytes_during,
+                "the arriving reader's bytes must be the ones the shape accounts as \
+                 recovered during the close"
+            );
+        }
+        assert_eq!(
+            r.recovered(),
+            r.bytes_before + r.bytes_during + r.bytes_after,
+            "the total must count every place the payload can come back from"
+        );
+        assert!(
+            !a.does_not_license().is_empty(),
+            "a race result with no statement of what it licenses is the reading §13 refuses"
+        );
+    }
+
+    /// The two readings of the arrival, checked against each other rather than
+    /// against whichever kernel is in front of you (§9). The `lost-the-race` arm is
+    /// the one a box whose close returns in microseconds may never produce, and it
+    /// is exactly the arm a Darwin-shaped kernel would make routine.
+    #[test]
+    fn the_arrival_row_names_both_outcomes_and_licenses_neither_by_default() {
+        let row = |arrived: bool| ArrivalTiming {
+            first_read_offset_us: if arrived { 1 } else { 900 },
+            close_returned_us: if arrived { 600_000 } else { 7 },
+            arrived_before_close_returned: arrived,
+            bytes_recovered: if arrived { 64 } else { 0 },
+            terminal: "EAGAIN".to_owned(),
+            arm_us: 250,
+        };
+        assert_ne!(row(true).reading(), row(false).reading());
+        assert_ne!(row(true).does_not_license(), row(false).does_not_license());
+        assert!(
+            row(false).does_not_license().contains("NOTHING"),
+            "a lost race must say so in the strongest available terms, because the \
+             cells beside it look exactly like an answer: {}",
+            row(false).does_not_license()
+        );
+        assert!(
+            row(true).does_not_license().contains("shape `a`"),
+            "an arrival must point at the shape that answers the question it does \
+             not: {}",
+            row(true).does_not_license()
+        );
+    }
+
+    /// **The arrival cells exist on the shape that has an arriving reader, and on
+    /// no other** — and the total counts them.
+    ///
+    /// Two properties in one guard because they are one decision. Stamping
+    /// `bytes_recovered_by_arriving_reader: 0` on the other four shapes would add a leaf
+    /// path to each for a structurally-zero number, moving `field_set` further than
+    /// the change earns; and a total that summed only before and after would publish
+    /// `bytes_lost: 64` beside a reader that recovered all 64 — a *wrong* cell,
+    /// which §13 ranks below a missing one.
+    #[test]
+    fn only_the_arriving_reader_shape_carries_arrival_cells_and_the_total_counts_them() {
+        let base = |during: u64, arrival: Option<ArrivalTiming>| CloseResult {
+            close_us: 9,
+            bytes_before: 0,
+            bytes_during: during,
+            bytes_after: 0,
+            terminal: "EIO".to_owned(),
+            slave_mode: "raw",
+            baseline_packet_bytes: 1,
+            arrival,
+        };
+        let plain = base(0, None).observations(64);
+        assert!(
+            plain.get("reader_arrival").is_none()
+                && plain.get("bytes_recovered_by_arriving_reader").is_none(),
+            "a shape with no arriving reader grew arrival cells: {plain}"
+        );
+        assert_eq!(plain["bytes_lost"], serde_json::json!(64));
+
+        let arrived = base(
+            64,
+            Some(ArrivalTiming {
+                first_read_offset_us: 1,
+                close_returned_us: 9,
+                arrived_before_close_returned: true,
+                bytes_recovered: 64,
+                terminal: "EIO".to_owned(),
+                arm_us: 250,
+            }),
+        )
+        .observations(64);
+        assert_eq!(
+            arrived["bytes_recovered_by_arriving_reader"],
+            serde_json::json!(64)
+        );
+        assert_eq!(arrived["bytes_recovered_total"], serde_json::json!(64));
+        assert_eq!(
+            arrived["bytes_lost"],
+            serde_json::json!(0),
+            "the payload came back through the arriving reader, and the row said it \
+             was lost: {arrived}"
+        );
+        assert!(arrived["reader_arrival"]["reading"].is_string());
+    }
+
+    /// A P16 result with the two arms set independently, so every quadrant of the
+    /// verdict is constructible on a box that can only produce one of them (§9).
+    fn p16_result(quiet: bool, hangup: bool, path_persists: bool) -> P16Result {
+        let window = |hangups: u32, passes: u32| P16Window {
+            passes,
+            hangups,
+            elapsed_us: 120,
+            revents: BTreeMap::from([("none".to_owned(), passes as u64)]),
+        };
+        P16Result {
+            tight: window(if quiet { 0 } else { 7 }, P16_TIGHT_PASSES),
+            paced: window(0, P16_PACED_PASSES),
+            stat_while_open: P16StatReading {
+                fstat_answers: true,
+                path_resolves: true,
+                identity_matches: Some(true),
+            },
+            hangup_after_close: hangup,
+            hangup_after_us: if hangup { 1 } else { 500_000 },
+            hangup_revents: if hangup {
+                "POLLHUP".to_owned()
+            } else {
+                "none".to_owned()
+            },
+            stat_after_close: P16StatReading {
+                fstat_answers: true,
+                path_resolves: path_persists,
+                identity_matches: path_persists.then_some(true),
+            },
+            read_after_close: "eof".to_owned(),
+        }
+    }
+
+    fn p16_probe(r: &P16Result) -> Probe {
+        p16_verdict(Probe::new("P16", "pts slave-witness liveness", "q"), r)
+    }
+
+    /// **P16's two arms are each other's control, and both must be able to fire**
+    /// (§15.59, §15.49, §9).
+    ///
+    /// The `degraded` shapes are the interesting ones and neither is reachable on
+    /// the platform of record — Linux is quiet while the master is open and
+    /// delivers `POLLHUP` in ~1 µs after it closes — so they are tested as a pure
+    /// fold rather than against whatever kernel is in front of you. Three
+    /// properties, in the order a reader needs them:
+    ///
+    /// 1. A quiet arm that was **not** quiet outranks everything. An fd that
+    ///    reports a hangup while the master is open answers "dead" correctly and
+    ///    "alive" wrongly, so the post-close reading below it is not a signal — and
+    ///    the guard pins that ranking against a row that would otherwise select the
+    ///    `supported` arm.
+    /// 2. No hangup after the close is `degraded` with the observation named,
+    ///    never `unsupported`: a kernel without a portable liveness signal is a
+    ///    fact to carry into the argument (§7), not a contradicted premise.
+    /// 3. `supported` requires both arms, which is the whole shape of the
+    ///    instrument.
+    #[test]
+    fn p16s_arms_are_each_others_control_and_every_verdict_is_reachable() {
+        // 3 — the Linux shape.
+        let p = p16_probe(&p16_result(true, true, false));
+        assert_eq!(p.status.label(), "supported");
+        assert!(p.consequence.contains("can** tell"), "{}", p.consequence);
+
+        // 2 — the hangup never arrives. Degraded, and the consequence must say what
+        // is lost rather than blaming the kernel.
+        let p = p16_probe(&p16_result(true, false, true));
+        assert_eq!(p.status.label(), "degraded");
+        assert!(
+            p.consequence.contains("did not arrive"),
+            "the missing hangup must be the headline: {}",
+            p.consequence
+        );
+        assert!(
+            !p.status.is_unsupported(),
+            "a kernel without this signal is an observation, never a contradicted \
+             design premise (§7)"
+        );
+
+        // 1 — the control fired, and it outranks the hangup arm. This row ALSO has
+        // a healthy post-close hangup, so a wrong ranking would print the
+        // `supported` sentence over a control that was not quiet.
+        let noisy = p16_result(false, true, false);
+        let p = p16_probe(&noisy);
+        assert_eq!(p.status.label(), "degraded");
+        assert!(
+            p.consequence.contains("negative control fired"),
+            "a control that fired must lead over both other findings: {}",
+            p.consequence
+        );
+        // **And the published answer must agree with the verdict.** The status is
+        // decided by its own arm, so a `poll_can_tell` that read the firing arm
+        // alone would print `true` in the cell beside a `degraded` saying the
+        // reading is unusable — a verdict contradicted by its own observation, in
+        // the shape §13 exists to prevent. Asserted here because the status
+        // assertion above cannot see it.
+        assert!(
+            !noisy.poll_can_tell(),
+            "an fd that reported a hangup while its master was open cannot tell a \
+             live pair from a dead one — it answers \"dead\" always, which is right \
+             once and wrong the rest of the time"
+        );
+        assert!(
+            !p16_result(true, false, false).poll_can_tell(),
+            "a hangup that never arrived cannot tell them apart either"
+        );
+        assert!(p16_result(true, true, false).poll_can_tell());
+    }
+
+    /// **The two instruments are reported side by side, and the `stat` one is
+    /// mirrored from the harness rather than re-imagined** (§15.59).
+    ///
+    /// `shipped_prove_open_would_refuse` is the disjunction `SlaveWitness::prove_open`
+    /// computes — `fstat` failed, or the path stopped resolving, or the path names a
+    /// different device — so a report says what the *shipped* check would have done
+    /// on this kernel rather than what this probe thinks of it. The Darwin-shaped
+    /// row (a path that persists past the master's close) is the one that matters and
+    /// is unreachable here.
+    #[test]
+    fn p16_says_whether_the_shipped_stat_comparison_could_tell() {
+        // Linux: the node is unlinked at the master's close, so the comparison
+        // refuses the dead witness and accepts the live one.
+        let linux = p16_result(true, true, false);
+        assert!(linux.stat_can_tell());
+        assert!(linux.poll_can_tell());
+        let c = p16_probe(&linux).consequence;
+        assert!(c.contains("also tells them apart here"), "{c}");
+
+        // Darwin's expected shape: a persistent devfs node. `prove_open` would
+        // return `Ok` on a witness whose pair is gone — the residual notes §3.60
+        // could only predict — while `poll` still tells.
+        let darwinish = p16_result(true, true, true);
+        assert!(
+            !darwinish.stat_can_tell(),
+            "a path that still resolves to the same device after the master closed \
+             is exactly the case the shipped comparison cannot see"
+        );
+        assert!(darwinish.poll_can_tell());
+        let c = p16_probe(&darwinish).consequence;
+        assert!(
+            c.contains("cannot tell them apart here"),
+            "the whole reason §15.59 exists is this row, and it must say so: {c}"
+        );
+
+        // **The other direction, which is the one an `and` is easy to lose.** An
+        // instrument that refuses a witness whose master is *open* tells nothing
+        // either — it answers "dead" always, exactly as a poll that always reports
+        // `POLLHUP` does — and `stat_can_tell` must be `false` there even though the
+        // post-close half of it reads correctly. Without this row the master-open
+        // conjunct is unexecuted and could be deleted silently.
+        let refuses_everything = P16Result {
+            stat_while_open: P16StatReading {
+                fstat_answers: true,
+                path_resolves: false,
+                identity_matches: None,
+            },
+            ..p16_result(true, true, false)
+        };
+        assert!(
+            !refuses_everything.stat_can_tell(),
+            "a comparison that refuses a live witness is not a discriminator, and \
+             reporting it as one would credit the harness with an enforcement it \
+             does not have"
+        );
+
+        // **And the identity cell must not read `false` where there is nothing to
+        // compare**: a vanished path is an absence, not a different device, and the
+        // two are different findings for a reader chasing a witness failure. Driven
+        // through the real `take` rather than a hand-built struct — the hand-built
+        // one cannot see the constructor deciding this, which is the half that can
+        // get it wrong.
+        let f = std::fs::File::open("/dev/null").expect("/dev/null opens");
+        let gone = P16StatReading::take(&f, "/dev/pts/this-path-does-not-exist");
+        assert!(gone.fstat_answers, "the fd is real, so step 1 must answer");
+        assert!(!gone.path_resolves);
+        assert_eq!(
+            gone.identity_matches, None,
+            "a path that does not resolve has no identity to disagree with, and a \
+             `false` there reads as 'some other device is at this path'"
+        );
+        assert!(gone.prove_open_would_refuse());
+        assert_eq!(
+            gone.observations()["device_identity_matches"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// **P16's quiet window carries its own wall clock, in the unit of its true
+    /// cost** (§15.49 clause 1), and the paced arm is a different claim from the
+    /// tight one (clause 3).
+    ///
+    /// Executed on whichever box runs this. It does not pin either answer — a
+    /// kernel that hangs up early is a finding — only that the windows ran, that
+    /// they are distinguishable, and that the paced one really paced.
+    #[test]
+    fn p16_windows_report_their_own_cost_and_the_paced_one_paces() {
+        let r = p16_inner().expect("the pty arms run");
+        assert_eq!(r.tight.passes, P16_TIGHT_PASSES);
+        assert_eq!(r.paced.passes, P16_PACED_PASSES);
+        let floor = (P16_PACED_PASSES as u64) * (P16_PACE.as_micros() as u64);
+        assert!(
+            r.paced.elapsed_us >= floor,
+            "the paced window took {} µs for {} passes at a {:?} pace — it did not \
+             pace, so it is a second copy of the tight window wearing a different \
+             name (§15.49's replicates-are-not-levels)",
+            r.paced.elapsed_us,
+            r.paced.passes,
+            P16_PACE
+        );
+        assert!(
+            r.tight.elapsed_us < floor,
+            "the tight window is supposed to be back-to-back and took {} µs",
+            r.tight.elapsed_us
+        );
+        assert_eq!(
+            r.tight.revents.values().sum::<u64>(),
+            P16_TIGHT_PASSES as u64,
+            "every pass must be accounted in the revents histogram, or a kernel \
+             answering with some other bit would vanish into the gap"
+        );
+    }
+
     #[test]
     fn p13_policy_reads_the_close_duration_not_only_the_byte_count() {
         let slow = P13_WAIT_THRESHOLD_US;
@@ -9046,6 +10306,22 @@ mod tests {
             honoured,
             shipped_predicate_agrees: Some(true),
             restored,
+            soft: Ok(soft_row(true, true)),
+        }
+    }
+
+    /// The software half of a row, built from the two answers that classify it:
+    /// did `tcsetattr` succeed, and did the flags read back.
+    fn soft_row(ok: bool, honoured: bool) -> SoftFlowReadback {
+        let ixon_ixoff = 0x400 | 0x1000;
+        SoftFlowReadback {
+            tcsetattr_ok: ok,
+            tcsetattr_error: None,
+            iflag_before: 0,
+            iflag_after: if honoured { ixon_ixoff } else { 0 },
+            ixon: honoured,
+            ixoff: honoured,
+            iflag_matches_request: honoured,
         }
     }
 
@@ -9281,6 +10557,162 @@ mod tests {
             p15_verdict(1, &[unmeasured], &[]).0,
             Status::Supported
         ));
+    }
+
+    /// **The software reading moves the verdict, ranked below the hardware one,
+    /// and moves nothing in the daemon** (plan §18 item 14, §15.59, §9).
+    ///
+    /// The measured answer on the rig of record is that `ftdi_sio` **honours**
+    /// `IXON|IXOFF` (`c_iflag` `0x5` → `0x1405`, a delta of exactly the two flags,
+    /// on both ports of the FT232R crossover, Linux 7.0.0-29) — so the interesting
+    /// arm, a driver that accepts and drops, is unreachable on this box and is
+    /// tested here as a pure fold instead of against whatever is plugged in.
+    ///
+    /// **The judgement half is the point of the guard, and it inverted at P16's
+    /// landing.** Between plan §18 item 14 and §15.59 this function asserted
+    /// `Supported` on a dropping software row, because P15's `question` named
+    /// `CRTSCTS` alone and a verdict may only answer for the question its header
+    /// asks. The widened question is what changes it: `supported` over a silently
+    /// dropped `IXON|IXOFF` would now be answering `supported` to a question this
+    /// port answered no to. What did **not** change is asserted here too, because
+    /// that is the clause a future reader will doubt: §15.53's refusal still covers
+    /// `rts-cts` only, and item 14's decline still stands.
+    #[test]
+    fn p15s_software_finding_degrades_the_verdict_and_refuses_nothing() {
+        // A clean hardware fleet whose driver silently drops the software mode.
+        let dropping = [FlowReadback {
+            soft: Ok(soft_row(true, false)),
+            ..flow_row("/dev/ttyUSB0", true, true, true)
+        }];
+        let (s, c) = p15_verdict(1, &dropping, &[]);
+        assert!(
+            matches!(s, Status::Degraded),
+            "the question names both flow-control kinds since §15.59, so a silently \
+             dropped IXON|IXOFF cannot leave this probe reporting `supported` — that \
+             is a verdict answering `supported` to a question it answered no to"
+        );
+        assert!(
+            c.contains("SOFTWARE") && c.contains("/dev/ttyUSB0"),
+            "a dropped software request must be named and its port named, or the \
+             finding reaches nobody: {c}"
+        );
+        assert!(
+            c.contains("faults at its own open") || c.contains("fault"),
+            "the consequence must say what such a node actually does — fault late, \
+             with the bare error the rts-cts refusal exists to prevent: {c}"
+        );
+        assert!(
+            c.contains("not refused at `load`") || c.contains("refuses nothing"),
+            "the verdict must say the daemon is unchanged: item 14 declines the \
+             refusal, and a `degraded` that read as a shipped policy would be that \
+             decline reversed by implication: {c}"
+        );
+
+        // **The ranking, both directions.** A fleet carrying both defects must lead
+        // with the `CRTSCTS` one, because that is the finding with a shipped
+        // consequence an operator acts on (§15.53's refusal at `load`).
+        let both = [FlowReadback {
+            soft: Ok(soft_row(true, false)),
+            ..flow_row("/dev/cu.usbserial-A", true, false, true)
+        }];
+        let (s, c) = p15_verdict(1, &both, &[]);
+        assert!(matches!(s, Status::Degraded));
+        assert!(
+            c.starts_with("**1 named port(s) ACCEPTED a `CRTSCTS` request"),
+            "the hardware drop must lead over the software one — it is the half with \
+             a refusal behind it: {c}"
+        );
+
+        // An honest refusal: `tcsetattr` failed rather than reporting success over a
+        // clear flag. Nothing to act on, and it must not be reported as a drop.
+        let refused = [FlowReadback {
+            soft: Ok(soft_row(false, false)),
+            ..flow_row("/dev/ttyS9", true, true, true)
+        }];
+        let (s, c) = p15_verdict(1, &refused, &[]);
+        assert!(matches!(s, Status::Supported));
+        assert!(
+            c.contains("REFUSED `IXON|IXOFF`"),
+            "a refusal must get its own arm, as the hardware half's does: {c}"
+        );
+        assert!(
+            !c.contains("ACCEPTED an `IXON|IXOFF` request"),
+            "an honest refusal reported as a silent drop: {c}"
+        );
+
+        // Unmeasurable is data, not absence (§15.47): the port is named and the
+        // sentence never reads as an answer.
+        let unmeasured = [FlowReadback {
+            soft: Err("tcgetattr after xon-xoff: ENOTTY".to_owned()),
+            ..flow_row("/dev/ttyUSB1", true, true, true)
+        }];
+        let (s, c) = p15_verdict(1, &unmeasured, &[]);
+        assert!(matches!(s, Status::Supported));
+        assert!(
+            c.contains("could not be read back") && c.contains("/dev/ttyUSB1"),
+            "an unmeasured port must say so and be named: {c}"
+        );
+
+        // And the ordinary answer this rig gives, so the honoured arm is exercised
+        // too and the three above are known to be distinguishable.
+        let (_, c) = p15_verdict(1, &[flow_row("/dev/ttyUSB0", true, true, true)], &[]);
+        assert!(
+            c.contains("honoured it on read-back") && c.contains("no config is refused on it"),
+            "the honoured arm must state both the reading and its own bound — the \
+             bound being that the daemon consults none of this (item 14's decline): {c}"
+        );
+    }
+
+    /// **A failed restore of the *software* write degrades, through the same arm
+    /// the hardware write's does.**
+    ///
+    /// `baseline_restored` now covers both flag words, and the reason is not
+    /// symmetry: the software pass writes `c_iflag`, so a restore check that read
+    /// `c_cflag` alone would certify a port this probe had left with `IXON`
+    /// asserted. This is the one route by which the software reading moves the
+    /// verdict, and it must be the *leading* arm — a reconfigured adapter is a
+    /// worse outcome than any unanswered question (notes §3.68).
+    #[test]
+    fn p15_ranks_an_unrestored_port_above_the_software_reading_too() {
+        let rows = [FlowReadback {
+            soft: Ok(soft_row(true, false)),
+            ..flow_row("/dev/ttyUSB0", true, true, false)
+        }];
+        let (s, c) = p15_verdict(1, &rows, &[]);
+        assert!(matches!(s, Status::Degraded));
+        assert!(
+            c.contains("could not restore"),
+            "the restore failure must lead over the software finding: {c}"
+        );
+        assert!(
+            !c.contains("SOFTWARE"),
+            "nothing below an unrestored port should be offered as trustworthy: {c}"
+        );
+    }
+
+    /// **The software read-back's error arm, executed rather than argued.**
+    ///
+    /// A probe that cannot take a reading must say so; the failure this guards
+    /// against is the arm returning a confident `false` — indistinguishable in the
+    /// JSON from a driver that dropped the request. Driven through a descriptor
+    /// that is not a terminal at all, with a real `Termios` taken from a pty, so
+    /// both syscalls fail the way they would on a port that vanished mid-probe.
+    #[test]
+    fn the_software_readback_reports_unmeasurable_rather_than_answering() {
+        let master = new_master().expect("a pty master opens");
+        let baseline = tcgetattr(&master).expect("the master has a termios");
+        let not_a_tty = std::fs::File::open("/dev/null").expect("/dev/null opens");
+
+        let r = p15_soft_readback(&not_a_tty, &baseline);
+        let e = r.err().expect(
+            "a descriptor with no termios answered the software flow-control question \
+             — the arm would then publish a reading nobody took",
+        );
+        assert!(
+            e.contains("tcgetattr"),
+            "the unmeasurable cell must name the mechanism that could not answer \
+             (§15.47), not merely that something failed: {e}"
+        );
     }
 
     /// No `--port` is a skip, not a verdict — the same opt-in shape as P3/P5/P11,

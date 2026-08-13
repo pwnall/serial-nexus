@@ -31,6 +31,7 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 
 | Figure | Scope | Date | Commit / record | Caveat |
 |---|---|---|---|---|
+| **999 passing · 0 failed · 7 ignored**, 126 test-result lines | Linux, default CI scope, `--no-fail-fast`, `--nocapture`, `SNX_EXEC_CODEC=required`, `SNX_TLS=required` | 2026-08-13 | the alignment-pass session's second half (notes §3.87–§3.91) | **the Linux authority row.** 126 result lines over **122 cargo targets** (114 `Running` + 8 doc-test) and **13 self-skips**. The +32 over the 967 row is this half's work: P16 and P15's software reading, the packaging gate's six, the harness primitives' self-tests, the tap-ack pair (item 59a), the orphan sweep's own proof, and the parked-child exit guard. `SNX_TLS=required` joins the scope for the first time — it was set by no lane at all until item 60(a). **Orphan-clean, and that is now asserted rather than observed:** every `Daemon` sweeps its process group at drop and panics naming survivors, after a run of this suite left 3 processes behind per invocation and 260 on the box (item 65). Supersedes the 967 row. |
 | **967 passing · 0 failed · 7 ignored**, 125 test-result lines | Linux, default CI scope, `--no-fail-fast`, `--nocapture`, **`SNX_EXEC_CODEC=required`** | 2026-08-12 | the v17 alignment-pass session (notes §3.84–§3.86) | **the Linux authority row, and the first fully green one in this record.** 125 result lines over **121 cargo targets** (113 `Running` + 8 doc-test) and **12 self-skips**, measured with `--nocapture`. The **+36** over the 931 row is measured per target rather than estimated, and closes exactly: `serial_nexus_devprep` +6 (item 52), `serial_nexus_rpc` +5 (item 51's hoisted policy, self-tested per §16.5), `serial_nexus_daemon` +4 and `serial_nexus_codec_api` +4 (items 56, 21, 53), `meta_skip_names` +3, `p5_codec_teardown` +3 (item 38) and `p8_daemon_transcript` +3 (item 36) as new files, `serial_nexus_sys` +2 (item 56's tri-state), `p13_teardown_accounting` +2 (item 21), and one each from `meta_gates` (item 52's derived verb-parity gate), `p13_legacy_defaults`, `serial_nexus_doctor` and **`p3_idle_cost`** — the last being item 46's guard passing rather than a new test. `ignored` moved 6 → 7 for a documentation reason: the kit's new suite carries an ```ignore` doc example like its siblings. **The one failure is gone**: `p3_idle_cost` reads **0.0750 %/fd** against its 0.1274 %/fd ceiling *under full suite parallelism*, within 3 % of the 0.0728 %/fd the artifact records from solo runs — which is the evidence that the marginal form is the right instrument, the absolute form having varied by more than that between one box and another. Supersedes the 931 row. |
 | **931 passing · 1 failed · 6 ignored**, 122 test-result lines | Linux, default CI scope, `--no-fail-fast`, `--nocapture` | 2026-08-12 | the item-47 landing (notes §3.83) | **the Linux authority row**, superseding the 894 below. 122 result lines over **118 cargo targets** (110 `Running` + 8 doc-test) and **12 self-skips**, measured with `--nocapture` (notes §3.78). The +37 over the 894 row is exactly this session's new tests, counted rather than estimated: **22** matcher units (`daemon/src/pattern.rs`, a new file), **12** pattern-wait acceptance guards (`itest/tests/p12_pattern_wait.rs`, a new file), **2** hub guards added to `daemon/src/tap.rs` (11 → 13) and **1** devprep capability-fold guard (1 → 2). Both ends were measured in this session, so the delta is quotable. **An earlier row here read 925 and decomposed it as 19+11+1**; that figure was taken before the adversarial review's fixes added six guards, and its decomposition was wrong by one even for its own tree — recorded because a Status row whose arithmetic does not close is exactly what this table's scope discipline exists to prevent. The one failure is `p3_idle_cost::thirty_two_idle_tty_fds_stay_under_the_recorded_cpu_budget` at **4.10 %** against its 3.50 % tripwire: item 46, and **measured not to be this change's** — runs on this tree read 3.70/3.70/3.90/4.10 %, and three runs on the unchanged tree (a `git worktree` at `849fc8e` with its own target dir, same box, same session) read 3.80/4.30/3.90 %, so the two trees sit in one band and the pattern wait adds no idle-path work (it runs inside `TapHub::ingest`, which an idle endpoint never reaches). |
 | **894 passing · 1 failed · 6 ignored**, 121 test-result lines | Linux, default CI scope, `--no-fail-fast` | 2026-08-12 | the v17 landing's gate run (notes, the v17 generation entry) | the one failure is `p3_idle_cost::thirty_two_idle_tty_fds_stay_under_the_recorded_cpu_budget` at **3.80 %** against its 3.50 % tripwire — item 46's recorded signature verbatim (its message prints "38 ticks over 10s"), reproduced in two of this landing's three suite runs (once under deliberate parallel load, once on a quiet box at load 0.33) and absent in the first; the product tree is unchanged by v17 (documents, two meta-gate consts, one harness message string), so this is item 46 resurfacing, never a fresh finding. Supersedes the 890 row as the default-scope authority; the total moved 896 → 901 because the 2026-08-12 rig session's later commits added tests after that row was taken. **Superseded by the 925 row above**, taken later the same day at the same scope, which is the current Linux authority. |
@@ -1190,7 +1191,27 @@ dropped. Product-surface deferrals use §14's vocabulary (refused-at-load / acce
     gate set would notice either way. Predates the M4 report; not an arm64 finding.
     **Remainder:** one measured number per Mac, taken the way item 12's guard would take it —
     which is why the two items share a schedule.
-14. **`flow_control = "xon-xoff"` has no pre-check and no probe.**
+14. **`flow_control = "xon-xoff"` has no pre-check and no probe** — **EXECUTED 2026-08-13**
+    (notes §3.89), as the item specified: a P15 *observation*, not a second probe — same open,
+    same restore, one more flag pair. It is faithful to what the daemon does rather than to what
+    is easy to read: `serial2`'s `XonXoff` sets `IXON|IXOFF` in `c_iflag` and clears `CRTSCTS`,
+    and its `matches_requested` compares the **whole** `c_iflag` word, so the shipped cell
+    `serial2_readback_would_fault` asserts the property the product promises, with
+    `ixon_on_readback`/`ixoff_on_readback` as the human-readable half.
+    **The answer, which is the item's whole point:** `ftdi_sio` on Linux 7.0.0-29 **honours** it —
+    `c_iflag` `0x5` → `0x1405`, a delta of exactly `IXON|IXOFF`, on both ports,
+    `serial2_readback_would_fault: false`. First artifact on any kernel for a question filed as
+    *unmeasured, not known-good*. **§15.53 stays un-extended**, exactly as the item's *Declined*
+    line requires: one driver on one kernel is not a dropping driver found.
+    *Two deliberate non-moves:* the verdict does not move on a software drop (P15's `question`
+    names `CRTSCTS`, so its verdict answers for that; a drop is loud in the consequence and in the
+    cells and refuses nothing), and `probe_set` does not move. The one route by which the software
+    pass *does* reach the verdict is `baseline_restored`, now covering **both** flag words — a
+    restore check reading `c_cflag` alone would have certified a port left with `IXON` asserted.
+    Corroborated from outside the probe: `stty` on both ports after a full Tier-3 run reads
+    `-crtscts -ixoff -ixon -ixany`. *Owed:* the Darwin arm — `IOSerialFamily` accepts-then-drops
+    `CRTSCTS` on this same rig, and whether it does the same to `IXON`/`IXOFF` is unmeasured,
+    which is precisely why the decline stands. The superseded filing follows.
     **State:** open (S).
     **Evidence:** §15.53 refuses an `rts-cts` config whose driver drops `CRTSCTS`, and P15
     measures it. Software flow control gets neither, and `serial2` verifies `c_iflag` by
@@ -1304,7 +1325,26 @@ Each item below uses the schema with its fields inline.
     merge stage is not reached (notes §3.55; named where the counter is documented, §15.50).
     *Validation:* a guard whose child has stopped reading stdin, so the merge stage holds bytes
     at teardown; fail-first per notes §3.55's disjoint-reddening method.
-22. **P13's missing shape: a reader arriving during the close-wait** — **open** (S).
+22. **P13's missing shape: a reader arriving during the close-wait** — **HALF EXECUTED
+    2026-08-13** (notes §3.89): the shape exists and is measured on **Linux only**; "measured on
+    both kernels" is the remainder. `e_reader_arrives_during_close_wait` uses a reader thread
+    **already spinning** on an `AtomicBool` when the close is entered — not spawned, not sleeping,
+    either of which would be structurally unable to land inside Linux's µs-wide window and would
+    have been §13's vacuity taxonomy 2. Both timestamps come off one `Instant` epoch, and the row
+    states its own applicability (`arrived_before_close_returned`; `reading` as
+    `arrived-inside-the-close-window` / `lost-the-race`; `does_not_license`).
+    *Linux 7.0.0-29, 3 of 3:* the arriving reader wins — first `read(2)` at 0–1 µs against a close
+    returning in 3–7 µs — recovering 64 of 64, terminal `EIO`. **Here it is a control proving
+    itself inert**, this kernel being `retains`; Darwin (`waits-then-discards`, 600104 µs) is where
+    it becomes the measurement, and where it answers what notes §3.29 could only predict: does the
+    arrival end `ttywait` with the bytes recovered, or does the close still pay its full timeout —
+    the reader-stall hypothesis for the macOS red.
+    *Two defects caught in the probe's own construction and fixed before landing:* a
+    `bytes_lost: 64` printed beside a reader that recovered all 64, and a cell named
+    `bytes_recovered_during_close` that would have been **false** on a lost race (renamed). A
+    panicked reader thread would also have published `arrived: true` with 0 bytes; the join
+    fallback is now `u64::MAX`, so that failure cannot read as a clean measurement.
+    The superseded filing follows. **Open** (S).
     *Evidence:* no P13 shape covers a reader that arrives *while* the kernel is inside its
     close-wait — the shape the failing macOS test inhabits (notes §3.29); the committed shapes
     all fix the reader's state before the close. *Validation:* measured on both kernels;
@@ -1325,16 +1365,86 @@ Each item below uses the schema with its fields inline.
     wrong; the figure lands in the Status table and nowhere else. (d) Executed at the v16 landing:
     `itest/tests/p8_web.rs:952`'s bare `(§14.3)` and `expectations/linux.jq:1`'s `(plan §4.3)`,
     both respelled.
-24. **Leash coverage for `Sim` and raw daemon spawn sites** — **open** (S). *Evidence:* the
+24. **Leash coverage for `Sim` and raw daemon spawn sites** — **EXECUTED 2026-08-13** (notes
+    §3.91), through item 50's shared helper as the item intended. `RawDaemon` is leashed by
+    default with `.unleashed()` as the escape hatch; `Sim::spawn` gained `--exit-on-stdin-eof`; and
+    `p13_legacy_defaults`'s bare spawn — which cannot use `RawDaemon`, its subject being what the
+    daemon derives with **no** `--socket`/`--state-file` — is covered directly. §15.43's opt-in
+    semantics are kept on both sides: `Sim::client` deliberately does **not** pass the flag, since
+    `Command::output()` gives a null stdin and therefore EOF at instant zero, and the sim
+    **refuses** the flag in `transcript` mode, whose stdin is the daemon's envelope pipe. The
+    notes §3.39 orphan's trigger is not speculated about anywhere. *Fail-first:* the flag removed
+    from `RawDaemon`, and again from `Sim`, each leaving a process that outlived a SIGKILLed
+    parent and named it; plus the inverse — an *unleashed* double that died with its parent, the
+    leash firing without being opted into. A live pre-change specimen was on the box when the work
+    started: an orphaned daemon, 55 minutes old, no leash in its argv. *Evidence:* the
     stdin-EOF leash (§15.43) exists only via `Daemon::start`; `Sim` and the raw spawn sites are
     uncovered, and the notes §3.39 orphan's trigger is still unestablished. *Validation:*
     coverage keeps §15.43's opt-in semantics; the trigger question stays a question unless a
     reproduction answers it.
-25. **The sim's `--hold-ms` timer retired for a caller-owned hold** — **open** (S). *Evidence:*
+25. **The sim's `--hold-ms` timer retired for a caller-owned hold** — **EXECUTED 2026-08-13**
+    (notes §3.91). `sim client --hold-stdin-eof`, `conflicts_with` `--hold-ms`, sharing one stdin
+    watch with the leash so nothing races for the pipe. The timer is **gone, not defaulted**, at
+    every background holder — `p4_exclusivity` (2), `p5_held`, `p7_unplug`, `p4_waiting`,
+    `data_path` (2). *Scoped, with the reason recorded:* the two surviving `client --hold-ms` uses
+    are synchronous `Sim::client` runs where the caller is blocked on the process, so a
+    caller-owned hold is structurally impossible; `pty --hold-ms` and `wire --hold-ms` mean
+    something else entirely (the device stays plugged in / the peer stays connected) and were
+    outside the item's evidence.
+    **A recorded fail-first was refuted here, and that is the item's best argument.** Re-running
+    notes §3.56's plant — the hold shortened to a timer — against the new mechanism stayed
+    **green at both 1000 ms and 300 ms, four runs**, on this 20-core box at load 1.2–1.9 with the
+    test's wall time 0.12 s. A shortened-timer plant is not a reliable instrument here; that it
+    passes on a fast box and fails on a slow one is precisely what made the old hold a proxy in
+    time. The deterministic replacement — the hold made a no-op — reddens. *Evidence:*
     `p4_exclusivity` still holds by timer; the replug helper already proved the caller-owned
     stdin-EOF hold shape — the caller owns the hold length and samples unprivileged (§15.45;
     notes §3.56). *Validation:* existing guards unchanged; the timer gone, not defaulted.
-26. **A slave-witness liveness probe for the doctor** — **open** (S). *Evidence:* the harness's
+26. **A slave-witness liveness probe for the doctor** — **EXECUTED 2026-08-13** (notes §3.90) as
+    **P16**, once the design amendment below unblocked it. Two arms on one held slave fd, **each
+    the other's control**: `POLLHUP` must be *absent* while the master is open — polled twice,
+    back-to-back and at the PTY node's own 5 ms `IDLE_POLL`, because those are different claims
+    (§15.49 clause 3) — and *present* after it closes. `supported` needs both; a control that fired
+    is reported **first**, because a hangup that was never absent makes the post-close reading
+    unreadable. Beside them, `SlaveWitness::prove_open`'s three steps are mirrored exactly, so the
+    report says what the **shipped** check would have done rather than what the probe thinks of it.
+    Placed after P8/P9/P10 deliberately: its paced arm parks 320 ms inside `poll(2)`, the syscall
+    P9 is timing.
+    **The answer, for Linux:** `prove_open` is **sound here, and measured rather than examined** —
+    `path_still_resolves` `true` → `false` across the close while `fstat_on_the_held_fd_answers`
+    stays `true` both sides, so `shipped_prove_open_would_refuse` moves `false` → `true` and
+    `stat_comparison_can_tell` reads `true`. The tautology is visible in the same row: `fstat`
+    still answers on a pair that is gone, which is why step 2 is the load-bearing one. Two bounds
+    the probe prints rather than leaving to prose: it is sound *for this kernel* (the harness's
+    residual was always the off-Linux half) and *for this edge* (whether the comparison sees the
+    master's close, not liveness in general).
+    *One design-invariant correction on the way:* the first draft reached for
+    `BorrowedFd::borrow_raw`, which is `unsafe` — the same §16.3 wall that sent this question to
+    the doctor in the first place. `AsFd` does it with a real lifetime instead of a promised one.
+    *Pre-registered Darwin readings*, so the interpretation is not chosen after the fact:
+    `path_still_resolves: true` after the close makes `prove_open` **unsound on Darwin** and leaves
+    notes §3.56's seven converted guards held by the compile-time borrow alone — with `poll_can_tell`
+    already `true` here, the portable upgrade would then be a `serial_nexus_sys` `poll` helper
+    rather than an argument; `path_still_resolves: false` there **refutes** the prediction and is to
+    be recorded as such (AGENTS §9); `poll_can_tell: false` there means neither instrument is
+    portable and the witness argument needs re-deriving rather than re-coding.
+    *Two guards started green and were fixed rather than the code* — the exact failure this
+    discipline exists to catch: the stat guard built its reading by hand and so could not see the
+    *constructor* choosing `None` versus `Some(false)`, and a dropped negative-control conjunct was
+    invisible because the verdict checked the windows separately. One pre-existing gate guard was
+    repaired as collateral: it anchored its needle on the *tail* of a list that grows.
+    The superseded filing follows. **Open** (S), **unblocked 2026-08-13**.
+    The item was attempted and correctly **stopped**: a new probe id is derived from the design's
+    §13 roster by `meta_derive`'s gate, so landing P16 first would have made the *tree* ahead of
+    the design — which AGENTS §5 forbids in the same words it forbids the reverse. The amendment
+    is now made (**§15.59**, plus §13's glance row, the roster string and the era row), so the
+    construction proceeds under the amend-first order rather than against it.
+    *Recorded with it:* P15's `question` widening rides **with** P16 rather than ahead of it. The
+    probe now reports a software-flow reading while its `question` still names `CRTSCTS` only, and
+    widening that string would move `probe_set` — spending an era boundary on a **wording** change
+    while P16 will spend one on a real instrument. Two boundaries where one will do; the fold
+    happens in P16's own commit. Mitigation already shipped: every software block carries its own
+    `asks` string, so the JSON is self-describing meanwhile. *Evidence:* the harness's
     Darwin residual — the witness-fd behavior notes §3.56 leans on — is expected, not measured,
     as a standalone observation; notes §3.60 names the doctor as its home. A `poll(POLLHUP)`
     probe makes it measured. *Validation:* a new probe id is a new instrument and moves
@@ -1780,7 +1890,26 @@ remain **open** and none is promised as existing.
     naming a test names its enclosing `#[test]` fn, with rule 10's planted offender.
     *Validation:* fail-first: one gated test run with a PATH lacking python3 under the new
     required mode reddens; the planted wrong-name SKIP reddens the new gate.
-50. **Harness scaffolding consolidation** — **open** (M; schedule beside item 24).
+50. **Harness scaffolding consolidation** — **EXECUTED 2026-08-13** (notes §3.91). Four
+    primitives in `itest/src/lib.rs`, each self-tested per §16.5: `KillOnDrop`,
+    `wait_daemon_ready`, `RawDaemon`/`RawDaemonBuilder`, and `WebServer`. `itest/src/lib.rs` +561;
+    the tests −308 net across 31 files.
+    **All four filed counts were verified exact — and two undercount the class**, which is worth
+    more than the tidying: the kill-on-drop shape is really **16** files, not 14 (`p8_web.rs`'s
+    `Kill(Child)` and `p13_legacy_defaults`'s `Bare(Child)` are the same three lines under other
+    names), and there are **5** raw-daemon spawn sites, not 4 — the fifth is inline rather than a
+    named type and so escaped a count that looked for types. `p4_purge`'s `Sink` was deliberately
+    left alone: piped stdout plus a `verdict()` method is a different abstraction, not a bare
+    guard.
+    *One intentional behaviour delta, in the stricter direction (AGENTS §9):* the seven
+    `wait_socket` copies stopped at `UnixStream::connect(..).is_ok()`; the shared
+    `wait_daemon_ready` keeps that — a stale socket file still refuses, which the `test -S` form
+    could not tell — and adds the `info` round trip `Daemon::start` always did. No guard changed
+    colour. *Not consolidated, deliberately:* the raw RFC 6455 web clients, whose per-file
+    capability divergence is load-bearing and whose own module doc says so. *Fail-first:* each
+    defect planted **in the primitive** rather than a caller — an emptied `KillOnDrop::drop`, a
+    `wait_daemon_ready` weakened back to a bare connect probe, a `WebServer` reporting port+1 —
+    each reddening the primitive's own self-test.
     *Evidence:* `KillOnDrop` re-derived in 14 files, `spawn_daemon` in 8, `wait_socket` in 7,
     four one-off raw-daemon wrappers, and the `serial-nexus-web` boot scaffolding in 7 — all
     behavior-preserving duplicates; §16.5's rule is "assertion helpers are shared and
@@ -2063,7 +2192,12 @@ cannot check was fixed (item 16's lesson).
     second lockfile the workspace build never touches.
 
 59. **Item 55's residue: the tap ack guard, the fourth framing, the third ack copy, and (f)** —
-    **open** (S; four independent clauses, none blocked on anything). Filed 2026-08-12 by item
+    **(a) EXECUTED 2026-08-13** (notes §3.91): two guards in `p12_ctl_tap.rs` — the stand-in-socket
+    refusal, which needs no daemon, plus the arm the shipped daemon can produce (`tap.open` on an
+    unknown endpoint). Fail-first reproduced the item's own measurement exactly: with the
+    ack-swallow planted in `tap_stream`, both new guards redden while `p12_ctl_subscribe`,
+    `p12_tap_replay` and `p8_replay_ring` stay green — which is what said the tap half was
+    unguarded in the first place. **(b), (c) and (d) remain open** (S; four independent clauses, none blocked on anything). Filed 2026-08-12 by item
     55's own execution rather than swept into it, because three of the four are outside that
     item's filed scope and the fourth is a file-ownership conflict, not a difficulty.
     *(a) The tap half of the 37-TOOL-2 rule has no guard at all* — **measured, not inferred**:
@@ -2113,6 +2247,18 @@ transcripts, the pattern-wait maxima). What follows is the residue.
     why it cost six consecutive pushes. Added.
     (d) **The macOS lane did not set `SNX_EXEC_CODEC=required`**, so item 49's battery was
     silently skippable on exactly the platform that lane exists to cover. Added.
+    (f) **`expectations/macos.jq` did not refuse `unsupported`, and its own comment said it did** —
+    text copied from `linux.jq`, where it is true. Six probe clauses were bare presence checks with
+    no status constraint. Repaired 2026-08-13 with the readings verified first, against a
+    Darwin-shaped report: at HEAD, `unsupported` on P1/P3/P4/P5/P11 exited **0** where `linux.jq`
+    exits 1, and so did a `skipped` on P6/P7; after the repair all four exit 1 and an honest report
+    still exits 0. **One correction to the audit's reading:** on a *passive* run P15 was already
+    refused — but by the per-port presence clause, a presence clause doing a status clause's job by
+    accident; name a port and it passed. The clause is now the leading one, P6/P7 match Linux's
+    by-enumeration spelling exactly rather than more strictly, and `docs/macos.md`'s paragraph —
+    which had become a *rationale* for the absence — is corrected in place. A synthetic-antecedent
+    guard proves the new clause can fail, which none of the unconditional clauses in either file
+    had.
     (e) **`REQUIRED_CAPS.len() >= 2` was a floor**, so a third capability — which AGENTS §4 and
     §15.45 call a design *amendment* — reddened nothing. It is now `assert_eq!` with a message
     naming the amend-first order, and **fail-first proven**: planting `cap_sys_admin` reddens it
@@ -2201,6 +2347,43 @@ transcripts, the pattern-wait maxima). What follows is the residue.
     *(g)* "One shared helper" rules (§16.1's boundary supervisor, §16.4's three purge instances,
     the one fragmenter) each have every *instance* tested and nothing forbidding a fourth
     hand-rolled one; §16.11 has nothing stopping a `.sh` reappearing under `scripts/validate/`.
+
+65. **The exec-child orphan class: one instance fixed, one live, one surface uncovered** —
+    **PARTLY EXECUTED 2026-08-13** (notes §3.91). Found by item 50's agent as **260 accumulated
+    orphans** on the development box, from code that had landed the same day with a green suite.
+    *(a) EXECUTED — the transcript child.* Root cause confirmed by `strace` on a live specimen and
+    it is not what anyone guessed: **`std::io::Stdin` is a plain, non-reentrant `Mutex`** — only
+    `Stdout` and `Stderr` use `ReentrantLock` — and `park_transcript` called `stdin().lock()` while
+    its caller's `StdinLock` was still alive. A **same-thread self-deadlock, before its first
+    read**, so the leash's EOF arrived at a process that had stopped listening. The orchestrator's
+    offered hypothesis (a *different* thread holding a reentrant lock) is **refuted in both
+    halves**. Fixed by passing the caller's reader in rather than reaching for the global; it still
+    parks rather than exits, so a restart cannot overwrite the evidence, and §15.36's idle rule was
+    re-measured on the fixed binary (`wchan=anon_pipe_read`, **0 CPU ticks over 5 s**).
+    *(b) EXECUTED — the guard, as a harness property rather than one test's assertion.*
+    `Daemon::start` now spawns with `process_group(0)` and `Daemon::drop` sweeps the group,
+    waits bounded, kills what is left and **panics naming pids and argv**. The process *group* is
+    the right relation because the parent link is exactly what has been destroyed by the time
+    anyone can ask — the children are on ppid 1. `ps` failure panics rather than reading as
+    "nothing found", so the sweep cannot pass vacuously, and a planted stdin-ignoring child
+    (`/bin/sh -c 'exec sleep 300'` — nothing serial_nexus about it, since the sweep matches the
+    group and not a name) proves it is not.
+    *(c) OPEN — `tests/ext-codec/deaf.py` is a second live instance*, masked today only because its
+    one test calls `remove-node` first and takes the graceful path. Its docstring claims "nothing
+    here outlives the node that started it", which is true **only where the daemon gets to run
+    code**. Now guarded: any test that loads it and lets the `Daemon` drop reddens.
+    *(d) OPEN — `serial-nexus-web` has no §15.43 leash arm at all.* `WebServer::spawn` has
+    `KillOnDrop` and no piped stdin, and the binary has no `--exit-on-stdin-eof` flag. A live
+    orphan was found on the box. Daemon ✓, sim ✓, web ✗.
+    *(e) OPEN — the latent sibling.* `stdin_eof_watch()` parks a background thread holding
+    `stdin.lock()` for the process's whole life, so **any** future sim mode that both arms the
+    leash and reads stdin on the main thread deadlocks identically. Unreachable today only because
+    `transcript` is the sole stdin reader and refuses the leash — and **that refusal has no test**.
+    *(f) OPEN — a policy question worth deciding rather than inheriting.* `Daemon::drop` calls
+    `rpc.shutdown()` and then SIGKILLs immediately, so the kill wins the race against the graceful
+    teardown that would have reaped the child. The tests therefore never exercise the daemon's real
+    teardown path on this axis. Letting `shutdown` land first would have contained this leak; it
+    would also add a wait to ~284 call sites, which is why it was not done blind.
 
 ### Evaluated and deliberately not scheduled — the closing register
 

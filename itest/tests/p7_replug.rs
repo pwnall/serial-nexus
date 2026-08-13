@@ -30,13 +30,11 @@
 //! where that is unavailable (macOS: a pty cannot be a `serial2` device — `ENOTTY`).
 
 use std::os::unix::fs::symlink;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use serial_nexus_itest::{Rpc, Sim, TempRun, bin, serial_echo, wait_until};
+use serial_nexus_itest::{RawDaemon, Rpc, Sim, TempRun, serial_echo, wait_until};
 
 /// The canonical usb identity the serial node is configured for (§12). The fixture
 /// tree below is what makes this resolve to `<dev-root>/dev/ttyUSB0`.
@@ -45,40 +43,6 @@ const DEVNAME: &str = "ttyUSB0";
 const BYID: &str = "usb-FTDI_REPLUG1-if00";
 const USBDIR: &str = "1-1";
 const IFACE: &str = "00";
-
-/// A daemon child SIGKILLed and reaped on drop, so a panicking test never leaks it.
-struct KillOnDrop(Child);
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Spawn `serial-nexus-daemon` on `run`'s socket + state file, rooted at the fixture
-/// `dev_root` (§12: `sys_root` is `<dev-root>/sys`) — the seam that lets the resolver
-/// walk fixture by-id/sysfs trees unprivileged.
-fn spawn_daemon(run: &TempRun, dev_root: &Path) -> Child {
-    Command::new(bin("serial-nexus-daemon"))
-        .arg("--socket")
-        .arg(run.socket())
-        .arg("--state-file")
-        .arg(run.state_file())
-        .arg("--dev-root")
-        .arg(dev_root)
-        .env("XDG_RUNTIME_DIR", run.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serial-nexus-daemon")
-}
-
-/// Wait until a daemon is actually accepting on `sock` (bounded poll, no bare sleep).
-fn wait_socket(sock: &Path) -> bool {
-    wait_until(Duration::from_secs(10), || {
-        UnixStream::connect(sock).is_ok()
-    })
-}
 
 /// Replace `link` with a fresh symlink to `target` — the `ln -sfn` the shell fixture
 /// used, so the fixture builder is idempotent and doubles as the replug.
@@ -183,11 +147,9 @@ fn replug_heals_and_reapplies_the_open_ritual() {
     make_fixture(&root);
     let device = spawn_device(&dev_node);
 
-    let _daemon = KillOnDrop(spawn_daemon(&run, &root));
-    assert!(
-        wait_socket(&run.socket()),
-        "daemon control socket never appeared"
-    );
+    let _daemon = RawDaemon::builder(&run)
+        .args(&["--dev-root", &root.to_string_lossy()])
+        .start();
     let rpc = Rpc::new(run.socket());
 
     // A free-for-all serial (so the console's targetward writes flow without a lock)

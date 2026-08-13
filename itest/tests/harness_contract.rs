@@ -9,11 +9,14 @@
 //! right to refuse — so it lives here.
 
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::json;
-use serial_nexus_itest::{Daemon, TempRun, wait_until};
+use serial_nexus_itest::{
+    Daemon, KillOnDrop, RawDaemon, Sim, TempRun, WebServer, bin, daemon_answers, pid_alive,
+    wait_until,
+};
 
 /// **Review 37, 37-TEST-4.** [`serial_nexus_itest::Rpc::stream`] used to swallow the
 /// stream verb's ack with `let _ =`, so a daemon that *refused* the subscribe or the
@@ -102,44 +105,45 @@ fn the_pair_provider_prefers_software_and_falls_back_to_the_rig() {
     );
 }
 
-/// A child killed and reaped on drop, so a panicking assertion in the parent test does
-/// not itself leak the fixture this file is about.
-struct KillOnDrop(Child);
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Is `pid` a live process? `kill -0` rather than a raw `kill(2)`: everything outside
-/// `serial_nexus_sys` is `unsafe`-free (§16.3) and the harness already borrows `kill(1)`
-/// for signals.
-fn pid_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 /// The child half of [`a_sigkilled_test_process_leaves_no_daemon`]. libtest runs every
 /// `#[test]` in a binary, so this is a no-op unless it was re-invoked as the fixture;
 /// `SNX_ORPHAN_FIXTURE` is both the trigger and the channel for what it reports.
+///
+/// It starts **one child per leashed spawn path in the harness** — `Daemon::start`,
+/// `RawDaemon` (the eight `spawn_daemon` copies and four one-off wrappers now behind
+/// it, plan §18 items 50 and 24), and `Sim::spawn` — plus one deliberately *unleashed*
+/// `Sim`, which is the control: §15.43's leash is opt-in, and a mechanism that fired
+/// without being asked would be a different, worse defect. The report is one line per
+/// field, in the order the parent reads them.
 #[test]
 fn orphan_leash_fixture() {
     let Ok(report) = std::env::var("SNX_ORPHAN_FIXTURE") else {
         return; // an ordinary suite run: nothing to do
     };
     let d = Daemon::start();
-    std::fs::write(&report, format!("{}\n{}\n", d.pid(), d.socket().display()))
-        .expect("report the daemon's pid and socket");
+    let raw_run = TempRun::new();
+    let raw = RawDaemon::start(&raw_run);
+    // Long-lived doubles: nothing here may self-terminate before the parent has looked,
+    // so the timeout is far past the parent's own deadlines.
+    let leashed_sim = Sim::spawn(&["pty", "--echo", "--timeout-ms", "600000"], None);
+    let unleashed_sim = Sim::spawn_unleashed(&["pty", "--echo", "--timeout-ms", "600000"], None);
+    std::fs::write(
+        &report,
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n",
+            d.pid(),
+            d.socket().display(),
+            raw.pid(),
+            raw.socket().display(),
+            leashed_sim.pid(),
+            unleashed_sim.pid(),
+        ),
+    )
+    .expect("report the children this fixture started");
     // Block until the parent kills us. Nothing here may run `Drop` — a parent that dies
-    // without unwinding is the entire point.
+    // without unwinding is the entire point. The `raw_run` binding is held so its temp
+    // directory is not swept out from under the daemon named in the report.
+    let _held = (&raw_run, &leashed_sim, &unleashed_sim);
     std::thread::sleep(Duration::from_secs(300));
     unreachable!("the orphan fixture was supposed to be killed long before this");
 }
@@ -181,17 +185,36 @@ fn a_sigkilled_test_process_leaves_no_daemon() {
         "the orphan fixture never reported a daemon: it may not have started one"
     );
     let reported = std::fs::read_to_string(&report).expect("read the fixture's report");
-    let mut lines = reported.lines();
-    let pid: u32 = lines
-        .next()
-        .and_then(|l| l.trim().parse().ok())
-        .unwrap_or_else(|| panic!("fixture report has no pid: {reported:?}"));
-    let socket = PathBuf::from(lines.next().expect("fixture report has no socket path"));
-    assert!(
-        pid_alive(pid),
-        "the fixture's daemon {pid} was already gone before the kill; this test would \
-         prove nothing"
+    let fields: Vec<&str> = reported.lines().collect();
+    assert_eq!(
+        fields.len(),
+        6,
+        "the fixture report is not the six lines this test reads: {reported:?}"
     );
+    let pid_at = |i: usize, what: &str| -> u32 {
+        fields[i]
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("fixture report has no {what} pid: {reported:?}"))
+    };
+    let pid = pid_at(0, "Daemon::start");
+    let socket = PathBuf::from(fields[1]);
+    let raw_pid = pid_at(2, "RawDaemon");
+    let raw_socket = PathBuf::from(fields[3]);
+    let sim_pid = pid_at(4, "leashed Sim");
+    let unleashed_pid = pid_at(5, "unleashed Sim");
+    for (what, p) in [
+        ("daemon", pid),
+        ("raw daemon", raw_pid),
+        ("sim double", sim_pid),
+        ("unleashed sim double", unleashed_pid),
+    ] {
+        assert!(
+            pid_alive(p),
+            "the fixture's {what} {p} was already gone before the kill; this test would \
+             prove nothing"
+        );
+    }
 
     // The mechanism, exactly: the fixture dies without unwinding, so none of its `Drop`
     // impls, `atexit` handlers, or signal arms run.
@@ -209,19 +232,197 @@ fn a_sigkilled_test_process_leaves_no_daemon() {
          holds {} and every device its graph had opened",
         socket.display()
     );
+    // The same claim for the *other* two leashed spawn paths, which had no leash at all
+    // until plan §18 items 50 and 24: every `spawn_daemon` copy and every one-off wrapper
+    // booted a daemon without one, and `Sim` was uncovered outright.
+    assert!(
+        wait_until(Duration::from_secs(30), || !pid_alive(raw_pid)),
+        "the RawDaemon {raw_pid} outlived the SIGKILLed test process that spawned it; \
+         it still holds {}",
+        raw_socket.display()
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || !pid_alive(sim_pid)),
+        "the Sim double {sim_pid} outlived the SIGKILLed test process that spawned it; \
+         it still holds a pty master, and its --timeout-ms is ten minutes away"
+    );
+
+    // **The control, and it is not decorative.** §15.43's leash is opt-in; a leash that
+    // fired without being asked would stop a double the moment anything handed it a null
+    // stdin, which is what `Command::output()` does and why `Sim::client` must never pass
+    // the flag. So the unleashed double must still be running here — and this test kills
+    // it itself, because nothing else will.
+    assert!(
+        pid_alive(unleashed_pid),
+        "the *unleashed* Sim double {unleashed_pid} died with its parent: the leash is \
+         firing without being opted into, which would end any double spawned with a \
+         closed or null stdin (§15.43)"
+    );
+    let _ = Command::new("kill")
+        .arg("-9")
+        .arg(unleashed_pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
     // The socket check is the half that pid reuse cannot fool, and it is also evidence
     // the daemon took its *clean* teardown path (§10 unlinks the socket) rather than
     // merely dying.
+    for socket in [&socket, &raw_socket] {
+        assert!(
+            wait_until(Duration::from_secs(5), || !socket.exists()),
+            "the daemon's control socket {} was never unlinked: it did not take the \
+             clean teardown path",
+            socket.display()
+        );
+    }
+
+    // The fixture died before its own `TempRun`s could sweep — that is the point; this
+    // test owns the sweeping.
+    for socket in [&socket, &raw_socket] {
+        if let Some(dir) = socket.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The shared child scaffolding, self-tested (design §16.5, "assertion helpers are
+// shared and self-tested"; plan §18 item 50).
+//
+// Each of these pins the one property whose quiet loss would look exactly like the
+// helper still working — which is the whole reason the item asks for self-tests
+// rather than for the consolidation alone.
+// ---------------------------------------------------------------------------
+
+/// **[`KillOnDrop`] really kills.**
+///
+/// A `std::process::Child`'s own `Drop` neither signals nor reaps, so this guard is the
+/// only thing standing between a panicking assertion and a leaked subprocess — in
+/// fifteen files before it was shared. Gut its `Drop` body and nothing else in the
+/// suite changes colour: every test that uses it still passes, and the leak shows up in
+/// the *next* run as a device already held.
+///
+/// Fail-first: replacing the `Drop` body with `{}` fails here with
+/// `the KillOnDrop guard's child <pid> is still alive after the guard was dropped`.
+#[test]
+fn a_killondrop_guard_really_kills_its_child() {
+    // A double with a ten-minute timeout, so "it is gone" can only mean the guard
+    // killed it — never that it finished on its own while this test looked away.
+    let guard = KillOnDrop(
+        Command::new(bin("serial-nexus-sim"))
+            .args(["pty", "--echo", "--timeout-ms", "600000"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the sim double"),
+    );
+    let pid = guard.id();
     assert!(
-        wait_until(Duration::from_secs(5), || !socket.exists()),
-        "the daemon's control socket {} was never unlinked: it did not take the clean \
-         teardown path",
-        socket.display()
+        wait_until(Duration::from_secs(10), || pid_alive(pid)),
+        "the sim double {pid} never came up, so this test would prove nothing"
     );
 
-    // The fixture died before its own `TempRun` could sweep — that is the point; this
-    // test owns the sweeping.
-    if let Some(dir) = socket.parent() {
-        let _ = std::fs::remove_dir_all(dir);
-    }
+    drop(guard);
+
+    assert!(
+        wait_until(Duration::from_secs(10), || !pid_alive(pid)),
+        "the KillOnDrop guard's child {pid} is still alive after the guard was dropped"
+    );
+}
+
+/// **[`RawDaemon::start`] returns a daemon that is already answering.**
+///
+/// The seven `wait_socket` copies it replaced stopped at `UnixStream::connect(..).is_ok()`,
+/// which a bound listener satisfies before the daemon is serving. Every caller's next
+/// line is an RPC, so the readiness wait is load-bearing and its failure mode is a
+/// timing-dependent error from nowhere — the shape that reads as a flake rather than as
+/// a defect in the harness.
+///
+/// The assertion is deliberately *un*retried: one `info` call, immediately, with no
+/// `wait_until` around it. That is exactly the promise `start` makes.
+///
+/// Fail-first: weakening `wait_daemon_ready` to `socket.exists()` makes this fail with
+/// the RPC error from the un-served socket. (Weakening it to a bare connect is the
+/// *other* half of the pair and is pinned deterministically by
+/// `a_listener_that_accepts_but_never_answers_is_not_ready` in the library's own unit
+/// tests, where a silent listener can be arranged on purpose.)
+#[test]
+fn a_raw_daemon_answers_rpc_the_instant_start_returns() {
+    let run = TempRun::new();
+    let d = RawDaemon::start(&run);
+    let info = d.rpc().ok("info", json!({}));
+    assert!(
+        info.get("daemon_version").is_some(),
+        "RawDaemon::start returned before the daemon could answer `info`: {info}"
+    );
+    assert!(
+        daemon_answers(d.socket()),
+        "the socket RawDaemon::start reports is not the one the daemon answers on"
+    );
+    assert!(
+        pid_alive(d.pid()),
+        "RawDaemon::pid does not name a live process"
+    );
+}
+
+/// **A restart on the same socket and state file works through the shared spawner** —
+/// the capability the eight private `spawn_daemon` copies existed for, and the one a
+/// consolidation onto `Daemon::start` (fresh temp dir per call) would have silently
+/// dropped.
+#[test]
+fn a_raw_daemon_can_be_killed_and_restarted_on_the_same_socket() {
+    let run = TempRun::new();
+    let mut first = RawDaemon::start(&run);
+    let first_pid = first.pid();
+    first.kill();
+    assert!(
+        wait_until(Duration::from_secs(10), || !pid_alive(first_pid)),
+        "RawDaemon::kill left {first_pid} running"
+    );
+
+    // The hard kill leaves a stale socket file behind, which is precisely the state
+    // `test -S` would have called "ready" and the connect probe correctly refuses.
+    let second = RawDaemon::start(&run);
+    assert_ne!(second.pid(), first_pid, "the restart reused the dead pid?");
+    assert!(
+        second
+            .rpc()
+            .ok("info", json!({}))
+            .get("daemon_version")
+            .is_some(),
+        "the restarted daemon does not answer on the reclaimed socket"
+    );
+}
+
+/// **[`WebServer::start`] returns only once the port it reports is accepting.**
+///
+/// The seven copies it replaced all scraped the bound URL out of the child's stdout,
+/// and the value of doing that — rather than sleeping — is that the port is live when
+/// the scan succeeds. So the assertion is an un-retried TCP connect: a `start` that
+/// returned early, or reported a port it read from the wrong line, fails here rather
+/// than three HTTP helpers downstream with `Connection refused`.
+///
+/// No daemon: the console answers its own assets long before anything reaches the
+/// control socket, so this is a pure test of the boot scaffolding.
+///
+/// Fail-first: returning `port + 1` from `WebServer::start` fails here with
+/// `the port WebServer::start reported is not accepting`.
+#[test]
+fn a_web_server_start_returns_a_port_that_already_accepts() {
+    let run = TempRun::new();
+    let server = WebServer::start(
+        "127.0.0.1:0",
+        "harnesstoken0123456789abcdef",
+        &run.socket(),
+        run.path(),
+        &[],
+    );
+    let port = server.port();
+    assert!(port != 0, "WebServer::start reported port 0");
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+        "the port WebServer::start reported is not accepting: 127.0.0.1:{port}"
+    );
 }

@@ -33,44 +33,15 @@
 //! spawns), which `Daemon::start` cannot express — the `p7_crash_recovery` pattern.
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use serial_nexus_itest::{Rpc, TempRun, bin, daemon_answers, wait_until};
+use serial_nexus_itest::{RawDaemon, Rpc, TempRun, wait_until};
 
-/// A daemon child killed and reaped on drop, so a panicking test leaks nothing.
-struct KillOnDrop(Child);
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Spawn `serial-nexus-daemon` on `run`'s fixed socket + state file and wait until it
-/// **answers** RPC. Reusing the same paths across two spawns is what exercises the
-/// restart: the second daemon reclaims the socket and recovers the persisted
-/// configuration at startup (§10/§11).
-fn spawn_daemon(run: &TempRun) -> KillOnDrop {
-    let child = Command::new(bin("serial-nexus-daemon"))
-        .arg("--socket")
-        .arg(run.socket())
-        .arg("--state-file")
-        .arg(run.state_file())
-        .env("XDG_RUNTIME_DIR", run.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serial-nexus-daemon");
-    let socket = run.socket();
-    assert!(
-        wait_until(Duration::from_secs(10), || daemon_answers(&socket)),
-        "daemon never answered on {}",
-        socket.display()
-    );
-    KillOnDrop(child)
-}
+// The daemon here is a [`RawDaemon`] on `run`'s fixed socket + state file, waited for
+// until it **answers** RPC. Reusing the same paths across two spawns is what exercises
+// the restart: the second daemon reclaims the socket and recovers the persisted
+// configuration at startup (§10/§11).
 
 /// A two-console, edgeless graph. Two so a removal has a survivor to be distinguished
 /// from a truncation: a snapshot that lost *everything* would pass a one-node test.
@@ -128,7 +99,7 @@ fn wait_snapshot(path: &Path, mut ok: impl FnMut(&str) -> bool) -> bool {
 fn remove_node_is_snapshotted_and_the_restart_does_not_resurrect_it() {
     let run = TempRun::new();
     let state = run.state_file();
-    let daemon = spawn_daemon(&run);
+    let daemon = RawDaemon::start(&run);
     let rpc = Rpc::new(run.socket());
 
     rpc.load_toml(&two_consoles(&run), false).expect("load");
@@ -154,7 +125,7 @@ fn remove_node_is_snapshotted_and_the_restart_does_not_resurrect_it() {
     // Stop cleanly and come back on the same paths.
     rpc.shutdown();
     drop(daemon);
-    let _daemon2 = spawn_daemon(&run);
+    let _daemon2 = RawDaemon::start(&run);
     assert_eq!(
         node_names(&rpc),
         vec!["keep".to_string()],
@@ -166,7 +137,7 @@ fn remove_node_is_snapshotted_and_the_restart_does_not_resurrect_it() {
 fn teardown_persists_the_empty_graph_and_the_restart_comes_up_empty() {
     let run = TempRun::new();
     let state = run.state_file();
-    let daemon = spawn_daemon(&run);
+    let daemon = RawDaemon::start(&run);
     let rpc = Rpc::new(run.socket());
 
     rpc.load_toml(&two_consoles(&run), false).expect("load");
@@ -189,7 +160,7 @@ fn teardown_persists_the_empty_graph_and_the_restart_comes_up_empty() {
 
     rpc.shutdown();
     drop(daemon);
-    let _daemon2 = spawn_daemon(&run);
+    let _daemon2 = RawDaemon::start(&run);
     assert!(
         node_names(&rpc).is_empty(),
         "the restart resurrected a torn-down graph: {:?}",
@@ -201,7 +172,7 @@ fn teardown_persists_the_empty_graph_and_the_restart_comes_up_empty() {
 fn a_clean_shutdown_preserves_the_snapshot_byte_for_byte() {
     let run = TempRun::new();
     let state = run.state_file();
-    let daemon = spawn_daemon(&run);
+    let daemon = RawDaemon::start(&run);
     let rpc = Rpc::new(run.socket());
 
     rpc.load_toml(&two_consoles(&run), false).expect("load");
@@ -225,7 +196,7 @@ fn a_clean_shutdown_preserves_the_snapshot_byte_for_byte() {
         "a clean shutdown rewrote the snapshot"
     );
 
-    let _daemon2 = spawn_daemon(&run);
+    let _daemon2 = RawDaemon::start(&run);
     assert_eq!(
         node_names(&rpc),
         vec!["drop".to_string(), "keep".to_string()],

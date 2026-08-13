@@ -35,10 +35,11 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -611,6 +612,12 @@ impl Daemon {
             .arg("--exit-on-stdin-eof")
             .args(extra)
             .env("XDG_RUNTIME_DIR", run.path())
+            // A process group of its own, so everything this daemon spawns — its
+            // `exec` codec children and whatever those spawn — is enumerable after
+            // the daemon is gone, when the parent links no longer are. See
+            // [`Daemon::survivors`]; nothing else about the daemon changes, because
+            // this harness sends every signal to a pid and never to a group.
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -655,9 +662,26 @@ impl Daemon {
         self.run.socket()
     }
 
-    /// The daemon subprocess's pid.
+    /// The daemon subprocess's pid. Also its process group id — [`Daemon`] makes the
+    /// daemon a group leader so [`Self::survivors`] can ask its question.
     pub fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Processes this daemon has left running in its process group, other than the
+    /// daemon itself: its `exec` codec children and anything they spawned, as
+    /// `(pid, argv)`.
+    ///
+    /// Live while the daemon is — a running codec child is a *healthy* graph, not a
+    /// leak — so this is a question, not an assertion. The assertion is
+    /// [`Daemon::drop`]'s, which asks it once the daemon is dead and reaped, when the
+    /// only correct answer is "none".
+    pub fn survivors(&self) -> Vec<(u32, String)> {
+        let me = self.child.id();
+        process_group_members(me)
+            .into_iter()
+            .filter(|(pid, _)| *pid != me)
+            .collect()
     }
 
     /// Send `signal` (a `kill(1)` name — `"TERM"`, `"INT"`) and wait up to `timeout` for
@@ -707,6 +731,567 @@ impl Drop for Daemon {
         self.rpc.shutdown();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.sweep_process_group();
+    }
+}
+
+impl Daemon {
+    /// After the daemon is dead and reaped: nothing it spawned may still be running.
+    ///
+    /// **Why this is a harness property and not one test's assertion.** A daemon's
+    /// `exec` codec child is spawned by the *daemon*, so no `KillOnDrop` in this
+    /// process can reach it, and §15.43's leash cannot either — the leash is stdin
+    /// EOF, which is a signal the child has to *act on*. A child that never gets as far
+    /// as reading its stdin ignores it forever, and after the daemon is SIGKILLed
+    /// (which is what this `Drop` does, and what a SIGKILLed daemon can do nothing
+    /// about) there is no other authority left to stop it. That leak is invisible to
+    /// every assertion a test makes about bytes, counters or verdicts: `cargo test`
+    /// reports the test green and the process is still on the box. It happened —
+    /// `serial-nexus-sim transcript` self-deadlocked on `std::io::Stdin`'s
+    /// non-reentrant mutex before its first `read`, and `p8_daemon_transcript` left
+    /// **three orphans per run**, measured, accumulating across runs until someone
+    /// noticed the process list, with the suite green every one of those times.
+    ///
+    /// So the sweep runs for every [`Daemon`] in the suite, not for the one test that
+    /// was caught: any exec fixture can hang in the same place, and this is the only
+    /// vantage point that can see it.
+    ///
+    /// Survivors are SIGKILLed either way — a guard that reports a leak and then leaves
+    /// it running has doubled the mess it exists to find.
+    fn sweep_process_group(&mut self) {
+        let pgid = self.child.id();
+        // A grace window, not a timer standing in for a fact (§9): a child that honours
+        // its stdin EOF exits in microseconds, so the first poll is normally the last.
+        // The window only bounds how long a *loaded* box may take to schedule it.
+        let mut outcome = group_members(pgid);
+        if !matches!(&outcome, Ok(v) if v.is_empty()) {
+            wait_until(Duration::from_secs(10), || {
+                outcome = group_members(pgid);
+                matches!(&outcome, Ok(v) if v.is_empty())
+            });
+        }
+        let complaint = match outcome {
+            Ok(v) if v.is_empty() => return,
+            Ok(survivors) => {
+                let named: Vec<String> = survivors
+                    .iter()
+                    .map(|(pid, argv)| format!("  pid {pid}: {argv}"))
+                    .collect();
+                let pids: Vec<String> = survivors.iter().map(|(pid, _)| pid.to_string()).collect();
+                let _ = Command::new("kill")
+                    .arg("-9")
+                    .args(&pids)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                format!(
+                    "the daemon (pid/pgid {pgid}) is dead but left {} process(es) running in its \
+                     process group:\n{}\nThey have been SIGKILLed so the box stays clean. A \
+                     process the daemon spawned must stop when the daemon does: an `exec` codec \
+                     child's only leash is the EOF on its stdin (§15.43, §7.6), so one that \
+                     blocks before reading stdin — or that treats EOF as anything but the end — \
+                     outlives every run for good.",
+                    survivors.len(),
+                    named.join("\n"),
+                )
+            }
+            Err(e) => e,
+        };
+        // Never a second panic during unwinding: that aborts the process and destroys
+        // the failing test's own name, which is the one thing AGENTS §8 says to capture.
+        if std::thread::panicking() {
+            eprintln!("serial-nexus-itest: {complaint}");
+        } else {
+            panic!("{complaint}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared child scaffolding (design §16.5, "assertion helpers are shared and
+// self-tested"; plan §18 items 50 and 24).
+// ---------------------------------------------------------------------------
+
+/// A child SIGKILLed and reaped on `Drop`, so a panicking assertion never leaks a
+/// process.
+///
+/// `std::process::Child` has no kill-on-drop of its own — its `Drop` neither signals
+/// nor reaps — so every test that manages a child by hand needs this, and fourteen
+/// files carried a byte-identical private copy of it (plus `p8_web.rs`'s `Kill` and
+/// `p13_legacy_defaults.rs`'s `Bare`, the same three lines under other names). One
+/// copy, with [`a_killondrop_guard_really_kills_its_child`] proving it does what its
+/// name says: a guard whose `Drop` quietly stopped killing looks exactly like a guard
+/// that works, right up to the run that inherits the leak.
+///
+/// The field is public because the call sites reach for the `Child` directly —
+/// `stderr.take()`, `try_wait`, `id` — and hiding it behind accessors would only
+/// re-derive `Child`'s own API here.
+pub struct KillOnDrop(pub Child);
+
+impl KillOnDrop {
+    pub fn new(child: Child) -> Self {
+        KillOnDrop(child)
+    }
+
+    /// The child's pid.
+    pub fn id(&self) -> u32 {
+        self.0.id()
+    }
+
+    /// `Some(status)` once the child has exited; does **not** reap a live child.
+    pub fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+        self.0.try_wait().expect("try_wait on the child")
+    }
+
+    /// Wait up to `timeout` for the child to exit on its own. `None` means it was
+    /// still running at the deadline — never a kill, so the caller decides whether
+    /// that is the failure or the expectation.
+    pub fn wait_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let mut status = None;
+        wait_until(timeout, || {
+            status = self.try_wait();
+            status.is_some()
+        });
+        status
+    }
+
+    /// SIGKILL and reap now, rather than at the drop.
+    pub fn kill_now(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The orphan sweep: what a daemon leaves behind (design §15.43, §15.31).
+// ---------------------------------------------------------------------------
+
+/// Every live process in Unix process group `pgid`, as `(pid, argv)`, or why the
+/// question could not be answered.
+///
+/// **Why the process *group* and not the process tree.** The processes this exists to
+/// find are the daemon's `exec` codec children, and by the time anyone can ask, the
+/// daemon is dead and they have been reparented to pid 1 — so "descendants of the
+/// daemon" is exactly the relation that has already been destroyed. A process group is
+/// the handle that survives its leader: [`Daemon`] spawns the daemon with
+/// `process_group(0)`, every process it spawns inherits that group, and the group is
+/// therefore the complete answer to "what did this daemon leave running", including
+/// things a codec child spawned in turn.
+///
+/// `ps` rather than `/proc`: `/proc/<pid>/stat` field 5 is the same number and is
+/// Linux-only, which is §9's proxy in space — a guard that reads it passes vacuously on
+/// macOS, where this class of leak is no less possible.
+fn group_members(pgid: u32) -> Result<Vec<(u32, String)>, String> {
+    // `-ww` is for the *message*: BSD `ps` truncates `args` to the output width, and a
+    // leaked child's argv is the whole diagnosis. It is asked for and not required —
+    // both platforms of record accept it, but the flag is worth no risk of a sweep that
+    // panics everywhere on the platform this box cannot test, so a `ps` that dislikes it
+    // is retried plain and only then reported. The two numeric fields are never
+    // truncated, so detection is identical either way.
+    let run = |wide: bool| {
+        let mut cmd = Command::new("ps");
+        cmd.arg("-A");
+        if wide {
+            cmd.arg("-ww");
+        }
+        cmd.args(["-o", "pid=,pgid=,args="]).output()
+    };
+    let out = match run(true) {
+        Ok(out) if out.status.success() => out,
+        _ => run(false).map_err(|e| format!("run ps(1) to sweep process group {pgid}: {e}"))?,
+    };
+    if !out.status.success() {
+        return Err(format!(
+            "ps(1) failed while sweeping process group {pgid}: {}",
+            out.status
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(pg)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(pg)) = (pid.parse::<u32>(), pg.parse::<u32>()) else {
+            continue; // a header line, or a kernel thread with no numbers
+        };
+        if pg == pgid {
+            found.push((pid, fields.collect::<Vec<_>>().join(" ")));
+        }
+    }
+    Ok(found)
+}
+
+/// [`group_members`], panicking rather than reporting — the shape a test wants.
+///
+/// The panic on a failed `ps` is deliberate: a sweep that answers "nothing found"
+/// because it could not look is the vacuous gate AGENTS §3 names, and its passing
+/// output would be identical to its not-running output.
+pub fn process_group_members(pgid: u32) -> Vec<(u32, String)> {
+    group_members(pgid).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Is `pid` a live process? `kill -0` rather than a raw `kill(2)`: everything outside
+/// `serial_nexus_sys` is `unsafe`-free (§16.3) and the harness already borrows `kill(1)`
+/// for signals.
+pub fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Wait, bounded, until a daemon is **answering RPC** on `socket`.
+///
+/// The connect-probing readiness wait, shared (plan §18 item 50): seven files carried a
+/// `wait_socket` that stopped at `UnixStream::connect(sock).is_ok()`. That is
+/// restart-safe — a stale socket file left by a hard kill refuses the connection, where
+/// `test -S` would match it — but it is *not* readiness: a bound listener accepts before
+/// the daemon is serving, and the next RPC then fails with an error from nowhere (T7).
+/// This one keeps the restart-safety (a connect failure is still `false`) and adds the
+/// `info` round trip [`Daemon::start`] has always used, so one definition of "up" serves
+/// the whole suite. Deliberately the **stricter** of the two shapes it replaces
+/// (AGENTS §9).
+pub fn wait_daemon_ready(socket: &Path) -> bool {
+    wait_until(Duration::from_secs(10), || {
+        socket.exists() && daemon_answers(socket)
+    })
+}
+
+/// A `serial-nexus-daemon` whose `Child` the **caller** owns — the `p7_*` "manage your
+/// own child" pattern, shared (plan §18 item 50).
+///
+/// [`Daemon`] boots one plain shape on a fresh temp directory and shuts down cleanly on
+/// drop. Three things tests need that it deliberately does not give: a *restart* on the
+/// same socket and state file, extra flags (`--dev-root`, `--socket-group`), and the pid.
+/// Eight files answered with a private `spawn_daemon`, four more with a one-off wrapper
+/// type (`OwnDaemon`, `OwnedDaemon`, `FlaggedDaemon`, `p13_socket_claim`'s `spawn`), and
+/// **not one of them passed §15.43's leash** — so a test process killed without unwinding
+/// left a daemon holding its control socket and every device its graph had opened, which
+/// is the failure §15.43 exists to remove (plan §18 item 24).
+///
+/// The leash is on by default *here* because this harness is exactly the supervisor
+/// §15.43 describes: it spawns the daemon with a pipe on stdin and holds the write end
+/// for the child's whole life. The daemon's own default stays off — under a service
+/// manager stdin is at EOF from the first instant — and [`RawDaemonBuilder::unleashed`]
+/// is how a test says so.
+pub struct RawDaemon {
+    child: KillOnDrop,
+    /// The write end of the daemon's stdin pipe, held and never written to (§15.43).
+    /// `None` when the caller asked for an unleashed daemon.
+    _leash: Option<std::process::ChildStdin>,
+    socket: PathBuf,
+}
+
+/// Builder for [`RawDaemon`] — the divergence between the spawn sites is all flags,
+/// stderr, and whether readiness is expected at all.
+pub struct RawDaemonBuilder {
+    socket: PathBuf,
+    state_file: PathBuf,
+    xdg: PathBuf,
+    args: Vec<std::ffi::OsString>,
+    stderr_piped: bool,
+    leash: bool,
+}
+
+impl RawDaemon {
+    /// The common shape: a leashed daemon on `run`'s socket and state file, waited for
+    /// until it answers. Panics if it never does.
+    pub fn start(run: &TempRun) -> RawDaemon {
+        Self::builder(run).start()
+    }
+
+    /// A leashed daemon on `run`'s socket and state file, **not** waited for — the
+    /// caller owns readiness (or is asserting that it never arrives).
+    pub fn spawn(run: &TempRun) -> RawDaemon {
+        Self::builder(run).spawn()
+    }
+
+    pub fn builder(run: &TempRun) -> RawDaemonBuilder {
+        RawDaemonBuilder {
+            socket: run.socket(),
+            state_file: run.state_file(),
+            xdg: run.path().to_path_buf(),
+            args: Vec::new(),
+            stderr_piped: false,
+            leash: true,
+        }
+    }
+
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// The daemon subprocess's pid.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// A JSON-RPC client pointed at this daemon's control socket.
+    pub fn rpc(&self) -> Rpc {
+        Rpc::new(self.socket.clone())
+    }
+
+    /// Wait until it answers `info` ([`wait_daemon_ready`]).
+    pub fn wait_ready(&self) -> bool {
+        wait_daemon_ready(&self.socket)
+    }
+
+    /// The child, for the handful of tests that need `Child` itself (its stderr pipe,
+    /// a hard kill at a chosen instant).
+    pub fn child(&mut self) -> &mut Child {
+        &mut self.child.0
+    }
+
+    /// `Some(status)` once it has exited; does not reap a live child.
+    pub fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait()
+    }
+
+    /// Wait up to `timeout` for it to exit on its own. `None` means still running.
+    pub fn wait_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        self.child.wait_exit(timeout)
+    }
+
+    /// Everything the daemon wrote to stderr, for a builder that piped it. Consumes the
+    /// pipe, so it is read once — after the process has exited, or the read blocks.
+    pub fn stderr_to_string(&mut self) -> String {
+        let mut out = String::new();
+        if let Some(mut e) = self.child.0.stderr.take() {
+            let _ = e.read_to_string(&mut out);
+        }
+        out
+    }
+
+    /// SIGKILL and reap now — the "the operator restarted the daemon" event, and the one
+    /// thing [`Daemon`]'s clean-shutdown drop cannot express.
+    pub fn kill(&mut self) {
+        self.child.kill_now();
+    }
+}
+
+impl RawDaemonBuilder {
+    /// Put the control socket somewhere other than the run directory's default (the
+    /// seam `p9_permissions.rs` needs, where `--socket` names an operator's file).
+    pub fn socket(mut self, socket: PathBuf) -> Self {
+        self.socket = socket;
+        self
+    }
+
+    /// Extra `serial-nexus-daemon` flags (`--dev-root`, `--socket-group`, …).
+    pub fn args<S: AsRef<std::ffi::OsStr>>(mut self, extra: &[S]) -> Self {
+        self.args
+            .extend(extra.iter().map(|a| a.as_ref().to_os_string()));
+        self
+    }
+
+    /// Pipe stderr, so a refusal's diagnostic can be read back
+    /// ([`RawDaemon::stderr_to_string`]).
+    pub fn stderr_piped(mut self) -> Self {
+        self.stderr_piped = true;
+        self
+    }
+
+    /// Boot **without** §15.43's leash. The escape hatch for a test whose subject is the
+    /// leash's own opt-in semantics; nothing else should want it.
+    pub fn unleashed(mut self) -> Self {
+        self.leash = false;
+        self
+    }
+
+    /// Spawn without waiting for readiness.
+    pub fn spawn(self) -> RawDaemon {
+        let mut cmd = Command::new(bin("serial-nexus-daemon"));
+        cmd.arg("--socket")
+            .arg(&self.socket)
+            .arg("--state-file")
+            .arg(&self.state_file)
+            .args(&self.args)
+            .env("XDG_RUNTIME_DIR", &self.xdg)
+            .stdout(Stdio::null())
+            .stderr(if self.stderr_piped {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
+        if self.leash {
+            // The leash: this daemon stops when the pipe is closed, which the kernel
+            // does when the test process dies, however it dies (§15.43).
+            cmd.arg("--exit-on-stdin-eof").stdin(Stdio::piped());
+        } else {
+            cmd.stdin(Stdio::null());
+        }
+        let mut child = cmd.spawn().expect("spawn serial-nexus-daemon");
+        let leash = if self.leash {
+            Some(
+                child
+                    .stdin
+                    .take()
+                    .expect("the daemon was spawned with a piped stdin"),
+            )
+        } else {
+            None
+        };
+        // The guard is constructed *before* any readiness assertion (the ordering
+        // `Daemon::start` records): a bare `Child` has no kill-on-drop, so unwinding
+        // past a running daemon on a timeout would leave it with nobody holding its pid.
+        RawDaemon {
+            child: KillOnDrop(child),
+            _leash: leash,
+            socket: self.socket,
+        }
+    }
+
+    /// Spawn and wait until the daemon answers `info`. Panics if it never does.
+    pub fn start(self) -> RawDaemon {
+        let daemon = self.spawn();
+        assert!(
+            daemon.wait_ready(),
+            "daemon never answered `info` on {} within 10s (socket present: {})",
+            daemon.socket.display(),
+            daemon.socket.exists()
+        );
+        daemon
+    }
+}
+
+/// A running `serial-nexus-web` whose stdout is drained into a shared buffer for the
+/// child's whole life, so the bound `http(s)://…` URL it prints right after binding can
+/// be scanned for the OS-chosen ephemeral port. Killed on drop.
+///
+/// Shared (plan §18 item 50): seven files carried this boot scaffolding, and the drain
+/// thread is why it is not two lines — the tracing subscriber writes to stdout too, so a
+/// pipe whose read end was dropped after the port was scraped takes the server down on
+/// its next log line.
+///
+/// **The raw RFC 6455 clients that ride on top of this are deliberately *not* shared.**
+/// Their per-file capability divergence is load-bearing — `p12_web_ws_bounds.rs`'s module
+/// doc states the case: that one must emit frames the others cannot (payloads past the
+/// 16-bit length form, a continuation sequence), and unifying them would mean one client
+/// with every capability, which is the opposite of a scripted peer.
+pub struct WebServer {
+    child: KillOnDrop,
+    lines: Arc<Mutex<Vec<String>>>,
+    /// The `http://` port scraped by [`WebServer::start`]; `None` after a bare
+    /// [`WebServer::spawn`], which may be waiting on a refusal instead.
+    port: Option<u16>,
+}
+
+impl WebServer {
+    /// Spawn `serial-nexus-web --bind <bind> --token <token> --socket <socket>` plus
+    /// `extra`, with `XDG_RUNTIME_DIR = xdg`. Does **not** wait for a URL: the bind
+    /// policy cases (§15.29) are asserting that the process *refuses* instead.
+    pub fn spawn(bind: &str, token: &str, socket: &Path, xdg: &Path, extra: &[&str]) -> WebServer {
+        let socket_str = socket.to_string_lossy().into_owned();
+        let mut args: Vec<&str> = vec!["--bind", bind, "--token", token, "--socket", &socket_str];
+        args.extend_from_slice(extra);
+        let mut child = Command::new(bin("serial-nexus-web"))
+            .args(&args)
+            .env("XDG_RUNTIME_DIR", xdg)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn serial-nexus-web");
+        let stdout = child.stdout.take().expect("piped serial-nexus-web stdout");
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = lines.clone();
+        std::thread::spawn(move || {
+            for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
+                match line {
+                    Ok(l) => sink.lock().unwrap().push(l),
+                    Err(_) => break,
+                }
+            }
+        });
+        WebServer {
+            child: KillOnDrop(child),
+            lines,
+            port: None,
+        }
+    }
+
+    /// [`Self::spawn`] plus the readiness wait: returns once the server has printed the
+    /// `http://…` URL it binds, with [`Self::port`] answering the OS-chosen port.
+    /// Panics if it never prints one — a web test against a server that never bound
+    /// would otherwise fail somewhere downstream with a connection error.
+    pub fn start(bind: &str, token: &str, socket: &Path, xdg: &Path, extra: &[&str]) -> WebServer {
+        let mut server = Self::spawn(bind, token, socket, xdg, extra);
+        let port = server.port_for("http", Duration::from_secs(10));
+        assert!(
+            port.is_some(),
+            "serial-nexus-web never printed its bound http URL; saw {:?}",
+            server.log_lines()
+        );
+        server.port = port;
+        server
+    }
+
+    /// The bound `http://` port, from [`Self::start`].
+    pub fn port(&self) -> u16 {
+        self.port
+            .expect("WebServer::port is answered by `start`, not by a bare `spawn`")
+    }
+
+    /// Wait, bounded, for the printed `<scheme>://…` URL line and return it (trimmed).
+    pub fn url_for(&self, scheme: &str, timeout: Duration) -> Option<String> {
+        let needle = format!("{scheme}://");
+        let mut found = None;
+        wait_until(timeout, || {
+            for l in self.lines.lock().unwrap().iter() {
+                if let Some(i) = l.find(needle.as_str()) {
+                    found = Some(l[i..].trim().to_string());
+                    return true;
+                }
+            }
+            false
+        });
+        found
+    }
+
+    /// The port parsed from the printed `<scheme>://host:port/…` URL (loopback IPv4
+    /// forms only, which is all this server prints).
+    pub fn port_for(&self, scheme: &str, timeout: Duration) -> Option<u16> {
+        let url = self.url_for(scheme, timeout)?;
+        let authority = url.split("://").nth(1)?.split('/').next()?;
+        authority.rsplit_once(':')?.1.trim().parse().ok()
+    }
+
+    /// Wait, bounded, for a stdout line containing `needle`.
+    ///
+    /// Polled rather than read once: the server logs on its own schedule and a client
+    /// observes the closed socket first, so a single look is a race the server usually
+    /// loses.
+    pub fn logged(&self, needle: &str, timeout: Duration) -> bool {
+        wait_until(timeout, || {
+            self.lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains(needle))
+        })
+    }
+
+    /// Everything the child has written to stdout so far.
+    pub fn log_lines(&self) -> Vec<String> {
+        self.lines.lock().unwrap().clone()
+    }
+
+    /// Whether the server process has already exited — how "this environment cannot
+    /// bind what the test needs" (a skip) is told from "the server is broken" (a fail).
+    pub fn exited(&mut self) -> bool {
+        self.child.try_wait().is_some()
     }
 }
 
@@ -714,23 +1299,76 @@ impl Drop for Daemon {
 /// [`Sim::client`] for the one-shot `client` verdicts (which run to completion).
 pub struct Sim {
     child: Child,
+    /// The orphan leash (§15.43), the sim's arm of it (plan §18 item 24): the write end
+    /// of the double's stdin pipe, held for this `Sim`'s whole life and never written to.
+    ///
+    /// [`Drop`] is the happy path; this covers every unhappy one. A test process killed
+    /// by a signal, aborted, or killed as a process group runs no `Drop` at all — but the
+    /// kernel still closes this fd, and the double stops. Without it a `--timeout-ms
+    /// 600000` pty double outlives the run by ten minutes, holding a pty master and its
+    /// device symlink, and the next test wanting that path fails for a reason nowhere in
+    /// its own output.
+    ///
+    /// Opt-in on the sim's side exactly as on the daemon's: `Sim::client` deliberately
+    /// does **not** pass the flag, because `Command::output()` gives the child a null
+    /// stdin, which is at EOF from the first instant.
+    _leash: Option<std::process::ChildStdin>,
 }
 
 impl Sim {
     /// Spawn `serial-nexus-sim` with `args` in the background (a long-lived double such as
     /// `pty --echo --link …`), waiting for `link` to appear if given.
+    ///
+    /// Leashed: the double is given `--exit-on-stdin-eof` and a piped stdin whose write
+    /// end this `Sim` holds (§15.43, plan §18 item 24). See [`Sim::_leash`].
     pub fn spawn(args: &[&str], link: Option<&Path>) -> Self {
-        let child = Command::new(bin("serial-nexus-sim"))
+        let mut child = Command::new(bin("serial-nexus-sim"))
+            .arg("--exit-on-stdin-eof")
             .args(args)
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn serial-nexus-sim");
+        let leash = child
+            .stdin
+            .take()
+            .expect("the sim was spawned with a piped stdin");
+        let sim = Sim {
+            child,
+            _leash: Some(leash),
+        };
         if let Some(link) = link {
             let up = wait_until(Duration::from_secs(5), || link.exists());
             assert!(up, "sim link never appeared at {}", link.display());
         }
-        Sim { child }
+        sim
+    }
+
+    /// [`Self::spawn`] without §15.43's leash — the escape hatch for a test whose
+    /// subject is the leash's own opt-in semantics. Nothing else should want it.
+    pub fn spawn_unleashed(args: &[&str], link: Option<&Path>) -> Self {
+        let child = Command::new(bin("serial-nexus-sim"))
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn serial-nexus-sim");
+        let sim = Sim {
+            child,
+            _leash: None,
+        };
+        if let Some(link) = link {
+            let up = wait_until(Duration::from_secs(5), || link.exists());
+            assert!(up, "sim link never appeared at {}", link.display());
+        }
+        sim
+    }
+
+    /// The double's pid.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// Run a one-shot `serial-nexus-sim client …` to completion and return its JSON verdict.
@@ -2520,5 +3158,93 @@ mod tests {
     fn adopting_a_witness_with_the_wrong_path_panics_at_the_constructor() {
         let null = std::fs::File::open("/dev/null").expect("open /dev/null");
         let _ = adopt_slave(null, Path::new("/dev/zero"));
+    }
+
+    // -----------------------------------------------------------------------------
+    // The readiness predicate's own guards (plan §18 item 50). Here rather than in
+    // `harness_contract.rs` for that file's stated reason: these need a peer that
+    // misbehaves on purpose, which no correct daemon does.
+    // -----------------------------------------------------------------------------
+
+    /// **A listener that accepts and then says nothing is not ready.**
+    ///
+    /// This is the whole distance between the seven `wait_socket` copies
+    /// [`wait_daemon_ready`] replaced — `UnixStream::connect(sock).is_ok()` — and the
+    /// definition [`Daemon::start`] has always used. A bound listener satisfies the
+    /// connect probe *before* the daemon is serving, and every caller's next line is an
+    /// RPC, so the weaker predicate hands back a socket whose first request fails for
+    /// reasons that have nothing to do with the test.
+    ///
+    /// Deterministic, and that is the point: on a real daemon the gap between accept
+    /// and serve is a race, so a guard over one would be a flake either way. Here the
+    /// peer never answers at all.
+    ///
+    /// Fail-first: replacing `wait_daemon_ready`'s body with
+    /// `wait_until(.., || UnixStream::connect(socket).is_ok())` — the shape it replaced —
+    /// makes both assertions below fail.
+    #[test]
+    fn a_listener_that_accepts_but_never_answers_is_not_ready() {
+        let run = TempRun::new();
+        let socket = run.join("silent.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("bind the silent listener");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let accepting = stop.clone();
+        // Accept and hold, writing nothing — a control plane that has bound but is not
+        // yet dispatching. The connections are parked, not closed, because a *closed*
+        // connection is an answer of its own and would let a weaker predicate off.
+        let peer = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !accepting.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // The control: the weaker predicate this replaced is satisfied *right now*, so
+        // the assertion below is about the strengthening and not about an unbound path.
+        assert!(
+            UnixStream::connect(&socket).is_ok(),
+            "the silent listener is not accepting, so this test would prove nothing"
+        );
+        assert!(
+            !daemon_answers(&socket),
+            "a listener that accepts and never answers was read as a live daemon"
+        );
+        assert!(
+            !wait_daemon_ready(&socket),
+            "wait_daemon_ready returned true for a listener that never answered a \
+             request — it has been weakened back to a bare connect probe"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        // Unblock the accept loop with one last dial, then let it go.
+        let _ = UnixStream::connect(&socket);
+        let _ = peer.join();
+    }
+
+    /// The other arm, so the predicate is not merely "always false": a path with
+    /// nothing bound on it is refused immediately, which is what makes
+    /// [`wait_daemon_ready`] restart-safe where `test -S` was not — a stale socket
+    /// **file** left by a hard kill still exists, and still refuses.
+    #[test]
+    fn a_stale_socket_file_is_not_ready_either() {
+        let run = TempRun::new();
+        let socket = run.join("stale.sock");
+        {
+            let _listener =
+                std::os::unix::net::UnixListener::bind(&socket).expect("bind then drop");
+        }
+        assert!(
+            socket.exists(),
+            "the stale socket file is gone, so `test -S`'s failure mode is not being \
+             reproduced here"
+        );
+        assert!(
+            !daemon_answers(&socket),
+            "a stale socket file with no listener was read as a live daemon"
+        );
     }
 }

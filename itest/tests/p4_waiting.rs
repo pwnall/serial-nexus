@@ -259,10 +259,9 @@ fn fifo_grants_in_arrival_order_and_purges_on_each_acquire() {
             &format!("seeded:{PRE}"),
             "--seed",
             "5",
-            "--hold-ms",
-            "30000",
-            "--timeout-ms",
-            "35000",
+            // Caller-owned hold (plan §18 item 25): the detach this test drives is the
+            // `drop` below, never an expiring timer.
+            "--hold-stdin-eof",
         ],
         None,
     ));

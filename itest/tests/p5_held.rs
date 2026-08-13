@@ -211,10 +211,11 @@ fn stealing_the_held_lock_stalls_the_channel_then_resumes() {
             &send,
             "--seed",
             "3",
-            "--hold-ms",
-            "30000",
-            "--timeout-ms",
-            "40000",
+            // Caller-owned hold (plan §18 item 25): this client keeps its slave open
+            // until the `Sim` guard above goes out of scope, so nothing here can expire
+            // early and leave the stall being observed against an already-detached
+            // writer.
+            "--hold-stdin-eof",
         ],
         None,
     );

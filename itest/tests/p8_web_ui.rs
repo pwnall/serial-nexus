@@ -32,13 +32,11 @@
 //! Traces and screenshots for a failing spec land in `web/ui-tests/
 //! test-results/`, which the CI job uploads.
 
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 
-use serial_nexus_itest::{Daemon, Sim, bin, serial_echo, wait_until};
+use serial_nexus_itest::{Daemon, Sim, WebServer, bin, serial_echo};
 
 /// The fixed per-session bearer token. Overriding the random default keeps the
 /// bootstrap URL deterministic (`--token`, §15.29) — same choice `p8_web.rs` makes.
@@ -270,8 +268,8 @@ device = "{dev}"
         }
     }
 
-    let mut server = WebServer::spawn("127.0.0.1:0", &d.socket(), d.run().path());
-    let Some(port) = server.port(Duration::from_secs(15)) else {
+    let mut server = WebServer::spawn("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
+    let Some(port) = server.port_for("http", Duration::from_secs(15)) else {
         assert!(
             !server.exited(),
             "serial-nexus-web exited before printing its bootstrap URL"
@@ -456,64 +454,4 @@ fn missing_browser(stdout: &str, stderr: &str) -> bool {
     MARKERS
         .iter()
         .any(|m| stdout.contains(m) || stderr.contains(m))
-}
-
-/// A running `serial-nexus-web` whose stdout is drained into a shared buffer, so the
-/// bound URL (printed once, right after binding) can be scanned for the OS-chosen
-/// ephemeral port. Killed on drop. (Deliberately a small local copy rather than a
-/// shared helper: `p8_web.rs`'s version carries TLS flags and a raw RFC 6455 client
-/// this gate has no use for.)
-struct WebServer {
-    child: Child,
-    lines: Arc<Mutex<Vec<String>>>,
-}
-
-impl WebServer {
-    fn spawn(bind: &str, socket: &Path, xdg: &Path) -> Self {
-        let socket_str = socket.to_string_lossy().into_owned();
-        let mut child = Command::new(bin("serial-nexus-web"))
-            .args(["--bind", bind, "--token", TOKEN, "--socket", &socket_str])
-            .env("XDG_RUNTIME_DIR", xdg)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn serial-nexus-web");
-        let stdout = child.stdout.take().expect("piped serial-nexus-web stdout");
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let sink = lines.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                sink.lock().unwrap().push(line);
-            }
-        });
-        WebServer { child, lines }
-    }
-
-    fn port(&self, timeout: Duration) -> Option<u16> {
-        let mut found = None;
-        wait_until(timeout, || {
-            let guard = self.lines.lock().unwrap();
-            for l in guard.iter() {
-                if let Some(i) = l.find("http://") {
-                    found = Some(l[i..].trim().to_string());
-                    return true;
-                }
-            }
-            false
-        });
-        let url = found?;
-        let authority = url.split("://").nth(1)?.split('/').next()?;
-        authority.rsplit_once(':')?.1.parse().ok()
-    }
-
-    fn exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
-    }
-}
-
-impl Drop for WebServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }

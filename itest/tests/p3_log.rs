@@ -43,14 +43,14 @@
 
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use serial_nexus_itest::{
-    Daemon, Rpc, Sim, TempRun, bin, file_len, seeded_bytes, serial_echo, sha256_hex, wait_until,
+    Daemon, RawDaemon, Rpc, Sim, TempRun, file_len, seeded_bytes, serial_echo, sha256_hex,
+    wait_until,
 };
 
 const SIZE_256K: u64 = 256 * 1024;
@@ -372,42 +372,11 @@ b = "rot"
 
 // ---- Check 3: rotation counter recovered by directory scan on restart (§7.3) ----
 
-/// A daemon child that is SIGKILLed and reaped on drop, so a panicking test never
-/// leaks a daemon.
-struct KillOnDrop(Child);
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Spawn `serial-nexus-daemon` on `run`'s socket + state file (the persisted-config path
-/// policy, §11/§15.9). Reusing the same paths across two spawns is how the restart is
-/// exercised: the stale-socket dance reclaims the leftover socket and the persisted
-/// state file is recovered at startup (§10).
-fn spawn_daemon(run: &TempRun) -> Child {
-    Command::new(bin("serial-nexus-daemon"))
-        .arg("--socket")
-        .arg(run.socket())
-        .arg("--state-file")
-        .arg(run.state_file())
-        .env("XDG_RUNTIME_DIR", run.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serial-nexus-daemon")
-}
-
-/// Wait until a daemon is actually listening on `sock` (a bound listener accepts the
-/// connection; a leftover stale socket file refuses it). Bounded poll, no panic — this
-/// is the restart-safe replacement for `test -S`, which would spuriously match the
-/// stale socket file left by the hard kill.
-fn wait_socket(sock: &Path) -> bool {
-    wait_until(Duration::from_secs(10), || {
-        UnixStream::connect(sock).is_ok()
-    })
-}
+// The daemon here is a [`RawDaemon`]: reusing `run`'s socket + state file across two
+// spawns is how the restart is exercised (the stale-socket dance reclaims the leftover
+// socket and the persisted state file is recovered at startup, §10/§11/§15.9), and
+// `RawDaemon::start`'s readiness wait is restart-safe in the way `test -S` is not — a
+// stale socket file refuses the connection where `test -S` would match it.
 
 #[test]
 fn rotation_counter_recovered_by_directory_scan_on_restart() {
@@ -418,11 +387,7 @@ fn rotation_counter_recovered_by_directory_scan_on_restart() {
     let logdir = run.join("logs");
     std::fs::create_dir_all(&logdir).expect("mkdir log directory");
 
-    let mut d1 = KillOnDrop(spawn_daemon(&run));
-    assert!(
-        wait_socket(&run.socket()),
-        "daemon 1 control socket never appeared"
-    );
+    let mut d1 = RawDaemon::start(&run);
     let rpc = Rpc::new(run.socket());
 
     // A lone log node: the directory-scan recovery is independent of any producer.
@@ -463,16 +428,12 @@ filename = "rot.log"
 
     // Hard kill (SIGKILL) skips the clean-shutdown socket unlink and never persists the
     // rotation counter — the next daemon must recover both from the environment (§7.3).
-    d1.0.kill().expect("SIGKILL daemon 1");
-    d1.0.wait().expect("reap daemon 1");
+    d1.child().kill().expect("SIGKILL daemon 1");
+    d1.child().wait().expect("reap daemon 1");
 
     // A fresh daemon reclaims the stale socket (§10) and recovers config from the
     // persisted state file; its log node rescans the directory itself (§7.3).
-    let _d2 = KillOnDrop(spawn_daemon(&run));
-    assert!(
-        wait_socket(&run.socket()),
-        "daemon 2 control socket never came back"
-    );
+    let _d2 = RawDaemon::start(&run);
 
     // Existing rotations are .000 and .001, so the recovered counter must read 1 — not
     // a restart at 000.

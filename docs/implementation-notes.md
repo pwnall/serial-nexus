@@ -11437,3 +11437,208 @@ is mine: I ran the meta-gates before that edit and not after, so the commit went
 next agent's report is what surfaced it. **Run the gates between the last edit and the commit, not
 between the last-but-one and the commit** — the rule is obvious and I broke it inside the same
 session that filed four gates for asserting nothing.
+
+---
+
+### 3.89 Two probe questions answered, one refused for the right reason, and a gate that agreed with everything
+
+**Item 14, and the answer nobody had asked for.** §15.53 refuses an `rts-cts` config whose driver
+drops `CRTSCTS`; software flow control had neither a pre-check nor a probe, and the item's honest
+framing was *unmeasured, not known-good*. It is now measured: `ftdi_sio` on Linux 7.0.0-29
+**honours** `IXON|IXOFF` — `c_iflag` `0x5` → `0x1405`, a delta of exactly those two bits, on both
+ports. So no dropping driver has been found, and **§15.53 stays un-extended**, which is what the
+item's *Declined* line demanded and what a weaker session would have quietly overturned by
+"consistency".
+
+The observation is shaped to what the daemon does rather than to what reads well:
+`serial2::FlowControl::XonXoff` sets those bits and clears `CRTSCTS`, and its `matches_requested`
+compares the **whole** `c_iflag` word — so the shipped cell is `serial2_readback_would_fault`, the
+property the product actually promises, with the two human-readable flags beside it. The one place
+the software pass reaches the *verdict* is `baseline_restored`, which now covers both flag words: a
+restore check reading `c_cflag` alone would have certified a port left with `IXON` asserted.
+Corroborated from outside the probe, notes §3.68's method: `stty` after a full Tier-3 run reads
+`-crtscts -ixoff -ixon -ixany`.
+
+**Item 22, where the Linux answer is a control proving itself inert.** P13 gained the shape it
+lacked — a reader arriving *while* the kernel is inside its close-wait, which is the shape the
+failing macOS test inhabits. The construction detail is the finding: the reader must be **already
+spinning** when the close is entered. Spawning it, or sleeping and then reading, cannot land inside
+Linux's µs-wide window at all, so either would have produced a probe that never measures its own
+subject — §13's vacuity taxonomy 2, arriving in the instrument written to close a gap in the
+instruments. Linux reads 3 of 3: the arriving reader wins, first `read(2)` at 0–1 µs against a
+close returning in 3–7 µs, 64 of 64 recovered. On a `retains` kernel that is exactly what should
+happen and it establishes nothing about the question; **Darwin is where this shape is the
+measurement**, and until that capture the item is half discharged and says so in its registry row.
+
+Two defects were caught inside the probe's own construction, which is worth recording because both
+would have shipped a confident wrong number: a `bytes_lost: 64` printed beside a reader that
+recovered all 64, and a cell named `bytes_recovered_during_close` that would have been *false* on a
+lost race. And a panicked reader thread would have published `arrived: true` with 0 bytes — the
+join fallback is now `u64::MAX`, so a broken instrument cannot read as a clean measurement.
+
+**Item 26 was refused, and the refusal is the point.** A new probe id is derived from the design's
+§13 roster by `meta_derive`'s gate. Landing P16 with the design still saying P1–P15 would have made
+the **tree ahead of the design** — which AGENTS §5 forbids in the same words it forbids the reverse,
+and which would have shipped a red meta-gate as the cost of a green feature. The right move was to
+stop and say what unblocks it, which is what happened. The amendment is now made (§15.59 plus §13's
+glance row, roster string and era row) and the construction proceeds under the amend-first order
+rather than against it.
+
+**The era decision, and why one boundary rather than two.** Items 14 and 22 add observation *keys*
+under unchanged `question` strings, so `field_set` moves and `probe_set` does not — §13's era law
+clause 4 in as many words, meaning the era stays open and the new artifacts are **era-mates** of the
+rows below, diffable on the intersection. `field_set` went `fc01990f2e38876e` → `c4ed6e7ef3f8088f`
+(Tier-3) and `141e256d40c1e83e` → `544dca850580d430` (passive). The genuinely hard sub-decision: P15's
+`question` still names `CRTSCTS` while its probe now reports a software reading too. Widening that
+string moves `probe_set` — and would close this era for a **wording** change while P16 is already
+owed and will close it for a real instrument. Two boundaries where one will do, so the widening
+rides with P16 in the same commit, and every software block carries its own `asks` string meanwhile
+so the JSON is self-describing rather than merely narrower than its probe.
+
+**And a gate that agreed with everything.** `expectations/macos.jq` — the file AGENTS §3 names as
+the macOS gate — carried a bare `(.summary != null)` where `linux.jq` carries
+`(.summary.unsupported == 0)`, while its own head comment, copied verbatim from its Linux sibling,
+claimed unsupported stayed a gate failure through the summary clause. Six probes' clauses were bare
+presence checks with no status constraint. Measured against a Darwin-shaped report before anything
+was touched: `unsupported` on P1/P3/P4/P5/P11 exited **0**, and so did a `skipped` on P6/P7. After
+the repair all four exit 1 and an honest report still exits 0.
+
+One correction to the audit that found it: on a *passive* run P15 was already refused — but by the
+**per-port presence clause**, a presence clause doing a status clause's job by accident. Name a port
+and it passed. That is a nastier shape than a missing clause, because it makes the file look
+covered from one direction.
+
+Worst of all, `docs/macos.md` had grown a paragraph *explaining* the absence — "nothing may report
+`unsupported` stopped being the right shape once the probe set grew past P5" — a rationale for a
+clause that had simply never been written. A hole with a justification attached survives review in
+a way a bare hole does not, and correcting the file meant correcting the story as well as the code.
+
+---
+
+### 3.90 P16, and two guards that started green
+
+**The probe.** `pts slave-witness liveness`, built once §15.59 unblocked it. Two arms on one held
+slave fd, **each the other's control**: `POLLHUP` must be *absent* while the master is open and
+*present* after it closes. A probe with only the second arm would report a hangup that was never
+absent — which is why a fired control is reported **first**, ahead of the finding it invalidates.
+The quiet arm polls twice, back-to-back and again at the PTY node's own 5 ms `IDLE_POLL`, because
+"no hangup right now" and "no hangup at the cadence the shipped node actually polls" are different
+claims (§15.49 clause 3). It is placed after P8/P9/P10 deliberately: its paced arm parks 320 ms
+inside `poll(2)`, which is the syscall P9 is timing.
+
+**What it answers.** `SlaveWitness::prove_open` — the harness check notes §3.60 filed as
+*expected, not measured* — is **sound on Linux, and now measured rather than examined**:
+`path_still_resolves` goes `true` → `false` across the master's close while
+`fstat_on_the_held_fd_answers` stays `true` on both sides, so `shipped_prove_open_would_refuse`
+moves `false` → `true`. The tautology sits in the same row and is the point of printing all three
+steps: `fstat` still answers on a pair that is gone, which is exactly why step 2 is the
+load-bearing one and why a witness resting on step 1 alone would be a check that cannot fail.
+
+Two bounds the probe prints rather than leaving to prose: it is sound *for this kernel* — the
+residual was always the off-Linux half — and *for this edge*, meaning whether the comparison sees
+**the master's close**, not liveness in general.
+
+**The Darwin readings are pre-registered**, so the interpretation cannot be chosen after the
+capture arrives. `path_still_resolves: true` after the close is the predicted persistent-devfs
+shape and makes `prove_open` **unsound there**, leaving notes §3.56's seven converted guards held
+by the compile-time borrow alone — and since `poll_can_tell` already reads `true` here, the
+portable upgrade would then be a `serial_nexus_sys` `poll` helper rather than an argument.
+`path_still_resolves: false` **refutes** the prediction, and that refutation is as load-bearing as
+a confirmation. `poll_can_tell: false` means neither instrument is portable and the witness
+argument needs re-deriving rather than re-coding.
+
+**Two guards started green, and the code was not the thing that was wrong.** This is the failure
+the fail-first discipline exists to catch, arriving inside the work written to honour it. The stat
+guard constructed its reading **by hand**, so it could not see the *constructor* deciding between
+`None` and `Some(false)` — it now drives the real `take` against a path that does not exist. And a
+dropped negative-control conjunct in `poll_can_tell` was invisible because the verdict checks the
+two windows separately; the guard now asserts the published cell agrees with the verdict, which is
+§13's own shape — a verdict contradicted by its own observation — that it had been blind to. A
+third, pre-existing, was repaired as collateral: a gate guard anchored its needle on the **tail**
+of a list that grows, so it would have gone quiet the moment the list grew again.
+
+**One design-invariant correction on the way**, and it is a small vindication of the wall it hit:
+the first draft reached for `BorrowedFd::borrow_raw`, which is `unsafe` — §16.3, the very rule
+that sent this question to the doctor rather than into the harness. `AsFd` does the job with a real
+lifetime instead of a promised one.
+
+**The era, and a naming problem that had to be solved rather than papered over.** `probe_set` moved
+`e79f5fcd86a2e5f0` → **`4317ea5ac187f506`**: one boundary carrying two changes, P16's arrival and
+P15's widened `question`, exactly as §15.59 scheduled so that a wording change would not spend a
+boundary of its own. The six new captures share a UTC day *and* a `commit` with the era-closing
+triple — the tree was uncommitted through both, so `build.rs` stamped the same `<sha>-dirty` — and
+what separates them is the **instrument**, which a sha cannot say and which `-2`/`-3` would say the
+opposite of. Hence a third filename segment naming the move. The lesson is recorded where the next
+person meets it: the era-closing triple's owed *passive* half is now **never takeable**, because
+the era closed before it was taken. Take both halves before an instrument change, not after.
+
+---
+
+### 3.91 260 orphans, a green suite, and a self-deadlock nobody guessed
+
+**The finding.** Item 50's agent reported **260 orphaned `serial-nexus-sim transcript` processes**
+on the development box, `ppid 1`, ages up to an hour. They came from `p8_daemon_transcript.rs`,
+which had landed the same day with three tests passing. Reproduced from a clean state:
+`transcript 0 → 3` per run, `daemon 0 → 0`. Three tests green, three processes leaked, and the
+arithmetic says it had happened about eighty times.
+
+**Zero daemons leaked, which is the first useful fact.** Item 24's stdin-EOF leash works. What
+survived was the daemon's *exec children* — processes the harness never spawned and no
+`KillOnDrop` guard can reach.
+
+**The diagnosis, and my hypothesis was refuted in both halves.** The forensics ruled out the
+obvious story before anyone read code: each orphan held its stdin pipe with **exactly one fd
+reference across the whole box — its own**, so nobody held the write end and `read` would have
+returned EOF at once. The process sat in `futex_do_wait`, single-threaded. I offered the guess that
+`Stdin`'s lock is reentrant per thread and a *different* thread must be holding it. Both halves are
+wrong. `strace` on a live specimen, reproduced with no daemon at all:
+
+    write(2, " (stdin reached EOF before the e"..., 42) = 42
+    futex(0x…, FUTEX_WAIT_BITSET_PRIVATE, 2, NULL, FUTEX_BITSET_MATCH_ANY)
+
+and no `read(0, …)` ever follows. **`std::io::Stdin` is a plain, non-reentrant `Mutex`** — only
+`Stdout` and `Stderr` use `ReentrantLock`. `park_transcript` called `std::io::stdin().lock()` while
+its caller's `StdinLock` was still alive, so it self-deadlocked **on its own thread, before its
+first read**. The leash's EOF arrived at a process that had already stopped listening. Exactly
+three of the five transcript children park; the two that reach clean EOF return without parking and
+never leaked, which is why the count was 3 and not 5.
+
+The fix passes the caller's reader in rather than reaching for the global. It still **parks** — an
+exec child that exits is a crash to the daemon and gets respawned over the evidence — and §15.36's
+idle rule was re-measured on the fixed binary: `wchan=anon_pipe_read`, **0 CPU ticks over 5 s**.
+
+**The guard is a harness property, because the defect was not a property of one test.** The child
+is spawned by the *daemon*, so the relation the harness could use — parenthood — is precisely the
+one already destroyed by the time anyone can ask. `Daemon::start` now spawns with
+`process_group(0)` and `Daemon::drop` sweeps the **group**, waits bounded, kills what remains, and
+panics naming pids and argv. Two details make it non-vacuous: a `ps` failure panics rather than
+reading as "nothing found", and its own proof plants a child that ignores stdin — `/bin/sh -c
+'exec sleep 300'`, nothing serial_nexus about it, since the sweep matches the group and not a name.
+
+**What the sweep then found, measured across every fixture.** `tests/ext-codec/deaf.py` is a
+**second live instance**, masked only because its one test calls `remove-node` first and takes the
+graceful path; its docstring's claim that "nothing here outlives the node that started it" is true
+only where the daemon gets to run code. And `serial-nexus-web` has **no leash arm at all** — no
+piped stdin, no flag — with a live orphan on the box to prove it. Daemon ✓, sim ✓, web ✗.
+
+**The supervisor meets its obligation everywhere it can run code**, which is worth stating because
+the headline invites the opposite conclusion: on `teardown`, on `shutdown` and on SIGTERM the child
+dies. Only after SIGKILL does it survive, and after SIGKILL nothing in the daemon can act — the
+leash is the only backstop by construction, and a child that blocks before reading stdin cannot
+honour it. But the harness makes SIGKILL the *only* path its tests take: `Daemon::drop` calls
+`rpc.shutdown()` and then kills immediately, so the kill wins the race against the graceful
+teardown that would have reaped the child. That is now a filed question rather than an inherited
+default (item 65(f)).
+
+**The latent sibling, recorded because it is one refusal away.** `stdin_eof_watch()` parks a
+background thread holding `stdin.lock()` for the process's whole life. Any future sim mode that
+both arms the leash and reads stdin on the main thread deadlocks identically. It is unreachable
+today only because `transcript` is the sole stdin reader and *refuses* the leash — and **that
+refusal has no test**.
+
+**One unreproduced observation, recorded rather than swept.** A full-suite run stalled ~14 minutes
+on `p6_outage::outage_faults_then_purges_then_recovers_byte_clean` on an idle box (load 0.12). This
+is the same hang §3.83 recorded at 39 minutes and deliberately left unattributed. It did not recur:
+4/4 in isolation in ~4 s, and green in the second full-suite run on the same tree. Process-group
+membership has no bearing on `bind()`, so it is not attributed to this change — and it is not
+closed either.

@@ -30,51 +30,16 @@
 //!   `--timeout-ms` (the lifetime knob for a pure echo device, as [`serial_echo`] does
 //!   in the harness) with a value far longer than the test.
 //! * `Daemon::start` cannot pass `--dev-root`, so the daemon is hand-managed via
-//!   `Command` + `bin("serial-nexus-daemon")` (the pattern in `p3_log.rs`), killed on drop.
+//!   a `RawDaemon` on `run`'s fixed socket and state file, killed on drop.
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use serial_nexus_itest::{Rpc, Sim, TempRun, bin, serial_echo, wait_until};
+use serial_nexus_itest::{RawDaemon, Rpc, Sim, TempRun, serial_echo, wait_until};
 
 /// `serial-nexus-rpc` `AppError::DeviceAbsent` — base `-32000` (`APP_ERROR_BASE`) offset by 5.
 const DEVICE_ABSENT: i64 = -32005;
-
-/// A daemon child SIGKILLed and reaped on drop, so a panicking test never leaks it.
-struct KillOnDrop(Child);
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Spawn `serial-nexus-daemon` on `run`'s socket + state file with the resolver rooted at
-/// `dev_root` (the §12 fixture seam). `Daemon::start` cannot express `--dev-root`.
-fn spawn_daemon(run: &TempRun, dev_root: &Path) -> Child {
-    Command::new(bin("serial-nexus-daemon"))
-        .arg("--socket")
-        .arg(run.socket())
-        .arg("--state-file")
-        .arg(run.state_file())
-        .arg("--dev-root")
-        .arg(dev_root)
-        .env("XDG_RUNTIME_DIR", run.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serial-nexus-daemon")
-}
-
-/// Wait until a daemon is actually listening on `sock` (a bound listener accepts;
-/// a stale socket file refuses). Bounded poll — the restart-safe `test -S` replacement.
-fn wait_socket(sock: &Path) -> bool {
-    wait_until(Duration::from_secs(10), || {
-        std::os::unix::net::UnixStream::connect(sock).is_ok()
-    })
-}
 
 /// Force-create a symlink at `link` pointing to `target` (removing any prior entry),
 /// the portable `ln -sfn`. The fixture dir is fresh, so a prior entry never exists.
@@ -237,11 +202,9 @@ fn device_identity_matrix_over_fixture_trees() {
     ));
 
     // Bring up the daemon with the resolver rooted at the fixture tree.
-    let _daemon = KillOnDrop(spawn_daemon(&run, &root));
-    assert!(
-        wait_socket(&run.socket()),
-        "daemon control socket never appeared"
-    );
+    let _daemon = RawDaemon::builder(&run)
+        .args(&["--dev-root", &root.to_string_lossy()])
+        .start();
     let rpc = Rpc::new(run.socket());
 
     // ---- 1. FT4232: four independently bound nodes with distinct resolved paths ----

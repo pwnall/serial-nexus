@@ -2488,7 +2488,7 @@ Supporting several systems is a stated requirement, and capability differences a
 tooling, not by bug reports. The project ships **`serial-nexus-doctor`** (§15.17), the one
 diagnostic binary consolidating every kernel-behavior probe the design depends on. Its contract:
 
-1. **The probe roster is P1–P15**, and `docs/serial-nexus-doctor.md` is the probe registry of
+1. **The probe roster is P1–P16**, and `docs/serial-nexus-doctor.md` is the probe registry of
    record: per-probe questions, verdict grammars, and measured baselines live there, not here.
    Identity probes ask about *devices*, never the by-id directory — the diagnostic cannot skip
    in the one environment §12 grew a fallback for, and a by-id tree absent with devices
@@ -2582,6 +2582,7 @@ baselines) stays delegated to `docs/serial-nexus-doctor.md`:
 | P13 | At a pts last close, are unread client bytes retained, discarded, or does the close wait? |
 | P14 | The highest baud at which a payload round-trips byte-exact both ways, and what stopped the search? |
 | P15 | Does a named port honour a requested flow-control mode, or accept it and silently drop it? |
+| P16 | Does a held pts slave fd report `POLLHUP` once the master closes, and stay quiet while it is open? |
 
 ### Instrument validity
 
@@ -2805,6 +2806,7 @@ record and carries the per-artifact rows, including eras predating both digests.
 | `94d64d8bbacf1174` | + P14 | the `42eac2a` macOS triple against the `3d850cf` Linux triple — P14's first cross-kernel reading (§15.51) | opened by P14 (notes §3.57); closed by P15 (notes §3.65) |
 | `82a8e2198e54626a` | + P15 | the `7cf0338` Linux triple, the `acb5162` macOS triple, the 6.18 field report at `3e23c52` — holding the first lawful cross-kernel Linux comparison (6.18 ↔ 7.0, same-source basis) | opened by P15 (notes §3.65); closed by the P15 `question` correction (notes §3.73) |
 | `e79f5fcd86a2e5f0` | P1–P15, corrected citation | the current era; first artifacts committed at its opening | opened by notes §3.73; open |
+| `4317ea5ac187f506` | P1–P16 | the current era, opened 2026-08-13 by P16's arrival together with P15's widened `question` — **one boundary, two changes**, deliberately (§15.59). The `field_set` moves earlier the same day (P15's software reading, P13's fifth shape) are **not** boundaries — clause 4 — so the artifacts either side of *those* stay era-mates, while nothing diffs across *this* row | opened by notes §3.89/§3.90; open |
 
 Two reading rules close the section: a cross-kernel claim quotes the rung it stands on — "same
 binary", "equal `field_set`", or the era and fingerprint pair — and a diff without its basis
@@ -3160,7 +3162,7 @@ text and the status line names that home. A few entries still carry normative te
   invariant): frozen `docs/doctor/` artifacts, gates, and code cite §15.N by number, so an entry
   cited by immutable evidence is never renumbered, its number never reused; an emptied entry
   becomes a stub. This record keeps the prior generation's numbering through §15.55;
-  §15.56, §15.57 and §15.58 are this generation's additions.
+  §15.56, §15.57, §15.58 and §15.59 are this generation's additions.
 - **Refutations are decisions.** A refuted diagnosis or a declined proposal is recorded like an
   adopted design — falsifier (or reason), outcome, status — because refutations are what stop a
   rejected shape from being re-proposed on no new evidence. Silently re-fixing a declined item is
@@ -3168,7 +3170,7 @@ text and the status line names that home. A few entries still carry normative te
   never drift (§15.48 carries the exemplar overturn, notes §3.37 → §3.43).
 
 **Topic index.** "Was this decided, declined, or refuted?" should be one lookup. Every entry
-§15.1–§15.58 appears below, titled at its primary topic (numbers alone on repeats); an entry can
+§15.1–§15.59 appears below, titled at its primary topic (numbers alone on repeats); an entry can
 appear under more than one topic.
 
 - **Graph model and vocabulary** — §15.2 typed endpoints · §15.3 orientation vocabulary ·
@@ -3196,7 +3198,7 @@ appear under more than one topic.
   certificate · §15.44 two digests · §15.46 instrument self-testimony · §15.47 portable
   certificate · §15.49 a zero is a claim · §15.51 P14 maximum-rate search · §15.52 handshake
   continuity · §15.57 the Markdown rendering is a view, not a format · §15.58 actual
-  baud in node state
+  baud in node state · §15.59 P16, the slave-witness liveness instrument
 - **Harness and validation doctrine** — §15.31 harness as crate · §15.34 review-26 classes
   become rules · §15.36 flake doctrine · §15.37 · §15.48 provider seam, last-hop physics
 - **Platform and privilege** — §15.13 · §15.30 · §15.45 privileged replug capability ·
@@ -4357,6 +4359,37 @@ platform and assert nothing, which is plan §3 rule 22's tell in a state field.
 **Validation** (item 41): fail-first against a refusing rate on the rig — the FT232R that P14
 already measured accepting 3000000 and refusing above it is the fixture, so the guard has a real
 divergence to see rather than a synthetic one.
+
+### 15.59 The slave-witness liveness question becomes an instrument: P16
+
+**Status:** DECIDED — roster and era rows at §13; construction is plan §18 item 26. Written before
+the tree moves (AGENTS §5), which is the order item 26 was blocked on: a new probe id is derived
+from *this* document by `meta_derive`'s roster gate, so landing P16 first would have made the tree
+ahead of the design — the same defect as the reverse, and the reason the item stopped rather than
+shipping a red gate.
+
+**The gap, and why it is a probe rather than a comment.** The harness's `SlaveWitness::prove_open`
+establishes that a pts slave is still open by comparing `(st_dev, st_ino, st_rdev)` against a fresh
+`stat` of the path. That works on Linux because the kernel unlinks `/dev/pts/N` when the master
+closes. On Darwin, whose devfs nodes persist, the same comparison is **expected to degrade and has
+never been measured** — notes §3.56 leans on the behaviour, §3.60 names the doctor as its home, and
+between them sits a load-bearing assumption with no artifact. §7's rule is the whole answer: when
+two credible readings of kernel behaviour are possible, measure instead of assuming.
+
+**What P16 asks.** `poll(POLLHUP)` on a held slave fd, twice: with the master **open**, where it
+must stay quiet — that is the negative arm, and a probe without it would report a hangup that was
+never absent — and after the master **closes**, where it must fire. Beside it, whether `stat(path)`
+still resolves, so the two instruments are read side by side on the same kernel in the same run.
+Two arms, both able to fire, no third-way verdict.
+
+**Consequences, stated because they are the cost.** A new probe id moves `probe_set` and therefore
+**closes the `e79f5fcd86a2e5f0` era** — the deliberate, recorded kind of era move (§15.44's law),
+not a drifted one. That is also why P15's `question` string was *not* widened **at its own
+landing**, when the probe gained a software-flow reading beside `CRTSCTS`: widening it would have
+moved `probe_set` for a **wording** change, spending a second era boundary where one will do. The
+two are folded together at P16's landing, in one commit — the widened `question`, the software
+reading folded into P15's verdict, and P16's arrival — so the archive gains one boundary rather
+than two.
 
 ## 16. Post-completion review: reliability through simplification
 

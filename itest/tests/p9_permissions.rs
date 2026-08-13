@@ -34,14 +34,13 @@
 //! skip is CP-3's success case, which needs the test user to be in a secondary group;
 //! a machine with none is a valid skip, announced.
 
-use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
-use serial_nexus_itest::{Daemon, TempRun, bin, daemon_answers, sha256_hex, wait_until};
+use serial_nexus_itest::{Daemon, RawDaemon, TempRun, daemon_answers, sha256_hex, wait_until};
 
 /// The permission bits of `path` (`& 0o777`). Panics if it does not exist — a missing
 /// file is a broken test, not a passing one (the anti-tautology rule, §5).
@@ -117,85 +116,20 @@ fn secondary_group() -> Option<(String, u32)> {
         .find(|(name, gid)| *gid != primary && !name.chars().all(|c| c.is_ascii_digit()))
 }
 
-/// A `serial-nexus-daemon` booted with **extra flags** — the harness [`Daemon`] deliberately
-/// boots one plain shape, and `--socket-group` is the whole point here. Same temp
-/// runtime dir discipline (short `/tmp` path, `SUN_LEN`), same kill-and-clean on `Drop`,
-/// so a panicking assertion never leaks a daemon.
-struct FlaggedDaemon {
-    child: Child,
-    socket: PathBuf,
-    /// Held for its `Drop` (the temp directory goes with it), not read.
-    _run: TempRun,
+/// A daemon booted with **extra flags** — the harness [`Daemon`] deliberately boots one
+/// plain shape, and `--socket-group` is the whole point here. [`RawDaemon`] carries the
+/// temp-runtime-dir discipline (short `/tmp` path, `SUN_LEN`) and the kill-on-drop; the
+/// spawn is deliberately not waited for, because a test here may be asserting that the
+/// daemon *never* becomes ready.
+fn flagged_daemon(run: &TempRun, extra: &[&str]) -> RawDaemon {
+    RawDaemon::builder(run).args(extra).stderr_piped().spawn()
 }
 
-impl FlaggedDaemon {
-    /// Spawn with `extra` appended to the standard `--socket`/`--state-file` flags.
-    /// Does **not** wait for readiness: a test here may be asserting that it never
-    /// becomes ready.
-    fn spawn(extra: &[&str]) -> FlaggedDaemon {
-        let run = TempRun::new();
-        let socket = run.socket();
-        Self::spawn_at(run, socket, extra)
-    }
-
-    /// [`Self::spawn`] with `--socket` pointed somewhere other than the run directory's
-    /// default — the seam SEAM-2 needs, where the flag names an operator's file rather
-    /// than a socket.
-    fn spawn_at(run: TempRun, socket: PathBuf, extra: &[&str]) -> FlaggedDaemon {
-        let child = Command::new(bin("serial-nexus-daemon"))
-            .arg("--socket")
-            .arg(&socket)
-            .arg("--state-file")
-            .arg(run.state_file())
-            .args(extra)
-            .env("XDG_RUNTIME_DIR", run.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn serial-nexus-daemon");
-        FlaggedDaemon {
-            child,
-            socket,
-            _run: run,
-        }
-    }
-
-    fn socket(&self) -> PathBuf {
-        self.socket.clone()
-    }
-
-    /// Wait until the daemon answers an `info` round trip — the same readiness
-    /// definition [`Daemon::start`] uses (T7), not merely "the inode appeared".
-    fn wait_ready(&self) -> bool {
-        let socket = self.socket();
-        wait_until(Duration::from_secs(10), || {
-            socket.exists() && daemon_answers(&socket)
-        })
-    }
-
-    /// Wait for the process to exit within `timeout`, returning its exit code and
-    /// stderr. `None` means it was still running (which for a "must refuse" case is
-    /// the failure).
-    fn wait_exit(mut self, timeout: Duration) -> Option<(Option<i32>, String)> {
-        let mut status = None;
-        wait_until(timeout, || {
-            status = self.child.try_wait().expect("try_wait");
-            status.is_some()
-        });
-        let status = status?;
-        let mut stderr = String::new();
-        if let Some(mut e) = self.child.stderr.take() {
-            let _ = e.read_to_string(&mut stderr);
-        }
-        Some((status.code(), stderr))
-    }
-}
-
-impl Drop for FlaggedDaemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+/// Wait for `daemon` to exit within `timeout`, returning its exit code and stderr.
+/// `None` means it was still running (which for a "must refuse" case is the failure).
+fn wait_exit(daemon: &mut RawDaemon, timeout: Duration) -> Option<(Option<i32>, String)> {
+    let status = daemon.wait_exit(timeout)?;
+    Some((status.code(), daemon.stderr_to_string()))
 }
 
 // ============================================================================
@@ -492,9 +426,12 @@ fn a_daemon_pointed_at_an_existing_file_refuses_and_leaves_it_intact() {
     std::fs::write(&notes, content).expect("write the operator file");
     let before = sha256_hex(content);
 
-    let d = FlaggedDaemon::spawn_at(TempRun::new(), notes.clone(), &[]);
-    let (code, stderr) = d
-        .wait_exit(Duration::from_secs(10))
+    let run = TempRun::new();
+    let mut d = RawDaemon::builder(&run)
+        .socket(notes.clone())
+        .stderr_piped()
+        .spawn();
+    let (code, stderr) = wait_exit(&mut d, Duration::from_secs(10))
         .expect("the daemon kept running with --socket pointed at a regular file");
 
     assert_ne!(
@@ -558,13 +495,14 @@ fn socket_group_chgrps_the_control_socket_and_widens_it_to_0660() {
         return;
     };
 
-    let d = FlaggedDaemon::spawn(&["--socket-group", &group]);
+    let run = TempRun::new();
+    let d = flagged_daemon(&run, &["--socket-group", &group]);
     assert!(
         d.wait_ready(),
         "the daemon never answered RPC with --socket-group {group}"
     );
 
-    let socket = d.socket();
+    let socket = d.socket().to_path_buf();
     assert_eq!(
         gid_of(&socket),
         gid,
@@ -605,10 +543,10 @@ fn an_unknown_socket_group_is_a_hard_startup_error() {
     // collide with a real group somebody just created.
     let bogus = format!("snx-no-such-group-{}", std::process::id());
 
-    let d = FlaggedDaemon::spawn(&["--socket-group", &bogus]);
-    let socket = d.socket();
-    let (code, stderr) = d
-        .wait_exit(Duration::from_secs(10))
+    let run = TempRun::new();
+    let mut d = flagged_daemon(&run, &["--socket-group", &bogus]);
+    let socket = d.socket().to_path_buf();
+    let (code, stderr) = wait_exit(&mut d, Duration::from_secs(10))
         .expect("the daemon kept running with an unresolvable --socket-group");
 
     assert_ne!(

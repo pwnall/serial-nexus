@@ -57,11 +57,12 @@
 //! §5 promises — is asserted here beside the comparison.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
 use serial_nexus_codec_api::{Event, MAX_FRAME_SIZE, encode};
-use serial_nexus_itest::{Daemon, Rpc, bin, wait_until};
+use serial_nexus_itest::{Daemon, Rpc, TempRun, bin, wait_until};
 
 /// The end-of-conversation sentinel. Matches `serial-nexus-sim transcript`'s
 /// `--end-marker` default; spelled once here and passed nowhere, so the two can only
@@ -570,6 +571,191 @@ fn replaying_the_host_transcript_passes_and_a_one_byte_mutation_fails_it() {
         v["observed_byte"].as_str(),
         Some(format!("0x{want:02x}").as_str()),
         "and the daemon sent the original: {v}"
+    );
+}
+
+// --- the park's own promise --------------------------------------------------
+
+/// **A parked transcript child stops when its stdin closes** — every one of the three
+/// places it parks.
+///
+/// The sweep below catches the *class* from the daemon's side; this names the property
+/// the product promises, at the boundary that promises it, with no daemon in the way.
+/// It is the cheaper of the two and the one whose failure message points at the sim.
+///
+/// The defect it guards: `park_transcript` used to call `std::io::stdin().lock()` for
+/// itself, and two of its three call sites are inside a function whose `StdinLock` is
+/// still alive. `Stdin` is a plain `Mutex`, not the `ReentrantLock` behind `Stdout` and
+/// `Stderr`, so that second lock was a same-thread self-deadlock: `futex(FUTEX_WAIT…)`,
+/// forever, *before* the first `read`. The EOF that is §15.43's whole leash arrived at a
+/// process that had stopped listening for it.
+///
+/// Each case closes the child's stdin and asserts an exit, which is exactly what the
+/// daemon's teardown does. Deliberately not a `--record`-file assertion: the file
+/// appeared fine while the process stayed forever.
+#[test]
+fn a_parked_transcript_child_exits_when_its_stdin_closes() {
+    let dir = TempRun::new();
+    let script = dir.join("script.transcript");
+    // One daemon→child record and no child half: enough to give the replay something to
+    // disagree with, and nothing for the child to write.
+    std::fs::write(&script, "> H:aa\n").expect("write the script");
+
+    /// One parking call site: how it is reached, and what (if anything) must be fed
+    /// before the EOF for the child to be sitting in the park when it arrives.
+    struct ParkCase {
+        what: &'static str,
+        args: Vec<String>,
+        feed: Option<&'static [u8]>,
+    }
+
+    // The three call sites, in the order they appear in `sim/src/main.rs`.
+    let cases = vec![
+        ParkCase {
+            what: "the error path (an unreadable transcript)",
+            args: vec![
+                "--transcript".to_owned(),
+                dir.join("does-not-exist").display().to_string(),
+                "--record".to_owned(),
+                dir.join("never.transcript").display().to_string(),
+            ],
+            feed: None,
+        },
+        ParkCase {
+            what: "the recorder, after its conversation ended",
+            args: vec![
+                "--transcript".to_owned(),
+                script.display().to_string(),
+                "--record".to_owned(),
+                dir.join("observed.transcript").display().to_string(),
+            ],
+            feed: None,
+        },
+        ParkCase {
+            what: "the replayer, parked on a mismatch it has already written down",
+            args: vec![
+                "--transcript".to_owned(),
+                script.display().to_string(),
+                "--verdict".to_owned(),
+                dir.join("verdict.json").display().to_string(),
+            ],
+            // One byte that is not the 0xaa the transcript asks for: the replayer
+            // records the mismatch and parks rather than exiting (a child that exits is
+            // a crash to the daemon, which would restart it over the diagnosis).
+            feed: Some(b"\xbb"),
+        },
+    ];
+
+    for ParkCase { what, args, feed } in cases {
+        let mut child = Command::new(bin("serial-nexus-sim"))
+            .arg("transcript")
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn serial-nexus-sim transcript");
+        {
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            if let Some(bytes) = feed {
+                use std::io::Write;
+                stdin.write_all(bytes).expect("feed the replayer");
+                stdin.flush().expect("flush");
+                // Let it reach the park before the EOF, so this tests the park and not
+                // a read that had not started.
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            // …and the EOF, which is the only thing that may stop it.
+        }
+        let mut status = None;
+        let exited = wait_until(Duration::from_secs(15), || {
+            status = child.try_wait().expect("try_wait");
+            status.is_some()
+        });
+        if !exited {
+            let pid = child.id();
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "{what}: `serial-nexus-sim transcript` was still running 15 s after its \
+                 stdin closed (pid {pid}, killed). A parked codec child's only leash is \
+                 that EOF (§15.43); one that misses it outlives every run that spawns it."
+            );
+        }
+    }
+}
+
+// --- the sweep that would have caught the recorder ---------------------------
+
+/// The orphan sweep's own proof, which is what stops it being a gate that asserts
+/// nothing (AGENTS §3, plan §3 rule 22).
+///
+/// Every [`Daemon`] in this suite now sweeps its process group on drop and fails if the
+/// daemon left anything running. That check is silent when it passes — its output is
+/// identical to its not-running output — so on its own it is exactly the shape §3 warns
+/// about. This test supplies the other half by **planting** the violation: a codec child
+/// that never reads its stdin, which is precisely how the recorder leaked (it
+/// self-deadlocked on `std::io::Stdin`'s non-reentrant mutex before its first `read`, so
+/// the EOF that is §15.43's whole leash arrived at a process that was never going to
+/// look). The planted child is `sleep`, with nothing serial_nexus about it, because the
+/// sweep matches on the daemon's **process group** and not on a name — the matcher and
+/// the walker, both exercised.
+///
+/// Then it kills the plant and watches the sweep go quiet, so a sweep that had rotted
+/// into "always reports something" fails here too.
+#[test]
+fn the_orphan_sweep_sees_a_codec_child_that_ignores_its_stdin() {
+    let d = Daemon::start();
+    // `sh -c 'exec sleep 300'` rather than a bare path: `sleep` is found on `PATH` on
+    // both platforms of record, and `exec` leaves exactly one process to find.
+    let argv: Vec<String> = ["/bin/sh", "-c", "exec sleep 300"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    d.rpc()
+        .load_toml(&host_config(&argv), false)
+        .expect("load a graph whose codec child ignores its stdin");
+
+    let planted = {
+        let mut found = Vec::new();
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                found = d.survivors();
+                !found.is_empty()
+            }),
+            "the sweep never saw the codec child the daemon spawned into its process \
+             group; a sweep that cannot see a live child cannot see a leaked one"
+        );
+        found
+    };
+    assert_eq!(
+        planted.len(),
+        1,
+        "the graph has exactly one codec child: {planted:?}"
+    );
+    let (pid, argv_seen) = planted.into_iter().next().expect("one planted child");
+    assert!(
+        argv_seen.contains("sleep"),
+        "the sweep reports the survivor's argv, which is the whole diagnosis a leak \
+         report carries; got {argv_seen:?}"
+    );
+
+    // …and it reports a *clean* group as clean. Killing the plant is also what keeps
+    // this test's own `Daemon` drop from failing on it — the daemon's restart backoff
+    // is pinned at an hour, so nothing respawns.
+    assert!(
+        Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status()
+            .expect("run kill(1)")
+            .success(),
+        "kill the planted child (pid {pid})"
+    );
+    assert!(
+        wait_until(Duration::from_secs(20), || d.survivors().is_empty()),
+        "the sweep still reports survivors after the only one was killed: {:?}",
+        d.survivors()
     );
 }
 

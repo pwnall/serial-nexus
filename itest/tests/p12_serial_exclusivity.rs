@@ -45,13 +45,11 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use serial_nexus_itest::{
-    Daemon, Rpc, TempRun, bin, crossover_ports, daemon_answers, serial_echo, skip_no_rig,
-    wait_until,
+    Daemon, RawDaemon, TempRun, crossover_ports, serial_echo, skip_no_rig, wait_until,
 };
 
 /// The daemon's documented signal-verb ceiling (`Daemon::MAX_SIGNAL_MS`). Duplicated
@@ -60,53 +58,11 @@ use serial_nexus_itest::{
 const MAX_SIGNAL_MS: u64 = 60_000;
 
 // ---------------------------------------------------------------------------
-// A daemon this test owns the `Child` of, so it can census the daemon's open fds.
-// `serial_nexus_itest::Daemon` deliberately does not expose its pid, and `src/lib.rs` is
-// shared with every other suite — so this is local, the `p7_*` "manage your own
-// Child" pattern, and it cleans up on `Drop` like the shared one does.
+// A daemon this file owns the `Child` of, so it can census the daemon's open fds:
+// `serial_nexus_itest::Daemon` deliberately does not expose its pid. That is
+// [`RawDaemon`]'s shape — the `p7_*` "manage your own child" pattern, shared, killed
+// on drop and leashed to this process (§15.43).
 // ---------------------------------------------------------------------------
-
-struct OwnDaemon {
-    child: Child,
-    rpc: Rpc,
-    run: TempRun,
-}
-
-impl OwnDaemon {
-    fn start() -> OwnDaemon {
-        let run = TempRun::new();
-        let socket = run.socket();
-        let child = Command::new(bin("serial-nexus-daemon"))
-            .arg("--socket")
-            .arg(&socket)
-            .arg("--state-file")
-            .arg(run.state_file())
-            .env("XDG_RUNTIME_DIR", run.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn serial-nexus-daemon");
-        assert!(
-            wait_until(Duration::from_secs(10), || socket.exists()
-                && daemon_answers(&socket)),
-            "daemon never answered `info` on {}",
-            socket.display()
-        );
-        let rpc = Rpc::new(socket);
-        OwnDaemon { child, rpc, run }
-    }
-
-    fn pid(&self) -> u32 {
-        self.child.id()
-    }
-}
-
-impl Drop for OwnDaemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 /// How many fds the daemon holds on `device` right now, read from `/proc/<pid>/fd`.
 /// The device is a symlink to the pts, and `/proc` reports the resolved target, so
@@ -177,8 +133,9 @@ fn a_modem_line_failure_leaves_the_device_openable_and_the_true_cause_reported()
         );
         return;
     };
-    let d = OwnDaemon::start();
-    let rpc = &d.rpc;
+    let run = TempRun::new();
+    let d = RawDaemon::start(&run);
+    let rpc = d.rpc();
 
     // The exact shape §7.1 documents and nothing in the tree covered: an initial
     // modem-line assertion. A pts has no TIOCMSET, so `set_dtr` ENOTTYs *after*
@@ -278,8 +235,9 @@ fn remove_node_during_a_send_break_takes_the_device_fd_with_it() {
         );
         return;
     };
-    let d = OwnDaemon::start();
-    let rpc = &d.rpc;
+    let run = TempRun::new();
+    let d = RawDaemon::start(&run);
+    let rpc = d.rpc();
     let device = echo.device().to_owned();
 
     let cfg = format!(
@@ -311,7 +269,7 @@ arbitration = "free-for-all"
     // signals once the *request bytes are written*, so the daemon — which accepts
     // connections in order on one runtime thread — dispatches the break before the
     // `remove-node` connection this test opens afterwards.
-    let socket = d.run.socket();
+    let socket = run.socket();
     let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
     let (done_tx, done_rx) = std::sync::mpsc::channel::<Value>();
     let breaker = std::thread::spawn(move || {
@@ -569,9 +527,10 @@ fn log_contains(path: &Path, needle: &str) -> bool {
 /// the port.
 #[test]
 fn an_out_of_range_signal_ms_is_refused_by_name_before_the_port_is_touched() {
-    let d = OwnDaemon::start();
-    let rpc = &d.rpc;
-    let absent = d.run.join("absent-usb0");
+    let run = TempRun::new();
+    let d = RawDaemon::start(&run);
+    let rpc = d.rpc();
+    let absent = run.join("absent-usb0");
 
     let cfg = format!(
         r#"

@@ -23,14 +23,11 @@
 //!
 //! No serial device is involved, so this runs on **every** platform (§5).
 
-use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 use serde_json::Value;
-use serial_nexus_itest::{Daemon, bin, wait_until};
+use serial_nexus_itest::{Daemon, WebServer, bin};
 
 /// The fixed per-session token, so "this exact string is absent from argv" is a
 /// byte-level fact.
@@ -42,77 +39,6 @@ const TOKEN: &str = "webs1envtoken0123456789abcdef";
 const TOKEN_ENV: &str = "SERIAL_NEXUS_WEB_TOKEN";
 
 // ---------------------------------------------------------------- child process ----
-
-/// A `serial-nexus-web` child whose printed bootstrap URL is scanned for the OS-chosen
-/// port. Killed on drop.
-struct WebServer {
-    child: Child,
-    port: u16,
-}
-
-impl WebServer {
-    fn spawn(socket: &Path, xdg: &Path) -> WebServer {
-        let socket_str = socket.to_string_lossy().into_owned();
-        let mut child = Command::new(bin("serial-nexus-web"))
-            .args([
-                "--bind",
-                "127.0.0.1:0",
-                "--token",
-                TOKEN,
-                "--socket",
-                &socket_str,
-            ])
-            .env("XDG_RUNTIME_DIR", xdg)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn serial-nexus-web");
-        // Drained for the child's whole life: the tracing subscriber writes to stdout
-        // too, and a pipe whose read end we dropped would take the server down on its
-        // next log line.
-        let stdout = child.stdout.take().expect("piped serial-nexus-web stdout");
-        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = lines.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(l) => sink.lock().unwrap().push(l),
-                    Err(_) => break,
-                }
-            }
-        });
-        let mut port = None;
-        let found = wait_until(Duration::from_secs(10), || {
-            for l in lines.lock().unwrap().iter() {
-                if let Some(rest) = l.split("http://").nth(1)
-                    && let Some(authority) = rest.split('/').next()
-                    && let Some((_, p)) = authority.rsplit_once(':')
-                    && let Ok(n) = p.trim().parse::<u16>()
-                {
-                    port = Some(n);
-                    return true;
-                }
-            }
-            false
-        });
-        assert!(
-            found,
-            "serial-nexus-web never printed its bound http URL; saw {:?}",
-            lines.lock().unwrap()
-        );
-        WebServer {
-            child,
-            port: port.expect("a port once the URL line was found"),
-        }
-    }
-}
-
-impl Drop for WebServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 // ------------------------------------------------------------------ the client ----
 
@@ -184,7 +110,7 @@ impl Run {
 #[test]
 fn the_headless_client_takes_its_token_from_a_file_or_the_environment() {
     let d = Daemon::start();
-    let web = WebServer::spawn(&d.socket(), d.run().path());
+    let web = WebServer::start("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
 
     // The preferred spelling: a file, mode 0600, named on argv while its *contents*
     // stay off it.
@@ -201,7 +127,7 @@ fn the_headless_client_takes_its_token_from_a_file_or_the_environment() {
             .expect("chmod 600");
     }
     let path = token_file.to_string_lossy().into_owned();
-    let run = wsclient(web.port, &["--token-file", &path], None);
+    let run = wsclient(web.port(), &["--token-file", &path], None);
     assert!(
         !run.token_on_argv(),
         "the token must not be on the command line: {:?}",
@@ -216,7 +142,7 @@ fn the_headless_client_takes_its_token_from_a_file_or_the_environment() {
     // The environment: `/proc/<pid>/environ` is readable by the process's own user,
     // where `cmdline` is readable by every local user — the distinction the finding
     // turns on.
-    let run = wsclient(web.port, &[], Some(TOKEN));
+    let run = wsclient(web.port(), &[], Some(TOKEN));
     assert!(!run.token_on_argv(), "{:?}", run.args);
     assert!(
         run.response().get("result").is_some(),
@@ -227,12 +153,12 @@ fn the_headless_client_takes_its_token_from_a_file_or_the_environment() {
     // `--token` still works — it is the right tool on a single-user box, and the rest
     // of this suite passes it — and it still beats an inherited variable, because an
     // explicit flag is the more specific statement of intent.
-    let run = wsclient(web.port, &["--token", TOKEN], Some("not-the-token"));
+    let run = wsclient(web.port(), &["--token", TOKEN], Some("not-the-token"));
     assert!(run.token_on_argv(), "precondition: this spelling *is* argv");
     assert!(run.response().get("result").is_some(), "{}", run.stdout);
 
     // A file beats the environment, being the narrower source.
-    let run = wsclient(web.port, &["--token-file", &path], Some("not-the-token"));
+    let run = wsclient(web.port(), &["--token-file", &path], Some("not-the-token"));
     assert!(run.response().get("result").is_some(), "{}", run.stdout);
 }
 
@@ -241,9 +167,9 @@ fn the_headless_client_takes_its_token_from_a_file_or_the_environment() {
 #[test]
 fn a_client_with_no_token_names_all_three_spellings() {
     let d = Daemon::start();
-    let web = WebServer::spawn(&d.socket(), d.run().path());
+    let web = WebServer::start("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
 
-    let run = wsclient(web.port, &[], None);
+    let run = wsclient(web.port(), &[], None);
     assert!(!run.ok, "a client with no credential must not succeed");
     let said = format!("{}{}", run.stdout, run.stderr);
     for spelling in ["--token-file", TOKEN_ENV, "--token"] {
@@ -255,7 +181,7 @@ fn a_client_with_no_token_names_all_three_spellings() {
 
     // A wrong token is a refusal from the *server*, not a usage error — the two are
     // different problems and must not read alike.
-    let run = wsclient(web.port, &[], Some("0000000000000000"));
+    let run = wsclient(web.port(), &[], Some("0000000000000000"));
     assert!(!run.ok, "a wrong token must not authenticate");
     let said = format!("{}{}", run.stdout, run.stderr);
     assert!(

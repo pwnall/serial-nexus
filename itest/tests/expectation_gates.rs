@@ -306,12 +306,573 @@ fn both_expectation_files_carry_the_same_p14_clauses() {
                  only through this identity"
             );
         }
+        // Membership in the measurement list, not the list's exact tail: the list
+        // grows (P16 joined it at §15.59's landing), and a needle anchored on
+        // whichever id happened to be last would fail on every addition while
+        // asserting nothing about P14. It is checked inside the `index(...)` clause
+        // so a stray `"P14"` elsewhere in the file cannot satisfy it.
+        let list = text
+            .split_once("| index($p.id)) == null)")
+            .and_then(|(head, _)| head.rsplit_once('[').map(|(_, l)| l.to_owned()))
+            .unwrap_or_default();
         assert!(
-            text.contains(r#""P14"] | index($p.id)) == null)"#),
+            list.contains(r#""P14""#),
             "{name} does not list P14 among the probes that must carry measurements \
-             when they run"
+             when they run — the list reads [{list}"
         );
     }
+}
+
+/// **Both gates must refuse `unsupported`, and both must be shown able to** — the
+/// unconditional clause that had no behavioural proof anywhere, and on one lane no
+/// clause either.
+///
+/// §13 gives `unsupported` one meaning on every platform: a design premise
+/// contradicted with no fallback, a stop condition asking for an amendment rather
+/// than a workaround. `expectations/linux.jq` has always opened with
+/// `(.summary.unsupported == 0)`. `expectations/macos.jq` opened with a bare
+/// `(.summary != null)` while its own P14 paragraph said "`unsupported` stays a gate
+/// failure through the summary clause" — a sentence copied from the Linux file,
+/// where it was true. Measured before the repair, on this box against a
+/// Darwin-shaped report: that file exited **0** with P1, P3, P4, P5 or P11 forced to
+/// `unsupported`, and 0 with P15 forced to it on a run that named a port. Five of
+/// those clauses are bare presence checks with no status constraint, and P5 can
+/// genuinely reach `unsupported` (§15.21's data-integrity failure).
+///
+/// It was a hole in the *file* rather than live blindness — the doctor binary exits
+/// 1 on any `unsupported`, CI redirects rather than tees, and `meta_gates.rs`
+/// asserts the same count in portable Rust on both platforms. What was missing is
+/// the assertion AGENTS §3 names as the macOS gate.
+///
+/// **Both files are exercised from whichever box runs this**, not just the local
+/// one, because the defect was that the two had drifted: the report is shaped for
+/// each file (the one cross-platform difference is P12, inert on Linux and
+/// load-bearing on Darwin), required to be ACCEPTED first — that acceptance is what
+/// makes the rejection below mean something — and then planted in two spellings.
+#[test]
+fn both_gates_refuse_an_unsupported_verdict_and_are_shown_able_to() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    for name in ["expectations/linux.jq", "expectations/macos.jq"] {
+        let expectation = repo_root().join(name);
+
+        // Shape the live report for this file. P12 is the one probe whose expected
+        // word differs by platform — `skipped` on Linux (the retained packet P7
+        // measures carries §6 there), `supported`/`degraded` on Darwin — so a run
+        // from either box needs that one cell moved to satisfy the other's file.
+        // Nothing else is touched: a shaping that had to rewrite measurements would
+        // mean this guard was testing a fixture rather than a report.
+        let shaped = if gate_accepts(&expectation, &report) {
+            report.clone()
+        } else {
+            let darwinish = jq_filter(
+                r#"(.probes[] | select(.id=="P12")) |= (.status="degraded" | del(.reason))"#,
+                &report,
+            );
+            let linuxish = jq_filter(
+                r#"(.probes[] | select(.id=="P12")) |= (.status="skipped"
+                     | .reason="serial-nexus-sys's SessionLatch is inert on this platform")"#,
+                &report,
+            );
+            [darwinish, linuxish]
+                .into_iter()
+                .find(|c| gate_accepts(&expectation, c))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} rejects this box's honest report even with P12 shaped either \
+                         way, so the plants below would prove nothing. The two files have \
+                         drifted in some clause other than P12 and this guard has to learn \
+                         the new difference rather than be deleted."
+                    )
+                })
+        };
+
+        // Spelling 1 — the clause's literal subject. A count the report itself
+        // publishes, moved without touching a probe: this is what the clause reads,
+        // and a file that lost the clause cannot see it.
+        let planted = jq_filter(r#".summary.unsupported = 1"#, &shaped);
+        assert!(
+            !gate_accepts(&expectation, &planted),
+            "{name} admitted a report whose own summary counts an `unsupported` \
+             probe — §13 makes that a stop condition on every platform, and this \
+             file is the gate AGENTS §3 names"
+        );
+
+        // Spelling 2 — the realistic shape: a probe carrying the verdict, with the
+        // summary recounted the way the doctor would. P5 because it is the one
+        // probe on a rig lane that can genuinely reach `unsupported` (§15.21: the
+        // rig did not deliver the bytes it was handed), and because its own clause
+        // in both files is presence-only, so nothing but the summary clause can
+        // refuse it.
+        let planted = jq_filter(
+            r#"(.probes[] | select(.id=="P5")) |= (.status="unsupported" | del(.reason))
+               | .summary.unsupported = 1
+               | .summary.skipped = ((.summary.skipped // 1) - 1)"#,
+            &shaped,
+        );
+        assert!(
+            !gate_accepts(&expectation, &planted),
+            "{name} admitted an `unsupported` P5 — a rig that did not deliver the \
+             bytes it was handed is §15.21's stop condition, not a lane to pass"
+        );
+    }
+}
+
+/// The clause-identity guard for the summary clause and for the P6/P7 words, for the
+/// reason the three above give — and with one difference worth stating: this pair
+/// had *drifted*, so the identity assert is what stops it drifting again.
+#[test]
+fn both_expectation_files_carry_the_same_summary_and_pty_probe_clauses() {
+    let summary = r#"(.summary.unsupported == 0)"#;
+    // Spelled by enumeration, never by exclusion. `.status != "unsupported"` admits
+    // `skipped` — the one word every conditional clause in these files exempts,
+    // including "a probe that RAN must carry measurements" — so a P6 or P7 error arm
+    // wearing it would pass the whole file. That is the §13 defect notes §3.75
+    // repaired for P8/P9/P10; `expectations/macos.jq` carried the by-exclusion
+    // spelling for these two until 2026-08-12, latent because neither probe
+    // constructs `Status::skipped`.
+    let p6 = r#"and (any(.probes[]; .id == "P6" and (.status == "supported" or .status == "degraded")))"#;
+    let p7 = r#"and (any(.probes[]; .id == "P7" and (.status == "supported" or .status == "degraded")))"#;
+    for name in ["expectations/linux.jq", "expectations/macos.jq"] {
+        let path = repo_root().join(name);
+        let text = std::fs::read_to_string(&path).expect("the expectation file is readable");
+        for (what, clause) in [("summary", summary), ("P6", p6), ("P7", p7)] {
+            assert!(
+                text.contains(clause),
+                "{name} does not carry the {what} clause verbatim — these two files \
+                 drifted here once and the drift was invisible to everything except a \
+                 hand audit"
+            );
+        }
+        assert!(
+            !text.contains(r#".id == "P6" and .status != "unsupported""#)
+                && !text.contains(r#".id == "P7" and .status != "unsupported""#),
+            "{name} still spells P6/P7 by exclusion, which admits `skipped` and so \
+             exempts the probe from every conditional clause in the file (§13)"
+        );
+    }
+}
+
+/// P16's status clause, spelled by enumeration for the reason the P6/P7 guard
+/// above records: `.status != "unsupported"` would admit `skipped`, and `skipped`
+/// is the one word every conditional clause in these files exempts — including
+/// P16's own content clause and the "a probe that RAN must carry measurements"
+/// clause at the bottom.
+const P16_STATUS_CLAUSE: &str =
+    r#"and (any(.probes[]; .id == "P16" and (.status == "supported" or .status == "degraded")))"#;
+
+/// P16's content clause. Both arms, with the quiet arm's witnesses (§15.49) and
+/// with every answer left free.
+const P16_CONTENT_CLAUSE: &str = r#"and (all(.probes[]; . as $p | ($p.id != "P16") or
+      (($p.observations | any(.key == "quiet_window_tight"
+             and (.value.passes | type == "number") and (.value.passes > 0)
+             and (.value.hangup_passes | type == "number")
+             and (.value.elapsed_us | type == "number")))
+       and ($p.observations | any(.key == "quiet_window_paced"
+             and (.value.passes | type == "number") and (.value.passes > 0)
+             and (.value.hangup_passes | type == "number")
+             and (.value.elapsed_us | type == "number")))
+       and ($p.observations | any(.key == "hangup_after_master_closed"
+             and (.value.hangup_delivered | type == "boolean")
+             and (.value.microseconds_to_hangup | type == "number")))
+       and ($p.observations | any(.key == "stat_comparison_while_master_open"
+             and (.value.shipped_prove_open_would_refuse | type == "boolean")))
+       and ($p.observations | any(.key == "stat_comparison_after_master_closed"
+             and (.value.shipped_prove_open_would_refuse | type == "boolean")))
+       and ($p.observations | any(.key == "poll_can_tell_a_live_pair_from_a_dead_one"
+             and (.value | type == "boolean")))
+       and ($p.observations | any(.key == "stat_comparison_can_tell"
+             and (.value | type == "boolean")))
+       and ($p.observations | any(.key == "does_not_license" and (.value | type == "string"))))))"#;
+
+/// The clause-identity guard for the clauses plan §18 items 14, 22 and 26 added,
+/// for the reason the three above give.
+#[test]
+fn both_expectation_files_carry_the_same_new_flow_and_close_shape_clauses() {
+    let soft = r#"and (all(.probes[]; . as $p | ($p.id != "P15") or ($p.status | startswith("skipped")) or
+      (($p.observations | map(select(.value | type == "object")) | length) > 0
+       and ($p.observations | map(select(.value | type == "object")) | all(
+             (.value.software_flow_control | type == "object")
+             and (.value.software_flow_control.asks | type == "string")
+             and (.value.software_flow_control.measured | type == "boolean")
+             and ((.value.software_flow_control.measured | not)
+                  or ((.value.software_flow_control.tcsetattr_ok | type == "boolean")
+                      and (.value.software_flow_control.honoured_on_readback | type == "boolean")
+                      and (.value.software_flow_control.silently_dropped | type == "boolean")
+                      and (.value.software_flow_control.serial2_readback_would_fault | type == "boolean"))))))))"#;
+    let arrival = r#"and (all(.probes[]; . as $p | ($p.id != "P13") or
+      ($p.observations | any(.key == "e_reader_arrives_during_close_wait"
+         and (.value | type == "object")
+         and (.value.bytes_recovered_by_arriving_reader | type == "number")
+         and (.value.reader_arrival | type == "object")
+         and (.value.reader_arrival.arrived_before_close_returned | type == "boolean")
+         and (.value.reader_arrival.reading | type == "string")
+         and (.value.reader_arrival.does_not_license | type == "string")))))"#;
+    for name in ["expectations/linux.jq", "expectations/macos.jq"] {
+        let path = repo_root().join(name);
+        let text = std::fs::read_to_string(&path).expect("the expectation file is readable");
+        for (what, clause) in [
+            ("P15 software-flow-control", soft),
+            ("P13 arriving-reader shape", arrival),
+            ("P16 status", P16_STATUS_CLAUSE),
+            ("P16 two-arm content", P16_CONTENT_CLAUSE),
+        ] {
+            assert!(
+                text.contains(clause),
+                "{name} does not carry the {what} clause verbatim — the behavioural \
+                 proof in this file runs on one platform's gate and reaches the other \
+                 only through this identity"
+            );
+        }
+    }
+}
+
+/// **P16's two arms must survive the gate, and every way of losing one must not**
+/// (§15.59, plan §18 item 26, plan §3 rule 10).
+///
+/// P16 needs no hardware, so this runs against the live report the CI lane itself
+/// produces — the unmutated run is required to pass first, so each plant is known
+/// to be rejected for the reason claimed.
+///
+/// The plants cover the four ways this probe can stop measuring while still
+/// looking like a probe: gone from the roster, wearing `skipped` (the one word
+/// every conditional clause in these files exempts, which is why an error path may
+/// never spell it), observations emptied, and — the two that matter most — a quiet
+/// window that lost its wall clock or ran zero passes. That last pair is §15.49's
+/// rule in gate form: `hangup_passes: 0` over an unsized window is not a
+/// measurement, and a zero-pass window is the vacuous fold this file's P4 clause
+/// already exists to refuse.
+///
+/// The controls are the point of the probe. Both `hangup_delivered: false` and
+/// `stat_comparison_can_tell: false` must be **accepted**: the first is a kernel
+/// with no portable liveness signal and the second is the Darwin-shaped reading
+/// this probe was built to be able to report. A clause that reddened on either
+/// would be this file asserting the answer §15.59 went looking for.
+#[test]
+fn the_p16_clauses_reject_an_arm_that_stopped_measuring() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let expectation = platform_expectation();
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    assert!(
+        gate_accepts(&expectation, &report),
+        "{} rejected an honest passive report: {}",
+        expectation.display(),
+        jq_filter(r#".probes[] | select(.id=="P16")"#, &report)
+    );
+
+    for (what, filter) in [
+        (
+            "P16 gone from the roster",
+            r#".probes |= map(select(.id!="P16"))"#,
+        ),
+        (
+            "P16 wearing `skipped`",
+            r#"(.probes[]|select(.id=="P16")) |= (.status="skipped" | .reason="compiled out")"#,
+        ),
+        (
+            "P16 with no observations",
+            r#"(.probes[]|select(.id=="P16")) |= (.observations=[])"#,
+        ),
+        (
+            "a quiet window with no wall clock",
+            r#"(.probes[]|select(.id=="P16")|.observations[]|select(.key=="quiet_window_tight")|.value) |= del(.elapsed_us)"#,
+        ),
+        (
+            "a quiet window that ran zero passes",
+            r#"(.probes[]|select(.id=="P16")|.observations[]|select(.key=="quiet_window_paced")|.value.passes) |= 0"#,
+        ),
+        (
+            "the paced window deleted, leaving only the tight one",
+            r#"(.probes[]|select(.id=="P16")|.observations) |= map(select(.key!="quiet_window_paced"))"#,
+        ),
+        (
+            "the post-close stat reading deleted",
+            r#"(.probes[]|select(.id=="P16")|.observations) |= map(select(.key!="stat_comparison_after_master_closed"))"#,
+        ),
+        (
+            "the bound deleted",
+            r#"(.probes[]|select(.id=="P16")|.observations) |= map(select(.key!="does_not_license"))"#,
+        ),
+    ] {
+        let planted = jq_filter(filter, &report);
+        assert!(
+            !gate_accepts(&expectation, &planted),
+            "{} admitted {what}",
+            expectation.display()
+        );
+    }
+
+    // Control 1 — a kernel with no portable liveness signal. `degraded` with the
+    // observation named is §7's rule, not a lane to fail.
+    let no_hangup = jq_filter(
+        r#"(.probes[]|select(.id=="P16")) |= (.status="degraded"
+             | (.observations[]|select(.key=="hangup_after_master_closed")|.value.hangup_delivered)=false
+             | (.observations[]|select(.key=="poll_can_tell_a_live_pair_from_a_dead_one")|.value)=false)"#,
+        &report,
+    );
+    assert!(
+        gate_accepts(&expectation, &no_hangup),
+        "{} reddened on a kernel that does not deliver POLLHUP to a held slave — \
+         that is the observation §15.59 asks for, and pinning it would make this \
+         file assert the thing the probe measures",
+        expectation.display()
+    );
+
+    // Control 2 — the Darwin-shaped reading: a devfs node that outlives its pair,
+    // so the shipped `stat` comparison cannot tell. This is the row the probe was
+    // built to be able to report, and the gate must never punish it.
+    let stat_blind = jq_filter(
+        r#"(.probes[]|select(.id=="P16")|.observations[]|select(.key=="stat_comparison_can_tell")|.value)=false
+           | (.probes[]|select(.id=="P16")|.observations[]|select(.key=="stat_comparison_after_master_closed")|.value.shipped_prove_open_would_refuse)=false"#,
+        &report,
+    );
+    assert!(
+        gate_accepts(&expectation, &stat_blind),
+        "{} reddened on a kernel where `SlaveWitness::prove_open` cannot tell a live \
+         pair from a dead one — that is the finding, not a failure",
+        expectation.display()
+    );
+}
+
+/// **P13's arriving-reader shape must survive the gate, and its absence must not**
+/// (plan §18 item 22, plan §3 rule 10).
+///
+/// P13 needs no hardware, so unlike the P15 guard below this one runs against the
+/// live report the CI lane itself produces — the strongest form available: the
+/// unmutated run is required to pass first, so the plants below are known to be
+/// rejected *for the reason claimed* rather than by some unrelated clause.
+///
+/// Three plants, because the three ways this row can go missing are three different
+/// edits: the shape deleted from the list, the shape *erroring* (its value becomes
+/// a bare string, which is what `p13_shape`'s `Err` arm emits and which nothing else
+/// in the gate set notices — P13 only degrades when shape `a` is the one that
+/// failed), and the row surviving with the sentence that bounds it removed. The
+/// fourth case is the control: flipping the answer to `false` must still be
+/// accepted, because winning or losing that race is the kernel's business and a
+/// clause that pinned it would redden an honest box (§13, plan §3 rule 14).
+#[test]
+fn the_p13_arrival_clause_rejects_a_shape_that_stopped_running() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let expectation = platform_expectation();
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    assert!(
+        gate_accepts(&expectation, &report),
+        "{} rejected an honest passive report: {}",
+        expectation.display(),
+        jq_filter(r#".probes[] | select(.id=="P13")"#, &report)
+    );
+
+    // Plant 1 — the shape deleted. The verdict word and every other shape survive.
+    let planted = jq_filter(
+        r#"(.probes[] | select(.id=="P13") | .observations) |=
+             map(select(.key != "e_reader_arrives_during_close_wait"))"#,
+        &report,
+    );
+    assert!(
+        !gate_accepts(&expectation, &planted),
+        "{} admitted a P13 that had quietly stopped running its arriving-reader shape",
+        expectation.display()
+    );
+
+    // Plant 2 — the shape errored. `p13_shape`'s Err arm observes a bare string
+    // under the same key, and P13's verdict does not degrade for it: only shape `a`
+    // failing does that. So this is the spelling with no other instrument behind it.
+    let planted = jq_filter(
+        r#"(.probes[] | select(.id=="P13") | .observations[]
+             | select(.key=="e_reader_arrives_during_close_wait") | .value) |= "probe error: boom""#,
+        &report,
+    );
+    assert!(
+        !gate_accepts(&expectation, &planted),
+        "{} admitted a P13 whose arriving-reader shape reported an error instead of a \
+         measurement",
+        expectation.display()
+    );
+
+    // Plant 3 — the row present, the sentence bounding it deleted. A race result
+    // with no statement of what it licenses is exactly the reading §13 refuses:
+    // `lost-the-race` and `arrived-inside-the-close-window` are not interchangeable.
+    let planted = jq_filter(
+        r#"(.probes[] | select(.id=="P13") | .observations[]
+             | select(.key=="e_reader_arrives_during_close_wait") | .value.reader_arrival)
+           |= del(.does_not_license)"#,
+        &report,
+    );
+    assert!(
+        !gate_accepts(&expectation, &planted),
+        "{} admitted an arrival row with no statement of what it does not license",
+        expectation.display()
+    );
+
+    // The control: the ANSWER is free. A kernel whose close returns before the
+    // reader gets there is a legitimate reading — it is the expected one wherever
+    // the close does not wait — and this clause must never punish it.
+    let honest = jq_filter(
+        r#"(.probes[] | select(.id=="P13") | .observations[]
+             | select(.key=="e_reader_arrives_during_close_wait") | .value.reader_arrival)
+           |= (.arrived_before_close_returned = false | .reading = "lost-the-race")"#,
+        &report,
+    );
+    assert!(
+        gate_accepts(&expectation, &honest),
+        "{} rejected an honest `lost-the-race` reading — the plants above then prove \
+         nothing, and every kernel that does not wait would fail this lane",
+        expectation.display()
+    );
+}
+
+/// **P15's software-flow-control cells must be present per port, and the answer must
+/// stay free** (plan §18 item 14, plan §3 rule 10).
+///
+/// P15 is opt-in behind `--port` and CI has no adapter, so unlike the P13 guard the
+/// subject here is *synthesised* onto the live report: the clause is conditioned on
+/// P15 not skipping, and a passive run skips, which would make every plant below
+/// vacuously green. The honest block is injected first and required to PASS — that
+/// is the control that makes the plants mean something — and the probe half of the
+/// two-guard pattern (notes §3.64) is carried by
+/// `probes::tests::p15_reports_the_software_reading_without_letting_it_move_the_verdict`
+/// and by the committed rig capture, not by this test.
+#[test]
+fn the_p15_software_clause_rejects_a_reading_that_was_never_taken() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let expectation = platform_expectation();
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    // A rig-shaped P15 block: one port, honoured both ways, restored.
+    const HONEST: &str = r#"(.probes[] | select(.id=="P15")) |= (.status = "supported"
+       | .observations = [{"key":"/dev/ttyUSB0","value":{
+           "requested":"rts-cts (CRTSCTS)","tcsetattr_ok":true,"tcsetattr_error":null,
+           "cflag_before_hex":"0x10021cb2","cflag_after_hex":"0x90021cb2",
+           "honoured_on_readback":true,"shipped_predicate_agrees":true,
+           "silently_dropped":false,"baseline_restored":true,
+           "software_flow_control":{"asks":"…","measured":true,
+             "requested":"xon-xoff (IXON|IXOFF)","tcsetattr_ok":true,"tcsetattr_error":null,
+             "iflag_before_hex":"0x5","iflag_after_hex":"0x1405",
+             "ixon_on_readback":true,"ixoff_on_readback":true,
+             "honoured_on_readback":true,"silently_dropped":false,
+             "serial2_readback_would_fault":false,"does_not_license":"…"}}}])"#;
+    let honest = jq_filter(HONEST, &report);
+    assert!(
+        gate_accepts(&expectation, &honest),
+        "{} rejected a complete P15 block — every plant below would then prove nothing",
+        expectation.display()
+    );
+
+    // Plant 1 — the software block gone entirely. This is the shape a revert takes.
+    let planted = jq_filter(
+        r#"(.probes[] | select(.id=="P15") | .observations[].value) |= del(.software_flow_control)"#,
+        &honest,
+    );
+    assert!(
+        !gate_accepts(&expectation, &planted),
+        "{} admitted a P15 carrying no software-flow-control reading at all",
+        expectation.display()
+    );
+
+    // Plant 2 — the block present, `measured` gone. A reading with no statement of
+    // whether it was taken is the "unknown wearing an answer's clothes" shape
+    // §15.47 names: unmeasurable is data, and its absence is not.
+    let planted = jq_filter(
+        r#"(.probes[] | select(.id=="P15") | .observations[].value.software_flow_control)
+           |= del(.measured)"#,
+        &honest,
+    );
+    assert!(
+        !gate_accepts(&expectation, &planted),
+        "{} admitted a software reading that does not say whether it was taken",
+        expectation.display()
+    );
+
+    // Plant 3 — `measured: true` with the cell that decides the node's fate gone.
+    // `serial2_readback_would_fault` is the whole-`c_iflag` comparison the product
+    // actually performs; the two flag booleans are the human-readable half.
+    let planted = jq_filter(
+        r#"(.probes[] | select(.id=="P15") | .observations[].value.software_flow_control)
+           |= del(.serial2_readback_would_fault)"#,
+        &honest,
+    );
+    assert!(
+        !gate_accepts(&expectation, &planted),
+        "{} admitted a `measured` software reading with no read-back verdict",
+        expectation.display()
+    );
+
+    // Plant 4 — the port population emptied while the verdict stays `supported`.
+    // An `all` over zero ports passes forever; this is the same vacuity the P4
+    // population clause exists to refuse, in P15's clothes.
+    let planted = jq_filter(
+        r#"(.probes[] | select(.id=="P15")) |= (.status = "supported" | .observations = [])"#,
+        &honest,
+    );
+    assert!(
+        !gate_accepts(&expectation, &planted),
+        "{} admitted a `supported` P15 whose port population is empty",
+        expectation.display()
+    );
+
+    // Control A — the ANSWER is free. A driver that drops the request is precisely
+    // what plan §18 item 14 went looking for, and the item declines turning that
+    // finding into policy; a clause that reddened on it would encode the policy the
+    // item refused to write.
+    let dropping = jq_filter(
+        r#"(.probes[] | select(.id=="P15") | .observations[].value.software_flow_control)
+           |= (.honoured_on_readback = false | .ixon_on_readback = false
+               | .ixoff_on_readback = false | .silently_dropped = true
+               | .serial2_readback_would_fault = true)"#,
+        &honest,
+    );
+    assert!(
+        gate_accepts(&expectation, &dropping),
+        "{} reddened on a driver that silently drops IXON/IXOFF — that is a finding to \
+         report, not a lane to fail (plan §18 item 14 declines the refusal)",
+        expectation.display()
+    );
+
+    // Control B — an honest `measured: false`. A port whose termios could not be
+    // read back says so and carries no reading cells, and that must pass: refusing
+    // it would push the probe toward inventing an answer.
+    let unmeasured = jq_filter(
+        r#"(.probes[] | select(.id=="P15") | .observations[].value.software_flow_control)
+           |= {asks:"…", measured:false, unmeasurable_here:"tcgetattr after xon-xoff: ENOTTY",
+               does_not_license:"…"}"#,
+        &honest,
+    );
+    assert!(
+        gate_accepts(&expectation, &unmeasured),
+        "{} rejected an honest unmeasurable-here reading (§15.47)",
+        expectation.display()
+    );
 }
 
 /// **The P14 presence clause, proven against a planted violation in every spelling
@@ -975,7 +1536,12 @@ fn the_flow_control_clause_rejects_a_reading_that_cannot_say_what_it_measured() 
             &report,
         )
     };
-    const FULL: &str = r#"[{"key":"/dev/ttyUSB0","value":{"honoured_on_readback":true,"tcsetattr_ok":true,"baseline_restored":true}}]"#;
+    // The software block joined the honest shape at plan §18 item 14: P15's clause
+    // set now spans both flag words, so a "complete P15 reading" that carried only
+    // the hardware cells would be refused by the sibling clause and every rejection
+    // below would then be proving that one instead of this one. Its own plants live
+    // in `the_p15_software_clause_rejects_a_reading_that_was_never_taken`.
+    const FULL: &str = r#"[{"key":"/dev/ttyUSB0","value":{"honoured_on_readback":true,"tcsetattr_ok":true,"baseline_restored":true,"software_flow_control":{"asks":"…","measured":true,"tcsetattr_ok":true,"honoured_on_readback":true,"silently_dropped":false,"serial2_readback_would_fault":false}}}]"#;
 
     // The honest shape must be ACCEPTED, or every rejection below proves nothing
     // about this clause and everything about some other one.
