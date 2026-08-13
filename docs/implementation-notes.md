@@ -10893,6 +10893,28 @@ byte can exist and the assertion passes identically whether the property holds o
 rule 22's own tell, inside the battery written to honour it. It is deleted, with the reason and
 the fixture it would need stated where it stood.
 
+**CI, and two results the push produced that this session had not measured.** Run 31657666919
+on `main` is green in all six jobs.
+
+1. **macOS reads 896 · 0 · 6 at whole-workspace scope** (job 94315579211, macOS 26.5.2 / arm64;
+   the lane runs `cargo test --workspace --locked --no-fail-fast`, no exclusions), superseding
+   the 860 row. The delta closes exactly and is worth stating because it is a check on the
+   Linux decomposition rather than a restatement of it: this session added 37 tests, and 36 of
+   them run on macOS — the one that does not is the devprep capability-fold guard, which lives
+   inside the Linux-only platform module. 860 + 36 = 896. That the six device-gated pattern-wait
+   guards run and self-skip there is why the battery was split so half of it needs no serial
+   device.
+2. **The macOS doctor jq gate executed green — the first time in this record** (plan §18 item
+   48). The diagnostic CI prints on every run, green ones included, shows `arm64`,
+   `ProductVersion: 26.5.2`, and `Mach-O 64-bit executable arm64` for
+   `target/debug/serial-nexus-doctor`; the doctor produced its JSON twin and
+   `jq -e -f expectations/macos.jq` printed `true` and exited 0. Item 48 is therefore **half**
+   discharged, and the half is the measurement. **No cause is claimed for the ENOEXEC** that
+   notes §3.77 recorded: it was seen once and has not been seen since, which is not the same as
+   explained, and a one-off that stops happening is exactly the evidence AGENTS §8 says not to
+   reason from. The item's second half is untouched — the gate still sits after the test step,
+   so a red test would hide it again, which is rule 22's own class.
+
 **Still declined, and visible as such:** deliver-path matching, backtracking engines, patterns
 over decoded text, unbounded lookback, and broadcast delivery. Web-bridge admission is the one
 that needed more than an absence: a verb nobody added and a verb deliberately kept out look
