@@ -570,7 +570,7 @@ variables (rule 11).
 | `SNX_RIG_FLOW` | The two `rts-cts` end-to-end tests (§15.52) | Skip on a 3-wire bench, printing the measurement | Skip is a failure | Precondition *measured*, not declared: a 3-wire bench is §5's stated assumption, so `SNX_CROSSOVER=required` deliberately does not redden it (notes §3.63) |
 | `SNX_WEB_UI` | Playwright browser suite (§15.37) | Self-skip without node | Skip is a failure | Retries stay 0 (rule 15) |
 | `SNX_LICENSE_GATE` | Licensing-gate lane | Self-skip | Skip is a failure | — |
-| `SNX_EXEC_CODEC` | The out-of-process codec battery (§8, §15.26): thirteen tests over four files that drive a codec child through an external interpreter — `exec-conformance`, the any-language envelope battery, the crash-and-restart guard, the unconfigured-channel counter | Self-skip naming what the provider saw (`python3 not found`) | Skip is a failure (item 49) | Named for the **capability**, not the tool, like every instance beside it — `SNX_TLS`'s absent tool is `curl`, `SNX_WEB_UI`'s is `node`. A fixture ported to another language would leave an `SNX_PYTHON` naming nothing while the battery it gated still existed; the tool's name belongs in the message, on the box printing it (rule 11) |
+| `SNX_EXEC_CODEC` | The out-of-process codec battery (§8, §15.26): every test that drives a codec child through an external interpreter — `exec-conformance`, the any-language envelope battery, the crash-and-restart guard, the orphan-reaping pair, the unconfigured-channel counter, the exec teardown-accounting stage | Self-skip naming what the provider saw (`no python3 on PATH`) | Skip is a failure | Named for the **capability**, not the tool, like every instance beside it — `SNX_TLS`'s absent tool is `curl`, `SNX_WEB_UI`'s is `node`. A fixture ported to another language would leave an `SNX_PYTHON` naming nothing while the battery it gated still existed. **This row deliberately carries no count**: it read "thirteen tests over four files", which was already wrong when written (fourteen over five) and is sixteen over six now — and the same figure sat unchecked in the helper's doc and two CI comments, four copies with no authority, which is the figure equivalent of a second mechanism (rule 11). The checked enumeration is `meta_skip_names.rs`'s routing gate, which derives both sides and fails when a python3-dependent test does not route its skip through `skip_no_exec_codec` |
 | `SNX_PACKAGING` | The packaged deployment surface (item 31): `systemd-analyze verify` over the unit and `udevadm verify` over the udev rules, each staged past its environmental arm | Self-skip naming what the provider saw (`systemd-analyze not found on PATH`) | Skip is a failure | Named for the **capability**, not the tool, like every instance beside it. The three text checks in the same file need no tool and **never skip**, so the drift class this tree can cause stays covered where this variable's subjects are absent |
 | `SNX_PACKAGING_ROOT` | Item 31's owed measurement: the `/var/lib/private/` indirection under `DynamicUser=`, and the EACCES-versus-EROFS pair proving `ReadWritePaths=` flips the mount without chowning | Self-skip naming the precondition that failed — PID 1's name, the effective uid, or `systemd-run`'s absence | Skip is a failure | **Set on CI's packaging root step since 2026-08-15** (notes §3.104), and the demand followed the measurement exactly as §15.52 required of `SNX_RIG_FLOW`: run 31695823765 (2026-08-13) read `PID 1: systemd`, `sudo: passwordless`, and six passing root-arm tests before `required` was asked for. Until then it was set by **no lane**, which left that step's passing output identical to its self-skipping output — rule 22's tell, in the one step that had just been un-escaped from `continue-on-error` in order to gate. **It is spelled at the call, `sudo -n env SNX_PACKAGING_ROOT=required "$BIN"`, and a step-level `env:` block would be wrong**: `sudo` runs `env_reset`, so the variable would never reach the test, the test would find root and run anyway, and `required` would assert nothing — a fix for a gate that asserts nothing, itself asserting nothing, one layer down |
 | `SNX_SERIAL_PAIR=rig` | Forces `serial_pair_or_rig()` onto hardware (§15.48) — not a required mode | Software wins by default | Forcing with no rig visible is a hard failure, never a silent fallback | Provider printed before transmit |
@@ -2190,7 +2190,32 @@ remain **open** and none is promised as existing.
     test step cannot hide (rule 22's class — the gate needs only the build). Narrows item 18's
     capture half; closes none of it. *Validation:* the run's log shows the jq step executed and
     the doctor's exit status reached the lane.
-49. **Skip-discipline hardening: the python3 class, and skip-message naming** — **open** (S).
+49. **Skip-discipline hardening: the python3 class, and skip-message naming** — **EXECUTED**:
+    (a) and (b) 2026-08-12 in `4a4e0dd`, the coverage guard and the figure repair 2026-08-15
+    (notes §3.110). **Both halves landed with the v17 alignment pass and this entry was never
+    flipped**, so the plan read "open" against a tree already carrying the mechanism, its call
+    sites, both CI lanes, its lattice row and its meta-gate — while AGENTS §2 already listed 49 as
+    executed. Two normative documents disagreeing is §2's own "a stale claim is a defect".
+    *Two clauses of the filed description were wrong about the tree:* the class is **sixteen tests
+    over six files**, not "~15 across four" (fourteen over five when the sentence was typed); and
+    **"both `meta_derive` sides" needed no edit** — gate (a) derives the required-mode roster from
+    the code's own `var("SNX_…") … "required"` comparisons, so the variable was covered the moment
+    the helper landed, which is why the string appears nowhere in `meta_derive.rs`. The
+    `p8_web_history` template citation is correct, checked.
+    *Remainder executed 2026-08-15, and it is the part that mattered:* **the required-mode mechanism
+    had never been exercised on any box.** No `skip_no_*` helper has a self-test and nothing in the
+    tree sets any of the eight variables, so the lattice eight lanes depend on was unproven code.
+    Measured with the interpreter hidden behind a symlink-farm `PATH`: the conformance battery
+    passes **10 of 10 in 0.00 s** with the variable unset — rule 22's tell made visible, an
+    identical green verdict having run nothing — and **fails** under `required`, naming the test and
+    `no python3 on PATH`, while an interpreter-present run under `required` passes in 2.09 s, so the
+    demand **discriminates** rather than always failing. Delivery through the CI shape was proven
+    under `env -i` rather than assumed.
+    *And its coverage is now guarded:* a python3-dependent test that announces its own skip is
+    invisible to `required`. Planting exactly that bypass in `p5_envelope.rs` turns a python3-less
+    box green again with **all 22 pre-existing meta-gate assertions still passing** — only the new
+    routing gate reddens, naming file and test. The gate derives both sides and lands on exactly the
+    sixteen tests with no false positives.
     *Evidence:* (a) ~15 exec/envelope-codec tests across four files self-skip when `python3` is
     absent, no lane asserts they executed, and a runner image dropping python3 turns the whole
     item-34/35 conformance battery vacuously green — rule 22's tell, and exactly the hole

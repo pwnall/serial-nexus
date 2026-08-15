@@ -1,7 +1,15 @@
 #![forbid(unsafe_code)]
 
-//! **The SKIP-message naming gate** (plan §18 item 49 clause (b); plan §3 rules 10, 11
+//! **Item 49's two skip-discipline gates** (plan §18 item 49; plan §3 rules 10, 11
 //! and 22).
+//!
+//! Clause (b)'s **SKIP-message naming gate** is the bulk of this file and is described
+//! immediately below. Clause (a)'s **routing gate** is the last test in it: every
+//! `#[test]` that depends on an external interpreter must route its self-skip through
+//! the shared required-mode helper, so that `SNX_EXEC_CODEC=required` can see it. The
+//! two belong together because they fail the same way — a skip that lies, and a skip
+//! nothing can demand — and because both are enforced by walking this tree's sources
+//! with the one scanner below.
 //!
 //! Every self-skip in this tree prints one line naming the test that skipped, and
 //! forty-plus of them **free-type that name**. Two spellings carry it:
@@ -1251,5 +1259,330 @@ fn a_skip_helper_call_naming_a_test_names_its_enclosing_fn() {
             .map(Mismatch::to_string)
             .collect::<Vec<_>>()
             .join("\n  ")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (3) The python3 class routes through the required-mode helper
+// ---------------------------------------------------------------------------
+
+/// The required-mode helper the out-of-process codec battery must route its
+/// self-skips through, and the file-local predicate that battery guards itself with.
+///
+/// Both live at module level rather than inside the test below, and that placement is
+/// load-bearing: the roster reader looks for these tokens **inside `#[test]` bodies**,
+/// so a fixture spelling either of them as a literal in the test below would make this
+/// file's own gate read as a member of the class it polices. Same reason every fixture
+/// in this file is assembled from `q` rather than written out — see the module doc.
+const EXEC_CODEC_HELPER: &str = "skip_no_exec_codec";
+const HAVE_PY: &str = "have_python3";
+const PY: &str = "python3";
+
+/// Does the code in `hay` call `name` as a whole identifier?
+///
+/// Runs on the **skeleton**, so a helper name quoted inside a string is not a call —
+/// which matters here because `itest/src/lib.rs` names the helper inside its own
+/// failure text, and this file names it in fixtures. Bounded on the left exactly as
+/// [`helper_call_subjects`] bounds it: a path-qualified call
+/// (`serial_nexus_itest::skip_no_exec_codec(`) counts because `:` is not a word byte,
+/// while `my_skip_no_exec_codec(` does not.
+fn contains_call(hay: &str, name: &str) -> bool {
+    let bytes = hay.as_bytes();
+    let needle = format!("{name}(");
+    let mut i = 0usize;
+    while let Some(pos) = hay[i..].find(&needle) {
+        let at = i + pos;
+        i = at + name.len();
+        if at > 0 && is_word(bytes[at - 1]) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Every `#[test]` in this source that depends on an external `python3`.
+///
+/// Two disjuncts, because the battery reaches the interpreter two ways:
+///
+/// * the test **names** it in its own body — `Command::new("…")`, a `format!` building
+///   an `--exec` command line, an `argv = [ … ]` inside an embedded TOML fixture. Read
+///   from `text`, which keeps string contents, because that is where the name lives;
+/// * the test **asks** a file-local `have_python3()` predicate. This disjunct is the
+///   load-bearing one: the ten `exec-conformance` tests reach the interpreter through
+///   `exec_command()`, a plain helper the test never names the interpreter beside, so
+///   a name-only reader would see ten independent tests and cover none of them.
+///
+/// A test that satisfies either is in the class and owes the required-mode helper.
+fn interpreter_dependent_tests(src: &Source) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for def in fn_defs(&src.skel) {
+        if !carries_test_attribute(&src.text, def.fn_at) {
+            continue;
+        }
+        if src.text[def.body.clone()].contains(PY)
+            || contains_call(&src.skel[def.body.clone()], HAVE_PY)
+        {
+            out.insert(def.name.clone());
+        }
+    }
+    out
+}
+
+/// Every `#[test]` in this source that routes a self-skip through the required-mode
+/// helper.
+fn exec_codec_guarded_tests(src: &Source) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for def in fn_defs(&src.skel) {
+        if !carries_test_attribute(&src.text, def.fn_at) {
+            continue;
+        }
+        if contains_call(&src.skel[def.body.clone()], EXEC_CODEC_HELPER) {
+            out.insert(def.name.clone());
+        }
+    }
+    out
+}
+
+/// **Clause (a)'s gate.** A test that needs the interpreter must announce its skip
+/// through [`serial_nexus_itest::skip_no_exec_codec`], because that helper is the only
+/// thing `SNX_EXEC_CODEC=required` can see.
+///
+/// The mechanism item 49 built works — measured, four arms, on a PATH with the
+/// interpreter hidden: unset, the battery reports ten passing tests in 0.00 s having
+/// run nothing; `required`, the same ten fail naming the absent interpreter; and with
+/// the interpreter present `required` passes in 2.09 s, so the demand discriminates
+/// rather than simply always failing. What had **no** guard is the mechanism's
+/// *coverage*. A new exec test written in the shape the tree used before item 49 —
+///
+/// ```ignore
+/// if !have_python3() {
+///     eprintln!("SKIP my_new_test: no python3");
+///     return;
+/// }
+/// ```
+///
+/// — self-skips silently, is invisible to `SNX_EXEC_CODEC=required`, and re-opens the
+/// exact hole item 49 closed, on a lane that stays green because the variable it set is
+/// only ever read by the helper this test declined to call.
+///
+/// **That this is unguarded is measured, not hypothesised.** The class was fourteen
+/// tests over five files when item 49 landed; two more arrived in `p5_exec_orphans.rs`
+/// afterwards and nothing anywhere moved — not the helper's doc, not either CI comment,
+/// not plan §3's lattice row, all four of which claimed "thirteen tests over four
+/// files", a figure that was already wrong when it was written. A count hand-copied
+/// into four places and checked in none is the figure equivalent of a second mechanism
+/// (rule 11). So the count now lives here, derived, as a floor — and the containment
+/// below is what actually matters: it is indifferent to how large the class grows and
+/// fails only when a member escapes the helper.
+#[test]
+fn every_python3_dependent_test_routes_its_skip_through_the_required_mode_helper() {
+    let root = repo_root();
+    let q = '"';
+
+    // 0. The matcher, in every spelling it claims to cover and every near miss it must
+    //    ignore. Assembled at runtime — a literal here would put this file's own test
+    //    into the class it polices, and the gate would redden against itself.
+    let guarded = format!(
+        "#[test]\nfn planted_test() {{\n    if !{HAVE_PY}() {{\n        {EXEC_CODEC_HELPER}({q}planted_test{q}, {q}not found{q});\n        return;\n    }}\n    let _ = {q}{PY} fixture.py{q};\n}}\n"
+    );
+    let src = scan(&guarded);
+    assert_eq!(
+        interpreter_dependent_tests(&src),
+        BTreeSet::from(["planted_test".to_owned()]),
+        "the dependency reader does not see a test that both asks the predicate and \
+         names the interpreter — the shape every member of this battery is written in"
+    );
+    assert_eq!(
+        exec_codec_guarded_tests(&src),
+        BTreeSet::from(["planted_test".to_owned()]),
+        "the coverage reader does not see a plain call to the required-mode helper"
+    );
+
+    // The violation, in the shape the tree used *before* item 49 and the one a new test
+    // would regress to: the predicate is asked, the answer is announced by hand.
+    let bypass = format!(
+        "#[test]\nfn planted_test() {{\n    if !{HAVE_PY}() {{\n        eprintln!({q}SKIP planted_test: no {PY}{q});\n        return;\n    }}\n}}\n"
+    );
+    let src = scan(&bypass);
+    assert!(
+        interpreter_dependent_tests(&src).contains("planted_test"),
+        "a hand-rolled self-skip on the interpreter predicate is not read as a \
+         dependency, so the regression this gate exists for is invisible to it"
+    );
+    assert!(
+        exec_codec_guarded_tests(&src).is_empty(),
+        "a test that never calls the helper was counted as covered by it"
+    );
+
+    // …and the name-only spelling, with no predicate at all: a test that shells out to
+    // the interpreter directly still owes the helper.
+    let inline = format!(
+        "#[test]\nfn planted_test() {{\n    let out = Command::new({q}{PY}{q}).arg({q}-c{q}).output();\n}}\n"
+    );
+    assert!(
+        interpreter_dependent_tests(&scan(&inline)).contains("planted_test"),
+        "a test naming the interpreter inline is not read as depending on it"
+    );
+
+    // The near misses, each of which would otherwise redden this gate against innocent
+    // code:
+    //   * the predicate's own definition, and every other non-test helper that names the
+    //     interpreter (`exec_command`, `ext_codec`) — not `#[test]`, so not in the class;
+    let helper_def =
+        format!("fn {HAVE_PY}() -> bool {{\n    Command::new({q}{PY}{q}).output().is_ok()\n}}\n");
+    assert!(
+        interpreter_dependent_tests(&scan(&helper_def)).is_empty(),
+        "a plain helper naming the interpreter is read as a test that owes the required-\
+         mode helper; every file in the battery defines one and each would redden"
+    );
+    //   * the interpreter named only in a comment — prose about the battery is not the
+    //     battery, and this tree's doc comments discuss it constantly;
+    let commented =
+        format!("#[test]\nfn planted_test() {{\n    // drives a {PY} child\n    let _ = 1;\n}}\n");
+    assert!(
+        interpreter_dependent_tests(&scan(&commented)).is_empty(),
+        "the interpreter named in a comment put a test into the class"
+    );
+    //   * a look-alike callee, which must not be mistaken for the helper.
+    let lookalike = format!(
+        "#[test]\nfn planted_test() {{\n    my_{EXEC_CODEC_HELPER}({q}planted_test{q}, {q}x{q});\n    let _ = {q}{PY}{q};\n}}\n"
+    );
+    assert!(
+        exec_codec_guarded_tests(&scan(&lookalike)).is_empty(),
+        "a call to `my_{EXEC_CODEC_HELPER}` was credited to `{EXEC_CODEC_HELPER}`, so an \
+         unrelated function could satisfy this gate"
+    );
+    //   * …while the path-qualified spelling must be, since the tree imports both ways.
+    let qualified = format!(
+        "#[test]\nfn planted_test() {{\n    serial_nexus_itest::{EXEC_CODEC_HELPER}({q}planted_test{q}, {q}x{q});\n}}\n"
+    );
+    assert!(
+        exec_codec_guarded_tests(&scan(&qualified)).contains("planted_test"),
+        "a path-qualified call to the helper was not credited, so a file that does not \
+         `use` it would redden despite being covered"
+    );
+
+    // 1. The walker: plant the bypass two directories down and require the walk to
+    //    surface it. A walk that stops walking reports the same green as a clean tree.
+    let scratch = Scratch::new("routing");
+    scratch.write("deep/nested/planted.rs", &bypass);
+    let mut escaped: Vec<String> = Vec::new();
+    let planted_stats = walk_rs(scratch.path(), &mut |_p, raw| {
+        let src = scan(raw);
+        let covered = exec_codec_guarded_tests(&src);
+        escaped.extend(
+            interpreter_dependent_tests(&src)
+                .into_iter()
+                .filter(|t| !covered.contains(t)),
+        );
+    });
+    assert_eq!(
+        planted_stats.files, 1,
+        "the planted walk visited an unexpected file count"
+    );
+    assert_eq!(
+        escaped,
+        vec!["planted_test".to_owned()],
+        "the walk did not reach a planted .rs file two directories down. Found: {escaped:?}"
+    );
+
+    // 2. The real scan.
+    let mut dependent: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut covered_total = 0usize;
+    let mut escaped: Vec<String> = Vec::new();
+    let mut first_real: Option<(String, String)> = None; // (rel, raw source)
+    let stats = walk_rs(&root, &mut |p, raw| {
+        let rel = rel_of(&root, p);
+        let src = scan(raw);
+        let deps = interpreter_dependent_tests(&src);
+        if deps.is_empty() {
+            return;
+        }
+        let covered = exec_codec_guarded_tests(&src);
+        covered_total += covered.len();
+        if first_real.is_none() && !covered.is_empty() {
+            first_real = Some((rel.clone(), raw.to_owned()));
+        }
+        for t in &deps {
+            if !covered.contains(t) {
+                escaped.push(format!(
+                    "{rel} — `{t}` depends on the interpreter but never calls `{EXEC_CODEC_HELPER}`"
+                ));
+            }
+        }
+        dependent.insert(rel, deps);
+    });
+    assert!(
+        stats.unreadable.is_empty(),
+        "directories went unread, so this verdict covers part of the tree: {:?}",
+        stats.unreadable
+    );
+    assert!(
+        stats.files >= 100,
+        "only {} .rs file(s) visited — the walk shrank, and a scan over a shrunken walk \
+         agrees with anything",
+        stats.files
+    );
+
+    // The floors. Sixteen tests over six files were measured when this gate was written
+    // (the prose it replaced claimed thirteen over four, and was wrong the day it was
+    // typed). These are floors rather than equalities so that adding an exec test is not
+    // a gate edit — the containment verdict below is what a new test has to satisfy.
+    let total: usize = dependent.values().map(BTreeSet::len).sum();
+    assert!(
+        total >= 14,
+        "only {total} test(s) read as depending on the interpreter — 16 were measured \
+         across 6 files when this gate was written, so the dependency reader has stopped \
+         reading and this gate's passing output is now identical to its not-running \
+         output (plan §3 rule 22). Found: {dependent:?}"
+    );
+    assert!(
+        dependent.len() >= 5,
+        "the class was found in only {} file(s); 6 carried it when this gate was \
+         written, so the walk is reaching only part of the tree",
+        dependent.len()
+    );
+    assert!(
+        covered_total >= 14,
+        "only {covered_total} test(s) route through `{EXEC_CODEC_HELPER}` — the coverage \
+         reader has stopped reading, and a containment check against an empty right-hand \
+         side is satisfied by nothing at all"
+    );
+
+    // 3. The comparison, exercised on this tree's own bytes: disable one real call and
+    //    require the report to name the test that lost it. Taken from the scan rather
+    //    than typed, so this proof cannot go stale when the battery is renamed.
+    let (rel, raw) = first_real.expect("the scan found a file whose tests call the helper");
+    let corrupt = raw.replace(
+        &format!("{EXEC_CODEC_HELPER}("),
+        &format!("{EXEC_CODEC_HELPER}_disabled("),
+    );
+    assert_ne!(
+        corrupt, raw,
+        "the planted removal never applied to {rel}, so the proof below asserts nothing"
+    );
+    let corrupt = scan(&corrupt);
+    let covered = exec_codec_guarded_tests(&corrupt);
+    let now_escaped: Vec<String> = interpreter_dependent_tests(&corrupt)
+        .into_iter()
+        .filter(|t| !covered.contains(t))
+        .collect();
+    assert!(
+        !now_escaped.is_empty(),
+        "disabling every `{EXEC_CODEC_HELPER}` call in {rel} produced no escapee: this \
+         gate cannot notice the regression it exists for"
+    );
+
+    // 4. The verdict.
+    assert!(
+        escaped.is_empty(),
+        "a test depends on an external interpreter but does not route its self-skip \
+         through `{EXEC_CODEC_HELPER}`, so `SNX_EXEC_CODEC=required` cannot see it and \
+         the test is silently skippable on any box or runner image missing the \
+         interpreter (plan §3 rules 11 and 22, plan §18 item 49):\n  {}\n\
+         Call the helper instead of announcing the skip by hand — that call is the only \
+         thing required mode can observe.",
+        escaped.join("\n  ")
     );
 }

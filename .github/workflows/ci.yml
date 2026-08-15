@@ -187,8 +187,8 @@ jobs:
       # `SNX_EXEC_CODEC=required` is the seventh instance of the one required-mode
       # mechanism (plan §3 rule 11, plan §18 item 49), and this is the job that earns
       # the right to set it: the ubuntu image provides python3, so a skip *here* is a
-      # runner that lost the interpreter, not a laptop without it. Thirteen tests over
-      # four files drive a codec child through it — the whole out-of-process extension
+      # runner that lost the interpreter, not a laptop without it. A battery spread over
+      # six files drives a codec child through it — the whole out-of-process extension
       # surface §8 and §15.26 promise — and until item 49 no lane asserted they had
       # executed, so an image that dropped python3 would have reported the entire
       # battery green without running a byte of it. Rule 22's tell in its plainest form:
@@ -491,7 +491,7 @@ jobs:
       # the suite any more than a red suite was allowed to hide the gate. It keys on the
       # build because that is what this step actually needs.
       # `SNX_EXEC_CODEC=required` here as well as on the Linux lane: the macOS image also
-      # provides python3, so the 13-test out-of-process codec battery must prove it executed
+      # provides python3, so the out-of-process codec battery must prove it executed
       # on both platforms rather than only on one. Item 49 built the mechanism and wired the
       # Linux lane; leaving macOS unset would make the extension surface silently skippable on
       # exactly the platform this lane exists to cover.

@@ -12835,3 +12835,59 @@ proves something adjacent.
 took it there), re-measured in both expectation files. **The figure's direction strengthens the
 decline rather than weakening it** — more of the gate turns on the JSON's kinds, so the case that the
 JSON is the artifact of record is stronger now than when §15.57 was written.
+
+### 3.110 A required mode nobody had ever run, and a figure copied into four places
+
+Plan §18 item 49. **Its two halves had been executed since `4a4e0dd` and the plan entry was never
+flipped** — the plan said "open" while AGENTS §2 listed 49 among that pass's executed items, against
+a tree already carrying the mechanism, its call sites, both CI lanes, its lattice row and its
+meta-gate. Two normative documents disagreeing is §2's own "a stale claim is a defect", and it is
+worth naming the failure mode: a landing that executes an item and updates *one* of the two places
+the state lives leaves the ledger describing a tree that has not existed for three days.
+
+**Asking whether the premise still held is what made this cheap.** The instruction to check whether
+`SNX_EXEC_CODEC` already covered the class before inventing a variable for it saved the entire filed
+remainder: it covers *all* of it, and a sweep of every `python3` mention tree-wide found the only
+others are prose. Rule 11 exists to prevent a second mechanism, and the fastest way to add one is to
+implement a ledger item whose premise expired.
+
+**Two things were genuinely missing, and the first is the one that matters.** *No required mode had
+ever been exercised on any box.* None of the eight `skip_no_*` helpers has a self-test, and nothing
+in the tree sets any of the eight variables — so the lattice that eight lanes and four `required`
+spellings rest on was **unproven code**, believed rather than measured, for as long as it has
+existed. Measured now, with the interpreter hidden behind a symlink-farm `PATH`, four arms:
+
+| interpreter | `SNX_EXEC_CODEC` | reading |
+|---|---|---|
+| present | unset | 10 passed, 2.09 s |
+| present | `required` | 10 passed, 2.09 s |
+| **absent** | unset | **10 passed, 0.00 s** |
+| **absent** | `required` | **10 failed** |
+
+The `0.00 s` against `2.09 s` is rule 22's tell made visible: the same green verdict, nothing
+executed. And the third row against the fourth is what makes the demand a *discriminator* rather
+than something that always fails — a distinction a one-armed proof cannot make. Delivery through
+CI's shape was proven under `env -i` with three variables, not assumed.
+
+**Second: the mechanism's coverage was unguarded, and the drift proves it.** A python3-dependent test
+that announces its own skip never reaches the helper and is therefore invisible to `required`.
+Planting exactly that bypass in `p5_envelope.rs` turns a python3-less box green again — the hole
+fully re-opened — while **all 22 pre-existing meta-gate assertions stay green**; only the new routing
+gate reddens. It derives both sides (a test is in the class if it names the interpreter in its own
+body *or* calls a file-local `have_python3()` — the second disjunct load-bearing, since the ten
+conformance tests reach the interpreter through `exec_command()` and would otherwise read as
+independent of it) and lands on exactly sixteen tests over six files with no false positives.
+
+**The tell that this had gone unguarded was a figure.** "Thirteen tests over four files" was wrong
+the day it was typed — fourteen over five — drifted to sixteen over six, and sat hand-copied in
+**four** places: the helper's doc, two CI comments, and the plan's lattice row. Checked in none.
+**A figure repeated in four places with no authority is the figure equivalent of a second
+mechanism**, and rule 11 forbids that for the same reason: the copies drift and nothing notices. The
+count now lives once, in the gate, as a floor; the containment verdict is what a new test must
+satisfy, and the lattice row deliberately carries no number at all.
+
+*One moment worth keeping.* The new gate **reddened against itself** on its first run, because its
+own derivation function's name contained the token it scans for. That is the file's documented "own
+worst case" convention firing exactly as its module doc says it must — the scanner that cannot see
+its own file is the scanner that will not see the next one either — and the prescribed fix
+(rename, hold the tokens in module-level consts outside every `#[test]` body) is what landed.

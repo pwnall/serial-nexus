@@ -2959,12 +2959,13 @@ pub fn skip_no_tls(test: &str, reason: &str) {
 /// Announce an out-of-process codec test's self-skip — and refuse to skip when the
 /// operator has said the battery must be exercised.
 ///
-/// **The python3 class** (plan §3 rule 11, plan §18 item 49). Thirteen tests across
-/// four files drive a codec child through an external `python3`: the whole
-/// `exec-conformance` battery (§15.26), the any-language envelope battery (§8), the
-/// crash-and-restart guard, and the unconfigured-channel counter. Every one of them
-/// self-skips when the interpreter is absent, and until this existed **no lane
-/// asserted they had executed** — so a runner image that dropped python3 would have
+/// **The python3 class** (plan §3 rule 11, plan §18 item 49). A battery of tests
+/// spread over six files drives a codec child through an external `python3`: the
+/// whole `exec-conformance` battery (§15.26), the any-language envelope battery
+/// (§8), the crash-and-restart guard, the orphan-reaping pair, the
+/// unconfigured-channel counter, and the exec teardown-accounting stage. Every one
+/// of them self-skips when the interpreter is absent, and until this existed **no
+/// lane asserted they had executed** — so a runner image that dropped python3 would have
 /// reported the entire out-of-process codec surface green without running a byte of
 /// it. That is plan §3 rule 22's tell in its plainest form: the passing output and
 /// the not-running output are the same line, and libtest captures a passing test's
@@ -2986,6 +2987,18 @@ pub fn skip_no_tls(test: &str, reason: &str) {
 /// The seventh instance of one mechanism, not a seventh mechanism: same variable
 /// shape, same word, same failure text as [`skip_no_tls`] — a skip class that
 /// invented its own spelling would be one more thing to remember (plan §3 rule 11).
+///
+/// **The roster is derived, and this prose deliberately carries no count.** It used
+/// to say "thirteen tests across four files", which was never true — the class was
+/// fourteen over five when the sentence was written and is larger now — and the same
+/// figure had been hand-copied into two CI comments and plan §3's lattice row, so
+/// four places drifted together and none of them was checked. A count repeated in
+/// four places is the figure equivalent of a second mechanism (rule 11). The
+/// enumeration that *is* checked lives in `itest/tests/meta_skip_names.rs`, whose
+/// routing gate derives both sides — every `#[test]` that depends on `python3`, and
+/// every `#[test]` that routes its skip through this helper — and fails when the
+/// first is not contained in the second. That gate, not a sentence, is what keeps a
+/// newly-added exec test from quietly re-opening the hole this helper closed.
 pub fn skip_no_exec_codec(test: &str, reason: &str) {
     assert!(
         std::env::var("SNX_EXEC_CODEC").as_deref() != Ok("required"),
