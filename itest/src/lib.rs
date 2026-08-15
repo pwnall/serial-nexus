@@ -2820,12 +2820,24 @@ pub fn usb_port_of(by_id_link: &Path) -> Option<String> {
 /// *measured* rather than declared** (plan §3 rule 11, §18 item 7, design §15.52).
 /// The other three ask whether a *thing* is present: a crossover rig, a blessed
 /// replug helper, `curl`. This one asks whether the rig that is present carries
-/// RTS↔CTS, which is a property of the operator's cabling and not of their
-/// checkout — and §5's stated design assumption is the **3-wire** link, so a rig
-/// that answers no is a legitimate rig and not a fault. The measurement is taken
-/// first and printed in the skip, so a reader never has to guess which of the two
-/// they have; the doctor reports the same fact independently in P5's handshake
-/// block.
+/// RTS↔CTS **in both directions**, which is a property of the operator's cabling
+/// and not of their checkout — and §5's stated design assumption is the **3-wire**
+/// link, so a rig that answers no is a legitimate rig and not a fault. The
+/// measurement is taken first and printed in the skip, so a reader never has to
+/// guess which of the two they have; the doctor reports the same fact
+/// independently in P5's handshake block.
+///
+/// **Half-crossed lands here too, and that is a deliberate reading of two
+/// different states through one word** (plan §18 item 74). A bench that carries
+/// RTS↔CTS one way only is not the legitimate 3-wire cabling above: it is a
+/// miswiring, the state P5 names `HALF-CROSSED handshake: RTS/CTS carries one way
+/// only`. Without `SNX_RIG_FLOW` it skips — the caller cannot prove its promise,
+/// and a skip printing its reading is what every other unmet capability in this
+/// tree does. With `SNX_RIG_FLOW=required` it fails, naming the state, which is
+/// the right answer to an operator who declared the bench 5-wire. Before item 74
+/// the precondition measured one direction, so this helper never saw a
+/// half-crossed bench at all: the caller passed its gate and then reddened
+/// mid-promise.
 ///
 /// `SNX_CROSSOVER=required` deliberately does **not** redden this: the rig is
 /// present, the capability is not, and conflating the two would make an honest
@@ -2834,12 +2846,15 @@ pub fn usb_port_of(by_id_link: &Path) -> Option<String> {
 pub fn skip_no_rig_flow(test: &str, measured: &str) {
     assert!(
         std::env::var("SNX_RIG_FLOW").as_deref() != Ok("required"),
-        "SNX_RIG_FLOW=required, but {test} found no hardware handshake: {measured}.\n\
+        "SNX_RIG_FLOW=required, but {test} found no fully-crossed RTS/CTS handshake: \
+         {measured}.\n\
          Required mode exists so a 5-wire bench cannot report a green run for the \
          one capability that only a 5-wire bench can exercise (§15.52, plan §3 \
-         rule 11). Cross-wire RTS↔CTS, or unset SNX_RIG_FLOW."
+         rule 11). Cross-wire RTS↔CTS both ways — a half-crossed bench reads as one \
+         of the two directions carrying and is a miswiring, not a 3-wire rig — or \
+         unset SNX_RIG_FLOW."
     );
-    eprintln!("SKIP {test}: the rig carries no RTS/CTS handshake — {measured}");
+    eprintln!("SKIP {test}: the rig carries no fully-crossed RTS/CTS handshake — {measured}");
 }
 
 /// Announce the TLS round-trip's self-skip — and refuse to skip when the operator

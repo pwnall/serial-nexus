@@ -8916,20 +8916,22 @@ mod tests {
         assert!(status.is_unsupported());
     }
 
-    /// The two constructors that feed the fold: a skipped characterization records
-    /// no failure (the CI sim must stay green), while an unavailable one degrades.
     /// **The handshake vocabulary names every shape, and judges none of them**
     /// (§15.52).
     ///
-    /// Two properties, and the second is the one that keeps the item honest. The
-    /// classifier must distinguish a 5-wire crossover from a 3-wire link from a
-    /// half-crossed handshake — otherwise the six cells beneath it are all a
+    /// The classifier must distinguish a 5-wire crossover from a 3-wire link from
+    /// a half-crossed handshake — otherwise the six cells beneath it are all a
     /// reader has, and a half-crossed handshake is exactly the state discovery
-    /// already refuses to leave unnamed on the data pair. And **no shape may
-    /// produce a certificate failure**: a 3-wire rig is §5's own stated
-    /// assumption, so an item that degraded one would report the operator's
-    /// cabling choice as a fault and would move the verdict on every committed
-    /// artifact whose rig nobody has re-inspected.
+    /// already refuses to leave unnamed on the data pair. That is what this test
+    /// asserts, cell by cell.
+    ///
+    /// The second half of §15.52 — **no shape may produce a certificate failure**,
+    /// because a 3-wire rig is §5's own stated assumption and an item that degraded
+    /// one would report the operator's cabling choice as a fault — is a property of
+    /// the *types*, not of this test, and the closing comment says which signatures
+    /// carry it and where the one reachable way to break it lives. Nothing below
+    /// asserts it, deliberately: a loop that pretended to stood here until plan §18
+    /// item 77.
     #[test]
     fn the_handshake_line_names_the_wiring_and_grades_none_of_it() {
         // Eight cells, named, so a transposed argument cannot hide in a
@@ -9065,19 +9067,60 @@ mod tests {
             stuck.starts_with("5-wire crossover") && stuck.contains("dtr_a_to_dsr_b=stuck-high"),
             "a stuck line was read as wired, or was dropped from the cells: {stuck}"
         );
-        // **Reported, never judged**: the handshake reaches no `CertFailure`, so
-        // no shape can move P5's verdict. Asserted over the verdict itself rather
-        // than by inspecting the call site, because that is the property.
-        for l in [&five_wire, &three_wire, &half] {
-            let (status, _) = p5_verdict(true, true, &[], &[], paired());
-            assert_eq!(
-                status.label(),
-                "supported",
-                "a handshake reading moved the verdict: {l}"
-            );
-        }
+        // `inverted` is the **fourth** reading `crosses()` can return — a line
+        // that followed both levels backwards — and it gets `stuck-high`'s
+        // treatment for the same reason: it is not a crossing, and it must still
+        // reach the reader. Fail-first: against an `any_dtr`/`both_rts` that
+        // counted `inverted` as wiring, both halves below fail while every
+        // assertion above, `stuck-high` included, still passes.
+        let inverted_dtr = line([
+            "false", "false", "inverted", "false", "false", "false", "false", "false",
+        ]);
+        assert!(
+            inverted_dtr.starts_with("3-wire") && inverted_dtr.contains("dtr_a_to_dsr_b=inverted"),
+            "an inverted DTR reading was counted as a wired line, or was dropped \
+             from the cells: {inverted_dtr}"
+        );
+        let inverted_rts = line([
+            "inverted", "true", "false", "false", "false", "false", "false", "false",
+        ]);
+        assert!(
+            inverted_rts.contains("HALF-CROSSED")
+                && inverted_rts.contains("rts_a_to_cts_b=inverted"),
+            "an inverted RTS/CTS direction completed a crossing: {inverted_rts}"
+        );
+
+        // **Reported, never judged — carried by the signatures, not by an
+        // assertion here** (plan §18 item 77). No shape can move P5's verdict
+        // because no shape can *reach* it: `p5_handshake_line(&HandshakeCells) ->
+        // String` and `p5_handshake(&Path, &Path) -> String` both hand back text
+        // and no `Certificate`, and `p5_verdict(bool, bool, &[CertFailure],
+        // &[String], RigFacts)` takes no handshake input at all. There is nothing
+        // to vary, so a runtime check in this test can only re-call `p5_verdict`
+        // with literals — which is exactly what stood here until item 77: a loop
+        // over the three shapes above that passed none of them in and was green
+        // whatever the handshake said. Do not re-add one; if either signature
+        // above ever grows a `Certificate`, the compiler is the guard.
+        //
+        // The one reachable way to break §15.52 is the **call site** in `p5_rig`,
+        // which drains the returned `String` into `p.observe` and into nothing
+        // else. Measured (item 77's fail-first): a `Certificate::new(handshake)`
+        // there with a `fail_if` on the 3-wire/HALF-CROSSED reading, drained into
+        // `failures`, degrades an honest 3-wire bench — and leaves all 92 unit
+        // tests in this file green, because `p5_rig` needs a bench and no unit
+        // test can call it. So this is a review property, kept honest by that call
+        // site staying one `observe`. A source-scanning guard was considered and
+        // declined: it could pin the two signatures and still miss the fold, which
+        // makes it weaker than the sentence above it would claim — AGENTS §3's
+        // second register of a gate that asserts nothing.
     }
 
+    /// The two constructors that feed the fold: a skipped characterization records
+    /// no failure (the CI sim must stay green), while an unavailable one degrades.
+    ///
+    /// (This doc comment describes this test. It was stranded above the handshake
+    /// test when that one was inserted between the two — 77f6798 — and reunited
+    /// with its subject at plan §18 item 77.)
     #[test]
     fn skipped_certificates_carry_no_failure_but_unavailable_ones_do() {
         let skipped = Certificate::skipped(P5_UNCHARACTERIZED);

@@ -2949,7 +2949,32 @@ carry the flow-control claim rather than in the product. **None of them weakens 
 result**, and each entry says why — a finding that does not move the conclusion still gets a
 number, because the next review cannot check that an unnumbered defect was fixed.
 
-74. **`handshake_measured` measures one direction; the test it gates asserts two** — **open** (S).
+74. **`handshake_measured` measures one direction; the test it gates asserts two** —
+    **EXECUTED 2026-08-15** (notes §3.103). **The decision the filing left open is made: a
+    half-crossed bench SKIPS**, printing its reading, and hard-fails under
+    `SNX_RIG_FLOW=required`. The rule behind it is the one this defect broke — *the precondition
+    must measure what the promise asserts* — so `handshake_measured` now drives both directions at
+    both polarities and returns `carries` only if all four readings are right. §15.52's "not wired
+    is a valid answer" is unchanged for 3-wire; a half-crossed bench is a **miswiring**, and
+    `SNX_RIG_FLOW=required` is the operator asserting 5-wire, so failing there names the fault
+    instead of letting it surface as a mid-test assertion.
+    **The filing was wrong about the blast radius, and the correction is a correctness blocker
+    rather than a tidy-up.** The item said to "check whether the call sites need any change"; one
+    did. The stall test called the precondition *after* loading its arm-1 graph, where port0 runs
+    `flow_control = "rts-cts"` and **the kernel's line discipline owns port0's RTS** — the very
+    thing `crossover_rig_rts_crosses_to_the_far_ports_cts` keeps both ports at `none` to avoid. On
+    an FT232R the chip drives RTS itself under hardware flow control, so the added direction would
+    have read "does not carry" on a **fully-crossed** bench, skipping the test and hard-failing the
+    documented rig lane. The measurement now runs on a `none`/`none` probe graph booted and dropped
+    ahead of arm 1.
+    *One consequence recorded rather than discovered later:* the stall test's precondition is now
+    **stricter than its own promise** — it asserts only `port1 RTS -> port0 CTS`, so a bench
+    half-crossed the other way could still prove that promise and will now skip. Accepted, because
+    the gate is defined by the 5-wire declaration `SNX_RIG_FLOW` makes, not per-test.
+    *Fail-first, three arms on the real bench (notes §3.103):* with the `port0 -> port1` drive
+    suppressed in software, the fixed tree **skips** both tests naming the half-crossed direction;
+    with `SNX_RIG_FLOW=required` both **fail** naming it; and the **unfixed** tree passes the
+    precondition and reddens at the second loop iteration, which is the defect.
     *Evidence:* `itest/tests/serial_hardware.rs:681-689` drives `port1 → port0` only, both
     polarities, and returns that as `carries`; `crossover_rig_rts_crosses_to_the_far_ports_cts`
     (`:740-754`) then asserts **both** directions, and its own comment gives the reason — "a
@@ -2967,7 +2992,19 @@ number, because the next review cannot check that an unnumbered defect was fixed
     the half-crossed reading, and the unfixed one must redden at the second loop iteration.
 
 75. **The stall test's 25 ms control is asserted at 5 s, and the comment says otherwise** —
-    **open** (S). *Evidence:* `itest/tests/serial_hardware.rs:1098-1108` argues the 1.5 s stall
+    **EXECUTED 2026-08-15** (notes §3.103). The control arm now times delivery from an `Instant`
+    taken before `send` and captured at the first satisfying poll, prints the figure on every run,
+    and asserts a **structural margin** instead of a remembered number: `STALL_WINDOW` (1.5 s) is a
+    named const both arms read, and the control asserts `latency * MIN_MARGIN <= STALL_WINDOW` with
+    `MIN_MARGIN = 4`. The "60x" sentence is replaced by one stating what the code checks.
+    **Measured on this bench: 20.35 ms**, against the 25 ms the old comment cited from a different
+    adapter pair — so the figure is now re-derived per run, which is what the comment always
+    claimed. *Fail-first, both plants on the real bench:* `MIN_MARGIN = 400` reddens the control
+    naming the measured latency (proving the assertion reads the measurement, not a constant), and
+    `STALL_WINDOW = 40 ms` leaves arm 1 green while printing `held 40 B for 40ms` — proving both
+    arms read the one const — and reddens the control. The 5 s `wait_until` stays, being delivery
+    *detection*; the margin is the separate assertion, so a 4 s delivery now passes `crossed` and
+    then reddens on the margin, which is the inversion the item described. *Evidence:* `itest/tests/serial_hardware.rs:1098-1108` argues the 1.5 s stall
     window is "a 60x margin" over a measured 25 ms and states that "the control arm below
     re-establishes the 25 ms figure on every run rather than trusting this comment". The control
     arm (`:1183-1196`) calls `wait_until(Duration::from_secs(5), …)` and asserts only that the
@@ -2981,7 +3018,24 @@ number, because the next review cannot check that an unnumbered defect was fixed
     not the result. *Validation:* time the control arm and either assert a bound or print the
     figure; deleting the 25 ms claim is an acceptable disposition, leaving it unmeasured is not.
 
-76. **The stall test never primes the wire** — **open** (S). *Evidence:* the test builds its
+76. **The stall test never primes the wire** — **EXECUTED 2026-08-15 with its central prediction
+    NOT REPRODUCED** (notes §3.103), which is the more useful half. `prime_the_wire_once` is now
+    called after the rig guard, and the post-release assertion's message — which blamed the peer's
+    RTS for what a swallowed leading packet looks like — now names the primer as the first thing to
+    check. **But the item predicted that an unprimed run fails after a re-enumeration, and it does
+    not: 5 of 5 unprimed trials passed**, each after a real `devprep cycle` of both ports.
+    **The hazard is nonetheless real on this pair, measured the same session:** with priming
+    disabled globally, `crossover_rig_custom_baud_byte_exact`'s 32768-byte transfer failed its
+    byte-exact assertion on **1 of 3** re-enumerations. So notes §3.70's swallow reproduces here —
+    intermittently, not the 3-of-3 it read on the original adapter pair — while this particular
+    test does not expose it in 5 attempts. Two candidate reasons are named and neither is measured:
+    the stall test boots three daemons before its 40 bytes cross, and the failing observation was at
+    a **custom** baud, so the swallow may track the rate change rather than the enumeration.
+    *Disposition:* the primer stays — it is free, it matches every sibling test, and the underlying
+    hazard is measured on this bench — but **the item's stated failure mode is unproven here** and
+    must not be cited as though it were. A confound is recorded with it: the plant also had to
+    convert the precondition probe from `boot_rig` to `boot_rig_raw` to remove the second priming
+    path, which changes the boot sequence the trial measures. *Evidence:* the test builds its
     daemons with `Daemon::start()` at four sites (`:953`, `:995`, `:1040`, `:1149`) and never calls
     `prime_the_wire_once`, which is reached only through `boot_rig` (`:282`) and the map test's
     explicit call (`:505`). Its payload is **40 bytes**, smaller than the **64-byte** leading packet
@@ -2994,7 +3048,27 @@ number, because the next review cannot check that an unnumbered defect was fixed
     a live failure. *Validation:* run this test first in a fresh binary after a physical replug —
     unprimed it must fail, primed it must pass 3 of 3.
 
-77. **A doctor unit test loops over three constants and passes none of them in** — **open** (S).
+77. **A doctor unit test loops over three constants and passes none of them in** —
+    **EXECUTED 2026-08-15** (notes §3.103). *The plant came first and proved the vacuity:* a
+    `Certificate` failure keyed on the handshake reading was planted at `p5_rig`'s call site, which
+    genuinely degrades an honest 3-wire bench — exactly what §15.52 forbids — and **the loop stayed
+    green**, as did all 92 doctor unit tests. The loop is deleted and the structural argument put in
+    its place, naming the signatures that carry the property: `p5_handshake_line(&HandshakeCells)
+    -> String` and `p5_handshake(&Path, &Path) -> String` hand back text and no `Certificate`, and
+    `p5_verdict` takes no handshake input at all. The one reachable way to break it — the `p5_rig`
+    call site ceasing to be a single `observe` — is named so the next reader does not re-add a
+    runtime check the compiler already makes.
+    **The item's own *Validation* line was unachievable and is corrected here:** it asked for the
+    loop to be "green today and red after any honest rewrite of it". The first half is confirmed;
+    the second cannot be, because the fold lives in `p5_rig`, which needs a bench, so **no unit test
+    of that shape can ever see the plant**. The honest rewrite removes the claim rather than making
+    it fail. *A source-scanning guard was evaluated and declined:* it could pin the two signatures
+    and still miss the call-site fold, which is AGENTS §3's second register — an assertion weaker
+    than the comment above it — and writing a fresh instance of that is worse than the defect.
+    *The vacated slot got a real assertion:* `crosses()` returns four values and **`inverted`** was
+    exercised by nothing. Two assertions added, each fail-first proven with its own plant — an
+    `any_dtr` counting `inverted` as wiring, and a `both_rts` doing the same — with every
+    pre-existing assertion, `stuck-high` included, staying green under both.
     *Evidence:* `doctor/src/probes.rs:9068-9078` iterates `for l in [&five_wire, &three_wire,
     &half]` and calls `p5_verdict(true, true, &[], &[], paired())` — five literals, identical on
     every iteration — using `l` only inside the panic message. Its comment claims the property is

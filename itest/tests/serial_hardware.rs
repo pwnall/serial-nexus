@@ -675,17 +675,59 @@ fn drive_rts_read_far(rpc: &serial_nexus_itest::Rpc, node: &str, far: &str, rts:
     rpc.node(far).unwrap_or_else(|| panic!("{far} has state"))["modem_lines"].clone()
 }
 
-/// Whether this rig carries a hardware handshake, **measured** — the precondition
-/// the two tests below gate on, and the reason their skip is honest rather than a
-/// declaration. Returns the measurement either way so the skip can print it.
+/// Whether this rig carries a **fully crossed** hardware handshake, **measured** —
+/// the precondition the two tests below gate on, and the reason their skip is honest
+/// rather than a declaration. Returns the measurement either way so the skip can
+/// print it.
+///
+/// **Four cells, because the promise this gates is a two-direction one** (plan §18
+/// item 74). It drove `port1 → port0` alone until this landed, while
+/// `crossover_rig_rts_crosses_to_the_far_ports_cts` asserted **both** directions —
+/// so a half-crossed bench, which P5 names as a real wiring state
+/// (`HALF-CROSSED handshake: RTS/CTS carries one way only`), passed the precondition
+/// and then reddened the promise mid-test, where every other `required`-gated
+/// capability in this tree skips with its reading printed. A precondition that
+/// measures less than its promise asserts is not a precondition. Both polarities in
+/// each direction for the reason §15.52 gives: a line stuck high passes a
+/// one-polarity test.
+///
+/// A half-crossed bench therefore **skips** here and, under `SNX_RIG_FLOW=required`,
+/// **fails** naming that state — which is the right verdict for an operator who
+/// asserted the bench is 5-wire: 3-wire is a legitimate cabling under §5's stated
+/// assumption, half-crossed is a miswiring.
+///
+/// **Call it only on a graph where the *test* owns both RTS pins** — both ports at
+/// `flow_control = "none"`. Under `rts-cts` the kernel owns that port's RTS and a
+/// `set-modem` fights the line discipline for the same pin, so the reading would be
+/// the discipline's answer rather than the wire's.
 fn handshake_measured(rpc: &serial_nexus_itest::Rpc) -> (bool, String) {
-    let hi = drive_rts_read_far(rpc, "port1", "port0", true);
-    let lo = drive_rts_read_far(rpc, "port1", "port0", false);
-    let carries = hi["cts"] == json!(true) && lo["cts"] == json!(false);
-    (
-        carries,
-        format!("port1 RTS high -> port0 {hi}, RTS low -> port0 {lo}"),
-    )
+    let measure = |near: &str, far: &str| -> (bool, String) {
+        let hi = drive_rts_read_far(rpc, near, far, true);
+        let lo = drive_rts_read_far(rpc, near, far, false);
+        let carries = hi["cts"] == json!(true) && lo["cts"] == json!(false);
+        (
+            carries,
+            format!(
+                "{near} RTS high -> {far} cts={}, RTS low -> {far} cts={}: {}",
+                hi["cts"],
+                lo["cts"],
+                if carries { "carries" } else { "does not carry" }
+            ),
+        )
+    };
+    // `port1 → port0` first, because that is the direction the stall test's promise
+    // rides on and a reader chasing a skip reads left to right.
+    let (b_to_a, b_cell) = measure("port1", "port0");
+    let (a_to_b, a_cell) = measure("port0", "port1");
+    // P5's own vocabulary, deliberately: an operator holding this skip line and a
+    // doctor report should not have to translate between them (§15.52).
+    let shape = match (b_to_a, a_to_b) {
+        (true, true) => "5-wire: RTS/CTS carries both ways",
+        (true, false) => "HALF-CROSSED handshake: RTS/CTS carries port1->port0 only",
+        (false, true) => "HALF-CROSSED handshake: RTS/CTS carries port0->port1 only",
+        (false, false) => "3-wire: no RTS/CTS handshake in either direction",
+    };
+    (b_to_a && a_to_b, format!("{shape} [{b_cell} | {a_cell}]"))
 }
 
 /// **RTS on one node moves CTS on the other, through the daemon's own state**
@@ -704,6 +746,13 @@ fn handshake_measured(rpc: &serial_nexus_itest::Rpc) -> (bool, String) {
 /// **both directions**, because a half-crossed handshake is a real wiring state
 /// that a single direction cannot see — the same reason P5's discovery refuses to
 /// call a half-crossed data pair "paired".
+///
+/// [`handshake_measured`] now measures those same four cells, so the loop below is
+/// no longer asserting anything the precondition did not gate on (plan §18 item
+/// 74). That is deliberate rather than redundant: the precondition decides
+/// skip-versus-run, and the loop is the promise — a bench that goes half-crossed
+/// *between* the two, a connector working loose being the obvious way, reddens here
+/// instead of turning the run green.
 ///
 /// The DTR arm is the **negative control** and it is not decoration: on this rig
 /// DTR moves no DSR, DCD or RI (measured, notes §3.53 i), so a `modem_lines` that
@@ -923,6 +972,19 @@ fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
     let _rig = rig_guard();
     eprintln!("crossover rig (rts-cts flow control): {p0} <-> {p1}");
 
+    // **Prime the wire** (plan §18 item 76). This test builds its daemons directly
+    // rather than through `boot_rig`, so it reached the primer only by accident —
+    // through whichever sibling crossover test happened to run before it in the same
+    // binary. Run first in a fresh binary after a replug it would lose its whole
+    // **40-byte** payload to the **64-byte** leading packet a freshly re-enumerated
+    // FT232R swallows (see [`prime_the_wire_once`]), and fail at the post-release
+    // byte-exact assertion — whose message blames the peer's RTS. A process-wide
+    // `OnceLock`, so one call here covers both arms and costs nothing when a sibling
+    // already primed. The handshake probe below reaches the primer through
+    // `boot_rig` as well; this call is the deliberate one, and it stays so that a
+    // later edit to that probe cannot silently take the priming with it.
+    prime_the_wire_once(&p0, &p1);
+
     // **On a driver that cannot honour RTS/CTS, the promise under test is a
     // different one, and it is asserted rather than skipped.** `serial2` verifies
     // line settings by reading them back, so a driver that accepts a `CRTSCTS`
@@ -1035,6 +1097,37 @@ fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
     // the *wire* stops, not that the daemon backs up.
     const LINE: &str = "SNX-RTSCTS-STALL-PROBE-0123456789ABCDEF";
 
+    // How long arm 1 holds the line down and watches for bytes. **One const, read
+    // by both arms**, because the window and the margin the control arm checks it
+    // against are one claim and must not be able to drift apart (plan §18 item 75).
+    const STALL_WINDOW: Duration = Duration::from_millis(1_500);
+    // The floor the control arm holds that window to: STALL_WINDOW must be at least
+    // this many times the uncontrolled latency measured on the same rig in the same
+    // run, or arm 1's "nothing crossed" is satisfiable by slowness.
+    const MIN_MARGIN: u32 = 4;
+
+    // ---- The precondition: does this bench carry the handshake at all?
+    //
+    // **Measured on a graph where the test owns both RTS pins**, which is why it
+    // happens here and not on arm 1's graph. Arm 1 runs port0 at `rts-cts`, so
+    // port0's RTS belongs to the kernel's line discipline; driving it with
+    // `set-modem` there would read the discipline's answer rather than the wire's,
+    // and `handshake_measured` needs both directions (plan §18 item 74). This
+    // daemon is dropped before arm 1 opens the ports.
+    let (carries, measured) = {
+        let (probe, _run_dir, _i0, _i1) = boot_rig(&p0, &p1, 115_200);
+        std::thread::sleep(Duration::from_millis(300));
+        handshake_measured(probe.rpc())
+    };
+    if !carries {
+        serial_nexus_itest::skip_no_rig_flow(
+            "rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes",
+            &measured,
+        );
+        return;
+    }
+    eprintln!("handshake: {measured}");
+
     // ---- Arm 1: rts-cts on the transmitter. The line must hold.
     let (d, run_dir, _i0, _i1) = {
         let d = Daemon::start();
@@ -1068,16 +1161,6 @@ fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
     let rpc = d.rpc();
     std::thread::sleep(Duration::from_millis(300));
 
-    let (carries, measured) = handshake_measured(rpc);
-    if !carries {
-        serial_nexus_itest::skip_no_rig_flow(
-            "rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes",
-            &measured,
-        );
-        return;
-    }
-    eprintln!("handshake: {measured}");
-
     let rx1 = run_dir.join("rx1.log");
     let baseline = std::fs::metadata(&rx1).map(|m| m.len()).unwrap_or(0);
 
@@ -1098,15 +1181,21 @@ fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
 
     // The stall is real: nothing crosses while the peer holds the line.
     //
-    // **The window is 1.5 s against a measured 25 ms**, and the ratio is the
-    // point. Probed directly on this rig with the same graph and
-    // `flow_control = "none"` on the transmitter, the payload lands in the log
-    // **25 ms** after `send` returns while CTS is held low; with `rts-cts` it does
-    // not arrive in **6 s**. So a 1.5 s window is a 60x margin over the only
-    // behaviour that could produce a false green here, and widening it further
-    // would buy nothing but wall clock. The control arm below re-establishes the
-    // 25 ms figure on every run rather than trusting this comment.
-    std::thread::sleep(Duration::from_millis(1_500));
+    // **The window is a ratio, and the ratio is checked** (plan §18 item 75). What
+    // could produce a false green here is a rig on which delivery simply takes
+    // longer than the window, so the window has to be read against this bench's own
+    // uncontrolled latency rather than against a remembered number. Probed on this
+    // rig when the test was written, the payload landed in the log **25 ms** after
+    // `send` returned while CTS was held low, and with `rts-cts` it did not arrive
+    // in **6 s** — but that figure is a record, not the assertion. The control arm
+    // below **times** its delivery on every run, prints it, and asserts that
+    // `STALL_WINDOW` covers it at least `MIN_MARGIN` times; a bench slow enough to
+    // make this window meaningless reddens there. This comment said the control arm
+    // re-established the 25 ms figure while the control arm recorded no time at all
+    // and waited 5 s — the assertion was 200x looser than the sentence describing
+    // it, which is AGENTS §3's "assertion strictly weaker than the comment above it
+    // claims".
+    std::thread::sleep(STALL_WINDOW);
     let during = std::fs::metadata(&rx1).map(|m| m.len()).unwrap_or(0);
     assert_eq!(
         during,
@@ -1128,7 +1217,14 @@ fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
         arrived,
         "the payload never arrived after the peer raised RTS: {after} of {want} \
          bytes. A stall that loses its payload is not backpressure, it is loss \
-         under another name (design §5: commands are delayed, never lost)"
+         under another name (design §5: commands are delayed, never lost). \
+         **Before believing that, check the primer**: this payload is 40 bytes and \
+         a freshly re-enumerated FT232R swallows the first 64 — one bulk packet — \
+         of the traffic that follows (notes §3.70). A whole payload inside one \
+         swallowed packet reads exactly like the loss this message names, so a \
+         `{after}` of 0 immediately after a replug is the primer's absence, not \
+         the peer's RTS. `prime_the_wire_once` above exists for that; if it was \
+         removed or bypassed, this is the first assertion to notice"
     );
     let body = std::fs::read(&rx1).expect("read rx1.log");
     assert!(
@@ -1138,7 +1234,7 @@ fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
         String::from_utf8_lossy(&body[baseline as usize..])
     );
     eprintln!(
-        "held {} B for 1.5 s, then delivered byte-exact",
+        "held {} B for {STALL_WINDOW:?}, then delivered byte-exact",
         want - baseline
     );
     drop(d);
@@ -1178,11 +1274,22 @@ fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
     let base2 = std::fs::metadata(&rx1b).map(|m| m.len()).unwrap_or(0);
 
     drive_rts_read_far(rpc2, "port1", "port0", false);
+    let want2 = base2 + LINE.len() as u64 + 1;
+    // **Timed, because arm 1's window is an argument about this number** (plan §18
+    // item 75). The clock starts before the `send` so the figure covers the same
+    // span arm 1 sleeps through — RPC round trip, daemon write, wire, log — and is
+    // read the instant the log first satisfies the condition, not after the loop.
+    let started = std::time::Instant::now();
     rpc2.send("port0", LINE, false, 5_000)
         .expect("send in the control arm");
-    let want2 = base2 + LINE.len() as u64 + 1;
+    let mut latency = None;
     let crossed = serial_nexus_itest::wait_until(Duration::from_secs(5), || {
-        std::fs::metadata(&rx1b).map(|m| m.len()).unwrap_or(0) >= want2
+        if std::fs::metadata(&rx1b).map(|m| m.len()).unwrap_or(0) >= want2 {
+            latency = Some(started.elapsed());
+            true
+        } else {
+            false
+        }
     });
     // Put the line back before asserting, so a red here cannot leave the rig held.
     drive_rts_read_far(rpc2, "port1", "port0", true);
@@ -1192,5 +1299,20 @@ fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
          arm 1's stall proves nothing about `rts-cts`, and something else on this \
          rig is holding the line"
     );
-    eprintln!("control: flow_control=none delivered through the same CTS-low state");
+    let latency = latency.expect("wait_until answered true, so the arrival was timed");
+    // Printed on every run, so the figure arm 1's comment argues from is in the
+    // record of the run that argued from it rather than in a sentence.
+    eprintln!(
+        "control: flow_control=none delivered {} B through the same CTS-low state in \
+         {latency:?} (stall window {STALL_WINDOW:?}, floor {MIN_MARGIN}x)",
+        want2 - base2
+    );
+    assert!(
+        latency * MIN_MARGIN <= STALL_WINDOW,
+        "the uncontrolled path took {latency:?} to cross this rig, so arm 1's \
+         {STALL_WINDOW:?} window is under {MIN_MARGIN}x that latency — \"nothing \
+         crossed in {STALL_WINDOW:?}\" is then satisfiable by a bench that is merely \
+         slow, and arm 1's green says nothing about `rts-cts`. Widen STALL_WINDOW \
+         (both arms read it) or find out why this rig delivers 40 bytes that slowly"
+    );
 }

@@ -12396,3 +12396,68 @@ must not be quoted precisely: this splice destroyed one name because of where th
 happened to land, and one byte's difference would have destroyed both. What the figure is *for* is
 separating a rig lane from a default-scope run — 3 against 14 here — and that gap is an order of
 magnitude clear of the noise, which is the only property this session relied on.
+
+### 3.103 Four guards repaired, and the one whose predicted failure would not reproduce
+
+Plan §18 items 74–77, all filed the previous day by the 5-wire session against the guards that
+carry its own flow-control claim. Three are ordinary repairs; the fourth is worth the entry on its
+own, because its central prediction did not survive being tested.
+
+**Item 74, and the decision it left open.** `handshake_measured` drove `port1 -> port0` only while
+the test it gates asserted both directions. The decision — half-crossed **skips**, printing its
+reading, and hard-fails under `SNX_RIG_FLOW=required` — follows one rule: *the precondition must
+measure what the promise asserts*. §15.52's "not wired is a valid answer" is untouched for 3-wire;
+a half-crossed bench is a miswiring, and `SNX_RIG_FLOW=required` is the operator asserting 5-wire,
+so failing there names the fault rather than letting it surface as a mid-test assertion.
+
+**The fix could not go where the item said it went, and that is the transferable part.** The stall
+test took the precondition *after* loading its arm-1 graph, where port0 runs `rts-cts` — so **the
+kernel's line discipline owns port0's RTS**, which is precisely what the sibling test keeps both
+ports at `none` to avoid. Driving the added direction there would have read "does not carry" on a
+**fully-crossed** bench: the test would skip, and under the documented rig lane's
+`SNX_RIG_FLOW=required` it would redden. A defect fix that reddens the lane it was written to
+protect is the failure mode this repo keeps finding one register at a time; here it was caught
+before landing because the item's own "check whether the call sites need any change" clause was
+executed instead of assumed. The measurement now runs on a `none`/`none` probe graph booted and
+dropped ahead of arm 1.
+
+**Item 75 turned a remembered number into a measured one.** The control arm now times delivery and
+asserts `latency * 4 <= STALL_WINDOW`, with `STALL_WINDOW` a const both arms read. This bench reads
+**20.35 ms** against the 25 ms the comment cited from another adapter pair. Two plants: `MIN_MARGIN
+= 400` reddens naming the measured latency, and `STALL_WINDOW = 40 ms` leaves arm 1 green while it
+prints `held 40 B for 40ms` — the proof the two arms cannot drift apart — and reddens the control.
+
+**Item 77's plant is the whole of its value.** A `Certificate` failure keyed on the handshake was
+planted at `p5_rig`'s call site — a real defect that degrades an honest 3-wire bench — and the loop
+stayed green, with all 92 doctor unit tests. The loop is gone and the structural argument stands in
+its place. Its *Validation* line asked for the loop to be "red after any honest rewrite", which is
+unachievable: the fold lives in `p5_rig`, which needs a bench, so no unit test of that shape can
+ever see the plant. **When a guard's stated property is carried by a signature, the honest repair
+deletes the guard and names the signature** — adding a source-scanning substitute would have been a
+fresh instance of the assertion-weaker-than-its-comment register, declined for that reason.
+
+**Item 76's prediction did not reproduce, and the record is more useful for it.** The item held that
+an unprimed stall test fails after a re-enumeration, its 40-byte payload sitting wholly inside the
+64-byte packet a freshly re-enumerated FT232R swallows (§3.70). Measured: **5 of 5 unprimed trials
+passed**, each after a real `devprep cycle` of both ports.
+
+That is not a licence to drop the primer, because **the hazard itself did reproduce on this pair in
+the same session**: with priming disabled globally, `crossover_rig_custom_baud_byte_exact`'s
+32768-byte transfer failed its byte-exact assertion on **1 of 3** re-enumerations. So §3.70's
+swallow is present here — *intermittently*, against the 3-of-3 it read on the original adapter pair
+— while this particular test does not expose it in five attempts. Two candidate reasons are named
+and **neither is measured**: the stall test boots three daemons before its bytes cross, and the
+failing observation was at a **custom** baud, so the swallow may track the rate change rather than
+the enumeration. The primer stays — free, consistent with every sibling, and defending a measured
+hazard — but the item's stated failure mode is unproven on this bench and must not be cited as
+though it were. One confound is recorded with the trial: removing the second priming path required
+converting the precondition probe from `boot_rig` to `boot_rig_raw`, which changes the boot sequence
+the trial measures.
+
+**The generalizable half.** A first unprimed green was very nearly written down as a refutation of
+item 76 after a single trial; what turned it into an honest "not reproduced in five" was asking a
+different question — *does this bench exhibit the hazard at all?* — with an instrument big enough to
+see it (32768 bytes rather than 40). **An underpowered negative is not a refutation, and the cheapest
+way to tell them apart is to measure the mechanism rather than the symptom.** The misattributing
+message the item also named is fixed: the post-release assertion now tells its reader that a payload
+of 0 immediately after a replug is the primer's absence, not the peer's RTS.
