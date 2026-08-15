@@ -128,8 +128,12 @@ carrying two changes deliberately folded into one boundary** (design §15.59).
   instrument change was already owed would have closed two eras where one would do.
   Folding them cost the archive one boundary instead of two, and it is the whole
   reason move one shipped with a header narrower than its body for one commit.
-  (What the daemon does is unchanged: no `xon-xoff` pre-check, no refusal at
-  `load` — plan §18 item 14's decline stands.)
+  (What the daemon did was unchanged *at that boundary*: no `xon-xoff` pre-check, no
+  refusal at `load`. That held for one day. §15.61 then met item 14's decline on its
+  own stated condition — a dropping driver was measured — so the pre-check consults
+  this cell for `xon-xoff` too and an accept-then-drop reading predicts a refusal at
+  `load`/`add-node`. Recorded here rather than rewritten away, because the sentence
+  was true of the boundary it describes; notes §3.101, plan §18 item 72.)
 
 So a capture from `4317ea5ac187f506` and one from `e79f5fcd86a2e5f0` must not be
 diffed field by field without the mismatch stated, **including for P1–P14**, whose

@@ -11811,6 +11811,20 @@ Linux's reason and leaving step 4 unexercised.
 *Owed, and stated rather than implied:* the reddening of step 4 has been proven on Darwin only.
 Both new guards run and pass on Linux, but this session had one box.
 
+> **Correction, 2026-08-14 (§3.101).** The last sentence is wrong about one of the two guards, and
+> the error is the interesting half. `peer_hungup`'s `sys` self-test does run and pass on Linux.
+> `a_witness_on_a_pty_whose_master_closed_is_refused_where_the_node_outlives_the_pair` does **not**:
+> it is `#[cfg(not(target_os = "linux"))]` and is not compiled on this kernel at all — so what was
+> owed was never merely "the reddening", it was any Linux exercise of step 4 whatsoever. Measured
+> on the Linux rig box: **step 4 is unreachable on Linux by construction, and that is a property of
+> the kernel rather than of the test.** While any fd on a pts is still open, Linux will not
+> reallocate that index — six sequential open/close cycles all returned `/dev/pts/9`, while the same
+> pair with the slave *held* forced the next allocation to `/dev/pts/10`. A witness therefore cannot
+> observe its path come back pointing at a different pair, so step 2 (the path is unlinked) always
+> fires first and step 4's `true` arm has no Linux trigger. Deleting the step-4 block leaves the
+> Linux suite green, which is the vacuity this correction records rather than papers over; the guard
+> for the kernel property it rests on is §3.101's.
+
 ### 3.95 A conditional decline paid off, and a primer that left its own payload on the wire
 
 Plan §18 items 67 and 70, and they are unrelated except that one session found both — the first
@@ -12095,3 +12109,136 @@ box that wrote them and wrong on the platform of record; it closes by having wri
 Two Macs are not one platform, and the record already said so in another register: plan §18 item 18
 insists the CI arm64 runner, the M4, and the x86_64 rig box are "three machines, none substituting
 for another".
+
+### 3.101 The Linux side of a Mac session: §15.61 landed in the daemon and not in the report
+
+Hardware validation of `b346188..4548881` — sixteen commits authored and measured on macOS — against
+Linux 7.0.0-29 and the FT232R crossover rig (3-wire, TX/RX/GND). The headline is that the Mac
+session's *code* survives Linux intact: no product behaviour on this kernel is wrong because of it.
+What did not survive is a set of **claims** the same commits left standing, and the one that matters
+is operator-facing.
+
+**§15.61 was implemented in the daemon and in one constant, and nowhere else.** The decision extends
+§15.53's load-time refusal to `xon-xoff` on a driver that accepts the request and reads the flags
+back clear. `flow_precheck_target` learned the mode, `precheck_flow_control` learned to refuse on
+it, and `P15_SOFT_DOES_NOT_LICENSE` was rewritten to say so. But `p15_soft_note` — the prose P15
+prints *into the report an operator reads* — was left at the pre-§15.61 answer in all three of its
+arms, as was the function's own doc ("**What did not change is the daemon.** … nothing in the
+product consults this cell"). One report therefore carried both statements at once, which is §7.1
+clause 2's split inside the artifact whose whole purpose is to prevent it.
+
+The worst arm is the dropped one. It told an operator holding a structural refusal that
+"a `flow_control = "xon-xoff"` node on such a port does **not** get §15.53's refusal at `load` —
+that refusal covers `rts-cts` only — and instead faults at its own open". Every clause of that is
+now false, and it prints exactly where the refusal fires. The honoured arm is the one this rig
+prints, since `ftdi_sio` honours the mode (`c_iflag` `0x5` → `0x1405`,
+`docs/doctor/linux-7.0-2026-08-13-8c00078-dirty-tier3.json`), and it claimed "no pre-check consults
+it and no config is refused on it".
+
+**Why a green suite certified it, which is the transferable half.** The guard
+`p15s_software_finding_degrades_the_verdict_and_refuses_nothing` *asserted the stale clauses on
+purpose*: `c.contains("not refused at \`load\`") || c.contains("refuses nothing")`, and on the
+honoured arm `c.contains("no config is refused on it")` — the latter justified in as many words as
+"the bound being that the daemon consults none of this (item 14's decline)". The reasoning was
+sound when written and became false when the decline was paid off. **A guard that pins a *decision*
+rather than a *mechanism* must be moved by the commit that changes the decision, or it stops being
+a guard and becomes the thing holding the defect in place.** That is a new instance of AGENTS §3's
+tell, one register over: not a gate that asserts nothing, but a gate that asserts the previous
+answer. Nothing else could have caught it — `expectations/linux.jq` type-checks
+`.software_flow_control.*` cells and never reads `.consequence`, a blind spot the probe's own doc
+comment states.
+
+Repaired: all three arms, the function doc, the pinning guard (renamed
+`…_refuses_the_dropping_port`, now with negative clauses that redden on each stale sentence), and
+the two verdict remedies that still offered `flow_control = "none"` (**or `xon-xoff`**) — advice
+§15.61 clause 3 retracted, because the driver that founded the measurement drops both modes, so the
+fallback led from one refusal into the other. The daemon's own messages had been corrected in the
+landing commit; the doctor's had not. Fail-first proof taken by restoring the honoured arm's stale
+sentence in place: the new guard reddens naming it, and passes when it is put back.
+
+**A second claim, at the place the design requires the cost be stated.** `precheck_flow_control`'s
+doc bounds the DTR/RTS drop it costs as "bounded (only nodes that asked for `rts-cts`)". §15.61 puts
+every `xon-xoff` node on that same path and says so ("the DTR-toggle cost §7.1 clause 6 states now
+applies to `xon-xoff` nodes too"); the cost statement did not move with it. Corrected, with the
+asymmetry that is invisible from the mode name recorded beside it: the `xon-xoff` arm writes
+`c_cflag` as well as `c_iflag` (it clears `CRTSCTS`, mirroring `serial2`), where the `rts-cts` arm
+touches `c_cflag` only.
+
+**A third, and it is a coverage claim rather than a prose one.** §3.94 closes "Both new guards run
+and pass on Linux, but this session had one box." One of them —
+`a_witness_on_a_pty_whose_master_closed_is_refused_where_the_node_outlives_the_pair` — is
+`#[cfg(not(target_os = "linux"))]` and is not compiled here, so what was owed was never merely the
+*reddening* of `SlaveWitness::prove_open`'s new step 4 but any Linux exercise of it at all. Deleting
+that step leaves the Linux suite green.
+
+Measured rather than argued: **step 4 has no Linux trigger by construction, and the reason is a
+kernel property.** While any fd on a pts is open, Linux will not hand that index to a new pair — six
+sequential open/close cycles all returned `/dev/pts/9`, while the same pair with the slave *held*
+forced the next allocation to `/dev/pts/10`. A witness therefore cannot observe its path come back
+pointing at a different pair, so the path check always answers first. That is why the vacuity is
+acceptable, and it is now a guard (`a_held_pts_index_is_never_reallocated_to_a_new_pair`, in `sys`
+beside `peer_hungup` because `itest` deliberately carries no `nix`): if a future Linux began reusing
+a held index, the witness's path check would silently stop being sufficient and this reddens instead
+of the witness quietly weakening. Its control arm proves this kernel *does* reuse a freed index, so
+the assertion discriminates held from free rather than passing on a kernel that reuses nothing.
+
+**What the Mac session got right, recorded because refuted diagnoses are load-bearing (§9).** Four
+candidate defects were raised against it and refuted on the tree: the nanosecond conversions in
+`p3_idle_cost`, `p9_pty_collapse` and `p12_sim_idle_cpu` preserve their thresholds exactly (10 % of
+a core each; `_SC_CLK_TCK` is 100 here so `1_000_000_000 / hz` is exact); the `XonXoff` arm's
+`CRTSCTS` clear is a no-op on the pts fixture and is restored either way; the load-refusal message
+was already built inline before this diff, so its lack of a constructing test is not new; and the
+absence of a `shipped_predicate_agrees` cross-check for the software mode is a real narrowness but
+not the disagreement-by-construction it was filed as. The method was six readers over disjoint areas
+of the diff with one adversarial verifier per candidate, each told to default to refuted.
+
+**The rig lane, and what it settled.** The documented lane ran on the crossover box after a
+re-bless (the `sys/` change relinked `devprep`, so `install` rewrote the binary and the kernel
+stripped its capability — the expected consequence of §15.45's design, not a defect):
+**1004 · 0 · 7**, zero failed binaries, self-skips **13 → 5**. All five are named measurements —
+two browser tests with no `node`, the packaging root arm with no root, and the two `rts-cts`
+tests printing the reading that justifies them (port1 RTS high and low both leave port0's CTS
+`false`, the **sixth** independent confirmation of a 3-wire bench and §15.52's legitimate
+answer). The `grant` verb worked on the rebuilt helper across every re-enumeration
+(`granted on ports 3-2.3, 3-2.4`, uid 1000), and all four replug tests passed including the
+renumbering one, which swapped the adapters' `/dev` names and said so.
+
+**Item 67's owed remainder is discharged, and it is the interesting result.** That item closed
+with: "the honouring **serial** arm is measured on a pts and on Linux's `ftdi_sio` through the
+committed captures, *not by a rig guard executing on Linux* — this session had one box."
+`xon_xoff_is_refused_at_load_exactly_where_the_driver_drops_it` has now taken its **`Honoured`**
+arm on real hardware — "driver honours xon-xoff — asserting the config LOADS" — and that arm had
+executed on **no machine anywhere** before this run: the Mac takes the accept-then-drop arm, and
+the arm asserting that a honouring port is *not* refused shipped unexecuted. So §15.61's
+discrimination is now proven end to end against hardware on both kernels, on the same two
+adapters and the same cable: the FT232R under `IOSerialFamily` is refused at `load`, the same
+FT232R under `ftdi_sio` loads and does not fault. **A refusal rule proven only against ports it
+refuses is not proven** — that sentence now has both halves behind it.
+
+Two more things the lane settled, both about this session's own subjects. `p4_exclusivity`,
+`p4_purge`, `p4_free_for_all` and `p6_outage` all ran against the rig and passed, so
+`SlaveWitness::prove_open`'s new step 4 causes no regression on Linux hardware — consistent with
+its having no Linux trigger at all. And the primer's new quiescence wait behaves here exactly as
+its comment claims: `primed … with 1024 B, quiet for 300 ms` on both logs, the full kibibyte
+arriving because Linux retains it (P13 `retains`), where the kernel that motivated the wait eats
+the leading packet. `crossover_rig_map_node_both_directions`, which item 70 records failing 4 of
+4 on Darwin from that residue, is green.
+
+**A third instance of §3.78's class, and the first on Linux.** The Status table's Linux rows have
+carried "13 self-skips" since the figure was first taken, and AGENTS §3 warned that
+`grep -c '^SKIP'` is unstable under `--nocapture` — but recorded that warning as a *macOS*
+observation ("two adjacent trees on one box read 105 and 102"). It is not a macOS property. Two
+default-scope runs of **this same tree**, this session, read **13** and **14** by the anchored
+grep. Extracting names instead of counting anchors makes it worse rather than better: both runs
+yield 13 names, but **different** ones — run one has no `rts_cts_flow_control_stalls_the_writer_
+instead_of_losing_bytes` anywhere in its log, run two has no `crossover_rig_custom_baud_byte_exact`,
+and at this scope (`SNX_CROSSOVER_A`/`_B` unexported) both tests must self-skip. Their union is
+**14**, and the union is still a floor: a line mangled in both runs is invisible to both.
+
+So the long-carried Linux 13 is an undercount, by at least one, for the same reason the macOS
+count could not be pinned — a concurrent write splices a `SKIP` message mid-name, which defeats
+the anchor *and* the name match at once. The 1004 row states 14 as a **lower bound** rather than
+replacing one precise-looking number with another. What the figure is for is unaffected and needs
+no precision: it separates a rig-lane row (5) from a default-scope one (~14), and that gap is an
+order of magnitude clear of the instability.
+

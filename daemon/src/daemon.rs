@@ -762,11 +762,28 @@ impl Daemon {
     /// takes one extra reset per `load`, per `add-node`, and per `startup_load`
     /// replay of a persisted config — and fixing the resolution above *widened* that,
     /// because identity-form configs now reach the check where before they silently
-    /// skipped it. It is bounded (only nodes that asked for `rts-cts`) and it buys a
-    /// refusal the operator can act on instead of a node that faults later. Removing
-    /// it means asking the question from inside the node's own open, which is after
-    /// the point where "nothing is created" still holds — a design question, not a
-    /// patch (§5).
+    /// skipped it. It buys a refusal the operator can act on instead of a node that
+    /// faults later. Removing it means asking the question from inside the node's own
+    /// open, which is after the point where "nothing is created" still holds — a
+    /// design question, not a patch (§5).
+    ///
+    /// **§15.61 widened it a second time, and this sentence said otherwise until
+    /// 2026-08-14.** The bound read "only nodes that asked for `rts-cts`", which was
+    /// true while the pre-check interrogated that mode alone; extending the refusal to
+    /// `xon-xoff` put every *software* flow-control node on this same path, so those
+    /// nodes now pay the DTR/RTS drop too. §15.61 states the widening ("the DTR-toggle
+    /// cost §7.1 clause 6 states now applies to `xon-xoff` nodes too") — the cost
+    /// statement here simply did not move with it, which is the class of defect AGENTS
+    /// §2 calls out: the decision's own recorded cost outliving the decision.
+    ///
+    /// The bound that *does* hold is `flow_control` naming a handshaking mode at all:
+    /// a `none` node still never reaches [`serial_nexus_sys::honours_flow_control`] and
+    /// still pays nothing. One asymmetry is worth knowing at this call site, because it
+    /// is not visible from the mode name: the `xon-xoff` arm writes `c_cflag` as well
+    /// as `c_iflag` — it clears `CRTSCTS` to mirror what `serial2`'s
+    /// `FlowControl::XonXoff` does — where the `rts-cts` arm touches `c_cflag` only.
+    /// Both are restored before the fd closes; it is the *close* that drops the lines,
+    /// not the write.
     fn precheck_flow_control(
         &self,
         nodes: &[serial_nexus_core::config::NodeConfig],

@@ -398,10 +398,15 @@ The assumption is a default, not a constraint:
    proven on the wire, not only in the model: over the crossover rig, a `flow_control = "none"`
    transmitter delivers through a CTS stop and an `rts-cts` one never does (notes §3.63).
 2. Whether the driver *honours* a configured mode is measured, never assumed, by the one shared
-   predicate `sys::honours_rtscts`; a driver that accepts `CRTSCTS` and silently drops it is
-   refused at `load`/`add-node` (§15.53). The per-mode measurement status, the kernels of
-   record, and the `xon-xoff` gap are §7.1's contract (clause 7) — the `xon-xoff` half is a
-   measurement debt (plan §18 item 14), not a §14 deferral.
+   predicate `sys::honours_flow_control`, which takes the mode as a parameter and answers for
+   **both**; a driver that accepts the request and silently drops it is refused at
+   `load`/`add-node` (§15.53, extended to the software mode at §15.61). The per-mode measurement
+   status and the kernels of record are §7.1's contract (clause 7). *(This clause named
+   `honours_rtscts` and called the `xon-xoff` half "a measurement debt (plan §18 item 14)" until
+   2026-08-14. Both halves of that were overtaken on 2026-08-13: the predicate was renamed when it
+   was generalized, and item 14's debt was paid — a dropping driver was found, so §15.61 extended
+   the refusal and clause 7 now records both modes as measured on both kernels. Notes §3.101,
+   plan §18 item 72.)*
 3. The 3-wire default is also why the rig-flow lane's precondition is measured rather than
    declared: a bench that answers "no flow-control wires" is a legitimate rig under this
    section's own assumption (§15.52; plan §3).
@@ -1029,7 +1034,7 @@ would be degraded here is not an observation but the transport's *contract*.
    match the read-back P15 takes by hand, reporting `shipped_predicate_agrees` with its own
    `degraded` arm ranked above the finding itself — a report that calls a port fine while `load`
    refuses it is worse than either verdict alone (§13). **Four states and only one refuses:**
-   the predicate answers `Ok(RtsCtsOutcome::{Honoured, Refused, AcceptedThenDropped})` or `Err`,
+   the predicate answers `Ok(FlowOutcome::{Honoured, Refused, AcceptedThenDropped})` or `Err`,
    only `AcceptedThenDropped` refuses the config, `Err` is *unmeasured* and never a refusal, and
    an absent device never reaches the check at all — unplugged hardware still just waits (§12).
    *(This clause enumerated a two-valued `Ok(false)`-refuses predicate until 2026-08-12, and that
@@ -1061,9 +1066,15 @@ would be degraded here is not an observation but the transport's *contract*.
    is an extra DTR toggle (last close of a tty with `HUPCL` lowers DTR and RTS — measured on
    the rig by far-port CTS edge counting, which also falsified the shipped claim that the open
    was "not an *extra* toggle", with the confound that `CRTSCTS` itself moved the line refuted;
-   notes §3.68). A board that auto-resets on DTR takes one extra reset per `load` of an
-   `rts-cts` node; removing it would mean asking from inside the node's own open, past where
-   "nothing is created" holds — a filed design question, not a patch.
+   notes §3.68). A board that auto-resets on DTR takes one extra reset per `load` of a node that
+   asked for **either** handshaking mode; removing it would mean asking from inside the node's own
+   open, past where "nothing is created" holds — a filed design question, not a patch. *(This
+   clause read "an `rts-cts` node" until 2026-08-14. §15.61 states in as many words that "the
+   DTR-toggle cost §7.1 clause 6 states now applies to `xon-xoff` nodes too" — the clause it
+   names simply did not move with it, as neither did the same bound in `precheck_flow_control`'s
+   own doc; notes §3.101, plan §18 item 72. The asymmetry worth knowing is that the `xon-xoff`
+   arm writes `c_cflag` as well as `c_iflag`, clearing `CRTSCTS` to mirror `serial2`, where the
+   `rts-cts` arm writes `c_cflag` alone — both restored before the close that drops the lines.)*
 7. Per-mode measurement status. **Both modes are now measured on both kernels, and both are
    refused where the driver drops them (§15.61, 2026-08-13).** `xon-xoff`'s Darwin arm is the
    FT232R on `IOSerialFamily` accepting `IXON|IXOFF` and reading `c_iflag` back `0x0` → `0x0` —

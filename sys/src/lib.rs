@@ -2044,6 +2044,101 @@ mod tests {
              reads false there), so an empty mask makes this helper silently useless"
         );
     }
+
+    /// **Why [`peer_hungup`]'s `true` arm has no Linux trigger inside a witness**
+    /// (plan §18 item 66; notes §3.101).
+    ///
+    /// `itest`'s `SlaveWitness::prove_open` checks four things, and on Linux the
+    /// third — the path still resolves to the fd's device — always answers before
+    /// this helper is reached, because the kernel unlinks a pts entry at its master's
+    /// close. The only shape that could slip past it is the path coming *back*,
+    /// pointing at a different pair; this test asserts that Linux cannot produce that
+    /// shape while the witness holds its fd. **While any descriptor on a pts is open,
+    /// the kernel will not hand that index to a new pair.**
+    ///
+    /// **Recorded as a vacuity, not sold as coverage.** Deleting the witness's
+    /// `peer_hungup` step leaves the Linux suite green — notes §3.94 said both of item
+    /// 66's guards ran here, and the one that exercises that step is
+    /// `#[cfg(not(target_os = "linux"))]`. What this buys is the *reason* that is
+    /// acceptable: if a future Linux began reusing a held index, the witness's path
+    /// check would silently stop being sufficient and this would redden, instead of
+    /// the witness quietly weakening. It is the same shape as the Darwin guard, which
+    /// asserts its own platform fact in the same run rather than citing it.
+    ///
+    /// The control arm is load-bearing: a box that reused *nothing* would satisfy the
+    /// main assertion for the wrong reason, so the test first shows this kernel does
+    /// reuse a freed index (measured on Linux 7.0.0-29: six sequential open/close
+    /// cycles all returned `/dev/pts/9`).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_held_pts_index_is_never_reallocated_to_a_new_pair() {
+        use nix::fcntl::{OFlag, open};
+        use nix::pty::{grantpt, posix_openpt, unlockpt};
+        use nix::sys::stat::Mode;
+
+        let open_pair = || {
+            let m = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY).expect("posix_openpt");
+            grantpt(&m).expect("grantpt");
+            unlockpt(&m).expect("unlockpt");
+            let name = ptsname(&m).expect("ptsname");
+            (m, name)
+        };
+
+        // The control: a fully released index IS reused here, so the assertion below
+        // discriminates "held" from "free" rather than passing on a kernel that never
+        // reuses anything.
+        let mut freed = Vec::new();
+        for _ in 0..4 {
+            let (m, name) = open_pair();
+            drop(m);
+            freed.push(name);
+        }
+        assert!(
+            freed.windows(2).any(|w| w[0] == w[1]),
+            "no index was reused across four open/close cycles ({freed:?}), so this \
+             box cannot tell a held index from a free one and the assertion below \
+             would pass for the wrong reason"
+        );
+
+        // The real question: hold the SLAVE, close the master, and demand that no
+        // later pair is handed the same path.
+        let (master, held_name) = open_pair();
+        let held = std::fs::File::from(
+            open(
+                held_name.as_str(),
+                OFlag::O_RDWR | OFlag::O_NOCTTY,
+                Mode::empty(),
+            )
+            .expect("open the pts"),
+        );
+        drop(master);
+
+        assert!(
+            !std::path::Path::new(&held_name).exists(),
+            "{held_name} survived its master's close, so this kernel does not unlink a \
+             pts at all and the witness's path check could never fire"
+        );
+        assert!(
+            peer_hungup(&held),
+            "the held slave did not report the hangup, so the arm this test bounds is \
+             not even armed"
+        );
+
+        let mut others = Vec::new();
+        for _ in 0..4 {
+            let (m, name) = open_pair();
+            assert_ne!(
+                name, held_name,
+                "the kernel reallocated {held_name} while an fd on it was still held. \
+                 A witness compares its path's device against its fd's, so a reused \
+                 index would let it pass on a pair that is gone — `peer_hungup` would \
+                 become the only thing catching that on Linux, and notes §3.101's \
+                 claim that it has no Linux trigger would be false"
+            );
+            others.push((m, name));
+        }
+        drop(held);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

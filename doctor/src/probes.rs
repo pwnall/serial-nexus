@@ -7368,13 +7368,27 @@ fn p15_soft_readback<Fd: AsFd>(
 /// one `probe_set` boundary: the `question` now names both kinds, so a `supported`
 /// verdict over a silently-dropped software request would be the probe answering
 /// `supported` to a question it answered *no* to. [`p15_verdict`] therefore
-/// degrades on it — ranked below the hardware drop, because that one has a shipped
-/// consequence (`load` refuses, §15.53) and this one deliberately has none.
+/// degrades on it — ranked below the hardware drop, which is a presentation order
+/// retained for stability rather than a claim that one finding matters more: since
+/// §15.61 the two carry the **same** shipped consequence.
 ///
-/// **What did not change is the daemon.** Plan §18 item 14's decline stands: no
-/// `xon-xoff` pre-check, no refusal at `load`, nothing in the product consults
-/// this cell. A `degraded` here reports a driver difference (§7's rule) and does
-/// not enact a policy, and every arm below says so in as many words.
+/// **And the daemon now consults it** (§15.61, plan §18 item 67). Plan §18 item 14
+/// declined the `xon-xoff` pre-check *until a dropping driver was found*; one was,
+/// on the FT232R this probe runs against, so the decline's own condition was met and
+/// §15.53's refusal was extended to the software mode. A `flow_control = "xon-xoff"`
+/// node on an accept-then-drop port is now refused at `load`/`add-node` exactly as an
+/// `rts-cts` one is — same predicate, same position before anything is created, same
+/// one arm refusing.
+///
+/// **Every arm below had to move with the tree, and this is where that is enforced.**
+/// The arms said "nothing in the product consults this cell" — true when written,
+/// false the moment §15.61 landed, and left standing by the commit that landed it
+/// while the sibling [`P15_SOFT_DOES_NOT_LICENSE`] cell was updated to say the
+/// opposite. One report then carried both statements, which is §7.1 clause 2's split
+/// inside the artifact whose whole job is to prevent it — and the arm it was worst in
+/// was the dropped one, which told an operator holding a structural refusal that
+/// nothing would refuse their config. Caught on the Linux rig, where the honoured arm
+/// is the one that prints (notes §3.101).
 ///
 /// The sentence is not optional decoration: `expectations/*.jq` reads
 /// observations and never `.consequence`, and the digests read `(id, question)`
@@ -7406,21 +7420,21 @@ fn p15_soft_note(rows: &[FlowReadback]) -> String {
     let mut out = String::new();
     if !dropped.is_empty() {
         out.push_str(&format!(
-            " **SOFTWARE flow control: {} named port(s) ACCEPTED an `IXON|IXOFF` request and then reported it clear** ({}) — measured on the same open (plan §18 item 14). `serial2` verifies `c_iflag` by read-back exactly as it verifies `c_cflag`, so a `flow_control = \"xon-xoff\"` node on such a port does **not** get §15.53's refusal at `load` — that refusal covers `rts-cts` only — and instead faults at its own open with the bare `failed to apply some or all settings` the refusal exists to prevent. **This degrades the verdict and refuses nothing**: since §15.59 widened this probe's question to name both flow-control kinds, a `supported` here would be answering `supported` to a question this port answered no to — but the daemon is unchanged, no pre-check consults this cell, and plan §18 item 14's decline stands until a design decision is taken on the evidence this row now supplies (`serial2_readback_would_fault` is the cell that decides the node's fate, because it compares the whole `c_iflag` word rather than the two flags alone).",
+            " **SOFTWARE flow control: {} named port(s) ACCEPTED an `IXON|IXOFF` request and then reported it clear** ({}) — measured on the same open (plan §18 item 14). `serial2` verifies `c_iflag` by read-back exactly as it verifies `c_cflag`, so a `flow_control = \"xon-xoff\"` node on such a port would fault at its own open with the bare `failed to apply some or all settings`. **Since §15.61 it does not get that far: the config is REFUSED at `load`/`add-node`, before anything is created**, exactly as an `rts-cts` config on an accept-then-drop port is — the same predicate, the same position, and the same single arm refusing (an honest `tcsetattr` failure is not refused, and an unmeasurable port waits). Plan §18 item 14 declined this refusal *until a dropping driver was found*; this row is that driver, so the decline was paid off rather than reversed (plan §18 item 67). The remedy is `flow_control = \"none\"` for this port, or an adapter whose driver implements XON/XOFF — **not** `rts-cts`, if the hardware half of this probe reports the same port dropping that too. `serial2_readback_would_fault` is the cell that decides the node's fate, because it compares the whole `c_iflag` word rather than the two flags alone.",
             dropped.len(),
             dropped.join(", ")
         ));
     }
     if !refused.is_empty() {
         out.push_str(&format!(
-            " **SOFTWARE flow control: {} named port(s) REFUSED `IXON|IXOFF` outright** ({}) — `tcsetattr` failed rather than reporting success over a clear flag, which is the honest answer and the one nothing needs to act on.",
+            " **SOFTWARE flow control: {} named port(s) REFUSED `IXON|IXOFF` outright** ({}) — `tcsetattr` failed rather than reporting success over a clear flag. That is the honest answer, and since §15.61 it is a *decided* one rather than an unexamined one: a `flow_control = \"xon-xoff\"` config on such a port is deliberately **not** refused at `load`, because the failure is already loud and arrives at the node's own open (§7.1 clause 7). Only accept-then-drop is refused, for the software mode exactly as for the hardware one.",
             refused.len(),
             refused.join(", ")
         ));
     }
     if honoured > 0 {
         out.push_str(&format!(
-            " Software flow control (`xon-xoff`, `IXON|IXOFF`) was measured on the same open and {honoured} of {} named port(s) honoured it on read-back. The verdict answers for this half too since §15.59 widened the question — but the *daemon* does not: no pre-check consults it and no config is refused on it (plan §18 item 14's decline, unchanged).",
+            " Software flow control (`xon-xoff`, `IXON|IXOFF`) was measured on the same open and {honoured} of {} named port(s) honoured it on read-back. The verdict answers for this half too since §15.59 widened the question, and since §15.61 the daemon consults the same reading: a `load`/`add-node` pre-check asks this port the same question this probe just asked it. A port that **honours** the mode is not refused — the refusal fires on accept-then-drop alone — so this reading clears these port(s) rather than merely describing them.",
             rows.len()
         ));
     }
@@ -7546,7 +7560,7 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
         return (
             Status::Supported,
             format!(
-                "**{} of {} named port(s) REFUSED the `CRTSCTS` request outright** ({}); the rest honoured it on read-back. A refusal is `tcsetattr` *failing* rather than reporting success and leaving the flag clear, and it is the honest answer: nothing about the request was silently discarded. **A `flow_control = \"rts-cts\"` config on such a port is therefore NOT refused at `load`/`add-node` (§7.1, §15.53)** — only the accept-then-drop driver is, because only that one would leave a link running without the flow control it asked for. The node's own open fails instead, loudly, carrying the driver's own error plus the flag, the port and both remedies: `flow_control = \"none\"` (or `xon-xoff`) for this port, or an adapter whose driver implements RTS/CTS. Read this beside `honoured_on_readback` and `tcsetattr_ok` in the cells below: those two together are the three-way discrimination this probe exists to make, and `silently_dropped` is `false` here.{}",
+                "**{} of {} named port(s) REFUSED the `CRTSCTS` request outright** ({}); the rest honoured it on read-back. A refusal is `tcsetattr` *failing* rather than reporting success and leaving the flag clear, and it is the honest answer: nothing about the request was silently discarded. **A `flow_control = \"rts-cts\"` config on such a port is therefore NOT refused at `load`/`add-node` (§7.1, §15.53)** — only the accept-then-drop driver is, because only that one would leave a link running without the flow control it asked for. The node's own open fails instead, loudly, carrying the driver's own error plus the flag, the port and both remedies: `flow_control = \"none\"` for this port, or an adapter whose driver implements RTS/CTS. **Not `xon-xoff`**: this line offered it as a fallback until §15.61 clause 3 retracted the advice, because the one driver that founded this measurement drops the software mode the same way — so the fallback sent an operator from one refusal into another, worst exactly where it was reached from. Read this beside `honoured_on_readback` and `tcsetattr_ok` in the cells below: those two together are the three-way discrimination this probe exists to make, and `silently_dropped` is `false` here.{}",
                 refused.len(),
                 rows.len(),
                 refused
@@ -7561,7 +7575,7 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
     (
         Status::Degraded,
         format!(
-            "**{} named port(s) ACCEPTED a `CRTSCTS` request and then reported it clear** ({}). `tcsetattr` returned success and `tcgetattr` read the flag back unset, so the driver neither honours the mode nor refuses it. **What the daemon does about it is decided and shipped (§15.53, notes §3.67): a node configured with `flow_control = \"rts-cts\"` on such a port is REFUSED at `load`/`add-node`, before anything is created** — not faulted later, and not silently run without the flow control it asked for. The refusal names the node, the device, the resolved path and the read-back, and offers two remedies: `flow_control = \"none\"` (or `xon-xoff`) for this port, or an adapter whose driver implements RTS/CTS. `serial-nexus-doctor --port <this port>` reports the same reading the daemon consults, and `shipped_predicate_agrees` below says whether the two agree on this box. The refusal is structural and creates **nothing** — §11's load is atomic, so a five-node file with one such port creates zero nodes, not four; what survives is the *running* graph, because the pre-check runs before any teardown, so a refused `load --replace` leaves what is already up untouched. Measured on Darwin 24.6.0 / macOS 15.7.8 with an FT232R on Apple's IOSerialFamily driver: `CCTS_OFLOW` alone, `CRTS_IFLOW` alone, both together, a blocking open and the `/dev/tty.*` node all behave identically, while a **pty on the same box honours the flag** — so it is the serial driver and not the tty layer. The wire is not the suspect either: RTS↔CTS crossing is independently proven on that rig. **Two paths still reach a `faulted` node rather than the refusal**, both because the pre-check could not open the port to measure it: a `load --replace` on a port the running graph already holds (filed, notes §3.68 (5a)), and an adapter that arrives *after* the config loads. On those the node's own open fails, and the fault now carries this same reading and remedy instead of `serial2`'s bare `failed to apply some or all settings`.{}",
+            "**{} named port(s) ACCEPTED a `CRTSCTS` request and then reported it clear** ({}). `tcsetattr` returned success and `tcgetattr` read the flag back unset, so the driver neither honours the mode nor refuses it. **What the daemon does about it is decided and shipped (§15.53, notes §3.67): a node configured with `flow_control = \"rts-cts\"` on such a port is REFUSED at `load`/`add-node`, before anything is created** — not faulted later, and not silently run without the flow control it asked for. The refusal names the node, the device, the resolved path and the read-back, and offers two remedies: `flow_control = \"none\"` for this port, or an adapter whose driver implements RTS/CTS — **not** `xon-xoff`, which this line offered until §15.61 clause 3 retracted it: the same driver drops both modes, so that fallback led from this refusal straight into the software one. `serial-nexus-doctor --port <this port>` reports the same reading the daemon consults, and `shipped_predicate_agrees` below says whether the two agree on this box. The refusal is structural and creates **nothing** — §11's load is atomic, so a five-node file with one such port creates zero nodes, not four; what survives is the *running* graph, because the pre-check runs before any teardown, so a refused `load --replace` leaves what is already up untouched. Measured on Darwin 24.6.0 / macOS 15.7.8 with an FT232R on Apple's IOSerialFamily driver: `CCTS_OFLOW` alone, `CRTS_IFLOW` alone, both together, a blocking open and the `/dev/tty.*` node all behave identically, while a **pty on the same box honours the flag** — so it is the serial driver and not the tty layer. The wire is not the suspect either: RTS↔CTS crossing is independently proven on that rig. **Two paths still reach a `faulted` node rather than the refusal**, both because the pre-check could not open the port to measure it: a `load --replace` on a port the running graph already holds (filed, notes §3.68 (5a)), and an adapter that arrives *after* the config loads. On those the node's own open fails, and the fault now carries this same reading and remedy instead of `serial2`'s bare `failed to apply some or all settings`.{}",
             dropped.len(),
             dropped
                 .iter()
@@ -7627,11 +7641,18 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
 /// the body answered, and a wording change is not worth an era boundary of its own.
 /// At P16's landing the two were folded into **one** `probe_set` move: the
 /// `question` now names both flow-control kinds and [`p15_verdict`] degrades on a
-/// silently-dropped software request, ranked below the `CRTSCTS` drop because that
-/// one has a shipped consequence and this one has none. **The daemon is
-/// unchanged** — plan §18 item 14's decline stands, no pre-check consults the cell,
-/// and no config is refused on it; the verdict reports a driver difference (§7)
-/// and enacts nothing. The other route by which the software pass moves the
+/// silently-dropped software request, ranked below the `CRTSCTS` drop. **And then
+/// the daemon changed too** (§15.61, 2026-08-13): plan §18 item 14's decline was
+/// *conditional* on a dropping driver being found, one was, and the pre-check now
+/// consults this cell for `xon-xoff` exactly as it does for `rts-cts` — so an
+/// accept-then-drop reading here predicts a structural refusal at `load`/`add-node`
+/// rather than a late fault. This paragraph said the opposite until 2026-08-14
+/// ("**The daemon is unchanged** — plan §18 item 14's decline stands, no pre-check
+/// consults the cell, and no config is refused on it"), which is the same
+/// half-landing notes §3.101 records across `p15_soft_note`'s arms: the ranking
+/// above survives, but its old justification — that one finding had a shipped
+/// consequence and the other none — does not, because both now do.
+/// The other route by which the software pass moves the
 /// verdict is `baseline_restored`, which covers both flag words: a port left with
 /// `IXON` asserted is worse than any unanswered question.
 ///
@@ -10567,25 +10588,37 @@ mod tests {
     }
 
     /// **The software reading moves the verdict, ranked below the hardware one,
-    /// and moves nothing in the daemon** (plan §18 item 14, §15.59, §9).
+    /// and — since §15.61 — moves `load` as well** (plan §18 items 14 and 67, §15.59).
     ///
     /// The measured answer on the rig of record is that `ftdi_sio` **honours**
     /// `IXON|IXOFF` (`c_iflag` `0x5` → `0x1405`, a delta of exactly the two flags,
-    /// on both ports of the FT232R crossover, Linux 7.0.0-29) — so the interesting
-    /// arm, a driver that accepts and drops, is unreachable on this box and is
-    /// tested here as a pure fold instead of against whatever is plugged in.
+    /// on both ports of the FT232R crossover, Linux 7.0.0-29 —
+    /// `docs/doctor/linux-7.0-2026-08-13-8c00078-dirty-tier3.json`) — so the
+    /// interesting arm, a driver that accepts and drops, is unreachable on that box
+    /// and is tested here as a pure fold instead of against whatever is plugged in.
     ///
-    /// **The judgement half is the point of the guard, and it inverted at P16's
-    /// landing.** Between plan §18 item 14 and §15.59 this function asserted
+    /// **The judgement half is the point of the guard, and it has now inverted
+    /// twice.** Between plan §18 item 14 and §15.59 this function asserted
     /// `Supported` on a dropping software row, because P15's `question` named
     /// `CRTSCTS` alone and a verdict may only answer for the question its header
-    /// asks. The widened question is what changes it: `supported` over a silently
-    /// dropped `IXON|IXOFF` would now be answering `supported` to a question this
-    /// port answered no to. What did **not** change is asserted here too, because
-    /// that is the clause a future reader will doubt: §15.53's refusal still covers
-    /// `rts-cts` only, and item 14's decline still stands.
+    /// asks. The widened question changed that: `supported` over a silently dropped
+    /// `IXON|IXOFF` would be answering `supported` to a question this port answered
+    /// no to.
+    ///
+    /// **The second inversion is the one this test got wrong, and the way it got it
+    /// wrong is the lesson.** This guard used to assert the *stale* clause on
+    /// purpose — "§15.53's refusal still covers `rts-cts` only, and item 14's decline
+    /// still stands" — with a message explaining that a `degraded` reading as shipped
+    /// policy would be that decline reversed by implication. Sound reasoning, and it
+    /// became false the moment §15.61 paid the decline off. The commit that landed
+    /// §15.61 updated the daemon and the sibling `does_not_license` cell but not
+    /// these arms, and **this test is why nothing noticed**: it pinned the
+    /// pre-§15.61 answer, so a full green suite certified a report that contradicted
+    /// `load`. A guard that asserts a *decision* rather than a *mechanism* has to be
+    /// moved by the commit that changes the decision, or it stops being a guard and
+    /// becomes the thing holding the defect in place (AGENTS §9; notes §3.101).
     #[test]
-    fn p15s_software_finding_degrades_the_verdict_and_refuses_nothing() {
+    fn p15s_software_finding_degrades_the_verdict_and_refuses_the_dropping_port() {
         // A clean hardware fleet whose driver silently drops the software mode.
         let dropping = [FlowReadback {
             soft: Ok(soft_row(true, false)),
@@ -10604,20 +10637,35 @@ mod tests {
              finding reaches nobody: {c}"
         );
         assert!(
-            c.contains("faults at its own open") || c.contains("fault"),
-            "the consequence must say what such a node actually does — fault late, \
-             with the bare error the rts-cts refusal exists to prevent: {c}"
+            c.contains("REFUSED at `load`/`add-node`"),
+            "since §15.61 the consequence must say what actually happens to such a \
+             node — the config is refused before anything is created, exactly as an \
+             `rts-cts` one is. Saying it faults late describes the behaviour this \
+             refusal replaced: {c}"
         );
         assert!(
-            c.contains("not refused at `load`") || c.contains("refuses nothing"),
-            "the verdict must say the daemon is unchanged: item 14 declines the \
-             refusal, and a `degraded` that read as a shipped policy would be that \
-             decline reversed by implication: {c}"
+            !c.contains("no pre-check consults")
+                && !c.contains("item 14's decline stands")
+                && !c.contains("that refusal covers `rts-cts` only"),
+            "a clause claiming the daemon consults nothing survived §15.61. That is \
+             the exact defect this test was holding in place: the report would tell an \
+             operator nothing refuses their config while `load` refuses it — §7.1 \
+             clause 2's split, inside the artifact meant to prevent it: {c}"
+        );
+        assert!(
+            c.contains("flow_control = \"none\"") && !c.contains("(or `xon-xoff`)"),
+            "the dropped-software arm must carry the remedy §15.61 clause 3 left \
+             standing and not the one it retracted — `xon-xoff` is not a fallback on \
+             a port that just dropped it: {c}"
         );
 
         // **The ranking, both directions.** A fleet carrying both defects must lead
-        // with the `CRTSCTS` one, because that is the finding with a shipped
-        // consequence an operator acts on (§15.53's refusal at `load`).
+        // with the `CRTSCTS` one. The *reason* changed at §15.61 and the comment had
+        // to change with it: this used to be "the half with a refusal behind it",
+        // which stopped discriminating the moment both halves got one. The order is
+        // now a presentation choice held fixed so the headline of a two-defect report
+        // does not move under a reader — asserted because it is stable, not because
+        // one finding outranks the other.
         let both = [FlowReadback {
             soft: Ok(soft_row(true, false)),
             ..flow_row("/dev/cu.usbserial-A", true, false, true)
@@ -10626,8 +10674,16 @@ mod tests {
         assert!(matches!(s, Status::Degraded));
         assert!(
             c.starts_with("**1 named port(s) ACCEPTED a `CRTSCTS` request"),
-            "the hardware drop must lead over the software one — it is the half with \
-             a refusal behind it: {c}"
+            "the hardware drop must lead over the software one so a two-defect \
+             headline is stable: {c}"
+        );
+        // …and both refusals must be stated, which is the clause that would have
+        // caught §15.61's half-landing on a port carrying both defects at once.
+        assert!(
+            c.contains("REFUSED at `load`/`add-node`")
+                && c.contains("is REFUSED at `load`/`add-node`, before anything is created"),
+            "a port dropping BOTH modes must have both refusals stated — the operator \
+             needs to know that neither mode is a fallback from the other: {c}"
         );
 
         // An honest refusal: `tcsetattr` failed rather than reporting success over a
@@ -10662,11 +10718,33 @@ mod tests {
 
         // And the ordinary answer this rig gives, so the honoured arm is exercised
         // too and the three above are known to be distinguishable.
+        //
+        // **This is the arm that prints on the Linux rig of record, and the
+        // assertion under it is the one that let §15.61 half-land.** It required the
+        // string "no config is refused on it", justified as "the bound being that the
+        // daemon consults none of this (item 14's decline)" — so on the one box whose
+        // driver honours the mode, a green suite was certifying the sentence that
+        // contradicted `load`. It now requires the opposite, and the negative clause
+        // is what makes it a guard rather than a restatement.
         let (_, c) = p15_verdict(1, &[flow_row("/dev/ttyUSB0", true, true, true)], &[]);
         assert!(
-            c.contains("honoured it on read-back") && c.contains("no config is refused on it"),
-            "the honoured arm must state both the reading and its own bound — the \
-             bound being that the daemon consults none of this (item 14's decline): {c}"
+            c.contains("honoured it on read-back")
+                && c.contains("the daemon consults the same reading"),
+            "the honoured arm must state both the reading and what the product does \
+             with it — since §15.61 a `load` pre-check asks this port the same \
+             question: {c}"
+        );
+        assert!(
+            !c.contains("no pre-check consults it") && !c.contains("no config is refused on it"),
+            "the honoured arm still claims the daemon consults nothing. This is the \
+             assertion that held the defect in place — it fires on the ftdi_sio rig, \
+             which is the one box where this arm is what an operator reads: {c}"
+        );
+        assert!(
+            c.contains("is not refused"),
+            "a port that HONOURS the mode must be told it is cleared, not merely \
+             described — a refusal rule that fired on a honouring driver would refuse \
+             everything, and §15.61's bound rests on saying so: {c}"
         );
     }
 
