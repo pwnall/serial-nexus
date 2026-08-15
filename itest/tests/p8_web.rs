@@ -1320,7 +1320,11 @@ fn web_pre_auth_connections_are_capped_and_time_out() {
         .port_for("http", Duration::from_secs(10))
         .expect("web server never printed its bound http URL");
 
-    // Flood well past the cap with peers that connect and send nothing.
+    // Flood well past the cap with peers that connect and send nothing. The clock
+    // starts here because `HEAD_TIMEOUT` starts here, per peer: everything below has
+    // to finish while a *release* is still impossible, or an eviction and a 408 are
+    // the same observation.
+    let flood = Instant::now();
     let mut silent: Vec<TcpStream> = Vec::with_capacity(MAX_CONNECTIONS);
     for i in 0..MAX_CONNECTIONS {
         let s = TcpStream::connect(("127.0.0.1", port))
@@ -1335,20 +1339,71 @@ fn web_pre_auth_connections_are_capped_and_time_out() {
     // The newest peer — the last one we opened — is the one guaranteed to survive, so it
     // is the one held back for the deadline half below.
     let mut held = silent.pop().expect("the flood is not empty");
+    let need = MAX_CONNECTIONS - MAX_PRE_AUTH_CONNECTIONS;
+    //
+    // **The bound is a population; a FIN still in flight is not a peer being served.**
+    // `PreAuthPool::admit` decides the eviction synchronously in the accept loop but
+    // *delivers* it by waking the victim's task, so the close lands whenever that task
+    // is scheduled. Sampling each socket exactly once with a 20 ms deadline therefore
+    // asserted that every eviction had been scheduled and its FIN delivered within
+    // 20 ms of the flood — a property of the box, not of the server, and one that
+    // reddens by exactly one peer when the box is a little busier.
+    //
+    // Measured (this tree, load ~0.3): 2 of 10 whole-binary runs short by one once the
+    // harness's console gained §15.43's leash — one extra startup thread and a
+    // `select!` around the accept loop (plan §18 item 65(d)) — against **0 of 30** with
+    // that one argument removed, and 0 of 10 with the leash present and a wider sample
+    // window. Same product code in all three: the leash exposed the race rather than
+    // creating one, and widening the window is what stops the harness asserting the
+    // scheduler.
+    //
+    // Re-sampling to a deadline keeps the assertion exactly as strict — EOF is sticky,
+    // so a socket counted once stays counted, and a server that really does serve every
+    // peer still fails here, just later (proven by planting exactly that: `admit`'s
+    // eviction loop removed, this test red at 0 closed).
+    //
+    // **The budget is bounded well under `HEAD_TIMEOUT`, and that is the whole
+    // correctness of it.** The head deadline releases every silent peer at 5 s, so a
+    // sampling window that reached it would count *releases* as evictions and hold with
+    // no pre-auth cap at all. Measured, because this is not a hypothetical: the first
+    // draft of this loop used a 10 s budget and the `admit`-eviction plant went
+    // **green** — the same vacuous-gate tell AGENTS §3 names, introduced by the repair
+    // of a flake. The assertion below the loop is what keeps it honest.
+    const SAMPLING_BUDGET: Duration = Duration::from_millis(1_500);
+    let mut seen_closed = vec![false; silent.len()];
     let mut closed = 0usize;
-    for s in silent.iter_mut() {
-        let mut byte = [0u8; 1];
-        if matches!(s.read(&mut byte), Ok(0)) {
-            closed += 1;
+    let sampling = Instant::now();
+    while closed < need && sampling.elapsed() < SAMPLING_BUDGET {
+        for (i, s) in silent.iter_mut().enumerate() {
+            if seen_closed[i] {
+                continue;
+            }
+            let mut byte = [0u8; 1];
+            if matches!(s.read(&mut byte), Ok(0)) {
+                seen_closed[i] = true;
+                closed += 1;
+            }
         }
     }
+    // Every close counted above is an eviction and not a head-deadline release,
+    // because no peer can have been released yet. Asserted rather than reasoned: if a
+    // box is ever slow enough to break it, the count below stops meaning what it says
+    // and this must fail loudly instead of passing for the wrong reason.
+    assert!(
+        flood.elapsed() < HEAD_TIMEOUT,
+        "counting evictions took {:?}, past the {HEAD_TIMEOUT:?} head deadline — the \
+         closes below can no longer be told from 408 releases, and the population bound \
+         would hold on a server with no pre-auth cap at all",
+        flood.elapsed()
+    );
     let started = Instant::now();
     assert!(
-        closed >= MAX_CONNECTIONS - MAX_PRE_AUTH_CONNECTIONS,
+        closed >= need,
         "of {MAX_CONNECTIONS} silent peers at most {MAX_PRE_AUTH_CONNECTIONS} may sit at \
-         the token gate, so at least {} had to be closed — only {closed} were. Serving \
-         every peer that connects is the unbounded pre-auth path the review found",
-        MAX_CONNECTIONS - MAX_PRE_AUTH_CONNECTIONS
+         the token gate, so at least {need} had to be closed — only {closed} were, after \
+         {:?} of re-sampling. Serving every peer that connects is the unbounded pre-auth \
+         path the review found",
+        sampling.elapsed()
     );
 
     // Bounded in time: the head deadline releases even a peer that escaped eviction,

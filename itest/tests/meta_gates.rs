@@ -2061,3 +2061,424 @@ fn every_devprep_verb_answers_on_both_platform_arms() {
         vec!["Cycle".to_owned(), "Grant".to_owned()]
     );
 }
+
+// ---------------------------------------------------------------------------
+// The "one shared helper" rules, forbidden a second instance rather than merely
+// having their first one tested (plan §18 item 64(g)).
+//
+// §16.1's boundary supervisor, §16.4's purge, the one fragmenter (§15.27) and
+// §16.11's retired shell suite are each stated as "there is exactly one of these".
+// Every *instance* was covered — `boundary.rs`'s property tests, the three purge
+// instances' guards, `data_frames`' byte-exact fragmentation tests — and nothing
+// forbade a fourth hand-rolled one, which is the failure §16.1 was written after:
+// three of the five worst audit findings were the same lifecycle rules re-derived
+// by hand, per node.
+//
+// **What is gated here and what is not, said rather than implied.** Three of the
+// four rules have an enumerable spelling a second implementation cannot avoid:
+// a second framer must call `encode`, a second boundary must start a thread, a
+// returning shell suite must be a file. §16.4's purge has none — a hand-rolled
+// drain is a `try_recv` loop, and banning those in the daemon would redden on the
+// next legitimate control-channel drain rather than on a purge, which is a
+// nuisance gate rather than an invariant. It is left ungated deliberately and its
+// instances stay covered by their own guards (`runtime.rs`'s
+// `purge_to_quiescence_*` family, `serial.rs`'s and `leg.rs`'s per-instance
+// tests). Do not read the three gates below as covering it.
+// ---------------------------------------------------------------------------
+
+/// `src` with every `#[cfg(test)] mod … { … }` block **blanked** — every character
+/// inside replaced by a space, newlines kept — so line numbers survive the strip.
+///
+/// The gates below are about **product** code: a test that calls `encode` to build
+/// a fixture frame, or spawns a thread to bound a join, is not a second framer or a
+/// second boundary — `boundary.rs`'s own `within` helper is exactly that, and a
+/// scan that counted it would be red on arrival and deleted rather than fixed.
+/// Blanking rather than deleting is what lets the failure message name a line number
+/// the reader can open; a gate that names a line nobody can find is a gate nobody
+/// acts on.
+///
+/// Naive about braces inside string literals and about `#[cfg(test)]` on a
+/// non-module item; both make the stripper cut *less* than intended, which leaves
+/// more code under the ban rather than less. The direction matters: a stripper that
+/// over-cut would hide product code from every gate below.
+fn blank_test_modules(src: &str) -> String {
+    let mut out: Vec<char> = src.chars().collect();
+    let mut i = 0usize;
+    while let Some(at) = src[i..].find("#[cfg(test)]") {
+        let at = i + at;
+        let Some(open) = src[at..].find('{').map(|o| at + o) else {
+            break;
+        };
+        let mut depth = 0usize;
+        let mut end = src.len();
+        for (o, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + o + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Char indices, since `out` is a Vec<char>: this tree is ASCII in code and
+        // has non-ASCII in comments and strings, so byte offsets would misalign.
+        let start_c = src[..at].chars().count();
+        let end_c = src[..end].chars().count();
+        for c in out.iter_mut().take(end_c).skip(start_c) {
+            if *c != '\n' {
+                *c = ' ';
+            }
+        }
+        i = end;
+    }
+    out.into_iter().collect()
+}
+
+/// Every product-code line in `src` (test modules blanked, `//`-comments ignored)
+/// that **calls** `name` — the identifier as a whole word, immediately followed by
+/// `(` — as `(line number, line)`.
+///
+/// "Immediately followed by `(`" is what separates a call from a mention, and both
+/// near-misses are real lines in this tree: `use …::{Event, MAX_FRAME_SIZE, encode};`
+/// imports the fragmenter's encoder without calling it, and
+/// `format!("encode hello: {e}")` names it in an error message on a line whose
+/// *other* half is a call to something else entirely.
+fn code_call_sites(src: &str, name: &str) -> Vec<(usize, String)> {
+    let product = blank_test_modules(src);
+    let mut out = Vec::new();
+    for (n, line) in product.lines().enumerate() {
+        let code = line.split_once("//").map_or(line, |(head, _)| head);
+        if contains_word(code, &format!("{name}(")) {
+            out.push((n + 1, code.trim().to_owned()));
+        }
+    }
+    out
+}
+
+/// Every product-code line in `src` containing `needle` verbatim, as
+/// `(line number, line)`. For rules whose spelling is a path rather than a call —
+/// `thread::spawn(`, `thread::Builder` — where a whole-word match on the last
+/// segment would also match an unrelated `.spawn(` on a `Command`.
+fn code_lines_containing(src: &str, needle: &str) -> Vec<(usize, String)> {
+    let product = blank_test_modules(src);
+    let mut out = Vec::new();
+    for (n, line) in product.lines().enumerate() {
+        let code = line.split_once("//").map_or(line, |(head, _)| head);
+        if code.contains(needle) {
+            out.push((n + 1, code.trim().to_owned()));
+        }
+    }
+    out
+}
+
+/// **The one fragmenter has one call site** (§15.27, §5, invariant 3 — plan §18
+/// item 64(g)).
+///
+/// Invariant 3 says every targetward framer fragments oversize chunks through the
+/// one shared helper and never skips on an encode error. Both halves are tested at
+/// the helper — `data_frames_fragments_byte_exactly_with_no_residual` and its
+/// siblings in `runtime.rs` — and a *second* framer would satisfy neither while
+/// failing nothing, because those tests call `data_frames` by name.
+///
+/// The spelling a second framer cannot avoid is `serial_nexus_codec_api::encode`:
+/// the envelope is what makes a frame a frame, and hand-rolling the envelope too
+/// would be a §15.27 violation of a larger kind, caught by the codec conformance
+/// suite. So the daemon's product code may call `encode` in exactly one place, and
+/// this names it.
+#[test]
+fn the_daemon_builds_a_targetward_frame_in_exactly_one_place() {
+    // 0. The matcher, in the spellings it claims to cover and against the four
+    //    near-misses that must not trip it — every one of them a real line in this
+    //    tree, not an invented one.
+    assert_eq!(
+        code_call_sites("fn f() {\n    encode(&ev, &mut out)?;\n}", "encode").len(),
+        1,
+        "the scanner misses a bare `encode(` call"
+    );
+    for (what, near_miss) in [
+        (
+            "`base64_encode` read as the envelope encoder — a whole-word match is \
+             what separates them, and without it this gate would be permanently red \
+             and deleted rather than fixed",
+            "fn f() {\n    let s = serial_nexus_rpc::base64_encode(&b);\n}",
+        ),
+        (
+            "the import line read as a call site (`runtime.rs:50`)",
+            "use serial_nexus_codec_api::{Event, MAX_FRAME_SIZE, encode};\n",
+        ),
+        (
+            "the encoder named in an error message read as a call — the real line is \
+             `leg.rs`'s `encode_hello(…).map_err(|e| format!(\"encode hello: {e}\"))`, \
+             where a token match sees `encode` beside a `(` belonging to something else",
+            "fn f() {\n    encode_hello(&o, &mut f).map_err(|e| format!(\"encode hello: {e}\"))?;\n}",
+        ),
+        (
+            "a test fixture counted as a second framer",
+            "fn f() {}\n#[cfg(test)]\nmod tests {\n    fn t() { encode(&ev, &mut o); }\n}",
+        ),
+    ] {
+        assert!(
+            code_call_sites(near_miss, "encode").is_empty(),
+            "the scanner trips on {what}"
+        );
+    }
+
+    let root = repo_root();
+    let mut sites: Vec<String> = Vec::new();
+    let stats = walk_rs(&root.join("daemon/src"), &mut |path, src| {
+        for (n, line) in code_call_sites(src, "encode") {
+            sites.push(format!("{}:{n}: {line}", rel_path(&root, path)));
+        }
+    });
+    // The walker's own floor: `daemon/src` is tens of files, and a walk that reached
+    // none of them reports the same green as a compliant tree (37-TEST-1).
+    assert!(
+        stats.files >= 10,
+        "the walk over daemon/src reached {} .rs files — it stopped walking, and the \
+         comparison below is against nothing",
+        stats.files
+    );
+    assert!(
+        stats.unreadable.is_empty(),
+        "daemon/src has unreadable directories, so this scan is not complete: {:?}",
+        stats.unreadable
+    );
+
+    assert_eq!(
+        sites.len(),
+        1,
+        "the daemon's product code calls the envelope encoder in {} places. Invariant \
+         3 gives it one: `runtime.rs`'s `data_frames`, which fragments at \
+         `frame_payload_cap` and reports a residual rather than skipping on an encode \
+         error (§15.27). A second call site is a second framer, and the helper's own \
+         tests cannot see it — they call `data_frames` by name. If this is deliberate, \
+         it is a design amendment, not a patch:\n  {}",
+        sites.len(),
+        sites.join("\n  ")
+    );
+    assert!(
+        sites[0].starts_with("daemon/src/runtime.rs:"),
+        "the daemon's one envelope-encode call moved out of `runtime.rs`, where \
+         `data_frames` and its fragmentation tests live: {}",
+        sites[0]
+    );
+}
+
+/// **The boundary supervisor is the only thing that starts a thread** (§16.1 — plan
+/// §18 item 64(g)).
+///
+/// §16.1 exists because three of the five worst audit findings were instance-level
+/// violations of the same hand-rolled lifecycle rules — concurrent halves,
+/// park-don't-teardown, loss notification, join-then-transition — re-derived per
+/// node. One supervisor encodes them once and is property-tested once; serial, exec
+/// and leg are rebased onto it. Nothing forbade a fourth node from spawning its own
+/// pair, and a fourth would pass every test the supervisor has, because those tests
+/// drive the supervisor.
+///
+/// A hand-rolled boundary must start an OS thread, and the daemon's product code
+/// does that in exactly two places, both named here. The second is not a boundary
+/// and is why this gate is an allowlist rather than a count of one: `watch_stdin_eof`
+/// is the leash watcher — deliberately detached, no stop flag, no join, reclaimed by
+/// process exit — and its module doc argues that shape at length. Adding a third
+/// means either rebasing onto [`BlockingWorker`] or amending §16.1.
+#[test]
+fn the_daemon_starts_an_os_thread_only_in_the_supervisor_and_the_leash() {
+    // 0. The matcher, in both spellings an OS-thread start can take, and against the
+    //    three near-misses — all real lines in this tree.
+    const SPELLINGS: [&str; 2] = ["thread::spawn(", "thread::Builder"];
+    let scan = |src: &str| -> Vec<(usize, String)> {
+        let mut v: Vec<(usize, String)> = SPELLINGS
+            .iter()
+            .flat_map(|n| code_lines_containing(src, n))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    assert_eq!(
+        scan("fn f() { std::thread::spawn(move || {}); }").len(),
+        1,
+        "the scanner misses the bare `std::thread::spawn` spelling"
+    );
+    assert_eq!(
+        scan("fn f() { std::thread::Builder::new().name(n).spawn(body) }").len(),
+        1,
+        "the scanner misses the named-builder spelling, which is the one the \
+         supervisor uses and therefore the one a copy of it would use"
+    );
+    for (what, near_miss) in [
+        (
+            "a subprocess spawn (`exec.rs`'s `cmd.spawn()`) read as an OS thread",
+            "fn f() { let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => return }; }",
+        ),
+        (
+            "a thread named in an ERROR MESSAGE read as a thread start — the real \
+             lines are `pty.rs`'s and `log.rs`'s `format!(\"spawn pty writer thread: \
+             {e}\")`, which a token match on `spawn` plus `thread` reads as two \
+             hand-rolled boundaries",
+            "fn f() { Fault { reason: format!(\"spawn pty writer thread: {e}\") } }",
+        ),
+        (
+            "a test's helper thread counted as a second boundary — `boundary.rs`'s own \
+             bounded-join helper is exactly that, so this gate would be red on arrival",
+            "fn f() {}\n#[cfg(test)]\nmod tests {\n    fn t() { std::thread::spawn(|| {}); }\n}",
+        ),
+    ] {
+        assert!(scan(near_miss).is_empty(), "the scanner trips on {what}");
+    }
+
+    let root = repo_root();
+    // The two sanctioned starts, by file rather than by line: a line number rots on
+    // the next edit, and a gate that rots is a gate that gets relaxed.
+    const SANCTIONED: [&str; 2] = ["daemon/src/boundary.rs", "daemon/src/lib.rs"];
+    let mut sites: Vec<String> = Vec::new();
+    let stats = walk_rs(&root.join("daemon/src"), &mut |path, src| {
+        let rel = rel_path(&root, path);
+        for (n, line) in scan(src) {
+            sites.push(format!("{rel}:{n}: {line}"));
+        }
+    });
+    assert!(
+        stats.files >= 10,
+        "the walk over daemon/src reached {} .rs files — it stopped walking",
+        stats.files
+    );
+
+    let strays: Vec<&String> = sites
+        .iter()
+        .filter(|s| !SANCTIONED.iter().any(|ok| s.starts_with(&format!("{ok}:"))))
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "the daemon's product code starts an OS thread outside `boundary.rs`'s \
+         `spawn_named` and `lib.rs`'s stdin leash. §16.1 gives the tree one boundary \
+         supervisor precisely because the lifecycle rules — concurrent halves, \
+         park-don't-teardown, loss notification, join-then-transition — were being \
+         re-derived by hand per node, and a hand-rolled pair passes every test \
+         `BlockingWorker` has. Rebase onto `BlockingWorker::arm`/`arm_quiet`, or amend \
+         §16.1:\n  {}",
+        strays
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+    // ...and the allowlist must still be *reached*, or this gate passes because the
+    // scan found nothing at all rather than because it found the right things.
+    for ok in SANCTIONED {
+        assert!(
+            sites.iter().any(|s| s.starts_with(&format!("{ok}:"))),
+            "the scan found no OS-thread start in {ok} — either the supervisor's \
+             `spawn_named` moved, or the matcher stopped matching, and in both cases \
+             a stray somewhere else would now go unnoticed. Found: {sites:?}"
+        );
+    }
+}
+
+/// **The bash validation suite stays retired** (§16.11 — plan §18 item 64(g)).
+///
+/// §16.11 is EXECUTED: the shell suite folded into the harness, and `scripts/` holds
+/// only `bless` (§15.45). What held it retired was that nobody had written one back.
+/// The three surviving wrappers — the license gate, the external-consumer build, the
+/// wait helper — each live in the harness now, and each has a test that would keep
+/// passing beside a `.sh` that quietly did the same job again.
+///
+/// Two assertions, because "retired" has two halves: no `.sh` anywhere in the tree,
+/// and `scripts/` holding exactly what §16.11 says it holds. Both are the design's
+/// own words; a script that earns its place earns an amendment first.
+#[test]
+fn no_shell_script_has_come_back() {
+    let root = repo_root();
+
+    // 0. The walker, against a planted violation in a scratch tree — the half review
+    //    37 found missing, where the planted offender was always a string and never
+    //    a file.
+    let scratch = Scratch::new("shell");
+    scratch.write(
+        "scripts/validate/phase3/firehose.sh",
+        "#!/usr/bin/env bash\n",
+    );
+    scratch.write("scripts/bless", "#!/usr/bin/env bash\n");
+    let (planted, _) = shell_scripts_under(scratch.path());
+    assert_eq!(
+        planted,
+        vec!["scripts/validate/phase3/firehose.sh".to_owned()],
+        "the walker does not surface a `.sh` planted in a nested directory — which is \
+         where the retired suite lived, so a walker that only reads the top level \
+         proves nothing"
+    );
+
+    // 1. The tree, with the walker's own floor.
+    let (found, files) = shell_scripts_under(&root);
+    assert!(
+        files >= 100,
+        "the walk over the tree reached {files} files — it stopped walking, and a \
+         walker that stopped reports the same green as a clean tree (37-TEST-1)"
+    );
+    assert!(
+        found.is_empty(),
+        "shell scripts are back in the tree. §16.11 retired the bash validation suite \
+         into the harness, and plan §5 states the canonical form; a script here is a \
+         validation path CI does not run, cannot lint, and no meta-gate reads. If it \
+         earns its place, amend §16.11 first:\n  {}",
+        found.join("\n  ")
+    );
+
+    // 2. And `scripts/` holds exactly what §16.11 says it holds. A `.sh` is the
+    //    spelling the suite wore; an extensionless file with a `#!` line is the same
+    //    thing wearing `bless`'s clothes, and the sentence in §16.11 is what refuses
+    //    it without this gate having to guess at shebangs.
+    let mut entries: Vec<String> = std::fs::read_dir(root.join("scripts"))
+        .expect("scripts/ is readable")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec!["bless".to_owned()],
+        "§16.11 says `scripts/` holds only `bless` (§15.45's build + install + setcap). \
+         Anything else there is a validation or tooling path outside the harness — the \
+         state §16.11 ended — and belongs in the harness or in an amendment"
+    );
+}
+
+/// Every `.sh` file below `dir`, repo-relative, with the number of files walked.
+///
+/// Walks everything rather than only `.rs`, since the subject is a file that is not
+/// Rust; skips the same generated and vendored trees [`walk_rs`] does.
+fn shell_scripts_under(dir: &Path) -> (Vec<String>, usize) {
+    fn inner(root: &Path, dir: &Path, out: &mut Vec<String>, files: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if matches!(name.as_ref(), "target" | ".git" | "node_modules")
+                    || is_fuzz_scratch(&path)
+                    || is_nested_checkout(&path)
+                {
+                    continue;
+                }
+                inner(root, &path, out, files);
+            } else {
+                *files += 1;
+                if name.ends_with(".sh") {
+                    out.push(rel_path(root, &path));
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut files = 0usize;
+    inner(dir, dir, &mut out, &mut files);
+    out.sort();
+    (out, files)
+}

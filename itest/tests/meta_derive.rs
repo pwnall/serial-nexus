@@ -34,10 +34,17 @@
 //!   is kept — it fires only if the enumeration comes back — because the cheap way
 //!   for a copy to return is for someone to find the absence surprising.
 //!
-//!   **Two ungated enumerations remain, said rather than implied:**
+//!   **The two enumerations this gate declined are now held elsewhere.**
 //!   `expectations/{linux,macos}.jq` each carry a per-probe `.id == "PN"` clause, so
-//!   a probe with no clause is simply ungated there. That is a gate-coverage
-//!   question rather than a roster-drift one, and it is not this gate's.
+//!   a probe with no clause was simply ungated there. That is a gate-coverage
+//!   question rather than a roster-drift one, and it is still not this gate's — it
+//!   is `expectation_gates.rs`'s
+//!   `every_probe_the_doctor_emits_is_named_by_a_clause_in_both_expectation_files`,
+//!   which reads its roster from a live report rather than from this file's registry
+//!   because what a CI gate sees is a report (plan §18 item 64(d)). Measured before
+//!   it landed, with a seventeenth probe planted in `doctor/src/probes.rs`: the
+//!   doctor exited 0 and `jq -e -f expectations/linux.jq` exited 0, while the gate
+//!   below reddened — for the *documentation* roster, which is the half it owns.
 //! * **(c)** [`every_fuzz_target_file_is_registered_and_every_registration_has_a_file`]
 //!   — the `[[bin]]` table of `fuzz/Cargo.toml` against the sources under
 //!   `fuzz/fuzz_targets/`. This is the missing link under two claims already made

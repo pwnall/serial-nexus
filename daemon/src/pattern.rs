@@ -683,6 +683,77 @@ mod tests {
         );
     }
 
+    /// **The per-chunk scan COST is bounded by the lookback, not by the stream**
+    /// (plan §18 item 64(a); this module's doc, property 3).
+    ///
+    /// The guard above bounds the window's *semantics* — how far back a match may
+    /// reach — and that is a different property from this one. A window that trimmed
+    /// lazily (say, every hundredth chunk) would keep those semantics exactly and
+    /// multiply the work [`ScanWindow::scan`] does per chunk by a hundred, because
+    /// `scan` re-scans the **whole** window every time. At [`MAX_LOOKBACK`] on the
+    /// runtime thread that is the difference between a wait an operator may arm on a
+    /// busy console and one they may not, and nothing here was watching it: the
+    /// module doc has always said "`MAX_LOOKBACK` is a scan cost as well as an
+    /// allocation" and no test read the buffer's length.
+    ///
+    /// So this asserts the state that *determines* the next scan's cost, which is
+    /// deterministic and needs no clock: after every non-matching feed the retained
+    /// window is at most `lookback`, so the work per chunk is at most
+    /// `lookback + chunk` however long the stream runs. Timing it instead would make
+    /// the guard a property of the box (plan §18 item 61 measured this axis moving
+    /// 30x with load on one tree), and a timed ceiling wide enough not to flake is
+    /// wide enough to admit the regression.
+    ///
+    /// **The bound is asserted to be REACHED, not merely respected.** A `<=` over a
+    /// window that never fills holds for any bound at all — the vacuous shape this
+    /// item is about — so the worst observed length must equal the lookback exactly.
+    #[test]
+    fn the_retained_window_never_exceeds_the_lookback_so_per_chunk_work_is_bounded() {
+        // A max-lookback wait, the operator-reachable end of the one dimension that
+        // is a per-chunk cost, and a pattern that cannot appear in the fed bytes so
+        // every feed takes the trimming path.
+        let mut w = ScanWindow::new(
+            Matcher::compile(&[lit("never", b"NEVER-ON-THE-WIRE")]).unwrap(),
+            MAX_LOOKBACK,
+            DEFAULT_CONTEXT,
+            0,
+        );
+        // Chunks smaller than the window, which is the interesting shape: the window
+        // is then rebuilt from many feeds rather than replaced by one, and a lazy or
+        // deleted trim accumulates instead of staying flat.
+        let chunk = vec![b'.'; 4096];
+        let chunks = 512;
+        let mut worst = 0usize;
+        for i in 0..chunks {
+            assert!(
+                w.feed(&chunk, 0).is_none(),
+                "nothing may match at chunk {i}"
+            );
+            worst = worst.max(w.buf.len());
+            assert!(
+                w.buf.len() <= MAX_LOOKBACK,
+                "after {} fed bytes the retained window is {} B, past the {MAX_LOOKBACK} B \
+                 lookback. `ScanWindow::scan` re-scans the whole window per chunk, so this \
+                 is the per-chunk cost of every armed wait on the runtime thread growing \
+                 with the STREAM rather than with the operator's stated window (§10 \
+                 clause 4)",
+                (i + 1) * chunk.len(),
+                w.buf.len()
+            );
+        }
+        assert_eq!(
+            worst,
+            MAX_LOOKBACK,
+            "the window never reached its lookback across {} fed bytes, so the bound \
+             above held for a window that was never under pressure and would hold for \
+             any bound at all",
+            chunks * chunk.len()
+        );
+        // And the scan really did cover the stream, or the loop above trimmed a
+        // window nothing was ever fed into.
+        assert_eq!(w.scanned(), (chunks * chunk.len()) as u64);
+    }
+
     /// §10 clause 5: the ring is scanned as the ring, and a pattern wholly emitted
     /// before the wait began matches.
     #[test]

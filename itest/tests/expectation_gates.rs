@@ -1737,3 +1737,432 @@ fn the_kernel_diff_clauses_bite_on_a_probe_that_errored() {
         expectation.display()
     );
 }
+
+// ---------------------------------------------------------------------------
+// The clause-identity guards the audit found missing, and the plants that make
+// two of them mean something (plan §18 item 64(c)).
+//
+// Six clause pairs were byte-identical across the two files with nothing holding
+// them that way: P9's `zero_timeout_by_fd_state`, P10's `peer_pending`
+// cross-check, P10's recheck ladder, P12's anti-spin witness, and the two
+// provenance lines. Four of those carry a comment in one file or the other saying
+// "identical to `expectations/{other}.jq`'s clause, deliberately" — a claim about
+// the other file that nothing in the tree read.
+//
+// These guards spell `matches(...).count() == 1` rather than `contains`, which the
+// four older identity guards above use. `contains` cannot pass vacuously — the
+// needle is a whole clause and a missing one fails — but it is satisfied by a file
+// that carries the clause *twice*, which is what a merge of two edits to one gate
+// produces, and a duplicated clause is a second place to edit that nobody is
+// looking at. Exactly-once is the property the word "the clause" already meant.
+// ---------------------------------------------------------------------------
+
+/// One clause needle, required verbatim and exactly once in both expectation files.
+fn assert_clause_identical(what: &str, clause: &str) {
+    for name in ["expectations/linux.jq", "expectations/macos.jq"] {
+        let path = repo_root().join(name);
+        let text = std::fs::read_to_string(&path).expect("the expectation file is readable");
+        let n = text.matches(clause).count();
+        assert_eq!(
+            n, 1,
+            "{name} carries the {what} clause {n} times, not once — the behavioural \
+             proof in this file runs on one platform's gate and reaches the other only \
+             through this identity, and a duplicate is a second copy to edit that \
+             nobody reads"
+        );
+    }
+}
+
+/// The clause-identity guards for the four kernel-diff **content** clauses, for the
+/// reason the guards above give.
+///
+/// P9's and P10's ladder clause each say in their own comment that they are
+/// "identical to `expectations/{other}.jq`'s clause, deliberately", and give the
+/// reason: the defect each instruments was found on the kernel where the premise
+/// *fails*, so a clause that only ran where the premise holds could never catch it.
+/// That reasoning is what makes the identity load-bearing, and it was asserted by
+/// nothing. P10's `peer_pending` cross-check and P12's anti-spin witness are
+/// identical in fact without claiming to be — the same exposure, one comment short.
+#[test]
+fn both_expectation_files_carry_the_same_kernel_diff_content_clauses() {
+    let p9_mask = r#"and (all(.probes[]; . as $p | ($p.id != "P9") or ($p.status == "skipped") or
+      ($p.observations | any(.key == "zero_timeout_by_fd_state"
+         and (.value.hangup_delivered_to_a_mask_that_requested_nothing | type == "boolean")
+         and (.value.shape | type == "string")
+         and (.value.mask_role | type == "string")
+         and (.value.read_the_separation_from | type == "string")
+         and (.value.read_the_mask_spread_from | type == "string")
+         and (.value.order_control_says | type == "string")
+         and (.value.order_control_does_not_license | type == "string")))))"#;
+    let p10_peer = r#"and (all(.probes[]; . as $p | ($p.id != "P10") or ($p.status == "skipped") or
+      (["slave_to_master_targetward","master_to_slave_hostward"] | all(. as $d |
+         $p.observations | any(.key == $d
+            and (.value.peer_pending_input_trust | type == "string")
+            and (.value | has("peer_pending_input_bytes_at_drain"))
+            and (.value | has("writer_pending_input_bytes")))))))"#;
+    let p10_ladder = r#"and (all(.probes[]; . as $p | ($p.id != "P10") or ($p.status == "skipped") or
+      (["slave_to_master_targetward","master_to_slave_hostward"] | all(. as $d |
+         $p.observations | any(.key == $d
+            and ((.value.recheck.ladder | type == "array") and (.value.recheck.ladder | length >= 2))
+            and (.value.recheck.ladder_reading | has("rungs_carrying_a_bound"))
+            and (.value.recheck.ladder_reading | has("watermark_threshold_gt"))
+            and (.value.recheck.ladder_reading | has("watermark_threshold_le")))))))"#;
+    let p12_anti_spin = r#"and (all(.probes[]; . as $p | ($p.id != "P12") or
+      ((($p.observations | any(.key == "control_session_edge"))
+        or ($p.observations | any(.key == "idle_windows")))
+       and (($p.observations | any(.key == "idle_window_paced"
+              and (.value.elapsed_us | type == "number")
+              and (.value.passes | type == "number")))
+        or ($p.observations | any(.key == "idle_windows"))))))"#;
+    for (what, clause) in [
+        ("P9 mask-column", p9_mask),
+        ("P10 peer-pending cross-check", p10_peer),
+        ("P10 recheck-ladder", p10_ladder),
+        ("P12 anti-spin", p12_anti_spin),
+    ] {
+        assert_clause_identical(what, clause);
+    }
+}
+
+/// The clause-identity guard for the two **provenance** lines, for the reason the
+/// guards above give.
+///
+/// `field_set` has had one since it landed; `probe_set` and `commit` — the two the
+/// 2026-07-27 stale-binary run walked past, and the pair `field_set`'s own clause
+/// exists to complete — did not. They are one line each, which is exactly why they
+/// are the easiest to lose in an edit and the hardest to notice missing: nothing in
+/// a report's shape changes when a gate stops asking who built it.
+#[test]
+fn both_expectation_files_carry_the_same_provenance_clauses() {
+    for (what, clause) in [
+        (
+            "probe_set",
+            r#"and (.build.probe_set | type == "string" and length > 0)"#,
+        ),
+        (
+            "commit",
+            r#"and (.build.commit | type == "string" and length > 0)"#,
+        ),
+    ] {
+        assert_clause_identical(what, clause);
+    }
+}
+
+/// **P10's recheck must be a ladder, and the one-rung answer must be refused** —
+/// the plant the ladder clause has never been handed (plan §18 item 64(c)).
+///
+/// `macos.jq`'s comment on this clause names three spellings the gate "could not
+/// tell the difference" between before it landed: `recheck` deleted outright,
+/// `ladder` emptied, and **"handing back exactly the one rung the commit exists to
+/// replace"**. The first two are refused by any presence check; the third is the
+/// only one that tests the `length >= 2`, and it is the defect `f8315cc` was written
+/// against — a bracket computed from a single drain size, which cannot separate a
+/// capacity from any watermark above it. No plant in this file had ever produced it,
+/// so the cardinality half of the clause was carried by review.
+///
+/// The controls are the other half. The comment says "cardinality, not answer": a
+/// kernel is free to refuse every rung or none, so a ladder whose reading says every
+/// rung refused — with a watermark bound to show for it — must still be **accepted**.
+/// A clause that reddened on that would be this file asserting the kernel's answer.
+#[test]
+fn the_p10_ladder_clause_rejects_a_bracket_computed_from_one_point() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let expectation = platform_expectation();
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    // The honest passive report must PASS first, or every rejection below is
+    // attributable to some other clause.
+    assert!(
+        gate_accepts(&expectation, &report),
+        "{} rejected an honest passive report: {}",
+        expectation.display(),
+        jq_filter(r#".probes[] | select(.id=="P10") | .status"#, &report)
+    );
+    // ...and the rung count it passed with must be a real ladder, or the one-rung
+    // plant below is not a mutation of anything. This is the fixture's own floor.
+    let rungs = jq_filter(
+        r#"[.probes[] | select(.id=="P10") | .observations[].value.recheck.ladder | length] | min"#,
+        &report,
+    );
+    let rungs: usize = rungs.trim().parse().expect("the ladder has a length");
+    assert!(
+        rungs >= 2,
+        "this box's P10 reported a {rungs}-rung ladder and the gate accepted it — \
+         the clause under test is the one that forbids exactly that"
+    );
+
+    for (what, filter) in [
+        (
+            "a recheck deleted outright",
+            r#"(.probes[]|select(.id=="P10")|.observations[].value) |= del(.recheck)"#,
+        ),
+        (
+            "an emptied ladder",
+            r#"(.probes[]|select(.id=="P10")|.observations[].value.recheck.ladder) |= []"#,
+        ),
+        (
+            "a ONE-RUNG ladder — a bracket reported from a single drain size, which is \
+             the shape `f8315cc` replaced and the one nothing here had ever planted",
+            r#"(.probes[]|select(.id=="P10")|.observations[].value.recheck.ladder) |= [.[0]]"#,
+        ),
+        (
+            "a ladder whose reading lost the bound it brackets",
+            r#"(.probes[]|select(.id=="P10")|.observations[].value.recheck.ladder_reading) |= del(.watermark_threshold_le)"#,
+        ),
+        (
+            "a direction that lost its FIONREAD trust cell",
+            r#"(.probes[]|select(.id=="P10")|.observations[].value) |= del(.peer_pending_input_trust)"#,
+        ),
+    ] {
+        let planted = jq_filter(filter, &report);
+        assert!(
+            !gate_accepts(&expectation, &planted),
+            "{} admitted {what}",
+            expectation.display()
+        );
+    }
+
+    // The control: every rung refusing, with a watermark to show for it. This is a
+    // legitimate kernel reading — the opposite end of the answer space from the one
+    // this box happens to report — and the clause must be blind to it.
+    let every_rung_refused = jq_filter(
+        r#"(.probes[]|select(.id=="P10")|.observations[].value.recheck.ladder_reading) |=
+             (.rungs_refusing = (.rungs_carrying_a_bound) | .watermark_threshold_le = 8192)"#,
+        &report,
+    );
+    assert!(
+        gate_accepts(&expectation, &every_rung_refused),
+        "{} reddened on a ladder whose every rung refused — that is a kernel answer, \
+         and the clause gates cardinality rather than the answer (§7, plan §3 rule 14)",
+        expectation.display()
+    );
+}
+
+/// **P12's anti-spin zero must arrive with the window that sized it** — the clause
+/// the audit found with no plant behind it at all (plan §18 item 64(c)).
+///
+/// Six committed captures print `idle_edges_in_200_passes: 0` with no elapsed time
+/// and no control, and §9's rule is that a zero from a latch which cannot post an
+/// edge is not a measurement. The clause that fixed it is in both files and is the
+/// one conditional clause here with **no `skipped` exemption**, deliberately: the
+/// idle windows run on every box, so a P12 that skipped its *verdict* still owes its
+/// witnesses. That is a stronger promise than any neighbouring clause makes and it
+/// had no behavioural proof — this passive report's P12 is `skipped`, so the plants
+/// below are exercised through exactly that arm.
+///
+/// The control is the escape hatch the comment describes: a box where the windows
+/// could not run at all reports `idle_windows` — an error that names itself — and
+/// must be **accepted**, because the alternative is a gate that forces a probe to
+/// invent a measurement it could not take.
+#[test]
+fn the_p12_anti_spin_clause_rejects_a_zero_with_no_window() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let expectation = platform_expectation();
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    assert!(
+        gate_accepts(&expectation, &report),
+        "{} rejected an honest passive report: {}",
+        expectation.display(),
+        jq_filter(r#".probes[] | select(.id=="P12") | .status"#, &report)
+    );
+
+    for (what, filter) in [
+        (
+            "an anti-spin claim with no session-edge control and no self-named error",
+            r#"(.probes[]|select(.id=="P12")|.observations) |= map(select(.key != "control_session_edge"))"#,
+        ),
+        (
+            "a paced window deleted, leaving the claim unsized",
+            r#"(.probes[]|select(.id=="P12")|.observations) |= map(select(.key != "idle_window_paced"))"#,
+        ),
+        (
+            "a paced window that lost its wall clock — §15.49's zero over an unsized \
+             window, which is the reading this clause exists to refuse",
+            r#"(.probes[]|select(.id=="P12")|.observations[]|select(.key=="idle_window_paced")|.value) |= del(.elapsed_us)"#,
+        ),
+        (
+            "a paced window that cannot say how many passes it ran",
+            r#"(.probes[]|select(.id=="P12")|.observations[]|select(.key=="idle_window_paced")|.value) |= del(.passes)"#,
+        ),
+    ] {
+        let planted = jq_filter(filter, &report);
+        assert!(
+            !gate_accepts(&expectation, &planted),
+            "{} admitted {what}",
+            expectation.display()
+        );
+    }
+
+    // The control: the escape hatch. A box that could not run the windows says so in
+    // one observation, and that report must pass — §7's "a kernel that differs
+    // reports, it does not fail".
+    let could_not_run = jq_filter(
+        r#"(.probes[]|select(.id=="P12")|.observations) |=
+             (map(select(.key != "control_session_edge" and .key != "idle_window_paced"
+                         and .key != "idle_window_tight"))
+              + [{"key":"idle_windows","value":"posix_openpt: ENOENT: No such file or directory"}])"#,
+        &report,
+    );
+    assert!(
+        gate_accepts(&expectation, &could_not_run),
+        "{} reddened on a box that reported it could not run the idle windows — the \
+         `idle_windows` arm is the self-naming error §7 asks for, not a failure",
+        expectation.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Gate coverage: every probe the shipped doctor emits is named by a clause in
+// both expectation files (plan §18 item 64(d)).
+//
+// `itest/tests/meta_derive.rs` named this hole itself and declined it as out of
+// scope — "a probe with no clause is simply ungated there. That is a
+// gate-coverage question rather than a roster-drift one, and it is not this
+// gate's". It was right about the ownership and the hole outlived the sentence:
+// a probe added to `doctor/src/probes.rs` today lands in every report, is
+// documented by (b)'s roster gates, and is asserted by neither expectation file
+// on either platform. P16 is the worked example — it arrived with clauses in both
+// files because §15.59's author wrote them, not because anything would have
+// noticed their absence.
+// ---------------------------------------------------------------------------
+
+/// Does `text` name `id` in a **presence** clause over the probe roster?
+///
+/// The needle is deliberately the whole `any(.probes[]; .id == "PN"` head rather
+/// than a bare `.id == "PN"`, and the difference is the difference between a gate
+/// and a decoration. `all(.probes[]; . as $p | ($p.id != "PN") or …)` — the shape
+/// every *content* clause in these files takes — is vacuously true when the probe
+/// is absent from the report entirely, so a file carrying only that has no clause
+/// which can notice the probe going missing. `any(…)` over the roster is the form
+/// that can.
+///
+/// The closing quote is load-bearing: without it the needle for P1 is a prefix of
+/// the clause for P16, and this gate would report P1 covered by a file that never
+/// mentions it — the substring collapse AGENTS §3 records as the hardest register
+/// of the vacuous-gate tell to see, because the comment above it reads correctly.
+fn names_probe_in_a_presence_clause(text: &str, id: &str) -> bool {
+    text.contains(&format!(r#"any(.probes[]; .id == "{id}""#))
+}
+
+/// **Every probe the shipped doctor emits carries a presence clause in both
+/// expectation files** (plan §18 item 64(d)).
+///
+/// The roster is the **binary's**, read out of a live `--json` run rather than out
+/// of `doctor/src/probes.rs`'s source or a documented table: this is a question
+/// about what the CI gate sees, and what it sees is a report. A probe that
+/// `probes.rs` registers but never emits is `meta_derive`'s problem; a probe that
+/// arrives in the report with no clause is this one's.
+///
+/// *Stated residual, so nobody reads more into a green run than it holds:* this
+/// asserts that each probe is **named** by a presence clause, not that the clause
+/// demands anything worth demanding. `any(.probes[]; .id == "P9")` with no status
+/// term would satisfy it — that is P15's spelling in `linux.jq` today, deliberately,
+/// because its content clauses carry the weight. What the gate closes is the state
+/// where a probe is named by *nothing*, which is the one state in which both lanes
+/// are silent about it.
+#[test]
+fn every_probe_the_doctor_emits_is_named_by_a_clause_in_both_expectation_files() {
+    // 0. The matcher, against the near-misses that must not satisfy it. Both are
+    //    real spellings from these files, not invented ones.
+    assert!(
+        names_probe_in_a_presence_clause(
+            r#"and (any(.probes[]; .id == "P9" and (.status == "supported")))"#,
+            "P9"
+        ),
+        "the matcher misses the presence clause every probe in these files is \
+         written with"
+    );
+    assert!(
+        !names_probe_in_a_presence_clause(
+            r#"and (all(.probes[]; . as $p | ($p.id != "P9") or ($p.status == "skipped")))"#,
+            "P9"
+        ),
+        "the matcher counts a CONTENT clause as coverage — that clause is vacuously \
+         true for a probe that is not in the report at all, which is exactly the \
+         disappearance this gate exists to notice"
+    );
+    assert!(
+        !names_probe_in_a_presence_clause(r#"and (any(.probes[]; .id == "P16"))"#, "P1"),
+        "the matcher reads P16's clause as P1's — the substring collapse AGENTS §3 \
+         names, and with sixteen probes it would report a file that never mentions \
+         P1 as covering it"
+    );
+
+    // 1. The roster, from the shipped binary.
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("the report is JSON");
+    let roster: std::collections::BTreeSet<String> = report["probes"]
+        .as_array()
+        .expect("the report carries a probe array")
+        .iter()
+        .filter_map(|p| p["id"].as_str().map(str::to_owned))
+        .collect();
+
+    // ...and its own non-vacuity. A gate that compared an empty roster against two
+    // files would pass forever (`meta_derive`'s floor rule, and the same silent
+    // disarm as a scanner whose walker stopped walking). `>= 15` is the count
+    // `expectations/macos.jq`'s own structural clause already demands of a report,
+    // so it is not a second hand-kept number: if it ever reddens, that clause has
+    // reddened first.
+    assert!(
+        roster.len() >= 15,
+        "the doctor emitted {} probes — the report was reshaped and the comparison \
+         below is now against almost nothing: {roster:?}",
+        roster.len()
+    );
+    let highest = roster
+        .iter()
+        .filter_map(|id| id.strip_prefix('P').and_then(|n| n.parse::<u32>().ok()))
+        .max()
+        .expect("every emitted probe id is P followed by a number");
+    let contiguous: std::collections::BTreeSet<String> =
+        (1..=highest).map(|n| format!("P{n}")).collect();
+    assert_eq!(
+        roster, contiguous,
+        "the emitted probe ids are not P1..P{highest} — the id scanner and the \
+         roster disagree about what a probe id is, and every lookup below is then \
+         asking the wrong question"
+    );
+
+    // 2. The comparison, against both files from whichever box runs this. The
+    //    per-platform file is not enough: a probe added with a clause in the
+    //    author's own lane and none in the other is precisely the drift the
+    //    identity guards above exist for, one step earlier.
+    let mut missing: Vec<String> = Vec::new();
+    for name in ["expectations/linux.jq", "expectations/macos.jq"] {
+        let text = std::fs::read_to_string(repo_root().join(name))
+            .expect("the expectation file is readable");
+        for id in &roster {
+            if !names_probe_in_a_presence_clause(&text, id) {
+                missing.push(format!("{name} has no presence clause for {id}"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "the doctor emits probes that no expectation file gates, so neither CI lane \
+         asserts anything at all about them — §13 makes a probe's verdict the \
+         citation key for every kernel claim in the tree, and an ungated probe can \
+         report `skipped` forever without a lane noticing:\n  {}",
+        missing.join("\n  ")
+    );
+}

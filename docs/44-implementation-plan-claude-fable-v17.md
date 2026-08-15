@@ -2686,7 +2686,28 @@ transcripts, the pattern-wait maxima). What follows is the residue.
     node `state` builders, require each in `docs/rpc/*.md` or a named exemption, floors on both
     sides.
 
-64. **Second-tier audit residue** — **(b), (f) and (h) EXECUTED 2026-08-15** (notes §3.106);
+64. **Second-tier audit residue** — **(b), (c), (d), (e), (f), (g) and (h) EXECUTED**; **(a) PARTLY,
+    with its filed remedy REFUTED** (notes §3.106, §3.109).
+    *(a) The remedy is refuted, not deferred.* The filed test — a max-lookback `tap.wait` over the
+    firehose graph, armed and unarmed rungs — was **built and measured**, then removed: six runs on
+    20 cores, 64 MiB per rung, unloaded, read a wall ratio of 0.86 / 0.96 / 0.97 / 0.98 / 0.99 / 1.13
+    with `bytes_scanned` 67108864 of 67108864 and `gaps: 0` in **all six**. There is no active-path
+    cost to guard at that altitude, so the guard landed on the **mechanism** instead — the retained
+    window never exceeds the lookback, so per-chunk work is bounded — with both halves plant-proven
+    (a lazy trim, and an over-aggressive trim reddening the `worst == MAX_LOOKBACK` half).
+    **(a) is only partly executed and this entry says so rather than letting the guard imply
+    coverage:** the item names three cost surfaces and the guard covers two. The **`waits` list is
+    iterated per chunk and uncapped** (`tap.rs:644`'s `retain_mut`, `tap.rs:744`'s `push`) — neither
+    measured nor mentioned by the work, and verified still unguarded.
+    *(c)* jq clause-identity, two identity guards plus two behavioural, `matches().count() == 1`
+    rather than `contains`. *(d)* every probe the doctor emits is named by a clause in **both**
+    expectation files, the roster read from a live `--json` run rather than from `probes.rs` —
+    fail-first by planting a seventeenth probe and rebuilding, which the reviewer reproduced with a
+    cloned `P17`. *(e)* `AppError::ALL` is no longer hand-kept; both rosters read from the file's own
+    source, set-equal in both directions, plus the previously undocumented "in code order" property.
+    *(g)* three of the four "one shared helper" rules gated; **§16.4's purge is deliberately not
+    gated and that is a new decline**, recorded in the gate block's own comment rather than left as
+    a silent gap. The superseded filing follows. *Original:* **(b), (f) and (h) EXECUTED 2026-08-15** (notes §3.106);
     **(a), (c), (d), (e), (g) remain open** (S each; independent clauses). *(b)'s filed remedy would
     have asserted nothing* — confirmed structurally: `fan_out` charges `unattached` only when
     `!out.live`, and `Echo::start` attaches a `console` pty, so `discarded_unattached` is 0 at that
@@ -2739,7 +2760,30 @@ transcripts, the pattern-wait maxima). What follows is the residue.
     hand-rolled one; §16.11 has nothing stopping a `.sh` reappearing under `scripts/validate/`.
 
 65. **The exec-child orphan class: one instance fixed, one live, one surface uncovered** —
-    **PARTLY EXECUTED 2026-08-13** (notes §3.91). Found by item 50's agent as **260 accumulated
+    **(a) and (b) EXECUTED 2026-08-13** (notes §3.91); **(c), (d) and (e) EXECUTED 2026-08-15**,
+    **(f) CLOSED AS A DECLINE with its alternative measured** (notes §3.109), which closes the item.
+    *(c) the `deaf.py` orphan is fixed — and the filed claim about it was wrong in a way worth
+    keeping.* "Now guarded: any test that loads it and lets the `Daemon` drop reddens" was true of
+    the sweep's *mechanism* and had **zero instances**: `deaf.py`'s only pre-existing caller
+    (`p13_teardown_accounting.rs:668`) calls `remove_node("mux", true)` before the drop, so the
+    sweep's precondition was never met. **That is AGENTS §3's tell one level up — a guard whose
+    precondition nothing exercises** — and it is why the class guard was written rather than assumed.
+    *(d)* the web console gains `--exit-on-stdin-eof`, off by default, with the harness holding the
+    pipe. *(e)* the sim's refusal of the leash for the one mode that reads stdin is now tested,
+    pinning the *message* rather than the exit code, since `2` is also clap's usage error.
+    *(f) declined, and the measurement is what decided it, not the latency.* A graceful-first policy
+    was costed at ~284 call sites; the disqualifying fact is **detection**, not cost — with a 2 s
+    graceful wait a daemon holding the *unfixed* deaf child drops **green**, so the policy would have
+    hidden the very class this item exists for.
+    **The work found a flake it had itself introduced**, which is recorded rather than quietly
+    fixed: (d)'s harness leash shifted scheduling enough to expose an existing 20 ms FIN-delivery
+    race in `p8_web::web_pre_auth_connections_are_capped_and_time_out` — 2 of 10 whole-binary runs
+    with the leash, **0 of 30** with only that flag removed. `PreAuthPool::admit` decides eviction
+    synchronously and *delivers* it by waking the victim's task, so a single 20 ms sample was
+    asserting FIN delivery within 20 ms. **Its first repair was itself vacuous and only a plant
+    caught it:** a 10 s re-sampling budget let the 5 s `HEAD_TIMEOUT` supply the closes, and removing
+    `admit`'s eviction loop entirely left the test green. The shipped repair bounds the window under
+    that deadline and asserts the separation. Found by item 50's agent as **260 accumulated
     orphans** on the development box, from code that had landed the same day with a green suite.
     *(a) EXECUTED — the transcript child.* Root cause confirmed by `strace` on a live specimen and
     it is not what anyone guessed: **`std::io::Stdin` is a plain, non-reentrant `Mutex`** — only
@@ -3294,6 +3338,25 @@ number, because the next review cannot check that an unnumbered defect was fixed
     `ls -l` and the resolving udev rule, and move the README row from `measured (partially)` to
     `measured` with its scope named. Reported-never-judged where no such device is attached — this
     must **not** become a fifth `required` spelling, since a box without the device is not a fault.
+
+### Item 79 — filed by the final code batch (2026-08-15)
+
+79. **A third verbatim copy of the stdin-EOF leash watch** — **open** (S). *Evidence:*
+    `web/src/main.rs::watch_stdin_eof` is byte-for-byte `daemon/src/lib.rs:493-519` — same loop, same
+    `Interrupted` / `Err(_) => break` arms, same `"stdin-eof-watch"` thread name, the same
+    `_idle_tx`/`idle_rx` "one code path rather than a conditional arm" idiom, and the same
+    `tracing::info!` string. The sim carries a third variant. This is the §7.1-clause-2 shape items 56
+    and 73 track, one mechanism over.
+    **This binary has the named precedent, and it points at deletion rather than correction:** web's
+    second copy of the socket-path policy was *deleted*, not fixed — "the only repair that keeps
+    'exactly one implementation' true" (`daemon/src/lib.rs:350-354`, item 51, notes §3.75).
+    *Route:* `serial-nexus-web` does not depend on the daemon crate, but it does depend on
+    `serial_nexus_rpc`, which is exactly where item 51 put the shared thin client — so the shared
+    home already exists and is already precedented.
+    *Filed rather than fixed* because it arrived inside a batch that had just been repaired for
+    writing vacuous guards, and a third copy is a hazard, not a defect: no behaviour is wrong today.
+    *Validation:* one implementation, both callers on it, proven by a single planted defect reddening
+    a guard on each side — the shape item 59(d)'s hoist used.
 
 ### Evaluated and deliberately not scheduled — the closing register
 

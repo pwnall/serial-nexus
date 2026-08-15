@@ -111,12 +111,12 @@ fn main() {
             // Markdown twin, which is what a support request contains — so say
             // that, and say what to do, rather than leaving a serde error to be
             // interpreted (§6). Three Markdown-only field visits are on record.
-            // Matched on the H1's *shape* rather than on the tool's name: the
-            // 0.2.0-era captures in `docs/doctor/` carry a since-retired name in
-            // that heading, and §15.40's meta-gate correctly refuses to let this
-            // file spell it.
-            let first_line = text.trim_start().lines().next().unwrap_or_default();
-            if first_line.starts_with("# ") && first_line.ends_with("doctor report") {
+            // The recognizer lives in `report.rs` beside the renderer whose H1 it
+            // has to track — it matches the heading's *shape*, not the tool's name
+            // (§15.40) — and is tied to that renderer's actual output by
+            // `the_field_set_matcher_recognizes_the_markdown_this_renderer_emits`.
+            // Inline here, the two strings drifted apart with every gate green.
+            if report::looks_like_markdown_twin(&text) {
                 eprintln!(
                     "{}: this is the Markdown rendering, and the field set cannot be \
                      recomputed from it — it carries no `.probes[].observations` array. \

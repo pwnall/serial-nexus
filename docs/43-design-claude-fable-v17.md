@@ -4356,7 +4356,7 @@ eight distinct JSON values were demonstrated to render byte-identically — `2`/
    rather than asserted: the Markdown is a pure function of the JSON model minus one field
    (`generated_unix_ms`), validated at 228 of 228 passive lines and 290 of 291 Tier-3 lines; the
    reverse fails at 0 of 1064 Tier-3 scalar leaves, none of which carries its JSON kind, against
-   an `expectations/*.jq` gate with 22 `type ==` clauses. Making the *view* injective would not
+   an `expectations/*.jq` gate with 22 `type ==` clauses **at `bc75857`, and 51 in each of `expectations/{linux,macos}.jq` at `eba5548`** — taken there by `9237cfc`, re-measured 2026-08-15 (notes §3.109). **The figure moved and its direction strengthens the decline rather than weakening it:** more of the gate's assertions turn on the JSON's kinds, so the case that the JSON is the artifact of record and the Markdown a view is stronger now than when the entry was written. Making the *view* injective would not
    make it the artifact — the kinds are still gone — so the escape buys a property nothing needs
    and does not buy the one thing that would matter.
 2. **The cost lands on immutable evidence.** §16.13 freezes every committed `docs/doctor/`

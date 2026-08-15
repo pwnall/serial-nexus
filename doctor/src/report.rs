@@ -508,6 +508,32 @@ fn field_set_fingerprint(probes: &[Probe]) -> String {
     }))
 }
 
+/// Does this text look like the Markdown twin of a doctor report?
+///
+/// `--field-set` asks before it reports a bare serde error, because the
+/// overwhelmingly common way to hand it a file that is not JSON is to hand it the
+/// Markdown a support request contains — three Markdown-only field visits are on
+/// record (notes §3.74). Answering `true` buys the operator the cause and both
+/// remedies where `expected value at line 1 column 1` buys neither.
+///
+/// **Matched on the H1's shape, never on the tool's name.** The 0.2.0-era captures
+/// in `docs/doctor/` carry a since-retired name in that heading, and §15.40's
+/// meta-gate correctly refuses to let this file spell it, so the matcher tests the
+/// part of the heading that outlived the rename.
+///
+/// **It lives beside [`Report::to_markdown`] because it is the only thing in the
+/// tree that has to track that renderer's H1**, and nothing else would notice if it
+/// stopped. §15.57 declines to make the Markdown parseable and rests the whole
+/// obligation the decline carries — that nothing quietly parses the rendering — on
+/// this one message; an H1 that drifts out from under the matcher restores the bare
+/// serde error with *the same exit code, an error still printed, and every gate
+/// green* (AGENTS §3's tell). `the_field_set_matcher_recognizes_the_markdown_this_renderer_emits`
+/// is the tie, and it was fail-first proven against a drifted H1.
+pub fn looks_like_markdown_twin(text: &str) -> bool {
+    let first_line = text.trim_start().lines().next().unwrap_or_default();
+    first_line.starts_with("# ") && first_line.ends_with("doctor report")
+}
+
 /// [`field_set_fingerprint`] over an already-captured report, so the frozen
 /// artifacts in `docs/doctor/` can be indexed without being edited (§16.13).
 ///
@@ -964,6 +990,163 @@ mod tests {
         let undated = Report::new(None, vec![], vec![probe("P1", "t", "q")]);
         assert!(undated.to_markdown().contains("| generated | unknown |"));
         assert!(!undated.to_markdown().contains("1970-01-01"));
+    }
+
+    /// **§15.57's discharge, tied to the document it discharges against.**
+    ///
+    /// The design declines to escape the Markdown value grammar and rests the
+    /// obligation the decline carries — that nothing quietly parses the rendering —
+    /// on one operator-facing message: `--field-set`, handed the Markdown twin,
+    /// names the cause and both remedies instead of answering with serde's
+    /// `expected value at line 1 column 1`. That message is reached only through
+    /// [`looks_like_markdown_twin`], which matches this renderer's H1 — and the two
+    /// strings lived in different files with nothing between them.
+    ///
+    /// **Fail-first, measured rather than argued.** Rendering
+    /// `# serial-nexus-doctor capability report` instead — a drift of exactly the
+    /// kind the 0.2.0→0.3.0 rename already performed once — left all 92 doctor
+    /// tests passing, and the shape test above passes too because it asserts the
+    /// `## ` section headings and never the H1. The operator-visible result was the
+    /// bare serde error, at *the same exit code 2 with an error still printed*, so
+    /// nothing anywhere went red: AGENTS §3's tell in its "a discharge with no gate
+    /// under it" register. With this test present the same plant reddens here.
+    #[test]
+    fn the_field_set_matcher_recognizes_the_markdown_this_renderer_emits() {
+        let r = Report::new(Some(1_785_260_059_000), vec![], vec![probe("P1", "t", "q")]);
+        let md = r.to_markdown();
+        assert!(
+            looks_like_markdown_twin(&md),
+            "`--field-set` would answer this renderer's own output with a bare serde \
+             error, which is §15.57's discharge silently undone. First line: {:?}",
+            md.lines().next().unwrap_or_default()
+        );
+
+        // The negative controls, because a matcher that answered `true` for
+        // everything would satisfy the assertion above while diverting the JSON
+        // twin — the one form `--field-set` exists to read — into the "this is the
+        // Markdown" arm and exit 2 on a file it can digest perfectly.
+        assert!(
+            !looks_like_markdown_twin(&r.to_json()),
+            "the JSON twin was taken for the Markdown one"
+        );
+        assert!(
+            !looks_like_markdown_twin(""),
+            "an empty file is not a report"
+        );
+        assert!(
+            !looks_like_markdown_twin("# Captured reports\n\n| a | b |\n"),
+            "any Markdown at all was taken for a rendered report"
+        );
+    }
+
+    /// The matcher's *other* spelling, proven rather than claimed (AGENTS §3: a
+    /// scanning gate proves its matcher as well as its walker).
+    ///
+    /// [`looks_like_markdown_twin`] tests the H1's shape rather than the tool's
+    /// name precisely because the frozen corpus (§16.13) contains twins rendered
+    /// before the rename, whose heading carries a name §15.40 forbids this file
+    /// from spelling. The committed artifacts are the only evidence that the shape
+    /// actually spans both eras; asserting it on a string literal here would assert
+    /// it on a name nobody's report carries.
+    ///
+    /// **So the corpus's own composition is asserted, not assumed** — and it had to
+    /// be. Until that landed this test checked the walk (`recognized >= 2`) and the
+    /// matcher, and *nothing* checked that any twin was pre-rename, while the
+    /// paragraph above rested the whole design on the corpus spanning both eras.
+    /// Fail-first, executed: rewriting the retired-name H1 in a copy of the corpus
+    /// to the **current** spelling left this file at 94 passed, 0 failed — and with
+    /// that corpus even narrowing [`looks_like_markdown_twin`] to an equality test
+    /// against this renderer's H1 passed, the exact drift the whole tie exists to
+    /// catch, while the shipped binary still answered the real pre-rename twin with
+    /// `not JSON: expected value at line 1 column 1` and exit 2. AGENTS §3's tell,
+    /// once more: a corpus-driven gate is only as good as its corpus, and a corpus
+    /// is walked evidence rather than asserted evidence until someone asserts it.
+    ///
+    /// The two era assertions are written against
+    /// [`Report::to_markdown`]'s *own* first line rather than any literal, which is
+    /// what keeps them gate-legal (§15.40) and what makes "differs" mean "is not
+    /// what this renderer emits today" rather than "is not this hard-coded string".
+    #[test]
+    fn every_committed_markdown_twin_is_recognized_including_the_pre_rename_ones() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("doctor/ sits under the repository root")
+            .join("docs/doctor");
+        // Taken from the renderer, never written down: the string every *current*
+        // twin's H1 equals and every pre-rename one must not.
+        let current_h1 = Report::new(Some(1_785_260_059_000), vec![], vec![probe("P1", "t", "q")])
+            .to_markdown()
+            .lines()
+            .next()
+            .expect("the rendering has a first line")
+            .to_owned();
+        let mut from_before_the_rename: Vec<String> = Vec::new();
+        let mut from_this_era: Vec<String> = Vec::new();
+        let mut recognized = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("docs/doctor is readable") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            let text = std::fs::read_to_string(&path).expect("a readable capture");
+            if name == "README.md" {
+                // The index of the corpus, not a rendering of a report — and the
+                // walk's negative control: a matcher that said yes to any Markdown
+                // would pass every assertion below while telling an operator
+                // holding the index that they are holding a report.
+                assert!(
+                    !looks_like_markdown_twin(&text),
+                    "the corpus index was taken for a rendered report"
+                );
+                continue;
+            }
+            assert!(
+                looks_like_markdown_twin(&text),
+                "{name} is a committed Markdown twin that `--field-set` no longer \
+                 recognizes, so an operator holding it gets a bare serde error"
+            );
+            recognized += 1;
+            if text.trim_start().lines().next().unwrap_or_default() == current_h1 {
+                from_this_era.push(name);
+            } else {
+                from_before_the_rename.push(name);
+            }
+        }
+        // The walker, not only the matcher: a glob that matched nothing would pass
+        // the loop above in silence. Two is the floor because the corpus carries
+        // one twin from each side of the rename, which is what this test is for.
+        assert!(
+            recognized >= 2,
+            "only {recognized} committed Markdown twin(s) found under {} — the walk \
+             has stopped seeing the corpus it claims to check",
+            dir.display()
+        );
+        // **The corpus, not only the walk.** Both assertions are the test's name
+        // made checkable: without the first, every twin could carry today's H1 and
+        // the loop above would prove only that the matcher recognizes the string
+        // this very process just rendered; without the second, the corpus could
+        // have drifted entirely into history and stop covering the era operators
+        // are actually in.
+        assert!(
+            !from_before_the_rename.is_empty(),
+            "no committed twin under {} has an H1 differing from this renderer's \
+             ({current_h1:?}), so \"including the pre-rename ones\" is checking \
+             nothing and `looks_like_markdown_twin` could be narrowed to an equality \
+             test with every gate green. Twins seen: {from_this_era:?}",
+            dir.display()
+        );
+        assert!(
+            !from_this_era.is_empty(),
+            "no committed twin under {} carries this renderer's own H1 \
+             ({current_h1:?}) — the corpus no longer covers the era `--field-set` is \
+             handed reports from. Twins seen: {from_before_the_rename:?}",
+            dir.display()
+        );
     }
 
     /// **The Markdown document's SHAPE, not a substring of it** (notes §3.74).

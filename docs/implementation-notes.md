@@ -12766,3 +12766,72 @@ where a `by-path:` identity can never resolve. Also filed: `Resolver::bypath_of`
 `usbv2-`), so two captures of one adapter can mint two different identity strings with nothing
 choosing between them — §12 clause 9 already sorts *enumeration* output for exactly this reason, and
 capture is the same class. The test sidesteps it by choosing its identity sorted and saying so.
+
+### 3.109 A batch against vacuous guards wrote three more, and one flake it caused itself
+
+Plan §18 items 64(a)(c)(d)(e)(g) and 65(c)(d)(e)(f), plus a gate the item-27 decline had always
+owed. Three groups with an independent adversarial reviewer each, the shape §3.106 established —
+and the reviewers again found defects of the class the batch was written to remove. **That is now
+two consecutive batches on this subject in which the reviewers, not the authors, found the vacuity.
+The lesson is not that the authors were careless; it is that a guard's own author is the worst
+reader of whether it can fail.**
+
+**The blocking one was in the gate that discharged item 27's decline.** §15.57 declined a Markdown
+escape and carried an obligation — that nothing quietly parses the rendering — which had never been
+gated. The new gate walks the committed twins and asserts the matcher, and its doc comment claimed
+the corpus "is the only evidence that the shape actually spans both eras". It asserted no such
+thing: with every twin's H1 rewritten to the *current* name the file read **94 · 0**, and on that
+single-era corpus the equality-narrowing drift the tie exists to catch passed too. It now derives
+`Report::to_markdown`'s own first line at runtime, partitions the twins into *differs* and *equals*,
+and requires **both sets non-empty** — the reviewer asked for the first half, the author added its
+converse. The frozen corpus was never touched: the plants ran against scratch copies and
+`git status docs/doctor` is clean, which §16.13 requires.
+
+**An absence asserted with no presence established.** `the_deaf_fixture_stops_when_its_spawner_dies_
+before_or_after_it_starts` asserted only that a pid was gone within 15 s. A `deaf.py` whose first
+statement is `raise SystemExit` passed **both** arms, in 0.1 s and 0.2 s. The sibling test 88 lines
+above states the requirement in as many words — *"a guard that kills a daemon which never spawned
+anything reports a clean group and proves nothing"* — and applies it. **A readiness latch was chosen
+over a liveness poll for a measured reason:** in the before-it-starts arm the printed pid belongs to
+a subshell still inside `sleep 0.5`, so `pid_alive` holds against a fixture that dies at its first
+bytecode, and polling for the fixture is racy because once `exec`ed it is already an orphan. A latch
+survives the exit it is evidence of, so one assertion is deterministic in both arms — and its pid
+cross-check closes a hole nobody had named: the test could have been waiting on a pid that was never
+the fixture's.
+
+**Two filed descriptions were wrong, in the same direction.** 65(c)'s "now guarded: any test that
+loads it and lets the `Daemon` drop reddens" was true of the sweep's *mechanism* and had **zero
+instances** — `deaf.py`'s only caller removes the node before the drop, so the precondition was never
+met. And a docstring credited the leash-vs-stdin deadlock with "precisely how the transcript child
+leaked 260 processes", where §3.91 records that leak as a same-thread self-deadlock with the leash
+**not involved and unable to be**. The corrected sentence was then *measured* rather than asserted:
+removing the sim's refusal and running `--exit-on-stdin-eof transcript` leaves the record file
+absent and the main thread never past `stdin().lock()`, the process ending only because the leash
+thread called `exit(0)`.
+
+**Item 64(a)'s remedy is refuted, not deferred.** Six measured runs of the filed throughput test read
+a wall ratio of 0.86–1.13 with `bytes_scanned` complete and `gaps: 0` every time: there is no
+active-path cost to guard at that altitude. The test was **built, measured, and removed**, and the
+guard landed on the mechanism — the retained window never exceeds the lookback — with both halves
+plant-proven. **(a) remains partly executed and its entry says so**, because the item names three
+cost surfaces and the guard covers two; the uncapped `waits` list is untouched and was unmentioned
+by the work, which is the reporting failure worth more than the omission.
+
+**The batch caused a flake and then nearly hid it behind a vacuous repair.** Item 65(d)'s harness
+leash shifted scheduling enough to expose an existing 20 ms FIN-delivery race — 2 of 10 whole-binary
+runs with the leash, **0 of 30** with only that flag removed, which is what makes the attribution a
+measurement rather than a story. The first repair widened the re-sampling budget to 10 s, and the 5 s
+`HEAD_TIMEOUT` then supplied the closes: **removing the eviction loop entirely left the test green.**
+Only the plant caught it. The shipped repair bounds the window under that deadline and asserts the
+separation, so a counted close cannot be a timeout release.
+
+**One assertion ships unproven and says so.** `p8_web_leash.rs` gained `assert!(!web.exited())` before
+the release, because `WebServer::start` proves the console *started* and not that it is still there —
+but a faithful plant needs a product that exits shortly after binding, which does not exist. Flagged
+rather than claimed, which is the honest disposition and the one this ledger prefers to a plant that
+proves something adjacent.
+
+*Also repaired:* §15.57's "22 `type ==` clauses" is **51** at `eba5548` (`bc75857` had 22; `9237cfc`
+took it there), re-measured in both expectation files. **The figure's direction strengthens the
+decline rather than weakening it** — more of the gate turns on the JSON's kinds, so the case that the
+JSON is the artifact of record is stronger now than when §15.57 was written.

@@ -962,4 +962,201 @@ mod tests {
             );
         }
     }
+
+    // --- the registry's own roster (plan §18 item 64(e)) --------------------------
+
+    /// Drop `//`-comments so a variant named in prose cannot enter either roster.
+    /// Naive about `//` inside a string literal, which neither block below contains
+    /// — and if one ever does, the scanner truncates a line rather than inventing a
+    /// variant, so the failure is a missing entry rather than a phantom one.
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .map(|l| l.split_once("//").map_or(l, |(head, _)| head))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The body of the first `needle { … }` block, balanced on braces.
+    fn braced_block<'a>(src: &'a str, needle: &str) -> &'a str {
+        let at = src
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} is in this file"));
+        let open = src[at..].find('{').expect("the block opens") + at;
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open + 1..open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{needle}'s block never closes");
+    }
+
+    /// Every variant `enum AppError` declares, read out of this file's own source.
+    ///
+    /// A variant is an identifier at the head of a line inside the enum body,
+    /// followed by `,`, `(`, `{` or `=` — the shapes a Rust variant can take, unit
+    /// and tuple and struct and explicitly-discriminated. Attribute and doc lines are
+    /// skipped rather than parsed. The list is deliberately over-wide: a shape this
+    /// scanner does not know is a variant it silently omits, which is a licence to
+    /// leave that variant out of `ALL` — the exact hole this gate closes.
+    fn declared_app_error_variants(src: &str) -> std::collections::BTreeSet<String> {
+        let body = strip_line_comments(braced_block(src, "pub enum AppError"));
+        let mut out = std::collections::BTreeSet::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let end = line
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(line.len());
+            let (ident, rest) = line.split_at(end);
+            if ident.is_empty() || !ident.starts_with(|c: char| c.is_ascii_uppercase()) {
+                continue;
+            }
+            if [",", "(", "{", "="]
+                .iter()
+                .any(|p| rest.trim_start().starts_with(p))
+            {
+                out.insert(ident.to_owned());
+            }
+        }
+        out
+    }
+
+    /// Every variant `AppError::ALL` lists, in the order it lists them.
+    fn app_error_all_entries(src: &str) -> Vec<String> {
+        let at = src
+            .find("pub const ALL: &'static [AppError] = &[")
+            .expect("the ALL constant is in this file");
+        let end = src[at..].find("];").expect("the ALL constant closes") + at;
+        strip_line_comments(&src[at..end])
+            .split("AppError::")
+            .skip(1)
+            .map(|t| {
+                t.chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect::<String>()
+            })
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// **`AppError::ALL` must list every variant the enum declares** (plan §18 item
+    /// 64(e)).
+    ///
+    /// `ALL` is the registry's application half and everything downstream of it is
+    /// derived: [`error_code_registry`] builds the docs table from it, and
+    /// `docs_rpc_table_matches_the_registry` above asserts the table two ways. But
+    /// both directions run **over `ALL`**, never over the enum — so a ninth variant
+    /// added to `AppError` and forgotten here compiles (`code`, `name` and `summary`
+    /// are exhaustive matches and force *their* arms to be written), is emittable by
+    /// the daemon the moment something constructs it, and is documented by nothing.
+    /// Every gate in this file would stay green, because a code that is in neither
+    /// the registry nor the docs is in neither set the comparison sees.
+    ///
+    /// So this reads the enum itself. Both rosters come out of this file's source
+    /// rather than out of a list someone typed a third time, which is `meta_derive`'s
+    /// doctrine one crate over: a list typed once is correct once.
+    #[test]
+    fn app_error_all_lists_every_variant_the_enum_declares() {
+        // 0. The matcher, in every spelling it claims to cover and against the
+        //    near-misses that must not trip it.
+        let synthetic = "pub enum AppError {\n\
+             /// A doc comment naming AppError::Ghost, which is prose.\n\
+             #[allow(dead_code)]\n\
+             Plain,\n\
+             Tuple(u8),\n\
+             Braced { n: u8 },\n\
+             Numbered = 9,\n\
+             // Commented, \n\
+             }";
+        assert_eq!(
+            declared_app_error_variants(synthetic),
+            ["Braced", "Numbered", "Plain", "Tuple"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the variant scanner misses a variant shape, reads a commented-out one, \
+             or manufactures one out of a doc comment — each of which turns this gate \
+             into a demand that `ALL` list something that does not exist, or a licence \
+             to omit something that does"
+        );
+        assert_eq!(
+            app_error_all_entries(
+                "pub const ALL: &'static [AppError] = &[\n\
+                 AppError::Plain,\n\
+                 // AppError::Ghost,\n\
+                 AppError::Tuple,\n];"
+            ),
+            vec!["Plain".to_owned(), "Tuple".to_owned()],
+            "the ALL scanner reads a commented-out entry as a listing — which would \
+             let a variant be dropped from the shipped slice while this gate called it \
+             present"
+        );
+
+        // 1. Both rosters, from this file's own source, each with a floor: two sets
+        //    enumerated to zero are equal forever.
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("this crate's source is readable from its own manifest dir");
+        let declared = declared_app_error_variants(&src);
+        let listed = app_error_all_entries(&src);
+        assert!(
+            declared.len() >= 8,
+            "the enum scanner found {} variants — `AppError` was reshaped and this \
+             comparison is now against almost nothing: {declared:?}",
+            declared.len()
+        );
+        assert!(
+            listed.len() >= 8,
+            "the ALL scanner found {} entries — the constant was reshaped and this \
+             comparison is now against almost nothing: {listed:?}",
+            listed.len()
+        );
+
+        // 2. The comparison, both ways.
+        let listed_set: std::collections::BTreeSet<String> = listed.iter().cloned().collect();
+        assert_eq!(
+            listed_set.len(),
+            listed.len(),
+            "`AppError::ALL` lists a variant twice, so `error_code_registry` emits a \
+             duplicate row: {listed:?}"
+        );
+        assert_eq!(
+            declared, listed_set,
+            "`AppError::ALL` and the `AppError` enum disagree. A variant the enum \
+             declares and `ALL` omits is emittable, undocumented, and invisible to \
+             `docs_rpc_table_matches_the_registry`, whose comparison runs over `ALL` \
+             on both sides"
+        );
+
+        // 3. And the property `ALL`'s own doc comment states — "in code order" —
+        //    which nothing read. It is what fixes the order of the docs table rows
+        //    `error_code_registry` builds, so a reordering here silently reorders a
+        //    document that is asserted line by line elsewhere.
+        let codes: Vec<i64> = listed
+            .iter()
+            .map(|n| {
+                AppError::ALL
+                    .iter()
+                    .find(|e| format!("{e:?}") == *n)
+                    .unwrap_or_else(|| panic!("{n} is an AppError"))
+                    .code()
+            })
+            .collect();
+        let mut ordered = codes.clone();
+        ordered.sort_by(|a, b| b.cmp(a));
+        assert_eq!(
+            codes, ordered,
+            "`AppError::ALL` is not in code order, which its own doc comment claims \
+             and the docs table's row order depends on"
+        );
+    }
 }

@@ -734,6 +734,28 @@ impl Daemon {
 }
 
 impl Drop for Daemon {
+    /// `shutdown`, then SIGKILL **without waiting for it to land**, then the sweep.
+    ///
+    /// The ordering is deliberate and was re-decided by measurement rather than
+    /// inherited (plan §18 item 65(f), which asked whether the graceful teardown should
+    /// be allowed to finish first — it would have *contained* the 260-orphan leak, at
+    /// the cost of a wait on every one of the suite's ~284 daemons).
+    ///
+    /// **Measured, both halves.** The graceful exit costs 20.2–20.9 ms per drop
+    /// (twenty daemons, median 20.4, the floor being [`Daemon::wait_for_exit`]'s own
+    /// 20 ms poll tick) — real, but not what decided it. What decided it: with that
+    /// wait in place, a daemon holding a codec child that never reads its stdin drops
+    /// **green**, because the daemon reaps the child on its way out and the sweep then
+    /// sees a clean group. The same tree, the same live defect, one line of policy
+    /// apart: SIGKILL-first reddens naming the pid and argv, graceful-first says
+    /// nothing. The harness would have stopped being the instrument that found the
+    /// class (notes §3.91).
+    ///
+    /// Containment is not what is traded away — [`Daemon::sweep_process_group`] kills
+    /// survivors before it panics, so the box stays clean either way — and the
+    /// coverage 65(f) worried about, the daemon's real teardown path, is asserted where
+    /// it belongs: `p7_clean_exit` drives all three graceful exits and checks the
+    /// socket unlink, the pty symlinks and the state file's survival.
     fn drop(&mut self) {
         self.rpc.shutdown();
         let _ = self.child.kill();
@@ -1191,6 +1213,19 @@ impl RawDaemonBuilder {
 pub struct WebServer {
     child: KillOnDrop,
     lines: Arc<Mutex<Vec<String>>>,
+    /// The orphan leash (§15.43): the write end of the console's stdin pipe, held for
+    /// this `WebServer`'s whole life and never written to.
+    ///
+    /// [`KillOnDrop`] is the *happy* path and it covers only unwinding. A test process
+    /// killed by a signal, aborted, or killed as a process group runs no `Drop` at all,
+    /// and until plan §18 item 65(d) the console had no leash arm to fall back on — no
+    /// piped stdin and no flag — so it stayed up with its port bound and its taps open
+    /// on the daemon. A live orphan of exactly this shape was found on the development
+    /// box (notes §3.91). The kernel closes this fd however this process dies.
+    ///
+    /// `Option` only so [`WebServer::release_leash`] can close it deliberately, which
+    /// is what makes the leash observable rather than a field nobody ever exercises.
+    leash: Option<std::process::ChildStdin>,
     /// The `http://` port scraped by [`WebServer::start`]; `None` after a bare
     /// [`WebServer::spawn`], which may be waiting on a refusal instead.
     port: Option<u16>,
@@ -1206,11 +1241,22 @@ impl WebServer {
         args.extend_from_slice(extra);
         let mut child = Command::new(bin("serial-nexus-web"))
             .args(&args)
+            // The leash: this console stops when the pipe below is closed, which the
+            // kernel does when this test process dies, however it dies (§15.43). On by
+            // default *here* because this harness is exactly the supervisor §15.43
+            // describes; the console's own default stays off, since under a service
+            // manager stdin is at EOF from the first instant.
+            .arg("--exit-on-stdin-eof")
             .env("XDG_RUNTIME_DIR", xdg)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn serial-nexus-web");
+        let leash = child
+            .stdin
+            .take()
+            .expect("serial-nexus-web was spawned with a piped stdin");
         let stdout = child.stdout.take().expect("piped serial-nexus-web stdout");
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = lines.clone();
@@ -1225,6 +1271,7 @@ impl WebServer {
         WebServer {
             child: KillOnDrop(child),
             lines,
+            leash: Some(leash),
             port: None,
         }
     }
@@ -1299,6 +1346,27 @@ impl WebServer {
     /// bind what the test needs" (a skip) is told from "the server is broken" (a fail).
     pub fn exited(&mut self) -> bool {
         self.child.try_wait().is_some()
+    }
+
+    /// Close the leash — drop the write end of the console's stdin pipe — and wait up
+    /// to `timeout` for the console to stop **on its own**. `None` means it was still
+    /// running at the deadline; no kill is sent either way, so the caller decides
+    /// whether that is the failure or the expectation.
+    ///
+    /// The seam a leash guard needs (plan §18 item 65(d)), and the only way to observe
+    /// what [`Drop`] otherwise does silently: `KillOnDrop` covers unwinding, the leash
+    /// covers every way this process can die *without* unwinding, and a leash nobody
+    /// ever closes on purpose is indistinguishable from no leash at all until the run
+    /// that inherits the orphan. Closing it here is the same event the kernel delivers
+    /// when this process is SIGKILLed.
+    pub fn release_leash(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        self.leash.take();
+        self.child.wait_exit(timeout)
+    }
+
+    /// The console process's pid, for a guard that has to name it.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 }
 
