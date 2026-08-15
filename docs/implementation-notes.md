@@ -12461,3 +12461,65 @@ see it (32768 bytes rather than 40). **An underpowered negative is not a refutat
 way to tell them apart is to measure the mechanism rather than the symptom.** The misattributing
 message the item also named is fixed: the post-release assertion now tells its reader that a payload
 of 0 immediately after a replug is the primer's absence, not the peer's RTS.
+
+### 3.104 A root step that asserted nothing, and a root cause that was wrong
+
+Four repairs from a privilege inventory taken when the operator offered to remove the "no root"
+constraint on the dev box. **The inventory's headline is that less was blocked than the record
+implied, and none of it was blocked by the width of the privileged helper** — so the standing
+decline at plan §18 item 31 is untouched, and `REQUIRED_CAPS` still reads two capabilities. What
+the inventory found instead was a live gate hole and a wrong diagnosis, both in the machinery that
+had been measuring the root question all along.
+
+**The gate hole.** `SNX_PACKAGING_ROOT` was referenced in `.github/workflows/ci.yml` only inside
+comments, and in `p8_packaging.rs`'s skip helper. **It was set by no lane.** So CI's root step
+exited 0 whether it measured anything or self-skipped — passing output identical to not-running
+output, AGENTS §3's tell — *in the one step that had just been un-escaped from `continue-on-error`
+in order to gate*. The stated reason for leaving it unset was that whether a runner provides
+systemd as PID 1 with passwordless root was unmeasured; that has been false since run 31695823765
+read `PID 1: systemd`, `sudo: passwordless`, and six passing root-arm tests on 2026-08-13. It is
+now `required`, which is the order §15.52 set for `SNX_RIG_FLOW`: measure the precondition, then
+demand it.
+
+**The trap inside the fix, which is the transferable part.** Setting the variable the obvious way —
+a step-level `env:` block — would have reintroduced the very defect. `sudo` runs with `env_reset`,
+so a workflow environment never reaches a process launched as `sudo "$BIN"`: the variable would be
+unset inside the test, the root-gated test would find root and run anyway, the step would stay
+green, and `required` would assert exactly nothing. **A fix for a gate that asserts nothing can
+itself assert nothing, through a mechanism one layer below the one being fixed.** The variable is
+therefore spelled at the call, `sudo -n env SNX_PACKAGING_ROOT=required "$BIN"`.
+
+The probe line guarding it got its own correction, in the same register and within the same hour:
+its comment claimed it would fail "if the variable ever stops arriving". It cannot — `env VAR=x`
+always sets `VAR` for its child. What it actually detects is `sudo -n` not working at all. The
+comment now says that, because a check described as stronger than it is has been this session's
+most repeated finding.
+
+**The wrong root cause.** `p8_packaging.rs` recorded that the rootless fallback is "refused by the
+kernel's `uid_map` policy". Measured on Ubuntu 26.04 / 7.0.0-29: `unshare -U true` **succeeds**,
+exit 0, and `kernel.unprivileged_userns_clone` reads `1` — the kernel grants the namespace. What the
+namespace does not carry is capability: `CapEff` inside is `0000000000000000`, because
+`kernel.apparmor_restrict_unprivileged_userns=1` transitions the process into AppArmor's
+`unprivileged_userns` profile, and *that* is why the `/proc/self/uid_map` write `unshare -Ur`
+performs returns `EPERM`. The observed stderr quoted at three other sites was always accurate; only
+the cause attributed to it was wrong. Recorded as a refutation rather than quietly replaced
+(AGENTS §9).
+
+**A blocker that privilege cannot fix, removed from an item routed as privilege-blocked.** Item 31
+carried the `/dev/ttyACM*` half of the dialout claim among its unverified rows while being routed
+as "needs a root box" — so it covered a clause root cannot close, and could never have been closed.
+Split out as **item 78**, whose blocker is a CDC-ACM *device*. Its cheaper half is answered in the
+filing, unprivileged: `/usr/lib/udev/rules.d/50-udev-default.rules:47` matches `ttyACM0` under
+`tty[A-Z]*[0-9]` and sets `GROUP="dialout"`, so the group half holds by the same shipped rule that
+covers `ttyUSB0`. The rule sets no `MODE=`, so the mode half still needs a present device — which is
+the whole of what item 78 now asks for.
+
+**Why the helper stays two capabilities.** Four blocked items *are* capability-shaped
+(`CAP_SETFCAP` to build an orphan-sweep fixture, `CAP_SYS_ADMIN` for a `NO_NEW_PRIVS` launcher,
+`CAP_FOWNER` for a grant guard, and euid 0 proper for the control socket's root arm — that last one
+reachable by no capability, since the policy branches on `geteuid()`). **But none of them wants the
+capability in the *shipped* helper.** They want it in a throwaway test fixture, which is a different
+binary and a different argument: `serial-nexus-devprep` is mode 0700 and invocable by the
+unprivileged user at any time by design, so every capability it holds is a standing surface between
+runs, and `CAP_SETFCAP` in particular is root-equivalent for files. §15.45's narrowness is the
+safety argument, and nothing found here is worth spending it on.

@@ -317,7 +317,7 @@ rather than from any list a human keeps.
 | ↳ | the daemon prefers the persisted state file over `--config` | measured | `p13_legacy_defaults.rs::a_pre_rename_state_file_is_adopted_and_rewritten_under_the_current_name`, and its explicit-directory sibling |
 | ↳ | the daemon opens its own socket and exits cleanly on `SIGTERM`/`SIGINT`, releasing PTY symlinks and ports | measured | `p7_clean_exit.rs::sigterm_exits_cleanly_and_releases_the_node_environment` and the `sigint`/`shutdown` siblings |
 | `DynamicUser=` | A transient, unprivileged identity | man-page | `systemd.exec(5)`, `DynamicUser=` |
-| ↳ | under `DynamicUser=`, `StateDirectory=` really lives under `/var/lib/private/`, which is inaccessible to unprivileged users, so the pre-rename snapshot needs a root `cp` | **man-page, and owed a measurement** | `systemd.exec(5)`: "the directories are created below `/var/cache/private`, `/var/log/private` and `/var/lib/private`, respectively, which are host directories made inaccessible to unprivileged users". Plan §18 item 31's root-box half; `p8_packaging.rs::dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown` measures it where root exists |
+| ↳ | under `DynamicUser=`, `StateDirectory=` really lives under `/var/lib/private/`, which is inaccessible to unprivileged users, so the pre-rename snapshot needs a root `cp` | **measured** (CI root arm, run 31695823765, 2026-08-13; `state_real=/var/lib/private/…`, `private_stat=root:755`, probe running as a transient `uid=65180`) | `systemd.exec(5)`: "the directories are created below `/var/cache/private`, `/var/log/private` and `/var/lib/private`, respectively, which are host directories made inaccessible to unprivileged users". Plan §18 item 31's root-box half; `p8_packaging.rs::dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown` measures it where root exists |
 | `SupplementaryGroups=` | The service needs `dialout` because USB serial nodes are `root:dialout` mode 0660 | measured (partially) | linux-2026-08-12: `crw-rw---- 1 root dialout 188, 0 /dev/ttyUSB0`. One box, one distro, and **no `/dev/ttyACM*` was present to check** — the `ttyACM` half of that sentence and the `uucp` remark are unverified |
 | `RuntimeDirectory=`, `StateDirectory=`, `LogsDirectory=` | systemd creates each and chowns it to the service identity on every start | man-page | `systemd.exec(5)`: "the innermost specified directories will be owned by the user and group specified in `User=` and `Group=`" |
 | `RuntimeDirectoryMode=`, `StateDirectoryMode=`, `LogsDirectoryMode=` | 0700 on the socket directory bounds the post-bind window; 0750 on logs exposes them to the identity's group | man-page | `systemd.exec(5)`, the `*DirectoryMode=` family |
@@ -337,7 +337,7 @@ rather than from any list a human keeps.
 | `ports` opens nothing, so listing never toggles DTR | measured | `p10_ports.rs::ports_enumerates_every_candidate_in_its_identity_form` and the binding-status guards beside it |
 | The control socket is mode 0600, and whoever can open it owns every console | measured (the mode) | `p9_permissions.rs::a_running_daemon_writes_its_socket_state_and_logs_owner_only`; the consequence is `../docs/security.md`'s threat model |
 | The operators-group paragraph: `SupplementaryGroups=` cannot reach the runtime directory, so a static identity is the working recipe | man-page for the premise, **unverified** for the recipe | Same pair as the unit's socket-group row |
-| Extra log directories need `ReadWritePaths=` **and** a pre-`chown`, because `ReadWritePaths=` flips the mount without chowning | **man-page, and owed a measurement** | `systemd.exec(5)`: "Paths listed in `ReadWritePaths=` are accessible from within the namespace with the same access modes as from outside of it." Plan §18 item 31's root-box half measures the `EACCES`-versus-`EROFS` split that makes this concrete |
+| Extra log directories need `ReadWritePaths=` **and** a pre-`chown`, because `ReadWritePaths=` flips the mount without chowning | **measured** (CI root arm, run 31695823765, 2026-08-13 — the `EACCES`-versus-`EROFS` split, both halves of Claim 4 holding) | `systemd.exec(5)`: "Paths listed in `ReadWritePaths=` are accessible from within the namespace with the same access modes as from outside of it." Plan §18 item 31's root-box half measures the `EACCES`-versus-`EROFS` split that makes this concrete |
 | The udev step is a silent failure in both half-done directions | measured (the faulted arm) | A serial node that cannot open its device comes up `faulted` with the error named — `p9_permissions.rs`'s refusal guards; that a group without rules grants nothing is definitional |
 | The `99-serial-nexus.rules` file is syntactically valid udev | measured | `p8_packaging.rs::the_packaged_udev_rules_verify_clean_under_udevadm` on any box with `udevadm verify` |
 | The upgrade section's adoption behaviours (pre-rename state file adopted; client socket fallback; a live daemon never passed over) | measured | `p13_legacy_defaults.rs`, all five guards |
@@ -347,10 +347,31 @@ rather than from any list a human keeps.
 
 ### What is still owed
 
-Two rows above are marked **man-page, and owed a measurement**, and they are the same
-root-box measurement seen from two directions: what `DynamicUser=` does to
-`StateDirectory=`, and what `ReadWritePaths=` does *not* do to ownership. Both are
-carried by `p8_packaging.rs`'s root-gated test, which self-skips with a precise
-reason on a box that cannot become root — which is every box this project has
-measured on so far. Its skip line names what it saw, so a run that could have
-measured and did not is distinguishable from a run that never tried.
+**The two rows that stood here as owed are paid.** What `DynamicUser=` does to
+`StateDirectory=` and what `ReadWritePaths=` does *not* do to ownership were the same
+root-box measurement seen from two directions, and CI's root arm took it on
+2026-08-13 (run 31695823765, plan §18 item 68): six passed, zero failed, the probe
+running under `DynamicUser=yes` at a transient uid with `state_real=/var/lib/private/…`
+and `private_stat=root:755`. Both rows above now read **measured**.
+
+That measurement is a **guard** rather than a one-off, as of 2026-08-15: the root step
+sets `SNX_PACKAGING_ROOT=required`, so a runner image that stops providing
+systemd-as-PID-1 or passwordless root reddens the lane instead of self-skipping past
+it. Until then the variable was set by no lane at all, which left that step's passing
+output identical to its self-skipping output — the tell AGENTS §3 names, in the one
+step that had just been un-escaped from `continue-on-error` in order to gate.
+
+A **development** box still fails the precondition, and its skip line names what it
+saw, so a run that could have measured and did not stays distinguishable from a run
+that never tried. Two independent reasons close it there, and only the second is about
+privilege the box could be given: `systemctl start` needs polkit, which refuses
+without a terminal to prompt on; and the rootless fallback is closed by **AppArmor**,
+not by the kernel — `unshare -U` succeeds and `kernel.unprivileged_userns_clone` is
+`1`, but the namespace is transitioned into the `unprivileged_userns` profile with an
+empty `CapEff`, so the `/proc/self/uid_map` write returns `EPERM`.
+
+What remains unverified here is listed row by row above and is **not** all one class:
+the socket-group and operators-group recipes and the upgrade `cp` procedure want a
+live systemd to start a unit on, while the `/dev/ttyACM*` half of the dialout claim
+wants a **CDC-ACM device** and no amount of privilege supplies one — it is carried
+separately as plan §18 item 78.

@@ -1694,8 +1694,10 @@ Each item below uses the schema with its fields inline.
     from assumed to measured by being checked (`--help` for every flag and verb the page names;
     the tty node's real mode and group), several are honestly **man-page** with the quote verified
     to exist in `systemd.exec(5)` on this box, and six are **unverified** and say so — the
-    socket-group static-identity recipe, the upgrade procedure, and the `/dev/ttyACM*` half of the
-    dialout claim, which no box this project has measured on possesses. `itest/tests/p8_packaging.rs`
+    socket-group static-identity recipe, the upgrade procedure, and — until 2026-08-15 — the
+    `/dev/ttyACM*` half of the dialout claim. **That last clause is split out as item 78**: it needs
+    a CDC-ACM *device* and no privilege supplies one, so leaving it inside an item routed as "needs
+    a root box" made this item cover something root cannot fix, and un-closable for that reason. `itest/tests/p8_packaging.rs`
     is the gate: six tests, **three of which need no tool and never skip**, so the drift class this
     tree can cause is covered on macOS too. Eight plants against the real tree, each reddening and
     each restored md5-identical. What it provably does *not* catch is in its own module doc — a
@@ -3080,6 +3082,34 @@ number, because the next review cannot check that an unnumbered defect was fixed
     to look as though it varied the handshake, and a reader checking coverage would count it.
     *Validation:* plant a `cert.fail_if` on `p5_handshake`'s path; the loop must be green today and
     red after any honest rewrite of it.
+
+### Item 78 — filed by the privilege inventory (2026-08-15)
+
+78. **The `/dev/ttyACM*` half of the dialout claim** — **open** (S; needs a **CDC-ACM device**,
+    not privilege). Split out of item 31 on 2026-08-15, because that item is routed as "needs a
+    root box" and root cannot conjure a device node — leaving this clause inside it made the
+    blocker unactionable and that item un-closable for a reason unrelated to its subject.
+    *Evidence:* `packaging/README.md`'s `SupplementaryGroups=` row reads `measured (partially)` —
+    `crw-rw---- 1 root dialout 188, 0 /dev/ttyUSB0`, one box, one distro — and states that no
+    `/dev/ttyACM*` was present to check, leaving the `ttyACM` half of the sentence and the `uucp`
+    remark unverified.
+    **Its cheaper half is answered here, unprivileged, and the item narrows to what is left.** The
+    claim has two parts: *which group* the node lands in, and *what mode*. The group half is settled
+    by reading the shipped rules — `/usr/lib/udev/rules.d/50-udev-default.rules:47` is
+    `KERNEL=="tty[A-Z]*[0-9]|ttymxc[0-9]*|pppox[0-9]*|ircomm[0-9]*|noz[0-9]*|rfcomm[0-9]*",
+    GROUP="dialout"`, and `ttyACM0` matches `tty[A-Z]*[0-9]` exactly as `ttyUSB0` does. So on this
+    distro a CDC-ACM node is `dialout` by the same rule, which is what the unit's
+    `SupplementaryGroups=dialout` depends on. **What that reading cannot supply is the mode:** the
+    rule sets no `MODE=`, so `0660` comes from the driver default and only a present device shows it.
+    *Remainder:* (a) the mode on a real `/dev/ttyACM*`, and (b) the `uucp` remark, which is a claim
+    about distros this project has never booted and may be better answered by **deleting** it than
+    by acquiring one — a recorded decline is a legitimate disposition for (b).
+    *Declined:* inferring the mode from `ttyUSB0`. Different driver, different default, and the whole
+    value of the row is that it was measured rather than assumed.
+    *Validation:* attach a CDC-ACM device (an Arduino-class board is the cheapest instance), record
+    `ls -l` and the resolving udev rule, and move the README row from `measured (partially)` to
+    `measured` with its scope named. Reported-never-judged where no such device is attached — this
+    must **not** become a fifth `required` spelling, since a box without the device is not a fault.
 
 ### Evaluated and deliberately not scheduled — the closing register
 

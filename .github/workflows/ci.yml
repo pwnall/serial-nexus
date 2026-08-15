@@ -313,15 +313,25 @@ jobs:
   # that prints a complaint and exits 0 is the `jq -e` defect in a third costume.
   #
   # The ROOT arm is item 31's owed measurement: what `DynamicUser=` does to
-  # `StateDirectory=`, and what `ReadWritePaths=` does NOT do to ownership. No box
-  # this project has measured on can run it — the development box cannot `systemctl
-  # start` (polkit refuses without a terminal to prompt on) and cannot fall back to a
-  # user namespace (`unshare -Ur` is refused at `/proc/self/uid_map`). A GitHub-hosted
-  # runner has passwordless sudo, so it may be able to. **Whether it also runs systemd
-  # as PID 1 is UNMEASURED, which is exactly why `SNX_PACKAGING_ROOT` is not set
-  # here:** this arm reports what it found. Turning `required` on is a follow-up, once
-  # a green run proves the precondition — the precedent is `SNX_RIG_FLOW` (§15.52),
-  # whose precondition was measured before it was demanded.
+  # `StateDirectory=`, and what `ReadWritePaths=` does NOT do to ownership. A
+  # development box cannot run it — it cannot `systemctl start` (polkit refuses
+  # without a terminal to prompt on), and the user-namespace fallback is closed by
+  # AppArmor rather than by the kernel: `unshare -U` succeeds, but the new namespace
+  # is transitioned into the `unprivileged_userns` profile with an empty `CapEff`, so
+  # the `/proc/self/uid_map` write `unshare -Ur` then performs returns `EPERM` (the
+  # measured cause; `p8_packaging.rs::skip_no_packaging_root` carries the reading and
+  # the refutation of the earlier `uid_map`-policy diagnosis).
+  #
+  # **This runner can, and that was measured before it was demanded** — the discipline
+  # `SNX_RIG_FLOW` set (§15.52). The "What this runner actually is" step below reads
+  # `PID 1: systemd` and `sudo: passwordless` on `ubuntu-latest`, and the root arm has
+  # run the measurement green (6 passed / 0 failed; run 31695823765, 2026-08-13,
+  # reproduced at 31877969760, 2026-08-15). So `SNX_PACKAGING_ROOT=required` is set on
+  # that step as of 2026-08-15: a runner image that stops providing systemd-as-PID-1
+  # or passwordless root now reddens the lane instead of self-skipping past it.
+  # Before that it was set by NO lane, which meant the root step's passing output was
+  # identical to its self-skipping output — AGENTS §3's tell, in the one step that had
+  # just been un-escaped from `continue-on-error` in order to gate.
   packaging:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -333,7 +343,8 @@ jobs:
       - name: Install jq (locating the test binary from cargo's JSON output)
         run: sudo apt-get update && sudo apt-get install -y jq
       # The precondition, measured and printed rather than assumed. This step is what
-      # tells the next session whether SNX_PACKAGING_ROOT can be demanded.
+      # established that SNX_PACKAGING_ROOT could be demanded, and it stays because it
+      # is the reading a future runner-image change would move first.
       - name: What this runner actually is
         run: |
           echo "PID 1:  $(cat /proc/1/comm 2>/dev/null || echo '<no procfs>')"
@@ -365,6 +376,26 @@ jobs:
       # calls a tell** and must not be left in place. The arm is green — the probe runs
       # under `DynamicUser=yes`, prints all nine readings, and both halves of Claim 4
       # hold — so the escape hatch is gone and a regression here fails the lane again.
+      #
+      # **`SNX_PACKAGING_ROOT=required` as of 2026-08-15, and it is passed through
+      # `env` rather than through this step's `env:` block for a load-bearing reason.**
+      # `sudo` runs with `env_reset` by default, so a workflow-level `env:` never
+      # reaches a process launched as `sudo "$BIN"` — the variable would be unset in
+      # the test, the root-gated test would find root and run anyway, the step would
+      # stay green, and `required` would assert exactly nothing. That is AGENTS §3's
+      # tell reintroduced by the very edit meant to remove it. `sudo -n env VAR=value`
+      # sets it in the child regardless of sudoers policy, which is why the variable
+      # is spelled at the call and not in an `env:` block.
+      #
+      # **What the probe line below does and does not prove, stated exactly, because
+      # the honest scope is narrower than it looks:** `env VAR=x` always sets `VAR`
+      # for its child, so that line cannot detect the variable "failing to arrive" —
+      # it detects `sudo -n` not working at all (no passwordless sudo, no tty, a
+      # sudoers policy that refuses), which would otherwise surface as a confusing
+      # failure inside the test binary rather than as a named precondition. It is a
+      # sudo probe, not an environment probe. Claiming more of it here would be the
+      # assertion-weaker-than-its-comment register of AGENTS §3's tell, which is the
+      # defect this whole step exists to have stopped committing.
       - name: Packaging gate (root arm — item 31's owed measurement)
         run: |
           BIN=$(cargo test -p serial-nexus-itest --test p8_packaging --locked --no-run \
@@ -372,8 +403,11 @@ jobs:
                 | jq -r 'select(.executable != null and .target.name == "p8_packaging") | .executable' \
                 | tail -1)
           test -n "$BIN" || { echo "could not locate the p8_packaging test binary"; exit 1; }
-          echo "running $BIN as root"
-          sudo -n "$BIN" --nocapture --test-threads=1
+          sudo -n env SNX_PACKAGING_ROOT=required \
+            sh -c 'test "$SNX_PACKAGING_ROOT" = required' \
+            || { echo "SNX_PACKAGING_ROOT did not survive sudo — the run below would assert nothing"; exit 1; }
+          echo "running $BIN as root with SNX_PACKAGING_ROOT=required"
+          sudo -n env SNX_PACKAGING_ROOT=required "$BIN" --nocapture --test-threads=1
 
   # Out-of-tree codec template (§15.26 / plan §10.3): build the out-of-tree stand-in
   # from the CONSUMER's own position (its own workspace manifest, path deps standing

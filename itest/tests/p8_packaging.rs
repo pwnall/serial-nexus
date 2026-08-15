@@ -28,10 +28,13 @@
 //! And one root-gated measurement,
 //! [`dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown`],
 //! which is item 31's other half: the two claims in `packaging/README.md`'s evidence
-//! table marked *man-page, and owed a measurement*. Every box this project has
-//! measured on fails its precondition, so the part of its machinery that is pure
-//! derivation is pulled out into the text check above rather than waiting with it —
-//! a test that has never executed anywhere is a test nobody has debugged.
+//! table that read *man-page, and owed a measurement* until CI's root arm measured
+//! them (2026-08-13, item 68) and they became **measured**. It runs under
+//! `SNX_PACKAGING_ROOT=required` in the `packaging` job's root step and self-skips
+//! everywhere else, so the part of its machinery that is pure derivation stays
+//! pulled out into the text check above rather than riding with it — a development
+//! box still fails the precondition, and a test one lane executes is a test one lane
+//! debugs.
 //!
 //! # Using `systemd-analyze verify` correctly, which is not obvious
 //!
@@ -166,27 +169,49 @@ fn skip_no_packaging(test: &str, reason: &str) {
 ///
 /// **The root-box class** (plan §3 rule 11, plan §18 item 31). Separate from
 /// [`skip_no_packaging`] on purpose: its precondition is not a package but a
-/// privilege, and every box this project has measured on so far fails it — this one
-/// cannot `systemctl start` (polkit refuses without a terminal) and cannot fall back
-/// to a user namespace (`unshare -Ur` is refused by the kernel's `uid_map` policy).
-/// Folding the two classes into one variable would mean an operator who set
-/// `SNX_PACKAGING=required` for the cheap checks got a hard failure for a privilege
-/// they never claimed to have.
+/// privilege. Folding the two classes into one variable would mean an operator who
+/// set `SNX_PACKAGING=required` for the cheap checks got a hard failure for a
+/// privilege they never claimed to have.
 ///
-/// **Deliberately not switched on anywhere yet.** Whether a CI runner gives us
-/// systemd as PID 1 with passwordless root is unmeasured, and shipping `required` on
-/// an assumption reddens a lane for someone else's runner image. The precedent is
-/// `SNX_RIG_FLOW`, whose precondition was measured before it was demanded. Until a
-/// green run proves it, this test *reports* what it found and the skip line is the
-/// report.
+/// **Demanded by CI's root step, and the demand followed the measurement.** The
+/// `packaging` job's own "What this runner actually is" step reads `PID 1: systemd`
+/// and `sudo: passwordless` on `ubuntu-latest`, and the root arm has since run the
+/// measurement green — 6 passed, 0 failed, the probe under `DynamicUser=yes` at a
+/// transient uid with `state_real=/var/lib/private/…` (item 68, CI run 31695823765,
+/// 2026-08-13; reproduced at 31877969760, 2026-08-15). That order is the discipline
+/// §15.52 set for `SNX_RIG_FLOW`: measure the precondition, then demand it, because
+/// shipping `required` on an assumption reddens a lane for someone else's runner
+/// image. **Until it was set, this variable was set by no lane at all**, which left
+/// the root step's passing output identical to its self-skipping output — AGENTS
+/// §3's tell, in the very step that had just been un-escaped from
+/// `continue-on-error` in order to gate.
+///
+/// **A development box still fails the precondition — and the cause recorded here
+/// was wrong.** *Refuted 2026-08-15* (AGENTS §9: a refuted diagnosis is recorded,
+/// not quietly replaced). This comment used to say the rootless fallback was
+/// "refused by the kernel's `uid_map` policy". Measured on this box, Ubuntu 26.04 /
+/// kernel 7.0.0-29: `unshare -U true` **succeeds**, exit 0, and
+/// `kernel.unprivileged_userns_clone` reads `1` — the kernel grants the namespace.
+/// What the namespace does not carry is capability. `/proc/self/attr/current` reads
+/// `unconfined` outside it and `unprivileged_userns (enforce)` inside, and `CapEff`
+/// inside is `0000000000000000` where a fresh user namespace would otherwise hold a
+/// full set. That is AppArmor — `kernel.apparmor_restrict_unprivileged_userns=1`,
+/// with `/sys/kernel/security/apparmor` mounted — and it is why the *next* step,
+/// the `/proc/self/uid_map` write that `unshare -Ur` performs, is the one that
+/// returns `EPERM`. The observed stderr quoted elsewhere in this file is accurate
+/// and stays as it is; only the cause attributed to it is corrected. `systemctl
+/// start` remains closed for its own separate reason: polkit refuses without a
+/// terminal to prompt on.
 fn skip_no_packaging_root(test: &str, reason: &str) {
     assert!(
         std::env::var("SNX_PACKAGING_ROOT").as_deref() != Ok("required"),
         "SNX_PACKAGING_ROOT=required, but {test} skipped: {reason}.\n\
          Required mode exists so a box that can start a transient systemd service \
-         cannot report a green run for the two packaging claims that have never \
-         been measured anywhere (plan §18 item 31, plan §3 rule 11). Run as root on \
-         a systemd box, or unset SNX_PACKAGING_ROOT."
+         cannot report a green run for the two packaging claims only this test \
+         measures (plan §18 item 31, plan §3 rule 11) — CI's root step demands it \
+         precisely so a runner image that stopped providing systemd-as-PID-1 or \
+         passwordless root is noticed instead of skipped past. Run as root on a \
+         systemd box, or unset SNX_PACKAGING_ROOT."
     );
     eprintln!("SKIP {test}: {reason}");
 }
@@ -1091,10 +1116,10 @@ fn probe_readings(stdout: &str) -> BTreeMap<String, String> {
 
 /// The half of the root-gated measurement that can be checked without root.
 ///
-/// A test that has never executed anywhere is a test nobody has debugged, and this
-/// tree's every box fails its precondition — so the part of its machinery that is
-/// pure derivation runs on every push instead of waiting for a root box. What is
-/// covered here: that the probe's `systemd-run` properties really are the packaged
+/// Only CI's `packaging` job satisfies the root precondition; a development box does
+/// not — so the part of the probe's machinery that is pure derivation runs on every
+/// push, on every platform, instead of riding along with the arm that one lane
+/// executes. What is covered here: that the probe's `systemd-run` properties really are the packaged
 /// unit's own `[Service]` directives, that the four `systemd-run` supplies itself are
 /// dropped, and that the three `*Directory=` values are renamed so a probe cannot
 /// collide with a real install's state. What is not: anything that needs the service
@@ -1273,8 +1298,9 @@ fn dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown() {
     //   `StateDirectory`'s `/var/lib/<tag>`, never inside it, which is what the
     //   `-scratch` suffix keeps true.
     //
-    // **Unverified on a real box, like each of its predecessors** — this session has no
-    // systemd, and the next CI run is the measurement (plan §18 item 68).
+    // **Verified on a real box, unlike each of its predecessors** — the CI run after
+    // this line changed read all nine readings with both halves of Claim 4 holding
+    // (plan §18 item 68; run 31695823765, 2026-08-13, reproduced at 31877969760).
     let base = PathBuf::from("/var/lib").join(format!("{tag}-scratch"));
     let rw_dir = base.join("rw-listed");
     let ro_dir = base.join("rw-unlisted");
