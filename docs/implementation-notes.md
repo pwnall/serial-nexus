@@ -12891,3 +12891,92 @@ own derivation function's name contained the token it scans for. That is the fil
 worst case" convention firing exactly as its module doc says it must — the scanner that cannot see
 its own file is the scanner that will not see the next one either — and the prescribed fix
 (rename, hold the tokens in module-level consts outside every `#[test]` body) is what landed.
+
+### 3.111 What the 2026-08-15 session found out about this record itself
+
+Five sessions' worth of items landed in one day — twenty closed, three filed, one narrowed, the
+rig lane 1004 → 1040. The individual results are at their items. **These are the findings about the
+*method*, written here because the next generation of the document pair will read this file and not
+the session, and because every one of them is a claim about how this ledger works rather than about
+what it contains.**
+
+**1. An item's filed premise is the thing most likely to be wrong.** Nearly every result worth
+having came from an item contradicting its own description, not from executing it:
+
+| item | what the filing said | what was true |
+|---|---|---|
+| 76 | an unprimed stall test fails after a re-enumeration | 5 of 5 passed; the hazard is real but reproduces 1 in 3 through a *bigger* instrument |
+| 61 | the tripwire misses a throughput regression | it catches it — the rewrite *stalls* rather than passing slowly, 3 of 3 — and the filed remedy is unbuildable (load moves throughput 30×) |
+| 19 | "(S, one rig visit)" | P10 is a pty probe; it never needed the rig, which is why a size-S item survived three sessions that had one |
+| 41 | a 4 Mbaud ask silently lands at 9600 | unreachable — `serial2` verifies by read-back within ±2.5 %, so the open *fails* |
+| 65(c) | "now guarded: any test that loads it reddens" | true of the mechanism, **zero instances** — the only caller removed the node first |
+| 59(c) | the ack rule is spelled twice | four times, with `ctl` shipping two renderings of one object in one binary |
+| 49 | open | executed three days earlier; the plan and AGENTS §2 disagreed |
+| 74 | fix `handshake_measured` | applied where filed, it would have reddened the documented rig lane |
+
+**This is the ledger working, not failing.** A vaguer record would have absorbed all eight silently;
+these were catchable only because each entry states something falsifiable and names a plant. The
+operational rule: **before executing an item, re-verify its premise against the tree, and treat
+"the premise expired" as a first-class outcome** — it closed item 49 for the cost of a grep and
+saved a redundant `required` variable that rule 11 exists to forbid.
+
+**2. A guard's author is structurally its worst reader.** Two consecutive batches whose *subject*
+was guards that cannot fail each shipped new guards that cannot fail — five in one, three in the
+next — and in both the **reviewer** found them, never the author. That is not carelessness. Knowing
+what a guard is *for* is exactly what makes a weak assertion look sufficient; the author reads the
+intention and the reviewer reads the code. The structural answer is what these batches used:
+an independent adversarial reviewer per group who re-runs the plants rather than reading the report.
+
+**3. New registers of §3's tell, all found this day.**
+- **An assertion after a byte-exact `assert_eq!` on the same value can never fail.** Four instances.
+  Invisible on review because the equality reads as *extra rigour* rather than as a mask.
+- **A guard whose precondition nothing exercises** (65(c)): the mechanism was real and had zero
+  instances, so the coverage was zero while the code looked present.
+- **A guard pinning a decision belonging to a layer *below* the product** (item 17): asserting
+  payload loss on a parity mismatch pins `ftdi_sio`'s choice about flagging characters as though it
+  were a serial_nexus promise.
+- **A figure copied into four places and checked in none** (item 49): "thirteen tests over four
+  files" was wrong when typed and drifted to sixteen over six. **A figure with no authority is the
+  figure equivalent of a second mechanism**, and rule 11 forbids that for the same reason.
+
+**4. When a guard's property cannot be observed from a value, repairing the needle is not
+available.** `ctl`'s claim — that a second hand-spelled `{message} ({code})` re-entering the file
+would redden — is uncheckable at runtime, because a byte-identical copy *is* equal and equality is
+all a runtime check measures. The honest moves are to relocate the claim to where the property lives
+(a source-level guard) or delete it and name what carries it (a signature). Item 77 is the same
+shape: the handshake structurally cannot reach P5's verdict, so the loop pretending to test it was
+worse than no test.
+
+**5. Widening the read beats taking a new measurement.** Item 76's single unprimed trial nearly
+became a refutation; item 19's three-run reading nearly became a "warm-up shape" hypothesis. Both
+dissolved at five and twelve observations, and **item 19 was answered entirely from artifacts
+committed the day before**. A committed artifact set is an instrument. **An underpowered negative is
+not a refutation, and the cheapest way to tell them apart is to measure the mechanism rather than
+the symptom** — the 32768-byte transfer saw a hazard the 40-byte one could not.
+
+**6. A plant-and-restore cycle ends at the *rebuild*, not the restore.** The itest harness *execs*
+`target/debug/serial-nexus-daemon`; `cargo test` builds test targets and their library dependencies,
+not a sibling binary crate the harness happens to spawn. So `git status` and `md5sum` both correctly
+reported a restored source while the planted binary was still being measured, producing a convincing
+false red. **The tell: a failure whose message describes the defect you just removed.** This is
+AGENTS' `devprep` warning one binary over, and worse, because nothing prints a warning.
+
+**7. A fix for a gate that asserts nothing can itself assert nothing, one layer down.** Setting
+`SNX_PACKAGING_ROOT=required` in a step's `env:` block would never have reached a process launched
+as `sudo "$BIN"` — `env_reset` — so the variable would be unset, the test would find root and run
+anyway, and `required` would assert exactly nothing. Spell it at the call.
+
+**8. Pre-register several distinct readings, not one expected outcome.** The guards that produced
+*named* results rather than bare reds were the ones that wrote down four possibilities in advance.
+Item 17's parity test is the case: "counted + payload intact" arrived as a finding with a mechanism
+— §15.21's clause answered **counted, not lost** — where a single-outcome guard would have gone red
+and been "fixed" by loosening the assertion. Item 41 did the same across three altitudes, and the
+plants proved the ladder necessary: a single guard would have passed at least one of them.
+
+**9. Two mistakes of the session's own, recorded because the record is worth more than the
+appearance.** `git add -A` under concurrent subagent writers put unreviewed in-flight work on `main`
+inside a commit described as docs-only; CI caught it, and the revert was built in an isolated
+worktree so the agents' live checkout was never touched. **Stage by explicit path whenever anything
+else may be writing.** And pushing again while CI is still running cancels the earlier run
+(`cancel-in-progress` on pushes) — harmless when the newer commit is a superset, which must be
+*checked* rather than assumed.
