@@ -2049,9 +2049,11 @@ mod tests {
     /// (plan §18 item 66; notes §3.101).
     ///
     /// `itest`'s `SlaveWitness::prove_open` checks four things, and on Linux the
-    /// third — the path still resolves to the fd's device — always answers before
-    /// this helper is reached, because the kernel unlinks a pts entry at its master's
-    /// close. The only shape that could slip past it is the path coming *back*,
+    /// **second** — `stat` on the path the fd was opened through — always answers
+    /// before this helper is reached, because the kernel unlinks a pts entry at its
+    /// master's close, so that `stat` fails `ENOENT` and returns early. (Step 3, the
+    /// comparison of the two identities, is a *different* check and is never reached
+    /// on this path; conflating them was a slip in this comment until 2026-08-14.) The only shape that could slip past it is the path coming *back*,
     /// pointing at a different pair; this test asserts that Linux cannot produce that
     /// shape while the witness holds its fd. **While any descriptor on a pts is open,
     /// the kernel will not hand that index to a new pair.**

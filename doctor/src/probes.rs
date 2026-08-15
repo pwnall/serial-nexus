@@ -7526,11 +7526,21 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
     // silently-dropped `IXON|IXOFF` request would be answering `supported` to a
     // question this port answered no to.
     //
-    // Ranked *below* the `CRTSCTS` drop because that finding has a shipped
-    // consequence an operator acts on — §15.53 refuses the config at `load` — and
-    // this one has none by decision (plan §18 item 14's decline). The more
-    // actionable finding leads, which is the same ordering rule the restore and
-    // daemon-disagreement arms above follow.
+    // Ranked *below* the `CRTSCTS` drop, and **the reason is no longer that one of
+    // them is actionable**. This comment read "that finding has a shipped consequence
+    // an operator acts on — §15.53 refuses the config at `load` — and this one has
+    // none by decision (plan §18 item 14's decline)" until 2026-08-14. §15.61 gave the
+    // software finding the *same* shipped consequence — `flow_precheck_target` returns
+    // a target for `FlowControl::XonXoff` and `flow_precheck_refuses` refuses
+    // accept-then-drop for either mode — so the justification stopped discriminating
+    // while the ordering it justified stayed correct. The order is now held for
+    // **stability**: a two-defect report's headline must not move under a reader.
+    //
+    // Recorded rather than quietly reworded, because this line is the one the §15.61
+    // repair itself missed. That repair rewrote this function's callee, its own doc and
+    // the era paragraph, and left the ranking rationale 150 lines up the same file
+    // asserting the retired answer — the identical failure mode, one commit later
+    // (notes §3.101).
     let soft_dropped: Vec<&FlowReadback> = rows
         .iter()
         .filter(|r| r.soft.as_ref().is_ok_and(|s| s.silently_dropped()))
@@ -10677,13 +10687,26 @@ mod tests {
             "the hardware drop must lead over the software one so a two-defect \
              headline is stable: {c}"
         );
-        // …and both refusals must be stated, which is the clause that would have
-        // caught §15.61's half-landing on a port carrying both defects at once.
-        assert!(
-            c.contains("REFUSED at `load`/`add-node`")
-                && c.contains("is REFUSED at `load`/`add-node`, before anything is created"),
-            "a port dropping BOTH modes must have both refusals stated — the operator \
-             needs to know that neither mode is a fallback from the other: {c}"
+        // …and both refusals must be stated. **Counted, not `contains`-ed, and the
+        // first spelling of this assertion is worth keeping in view**: it was
+        //
+        //     c.contains("REFUSED at `load`/`add-node`")
+        //         && c.contains("is REFUSED at `load`/`add-node`, before anything is created")
+        //
+        // whose first operand is a strict substring of its second, so the conjunction
+        // reduced to the second alone — and the *hardware* arm satisfies that by
+        // itself. On the unfixed tree, where the software arm carried no refusal at
+        // all, it passed. A guard written to catch §15.61's half-landing that the
+        // half-landing walks straight through is the same defect as the one it was
+        // written for, in the same file, in the commit that fixed it (notes §3.101).
+        //
+        // Two occurrences is the property: one refusal per mode. It fails at 1.
+        assert_eq!(
+            c.matches("REFUSED at `load`/`add-node`").count(),
+            2,
+            "a port dropping BOTH modes must have BOTH refusals stated — one per mode. \
+             The operator needs to know that neither mode is a fallback from the other, \
+             which is exactly what §15.61 clause 3 retracted the old remedy for: {c}"
         );
 
         // An honest refusal: `tcsetattr` failed rather than reporting success over a

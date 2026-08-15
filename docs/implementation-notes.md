@@ -12184,8 +12184,13 @@ the assertion discriminates held from free rather than passing on a kernel that 
 
 **What the Mac session got right, recorded because refuted diagnoses are load-bearing (§9).** Four
 candidate defects were raised against it and refuted on the tree: the nanosecond conversions in
-`p3_idle_cost`, `p9_pty_collapse` and `p12_sim_idle_cpu` preserve their thresholds exactly (10 % of
-a core each; `_SC_CLK_TCK` is 100 here so `1_000_000_000 / hz` is exact); the `XonXoff` arm's
+`p3_idle_cost`, `p9_pty_collapse` and `p12_sim_idle_cpu` preserve their thresholds exactly
+(`_SC_CLK_TCK` is 100 here, so `1_000_000_000 / hz` is exact and every converted constant is the
+same number in a finer unit — `p9_pty_collapse` 200 ms over a 2 s window and `p12_sim_idle_cpu`
+300 ms over 3 s, both 10 % of a core; `p3_idle_cost` converts no ceiling of its own, since its two
+bounds are the artifact's `budget_percent` of **20** and `DRIFT_FACTOR` 1.75 × the recorded
+0.0728 %/fd slope — an earlier draft of this sentence said "10 % of a core each" and was wrong
+about that third file); the `XonXoff` arm's
 `CRTSCTS` clear is a no-op on the pts fixture and is restored either way; the load-refusal message
 was already built inline before this diff, so its lack of a constructing test is not new; and the
 absence of a `shipped_predicate_agrees` cross-check for the software mode is a real narrowness but
@@ -12242,3 +12247,50 @@ replacing one precise-looking number with another. What the figure is for is una
 no precision: it separates a rig-lane row (5) from a default-scope one (~14), and that gap is an
 order of magnitude clear of the instability.
 
+
+**The repair reproduced the defect it was repairing, and that is the entry's real subject.** This
+session's own commit was then put through the same treatment it had just applied to the macOS one —
+four readers over disjoint claim classes in `7047b9f`, one adversarial verifier per allegation,
+each told to default to refuted. Four survived, two of them the same class the commit exists to
+close.
+
+1. **`p15_verdict`'s ranking comment still carried the retired justification.** The repair rewrote
+   `p15_soft_note`'s three arms, that function's doc, and the era paragraph — and left the sentence
+   150 lines up the same file reading "that finding has a shipped consequence an operator acts on …
+   and this one has none by decision (plan §18 item 14's decline)". Live, present tense, and false
+   since §15.61. **The repair's own scope statement is what missed it**: notes and item 72 both
+   enumerate "all three arms, the function doc, the pinning guard, and the two verdict remedies",
+   and the enumeration was treated as the extent of the family rather than as the part of it that
+   had been found. A sweep keyed on the *claim* rather than on a list of sites is what closes this;
+   the claim is "the daemon consults nothing here", and it was grep-able the whole time.
+2. **A new guard whose stated power exceeded its actual power** — the same defect as the pinning
+   guard, in the commit that fixed the pinning guard. It read
+   `c.contains("REFUSED at `load`/`add-node`") && c.contains("is REFUSED at `load`/`add-node`,
+   before anything is created")`, whose first operand is a strict *substring* of its second, so the
+   conjunction reduced to the second alone — which the **hardware** arm satisfies by itself. On the
+   unfixed tree, where the software arm carried no refusal at all, it passed. A guard written to
+   catch §15.61's half-landing that the half-landing walks straight through. Replaced with a
+   *count* — two occurrences, one per mode — and proved fail-first in isolation by planting the
+   phrase out of the hardware arm alone, which leaves the earlier assertion green and reddens this
+   one at `left: 1, right: 2`. The old form passes that plant; the new one does not, so it is
+   strictly stronger in both directions.
+3. `peer_hungup`'s doc said the witness's **third** check answers first on Linux. It is the
+   **second** — the `stat` on the path — and step 3 is the identity comparison, which that path
+   never reaches. Two adjacent facts, conflated.
+4. The refuted-candidate record said the three CPU guards' ceilings are "10 % of a core each".
+   True of `p9_pty_collapse` and `p12_sim_idle_cpu`; `p3_idle_cost` converts no ceiling of its own,
+   its bounds being the artifact's `budget_percent` of 20 and `DRIFT_FACTOR` 1.75 × 0.0728 %/fd.
+
+Four allegations were refuted and are recorded as such: that the honoured arm's parenthetical about
+honest refusals was new (it is not, and it is accurate), that the ranking assertion at the dropped
+arm was misapplied (it is not), that witnesses are taken on real serial fds on Linux (they are not
+— every `attach_slave` call site holds a pty link), and that "§15.61 was implemented in the daemon
+and in one constant, and nowhere else" is a file-by-file inventory (it is a claim about where the
+*decision* landed, and it holds).
+
+**What generalizes.** AGENTS §3's tell has a third register now. The first is a gate that asserts
+nothing; the second, found earlier in this session, is a gate that asserts the *previous* answer.
+The third is a gate whose assertion is strictly weaker than the comment above it claims — and
+because the comment is what a reviewer reads, it is the hardest of the three to see. All three
+share one remedy: **plant the defect the guard names and watch it redden**, which is fail-first
+proof applied to the guard's *stated* property rather than to its code.
