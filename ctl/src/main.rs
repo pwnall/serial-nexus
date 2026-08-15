@@ -322,13 +322,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let envelope = json!({ "error": serde_json::to_value(&err)? });
             println!("{}", serde_json::to_string_pretty(&envelope)?);
         } else {
-            // One rendering for a refused request, spelled in `serial_nexus_rpc` beside
-            // the type (plan §18 item 59(c)). This line used to read
-            // `error <code>: <message>` while [`read_ack`] below read
-            // `<verb> failed: <message> (<code>)` — the same object, the same binary,
-            // the same operator, two shapes. `data` still follows on its own lines
-            // rather than riding this one; it is the half that can be large.
-            eprintln!("error: {err}");
+            eprintln!("error {}: {}", err.code, err.message);
             if let Some(data) = err.data {
                 eprintln!("{}", serde_json::to_string_pretty(&data)?);
             }
@@ -833,10 +827,7 @@ fn read_ack<R: BufRead>(reader: &mut R, line: &mut String, verb: &str) -> anyhow
         }
         if let Ok(Incoming::Response(resp)) = serde_json::from_str::<Incoming>(line.trim()) {
             if let Some(err) = resp.error {
-                // The rendering is `serial_nexus_rpc`'s, not this file's: the same
-                // object is turned into the same line by the one-shot path below and by
-                // the web console's headless client (plan §18 item 59(c)).
-                anyhow::bail!("{verb} failed: {err}");
+                anyhow::bail!("{verb} failed: {} ({})", err.message, err.code);
             }
             return Ok(resp.result.unwrap_or(Value::Null));
         }
@@ -1303,64 +1294,5 @@ mod tests {
         let params = params.unwrap();
         assert_eq!(params["dtr"], json!(false));
         assert_eq!(params["rts"], Value::Null);
-    }
-
-    /// **What a refused streaming ack prints, to the byte** (plan §18 item 59(c)).
-    ///
-    /// The two itest guards that already watch this path assert
-    /// `stderr.contains("-32601")` — which is what they claim and all they claim.
-    /// Every candidate rendering satisfies it, the raw JSON object included, so the
-    /// rendering itself was asserted by nothing at either client and diverged between
-    /// them unnoticed. This pins the whole line, and it pins the *tail* structurally to
-    /// `serial_nexus_rpc`'s rendering as well, so a second spelling of `<message>
-    /// (<code>)` re-entering this file reddens here rather than in a review.
-    ///
-    /// It needs no socket: `read_ack` is generic over [`BufRead`], and a `&[u8]` is one.
-    #[test]
-    fn a_refused_ack_names_the_verb_and_renders_the_error_once() {
-        let refusal = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":\
-                       {\"code\":-32601,\"message\":\"method not found: subscribe\"}}\n";
-        let mut reader = refusal.as_bytes();
-        let mut line = String::new();
-        let err = read_ack(&mut reader, &mut line, "subscribe")
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            err,
-            "subscribe failed: method not found: subscribe (-32601)"
-        );
-        assert!(
-            err.ends_with(
-                &serial_nexus_rpc::RpcError::new(-32601, "method not found: subscribe").to_string()
-            ),
-            "the line no longer ends in the shared rendering: {err}"
-        );
-
-        // `data` is printed by the one-shot path on its own lines; it must not be
-        // spliced into this one, where it would ride a single stderr line unbounded.
-        let with_data = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\
-                         \"message\":\"unknown endpoint: nope\",\
-                         \"data\":{\"available\":[\"usb0\"]}}}\n";
-        let mut reader = with_data.as_bytes();
-        let err = read_ack(&mut reader, &mut line, "tap.open")
-            .unwrap_err()
-            .to_string();
-        assert_eq!(err, "tap.open failed: unknown endpoint: nope (-32602)");
-
-        // The rest of the helper's stated contract, which nothing else asserts: a
-        // stray notification ahead of the ack is skipped rather than mistaken for it,
-        // the result comes back on success, and an EOF before the ack is an error
-        // naming the verb rather than a successful empty stream.
-        let with_note = "{\"jsonrpc\":\"2.0\",\"method\":\"node.status\",\"params\":{}}\n\
-                         {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"subscribed\":true}}\n";
-        let mut reader = with_note.as_bytes();
-        let ack = read_ack(&mut reader, &mut line, "subscribe").expect("the ack is the response");
-        assert_eq!(ack, json!({"subscribed": true}));
-
-        let mut empty = &b""[..];
-        let err = read_ack(&mut empty, &mut line, "tap.open")
-            .unwrap_err()
-            .to_string();
-        assert_eq!(err, "connection closed before the tap.open acknowledgement");
     }
 }

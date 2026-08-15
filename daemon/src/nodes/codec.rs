@@ -2,21 +2,15 @@
 //! compiled-in codec registry that instantiates these (§8/§15.26) lives in
 //! [`crate::registry`]; this module is the running node.
 //!
-//! **Orientation.** The **demultiplexer** (`faces = target`) is the shape a
-//! device drives: the multiplexed side is the node's default endpoint, facing the
-//! device across a serial; N channel endpoints face host consumers. Hostward, raw
-//! multiplexed bytes are `demux`ed into per-channel events and fanned out;
-//! targetward, per-channel writes are `mux`ed back into the multiplexed stream and
-//! forwarded to the device. The **re-multiplexer** (`faces = host`) is the mirror,
-//! and a standalone instance of it has no driver: §7.5 says such a node "is
-//! accepted by validation but waits for a driver", so it comes up **waiting** with
-//! a §14 reason — the config stays loadable and the gap is visible in state
-//! (§15.8). (The construction-era "Phase 5 implements the demultiplexer" framing
-//! this paragraph opened with is retired — plan §18 items 55(a), 59(d) — for
-//! `pty.rs`'s reason: it landed long ago, so the label was a map of a tree that no
-//! longer exists. The `faces = host` sentence is **not** such a label: no driver
-//! exists for a standalone re-multiplexer today, and §7.5 specifies the waiting
-//! node rather than deferring it.)
+//! **Orientation.** Phase 5 implements the **demultiplexer** (`faces = target`):
+//! the multiplexed side is the node's default endpoint, facing the device across
+//! a serial; N channel endpoints face host consumers. Hostward, raw multiplexed
+//! bytes are `demux`ed into per-channel events and fanned out; targetward,
+//! per-channel writes are `mux`ed back into the multiplexed stream and forwarded
+//! to the device. The **re-multiplexer** (`faces = host`) is the mirror, and a
+//! standalone instance of it has no driver yet: §7.5 says such a node "is accepted
+//! by validation but waits for a driver", so it comes up **waiting** with a §14
+//! reason — the config stays loadable and the gap is visible in state (§15.8).
 //!
 //! **Interior contract (§5).** The codec holds only parser state (a partial
 //! frame, bounded by the frame size) — no queues. It runs on the async runtime;
@@ -34,8 +28,9 @@
 //! demultiplexer's lock and corrupt the framing. The §6 stall, with commands
 //! delayed, never dropped.
 
+use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -49,7 +44,6 @@ use tokio::sync::mpsc;
 
 use crate::boundary::TaskSet;
 use crate::cell::CriticalCell;
-use crate::nodes::identity_set::IdentitySet;
 use crate::runtime::{
     DropCounters, EdgeInbox, HostwardChannelStat, LossCounter, SharedFanOut, SharedTargetEdge,
     TargetwardInbox, TeardownLoss, Wiring, await_origin, forward_targetward, frame_ranges,
@@ -105,6 +99,20 @@ impl HostwardChannelStat for ChannelStat {
     }
 }
 
+/// The largest number of *distinct* unconfigured channel identities a codec node
+/// remembers (CODEC-1). Same cap, same reasoning as the leg's `unbound` list
+/// (LEG-2): the identities come from outside the operator's configuration — a
+/// transform's decode, or an exec child's stdout — so an unbounded list is an
+/// unbounded allocation driven by the wire.
+pub(crate) const MAX_UNCONFIGURED: usize = 256;
+
+/// The largest stored length of one such identity, in bytes.
+pub(crate) const MAX_UNCONFIGURED_ID_LEN: usize = 64;
+
+/// Appended to a truncated identity, so `state` never shows a shortened name as
+/// though it were the real one.
+const TRUNCATION_MARKER: &str = "…(truncated)";
+
 /// Channel identities the transform decoded that this node is **not** configured
 /// for, and the bytes they carried (CODEC-1, design §5 "loss is always visible and
 /// attributable").
@@ -118,18 +126,19 @@ impl HostwardChannelStat for ChannelStat {
 /// distinguishes a typo from a device multiplexing a stream the operator never
 /// enumerated.
 ///
-/// The cap, the dedup, the marked truncation and the counted refusals are
-/// [`IdentitySet`]'s, which the leg holds the other instance of: these identities
-/// come from outside the operator's configuration — a transform's decode, or an
-/// exec child's stdout — so an unbounded list is an unbounded allocation driven by
-/// the wire, which is the leg's exposure exactly (LEG-2). This wrapper is the
-/// codec's half of the split: the byte count the leg has no equivalent of, the
-/// first-sighting WARN, and the three §5 field names. It lives in this module
-/// because the codec node is its first user and the exec codec shares this one
-/// instance (`nodes/exec.rs`), so the two cannot drift.
+/// This is `leg::UnboundSet`'s design reused rather than re-derived: a capped,
+/// insertion-ordered `Vec`, a `HashSet` for dedup, per-identity truncation with an
+/// explicit marker, and an overflow *occurrence* count for what the cap refused.
+/// It lives in this module because the codec node is its first user and the exec
+/// codec shares this one copy (`nodes/exec.rs`), so the two cannot drift.
 #[derive(Default)]
 pub(crate) struct UnconfiguredChannels {
-    set: IdentitySet,
+    order: Vec<String>,
+    seen: HashSet<String>,
+    /// Occurrences the cap refused to record — *not* distinct identities, which
+    /// cannot be counted without remembering them, which is the thing being bounded.
+    /// A repeat of an already-recorded identity is not an overflow.
+    overflow: u64,
     /// Bytes discarded on an unconfigured identity, whether or not the identity
     /// itself was recordable.
     bytes: u64,
@@ -140,19 +149,26 @@ impl UnconfiguredChannels {
     /// the identity alone, which is what an `open` on it amounts to.
     ///
     /// The first sighting also logs once at WARN — the dedup *is* the rate limit, so
-    /// an unconfigured channel screaming at 1 MB/s costs exactly one line. That the
-    /// log fires exactly when the identity is *newly recorded* is [`IdentitySet`]'s
-    /// return value rather than a second test of the same condition here.
+    /// an unconfigured channel screaming at 1 MB/s costs exactly one line.
     pub(crate) fn record(&mut self, id: &str, n: u64) {
         self.bytes += n;
-        if let Some(stored) = self.set.insert(id) {
-            tracing::warn!(
-                target: "codec",
-                channel = %stored,
-                "decoded data on a channel identity this node is not configured for; \
-                 dropped and counted as discarded_unconfigured_channel (§5)"
-            );
+        let id = truncate_identity(id);
+        if self.seen.contains(id.as_ref()) {
+            return;
         }
+        if self.order.len() >= MAX_UNCONFIGURED {
+            self.overflow += 1;
+            return;
+        }
+        tracing::warn!(
+            target: "codec",
+            channel = %id,
+            "decoded data on a channel identity this node is not configured for; \
+             dropped and counted as discarded_unconfigured_channel (§5)"
+        );
+        let id = id.into_owned();
+        self.seen.insert(id.clone());
+        self.order.push(id);
     }
 
     /// Write the three §5 fields into a node's `state_extra` object. One writer for
@@ -163,15 +179,23 @@ impl UnconfiguredChannels {
             "discarded_unconfigured_channel".to_owned(),
             json!(self.bytes),
         );
-        obj.insert(
-            "unconfigured_channels".to_owned(),
-            json!(self.set.identities()),
-        );
-        obj.insert(
-            "unconfigured_overflow".to_owned(),
-            json!(self.set.overflow()),
-        );
+        obj.insert("unconfigured_channels".to_owned(), json!(self.order));
+        obj.insert("unconfigured_overflow".to_owned(), json!(self.overflow));
     }
+}
+
+/// Bound the stored length of a decoded identity, marking a truncation explicitly.
+/// Truncation lands on a `char` boundary: the identity is transform-supplied UTF-8
+/// and a split code point would not survive JSON.
+fn truncate_identity(id: &str) -> Cow<'_, str> {
+    if id.len() <= MAX_UNCONFIGURED_ID_LEN {
+        return Cow::Borrowed(id);
+    }
+    let mut end = MAX_UNCONFIGURED_ID_LEN;
+    while end > 0 && !id.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!("{}{TRUNCATION_MARKER}", &id[..end]))
 }
 
 /// The prefix every demux-failure fault reason carries, so the demux task can tell
@@ -843,13 +867,6 @@ async fn channel_targetward(
 mod signal_tests {
     use super::*;
     use crate::runtime::{SharedLock, TargetEdge, frame_payload_cap};
-
-    // The codec's spellings of the shared bounds. Aliases of one definition, not a
-    // second copy: change the value in `identity_set` and both node kinds move.
-    use crate::nodes::identity_set::{
-        MAX_IDENTITIES as MAX_UNCONFIGURED, MAX_IDENTITY_LEN as MAX_UNCONFIGURED_ID_LEN,
-        TRUNCATION_MARKER,
-    };
     use serial_nexus_codec_api::CodecError;
     use serial_nexus_core::lock::{Arbitration, EndpointLock, OriginId, WriteMode};
     use tokio::sync::broadcast;
@@ -1124,24 +1141,20 @@ mod signal_tests {
         for i in 0..MAX_UNCONFIGURED + 50 {
             set.record(&format!("ch-{i}"), 1);
         }
-        assert_eq!(
-            set.set.identities().len(),
-            MAX_UNCONFIGURED,
-            "the list is bounded"
-        );
-        assert_eq!(set.set.overflow(), 50, "what the cap refused is counted");
+        assert_eq!(set.order.len(), MAX_UNCONFIGURED, "the list is bounded");
+        assert_eq!(set.overflow, 50, "what the cap refused is counted");
         assert_eq!(set.bytes, (MAX_UNCONFIGURED + 50) as u64, "no byte is lost");
 
         // A repeat is neither duplicated nor counted as overflow, but its bytes count.
-        let before = set.set.overflow();
+        let before = set.overflow;
         set.record("ch-0", 4);
-        assert_eq!(set.set.identities().len(), MAX_UNCONFIGURED);
-        assert_eq!(set.set.overflow(), before);
+        assert_eq!(set.order.len(), MAX_UNCONFIGURED);
+        assert_eq!(set.overflow, before);
 
         // A multi-byte identity truncates on a char boundary, marked.
         let mut set = UnconfiguredChannels::default();
         set.record(&"€".repeat(MAX_UNCONFIGURED_ID_LEN), 0);
-        let stored = &set.set.identities()[0];
+        let stored = &set.order[0];
         assert!(stored.ends_with(TRUNCATION_MARKER), "{stored}");
         assert!(
             stored.len() <= MAX_UNCONFIGURED_ID_LEN + TRUNCATION_MARKER.len(),

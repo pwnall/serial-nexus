@@ -16,10 +16,6 @@
 
 pub mod codec;
 pub mod exec;
-/// The bounded identity set the leg and the codec both keep (LEG-2 / CODEC-1).
-/// Not a node kind: a mechanism two of them share, hoisted here so the cap, the
-/// dedup and the truncation rule are written once (plan §18 item 59(d)).
-pub mod identity_set;
 pub mod leg;
 pub mod log;
 pub mod map;

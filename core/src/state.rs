@@ -1,22 +1,7 @@
 //! Observed state — the environment-owned half of the strict split (§15.8).
 //! Reportable by the `state` verb, never persisted, and by construction absent
-//! from every configuration type.
-//!
-//! This module is the status vocabulary and the split, and deliberately nothing
-//! else: the `active | waiting | faulted` family every node kind reports (§7),
-//! and the stamp that says when it last *changed* rather than when it was last
-//! polled. The per-boundary counters §5 asks for ("loss is always visible and
-//! attributable") live where the bytes cross — each node kind's own stats,
-//! surfaced through its `state_extra` object — because what a counter is called
-//! is part of what that boundary observed, and one struct here would have to give
-//! a single name to losses that are deliberately not the same loss.
-//!
-//! (This header used to frame that as construction phases — "Fleshed out with
-//! counters per boundary in phase 3; phase 1 establishes only the status
-//! vocabulary and the split". Retired for `daemon/src/nodes/mod.rs`'s reason,
-//! plan §18 item 59(b): the counters landed long ago, and they landed at the
-//! boundaries rather than here, so the sentence had become a map of a tree that
-//! never existed.)
+//! from every configuration type. Fleshed out with counters per boundary in
+//! phase 3; phase 1 establishes only the status vocabulary and the split.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -21,7 +21,7 @@ mod linux_impl {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    use serial_nexus_itest::{Daemon, Sim, cpu_nanos, seeded_bytes, sha256_hex};
+    use serial_nexus_itest::{Daemon, Sim, seeded_bytes, sha256_hex};
 
     /// 256 MiB, matching the script's `SIZE_H="256MiB"` / `SIZE_B=256*1024*1024`.
     /// Far larger than the RSS budget, so any interior accumulation of the stream
@@ -32,13 +32,6 @@ mod linux_impl {
     const RSS_BUDGET_KB: u64 = 120 * 1024;
     /// The source seed (`--seed 7`).
     const SEED: u64 = 7;
-    /// How often the drain loop stats the sink. It bounds the error on the
-    /// throughput window's *start*: the window opens on the first poll that sees
-    /// a non-empty sink, so the true first byte landed at most one `POLL` earlier.
-    /// At 2 ms against a window of well over a second that is under 0.2 %.
-    const POLL: Duration = Duration::from_millis(2);
-    /// The calibration rung's payload.
-    const REF_SIZE: usize = 64 * 1024 * 1024;
 
     /// Scan /proc for the `serial-nexus-daemon` process whose NUL-separated argv carries
     /// `socket` (unique per test) — the portable-Rust stand-in for the bash's
@@ -99,61 +92,6 @@ mod linux_impl {
         None
     }
 
-    /// What this box, at this instant, moves through a pty with a *null* consumer:
-    /// the same `serial-nexus-sim pty --source` double the firehose is fed by, drained
-    /// by a bare `read` loop in this process. Returns MiB/s over the same window shape
-    /// the daemon rung uses (first byte to last), and the bytes it actually saw.
-    fn reference_rate(run: &Path, bytes: usize, label: &str) -> f64 {
-        use std::io::Read;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let dev = run.join(format!("refdev-{label}"));
-        let _src = Sim::spawn(
-            &[
-                "pty",
-                "--source",
-                "--bytes",
-                &format!("{bytes}"),
-                "--seed",
-                "7",
-                "--link",
-                &dev.to_string_lossy(),
-                "--timeout-ms",
-                "120000",
-            ],
-            Some(&dev),
-        );
-        // O_NOCTTY: this is a pts, and a test process must never acquire one as its
-        // controlling terminal.
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOCTTY)
-            .open(&dev)
-            .unwrap_or_else(|e| panic!("open the reference source {}: {e}", dev.display()));
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut seen = 0usize;
-        let mut t0: Option<Instant> = None;
-        while seen < bytes {
-            match f.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if t0.is_none() {
-                        t0 = Some(Instant::now());
-                    }
-                    seen += n;
-                }
-                Err(_) => break,
-            }
-        }
-        let elapsed = t0
-            .expect("the reference source delivered nothing")
-            .elapsed();
-        let mib = seen as f64 / (1024.0 * 1024.0);
-        let rate = mib / elapsed.as_secs_f64();
-        eprintln!("p3_firehose: reference[{label}] {seen} B in {elapsed:?} = {rate:.1} MiB/s");
-        rate
-    }
-
     pub fn run() {
         let d = Daemon::start();
         let rpc = d.rpc();
@@ -162,8 +100,6 @@ mod linux_impl {
         // The daemon's PID (for the /proc RSS sample), found before the stream.
         let socket = d.socket();
         let pid = wait_for_daemon_pid(&socket);
-
-        let ref_before = reference_rate(run.path(), REF_SIZE, "before");
 
         // A software serial *source*: a pty double that floods SIZE seeded bytes
         // then exits. Spawned BEFORE the load (as the script does) and held in
@@ -215,11 +151,7 @@ b = "sink"
         // SIZE and RSS must stay under budget within the 60s throughput bound.
         let sink = run.join("sink.log");
         let mut peak_kb: u64 = 0;
-        // (when the sink was first seen non-empty, how much was already there) —
-        // the start of the throughput window. See `moved`/`elapsed` below.
-        let mut first_bytes: Option<(Instant, u64, u64)> = None;
-        let deadline = Instant::now() + Duration::from_secs(900);
-        let done_at;
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let size = std::fs::metadata(&sink).map(|m| m.len()).unwrap_or(0);
             if let Some(rss) = vmrss_kb(pid)
@@ -227,11 +159,7 @@ b = "sink"
             {
                 peak_kb = rss;
             }
-            if first_bytes.is_none() && size > 0 {
-                first_bytes = Some((Instant::now(), size, cpu_nanos(pid)));
-            }
             if size >= SIZE as u64 {
-                done_at = (Instant::now(), cpu_nanos(pid));
                 break;
             }
             assert!(
@@ -240,36 +168,11 @@ b = "sink"
             );
             assert!(
                 Instant::now() < deadline,
-                "firehose did not complete within 900s (throughput regression); \
+                "firehose did not complete within 60s (throughput regression); \
                  sink at {size}/{SIZE} B"
             );
-            std::thread::sleep(POLL);
+            std::thread::sleep(Duration::from_millis(20));
         }
-        let (t0, size0, cpu0) = first_bytes.expect(
-            "the sink went from empty to complete inside one poll, so there is no \
-             throughput window to measure",
-        );
-        let (t1, cpu1) = done_at;
-        let elapsed = t1.duration_since(t0);
-        let moved = SIZE as u64 - size0;
-        let mib = moved as f64 / (1024.0 * 1024.0);
-        let mib_per_s = mib / elapsed.as_secs_f64();
-        let cpu_ms_per_mib = (cpu1 - cpu0) as f64 / 1e6 / mib;
-        eprintln!(
-            "p3_firehose: {moved} B in {elapsed:?} = {mib_per_s:.1} MiB/s wall, \
-             {:.3} ms of daemon CPU per MiB ({} ms total) \
-             (window opens at the first byte on disk, {size0} B already there)",
-            cpu_ms_per_mib,
-            (cpu1 - cpu0) / 1_000_000
-        );
-        let ref_after = reference_rate(run.path(), REF_SIZE, "after");
-        let reference = ref_before.min(ref_after);
-        eprintln!(
-            "p3_firehose: ratio[min] {:.2}  ratio[before] {:.2}  ratio[after] {:.2}",
-            reference / mib_per_s,
-            ref_before / mib_per_s,
-            ref_after / mib_per_s
-        );
 
         // Byte-exact: identical size and checksum (a lossy firehose fails here).
         // Reconstruct the source's checksum from the seed, then release that buffer
