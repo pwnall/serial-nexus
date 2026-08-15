@@ -945,7 +945,16 @@ this section has never contained (notes §3.75).
    answer is the shape §12's `has_identity_source` exists to prevent, and echoing the ask would
    make the field agree with itself everywhere and assert nothing. It is a read-back and not a
    wire measurement — P14's `achieved_baud_floor` is that, and it needs a cross-wired peer.
-   *Specified ahead of the tree (AGENTS §5); plan §18 item 41 is the construction.*
+   *Constructed 2026-08-15 (plan §18 item 41; notes §3.107) — this clause is settled system, and
+   with it the design carries **no** surface specified ahead of the tree.* **One correction the
+   construction forced, recorded here because the clause's motivating example was wrong:** the
+   4 Mbaud ask does **not** reach an `active` node running at 9600. `serial2` verifies its own
+   `set_configuration` by read-back within ±2.5 %, so an FT232R clamping to 9600 fails that check
+   and the **open fails** — the node is `faulted`, and `actual_baud` is `null` because there is no
+   port to read. Measured on the rig: `status="faulted" baud=4000000 actual_baud=null`. So on this
+   platform the field earns its keep as *the `null` that refuses to claim a rate*, plus the truthful
+   answer wherever a driver reports a quantized one; the wire's realized rate stays P14's
+   `achieved_baud_floor`.
 
 **Ordered release.** Giving back what the node asserted *on the tty* belongs to the port rather
 than to whichever exit path someone remembered:

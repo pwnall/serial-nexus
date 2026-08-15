@@ -113,6 +113,7 @@ it is how a reading the kernel would not give us is distinguished from a zero.
 | `identity_kind` | string | which identity grammar that is: `usb`, `by-path`, `by-id`, `raw`, or `unknown` (§12) |
 | `resolved_path` | string \| null | the `/dev` node the identity resolves to *now* — state, not configuration (§12). `null` when nothing answers it |
 | `baud` | integer | the rate the port is opened at (§7.1) |
+| `actual_baud` | integer \| null | the rate the port's driver **answers with**, read back from the tty beside the `baud` that was asked for (§7.1's *Open, hold, and reopen* clause 7, decided at §15.58). `null` when the daemon holds no port (read `open` beside it) or the platform will not report a rate back: an unknown says so rather than echoing the request, since a field that agreed with itself everywhere would assert nothing. **Reporting only** — a driver quantizing to what its clock divisor can express is ordinary and only the operator knows which margin their device tolerates, so a divergence here is never a fault, a refusal, or a verdict. It is the *driver's answer*, not a measurement of the wire; the wire's rate is the doctor's P14 `achieved_baud_floor`, which needs a cross-wired peer |
 | `open` | boolean | whether the daemon currently holds the port open. `false` with `status: "waiting"` is an unplugged device, not a failure |
 | `discarded_unattached` | integer | see [loss counters](#loss-counters-in-the-node-type-extras) |
 | `purged_on_reconnect` | integer | see [loss counters](#loss-counters-in-the-node-type-extras) |

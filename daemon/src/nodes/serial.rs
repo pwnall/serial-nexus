@@ -597,11 +597,17 @@ impl SerialNode {
                 .resolve_current_path(&self.device)
                 .map(|p| p.display().to_string());
             let modem_lines = sh.port.as_ref().map(|p| read_modem_lines(p.as_raw_fd()));
+            // The rate asked for and the rate the driver answers with, side by side
+            // (§7.1's *Open, hold, and reopen* clause 7). Two different facts, and the
+            // pair is the point: a port that landed somewhere else is invisible in
+            // `baud` alone, which is the configuration echoed back.
+            let actual_baud = read_actual_baud(sh.port.as_deref());
             json!({
                 "identity": self.device,
                 "identity_kind": DeviceKind::of(&self.device).label(),
                 "resolved_path": resolved_path,
                 "baud": self.params.baud,
+                "actual_baud": actual_baud,
                 "open": sh.port.is_some(),
                 "discarded_unattached": self.discarded_unattached.load(Ordering::Relaxed),
                 "purged_on_reconnect": self.purged_reconnect.load(Ordering::Relaxed),
@@ -1427,6 +1433,48 @@ pub(crate) fn set_modem(
     })
 }
 
+/// The rate the driver says this port is running at — the read-back §7.1's *Open,
+/// hold, and reopen* clause 7 reports beside the configured rate — or `null` when
+/// there is no answer to read.
+///
+/// (Clause **7 of that list**, not of the flow-control list below it in the same
+/// section; §7.1 numbers three lists and both sevens exist.)
+///
+/// `null` has exactly two causes and they are told apart by the `open` field beside
+/// it: the node holds no port (`open: false` — `waiting`, `faulted`, or between
+/// them), or the port is open and the platform would not give the rate back. Both
+/// are "unknown", and the design's rule for an unknown is that it must *say so*:
+/// echoing the request would make the field agree with itself on every platform and
+/// assert nothing (§15.58; the same doctrine as §12's `has_identity_source`, and
+/// §15.49's "a zero is a claim" one field over — a number that was never measured,
+/// printed where a measurement goes).
+///
+/// **It is handed the port and nothing else, so an echo of the ask is not a mistake
+/// this function can make.** That is deliberate and structural rather than a comment
+/// asking the next author not to: `OpenParams::baud` is not in scope here, so the
+/// only number it can return is one the driver answered with.
+///
+/// Reporting only — no verdict, no fault, no refusal. A driver quantizing to what
+/// its clock divisor can express is ordinary, and only the operator knows which
+/// margin their device tolerates (§15.58, which records why this is *not* §15.53's
+/// refusal).
+///
+/// **Read live, like its two neighbours**, rather than latched at open: `state_extra`
+/// already re-reads `TIOCGICOUNT` and `TIOCMGET` off the same fd, and a rate latched
+/// at open would go stale in exactly the case that matters — a reconnect that adopted
+/// a *different* adapter (§12 permits the path to move; the identity is what must
+/// not). One `tcgetattr` per `state` call, the same class of cost as the two ioctls
+/// already here.
+fn read_actual_baud(port: Option<&ExclusivePort>) -> serde_json::Value {
+    match port
+        .and_then(|p| p.get_configuration().ok())
+        .and_then(|s| s.get_baud_rate().ok())
+    {
+        Some(baud) => json!(baud),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// Read the current modem-line levels for state (§7.1), or `null` where the fd
 /// does not support `TIOCMGET` (a pts). DTR/RTS are outputs, the rest inputs.
 fn read_modem_lines(fd: std::os::fd::RawFd) -> serde_json::Value {
@@ -2212,6 +2260,75 @@ mod tests {
         assert!(
             !err.to_string().is_empty(),
             "the failure must carry the driver's own words: {err}"
+        );
+    }
+
+    /// **The reported rate follows the port, not the configuration** — §7.1's
+    /// *Open, hold, and reopen* clause 7, asserted by making the two disagree.
+    ///
+    /// The whole value of the field is the case where the ask and the answer are
+    /// different numbers (§15.58: P14's `adapter-refused` class, a 4 Mbaud ask
+    /// landing at 9600 with no errno). An implementation that reported
+    /// `params.baud` would be indistinguishable from a correct one everywhere the
+    /// driver honours the ask — which is everywhere this suite runs — so the
+    /// divergence is *manufactured* here rather than waited for.
+    ///
+    /// **A master-side `tcsetattr` stands in for a driver that lands elsewhere**,
+    /// the way `PARENB` on a pts stands in for a `CRTSCTS`-refusing UART two tests
+    /// up: on Linux a `TCSETS` issued on a pty *master* is applied to the slave's
+    /// termios, so the tty this node holds open really does change speed underneath
+    /// it, with the node's own fd untouched. The mechanism differs from an adapter
+    /// clamping to its divisor; the observable — the termios says a number nobody
+    /// asked it for — is the same one, and that observable is all this field
+    /// reports. The hardware arm is
+    /// `itest/tests/serial_hardware.rs::crossover_rig_actual_baud_is_a_read_back_not_an_echo`,
+    /// where the FT232R does the clamping itself.
+    ///
+    /// This cannot pass vacuously: if the stand-in stopped working the subject arm
+    /// would read 115200 and fail. The independent read of the tty in between is
+    /// there to say *which* half broke — the mechanism or the field.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn actual_baud_follows_the_port_rather_than_the_rate_that_was_asked_for() {
+        use nix::sys::termios::{BaudRate, SetArg, cfgetospeed, cfsetispeed, cfsetospeed};
+        use nix::sys::termios::{tcgetattr, tcsetattr};
+        let pts = pts_fixture();
+
+        // No port: an unknown, said as one. Echoing the configured rate here is the
+        // shape clause 7 forbids in as many words.
+        assert_eq!(
+            read_actual_baud(None),
+            serde_json::Value::Null,
+            "a node holding no port reported a rate anyway"
+        );
+
+        let port = open_port(&pts.path, &open_params(ModemLines::default())).expect("open the pts");
+        assert_eq!(
+            read_actual_baud(Some(&port)),
+            json!(115_200),
+            "the read-back disagreed with a rate this tty accepted — the field is \
+             unusable if it cannot report the ordinary case"
+        );
+
+        // Move the tty under the open port, from the other end of the pair.
+        let mut t = tcgetattr(&pts._master).expect("tcgetattr on the master");
+        cfsetispeed(&mut t, BaudRate::B9600).expect("cfsetispeed");
+        cfsetospeed(&mut t, BaudRate::B9600).expect("cfsetospeed");
+        tcsetattr(&pts._master, SetArg::TCSANOW, &t).expect("tcsetattr on the master");
+        let moved = tcgetattr(&pts._master).expect("tcgetattr after");
+        assert_eq!(
+            cfgetospeed(&moved),
+            BaudRate::B9600,
+            "the stand-in did not move the tty, so the arm below would be measuring \
+             nothing (§9): a master-side TCSETS no longer reaches the slave's termios"
+        );
+
+        // The subject. `params.baud` is still 115200 and the wire is at 9600.
+        assert_eq!(
+            read_actual_baud(Some(&port)),
+            json!(9_600),
+            "`actual_baud` echoed the rate that was ASKED for while the port was \
+             running at another — the one thing §7.1 clause 7 exists to make visible"
         );
     }
 

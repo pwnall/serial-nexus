@@ -1883,11 +1883,40 @@ existing — §8 names them as ledger items.
     lattice exists to prevent. (d) The documented verb index against the daemon and `ctl` (the
     error-code table in the same file was already derived). One gate landed red on arrival, which
     is the item working: it found the `main.rs` roster three probes stale.
-41. **`actual_baud` read-back on serial open** (M; new design content — the probe already
-    proves the instrument). Report the actual rate beside the requested one in node state;
-    reporting only, no verdict or fault change. *Evidence:* P14's `adapter-refused` class — a
-    4 Mbaud ask silently landing at 9600, with no errno — is visible to the doctor and
-    invisible in node state. *Validation:* fail-first against a refusing rate on the rig.
+41. **`actual_baud` read-back on serial open** — **EXECUTED 2026-08-15** (notes §3.107). **This was
+    the design's only surface specified ahead of the tree; the two now agree completely.**
+    `actual_baud` sits beside `baud` in a serial node's `state_extra`, reporting the driver's answer,
+    `null` where there is no port or the read-back errors, and no verdict either way (§15.58's
+    reported-never-judged). The read-back is `serial2`'s own `get_configuration()`, the call P14
+    already uses, so `serial_nexus_sys` and §16.3 are untouched; it is read **live** per `state`
+    call like its `TIOCGICOUNT`/`TIOCMGET` neighbours, because a value latched at open goes stale
+    after a reconnect that adopted a different adapter. The helper takes the port and nothing else,
+    so `params.baud` is not in scope and an echo is not a mistake it can make — item 42's
+    "structural, not by convention" shape.
+    **The item's own evidence was half wrong, and the correction is the finding.** It read "a
+    4 Mbaud ask silently landing at 9600 … invisible in node state". The *invisible* half was true;
+    the *silent* half is not reachable through the daemon's open. `serial2` verifies
+    `set_configuration` by read-back within ±2.5 %, so an FT232R clamping to 9600 fails that check
+    and the open **fails** — there was never a silently-running node, only a `faulted` one whose
+    state had nothing to say about the rate. The doctor sees `adapter-refused` because it
+    *classifies* that same errno-less failure. Consequence: the reachable-while-`active` divergence
+    is ≤2.5 % quantization, and on `ftdi_sio` even that is zero.
+    *Pre-registered before the rig was touched, and held exactly:* at 4 000 000 —
+    `adapter-refused` on these adapters in the committed 2026-08-14 triple — the node reads
+    `status="faulted" baud=4000000 actual_baud=null`, with a control arm on the same port reading
+    `active` at 115200. *Fail-first at three altitudes:* a unit test that **manufactures** a
+    divergence (a master-side `TCSETS` moves a pts's termios under an open port, ask 115200 answer
+    9600); two pty itests, one anti-echo and one anti-`null`, asserting presence with `.get()`
+    because `node["actual_baud"] == Null` passes against a tree with no field at all; and the rig
+    guard, whose planted echo reads `left: Some(Number(4000000))` against `right: Some(Null)`.
+    *Filed rather than fixed:* (a) reopening at a safe rate on a failed open to surface "asked
+    4 000 000, the port is at 9600" is new mechanism plus a DTR toggle on a fault path — a design
+    question, not a patch; (b) which rungs an FT232R refuses under Darwin's `IOSSIOSPEED` is
+    unmeasured, and P14 on the Mac rig would settle it. The superseded filing follows.
+    *Original:* (M; new design content — the probe already proves the instrument). *Evidence:*
+    P14's `adapter-refused` class — a 4 Mbaud ask silently landing at 9600, with no errno — is
+    visible to the doctor and invisible in node state. *Validation:* fail-first against a refusing
+    rate on the rig.
 42. **`boundary::BlockingReader` unification** — **EXECUTED 2026-08-12** (notes §3.88).
     `BlockingReader` → **`BlockingWorker`**, the name the record itself proposed (review 32's
     SIMP-3) rather than an invented one. The loss counter is optional **structurally**, not by

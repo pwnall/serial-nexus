@@ -12636,3 +12636,67 @@ Two filed descriptions were wrong and are corrected at their items: 59(c)'s "spe
 different. The header predicted a shape the tree rejected.
 
 Rig lane at this tree: **1015 · 0 · 7**, three self-skips, every hardware test passing.
+
+### 3.107 The last surface the design was ahead of the tree on, and the example that was wrong
+
+Plan §18 item 41. `actual_baud` now sits beside `baud` in a serial node's state, which closes **the
+design's only surface specified ahead of the tree** — §7.1 clause 7 is settled system, and design and
+tree agree completely for the first time in this record.
+
+**The construction is unremarkable and the correction is not.** The item's evidence read: "P14's
+`adapter-refused` class — a 4 Mbaud ask silently landing at 9600, with no errno — is visible to the
+doctor and invisible in node state." The *invisible* half was true. The *silent* half is not
+reachable through the daemon's open at all. `serial2` verifies its own `set_configuration` by
+read-back within ±2.5 %, so an FT232R clamping a 4 Mbaud request to 9600 fails that verification and
+**the open fails**. There was never a silently-running node to make visible — only a `faulted` one
+whose state had nothing to say about the rate. The doctor reports `adapter-refused` because it
+*classifies* that same errno-less failure, not because it observes a running mis-clocked port.
+
+So the field's value on this platform is narrower and more honest than the item imagined: it is
+**the `null` that refuses to claim a rate**, plus the truthful answer wherever a driver reports a
+quantized one. The realized wire rate stays P14's `achieved_baud_floor`. On `ftdi_sio` the
+reachable-while-`active` divergence is ≤2.5 % quantization and in practice zero, because the driver
+echoes the request for every rate it accepts — including 2 500 000, which actually runs near
+1.9 Mbaud.
+
+**The prediction was written down before the hardware was touched, and it contradicted the item.**
+Pre-registered: at 4 000 000 — `adapter-refused` on these adapters in the committed 2026-08-14
+triple — the node would read `faulted` with `actual_baud: null`, *not* 9600. Measured:
+`status="faulted" baud=4000000 actual_baud=null`, control arm `active` at 115200 seconds later on
+the same port. The pre-registration also named what each other reading would mean, which is what
+made it worth writing: an `active` node at 4 Mbaud would have refuted the *model of the tree* rather
+than the field, and `actual_baud: 9600` there would have meant `serial2` loosened its verification —
+§15.58's ideal state, and a reason to rewrite the arm rather than the product.
+
+**Fail-first at three altitudes, because one was not enough to separate the failure modes.** A unit
+test *manufactures* a divergence the platform will not produce — a master-side `TCSETS` moves a pts's
+termios under an open port, so ask 115200 answers 9600 — and it is the only arm that catches a
+constant. Two pty itests cover echo and `null`. The rig guard covers a real refusal. Each was
+planted against separately, and the readings differ: the echo plant reddens the anti-echo arm and the
+rig arm; the always-`null` plant reddens the unit arm and the anti-`null` arm; a constant reddens
+only the manufactured-divergence arm. **A single guard would have passed at least one of those
+plants**, which is the argument for the ladder rather than a preference for thoroughness.
+
+One detail worth keeping: the itests assert presence with `.get()` rather than indexing, because
+`node["actual_baud"] == Null` passes against a tree that has no such field at all — §3's tell, one
+subscript deep.
+
+**A process trap this session fell into, recorded because it produced a convincing false red.** The
+first full rig lane after the fail-first plants read **1017 · 2 failed**, both failures showing
+`actual_baud` echoing the ask — the plant's exact behaviour — while `git` and `md5sum` both said the
+source was restored byte-identical. The source *was* restored. **The binary was not.** The itest
+harness spawns `target/debug/serial-nexus-daemon`, and `cargo test` does not rebuild that binary:
+it builds test targets and their library dependencies, not a sibling *binary* crate the harness
+happens to exec. The planted build from the previous step was still sitting there. One
+`cargo build --workspace` and the same tests read green, `actual_baud=null` on both adapters.
+
+This is AGENTS' `devprep` warning — "these tests are measuring the previously blessed build" — one
+binary over, and it is worse here because nothing prints a warning. **A plant-and-restore cycle is
+not complete at the restore; it is complete at the rebuild**, and any harness that execs a built
+artifact rather than linking it can silently measure the previous tree. The tell is a failure whose
+message describes the defect you just planted, on a tree that no longer contains it.
+
+*Filed rather than fixed:* reopening at a safe rate after a failed open, to surface "asked
+4 000 000, the port is at 9600" in node state, is new mechanism plus an extra DTR toggle on a fault
+path — a design question, not a patch. And which rungs an FT232R refuses under Darwin's
+`IOSSIOSPEED` is unmeasured; P14 on the Mac rig would settle it.

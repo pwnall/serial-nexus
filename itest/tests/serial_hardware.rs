@@ -402,6 +402,209 @@ fn crossover_rig_custom_baud_byte_exact() {
     eprintln!("baud {baud}: A→B {a} B, B→A {b} B — byte-exact both directions");
 }
 
+/// A rate this rig's FT232R **refuses**: it accepts the ask with no errno and lands at
+/// 9600, which is doctor P14's `adapter-refused` class (§15.51).
+///
+/// Measured on this box, this kernel and *these two adapters*:
+/// `docs/doctor/linux-7.0-2026-08-14-b58a1c4-tier3.json` — every rung from 9600 to
+/// 3000000 `passed` reading its own request back, and 3062500, 3125000, 3250000,
+/// 3500000 and 4000000 all `adapter-refused` with `actual_baud_a`/`_b` = 9600 and
+/// `refusal_errno: null` (`ftdi_sio` clamps anything past 3 Mbaud to 9600 and encodes
+/// *that* back into the termios). 4000000 is chosen over 3062500 because it is the
+/// rung §15.58 argues from and the one furthest from the cliff.
+const RIG_REFUSED_BAUD: u32 = 4_000_000;
+
+/// One serial node on one port — every check in the `actual_baud` test below reads
+/// `state` and moves no bytes, so it needs neither the far port, nor logs, nor
+/// injectors, nor [`prime_the_wire_once`]'s warm-up transfer.
+fn single_port_cfg(port: &str, baud: u32) -> String {
+    format!(
+        r#"
+[[node]]
+type = "serial"
+name = "port0"
+device = "{port}"
+baud = {baud}
+arbitration = "free-for-all"
+"#
+    )
+}
+
+/// **`actual_baud` is the driver's answer, never the configuration echoed back** —
+/// design §7.1's *Open, hold, and reopen* clause 7, decided at §15.58, built as plan
+/// §18 item 41. The hardware arm of the ladder whose software arms are
+/// `itest/tests/p7_actual_baud.rs`.
+///
+/// Two arms, in this order:
+///
+/// * **Refused (the subject).** At [`RIG_REFUSED_BAUD`] this adapter accepts the ask
+///   with no errno and lands at 9600. `serial2` verifies its own `set_configuration`
+///   by read-back with a ±2.5 % tolerance, so the daemon's open **fails** on that
+///   divergence and the node never holds the port: `open` is `false`, and
+///   `actual_baud` must be *present and `null`* — the field saying it does not know.
+///   A `state` that answered `4000000` there would be the configuration agreeing with
+///   itself about a port that is demonstrably at 9600 and not even open, which is the
+///   shape clause 7 names in as many words.
+/// * **Honoured (the control), on the same port, afterwards.** At 115200 the adapter
+///   takes the rate and reports it back, so `state` must carry it — the field is live
+///   rather than pinned at `null`. It runs *second* on purpose: it is also what rules
+///   out the subject having faulted for some reason other than the rate (a leftover
+///   claim, a squatter, a dead adapter all read the same in `state`), which a control
+///   taken *before* the subject could not do.
+///
+/// **What this arm does *not* claim.** It does not show a node reporting `active` with
+/// a divergent rate, because on this platform that state is unreachable: every
+/// divergence this adapter can produce is larger than `serial2`'s tolerance, so it
+/// becomes a failed open rather than a silently mis-clocked port (plan §18 item 41's
+/// filed evidence supposed otherwise — see the item's execution record). Manufacturing
+/// a *small* divergence is the unit test's job
+/// (`daemon/src/nodes/serial.rs::actual_baud_follows_the_port_rather_than_the_rate_that_was_asked_for`,
+/// where a master-side `TCSETS` moves the tty under an open port); what this arm adds
+/// is a **real driver refusing a real rate**, which no pts can do — a pts honours
+/// every rate it is handed.
+///
+/// **The precondition is asserted, not assumed** (AGENTS §9): if this adapter ever
+/// accepts 4 Mbaud the subject arm stops measuring a refusal, so it fails and says so
+/// rather than going quietly green.
+///
+/// Cost: the refused open is retried once a second while the node is faulted, and each
+/// attempt is an open/close, i.e. a DTR toggle on an auto-reset board (§7.1 clause 6's
+/// class of cost). The arm reads `state` immediately and drops the daemon, so it is a
+/// handful of toggles, not a soak.
+///
+/// **It self-skips off Linux rather than being compiled away**, so a Mac rig operator
+/// is told the test exists and why it did not run: the refusal is a measured property
+/// of `ftdi_sio`, and Darwin sets the rate through `IOSSIOSPEED` on a different driver
+/// with no committed measurement of which rungs it refuses. Running it there would
+/// assert a prediction nobody has taken (§13: no one-way decision on single-kernel
+/// evidence), and compiling it away would hide the gap instead of naming it. Staying
+/// compiled on both is also what keeps the Apple cross-check looking at this code.
+#[test]
+fn crossover_rig_actual_baud_is_a_read_back_not_an_echo() {
+    let Some((p0, _p1)) = crossover_ports() else {
+        skip_no_rig("crossover_rig_actual_baud_is_a_read_back_not_an_echo");
+        return;
+    };
+    if !cfg!(target_os = "linux") {
+        eprintln!(
+            "SKIP crossover_rig_actual_baud_is_a_read_back_not_an_echo: the refused \
+             rung this arm needs ({RIG_REFUSED_BAUD} → 9600, `adapter-refused`) is \
+             measured for `ftdi_sio` on Linux only. Darwin drives the same adapter \
+             through IOSerialFamily/`IOSSIOSPEED`, and which rungs it refuses there is \
+             not measured — take it with `serial-nexus-doctor --port A --port B` (P14) \
+             and file the Darwin arm rather than assuming this one carries over."
+        );
+        return;
+    }
+    let _rig = rig_guard();
+    eprintln!("crossover rig (actual_baud): {p0}");
+
+    // ---- The subject, first: a rate the adapter refuses. ----
+    //
+    // It runs *before* the control deliberately. The failure mode this arm has to be
+    // defended against is passing for the wrong reason — a port that faults because
+    // something else is holding it (a leftover `TIOCEXCL`, a squatter, a dead adapter)
+    // would produce the same `faulted` + `open: false` + `actual_baud: null` reading
+    // as a refused rate. The control below opens the *same* port seconds later, in the
+    // same test, under the same rig mutex, and requires `active`: so if the port had
+    // been unopenable, the control reddens and the subject's verdict is not believed.
+    // Running the control first would prove only that the port *was* free earlier.
+    let node = {
+        let d = Daemon::start();
+        let rpc = d.rpc();
+        rpc.load_toml(&single_port_cfg(&p0, RIG_REFUSED_BAUD), false)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "load one rig port @ {RIG_REFUSED_BAUD}: {e:?} — a rate the driver \
+                     refuses must still LOAD (§15.8: an open failure faults the node, \
+                     it does not fail the load), so this is a different defect"
+                )
+            });
+        // `SerialNode::create` opens synchronously, so the verdict is already in
+        // `state` when `load` returns; the wait is slack for a slow box, not a race.
+        wait_until(Duration::from_secs(5), || {
+            rpc.node_status("port0") != "active"
+        });
+        rpc.node("port0").expect("port0 in state")
+    };
+    eprintln!(
+        "rig @ {RIG_REFUSED_BAUD}: status={} reason={} baud={} actual_baud={}",
+        node["status"], node["reason"], node["baud"], node["actual_baud"]
+    );
+    assert_ne!(
+        node.get("status").and_then(Value::as_str),
+        Some("active"),
+        "the node came up ACTIVE at {RIG_REFUSED_BAUD}, which the pre-registered \
+         refusal says is impossible (`adapter-refused`, read-back 9600, \
+         docs/doctor/linux-7.0-2026-08-14-b58a1c4-tier3.json). The arm below would \
+         then assert `null` for a port that never diverged, i.e. pass while measuring \
+         nothing (§9). **`actual_baud` in the dump above says which of the two causes \
+         this is**, and they want opposite repairs: {RIG_REFUSED_BAUD} means the \
+         adapter really honours the rate now — re-measure with `serial-nexus-doctor \
+         --port … --port …` and pick a rung it still refuses; 9600 means the *open* \
+         stopped refusing (`serial2` loosened its post-set verification, which today \
+         is a ±2.5 % read-back compare), and then this is the state §15.58 describes \
+         and the arm should be rewritten to assert `actual_baud == 9600` on an \
+         **active** node — a strictly better test than this one: {node}"
+    );
+    // `faulted` rather than `waiting`: the open failed for a reason that is not
+    // `NotFound`, which is what §15.8 separates. `waiting` here would mean the device
+    // vanished mid-test (a pulled cable), not that the rate was refused. The *reason*
+    // string is printed above and deliberately not asserted — matching a driver's
+    // error text is not a contract (§7.1's flow-control clause 5 says so for the
+    // sibling case).
+    assert_eq!(
+        node.get("status").and_then(Value::as_str),
+        Some("faulted"),
+        "a refused rate must fault the node: {node}"
+    );
+    assert_eq!(
+        node.get("open"),
+        Some(&Value::Bool(false)),
+        "a node whose open was refused still reports a port: {node}"
+    );
+    assert_eq!(
+        node.get("baud").and_then(Value::as_u64),
+        Some(u64::from(RIG_REFUSED_BAUD)),
+        "the configured rate must still be reported — the pair is the point: {node}"
+    );
+    assert_eq!(
+        node.get("actual_baud").cloned(),
+        Some(Value::Null),
+        "`actual_baud` reported a rate for a port the daemon does not hold, on an \
+         adapter measured to land at 9600 when asked for {RIG_REFUSED_BAUD}. Echoing \
+         the ask is the one thing §7.1 clause 7 forbids, and a MISSING key is the same \
+         claim made by omission (`Value::get`, not `[...]`, is what tells those apart): \
+         {node}"
+    );
+
+    // ---- The control: a rate the adapter honours, on the same port. ----
+    //
+    // Two jobs. It shows the field is *live* rather than pinned at `null` — and it is
+    // the positive control for the subject above: this port was openable in this
+    // window, so the fault up there was about the rate and not about the port. The
+    // previous daemon is reaped by `Daemon`'s `Drop` (kill, `wait`, then the process
+    // group sweep), so its fd is closed by the kernel before this open is attempted.
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    rpc.load_toml(&single_port_cfg(&p0, 115_200), false)
+        .unwrap_or_else(|e| panic!("load one rig port @ 115200: {e:?}"));
+    assert!(
+        rpc.wait_status("port0", "active", Duration::from_secs(20)),
+        "port0 did not come up at 115200 right after the refused rate. Either this \
+         port is unusable — in which case the refusal above proved nothing about the \
+         RATE — or the refused open left something behind: {:?}",
+        rpc.node("port0")
+    );
+    let node = rpc.node("port0").expect("port0 in state");
+    assert_eq!(
+        node.get("actual_baud").cloned(),
+        Some(Value::from(115_200)),
+        "a real UART running at a rate it honours reported no rate, or the wrong one, \
+         in `state`: {node}"
+    );
+}
+
 /// The serial signal verbs driven end to end through the daemon against a real UART —
 /// send-break, set-modem (DTR/RTS high then low), pulse-dtr. On a real port these ioctls
 /// succeed (a pts `ENOTTY`s set-modem/pulse-dtr, which is why `p7_signals` cannot cover
