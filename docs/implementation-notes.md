@@ -12523,3 +12523,47 @@ binary and a different argument: `serial-nexus-devprep` is mode 0700 and invocab
 unprivileged user at any time by design, so every capability it holds is a standing surface between
 runs, and `CAP_SETFCAP` in particular is root-equivalent for files. §15.45's narrowness is the
 safety argument, and nothing found here is worth spending it on.
+
+### 3.105 The drain ladder's Linux half, read off artifacts that were already committed
+
+Plan §18 item 19's Linux half, closed without a measurement session — the twelve direction-runs
+committed on 2026-08-14 already contained the answer, and reading them was the whole of the work.
+
+**The item was mis-scoped, and the mis-scope is the first finding.** It was filed as "(S, one rig
+visit)". P10 is a **pty** probe: it opens a `posix_openpt` pair and needs no `--port`, so the six
+*passive* captures carry the ladder exactly as the six Tier-3 ones do. A rig visit was never
+required, and treating it as rig-gated is what kept a size-S item open across three sessions that
+each had the rig. **Before scheduling a rig session for an item, check that its instrument actually
+touches the wire** — P10 sits next to P5, P11, P14 and P15, which all genuinely do.
+
+**The answer.** Drain-size independence holds **12 of 12**: within any one direction-run,
+`topped_up_bytes` is a single value across drains of 512, 1, 128 and 900, while `drained_bytes`
+equals the request exactly at every rung. The ladder's own "writable iff occupancy < T" model is
+therefore refuted on this kernel at a twelve-observation width, where the item's *Evidence* line
+had asserted it from three. Darwin's contrast is undisturbed: there `topped_up == drained` at every
+rung, which is what made the `D = 1` rung the discriminator.
+
+**§15.60's open observation is answered, and the shape it proposed is refuted.** That entry recorded
+the between-run deviation as "a warm-up shape … tracks the **first rung**, not the drain size", and
+filed it for the next Linux session. It is not a warm-up. The constant is **bimodal — 2560 or
+9728 — and it differs between the two *directions of a single capture*:** `passive-2` reads 9728
+targetward and 2560 hostward, and `passive-3` reads the reverse. No per-process warm-up can produce
+that, because both directions live in one process and one run. It tracks the individual pty pair.
+
+**The two fields are one phenomenon.** `topped_up_bytes = 9728` co-occurs with a first-rung
+`refilled_from_empty_bytes` of 9728, and `2560` with `13824` — across all twelve, without exception.
+So the "anomalous first-rung refill" §15.60 saw and the top-up constant are the same fact reported
+in two cells, which is worth knowing before anyone treats them as two clues. Eight of the twelve
+read 2560.
+
+**What is not settled, and is deliberately not guessed at:** which property of a pty pair selects
+the mode. The from-empty rung is invariant — 13824 drained, 20480 topped,
+`carries_a_watermark_bound: false` — in all twelve, so whatever moves sits above the empty state and
+below capacity. Recorded as an observation rather than a defect: **no product claim rests on the
+constant's value, only on its independence from the drain size**, and that is exactly what holds.
+
+**The transferable half.** Two of this session's items — 19 here, and 76 in §3.103 — turned on
+having enough observations rather than on taking a new one. Item 76's single trial nearly became a
+refutation; item 19's three-run reading nearly became a warm-up hypothesis. Both dissolved at twelve
+and five respectively. **A committed artifact set is an instrument, and widening the read is
+cheaper than another session.**

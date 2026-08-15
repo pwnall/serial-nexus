@@ -1374,7 +1374,30 @@ Each item below uses the schema with its fields inline.
     CI runner, which is item 8's machine and not item 15's. *Validation:* the documented scope
     quoted with its exclusions; the era row in `docs/doctor/README.md` updated.
 19. **P10's drain ladder: both kernels' bounds** — **EXECUTED in its Darwin half 2026-08-13**
-    (§15.60; notes §3.93); **the Linux half stays open** (S, one rig visit).
+    (§15.60; notes §3.93) and **in its Linux half 2026-08-15** (notes §3.105), which closes the item.
+    **The Linux half needed no rig visit, and the item was mis-scoped in saying it did:** P10 is a
+    *pty* probe and runs identically with no `--port`, so the six passive captures answer it exactly
+    as the six Tier-3 ones do. Read off the twelve committed direction-runs of 2026-08-14
+    (`linux-7.0-2026-08-14-b58a1c4-{passive-1..3,tier3,tier3-2,tier3-3}`):
+    **drain-size independence holds 12 of 12** — within any one direction-run `topped_up_bytes` is a
+    single value across drains of 512, 1, 128 and 900, while `drained_bytes` equals the request
+    exactly at every rung. So the ladder's own "writable iff occupancy < T" model stays refuted on
+    this kernel, which is what the item's *Evidence* line claimed and what is now measured at a
+    twelve-observation width instead of three.
+    **§15.60's open observation is answered, and its proposed shape is refuted.** That entry filed
+    the between-run deviation as "a warm-up shape", tracking the first rung. It is not a warm-up:
+    the constant is **bimodal — 2560 or 9728 — and it differs between the two *directions of one
+    capture*** (`passive-2` reads 9728 targetward and 2560 hostward; `passive-3` reads the reverse),
+    which no per-process warm-up can produce. It tracks the individual pty pair instance.
+    **The two fields move together, perfectly, across all twelve:** `topped_up_bytes` 9728 always
+    co-occurs with a first-rung `refilled_from_empty_bytes` of 9728, and 2560 always with 13824 —
+    so this is one phenomenon reported twice, not two observations. Eight of the twelve read 2560.
+    *Not settled, and deliberately not guessed at:* which property of a pty pair selects the mode.
+    The from-empty rung is invariant at 13824 drained / 20480 topped with
+    `carries_a_watermark_bound: false` in all twelve, so whatever moves is above the empty state and
+    below capacity. Filed as an observation for whoever next has reason to care, **not** as a defect:
+    no product claim rests on the constant's value, only on its independence from the drain size,
+    and that is what holds. The superseded filing follows. *Original state:* open (S, one rig visit).
     **The item asked for a rung that already shipped.** The pre-registered next step was "a rung
     below 128"; the ladder is `[512, 1, 128, 900]` and the `1` rung — the *strongest* member of
     that family — landed in `f8315cc`, the same commit whose notes §3.52 pre-registered the step.

@@ -54,9 +54,8 @@
 //! socket with a live peer is never stolen, and teardown removes only the inode this
 //! node actually created.
 
-use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::rc::Rc;
@@ -79,6 +78,7 @@ use tokio::sync::mpsc;
 
 use crate::boundary::{self, TaskSet};
 use crate::cell::CriticalCell;
+use crate::nodes::identity_set::IdentitySet;
 use crate::runtime::{
     CHANNEL_CAP, DataFrame, DropCounters, Grant, HostwardChannelStat, LossCounter, READ_BUF,
     SharedFanOut, SharedLock, SharedTargetEdge, TargetwardInbox, TeardownBytes, TeardownLoss,
@@ -94,24 +94,6 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// *immediately* (ECONNREFUSED), so anything slower is somebody answering — and the
 /// safe reading of an ambiguous answer is "not mine to unlink" (SEC-8).
 const PEER_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// How many peer-announced-but-unconfigured identities one leg remembers (§8).
-/// The list exists to prompt an operator ("the peer offers `console-c`, you have not
-/// configured it"), and a few hundred is far past the point where a human reads it —
-/// but a peer streaming data frames with fresh channel ids would otherwise grow it
-/// without limit, on the single runtime thread (LEG-2). Hostile peers are in scope
-/// (`p6_hostility`), and a `listen`+`unix` leg is dialable by anyone who can reach
-/// its path.
-const MAX_UNBOUND: usize = 256;
-
-/// How much of a peer-supplied identity is remembered. Channel identities an
-/// operator writes are short; the wire admits far longer ones, and `state` needs
-/// only enough to recognize what the peer offered (LEG-2).
-const MAX_UNBOUND_ID_LEN: usize = 64;
-
-/// Appended to an identity [`MAX_UNBOUND_ID_LEN`] truncated, so `state` never
-/// implies the peer sent the shorter name.
-const TRUNCATION_MARKER: &str = "…(truncated)";
 
 /// A boxed duplex byte stream, abstracting over tcp and unix sockets so the pump
 /// is transport-agnostic. Tasks run on the single-threaded `LocalSet`, so no
@@ -216,60 +198,43 @@ impl HostwardChannelStat for ChannelStat {
 }
 
 /// Peer-announced identities this configuration does not declare — visible state
-/// awaiting an operator, never an endpoint (§8). Bounded in both count and
-/// per-identity length: a peer streaming data frames with fresh channel ids would
-/// otherwise grow an uncapped `Vec` without limit and turn its linear dedup scan
-/// into O(n²) work on the single runtime thread (LEG-2). Insertion order is what
-/// `state` reports, so two snapshots diff meaningfully; the parallel set makes the
-/// per-frame membership test O(1) rather than a scan of the cap.
+/// awaiting an operator, never an endpoint (§8). The list exists to prompt an
+/// operator ("the peer offers `console-c`, you have not configured it"), and a peer
+/// streaming data frames with fresh channel ids would otherwise grow it without
+/// limit on the single runtime thread (LEG-2) — so the cap, the dedup, the marked
+/// truncation and the counted refusals are [`IdentitySet`]'s, which the codec node
+/// holds the other instance of. This wrapper is the leg's half of the split: its
+/// per-connection lifecycle (`clear`) and nothing else. Bare `insert` here does not
+/// log — the leg reports what the peer announced as *state*, not as an event.
 #[derive(Default)]
 struct UnboundSet {
-    order: Vec<String>,
-    seen: HashSet<String>,
-    /// Occurrences the cap refused to record — *not* distinct identities, which
-    /// cannot be known without remembering them, which is the thing being bounded.
-    /// A repeat of an already-recorded identity is not an overflow.
-    overflow: u64,
+    set: IdentitySet,
 }
 
 impl UnboundSet {
     /// Record a peer-supplied identity, truncated and capped.
     fn insert(&mut self, id: &str) {
-        let id = truncate_identity(id);
-        if self.seen.contains(id.as_ref()) {
-            return;
-        }
-        if self.order.len() >= MAX_UNBOUND {
-            self.overflow += 1;
-            return;
-        }
-        let id = id.into_owned();
-        self.seen.insert(id.clone());
-        self.order.push(id);
+        self.set.insert(id);
     }
 
     /// Forget everything: binding state is per-connection (§8), so it is cleared at
     /// hello reconciliation and when a connection drops — the overflow count with
     /// it, since it describes that connection's peer.
     fn clear(&mut self) {
-        self.order.clear();
-        self.seen.clear();
-        self.overflow = 0;
+        self.set.clear();
     }
-}
 
-/// Bound the stored length of a peer-supplied identity, marking a truncation
-/// explicitly (LEG-2). Truncation lands on a `char` boundary: the identity is
-/// peer-supplied UTF-8 and a split code point would not survive JSON.
-fn truncate_identity(id: &str) -> Cow<'_, str> {
-    if id.len() <= MAX_UNBOUND_ID_LEN {
-        return Cow::Borrowed(id);
+    /// The announced-but-unconfigured identities, in the order they arrived — what
+    /// `state` lists as `binding: "unbound"`.
+    fn identities(&self) -> &[String] {
+        self.set.identities()
     }
-    let mut end = MAX_UNBOUND_ID_LEN;
-    while end > 0 && !id.is_char_boundary(end) {
-        end -= 1;
+
+    /// Wire frames whose identity the cap refused to record, reported as
+    /// `unbound_overflow`.
+    fn overflow(&self) -> u64 {
+        self.set.overflow()
     }
-    Cow::Owned(format!("{}{TRUNCATION_MARKER}", &id[..end]))
 }
 
 /// Node-level observed state shared with the supervisor task (which flips it as
@@ -684,10 +649,10 @@ impl LegNode {
         // in the bounded insertion order LEG-2 established.
         let mut channels = channels;
         let unbound_overflow = self.shared.unbound.with(|u| {
-            for id in &u.order {
+            for id in u.identities() {
                 channels.insert(id.clone(), json!({ "binding": "unbound" }));
             }
-            u.overflow
+            u.overflow()
         });
         let mut obj = json!({
             "role": role_str(self.role),
@@ -1887,9 +1852,18 @@ async fn connect_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    // The leg's spellings of the shared bounds (`itest/tests/p6_binding.rs` names
+    // them as `MAX_UNBOUND` / `MAX_UNBOUND_ID_LEN` too). Aliases of one definition,
+    // not a second copy: change the value in `identity_set` and both move.
+    use crate::nodes::identity_set::{
+        MAX_IDENTITIES as MAX_UNBOUND, MAX_IDENTITY_LEN as MAX_UNBOUND_ID_LEN, TRUNCATION_MARKER,
+        truncate_identity,
+    };
 
     /// A fresh, unique temp directory per call (tests may run in parallel). Kept
     /// short: a Unix socket path is bounded at ~108 bytes (`SUN_LEN`).
@@ -1956,13 +1930,13 @@ mod tests {
         for i in 0..MAX_UNBOUND + 50 {
             set.insert(&format!("ch-{i}"));
         }
-        assert_eq!(set.order.len(), MAX_UNBOUND);
-        assert_eq!(set.seen.len(), MAX_UNBOUND);
-        assert_eq!(set.overflow, 50);
+        assert_eq!(set.identities().len(), MAX_UNBOUND);
+        assert_eq!(set.set.seen_len(), MAX_UNBOUND);
+        assert_eq!(set.overflow(), 50);
         // Insertion order is stable, so two `state` snapshots diff meaningfully.
-        assert_eq!(set.order[0], "ch-0");
+        assert_eq!(set.identities()[0], "ch-0");
         assert_eq!(
-            set.order[MAX_UNBOUND - 1],
+            set.identities()[MAX_UNBOUND - 1],
             format!("ch-{}", MAX_UNBOUND - 1)
         );
     }
@@ -1976,17 +1950,18 @@ mod tests {
         for _ in 0..1000 {
             set.insert("ch-a");
         }
-        assert_eq!(set.order, vec!["ch-a".to_owned()]);
-        assert_eq!(set.overflow, 0);
+        assert_eq!(set.identities(), ["ch-a".to_owned()]);
+        assert_eq!(set.overflow(), 0);
 
         // …including once the cap is reached.
         for i in 0..MAX_UNBOUND * 2 {
             set.insert(&format!("ch-{i}"));
         }
-        let after = set.overflow;
+        let after = set.overflow();
         set.insert("ch-a");
         assert_eq!(
-            set.overflow, after,
+            set.overflow(),
+            after,
             "a recorded identity is never an overflow"
         );
     }
@@ -1998,8 +1973,8 @@ mod tests {
         let long = "z".repeat(MAX_UNBOUND_ID_LEN * 4);
         let mut set = UnboundSet::default();
         set.insert(&long);
-        assert_eq!(set.order.len(), 1);
-        let stored = &set.order[0];
+        assert_eq!(set.identities().len(), 1);
+        let stored = &set.identities()[0];
         assert!(stored.ends_with(TRUNCATION_MARKER), "{stored}");
         assert_eq!(
             stored.len(),
@@ -2009,7 +1984,7 @@ mod tests {
         // Two distinct over-long identities sharing a prefix collapse to one entry —
         // acceptable: the list prompts an operator, it is not a channel registry.
         set.insert(&format!("{long}-and-more"));
-        assert_eq!(set.order.len(), 1);
+        assert_eq!(set.identities().len(), 1);
     }
 
     // Truncation must land on a `char` boundary: the identity is peer-supplied UTF-8
@@ -2063,7 +2038,7 @@ mod tests {
         assert_eq!(stat.discarded_hostward.get(), 7);
         assert_eq!(stat.discarded_targetward.get(), 11);
         // A configured channel is never "unbound", whichever way its bytes went.
-        assert_eq!(shared.unbound.with(|u| u.order.len()), 0);
+        assert_eq!(shared.unbound.with(|u| u.identities().len()), 0);
     }
 
     // The unconfigured-identity arm records state instead of a counter (§8:
@@ -2081,8 +2056,8 @@ mod tests {
             );
         }
         shared.unbound.with(|u| {
-            assert_eq!(u.order.len(), MAX_UNBOUND);
-            assert_eq!(u.overflow, 3);
+            assert_eq!(u.identities().len(), MAX_UNBOUND);
+            assert_eq!(u.overflow(), 3);
         });
     }
 
@@ -2101,7 +2076,7 @@ mod tests {
             .with_mut(|p| *p = Some("unix".to_owned()));
         shared.unbound.with_mut(|u| {
             u.insert("ch-they-offered");
-            u.overflow = 9;
+            u.set.set_overflow(9);
         });
         stats["console"].bound.set(true);
         stats["console"].active.set(true);
@@ -2113,9 +2088,9 @@ mod tests {
         assert_eq!(shared.peer_capabilities.get(), 0);
         assert_eq!(shared.peer_address.with(|p| p.clone()), None);
         shared.unbound.with(|u| {
-            assert!(u.order.is_empty());
-            assert!(u.seen.is_empty());
-            assert_eq!(u.overflow, 0);
+            assert!(u.identities().is_empty());
+            assert_eq!(u.set.seen_len(), 0);
+            assert_eq!(u.overflow(), 0);
         });
         assert!(!stats["console"].bound.get());
         assert!(!stats["console"].active.get());
@@ -2156,7 +2131,7 @@ mod tests {
         let node = LegNode::create(&leg_config("up", "/tmp/never-bound.sock"));
         node.stats["console"].discarded_targetward.set(3);
         node.stats["console"].discarded_unframable.set(5);
-        node.shared.unbound.with_mut(|u| u.overflow = 12);
+        node.shared.unbound.with_mut(|u| u.set.set_overflow(12));
 
         let state = node.state_extra();
         assert_eq!(state["unbound_overflow"], json!(12));

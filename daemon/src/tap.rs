@@ -412,11 +412,10 @@ struct Tap {
 /// the §15.19 bound.
 struct ReplayRing {
     cap: usize,
-    /// Circular storage; empty until the first push, then exactly `cap` bytes long.
-    buf: Vec<u8>,
-    /// Index where the next byte will be written (`% cap`).
+    /// PLANT (item 61 fail-first): the byte-at-a-time deque §5 clause 3 names.
+    buf: std::collections::VecDeque<u8>,
+    #[allow(dead_code)]
     pos: usize,
-    /// Valid bytes currently retained, `<= cap`.
     len: usize,
 }
 
@@ -425,42 +424,16 @@ impl ReplayRing {
         if self.cap == 0 {
             return;
         }
-        // A single write larger than the ring keeps only its own tail.
-        let bytes = if bytes.len() > self.cap {
-            &bytes[bytes.len() - self.cap..]
-        } else {
-            bytes
-        };
-        if bytes.is_empty() {
-            return;
+        // PLANT: drain+extend on a VecDeque<u8>, byte at a time.
+        self.buf.extend(bytes.iter().copied());
+        while self.buf.len() > self.cap {
+            self.buf.pop_front();
         }
-        if self.buf.is_empty() {
-            self.buf = vec![0u8; self.cap];
-        }
-        // Write into the circular buffer at `pos`, wrapping once at the end.
-        let n = bytes.len();
-        let first = (self.cap - self.pos).min(n);
-        self.buf[self.pos..self.pos + first].copy_from_slice(&bytes[..first]);
-        if n > first {
-            self.buf[..n - first].copy_from_slice(&bytes[first..]);
-        }
-        self.pos = (self.pos + n) % self.cap;
-        self.len = (self.len + n).min(self.cap);
+        self.len = self.buf.len();
     }
 
     fn snapshot(&self) -> Vec<u8> {
-        if self.len == 0 {
-            return Vec::new();
-        }
-        // Oldest retained byte sits `len` behind the write cursor.
-        let start = (self.pos + self.cap - self.len) % self.cap;
-        let mut out = Vec::with_capacity(self.len);
-        let first = (self.cap - start).min(self.len);
-        out.extend_from_slice(&self.buf[start..start + first]);
-        if self.len > first {
-            out.extend_from_slice(&self.buf[..self.len - first]);
-        }
-        out
+        self.buf.iter().copied().collect()
     }
 }
 
@@ -556,7 +529,7 @@ impl TapHub {
             waits: Vec::new(),
             ring: (ring_cap > 0).then(|| ReplayRing {
                 cap: ring_cap,
-                buf: Vec::new(),
+                buf: std::collections::VecDeque::new(),
                 pos: 0,
                 len: 0,
             }),

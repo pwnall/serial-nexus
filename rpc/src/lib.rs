@@ -19,6 +19,8 @@
 //!   thin, stable framing layer and lets version skew degrade gracefully via
 //!   the standard `method not found` error.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize, de};
 use serde_json::Value;
 
@@ -293,6 +295,52 @@ impl RpcError {
 
     pub fn internal(msg: impl Into<String>) -> Self {
         RpcError::new(error_codes::INTERNAL_ERROR, msg)
+    }
+}
+
+/// **The one client-facing rendering of a refused request: `<message> (<code>)`.**
+///
+/// It lives here, beside the type, for the reason [`DAEMON_NAME`] does: more than one
+/// process turns this object into a line a human reads, and each of them used to spell
+/// the rendering out for itself. `serial-nexus-ctl` printed `<message> (<code>)` from
+/// its streaming acks and `error <code>: <message>` from its one-shot verbs — two
+/// spellings in one binary — while the headless WebSocket client printed the whole
+/// error *object*, JSON braces and all, because it holds the frame untyped and `{err}`
+/// was the shortest thing to write (plan §18 item 59(c)). The precedent is review
+/// **SIMP-6**, one layer down: `-32002` used to reach `error.message` prefixed from one
+/// producer and bare from another, so one refusal read as two sentences. This is that
+/// finding at the *consumer* end.
+///
+/// Two details are deliberate:
+///
+/// * **`data` is not on the line.** It is free-form and can be arbitrarily large — a
+///   structural refusal carries `data.errors` and, for an unknown codec, every
+///   registered name in `data.available` (§8/§15.26) — so a client that wants it prints
+///   it *after* the line, where a terminal can survive it.
+/// * **The message leads.** The code is the machine's half of the answer and rides in
+///   parentheses at the end; the operator reads the sentence first. Nothing parses this
+///   line — `serial-nexus-ctl --json` exists so that nothing has to (review 26, CLI-4),
+///   and that is what makes this rendering free to be one thing rather than three.
+impl fmt::Display for RpcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({})", self.message, self.code)
+    }
+}
+
+/// [`RpcError`]'s rendering for a client that holds the error frame **untyped** — the
+/// web console's headless WebSocket client, which parses a bridged frame as a bare
+/// [`Value`] and never builds the typed response.
+///
+/// A frame that is not a well-formed error object falls back to its own JSON rather
+/// than to silence: this is the client of a *bridge*, so the answer on the wire is not
+/// guaranteed to be the daemon's — and a line that says `{"oops":1}` still tells the
+/// operator what arrived, where a line that dropped it would say nothing at all. The
+/// fallback deliberately does **not** invent a code to render: a code on this line is a
+/// code the daemon sent.
+pub fn describe_error(err: &Value) -> String {
+    match RpcError::deserialize(err) {
+        Ok(e) => e.to_string(),
+        Err(_) => err.to_string(),
     }
 }
 
@@ -688,6 +736,66 @@ mod tests {
                 assert_eq!(r.error.as_ref().unwrap().code, error_codes::PARSE_ERROR);
             }
             Incoming::Notification(_) => panic!("null-id error must parse as a response"),
+        }
+    }
+
+    /// **The refusal rendering is pinned to its exact bytes, not to "the code appears
+    /// somewhere"** (plan §18 item 59(c)).
+    ///
+    /// The distinction is the whole point of this test. The two guards that already
+    /// watch a refused streaming verb assert `stderr.contains("-32601")`, which every
+    /// candidate rendering satisfies — including printing the raw JSON object, which is
+    /// what the WebSocket client did while the CLI printed `<message> (<code>)`. So the
+    /// divergence item 59(c) found was invisible to the suite, and would have been
+    /// invisible again the next time. An `assert_eq!` on the whole line is the only
+    /// assertion that can tell the renderings apart, and it is why this lives beside the
+    /// type rather than beside either client.
+    #[test]
+    fn a_refusal_renders_as_message_then_code_and_never_carries_data() {
+        let err = RpcError::new(error_codes::METHOD_NOT_FOUND, "method not found: tap.open");
+        assert_eq!(err.to_string(), "method not found: tap.open (-32601)");
+
+        // `data` is the free-form half and can be arbitrarily large (an unknown-codec
+        // refusal rides every registered name in `data.available`, §8/§15.26); it must
+        // not be spliced into the one line an operator reads.
+        let with_data = RpcError::invalid_params("unknown endpoint: nope")
+            .with_data(json!({"available": ["usb0", "console"]}));
+        assert_eq!(with_data.to_string(), "unknown endpoint: nope (-32602)");
+        assert!(!with_data.to_string().contains("usb0"));
+    }
+
+    /// The untyped twin renders **the same bytes** as the typed one for the same object,
+    /// which is what lets a client holding a bare frame share the rendering rather than
+    /// re-spell it; and a frame that is not an error object keeps its JSON instead of
+    /// vanishing or growing an invented code.
+    #[test]
+    fn describe_error_agrees_with_the_typed_rendering_and_falls_back_to_json() {
+        let typed = RpcError::new(error_codes::METHOD_NOT_FOUND, "method not found: tap.open");
+        let wire = json!({"code": -32601, "message": "method not found: tap.open"});
+        assert_eq!(describe_error(&wire), typed.to_string());
+
+        // A `data` key on the wire is carried by the type and still stays off the line.
+        let with_data = json!({"code": -32602, "message": "bad", "data": {"available": []}});
+        assert_eq!(describe_error(&with_data), "bad (-32602)");
+
+        // Not an error object: no message, wrong type for the code, or not an object at
+        // all. Each keeps its own JSON, and none of them prints a code the daemon never
+        // sent.
+        for junk in [
+            json!({"code": -32601}),
+            json!({"code": "minus a lot", "message": "x"}),
+            json!("boom"),
+        ] {
+            let line = describe_error(&junk);
+            assert_eq!(
+                line,
+                junk.to_string(),
+                "fallback must be the frame's own JSON"
+            );
+            assert!(
+                !line.contains("(-327"),
+                "the fallback invented a code: {line}"
+            );
         }
     }
 

@@ -2,12 +2,14 @@
 
 //! **Derive-from-tools meta-gates** (plan §18 item 40; AGENTS §3's closing rule).
 //!
-//! Four rosters in this tree exist twice: once as the code, manifest or registry
+//! Six rosters in this tree exist twice: once as the code, manifest or registry
 //! that *is* the thing, and once as a list a human typed — a Markdown table, a
 //! module-doc parenthetical, a `[[bin]]` block. A list typed once is correct once.
 //! AGENTS §3 states the doctrine for the one instance that already bit ("CI
 //! enumerates loops from tools (`cargo fuzz list`), never hand-kept lists"), and
-//! plan §18 item 40 names the four pairs still kept by hand:
+//! plan §18 item 40 names the first four pairs still kept by hand; items 62 and 63
+//! added (e) and (f), which are the same doctrine applied to two *invariants*
+//! rather than to two lists:
 //!
 //! * **(a)** [`every_required_mode_variable_the_harness_reads_appears_in_plan_3s_table`]
 //!   — the `SNX_*=required` lattice. Plan §3's table says outright that it "is the
@@ -56,6 +58,31 @@
 //!   `serial-nexus-rpc`'s own `docs_rpc_table_matches_the_registry` already does
 //!   this for the **error-code** table in the same file; the verb index is the half
 //!   that had no gate.
+//! * **(e)** [`every_numeric_configuration_attribute_is_bounded_and_says_so`] —
+//!   §16.12/§11 invariant 13: "every numeric attribute … carries a stated,
+//!   structurally checked maximum". That promise was enforced by seven hand-written
+//!   `range_error(…)` sites, each behind an `if let NodeConfig::X { …, .. }` whose
+//!   `..` means a new field triggers no compiler complaint, plus a property test
+//!   over a fixed list of four fields — so the *exhaustiveness* was per-field, and
+//!   was already violated: `Pty { advertised_baud }` had no bound at all (plan §18
+//!   item 62). This gate derives the field roster from the schema instead, so the
+//!   invariant is checked over whatever `NodeConfig` currently declares rather than
+//!   over what someone remembered to list. It reads **both** halves of the promise —
+//!   *structurally checked* against the validator, and *stated* against
+//!   `docs/rpc/configuration.md`'s range table.
+//! * **(f)** [`every_state_key_the_daemon_emits_is_documented`] — design §5 makes
+//!   `docs/rpc/observation.md` "the authoritative per-kind enumeration and stays
+//!   so", which was a claim about a document nothing read: the error-code table and
+//!   the verb index are gated two ways each while the largest surface on the wire
+//!   was checked only by hand-written per-field tests that *cite* the page without
+//!   reading it. Measured on arrival: twenty-nine keys the daemon emits appeared
+//!   nowhere on that page, `delivered_hostward` — which the design itself names at
+//!   §5 as the counter `p6_head_of_line.rs` reads — among them (plan §18 item 63).
+//!
+//!   Neither (e) nor (f) is a roster-drift gate wearing a new hat. A missing row in
+//!   (a)–(d) is a reader misled; a missing bound in (e) is an invariant that reads
+//!   as upheld because six of its seven instances are, and a missing key in (f) is a
+//!   wire surface with no schema.
 //!
 //! **What makes each of these a gate rather than a decoration** (AGENTS §3: "a
 //! scanning gate proves its **matcher** as well as its walker — plant the violation
@@ -215,6 +242,54 @@ fn paren_spans(text: &str) -> Vec<&str> {
                 }
             }
             _ => {}
+        }
+    }
+    out
+}
+
+/// The span between the first `open` at or after `at` and its matching `close`,
+/// counted for nesting; `None` if either end is missing.
+///
+/// The generic form of [`braced_body`], used by gate (e) for a call's argument list
+/// and for an array literal. Nesting matters in both: `range_error(name, "mode",
+/// *mode as u64, 0o600, 0o777)` has no inner parenthesis today, but
+/// `range_error(name, field, value, 0, MAX_TIMER_MS as u64)` is one edit away, and a
+/// scan that stopped at the first `)` would read half an argument list and silently
+/// under-report what the validator checks — a gate failing *open*.
+fn balanced_span(s: &str, at: usize, open: char, close: char) -> Option<&str> {
+    let rest = &s[at..];
+    let start = rest.find(open)?;
+    let mut depth = 0usize;
+    for (i, c) in rest[start..].char_indices() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&rest[start + 1..start + i]);
+            }
+        }
+    }
+    None
+}
+
+/// Every double-quoted span in `text`, in order.
+///
+/// No escape handling: every literal these gates read is a field name or a JSON
+/// key, none of which contains a quote. A literal that did would split into two
+/// tokens, neither of which looks like a field name, so the failure direction is a
+/// *missing* entry — the loud one — rather than a phantom match.
+fn string_literals(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('"') {
+        let after = &rest[open + 1..];
+        match after.find('"') {
+            Some(close) => {
+                out.push(after[..close].to_owned());
+                rest = &after[close + 1..];
+            }
+            None => break,
         }
     }
     out
@@ -1424,4 +1499,833 @@ fn the_documented_rpc_verb_table_matches_the_daemon_and_ctl() {
              methods, so a verb it can send has a schema page or it has no contract"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// (e) §16.12's numeric maxima, over the schema rather than over a list
+// ---------------------------------------------------------------------------
+
+/// The configuration schemas whose numeric fields §16.12 governs, as
+/// `(file, declaration header)`.
+///
+/// Two, and the second is not an afterthought: a codec's `attributes` table is
+/// opaque to `GraphConfig::validate` by design (§8), so the exec codec's own
+/// numerics are checked in `parse_attributes` instead. §16.12 says *every* numeric
+/// attribute, not every numeric attribute in one file, and a gate that read only
+/// the node schema would report green while the other door stood open — which is
+/// the shape of the defect this gate exists for, one file over.
+const NUMERIC_SCHEMAS: [(&str, &str); 2] = [
+    ("core/src/config.rs", "pub enum NodeConfig"),
+    ("daemon/src/nodes/exec.rs", "struct ExecAttributes"),
+];
+
+/// Is `ty` a numeric attribute's type?
+///
+/// `Option<u32>` counts. An omitted value is not a number and cannot be out of
+/// range, but a *present* one is, and `Pty { mode: Option<u32> }` is exactly that
+/// shape — the field review 32 found unchecked and fixed. Unwrapping the `Option`
+/// here is what keeps the next one from hiding behind it.
+fn is_numeric_type(ty: &str) -> bool {
+    let mut t = ty.trim();
+    if let Some(inner) = t.strip_prefix("Option<") {
+        t = inner.trim().trim_end_matches('>').trim();
+    }
+    matches!(
+        t,
+        "u8" | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+    )
+}
+
+/// The `name: Type` fields declared anywhere inside `body`, as `name -> Type`.
+///
+/// Line-oriented, because both schemas are written one field per line, and
+/// deliberately blind to which variant a field belongs to: §16.12's unit is the
+/// attribute, and `hostward_buffer` is one rule whether it is declared on `Serial`
+/// or on `Pty`. Attribute lines (`#[serde(…)]`) are skipped and comments are
+/// stripped, so a `default = "default_baud"` cannot be read as a field and a field
+/// discussed in prose cannot be read as declared.
+fn declared_fields(body: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for line in strip_line_comments(body).lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c == '_' || c.is_ascii_lowercase() || c.is_ascii_digit())
+        {
+            continue;
+        }
+        let ty = rest.trim().trim_end_matches(',').trim();
+        if !ty.is_empty() {
+            out.insert(name.to_owned(), ty.to_owned());
+        }
+    }
+    out
+}
+
+/// Every field name `validate_body` range-checks, in both spellings the validator
+/// uses.
+///
+/// 1. **The literal call** — `range_error(name, "baud", …)`, six of the seven sites.
+/// 2. **The loop table** — `for (field, value) in [("reconnect_initial_ms", …), …]
+///    { … range_error(name, field, value, …) }`, where the field names are in an
+///    array literal and the call itself names none. A matcher that read only
+///    spelling 1 would report the leg's three timers as unchecked and would be
+///    deleted for crying wolf, which is why the loop is read as well — and read
+///    *conditionally*, on its body actually reaching `range_error`, so an unrelated
+///    table of string pairs cannot vouch for a field nothing checks.
+fn range_checked_fields(validate_body: &str) -> BTreeSet<String> {
+    let code = strip_line_comments(validate_body);
+    let mut out = BTreeSet::new();
+    let opener = "range_error(";
+    let mut i = 0usize;
+    while let Some(pos) = code[i..].find(opener) {
+        let at = i + pos + opener.len() - 1;
+        i = at + 1;
+        if let Some(args) = balanced_span(&code, at, '(', ')') {
+            out.extend(string_literals(args));
+        }
+    }
+    let mut i = 0usize;
+    while let Some(pos) = code[i..].find("for ") {
+        let at = i + pos;
+        i = at + "for ".len();
+        let Some(brace_rel) = code[at..].find('{') else {
+            break;
+        };
+        let Some(open_rel) = code[at..at + brace_rel].find('[') else {
+            continue;
+        };
+        let Some(table) = balanced_span(&code, at + open_rel, '[', ']') else {
+            continue;
+        };
+        let Some(body) = braced_body(&code[at..], "for ") else {
+            continue;
+        };
+        if body.contains("range_error") {
+            out.extend(string_literals(table));
+        }
+    }
+    out
+}
+
+/// Every field name `body` compares against a `MAX_*` constant — the exec codec's
+/// spelling of the same rule, written by hand because a codec's attribute table is
+/// opaque to the shared helper.
+///
+/// The comparison operator is required, and required to sit *between* the field and
+/// the constant: `restart_backoff_ms` also appears in the error message two lines
+/// down, beside a `{MAX_TIMER_MS}` interpolation, and a matcher that accepted mere
+/// proximity would treat the message as the check — passing on a tree where someone
+/// deleted the `if` and kept the sentence.
+fn fields_compared_against_a_maximum(body: &str) -> BTreeSet<String> {
+    let code = strip_line_comments(body);
+    let bytes = code.as_bytes();
+    let mut out = BTreeSet::new();
+    let mut i = 0usize;
+    while let Some(pos) = code[i..].find("MAX_") {
+        let at = i + pos;
+        i = at + 1;
+        // Back over the whitespace, then the operator, then more whitespace.
+        let mut j = at;
+        while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+            j -= 1;
+        }
+        if j > 0 && (bytes[j - 1] == b'=' || bytes[j - 1] == b'\'') {
+            j -= 1; // the `=` of `>=` / `<=`
+        }
+        if j == 0 || !(bytes[j - 1] == b'>' || bytes[j - 1] == b'<') {
+            continue;
+        }
+        j -= 1;
+        while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+            j -= 1;
+        }
+        let end = j;
+        while j > 0 && (bytes[j - 1] == b'_' || bytes[j - 1].is_ascii_alphanumeric()) {
+            j -= 1;
+        }
+        if j < end {
+            out.insert(code[j..end].to_owned());
+        }
+    }
+    out
+}
+
+/// The field names stated in `docs/rpc/configuration.md`'s range table — the
+/// *stated* half of §16.12, which is a separate claim from the checked half and
+/// fails separately.
+fn stated_range_table(configuration_md: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for row in table_rows(configuration_md, "| Field | Range | Why bounded |") {
+        let Some(cell) = row.first() else { continue };
+        out.extend(backticked(cell));
+    }
+    out
+}
+
+#[test]
+fn every_numeric_configuration_attribute_is_bounded_and_says_so() {
+    let root = repo_root();
+
+    // 0. The matchers, in every spelling each side is written in — and in the near
+    //    misses that must not vouch for a field.
+    let schema = "Serial {\n    name: String,\n    #[serde(default = \"default_baud\")]\n    baud: u32,\n    /// prose about hostward_buffer: usize\n    hostward_buffer: usize,\n    mode: Option<u32>,\n    modem: ModemLines,\n    channels: Vec<String>,\n}";
+    let fields = declared_fields(schema);
+    let numeric: BTreeSet<String> = fields
+        .iter()
+        .filter(|(_, ty)| is_numeric_type(ty))
+        .map(|(n, _)| n.clone())
+        .collect();
+    assert_eq!(
+        numeric,
+        BTreeSet::from([
+            "baud".to_owned(),
+            "hostward_buffer".to_owned(),
+            "mode".to_owned()
+        ]),
+        "the schema reader mis-enumerates: it must take a plain numeric field, an \
+         `Option<numeric>` (which is how `mode` is declared, the field review 32 \
+         found unchecked), and neither the serde attribute above one nor a field \
+         merely named in a doc comment"
+    );
+    assert!(
+        !is_numeric_type("String") && !is_numeric_type("ModemLines"),
+        "a non-numeric type is read as numeric, so this gate would demand a range \
+         check for every string in the schema and be deleted within the day"
+    );
+    assert_eq!(
+        range_checked_fields(
+            "errors.extend(range_error(name, \"baud\", *baud as u64, 1, u32::MAX as u64));"
+        ),
+        BTreeSet::from(["baud".to_owned()]),
+        "the literal `range_error` spelling — six of the validator's seven sites — \
+         is not read"
+    );
+    assert_eq!(
+        range_checked_fields(
+            "for (field, value) in [(\"a_ms\", *a), (\"b_ms\", *b)] {\n errors.extend(range_error(name, field, value, 0, MAX_TIMER_MS));\n }"
+        ),
+        BTreeSet::from(["a_ms".to_owned(), "b_ms".to_owned()]),
+        "the loop-table spelling is not read — the leg's three timers name their \
+         fields in an array literal and the `range_error` call itself names none, so \
+         all three would be reported as unchecked"
+    );
+    assert!(
+        range_checked_fields(
+            "for (field, label) in [(\"a_ms\", \"A\"), (\"b_ms\", \"B\")] {\n log(field, label);\n }"
+        )
+        .is_empty(),
+        "any table of string pairs is read as a range check, so a logging loop could \
+         vouch for a field nothing bounds"
+    );
+    assert_eq!(
+        fields_compared_against_a_maximum("if attrs.restart_backoff_ms > MAX_TIMER_MS {"),
+        BTreeSet::from(["restart_backoff_ms".to_owned()]),
+        "the exec codec's hand-written comparison is not read, so its one timer \
+         would be reported unchecked forever"
+    );
+    assert!(
+        fields_compared_against_a_maximum(
+            "format!(\"restart_backoff_ms = {}, above the maximum {MAX_TIMER_MS}\")"
+        )
+        .is_empty(),
+        "the *message* naming the field beside the constant is read as the check — a \
+         tree with the `if` deleted and the sentence kept would pass"
+    );
+    assert_eq!(
+        stated_range_table(
+            "| Field | Range | Why bounded |\n| --- | --- |\n| `a_ms`, `b_ms` | `0 ..= 1` | because |\n| `mode` (pty) | `0 ..= 2` | because |\n"
+        ),
+        BTreeSet::from(["a_ms".to_owned(), "b_ms".to_owned(), "mode".to_owned()]),
+        "the range-table reader must take every field a row names (three rows carry \
+         more than one) and must not be confused by the kind in parentheses"
+    );
+
+    // 1. Both sides, from their real sources.
+    let mut declared: BTreeMap<String, String> = BTreeMap::new();
+    for (rel, header) in NUMERIC_SCHEMAS {
+        let src = strip_line_comments(&read_tree_file(&root, rel));
+        let body = braced_body(&src, header).unwrap_or_else(|| {
+            panic!(
+                "{rel} no longer declares `{header}` — the schema this gate derives \
+                 §16.12's roster from is gone, and an empty roster agrees with any \
+                 validator at all"
+            )
+        });
+        declared.extend(declared_fields(body));
+    }
+    let numeric: BTreeSet<String> = declared
+        .iter()
+        .filter(|(_, ty)| is_numeric_type(ty))
+        .map(|(n, _)| n.clone())
+        .collect();
+
+    let config_rs = strip_line_comments(&read_tree_file(&root, "core/src/config.rs"));
+    let validate = braced_body(&config_rs, "pub fn validate")
+        .expect("core/src/config.rs declares `pub fn validate`");
+    let exec_rs = strip_line_comments(&read_tree_file(&root, "daemon/src/nodes/exec.rs"));
+    let parse_attributes = braced_body(&exec_rs, "pub fn parse_attributes")
+        .expect("daemon/src/nodes/exec.rs declares `pub fn parse_attributes`");
+    let mut checked = range_checked_fields(validate);
+    checked.extend(fields_compared_against_a_maximum(parse_attributes));
+    let stated = stated_range_table(&read_tree_file(&root, "docs/rpc/configuration.md"));
+
+    assert!(
+        numeric.len() >= 9,
+        "the schemas declare {} numeric field(s) — the node schema alone carries \
+         nine, so the field reader has stopped reading and this gate is comparing \
+         nothing against everything",
+        numeric.len()
+    );
+    assert!(
+        checked.len() >= 9,
+        "only {} field(s) are structurally range-checked — the validator was \
+         reshaped and the check reader no longer sees it",
+        checked.len()
+    );
+    assert!(
+        stated.len() >= 9,
+        "docs/rpc/configuration.md's range table parsed to {} field(s) — it was \
+         retitled or reshaped, and the *stated* half of §16.12 is now unchecked",
+        stated.len()
+    );
+
+    // 2. Planted against the real sources, both halves, before a clean verdict is
+    //    trusted. The victim is taken from the tree rather than named here, so
+    //    neither proof goes stale when the schema grows.
+    // Drawn from the *intersection*, not from the schema: a victim that is already
+    // unchecked would make the deletion below a no-op, and the gate would then fail
+    // at its own scaffolding with a message about the proof instead of at the
+    // verdict with a message about the field. (Measured: with `advertised_baud`'s
+    // check removed — the plan §18 item 62 defect, replayed — a schema-order victim
+    // reddened this test on the wrong sentence.)
+    let victim = numeric
+        .iter()
+        .find(|f| checked.contains(*f))
+        .expect(
+            "no numeric field is range-checked at all — the validator or the check \
+             reader is gone, and the verdicts below would name every field at once",
+        )
+        .clone();
+    let unchecked = config_rs.replace(&format!("\"{victim}\""), "\"planted_no_such_field\"");
+    let mut planted = range_checked_fields(
+        braced_body(&unchecked, "pub fn validate").expect("the planted source still validates"),
+    );
+    planted.extend(fields_compared_against_a_maximum(parse_attributes));
+    let unchecked_exec = exec_rs.replace("> MAX_TIMER_MS", "> u64::MAX");
+    let exec_planted = fields_compared_against_a_maximum(
+        braced_body(&unchecked_exec, "pub fn parse_attributes")
+            .expect("the planted source still parses attributes"),
+    );
+    assert!(
+        checked.contains(&victim),
+        "`{victim}` is not range-checked on this tree, so the deletion below deletes \
+         nothing and proves nothing"
+    );
+    assert!(
+        !planted.contains(&victim),
+        "renaming `{victim}`'s range check in core/src/config.rs left it reported as \
+         checked: the gate's whole subject — a numeric field with no bound — passes it"
+    );
+    let victim_drift = drift(
+        "the configuration schema",
+        &numeric,
+        "the validator",
+        &planted,
+    );
+    assert!(
+        victim_drift.iter().any(|m| m.contains(&victim)),
+        "a real field with its real range check removed produced no drift naming it. \
+         Reported instead: {victim_drift:?}"
+    );
+    assert!(
+        !exec_planted.contains("restart_backoff_ms"),
+        "replacing the exec codec's `> MAX_TIMER_MS` comparison left the field \
+         reported as checked, so the one numeric attribute outside the node schema \
+         is ungated"
+    );
+    // …and the same removal must reach the *verdict*, not merely the matcher. Run
+    // the real comparison with the exec half of `checked` withheld, which is the
+    // state the tree would be in if that check were deleted. (Done on the values
+    // rather than on the file: `daemon/src/nodes/exec.rs` is not this gate's to
+    // edit, and a proof that needs to write a file it does not own is a proof that
+    // will be skipped.)
+    let node_schema_only = range_checked_fields(validate);
+    let exec_drift = drift(
+        "the configuration schema",
+        &numeric,
+        "the validator",
+        &node_schema_only,
+    );
+    assert!(
+        exec_drift.iter().any(|m| m.contains("restart_backoff_ms")),
+        "with the exec codec's own range check withheld, the verdict does not name \
+         the field it bounds — so this gate covers the node schema and quietly not \
+         the codec attribute table beside it. Reported instead: {exec_drift:?}"
+    );
+    // The anchor is code rather than prose: `config_rs` is comment-stripped above,
+    // so a doc-comment anchor would silently match nothing and this proof would
+    // assert that an unchanged file is unchanged.
+    let phantom = "planted_unbounded_ms";
+    let anchor = "\n    Pty {";
+    assert_eq!(
+        config_rs.matches(anchor).count(),
+        1,
+        "the planted-field anchor is no longer unique in core/src/config.rs"
+    );
+    let phantom_schema =
+        config_rs.replacen(anchor, &format!("{anchor}\n        {phantom}: u64,"), 1);
+    assert_ne!(
+        phantom_schema, config_rs,
+        "the phantom field was never inserted, so the proof below asserts nothing"
+    );
+    let phantom_fields = declared_fields(
+        braced_body(&phantom_schema, "pub enum NodeConfig").expect("the planted schema parses"),
+    );
+    assert!(
+        phantom_fields
+            .get(phantom)
+            .is_some_and(|ty| is_numeric_type(ty)),
+        "a numeric field planted into the real `NodeConfig` is not enumerated — a \
+         field added tomorrow is invisible to this gate, which is exactly the \
+         per-field exhaustiveness plan §18 item 62 filed"
+    );
+    let phantom_drift = drift(
+        "the configuration schema",
+        &phantom_fields
+            .iter()
+            .filter(|(_, ty)| is_numeric_type(ty))
+            .map(|(n, _)| n.clone())
+            .collect(),
+        "the validator",
+        &checked,
+    );
+    assert!(
+        phantom_drift.iter().any(|m| m.contains(phantom)),
+        "a numeric field with no range check produced no drift naming it. Reported \
+         instead: {phantom_drift:?}"
+    );
+    // …and the *stated* half against the real table, which fails separately and so
+    // has to be proved separately: strike the row that names the victim and require
+    // the second verdict to notice. Rows are matched on their first cell, because
+    // three of them name more than one field and several name a field in prose
+    // further along the row.
+    let configuration_md = read_tree_file(&root, "docs/rpc/configuration.md");
+    let stale_table: String = configuration_md
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.starts_with('|')
+                && backticked(trimmed.trim_matches('|').split('|').next().unwrap_or(""))
+                    .contains(&victim))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stale_stated = stated_range_table(&stale_table);
+    assert!(
+        !stale_stated.contains(&victim),
+        "striking `{victim}`'s row from docs/rpc/configuration.md's range table left \
+         it parsed as stated — the planted deletion below asserts nothing"
+    );
+    let unstated_drift = drift(
+        "the range-checked fields",
+        &checked,
+        "docs/rpc/configuration.md's range table",
+        &stale_stated,
+    );
+    assert!(
+        unstated_drift.iter().any(|m| m.contains(&victim)),
+        "a bound that loses its table row produced no drift naming it: §16.12's \
+         *stated* half could go unwritten while the check stayed. Reported instead: \
+         {unstated_drift:?}"
+    );
+
+    // 3. The verdict, both halves of the promise. **No exemption list**, and that is
+    //    a decision rather than an omission: §16.12 admits no numeric attribute
+    //    without a maximum, so an exemption here would be the invariant's own escape
+    //    hatch. A field that genuinely cannot carry one is a design amendment
+    //    (AGENTS §5), not a row in a list in a test.
+    let unbounded = drift(
+        "the configuration schema",
+        &numeric,
+        "the validator",
+        &checked,
+    );
+    let unbounded: Vec<String> = unbounded
+        .into_iter()
+        .filter(|m| m.contains("but not in the validator"))
+        .collect();
+    assert!(
+        unbounded.is_empty(),
+        "a numeric configuration attribute has no structural range check, which is \
+         §16.12/§11 invariant 13 — \"every numeric attribute … carries a stated, \
+         structurally checked maximum\":\n  {}\nThe fix is a `range_error(…)` site \
+         in `GraphConfig::validate` (or, for a codec attribute, the same comparison \
+         in its own `parse_attributes`) plus a row in docs/rpc/configuration.md's \
+         range table. The invariant admits no exemption: a value an operator can \
+         type is a value that has to be bounded before anything is created (§11).",
+        unbounded.join("\n  ")
+    );
+    let unstated: Vec<String> = drift(
+        "the range-checked fields",
+        &checked,
+        "docs/rpc/configuration.md's range table",
+        &stated,
+    );
+    assert!(
+        unstated.is_empty(),
+        "§16.12 asks for a *stated* maximum as well as a checked one, and the two \
+         have drifted:\n  {}\nA field checked but not tabled is a bound an operator \
+         meets only by tripping it; a field tabled but not checked is a documented \
+         promise nothing keeps (§16.14: editing either side alone is a test failure).",
+        unstated.join("\n  ")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (f) The observation surface against `docs/rpc/observation.md`
+// ---------------------------------------------------------------------------
+
+/// The directory whose modules build the `state` verb's node objects.
+///
+/// Listed rather than named file by file: a node kind added tomorrow lands here,
+/// and a gate that carried its own list of kinds would be exactly the hand-kept
+/// roster this file exists to abolish. §7's node kinds are the directory.
+const NODE_MODULES: &str = "daemon/src/nodes";
+
+/// The one page design §5 makes authoritative for this surface.
+///
+/// Deliberately *not* "anywhere under `docs/rpc/`". Half of these keys share a name
+/// with a configuration field — `baud`, `faces`, `role`, `transport`, `codec` — so a
+/// gate that accepted any page would let `configuration.md` vouch for a *state* key
+/// it never describes, and would report green while the enumeration §5 promises had
+/// a hole in it. The narrower target is the stricter one, which is the tell that it
+/// is the right one (AGENTS §9).
+const OBSERVATION_DOC: &str = "docs/rpc/observation.md";
+
+/// State keys emitted by `src` that this gate does not require `observation.md` to
+/// name, each with the reason.
+///
+/// Empty, and expected to stay that way — a key on the wire with no entry on the
+/// schema page is the defect, not the exception. It exists because the *walker*
+/// here is a whole module rather than one function: a future `json!` in a node
+/// module that is not part of `state` would be a false positive, and the honest
+/// answer to one is a named exemption rather than a weakened matcher. Two-sided
+/// below: an entry naming a key that is not emitted, or one that *is* documented,
+/// fails the gate.
+const UNDOCUMENTED_STATE_KEYS: &[(&str, &str)] = &[];
+
+/// Every JSON object key `src` writes, in the three spellings the node modules use.
+///
+/// 1. `"key": value` inside a `json!` literal — the great majority.
+/// 2. `obj.insert("key".to_owned(), …)` — how the shared unconfigured-channel
+///    reporter and the map node write into an object they were handed.
+/// 3. `obj["key"] = …` — one instance today, the leg's `insecure_bind` confession,
+///    which is written this way precisely because it is *conditional*, and a
+///    conditional key is the one most likely to be missed by a human reader.
+///
+/// Comments are stripped and the `mod tests` block is removed: prose about a key is
+/// not an emission of it, and a key asserted in a unit test is a key that already
+/// has to come from somewhere real.
+fn emitted_state_keys(src: &str) -> BTreeSet<String> {
+    let code = strip_tests_module(&strip_line_comments(src));
+    let mut out = BTreeSet::new();
+    let mut rest = code.as_str();
+    let mut base = 0usize;
+    while let Some(open) = rest.find('"') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('"') else { break };
+        let token = &after[..close];
+        let token_start = base + open + 1;
+        let tail = after[close + 1..].trim_start();
+        let looks_like_a_key = !token.is_empty()
+            && token.starts_with(|c: char| c.is_ascii_lowercase())
+            && token
+                .chars()
+                .all(|c| c == '_' || c.is_ascii_lowercase() || c.is_ascii_digit());
+        if looks_like_a_key {
+            // Spelling 1 and 2 are told apart by what follows; spelling 3 by what
+            // precedes. `"key":` must not be confused with `key: "value"` — the
+            // `tracing` macros are full of the latter — so the colon has to come
+            // *after* the literal.
+            let lead = code[..token_start.saturating_sub(1)].trim_end();
+            if tail.starts_with(':')
+                || (lead.ends_with("insert(") && tail.starts_with(&[',', '.'][..]))
+                || (lead.ends_with('[')
+                    && tail.starts_with(']')
+                    && tail[1..].trim_start().starts_with('='))
+            {
+                out.insert(token.to_owned());
+            }
+        }
+        base += open + 1 + close + 1;
+        rest = &after[close + 1..];
+    }
+    out
+}
+
+/// `src` with a trailing `mod tests { … }` block removed, brace-counted.
+fn strip_tests_module(src: &str) -> String {
+    let Some(at) = src.find("mod tests") else {
+        return src.to_owned();
+    };
+    let Some(body) = braced_body(&src[at..], "mod tests") else {
+        return src[..at].to_owned();
+    };
+    // `body` is a subslice of `src[at..]`; everything after its closing brace stays.
+    let body_end = (body.as_ptr() as usize - src.as_ptr() as usize) + body.len() + 1;
+    format!("{}{}", &src[..at], &src[body_end.min(src.len())..])
+}
+
+/// Does `doc` name `key` as a word — not as a fragment of a longer identifier?
+///
+/// `rx` and `tx` are real state keys, and a substring match would find both inside
+/// half the prose on the page. The boundary check is what makes a green verdict
+/// mean the key was written down rather than merely spelled somewhere.
+fn doc_names_key(doc: &str, key: &str) -> bool {
+    let is_word = |c: char| c == '_' || c.is_ascii_alphanumeric();
+    let mut from = 0usize;
+    while let Some(pos) = doc[from..].find(key) {
+        let at = from + pos;
+        from = at + 1;
+        let before_ok = at == 0 || !doc[..at].ends_with(is_word);
+        let after = &doc[at + key.len()..];
+        let after_ok = !after.starts_with(is_word);
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// The keys `emitted` that `doc` does not name and no exemption covers.
+fn undocumented_keys(
+    emitted: &BTreeMap<String, BTreeSet<String>>,
+    doc: &str,
+    exempt: &[(&str, &str)],
+) -> Vec<String> {
+    emitted
+        .iter()
+        .filter(|(key, _)| !doc_names_key(doc, key))
+        .filter(|(key, _)| !exempt.iter().any(|(e, _)| *e == key.as_str()))
+        .map(|(key, from)| {
+            format!(
+                "`{key}` is emitted by {} but appears nowhere in {OBSERVATION_DOC}",
+                from.iter().cloned().collect::<Vec<_>>().join(", ")
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn every_state_key_the_daemon_emits_is_documented() {
+    let root = repo_root();
+
+    // 0. The matcher, in all three spellings it claims to cover and in the near
+    //    misses that must not manufacture a key.
+    let planted = "json!({ \"alpha\": 1, \"beta\": x });\n\
+                   obj.insert(\"gamma\".to_owned(), json!(2));\n\
+                   obj[\"delta\"] = json!(true);\n";
+    assert_eq!(
+        emitted_state_keys(planted),
+        BTreeSet::from([
+            "alpha".to_owned(),
+            "beta".to_owned(),
+            "gamma".to_owned(),
+            "delta".to_owned()
+        ]),
+        "the key matcher misses one of the three spellings the node modules use. \
+         The `json!` literal is the common one; `insert` is how the shared \
+         unconfigured-channel reporter writes; and `obj[\"k\"] = …` is the leg's \
+         conditional `insecure_bind`, which is exactly the kind of key a human \
+         reader skips"
+    );
+    assert!(
+        emitted_state_keys("tracing::warn!(target: \"codec\", channel = %id, \"dropped\");")
+            .is_empty(),
+        "a `key: \"value\"` pair is read as an emitted key — the tracing macros are \
+         written that way throughout the node modules, so every log target would be \
+         demanded a row on the schema page"
+    );
+    assert!(
+        emitted_state_keys("assert_eq!(state[\"planted\"], json!(1));").is_empty(),
+        "an object *read* by subscript counts as one written — every field any unit \
+         test inspects would become a documentation obligation"
+    );
+    assert!(
+        emitted_state_keys("// one day: json!({ \"planted\": 1 })\nlet x = 1;").is_empty(),
+        "a key proposed in a comment is enumerated as emitted"
+    );
+    assert_eq!(
+        strip_tests_module(
+            "fn a() {}\n#[cfg(test)]\nmod tests {\n fn b() { let _ = 1; }\n}\nfn c() {}\n"
+        )
+        .trim(),
+        "fn a() {}\n#[cfg(test)]\n\nfn c() {}".trim(),
+        "the test-module stripper either leaves the tests in or eats the code after \
+         them — the first makes a fixture key a documentation obligation, the second \
+         hides real emissions from the walk"
+    );
+    assert!(
+        doc_names_key("the `rx` counter", "rx") && !doc_names_key("approx and rxx", "rx"),
+        "the doc matcher matches a key inside a longer word, so a short key like \
+         `rx` or `tx` is satisfied by any prose at all"
+    );
+    // The exemption mechanism, exercised rather than merely declared: with the entry
+    // it is silent, without it the key is reported. An empty `const` proves neither.
+    let synthetic: BTreeMap<String, BTreeSet<String>> =
+        BTreeMap::from([("planted".to_owned(), BTreeSet::from(["x.rs".to_owned()]))]);
+    assert!(
+        undocumented_keys(&synthetic, "nothing here", &[("planted", "a reason")]).is_empty(),
+        "a named exemption does not suppress its key, so the mechanism cannot be used"
+    );
+    assert_eq!(
+        undocumented_keys(&synthetic, "nothing here", &[]).len(),
+        1,
+        "an unexempted, undocumented key is not reported — the gate's whole subject"
+    );
+
+    // 1. The walker: list the node modules, and require the listing to reach a file
+    //    planted beside them. A gate that carried its own list of node kinds would
+    //    go stale the day a kind is added, which is the failure mode of every other
+    //    roster in this file.
+    let dir = root.join(NODE_MODULES);
+    let mut modules: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    modules.sort();
+    assert!(
+        modules.len() >= 7,
+        "only {} module(s) under {NODE_MODULES}/ — §7 ships six node kinds plus the \
+         exec codec, so the listing has stopped listing and this gate would compare \
+         an empty surface against a full page",
+        modules.len()
+    );
+
+    // 2. The emitted surface, from those modules.
+    let mut emitted: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for path in &modules {
+        let src = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for key in emitted_state_keys(&src) {
+            emitted.entry(key).or_default().insert(name.clone());
+        }
+    }
+    assert!(
+        emitted.len() >= 50,
+        "only {} state key(s) enumerated from {NODE_MODULES}/ — the seven kinds \
+         carry far more than that between them, so the matcher has stopped matching",
+        emitted.len()
+    );
+
+    let doc = read_tree_file(&root, OBSERVATION_DOC);
+    assert!(
+        doc.len() > 10_000,
+        "{OBSERVATION_DOC} is {} bytes — it was truncated or replaced, and a gate \
+         comparing a full surface against a stub reports every key as undocumented \
+         (or, if the stub is empty of nothing, reports nothing at all)",
+        doc.len()
+    );
+
+    // 3. Planted against the real page and the real sources, both directions.
+    let victim = emitted
+        .keys()
+        .find(|k| k.len() > 6 && doc_names_key(&doc, k))
+        .expect("some documented key")
+        .clone();
+    let stale: String = doc
+        .lines()
+        .filter(|l| !doc_names_key(l, &victim))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let planted_drift = undocumented_keys(&emitted, &stale, UNDOCUMENTED_STATE_KEYS);
+    assert!(
+        planted_drift.iter().any(|m| m.contains(&victim)),
+        "striking every line naming `{victim}` from {OBSERVATION_DOC} produced no \
+         drift naming it: this gate cannot notice a documented key losing its \
+         documentation. Reported instead: {planted_drift:?}"
+    );
+    // …and a key that arrives in the code with no page entry, in each of the three
+    // spellings, against the real page rather than a fixture.
+    for (spelling, planted_src) in [
+        ("a json! literal", "json!({ \"planted_state_key\": 1 })"),
+        (
+            "an insert call",
+            "obj.insert(\"planted_state_key\".to_owned(), json!(1));",
+        ),
+        ("a subscript assignment", "obj[\"planted_state_key\"] = j;"),
+    ] {
+        let mut with_planted = emitted.clone();
+        for key in emitted_state_keys(planted_src) {
+            with_planted
+                .entry(key)
+                .or_default()
+                .insert("planted.rs".to_owned());
+        }
+        let d = undocumented_keys(&with_planted, &doc, UNDOCUMENTED_STATE_KEYS);
+        assert!(
+            d.iter().any(|m| m.contains("planted_state_key")),
+            "a new state key written as {spelling} produced no drift: a counter can \
+             reach the wire with no schema entry, which is the drift plan §18 item \
+             63 measured at seventeen keys and this gate at twenty-nine. Reported \
+             instead: {d:?}"
+        );
+    }
+
+    // 4. The exemption list is two-sided: an entry must name a key that is really
+    //    emitted and really absent from the page, or it is a licence nobody needs.
+    for (key, reason) in UNDOCUMENTED_STATE_KEYS {
+        assert!(
+            emitted.contains_key(*key),
+            "`{key}` is exempted from {OBSERVATION_DOC} (\"{reason}\") but nothing \
+             under {NODE_MODULES}/ emits it — an exemption for a key that no longer \
+             exists is a hole waiting for the name to be reused"
+        );
+        assert!(
+            !doc_names_key(&doc, key),
+            "`{key}` is exempted from {OBSERVATION_DOC} (\"{reason}\") but the page \
+             documents it: delete the exemption rather than leave a licence standing \
+             over a key that does not need one"
+        );
+    }
+
+    // 5. The verdict.
+    let d = undocumented_keys(&emitted, &doc, UNDOCUMENTED_STATE_KEYS);
+    assert!(
+        d.is_empty(),
+        "the observation surface has drifted from its schema page:\n  {}\n\
+         Design §5 makes {OBSERVATION_DOC} \"the authoritative per-kind enumeration \
+         and stays so\", so a key the daemon puts in `state` with no entry there is a \
+         wire surface with no schema — the drift class that produced §15.54, where \
+         the loss taxonomy had to be corrected because four shipped counters \
+         falsified it. Document the key, or stop emitting it.",
+        d.join("\n  ")
+    );
 }
