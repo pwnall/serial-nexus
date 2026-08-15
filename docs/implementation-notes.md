@@ -12700,3 +12700,69 @@ message describes the defect you just planted, on a tree that no longer contains
 4 000 000, the port is at 9600" in node state, is new mechanism plus an extra DTR toggle on a fault
 path — a design question, not a patch. And which rungs an FT232R refuses under Darwin's
 `IOSSIOSPEED` is unmeasured; P14 on the Mac rig would settle it.
+
+### 3.108 §15.21's last two checklist items, answered — counted, not lost
+
+Plan §18 items 17 and 16, the two remaining rig-session items this bench could reach. Both land as
+suite guards under §15.52's boundary — the doctor certifies the rig, the suite drives the daemon
+through it — and neither grew a probe.
+
+**Item 17's break clause is the first assertion in this workspace that a break crossed a wire.**
+Nothing the doctor does can raise `brk` on any kernel, and the guard §15.21 names for the clause
+asserts that the line resumes *transmitting* after a straddled `--replace` and reads no counter at
+all. Measured: `send-break` on one port raises the far node's `driver_counters.brk` by 1, `frame`
+unmoved, the transmitting port's own `brk` still, and 2 s of idle wire quiet. A 250 ms and a 25 ms
+break both move it by **1** — one per break *event*, not per flagged packet — recorded and never
+asserted, because neither number is a promise this tree makes.
+
+**The parity clause answers COUNTED, NOT LOST, and the pre-registered prediction of payload loss is
+refuted.** An 8E1 transmitter into an 8O1 receiver raises `parity` by 2 for a 43-byte payload — the
+driver flags a USB packet, not a character — while the payload arrives **byte-exact**, 43 of 43.
+Even against odd was chosen deliberately over none-against-even: the latter mismatches the *frame
+length* and produces a collapse that says nothing about parity checking, while even and odd share an
+11-bit frame and differ on every byte regardless of content.
+
+**The cause was measured, not inferred, and it is the transferable half.** The obvious reading —
+`IGNPAR` absent — is wrong: `serial2`'s `set_raw` sets `IGNBRK | IGNPAR`, `set_configuration`
+verifies `c_iflag` back, and the committed artifact confirms it on these exact ports
+(`docs/doctor/linux-7.0-2026-08-14-b58a1c4-tier3.json`, P15, `iflag_before_hex: "0x5"`). Both flags
+are in force and the characters still arrive. **So in `ftdi_sio` the `TIOCGICOUNT` counter and the
+per-character `TTY_BREAK`/`TTY_PARITY` flag are independent**: the counter moves off the FTDI status
+byte while the character is handed up unflagged, and the line discipline never receives a flagged
+character to drop. The break's stray byte — 1 B delivered under a verified `IGNBRK`, where the
+prediction said 0 — is the same mechanism. Two citable facts force the conclusion: the flags are set
+(artifact) and the characters were not dropped (rig).
+
+**What that changes about the guards is the point.** Both assert the counter and *record* the bytes.
+A guard on payload loss would pin **another driver's decision about flagging characters** as though
+it were a serial_nexus promise — AGENTS §3's decision-not-mechanism register, and the first instance
+of it found *below* the product's own surface rather than inside it. The test earned this by failing
+correctly: it pre-registered four separated readings, so "counter moved + payload intact" arrived
+named instead of as a bare red.
+
+**One in-tree claim was false in two successive directions.** `serial_hardware.rs` said a far-end
+break "surfaces at the peer RX as a NUL"; that was corrected during this work to "`IGNBRK` drops it,
+so the delta reads 0 B"; measured, it is 1 B. Both spellings are gone. **A claim corrected once is
+not thereby correct** — the second spelling was reasoned from the same unmeasured premise as the
+first, and only the rig separated them.
+
+**Item 16 proves §12's one directly-provable fallback.** The `by-path:` identity is unchanged across
+a renumbering cycle while `resolved_path` follows the adapter, `identity_kind` reads `by-path`, and
+the node's path ends in A's **new** tty and not B's — a stale link on a bench whose minors just
+swapped is a node silently opening the other adapter. **The item's own *Validation* control now runs
+every time rather than being remembered:** §12 recorded the non-renumbering order as measured once
+and nothing executed it; it ships as arm 1, and it is what turns the subject's `assert_ne!` from a
+hope into a knob. The product plant — memoizing `bypath_lookup`, which is §12's
+"identity-to-current-path at *every* open" violated exactly — passes the control and reddens the
+subject at `left: "/dev/ttyUSB1" right: "/dev/ttyUSB1"`. It is invisible until the minors move.
+
+**Item 16's filed premise was wrong about the tree.** "The sysfs port name denoting the port" is not
+what `by-path:` is: it is a udev `/dev/serial/by-path` **link name**, and `bypath_lookup` resolves it
+by `read_link` on that tree alone, never consulting `class/tty`. Filed rather than fixed: `by-path:`
+is the one identity form with a single door, so §12's "by-id is a fast path *over* the sysfs listing,
+never an alternative" does not describe it; and `has_identity_source` answers yes on a sysfs-only box
+where a `by-path:` identity can never resolve. Also filed: `Resolver::bypath_of` (capture) is
+`read_dir`-order dependent and this bench publishes **two** valid names per adapter (`usb-` and
+`usbv2-`), so two captures of one adapter can mint two different identity strings with nothing
+choosing between them — §12 clause 9 already sorts *enumeration* output for exactly this reason, and
+capture is the same class. The test sidesteps it by choosing its identity sorted and saying so.

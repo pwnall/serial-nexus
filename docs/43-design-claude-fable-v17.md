@@ -3496,6 +3496,20 @@ items the certificate is the precondition *for*, and the in-tree guard for the b
 `p12_serial_exclusivity::a_break_straddled_by_a_replace_leaves_the_line_transmitting`, which needs
 a rig the harness can see (`crossover_ports()` — `SNX_CROSSOVER_A`/`_B` on Linux). The
 parity-mismatch and break-reception remainder is a plan §18 ledger item.
+**Executed 2026-08-15 (plan §18 item 17; notes §3.108), and two sentences above want reading with
+that answer beside them.** Both clauses are now suite guards asserting `driver_counters` — the
+doctor grew nothing — so naming
+`p12_serial_exclusivity::a_break_straddled_by_a_replace_leaves_the_line_transmitting` as "the
+in-tree guard for the break clause" is **imprecise**: that test guards the SERX-2 *restore* half,
+asserting the line resumes transmitting, and reads no counter. And framing both clauses as items
+whose evidence would be a corrupted pattern does not survive measurement: on `ftdi_sio` /
+Linux 7.0.0-29 the parity clause answers **counted, not lost** — the receiver's `parity` counter
+rises and the payload arrives byte-exact, because that driver's `TIOCGICOUNT` counter and its
+per-character `TTY_PARITY` flag are independent, so `IGNPAR` (verified in force,
+`docs/doctor/linux-7.0-2026-08-14-b58a1c4-tier3.json`, P15, `iflag_before_hex: "0x5"`) never
+receives a flagged character to drop. **Payload damage is therefore not the evidence for either
+clause**, and a guard demanding it would pin another driver's decision rather than this system's
+mechanism.
 
 ### 15.22 The exec codec is a boundary, and the empty channel is the multiplexed side
 

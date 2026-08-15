@@ -21,9 +21,40 @@
 //! * the serial *signal* verbs (`send-break`/`set-modem`/`pulse-dtr`) driven end to end
 //!   through the daemon against a real UART — the Tier-3 property (design §13) this
 //!   null-modem rig exists to test, unreachable on the pts that `p7_signals` uses
-//!   (set-modem/pulse-dtr `ENOTTY` a pts). Far-end break *reception* is observed
-//!   best-effort (a break surfaces at the peer RX as a NUL) but not asserted — macOS
-//!   has no frame-error counter (TIOCGICOUNT is Linux-only).
+//!   (set-modem/pulse-dtr `ENOTTY` a pts);
+//! * **break *reception* and a deliberate *parity* mismatch, read back through the far
+//!   node's `driver_counters`** — §15.21's two remaining checklist items, plan §18 item
+//!   17, in the last section of this file. They are asserted rather than observed
+//!   best-effort, on Linux only: `TIOCGICOUNT` is the tree's one shipped observable for
+//!   either, and off Linux `serial_nexus_sys::read_icounts` is a compile-time stub, so
+//!   both self-skip there with that named as the reason.
+//!
+//! **Both clauses are asserted on the counter, and which surface to assert on was
+//! settled by measurement rather than by argument.** This header has now been wrong
+//! about the far port's *data* stream twice: first that a break "surfaces at the peer RX
+//! as a NUL", then — when that was repaired — that `IGNBRK` means it surfaces as nothing
+//! at all. Neither holds, and the flags are not the reason. They really are in force:
+//! `serial2`'s `set_raw` sets `IGNBRK | IGNPAR`, `set_configuration` verifies the whole
+//! of `c_iflag` back after applying it, and the committed artifact
+//! `docs/doctor/linux-7.0-2026-08-14-b58a1c4-tier3.json` reads `iflag_before_hex: "0x5"`
+//! — `IGNBRK` (0x1) `| IGNPAR` (0x4) — on **both** of this bench's ports (P15,
+//! `software_flow_control`). And yet a break delivers a byte to the far log, and a
+//! parity-mismatched payload arrives byte-exact.
+//!
+//! **The mechanism, which is the transferable finding:** in `ftdi_sio` the driver's
+//! `TIOCGICOUNT` counter and the per-character `TTY_BREAK`/`TTY_PARITY` flag are
+//! **independent**. The counter is incremented off the FTDI status byte, while the
+//! character is handed up unflagged — so the line discipline never receives a flagged
+//! character, and `IGNBRK`/`IGNPAR` have nothing to act on. Two citable facts force that
+//! conclusion: the flags are set (the artifact above) and the characters were not
+//! dropped (measured on the rig). It is a deduction from measurement, not a source
+//! reading.
+//!
+//! So the counter is what these two tests assert and the byte stream is recorded and
+//! never asserted. What a driver does with an errored character is a property this
+//! project neither promises nor controls; "the far port noticed" is exactly what
+//! §15.21's two checklist items ask, and `driver_counters` is the field §7.1 promises
+//! it in.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -608,9 +639,18 @@ fn crossover_rig_actual_baud_is_a_read_back_not_an_echo() {
 /// The serial signal verbs driven end to end through the daemon against a real UART —
 /// send-break, set-modem (DTR/RTS high then low), pulse-dtr. On a real port these ioctls
 /// succeed (a pts `ENOTTY`s set-modem/pulse-dtr, which is why `p7_signals` cannot cover
-/// this). Far-end break reception is observed best-effort (a break surfaces at the peer
-/// RX as a NUL) and logged, not asserted — deterministic break→frame-error detection needs
-/// TIOCGICOUNT, which is Linux-only.
+/// this).
+///
+/// **Break *reception* is asserted elsewhere and this test's far-end read stays
+/// informational** — see [`a_break_on_one_port_is_counted_at_the_far_ports_driver`]
+/// (plan §18 item 17). Two successive justifications for the byte delta printed below
+/// have been measurably false: "a break surfaces at the peer RX as a NUL" (it is not a
+/// NUL this tree ever promises), and then "`IGNBRK` drops it, so this reads 0 B". The
+/// measured reading is **one byte per break**, with `IGNBRK` set and verified — see the
+/// module header for the artifact and for why the counter and the per-character flag are
+/// independent in this driver. It stays a print rather than becoming an assertion for
+/// the reason that finding gives: the byte is a driver artifact, and neither its
+/// presence nor its count is anything serial_nexus undertakes to deliver.
 #[test]
 fn crossover_rig_signal_verbs() {
     let Some((p0, p1)) = crossover_ports() else {
@@ -666,9 +706,10 @@ fn crossover_rig_signal_verbs() {
         rpc.node("port0")
     );
 
-    // Best-effort far-end observation (informational, not asserted): a break on port0 may
-    // surface at port1 RX as a framing anomaly / NUL. macOS has no frame-error counter, so
-    // we only report whether bytes appeared.
+    // Informational, never asserted (see this test's doc comment): the measured reading
+    // is one byte per break, delivered despite `IGNBRK` because this driver's counter
+    // and its per-character flag are independent. The far-end *assertion* lives in
+    // `a_break_on_one_port_is_counted_at_the_far_ports_driver`, on the counter.
     std::thread::sleep(Duration::from_millis(200));
     let after = std::fs::metadata(&rx1).map(|m| m.len()).unwrap_or(0);
     let delta = std::fs::read(&rx1)
@@ -676,7 +717,8 @@ fn crossover_rig_signal_verbs() {
         .unwrap_or_default();
     eprintln!(
         "signal verbs on real port0 all returned Ok — far-end rx1 delta = {} B {:?} \
-         (informational; macOS has no frame counter)",
+         (informational; a break is counted AND delivers a character on this driver, so \
+         a small nonzero reading here is ordinary and no reading is a verdict)",
         after - before,
         &delta[..delta.len().min(16)]
     );
@@ -1517,5 +1559,572 @@ fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
          crossed in {STALL_WINDOW:?}\" is then satisfiable by a bench that is merely \
          slow, and arm 1's green says nothing about `rts-cts`. Widen STALL_WINDOW \
          (both arms read it) or find out why this rig delivers 40 bytes that slowly"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §15.21's two remaining checklist items (plan §18 item 17)
+// ---------------------------------------------------------------------------
+//
+// §15.21 states the shipped P5 certificate exactly: per pair it carries a rate
+// ladder and one deliberate **baud** mismatch, and per port a **local** break
+// assertion — "not a parity mismatch, break reception, or far-side modem-line
+// signalling ... Those three are not lost: they are checklist items the
+// certificate is the precondition *for*."
+//
+// The third of them was answered in this file by
+// `crossover_rig_rts_crosses_to_the_far_ports_cts`, and §15.52 sets the boundary
+// that made the suite its right home: *the doctor certifies the rig, port to port,
+// with no daemon in the path; driving the daemon over the certified rig is the
+// suite's job.* These two follow that precedent exactly — both drive the daemon's
+// own verbs (`send-break`, `send`) and read the result back through node state
+// (`driver_counters`), which is the surface §7.1 promises an operator. Neither
+// adds a certificate item, and nothing here moves the doctor's `probe_set`.
+//
+// **Both are Linux-only, and the gate is the mechanism rather than the platform.**
+// `driver_counters` is `TIOCGICOUNT`, whose binding exists on Linux alone; off it
+// `serial_nexus_sys::read_icounts` is a compile-time `ENOTSUP` stub, so the daemon
+// omits the block for every fd — an FT232R included — and no rig, cable or re-seat
+// can change that.
+//
+// **And the counter is not merely the *first* observable, it is the only sound one.**
+// The obvious alternative — read the far port's bytes and require them to be damaged —
+// was tried and refuted on the rig: a break delivers a character and a parity-mismatched
+// payload arrives byte-exact, with `IGNBRK | IGNPAR` set and verified (the module
+// header carries the artifact and the counter/flag independence that explains it). So
+// the byte stream answers a question about the driver's flagging, not about whether the
+// far port noticed — and "the far port noticed" is the whole of what §15.21 asks and of
+// what §7.1 promises. Both tests therefore assert the counter, record the bytes, and
+// skip rather than pretend off Linux.
+
+/// This node's `driver_counters` block, insisting it is there.
+///
+/// **Absence is a failure here, not a skip**, and the distinction is
+/// `serial_nexus_sys::ICOUNTS_SUPPORTED`'s reason for existing: on Linux the ioctl
+/// is real, so an `Err` from it is a *measurement* — a pts answers `ENOTTY` because
+/// its driver implements nothing, and a genuine FT232R must not answer that way.
+/// The callers below check `ICOUNTS_SUPPORTED` first and skip on it; reaching this
+/// function means the build has the ioctl, and a missing block then says the port
+/// under test is not the UART the rig variables claim.
+fn driver_counters(rpc: &serial_nexus_itest::Rpc, node: &str) -> Value {
+    let state = rpc
+        .node(node)
+        .unwrap_or_else(|| panic!("{node} has no state"));
+    let counters = state["driver_counters"].clone();
+    assert!(
+        counters.is_object(),
+        "{node} reports no driver_counters on a build whose TIOCGICOUNT is real, so \
+         this port's driver does not implement it — a pts or a non-UART, not the \
+         adapter this test needs: {state}"
+    );
+    counters
+}
+
+/// One field out of a [`driver_counters`] block.
+fn icount(counters: &Value, field: &str) -> i64 {
+    counters[field]
+        .as_i64()
+        .unwrap_or_else(|| panic!("driver_counters.{field} is not a number: {counters}"))
+}
+
+/// Announce the self-skip of a test whose only observable is `TIOCGICOUNT`, on a
+/// build that has none.
+///
+/// It skips rather than compiling away for the reason
+/// `crossover_rig_actual_baud_is_a_read_back_not_an_echo` gives: a Mac rig operator
+/// is told the test exists and why it did not run, and the code stays visible to the
+/// Apple cross-check. It deliberately does **not** consult `SNX_CROSSOVER=required`:
+/// required mode asserts that a *rig* is attached, and no rig makes a Darwin kernel
+/// grow an error-counter ioctl.
+fn skip_no_driver_counters(test: &str) {
+    eprintln!(
+        "SKIP {test}: this build has no TIOCGICOUNT (serial_nexus_sys::ICOUNTS_SUPPORTED \
+         is false), so the far port's break/parity observation has no shipped observable \
+         here — the daemon omits `driver_counters` for every fd off Linux (§5, §13), and \
+         the byte stream is not a substitute for it: measured on the rig, an errored \
+         character is delivered rather than dropped, so the data plane answers a \
+         question about the driver's flagging and not about whether the far port \
+         noticed. Answering this clause on Darwin needs an observable that does not \
+         exist yet, not a rig."
+    );
+}
+
+/// **A break asserted on one port is observed at the far port** — §15.21's
+/// break-**reception** checklist item, plan §18 item 17, driven through the daemon's
+/// own `send-break` verb and read back through the far node's state.
+///
+/// The certificate cannot answer this and says so: `p5_certify_port` computes
+/// `break_ok` as `set_break(true).is_ok() && set_break(false).is_ok()` — local ioctl
+/// acceptance, one port at a time — and `p5_certify_pair` transmits a rate ladder and
+/// asserts no break at all, so nothing the doctor does can raise `brk` on any kernel
+/// (`docs/serial-nexus-doctor.md`). Nor does the tree's other break test:
+/// `p12_serial_exclusivity::a_break_straddled_by_a_replace_leaves_the_line_transmitting`
+/// asserts that the line resumes *transmitting* after a straddled replace and never
+/// reads a counter. So this is the first assertion in the workspace that a break
+/// crossed a wire.
+///
+/// **Three controls, because the assertion is that a number went up** and a number
+/// that goes up on its own proves nothing:
+///
+/// * *quiet in time* — the same two counters are read across an idle window of the
+///   same order as the break, and must not move. A bench whose `brk` free-runs (a
+///   floating RX line, a noisy cable) fails here rather than passing the subject;
+/// * *quiet in space* — the **transmitting** port's own `brk` must not move. It is
+///   the negative control §15.52's DTR arm is for the handshake test: a rig that is
+///   secretly a loopback, or an adapter that echoes its own TX into its RX, raises
+///   the far counter and this one together;
+/// * *the mechanism* — the far counter is polled only after the verb returns, so a
+///   `send-break` that is refused, parked, or answered by a node that no longer
+///   holds the port cannot reach the assertion at all.
+///
+/// **What is deliberately recorded and not asserted, and what those records have
+/// already answered.** Two numbers here are driver-internal artifacts rather than
+/// promises, so both are re-measured on every run and neither is pinned:
+///
+/// * *the size of the counter delta.* Whether a driver counts once per break **event**
+///   or once per USB packet it flags was open when this test was written, so a second,
+///   ten-times-shorter break runs after the first and the two deltas are printed side
+///   by side. Measured on this bench in the run that established this arm: `brk +1` for
+///   a 250 ms break and `brk +1` for a 25 ms one — **one per event**. Recorded here as
+///   the reading of a run, not converted into an assertion: the moment a number like
+///   that becomes a guard, a driver's packetization is a serial_nexus promise;
+/// * *the far end's byte delta.* Measured **1 B** per break, with `IGNBRK` set and
+///   verified — see the module header for the artifact and the counter/flag
+///   independence that explains it. The prediction this test shipped with said `0 B`
+///   and is refuted (AGENTS §9); the print now says what was seen rather than what was
+///   expected. It stays a print because a character the driver hands up unflagged is
+///   not something this project undertakes to deliver or to suppress.
+#[test]
+fn a_break_on_one_port_is_counted_at_the_far_ports_driver() {
+    let Some((p0, p1)) = crossover_ports() else {
+        skip_no_rig("a_break_on_one_port_is_counted_at_the_far_ports_driver");
+        return;
+    };
+    if !serial_nexus_sys::ICOUNTS_SUPPORTED {
+        skip_no_driver_counters("a_break_on_one_port_is_counted_at_the_far_ports_driver");
+        return;
+    }
+    let _rig = rig_guard();
+    eprintln!("crossover rig (break reception): {p0} <-> {p1}");
+
+    let (d, run_dir, _inj0, _inj1) = boot_rig(&p0, &p1, 115_200);
+    let rpc = d.rpc();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // ---- Control 1: quiet in time. ----
+    //
+    // **The idle window is at least as long as the window the subject is observed
+    // over**, which is the property that makes it a control rather than a gesture: a
+    // counter ticking at some background rate would have at least as many chances to
+    // tick here as it does there, so "it moved during the break" cannot be
+    // "the break's window was longer". `OBSERVE` bounds the subject's poll and
+    // `QUIET` equals it; changing one without the other is what turns this back into
+    // a gesture (AGENTS §3: an assertion weaker than the comment above it claims).
+    const OBSERVE: Duration = Duration::from_secs(2);
+    const QUIET: Duration = OBSERVE;
+    const BREAK_MS: u64 = 250;
+    let near_before = driver_counters(rpc, "port0");
+    let far_before = driver_counters(rpc, "port1");
+    std::thread::sleep(QUIET);
+    let near_quiet = driver_counters(rpc, "port0");
+    let far_quiet = driver_counters(rpc, "port1");
+    for (node, before, after) in [
+        ("port0", &near_before, &near_quiet),
+        ("port1", &far_before, &far_quiet),
+    ] {
+        assert_eq!(
+            icount(before, "brk"),
+            icount(after, "brk"),
+            "{node}'s break counter moved by itself across a {QUIET:?} idle window \
+             ({before} -> {after}). Nothing below can attribute a rise to the break \
+             verb on a bench whose counter free-runs — check the cabling before \
+             reading the failure under this one as a product defect"
+        );
+    }
+    eprintln!("quiet control: no brk on either port across {QUIET:?} of idle wire");
+
+    // ---- The subject. ----
+    let rx1 = run_dir.join("rx1.log");
+    let bytes_before = file_len(&rx1);
+    let far_base = icount(&far_quiet, "brk");
+    let near_base = icount(&near_quiet, "brk");
+
+    let echo = rpc
+        .send_break("port0", BREAK_MS)
+        .expect("send-break on port0 must reach the real UART");
+    assert_eq!(echo["break_ms"], json!(BREAK_MS), "send-break echo: {echo}");
+
+    // Polled, not sampled: the far end learns of the break over the USB bus, so the
+    // status packet carrying it arrives on the adapter's own latency timer (16 ms by
+    // default on an FT232R) rather than synchronously with the verb's return. The
+    // poll is bounded by `OBSERVE` and the quiet control ran for exactly that long.
+    let rose = wait_until(OBSERVE, || {
+        icount(&driver_counters(rpc, "port1"), "brk") > far_base
+    });
+    let far_after = driver_counters(rpc, "port1");
+    let near_after = driver_counters(rpc, "port0");
+    let brk_delta = icount(&far_after, "brk") - far_base;
+    let frame_delta = icount(&far_after, "frame") - icount(&far_quiet, "frame");
+    let parity_delta = icount(&far_after, "parity") - icount(&far_quiet, "parity");
+    let bytes_delta = file_len(&rx1) - bytes_before;
+    eprintln!(
+        "break {BREAK_MS} ms on port0: far port1 brk +{brk_delta} frame +{frame_delta} \
+         parity +{parity_delta}, {bytes_delta} B reached the far log (recorded, never \
+         asserted: measured 1 B, delivered despite a verified IGNBRK because this \
+         driver's counter and per-character flag are independent); far counters \
+         {far_after}, near counters {near_after}"
+    );
+
+    // The three readings this arm can produce are separated, because they are three
+    // different findings and they want three different next steps.
+    if brk_delta == 0 {
+        assert!(
+            frame_delta == 0 && parity_delta == 0,
+            "**REFUTATION, not a product defect.** The far port observed the break as \
+             a framing/parity error rather than as a break: brk +0, frame \
+             +{frame_delta}, parity +{parity_delta}. The pre-registration for this \
+             test named `brk`, on the reading of `ftdi_sio`'s error handling that \
+             break takes precedence over parity which takes precedence over framing. \
+             That precedence is what is refuted; break *reception* is confirmed, and \
+             the assertion below should be rewritten to name the counter this driver \
+             actually moves. Record the reading before changing anything (AGENTS §9)"
+        );
+        panic!(
+            "the far port observed **nothing** from a {BREAK_MS} ms break asserted on \
+             port0 (rose={rose}): brk, frame and parity all unmoved on port1, and \
+             {bytes_delta} B of data. The verb returned Ok, so the daemon reached the \
+             port; either the break is not being put on the wire, or this adapter does \
+             not report a received break through TIOCGICOUNT at all — which would \
+             answer §15.21's break-reception clause with a **no** on this hardware, \
+             and is worth recording as such rather than repairing blindly. \
+             far={far_after} near={near_after}"
+        );
+    }
+
+    // ---- Control 2: quiet in space. ----
+    assert_eq!(
+        icount(&near_after, "brk"),
+        near_base,
+        "the **transmitting** port counted a break on its own receiver while it was \
+         asserting one ({near_base} -> {}). Its RX is wired to the far port's TX, \
+         which was idle, so this rig is not the crossover the variables claim — a \
+         loopback, or an adapter echoing its own TX — and the far-side rise above \
+         proves nothing about a wire: near={near_after}",
+        icount(&near_after, "brk")
+    );
+
+    // ---- Recorded, never asserted: what the delta's size tracks. ----
+    let short_base = icount(&far_after, "brk");
+    const SHORT_BREAK_MS: u64 = 25;
+    rpc.send_break("port0", SHORT_BREAK_MS)
+        .expect("the second, shorter send-break");
+    wait_until(OBSERVE, || {
+        icount(&driver_counters(rpc, "port1"), "brk") > short_base
+    });
+    let short_delta = icount(&driver_counters(rpc, "port1"), "brk") - short_base;
+    eprintln!(
+        "recorded, never asserted: a {BREAK_MS} ms break moved port1's brk by \
+         {brk_delta} and a {SHORT_BREAK_MS} ms one by {short_delta}. Equal deltas mean \
+         the driver counts one per break *event*; a delta that scales with duration \
+         means it counts one per flagged USB packet. Measured 1 and 1 on this bench — \
+         per event — and re-measured here every run rather than remembered, because \
+         neither number is a promise this tree makes: which is why the assertion above \
+         reads `> 0` and not a number"
+    );
+
+    // The port survives its own signalling — the same closing check the sibling
+    // signal-verb test makes, for the same reason.
+    assert!(
+        rpc.wait_status("port0", "active", Duration::from_secs(3)),
+        "port0 faulted after two breaks: {:?}",
+        rpc.node("port0")
+    );
+}
+
+/// The rig config with a `parity` chosen per port.
+///
+/// Separate from [`null_modem_cfg`] rather than a parameter on it for the reason
+/// [`flow_cfg`] is separate: the test below needs the two ports to **differ**, and a
+/// single knob on the shared builder would not express that.
+fn parity_cfg(
+    p0: &str,
+    p1: &str,
+    baud: u32,
+    parity: (&str, &str),
+    dir: &Path,
+    inj0: &Path,
+    inj1: &Path,
+) -> String {
+    let (par0, par1) = parity;
+    null_modem_cfg(p0, p1, baud, dir, inj0, inj1)
+        .replace(
+            "name = \"port0\"",
+            &format!("name = \"port0\"\nparity = \"{par0}\""),
+        )
+        .replace(
+            "name = \"port1\"",
+            &format!("name = \"port1\"\nparity = \"{par1}\""),
+        )
+}
+
+/// **A deliberate parity mismatch across the pair is noticed by the receiver** —
+/// §15.21's parity-mismatch checklist item, plan §18 item 17.
+///
+/// §15.21 is exact about the gap: "`p5_certify_pair` runs `Parity::None` throughout —
+/// only baud is mismatched". So the certificate's one mismatch corrupts the pattern by
+/// clocking it wrong, and nothing in this workspace has ever put a *parity* bit on a
+/// wire, let alone mismatched one.
+///
+/// **Even against odd, not none against even, and the choice is the experiment.**
+/// A `none` transmitter into an `even` receiver mismatches the *frame length* — 10
+/// bits against 11 — so the receiver samples the stop bit as parity and the next start
+/// bit as stop, and what it reports is a framing collapse that says nothing about
+/// parity checking. Even and odd are complementary for every possible byte: same
+/// 11-bit frame, correct start and stop, and the parity bit wrong on **every**
+/// character regardless of payload. That makes the subject arm's expectation
+/// content-independent rather than a property of the string chosen.
+///
+/// **What is asserted: the receiver *notices*.** `driver_counters.parity` must rise.
+/// That is §15.21's clause in its own words — parity-error *observation* — and it is
+/// the observable serial_nexus promises: §7.1 surfaces the driver's input counters
+/// precisely because "framing/parity/overrun errors are otherwise invisible loss".
+///
+/// **What is deliberately not asserted: payload loss.** This arm shipped asserting it
+/// and the rig refuted the prediction (AGENTS §9). Measured: an 8E1 transmitter into an
+/// 8O1 receiver reads `parity +2` and the payload arrives **byte-exact**, 43 of 43
+/// bytes. The flags are not the explanation and were checked rather than assumed —
+/// `docs/doctor/linux-7.0-2026-08-14-b58a1c4-tier3.json` reads `iflag_before_hex:
+/// "0x5"`, `IGNBRK | IGNPAR`, on both of this bench's ports (P15,
+/// `software_flow_control`), and `set_configuration` verifies `c_iflag` back. In
+/// `ftdi_sio` the counter and the per-character `TTY_PARITY` flag are **independent**:
+/// the counter comes off the FTDI status byte and the character is handed up unflagged,
+/// so `IGNPAR` never receives one to drop. A guard on payload loss would therefore pin
+/// *another* driver's decision about flagging characters as if it were a serial_nexus
+/// promise — AGENTS §3's "a guard pinning a decision rather than a mechanism", one
+/// layer below the daemon. It is recorded on every run instead.
+///
+/// **The four readings stay separated**, because they are four different findings
+/// wanting four different next steps, and only the counter decides pass or fail:
+///
+/// * **counted, payload intact — the expected reading on `ftdi_sio` / Linux 7.0.0-29**,
+///   for the reason cited above. Passes;
+/// * counted, payload lost — also passes, and is a *different platform*: that driver
+///   does flag the characters, so `IGNPAR` drops them. Printed loudly, because it is a
+///   finding about that driver and the shape this test was originally written for;
+/// * not counted, payload lost — fails: the corruption is not attributable to parity,
+///   and the primer or the baud is the place to look;
+/// * not counted, payload intact — fails: the configured parity never reached the wire,
+///   which is the product defect this guard exists for.
+///
+/// **The control runs second and it now carries the whole discrimination.** Since the
+/// payload arrives in both arms on this hardware, the *only* thing separating a
+/// mismatched pair from a matched one is the counter — so the control's job is no
+/// longer mainly rig-liveness, it is to show that the counter is quiet when the parities
+/// agree. A counter that moved there would mean the subject arm's rise is not measuring
+/// the mismatch at all. It still runs second, for
+/// `crossover_rig_actual_baud_is_a_read_back_not_an_echo`'s reason: a control taken
+/// afterwards also rules out a rig that died mid-test, which a control taken first
+/// cannot.
+///
+/// **`active` is not decoration here, it is the read-back.** `serial2`'s
+/// `set_configuration` compares `c_cflag` and `c_iflag` back after applying them, so a
+/// driver that accepted `PARENB`/`PARODD` and dropped them fails the open and faults
+/// the node — the same shape §15.61 refuses for `xon-xoff`. A node that reaches
+/// `active` under a parity setting has had that setting read back off the termios it
+/// asked for.
+#[test]
+fn a_parity_mismatch_is_counted_at_the_far_ports_driver() {
+    let Some((p0, p1)) = crossover_ports() else {
+        skip_no_rig("a_parity_mismatch_is_counted_at_the_far_ports_driver");
+        return;
+    };
+    if !serial_nexus_sys::ICOUNTS_SUPPORTED {
+        skip_no_driver_counters("a_parity_mismatch_is_counted_at_the_far_ports_driver");
+        return;
+    }
+    let _rig = rig_guard();
+    eprintln!("crossover rig (parity mismatch): {p0} <-> {p1}");
+    // This test builds its own daemons rather than going through `boot_rig`, so it
+    // asks for the priming itself — the same reason
+    // `rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes` does (plan §18
+    // item 76): its payload is smaller than the 64-byte leading packet a freshly
+    // re-enumerated FT232R swallows, and a whole payload inside one swallowed packet
+    // reads exactly like the corruption this test is trying to attribute to parity.
+    prime_the_wire_once(&p0, &p1);
+
+    // No NUL and no high bytes, so a substituted or dropped character is legible in
+    // the failure message. Longer than one FTDI bulk packet is not needed: the driver
+    // flags a whole packet at once, so one packet is one counter increment and the
+    // payload is small enough to arrive quickly when it is meant to.
+    const LINE: &str = "SNX-PARITY-MISMATCH-PROBE-0123456789ABCDEF";
+    let want = LINE.len() + 1; // `send` appends a newline.
+
+    let boot = |parity: (&str, &str)| {
+        let d = Daemon::start();
+        let (run_dir, inj0, inj1) = {
+            let run = d.run();
+            (run.path().to_path_buf(), run.join("inj0"), run.join("inj1"))
+        };
+        d.rpc()
+            .load_toml(
+                &parity_cfg(&p0, &p1, 115_200, parity, &run_dir, &inj0, &inj1),
+                false,
+            )
+            .unwrap_or_else(|e| panic!("load the rig at parity {parity:?}: {e:?}"));
+        for port in ["port0", "port1"] {
+            assert!(
+                d.rpc().wait_status(port, "active", Duration::from_secs(20)),
+                "{port} did not come up at parity {parity:?}: {:?}. `serial2` verifies \
+                 its own settings by reading them back, so a driver that accepted the \
+                 parity request and dropped it faults the node here — which would be a \
+                 measurement about this adapter (the `xon-xoff` shape of §15.61, one \
+                 attribute over) and not a fault of this test",
+                d.rpc().node(port)
+            );
+        }
+        (d, run_dir)
+    };
+
+    // ---- The subject: an 8E1 transmitter into an 8O1 receiver. ----
+    let (d, run_dir) = boot(("even", "odd"));
+    let rpc = d.rpc();
+    std::thread::sleep(Duration::from_millis(300));
+    let rx1 = run_dir.join("rx1.log");
+    let before = driver_counters(rpc, "port1");
+    let parity_base = icount(&before, "parity");
+    let frame_base = icount(&before, "frame");
+
+    rpc.send("port0", LINE, false, 5_000)
+        .expect("send under a parity mismatch must be accepted by the daemon");
+    // **The wait is on the counter, because the counter is what this arm asserts.** It
+    // used to wait on "a counter moved *or* the payload landed", which on this hardware
+    // is satisfied by the payload every time — so the counter would have been read
+    // whenever the log happened to be flushed rather than after a bounded chance to
+    // move. A wait whose condition is not the assertion's condition is how a guard ends
+    // up timing something other than what it reports.
+    const NOTICE_WINDOW: Duration = Duration::from_secs(5);
+    wait_until(NOTICE_WINDOW, || {
+        let c = driver_counters(rpc, "port1");
+        icount(&c, "parity") > parity_base || icount(&c, "frame") > frame_base
+    });
+    // Then settle, so the payload reading below is a fair one in every arm. It is
+    // recorded rather than asserted — and a record taken too early is a wrong record,
+    // which is worse than no record.
+    std::thread::sleep(Duration::from_millis(500));
+    let after = driver_counters(rpc, "port1");
+    let parity_delta = icount(&after, "parity") - parity_base;
+    let frame_delta = icount(&after, "frame") - frame_base;
+    let body = std::fs::read(&rx1).unwrap_or_default();
+    let intact = body.windows(LINE.len()).any(|w| w == LINE.as_bytes());
+    let noticed = parity_delta > 0 || frame_delta > 0;
+    eprintln!(
+        "8E1 -> 8O1: port1 parity +{parity_delta} frame +{frame_delta}, {} of {want} B \
+         in the far log, payload intact = {intact}; far counters {after}; arrived = \
+         {:?}",
+        body.len(),
+        String::from_utf8_lossy(&body[..body.len().min(64)])
+    );
+    drop(d);
+
+    // Only the counter decides. The payload half is classified beside it because the
+    // two together say *which* platform this is, and a run that cannot tell those apart
+    // is a run whose green means less than it looks.
+    match (noticed, intact) {
+        (true, true) => eprintln!(
+            "the receiver counted the mismatch (parity +{parity_delta}, frame \
+             +{frame_delta}) and delivered the payload byte-exact — the expected \
+             reading on ftdi_sio / Linux 7.0.0-29. The counter and the per-character \
+             TTY_PARITY flag are independent in this driver, so IGNPAR — set, and read \
+             back verified: iflag 0x5 on both ports in \
+             docs/doctor/linux-7.0-2026-08-14-b58a1c4-tier3.json, P15 — never receives \
+             a flagged character to drop. §15.21's clause is answered COUNTED, NOT LOST"
+        ),
+        (true, false) => eprintln!(
+            "the receiver counted the mismatch (parity +{parity_delta}, frame \
+             +{frame_delta}) **and** the payload did not survive — a stricter reading \
+             than this bench gives, and a finding about this driver rather than about \
+             the daemon: it flags the erroring characters, so the line discipline's \
+             IGNPAR drops them. Passing, because what serial_nexus promises is that the \
+             receiver notices. Record the platform beside the reading (§16.13) — the \
+             recorded answer on ftdi_sio / Linux 7.0.0-29 is byte-exact delivery, and a \
+             second answer is a comparison worth having, not a regression. Arrived: {:?}",
+            String::from_utf8_lossy(&body[..body.len().min(64)])
+        ),
+        (false, false) => panic!(
+            "the payload did not survive but **no** counter moved on the receiver \
+             (parity +0, frame +0), so nothing attributes the loss to the parity \
+             mismatch and the clause is unanswered either way. Look at the primer first \
+             — a freshly re-enumerated FT232R eats the first 64 bytes and this payload \
+             is {want} — then at the baud. Arrived: {:?}",
+            String::from_utf8_lossy(&body[..body.len().min(64)])
+        ),
+        (false, true) => panic!(
+            "an 8E1 transmitter delivered to an 8O1 receiver with **no parity or \
+             framing error counted at all**. The receiver did not notice, which is the \
+             one thing §15.21's clause asks and the one thing `driver_counters` exists \
+             to report (§7.1). Byte-exact delivery is *not* the failure — it is this \
+             platform's ordinary reading and the control arm below expects it — so do \
+             not chase the payload: the configured parity never reached the wire. Both \
+             nodes reached `active`, so the termios read-back agreed and the request \
+             got as far as the tty and no further. That is the product defect this \
+             guard exists for (the `map_parity` → line path), one attribute over from \
+             §15.61's `xon-xoff` case"
+        ),
+    }
+
+    // ---- The control: the same pair, parity MATCHED. ----
+    //
+    // **This arm now carries the discrimination, not just the liveness.** On hardware
+    // that delivers the payload through a mismatch, the counter is the *only* thing
+    // separating a mismatched pair from a matched one — so the counter-quiet assertions
+    // below are what make the subject arm's rise mean "the mismatch", and they would
+    // catch a receiver whose parity counter simply ticks whenever parity is enabled.
+    // The byte-exact check stays as the rig-liveness half: an FT232R that could not
+    // carry 8E1 at all would fail it, and the subject arm would then have been about
+    // this adapter rather than about the mismatch.
+    let (d2, run_dir2) = boot(("even", "even"));
+    let rpc2 = d2.rpc();
+    std::thread::sleep(Duration::from_millis(300));
+    let rx1b = run_dir2.join("rx1.log");
+    let control_before = driver_counters(rpc2, "port1");
+    rpc2.send("port0", LINE, false, 5_000)
+        .expect("send in the control arm");
+    let crossed = wait_until(Duration::from_secs(10), || file_len(&rx1b) as usize >= want);
+    let control_after = driver_counters(rpc2, "port1");
+    let control_body = std::fs::read(&rx1b).unwrap_or_default();
+    eprintln!(
+        "8E1 -> 8E1 control: {} of {want} B, parity {} -> {}, frame {} -> {}",
+        control_body.len(),
+        icount(&control_before, "parity"),
+        icount(&control_after, "parity"),
+        icount(&control_before, "frame"),
+        icount(&control_after, "frame")
+    );
+    assert!(
+        crossed
+            && control_body
+                .windows(LINE.len())
+                .any(|w| w == LINE.as_bytes()),
+        "with parity **matched** at both ends the payload did not cross this rig \
+         byte-exact ({} of {want} B). So this adapter does not carry 8E1 at all, and \
+         the subject arm's counter rise is about the adapter rather than about the \
+         mismatch. Arrived: {:?}",
+        control_body.len(),
+        String::from_utf8_lossy(&control_body[..control_body.len().min(64)])
+    );
+    assert_eq!(
+        icount(&control_after, "parity"),
+        icount(&control_before, "parity"),
+        "the receiver counted a parity error while both ends ran the **same** parity. \
+         The counter the subject arm asserts on is then not measuring the mismatch — it \
+         moves whenever parity is *enabled* — and since the payload arrives in both \
+         arms on this hardware, nothing at all would separate the two: {control_after}"
+    );
+    assert_eq!(
+        icount(&control_after, "frame"),
+        icount(&control_before, "frame"),
+        "the receiver counted a framing error with both ends at 8E1 — the frame is \
+         mis-clocked or mis-shaped independently of parity, which undermines the \
+         subject arm's frame reading too: {control_after}"
     );
 }

@@ -1324,13 +1324,68 @@ dropped. Product-surface deferrals use §14's vocabulary (refused-at-load / acce
 
 Each item below uses the schema with its fields inline.
 
-16. **`by-path` topology identity against a real cycle** — **open** (S, rig session). Split out
+16. **`by-path` topology identity against a real cycle** — **EXECUTED 2026-08-15** (notes §3.108).
+    `by_path_identity_survives_a_replug_that_renumbers_the_tty` proves §12's one directly-provable
+    fallback: the identity string is unchanged across a renumbering cycle while the daemon's
+    `resolved_path` follows the adapter — measured `identity by-path:pci-0000:00:14.0-usb-0:2.4:1.0-port0`
+    held while adapter A moved `ttyUSB0 → ttyUSB1`, with `identity_kind` reading `by-path` and the
+    node's path ending in A's **new** tty and not B's, a stale link on a bench whose minors just
+    swapped being a node silently opening the other adapter.
+    **The item's own *Validation* control now executes on every run rather than being remembered.**
+    It named "the reauthorization order returning the adapter to the minor it already held is refused
+    by the guard"; §12 recorded that as run once and nothing executed it. It ships as arm 1, and it is
+    what turns the subject's `assert_ne!` from a hope into a knob. *Fail-first, product-level:*
+    memoizing `bypath_lookup` — §12's "identity-to-current-path at **every** open" violated exactly —
+    passes the control and then reddens the subject at `left: "/dev/ttyUSB1" right: "/dev/ttyUSB1"`,
+    the daemon holding a stale path. Invisible until the minors actually move, which is the whole
+    reason the renumbering arm exists.
+    **One filed premise is wrong about the tree and is corrected here:** "the sysfs port name denoting
+    the port" is not what `by-path:` is. It is a udev `/dev/serial/by-path` **link name**
+    (`pci-0000:00:14.0-usb-0:2.3:1.0-port0`), not a sysfs port name (`3-2.3:1.0`), and
+    `Resolver::bypath_lookup` resolves it by `read_link` on that tree and nothing else — it never
+    consults the `class/tty` listing. Two consequences are **filed rather than fixed**: `by-path:` is
+    the one identity form with a single door, so §12's "by-id is a fast path *over* the sysfs listing,
+    never an alternative" does not describe it; and `has_identity_source` answers yes on a sysfs-only
+    box where a `by-path:` identity can never resolve. *Stated non-claim, in the test:* no adapter
+    changes physical port, so "whatever occupies this physical port" — the semantic distinguishing
+    `by-path:` from `usb:` — is not exercised and needs hands. The superseded filing follows. Split out
     of item 7. *Evidence:* the replug work proved `usb:` identity across a renumbering replug
     (notes §3.54, §3.70); `by-path` — the one §12 fallback the replug lane could prove directly,
     the sysfs port name denoting the port and surviving the cycle — never has been.
     *Validation:* the fail-first control §12's founding measurement used — the reauthorization
     order returning the adapter to the minor it already held is refused by the guard.
-17. **§15.21's checklist items: break reception and the parity mismatch** — **open** (M, rig
+17. **§15.21's checklist items: break reception and the parity mismatch** — **EXECUTED 2026-08-15**
+    (notes §3.108), both clauses, in the suite per §15.52's boundary rather than grown into P5.
+    *Break reception:* a `send-break` on one port raises the far node's `driver_counters.brk` —
+    **the first assertion in this workspace that a break crossed a wire**, since nothing the doctor
+    does can raise `brk` on any kernel and the guard §15.21 names for the clause
+    (`p12_serial_exclusivity::a_break_straddled_by_a_replace_leaves_the_line_transmitting`) asserts
+    that the line resumes *transmitting* and reads no counter at all. Three controls: an idle window
+    at least as long as the subject's, the transmitting port's own `brk` as a loopback detector, and
+    the verb's return. Measured `brk +1` with `frame +0`, and **one per break event** — a 250 ms and
+    a 25 ms break both move it by 1 — recorded, never asserted.
+    *The parity mismatch:* answered as **COUNTED, NOT LOST** on `ftdi_sio` / Linux 7.0.0-29. An 8E1
+    transmitter into an 8O1 receiver raises `driver_counters.parity` (`+2` for a 43-byte payload —
+    the driver flags a USB packet, not a character) while the payload arrives **byte-exact**.
+    **The pre-registered prediction of payload loss is refuted and recorded** (AGENTS §9), and the
+    cause was measured rather than inferred: `IGNBRK | IGNPAR` are *in force* —
+    `docs/doctor/linux-7.0-2026-08-14-b58a1c4-tier3.json`, P15, `iflag_before_hex: "0x5"` on both
+    ports — so the mechanism is that **this driver's `TIOCGICOUNT` counter and its per-character
+    `TTY_BREAK`/`TTY_PARITY` flag are independent**: the counter moves off the status byte while the
+    character is handed up unflagged, and the line discipline never receives a flagged character to
+    drop. Both guards therefore assert the counter and *record* the bytes. **A guard on payload loss
+    would pin a driver's decision about flagging characters as though it were a serial_nexus
+    promise** — AGENTS §3's decision-not-mechanism register, found for the first time *below* the
+    product's own surface. *Fail-first:* `map_parity` returning `None` in all arms leaves both nodes
+    `active` (the read-back agrees with what was asked) and reddens the "never reached the wire" arm;
+    a no-op `set_break` reddens the "observed nothing" arm. Both messages name the alternative
+    reading rather than assuming a defect. *Owed:* nothing on Linux; both self-skip off it on
+    `ICOUNTS_SUPPORTED`, which is a real gap — Darwin has no equivalent counter, so the clause is
+    unanswerable there until an observable exists and a rig does not create one.
+    **One in-tree claim was false in two successive directions** and is repaired at its sources: the
+    module header and `crossover_rig_signal_verbs` said a far-end break "surfaces at the peer RX as a
+    NUL", then "`IGNBRK` drops it, so 0 B"; measured, it is **1 B**. The superseded filing follows.
+    *Original state:* open (M, rig
     session). Item 7's named remainder, explicitly separate from it. *Evidence:* §15.21 records
     both as checklist items, not losses; no tier transmits a break into an open peer; and the
     rig was proven 5-wire when this was filed (notes §3.53) — but the 2026-08-12 bench measures

@@ -46,6 +46,17 @@
 //! wants happens here, unprivileged — which is also what keeps `/dev` names out of
 //! the capability-carrying binary entirely.
 //!
+//! # Both identity forms the replug lane can prove
+//!
+//! §12's fallback chain is `usb:` → `by-path:` → `raw:`. The first is proved by
+//! [`identity_survives_a_replug_that_renumbers_the_tty`]; the second — the topology
+//! identity, "whatever occupies this physical port" — is proved by
+//! [`by_path_identity_survives_a_replug_that_renumbers_the_tty`] (plan §18 item 16,
+//! split out of item 7). The third is out of reach on purpose: `raw:` resolves a
+//! `/dev` path literally and carries a documented instability warning precisely
+//! because it does *not* survive a renumbering, so a test asserting that it did
+//! would be asserting the opposite of what §12 promises.
+//!
 //! # Serialization
 //!
 //! These tests own the physical adapters for their duration, exactly as
@@ -721,5 +732,417 @@ fn identity_survives_a_replug_that_renumbers_the_tty() {
          unaffected; any SNX_CROSSOVER_A/_B set to /dev/ttyUSB* now name the opposite \
          adapters (harmless on a symmetric crossover, but say so rather than surprise \
          the next reader)."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §12's second identity form, against a real cycle (plan §18 item 16)
+// ---------------------------------------------------------------------------
+
+/// Every `/dev/serial/by-path` link name currently pointing at `tty`, sorted.
+///
+/// **Sorted, and returned whole rather than "the first match", because a box can
+/// publish more than one name per adapter.** This bench publishes two per port —
+/// `pci-0000:00:14.0-usb-0:2.3:1.0-port0` and `pci-0000:00:14.0-usbv2-0:2.3:1.0-port0`
+/// — and both are legitimate topology names for the same UART. A test that took
+/// whichever `read_dir` happened to yield first would be running a different
+/// experiment from one run to the next, and would name the difference nowhere.
+///
+/// The resolver's own capture path (`Resolver::bypath_of`) does take the first
+/// `read_dir` hit, which is why the identity *this* test configures is chosen here
+/// rather than captured: what is under test is whether a topology name survives a
+/// cycle, and that question needs the name held fixed across it.
+fn bypath_names_for(tty: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir("/dev/serial/by-path")
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    std::fs::read_link(e.path())
+                        .ok()
+                        .and_then(|t| t.file_name().map(|s| s.to_string_lossy().into_owned()))
+                        .as_deref()
+                        == Some(tty)
+                })
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Every `/dev/serial/by-path` link name and where it points, for a message.
+fn bypath_links() -> Vec<String> {
+    std::fs::read_dir("/dev/serial/by-path")
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| {
+                    format!(
+                        "{} -> {:?}",
+                        e.file_name().to_string_lossy(),
+                        std::fs::read_link(e.path()).unwrap_or_default()
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `ttyUSBn` a by-path link points at right now, or `None` if the link is gone.
+///
+/// The independent oracle for the by-path assertions: it reads the link the daemon's
+/// resolver reads, without going through the daemon, so a green from `state` and a
+/// green from here are two witnesses rather than one restated.
+fn bypath_target(name: &str) -> Option<String> {
+    std::fs::read_link(Path::new("/dev/serial/by-path").join(name))
+        .ok()?
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+}
+
+/// **§12's topology identity, against a real cycle** (plan §18 item 16).
+///
+/// The replug lane proved `usb:` identity and only that. `by-path:` — the one §12
+/// fallback this lane can prove directly — had never been driven through a real
+/// re-enumeration by anything in this workspace, and it is the form that matters most
+/// on adapters with absent or duplicated serial numbers, where §12's chain *degrades*
+/// to it: those are exactly the boxes where a wrong-device adoption is possible, and
+/// this identity is the thing standing between an operator and one.
+///
+/// **The hazard this is really about.** A by-path identity is a name in
+/// `/dev/serial/by-path`, and the resolver resolves it by reading that link — so the
+/// question a cycle asks is whether udev republishes the same name pointing at the
+/// adapter's *new* `/dev` node. If the link came back stale, or came back under a
+/// different name and the old one lingered, the node would open the **other adapter**,
+/// silently, on a rig where the minors have just swapped. That is why the subject arm
+/// asserts not only that the path moved but that it moved to the tty *sysfs* says this
+/// port owns, and that it is not the peer's.
+///
+/// **Two cycles, and the first is the control the item names.** §12's founding
+/// measurement records its own fail-first: "the fail-first control (the order returning
+/// each adapter to the minor it already held) was run on the rig, leaves
+/// `ttyUSB1 → ttyUSB1`, and the guard refuses it." That control ships here as arm 1,
+/// executed on every run rather than remembered from a session: the same two adapters
+/// go down together and come back in the order that returns each to the minor it
+/// already held, and the discriminator the subject arm asserts on must stay **quiet**.
+/// Without it, "the tty changed" is a fact about a cycle rather than about the order
+/// that produced it, and the experiment has no knob.
+///
+/// **The control runs first here, and second in
+/// `a_parity_mismatch_is_counted_at_the_receiver_and_costs_the_payload`** — the
+/// difference is deliberate and worth a sentence, since a reader will notice it. A
+/// control belongs *after* a subject whose headline assertion is negative, because a
+/// dead rig satisfies a negative for free. This subject's assertions are all positive
+/// (the tty changed, the daemon followed it, the link points at the right adapter), so
+/// they cannot be satisfied by a rig that stopped working; the control's job here is
+/// only to show the order knob is real, and running it first leaves the bench in the
+/// state the subject's order was computed against.
+///
+/// **What this does not claim.** No adapter changes physical port, so "whatever
+/// occupies this physical port" — the semantic difference between `by-path:` and
+/// `usb:` — is not exercised: moving a plug between ports needs hands, and a test that
+/// pretended otherwise would be claiming an experiment it did not run. What is proved
+/// is the half a cycle can prove: the topology name denotes the same port across a real
+/// re-enumeration, and the daemon follows it onto the `/dev` name the kernel chose this
+/// time.
+#[test]
+fn by_path_identity_survives_a_replug_that_renumbers_the_tty() {
+    let _claim = rig_guard();
+    let rig = match rig() {
+        Ok(r) => r,
+        Err(why) => {
+            skip_no_replug(
+                "by_path_identity_survives_a_replug_that_renumbers_the_tty",
+                &why,
+            );
+            return;
+        }
+    };
+    let Ok(dev_b) = std::env::var("SNX_REPLUG_DEV_B") else {
+        skip_no_replug(
+            "by_path_identity_survives_a_replug_that_renumbers_the_tty",
+            "SNX_REPLUG_DEV_B is not set (the renumbering needs both adapters cycled together)",
+        );
+        return;
+    };
+    let by_id_b = PathBuf::from(&dev_b);
+    assert!(
+        dev_b.starts_with("/dev/serial/by-id/"),
+        "SNX_REPLUG_DEV_B={dev_b} is not a /dev/serial/by-id path"
+    );
+    let port_b = usb_port_of(&by_id_b)
+        .unwrap_or_else(|| panic!("SNX_REPLUG_DEV_B={dev_b} resolves to no sysfs USB port"));
+    assert_ne!(
+        rig.port, port_b,
+        "SNX_REPLUG_DEV and SNX_REPLUG_DEV_B name the same USB port ({})",
+        rig.port
+    );
+
+    let tty_a_before = tty_of(&rig.port).expect("adapter A has a tty before the cycle");
+    let tty_b_before = tty_of(&port_b).expect("adapter B has a tty before the cycle");
+    assert_ne!(tty_a_before, tty_b_before, "both adapters claim one tty");
+
+    // The identity under test. A box with no `/dev/serial/by-path` tree cannot answer
+    // this question at all — the resolver has no other door to a topology identity, so
+    // there is nothing to measure rather than something to fail.
+    let names_a = bypath_names_for(&tty_a_before);
+    let Some(bypath_a) = names_a.first().cloned() else {
+        skip_no_replug(
+            "by_path_identity_survives_a_replug_that_renumbers_the_tty",
+            &format!(
+                "no /dev/serial/by-path link points at {tty_a_before}, so this box \
+                 publishes no topology identity for adapter A and the resolver has no \
+                 other door to one (visible: {:?})",
+                bypath_links()
+            ),
+        );
+        return;
+    };
+    let names_b = bypath_names_for(&tty_b_before);
+    assert!(
+        !names_b.contains(&bypath_a),
+        "the by-path name {bypath_a} covers both adapters ({names_a:?} / {names_b:?}), \
+         so it pins no port and nothing below is a topology measurement"
+    );
+    let identity = format!("by-path:{bypath_a}");
+    eprintln!(
+        "by-path identity under test: {identity} (A={tty_a_before} names {names_a:?}, \
+         B={tty_b_before} names {names_b:?})"
+    );
+
+    let run = TempRun::new();
+    let console = run.join("con");
+    let daemon = Daemon::start();
+    let rpc = daemon.rpc();
+    rpc.load_toml(&config(&identity, &console), false)
+        .expect("load the by-path config");
+    assert!(
+        rpc.wait_status("usb0", "active", Duration::from_secs(20)),
+        "a by-path node never came up on the real adapter: {:?}",
+        rpc.node("usb0")
+    );
+    let path_before = rpc.node("usb0").expect("node")["resolved_path"]
+        .as_str()
+        .expect("a resolved path before the cycles")
+        .to_owned();
+    assert!(
+        path_before.ends_with(&tty_a_before),
+        "the by-path identity {identity} resolved to {path_before}, but sysfs says \
+         port {} owns {tty_a_before} — the link and the topology disagree before any \
+         cycle has run",
+        rig.port
+    );
+
+    // The helper reauthorizes in the **reverse** of the order it is given, so the port
+    // named last comes back first and takes the lowest free minor. Two orders exist and
+    // they are the experiment's knob:
+    //
+    // * `renumber` — A must end on the other minor, so A comes back *second*: name A
+    //   first when it already holds the lower one, last when it does not;
+    // * `keep` — its exact opposite, which returns each adapter to the minor it already
+    //   held. That is §12's founding fail-first control.
+    let a_is_lower = tty_a_before < tty_b_before;
+    let renumber: [&str; 2] = if a_is_lower {
+        [rig.port.as_str(), port_b.as_str()]
+    } else {
+        [port_b.as_str(), rig.port.as_str()]
+    };
+    let keep: [&str; 2] = [renumber[1], renumber[0]];
+
+    // ---- Arm 1: the control. The discriminator must be quiet. ----
+    let (down, up, (both_gone, noticed)) =
+        while_deauthorized_many(&rig.helper, &keep, false, || {
+            let gone = wait_until(Duration::from_secs(5), || {
+                !has_tty(&rig.port) && !has_tty(&port_b)
+            });
+            let noticed = wait_until(Duration::from_secs(10), || {
+                rpc.node_status("usb0") != "active"
+            });
+            (gone, noticed)
+        });
+    assert!(
+        both_gone,
+        "the control cycle never took both adapters away: down={down} up={up}"
+    );
+    assert!(
+        noticed,
+        "the daemon never left `active` during the control cycle, so the control \
+         measured no outage: {up}"
+    );
+    assert!(
+        up["reauthorize_failures"]
+            .as_array()
+            .is_some_and(|f| f.is_empty()),
+        "the helper failed to reauthorize during the control cycle: {up}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(15), || tty_of(&rig.port).is_some()
+            && tty_of(&port_b).is_some()),
+        "an adapter never produced a tty again after the control cycle"
+    );
+    let tty_a_control = tty_of(&rig.port).expect("adapter A has a tty after the control");
+    assert_eq!(
+        tty_a_control, tty_a_before,
+        "**the control order renumbered adapter A anyway** ({tty_a_before} -> \
+         {tty_a_control}). The reauthorization order is then not what decides the \
+         minor on this box — the kernel raced the two writes, or the assignment rule \
+         is not lowest-free-minor — and arm 2's `assert_ne!` would be measuring luck \
+         rather than the knob. Re-run before treating this as a product finding; if it \
+         persists, §12's founding measurement needs re-taking on this hardware"
+    );
+    // A control that leaves the subject unable to run is not a control: the node must
+    // be back, on the same path, through the same by-path link.
+    assert!(
+        wait_until(Duration::from_secs(15), || bypath_target(&bypath_a)
+            .is_some()),
+        "the by-path link {bypath_a} never returned after the control cycle. Visible \
+         now: {:?}",
+        bypath_links()
+    );
+    assert_eq!(
+        bypath_target(&bypath_a).as_deref(),
+        Some(tty_a_control.as_str()),
+        "the by-path link {bypath_a} came back pointing somewhere other than the tty \
+         sysfs says port {} owns ({tty_a_control}), after a cycle that moved nothing",
+        rig.port
+    );
+    assert!(
+        rpc.wait_status("usb0", "active", Duration::from_secs(30)),
+        "the by-path node never healed after the control cycle: {:?}",
+        rpc.node("usb0")
+    );
+    let control_path = rpc.node("usb0").expect("node")["resolved_path"]
+        .as_str()
+        .expect("a resolved path after the control")
+        .to_owned();
+    assert_eq!(
+        control_path, path_before,
+        "the control cycle moved the resolved path ({path_before} -> {control_path}) \
+         while sysfs says the adapter kept {tty_a_before}"
+    );
+    eprintln!(
+        "control: reauthorizing {keep:?} returned adapter A to {tty_a_control} — the \
+         discriminator arm 2 asserts on is quiet when the order says it should be"
+    );
+
+    // ---- Arm 2: the subject. Same identity, the renumbering order. ----
+    let (down, up, (both_gone, noticed)) =
+        while_deauthorized_many(&rig.helper, &renumber, false, || {
+            let gone = wait_until(Duration::from_secs(5), || {
+                !has_tty(&rig.port) && !has_tty(&port_b)
+            });
+            let noticed = wait_until(Duration::from_secs(10), || {
+                rpc.node_status("usb0") != "active"
+            });
+            (gone, noticed)
+        });
+    assert!(
+        both_gone,
+        "both adapters never went away: down={down} up={up}"
+    );
+    assert!(
+        noticed,
+        "the daemon never left `active`, so nothing below measures a replug: {up}"
+    );
+    assert!(
+        up["reauthorize_failures"]
+            .as_array()
+            .is_some_and(|f| f.is_empty()),
+        "the helper failed to reauthorize — an adapter may still be down: {up}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(15), || tty_of(&rig.port).is_some()
+            && tty_of(&port_b).is_some()),
+        "an adapter never produced a tty again"
+    );
+    let tty_a_after = tty_of(&rig.port).expect("adapter A has a tty after");
+    let tty_b_after = tty_of(&port_b).expect("adapter B has a tty after");
+    assert_ne!(
+        tty_a_after, tty_a_before,
+        "the swap did not renumber adapter A ({tty_a_before} -> {tty_a_after}), so the \
+         premise §12 rests on was not exercised and every assertion below is vacuous. \
+         The control above proved the order knob works in the other direction, so this \
+         is the guard §12's founding measurement describes doing its job"
+    );
+
+    // The independent oracle, read without the daemon: the topology name came back,
+    // and it came back pointing at the adapter that owns this physical port now.
+    assert!(
+        wait_until(Duration::from_secs(15), || bypath_target(&bypath_a)
+            .is_some()),
+        "the by-path link {bypath_a} never returned after the renumbering cycle, so \
+         the topology identity does not survive a real re-enumeration on this box — \
+         which is exactly what this test exists to find out. Visible now: {:?}",
+        bypath_names_for(&tty_a_after)
+    );
+    assert_eq!(
+        bypath_target(&bypath_a).as_deref(),
+        Some(tty_a_after.as_str()),
+        "the by-path link {bypath_a} came back pointing at {:?} while sysfs says port \
+         {} now owns {tty_a_after}. On a bench whose minors have just swapped, a stale \
+         topology link is a node that opens the **other adapter** without saying so",
+        bypath_target(&bypath_a),
+        rig.port
+    );
+
+    // And the daemon's own answer, which is the promise §12 makes to an operator.
+    assert!(
+        rpc.wait_status("usb0", "active", Duration::from_secs(30)),
+        "the by-path node never healed onto its new path: {:?}",
+        rpc.node("usb0")
+    );
+    let healed = rpc.node("usb0").expect("node after heal");
+    assert_eq!(
+        healed["identity"].as_str(),
+        Some(identity.as_str()),
+        "the topology identity changed across a renumbering replug: {healed}"
+    );
+    assert_eq!(
+        healed["identity_kind"].as_str(),
+        Some("by-path"),
+        "the node stopped reporting itself as a by-path binding: {healed}"
+    );
+    let path_after = healed["resolved_path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no resolved_path after the swap: {healed}"));
+    assert_ne!(
+        path_after, path_before,
+        "the daemon reports the same resolved_path across a swap that provably \
+         renumbered adapter A ({tty_a_before} -> {tty_a_after}): {healed}"
+    );
+    assert!(
+        path_after.ends_with(&tty_a_after),
+        "the daemon resolved {path_after} but adapter A is on {tty_a_after}: {healed}"
+    );
+    assert!(
+        !path_after.ends_with(&tty_b_after),
+        "the by-path node followed its identity onto the **peer** adapter \
+         ({path_after} is B's {tty_b_after}) — the wrong-device adoption §12 exists to \
+         make impossible, and the one a stale topology link produces: {healed}"
+    );
+    assert_eq!(
+        healed["open"],
+        Value::Bool(true),
+        "healed onto the new path but not open: {healed}"
+    );
+
+    eprintln!(
+        "by-path replug measured: identity {identity} unchanged; adapter A \
+         {tty_a_before} -> {tty_a_after}, daemon {path_before} -> {path_after}; held \
+         {} ms, released by {}",
+        up["held_ms"], up["released_by"]
+    );
+    // Recorded, never asserted: the whole topology tree as it came back. This bench
+    // publishes two names per port, and whether *both* return — and in what order a
+    // capture would see them — is a fact about udev worth having in the log of a run
+    // that cycled the bus, not an assertion about anything the daemon promises.
+    eprintln!("by-path tree after the cycles: {:?}", bypath_links());
+    eprintln!(
+        "NOTE: the adapters have swapped /dev names. by-id paths, usb: identities and \
+         by-path names are unaffected; any SNX_CROSSOVER_A/_B set to /dev/ttyUSB* now \
+         name the opposite adapters (harmless on a symmetric crossover, but say so \
+         rather than surprise the next reader)."
     );
 }
