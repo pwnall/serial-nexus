@@ -12294,3 +12294,105 @@ The third is a gate whose assertion is strictly weaker than the comment above it
 because the comment is what a reviewer reads, it is the hardest of the three to see. All three
 share one remedy: **plant the defect the guard names and watch it redden**, which is fail-first
 proof applied to the guard's *stated* property rather than to its code.
+
+### 3.102 The bench goes back to 5-wire, on a pair the record has never seen
+
+The operator re-cabled the rig from a 3-wire crossover (TX/RX/GND) to a 5-wire one, adding
+RTS↔CTS crossed both ways, and asked for whatever the 3-wire bench had made impossible. This
+entry is that session. **Six readings were pre-registered before anything was measured** — the
+discipline plan §18 item 28 states as "pre-registered readings before the wire is touched" — and
+all six held; none was refuted. The value of writing them down first is entirely in the two that
+could have gone the other way, and both are recorded below rather than folded away.
+
+**The bench, measured.** P5's handshake block, port to port with no daemon in the path, reads
+`5-wire crossover: RTS/CTS both ways, DTR moves nothing` — `rts_a_to_cts_b=true
+rts_b_to_cts_a=true` with all six DTR crossings `false` — byte-identical across three sequential
+runs, committed as `docs/doctor/linux-7.0-2026-08-14-b58a1c4-{passive-1..3,tier3,tier3-2,tier3-3}.json`
+from one clean build at `b58a1c4b7fc8`, with `jq -e -f expectations/linux.jq` executed against all
+six and exit 0 on every one.
+
+**The adapter pair is one this record has never carried.** The 5-wire discovery ran on
+`BH00L4KU` ↔ `BH00LL8O` (§3.53), the 3-wire re-measure on `ABSCDGL6` ↔ `BH00L4KU` (§3.80), and this
+bench presents `BH00L4KU` ↔ `BH00LW9U` — three cablings, three pairs, one adapter common to all
+three. So this reading corroborates the discovery's *shape* without reproducing its conditions, and
+nothing may be diffed across those rows as though only the cable moved. Named as a bound on the
+result rather than allowed to strengthen it, which is item 20's precedent one instrument over.
+
+**What the wires actually bought, which is the answer to the question asked.** Two tests, and only
+two, are gated on hardware handshake, and neither had executed on this bench since 2026-08-12:
+`crossover_rig_rts_crosses_to_the_far_ports_cts` (both directions, both polarities, through the
+daemon's own `modem_lines` rather than a test-issued ioctl) and
+`rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes` (40 B held for 1.5 s under a
+peer-held CTS, then delivered byte-exact, with the `flow_control = "none"` control arm delivering
+through the same CTS-low state). Both pass. On top of them, **the documented rig lane ran fully
+spelled for the first time in this record** — `SNX_CROSSOVER`, `SNX_REPLUG`, `SNX_TLS`,
+`SNX_RIG_FLOW` and `SNX_EXEC_CODEC` all `required`, dropping only `SNX_WEB_UI` on a box with no
+`node` — reading **1004 · 0 · 7** with the self-skip set falling **5 → 3**. Stated exactly: this is
+the first row in the Status table whose scope names `SNX_RIG_FLOW=required`, **not** the
+fully-spelled lane (`SNX_WEB_UI` is still dropped) and **not** establishably the first run ever to
+set that word — `ebf9c52` introduced it on 2026-08-05 and the 835 row's `17c6e87` descends from it
+on a bench that was 5-wire that day, which nothing in the record settles either way. The two names that left
+it are exactly the two `skip_no_rig_flow` callers and no other name moved, which is what attributes
+the delta to the cable rather than to anything else in the session. Skips counted by name and
+unanchored, per §3.101.
+
+**Neither flow guard was merely run; both were planted against.** Suppressing the RTS drive inside
+`drive_rts_read_far` — electrically what an unwired handshake looks like to these tests — reddens
+both, and `SNX_RIG_FLOW=required` converts the resulting self-skip into a hard failure, so the two
+propositions "the tests read the wire" and "required mode bites" are proven by one plant. The plant
+is worth one further sentence: under it CTS reads `true` at **both** polarities, the stuck-high
+shape, so **a one-polarity test would have passed it**. The both-polarities design in
+`handshake_measured` is not defensive decoration; it is the thing that catches this. The second
+plant drops arm 1's transmitter from `rts-cts` to `none` while still holding CTS low, and the stall
+reddens by its own message — 40 bytes crossed against 0 — which is what separates "the wire stopped"
+from "the rig was slow". The tree was restored md5-identical after each.
+
+**What the re-cable did *not* buy, recorded because the temptation runs the other way.** DTR is
+still unwired: all six crossings read `false`, so plan §18 item 28 stays blocked, now on a *third*
+independent cabling rather than one — its blocker is a property of every crossover cable this
+project has measured, and wiring DTR↔DSR is a deliberate act, not a side effect of adding handshake
+lines. The same measurement keeps the suite's DTR negative control a valid control rather than
+turning it into a tripwire. And item 17's two clauses — break reception and the parity mismatch —
+have their *entry* condition discharged by the re-inspection, but neither was ever electrically
+gated on the handshake wires: both ride TX/RX, which the 3-wire bench also carried. What the cable
+bought that item is its own stated precondition, not a new physical capability, and the work is
+unchanged in size and still owed.
+
+**One gate fact, measured from its other side.** `jq -e -f expectations/linux.jq` exits 0 on a
+5-wire report exactly as it does on a 3-wire one, because the handshake clause is presence-only by
+design (plan §3 rule 14; §15.52's "a clause that pinned the answer would redden every honest
+bench"). That is the rule working, and it has a consequence worth stating rather than leaving
+implicit: **no gate in this tree can tell a 5-wire bench from a 3-wire one.** The only instruments
+that can are the committed P5 artifact and the two `rts-cts` tests under `SNX_RIG_FLOW=required` —
+which is the whole reason that spelling exists, and not a redundancy in it. It is not an instance of
+AGENTS §3's tell: a clause deliberately scoped to presence is not a clause asserting nothing, and
+the distinction is that this one *was* proven to fail, on a gutted report, when it was written.
+
+**One operational note.** `scripts/bless --verify` reported the installed helper *Stale* because
+this session's `cargo build` relinked `devprep` from unchanged sources. The lane was run anyway and
+the reading justifies it: `grant` fired seven times across the re-enumerations and all four replug
+tests passed, so this was the ordinary-relink case the helper's own warning names and not §15.45's
+capability-stripping one. A session that changes `sys/` still owes the re-bless.
+
+**A third Linux instance of §3.101's skip-count class, and the first where the mechanism is
+visible rather than inferred.** The default-scope run closing this session reads **1004 · 0 · 7**
+at the same code as the rig lane (documentation-only delta), and its self-skip set extracts to
+**13** names. The fourteenth is `crossover_rig_signal_verbs`, which has **zero** `SKIP <name>`
+occurrences in the log — and it is nonetheless identifiable, because the splice that destroyed it
+is legible where it happened:
+
+    SKIP test crossover_rig_data_plane_send_and_exclusivity ... crossover_rig_signal_verbsok: no crossover rig (
+
+That is one `SKIP crossover_rig_signal_verbs: no crossover rig (…)` line and one
+`test crossover_rig_data_plane_send_and_exclusivity ... ok` line interleaved mid-write by two
+parallel test binaries sharing a pipe. The previous two instances reasoned *backwards* — this test
+must have self-skipped at this scope, and its line is absent in any form, therefore a line was
+lost. Here the lost line's name is sitting inside the corruption, glued to a neighbour's `ok`. So
+§3.101's **14** — recorded there as the union of two runs and explicitly "itself a floor" — is a
+single run's actual figure on this box, which is a stronger statement than the union could make.
+
+**It changes nothing about the rule and slightly strengthens the reason for it.** The count still
+must not be quoted precisely: this splice destroyed one name because of where the two writes
+happened to land, and one byte's difference would have destroyed both. What the figure is *for* is
+separating a rig lane from a default-scope run — 3 against 14 here — and that gap is an order of
+magnitude clear of the noise, which is the only property this session relied on.

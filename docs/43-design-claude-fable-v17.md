@@ -4090,6 +4090,24 @@ on that day — and notes §3.63's 25 ms end-to-end measurement is not refuted: 
 went away, which is exactly why `SNX_RIG_FLOW`'s precondition is measured per run rather than
 remembered (plan §3), and why the documented rig lane drops it on a bench that measures 3-wire.
 Plan §18 item 17's bench re-inspection clause carries the follow-up.
+**Re-cabled and re-measured (notes §3.102, 2026-08-14):** the operator re-cabled the bench and it
+answers **5-wire** again — `rts_a_to_cts_b=true rts_b_to_cts_a=true` with all six DTR crossings
+`false`, reproduced 3 of 3 and committed as
+`docs/doctor/linux-7.0-2026-08-14-b58a1c4-tier3{,-2,-3}.json`. **The adapter pair is one the record
+has never seen**: `BH00L4KU` ↔ `BH00LW9U`, where the 5-wire discovery above ran on
+`BH00L4KU` ↔ `BH00LL8O` and the 3-wire re-measure on `ABSCDGL6` ↔ `BH00L4KU`. Three cablings, three
+pairs, one adapter common to all of them — so this reading corroborates the discovery's *shape*
+without reproducing its conditions, and no cell may be diffed across the rows as though only the
+cable moved (item 20's confound, one instrument over). What the re-cable did **not** bring is DTR:
+a third independent measurement now says those six crossings carry nothing, which is why plan §18
+item 28 stays blocked rather than merely unscheduled, and why the suite's DTR negative control
+(`crossover_rig_rts_crosses_to_the_far_ports_cts`) remains a valid control rather than a tripwire.
+**The clause's presence-never-answer form is now measured from both sides** rather than argued from
+one: `jq -e -f expectations/linux.jq` exits 0 on a 5-wire report exactly as it does on a 3-wire one.
+That is rule 14 working, and it has a consequence worth stating plainly — **no gate in this tree can
+tell a 5-wire bench from a 3-wire one, by design.** The only instruments that can are the committed
+P5 artifact and the two `rts-cts` end-to-end tests under `SNX_RIG_FLOW=required`, which is the whole
+reason that spelling exists and not a redundancy in it.
 
 ### 15.53 A transport's contract is refused, not degraded: hardware flow control at load
 
