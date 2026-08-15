@@ -191,6 +191,30 @@ async fn connect(
     Ok(ws)
 }
 
+/// The correlated answer to this client's own `tap.open` (id 1), turned into either the
+/// operator's opening note or the refusal it exits on.
+///
+/// **The refusal reads exactly as `serial-nexus-ctl`'s does** (plan §18 item 59(c)).
+/// This client and the CLI implement one rule — read the ack of a streaming verb before
+/// the byte loop, and fail loudly naming what refused it (37-TOOL-2) — and they cannot
+/// share the *code*, `read_ack` being shaped around a `BufRead` where this is shaped
+/// around a WebSocket frame stream. They can share the *rendering*, which is the half an
+/// operator sees, and this line used to print `{err}`: the whole JSON error object,
+/// braces, `data` payload and all, where the CLI printed `<message> (<code>)`. Both now
+/// call [`serial_nexus_rpc::describe_error`], the one place that rendering exists.
+///
+/// It is a free function rather than three lines inside the loop so that the rendering
+/// is reachable from a test without a server, a bridge, or a daemon — which is what the
+/// refusal arm had never had.
+fn tap_open_ack(v: &Value) -> anyhow::Result<Option<String>> {
+    if let Some(err) = v.get("error") {
+        anyhow::bail!("tap.open failed: {}", serial_nexus_rpc::describe_error(err));
+    }
+    Ok(v.get("result")
+        .and_then(|r| r.get("replay_bytes"))
+        .map(|rb| format!("tap opened: replay_bytes={rb}")))
+}
+
 async fn run_tap(args: WsclientArgs) -> anyhow::Result<()> {
     let endpoint = args
         .endpoint
@@ -235,13 +259,10 @@ async fn run_tap(args: WsclientArgs) -> anyhow::Result<()> {
         };
         // The tap.open response (id 1): fail loudly if the open was refused.
         if v.get("id") == Some(&json!(1)) {
-            if let Some(err) = v.get("error") {
-                anyhow::bail!("tap.open failed: {err}");
+            if let Some(note) = tap_open_ack(&v)? {
+                eprintln!("{note}");
             }
             opened = true;
-            if let Some(rb) = v.get("result").and_then(|r| r.get("replay_bytes")) {
-                eprintln!("tap opened: replay_bytes={rb}");
-            }
             continue;
         }
         // tap.data notifications carry the base64 hostward bytes.
@@ -337,5 +358,61 @@ mod tests {
         assert!(err.contains(&missing.display().to_string()), "{err}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A refused `tap.open` prints what the CLI prints** (plan §18 item 59(c)).
+    ///
+    /// The expected string is written out in full here *and* in `serial-nexus-ctl`'s own
+    /// guard, because these are two binaries in two crates and no test can watch both at
+    /// once without a server, a bridge and a daemon — the arm this one covers had, until
+    /// now, no test of any kind anywhere: the tree's only headless tap invocation is
+    /// `p8_web`'s happy path, so the refusal line was written once, diverged, and stayed
+    /// diverged. Two literal pins that agree by construction are the enforceable form:
+    /// editing either client's rendering reddens that client's own suite.
+    #[test]
+    fn a_refused_tap_open_renders_the_error_the_way_the_cli_does() {
+        let refused = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": {"code": -32602, "message": "unknown endpoint: nope",
+                      "data": {"available": ["usb0"]}}
+        });
+        let err = tap_open_ack(&refused).unwrap_err().to_string();
+        // One assertion, because the equality pins every byte and anything asserted
+        // *after* it about the same string cannot fail while it passes. Two such
+        // followed it here — `!err.contains('{')` and `!err.contains("usb0")`, the
+        // braces and the `data` payload being the tells for the raw-object rendering
+        // this replaced — and both were dead; what they meant is in the message.
+        assert_eq!(
+            err, "tap.open failed: unknown endpoint: nope (-32602)",
+            "a refused tap.open no longer reads as `serial-nexus-ctl`'s refusal does: \
+             braces mean the raw error object is back, and `usb0` means the unbounded \
+             `data` payload rode the operator's one line"
+        );
+
+        // The success arms: the replay note when the daemon reports a prefix, silence
+        // when it does not. Neither is an error, and both mean the tap is open.
+        assert_eq!(
+            tap_open_ack(&json!({"id": 1, "result": {"replay_bytes": 4096}}))
+                .expect("an accepted open is not an error"),
+            Some("tap opened: replay_bytes=4096".to_string())
+        );
+        assert_eq!(
+            tap_open_ack(&json!({"id": 1, "result": {}})).expect("still not an error"),
+            None
+        );
+
+        // A bridge that answers something that is not an error object still fails, and
+        // still says what arrived — `describe_error`'s fallback, exercised through the
+        // one call site that can meet it.
+        let odd = tap_open_ack(&json!({"id": 1, "error": "boom"}))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err_tail(&odd), "\"boom\"");
+    }
+
+    /// The part of a refusal line after `tap.open failed: ` — the rendering itself.
+    fn err_tail(line: &str) -> &str {
+        line.strip_prefix("tap.open failed: ")
+            .unwrap_or_else(|| panic!("a refusal must name the verb it refused: {line}"))
     }
 }

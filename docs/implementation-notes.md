@@ -12567,3 +12567,72 @@ having enough observations rather than on taking a new one. Item 76's single tri
 refutation; item 19's three-run reading nearly became a warm-up hypothesis. Both dissolved at twelve
 and five respectively. **A committed artifact set is an instrument, and widening the read is
 cheaper than another session.**
+
+### 3.106 A sweep against vacuous guards wrote five of its own
+
+Plan §18 items 59(b)(c)(d), 61, 62, 63 and 64(b)(f)(h), executed by four agents in disjoint
+file-ownership groups with an independent adversarial reviewer per group. **The reviewers earned
+the structure: they found five assertions in the sweep's own new work that assert nothing** — in a
+sweep whose subject is assertions that assert nothing.
+
+**One class accounts for four of them, and it is a new register worth naming.** An assertion placed
+*after* a byte-exact `assert_eq!` on the same string cannot fail while the equality passes. Its
+passing output is its not-running output, which is AGENTS §3's tell in its purest form — and it is
+invisible on review, because the equality reads as **extra rigour rather than as a mask**. Measured
+instances: `ctl`'s "structural tail pin" survived a planted second `format!` spelling 6 of 6;
+`rpc`'s `assert!(!line.contains("(-327"), "the fallback invented a code")` survived an invented code
+28 of 28 — and was wrong twice over, since this tree's codes are `-326xx` and the loop emits no
+parenthesised rendering at all. Two more of the same shape sat in the web client's guard. The remedy
+each time was to delete the dead assertion and carry its intent in the equality's failure message.
+
+**Where the property genuinely lives outside the value, the guard has to move rather than be
+repaired.** `ctl`'s claim — that a second hand-spelled `{message} ({code})` re-entering the file
+would redden — is not checkable at runtime *at all*: a copy that agrees byte-for-byte is equal, and
+equality is the whole of what a runtime check measures. It became a source-level guard requiring
+zero `.message`/`.code` field reads outside tests, since spelling that rendering by hand needs both
+fields. **When a guard's stated property cannot be observed from a value, no amount of repairing the
+needle helps — the honest moves are to relocate the claim or delete it and name what carries it.**
+
+**A gate found a defect in the commit that introduced it.** Item 63's doc-parity matcher was a
+word-boundary substring search over the whole page, so a single appended
+`TODO(nobody): <twenty-nine key names>` line turned it green over a page documenting none of them.
+Tightened to require the key **backticked inside a Markdown table row**, it immediately reddened on
+four keys the same batch had left in prose only. The proposed stricter form — first cell of a
+per-kind row — was measured and **rejected**: it would have reddened ~20 keys that legitimately have
+no top-level row, the six modem lines under `modem_lines` among them. First-cell matching is correct
+for the *reverse* direction only, which the gate previously lacked entirely.
+
+**Item 62's finding is that a bound written is not a bound that constrains**, and the layer that
+caught it was thinner than the item assumed. Replacing `baud`'s `1, u32::MAX as u64` with
+`0, u64::MAX` left the derived gate green over a `range_error` call that can never fire. Exactly one
+hand-written unit test noticed; `validate`'s **property test did not**. The item filed the hand-kept
+layer as unreliable — the other automated layer was blind too, which is the sharper statement.
+
+**Item 61's central evidentiary claim is REFUTED**, and its filed remedy cannot be built.
+The premise was that the existing tripwire misses a throughput regression; it does not — a
+`VecDeque` drain+extend rewrite **stalls** at 13–43 %, 3 of 3, rather than passing slowly, and the
+old guard catches its named defect. The proposed 30 MiB/s criterion is unbuildable: under 20 hogs on
+20 cores throughput moves **30×** (11.9–62.9 against 460–558 unloaded), so it would redden a healthy
+tree in 5 of 12 runs. **What replaced the item's question is worth more than an answer to it: the
+pipeline is bistable.** Across ~20 builds over five regression classes nothing lands between 4.3 and
+108 MiB/s, and three plants stalled at 267.8/268.4 MB — caught by **0.2 % of margin**. So the
+shipped `(throughput regression)` message is *actively wrong* for the failure that actually occurs,
+and §3.69's recorded flake carries that signature and may be a tail stall rather than load.
+
+**The hoist that moved a predicate.** Item 59(d) unified `UnboundSet` and `UnconfiguredChannels`
+onto one `IdentitySet` — and the codec's log-once WARN rides `insert`'s `Option` return, which now
+lives in a different file whose other caller discards it. Nothing asserted the convention: a repeat
+made to report itself as a first sighting left 213 daemon unit tests and fourteen itests, the golden
+transcript included, green, while the daemon logged at WARN once per frame on an operator-reachable
+path at wire rate. **A refactor can relocate a predicate out of sight of every guard that depended
+on it without changing a line of the behaviour those guards assert.** Two guards hold it now, and
+the consequence guard proves its own instrument first, because `tracing` caches callsite interest
+globally and a sibling test reaching that WARN first would make every reading a vacuous zero.
+
+Two filed descriptions were wrong and are corrected at their items: 59(c)'s "spelled twice" is
+**four**, with `ctl` shipping two renderings of one object in one binary for one operator; and
+59(b)'s "the counters exist" is true but beside the point — they deliberately never landed in
+`core/src/state.rs`, because one shared struct would give a single name to losses §5 specifies as
+different. The header predicted a shape the tree rejected.
+
+Rig lane at this tree: **1015 · 0 · 7**, three self-skips, every hardware test passing.

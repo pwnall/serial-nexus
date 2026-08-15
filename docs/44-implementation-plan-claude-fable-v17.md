@@ -572,7 +572,7 @@ variables (rule 11).
 | `SNX_LICENSE_GATE` | Licensing-gate lane | Self-skip | Skip is a failure | — |
 | `SNX_EXEC_CODEC` | The out-of-process codec battery (§8, §15.26): thirteen tests over four files that drive a codec child through an external interpreter — `exec-conformance`, the any-language envelope battery, the crash-and-restart guard, the unconfigured-channel counter | Self-skip naming what the provider saw (`python3 not found`) | Skip is a failure (item 49) | Named for the **capability**, not the tool, like every instance beside it — `SNX_TLS`'s absent tool is `curl`, `SNX_WEB_UI`'s is `node`. A fixture ported to another language would leave an `SNX_PYTHON` naming nothing while the battery it gated still existed; the tool's name belongs in the message, on the box printing it (rule 11) |
 | `SNX_PACKAGING` | The packaged deployment surface (item 31): `systemd-analyze verify` over the unit and `udevadm verify` over the udev rules, each staged past its environmental arm | Self-skip naming what the provider saw (`systemd-analyze not found on PATH`) | Skip is a failure | Named for the **capability**, not the tool, like every instance beside it. The three text checks in the same file need no tool and **never skip**, so the drift class this tree can cause stays covered where this variable's subjects are absent |
-| `SNX_PACKAGING_ROOT` | Item 31's owed measurement: the `/var/lib/private/` indirection under `DynamicUser=`, and the EACCES-versus-EROFS pair proving `ReadWritePaths=` flips the mount without chowning | Self-skip naming the precondition that failed — PID 1's name, the effective uid, or `systemd-run`'s absence | Skip is a failure | **Deliberately set nowhere yet.** Whether a CI runner is systemd-as-PID-1 with passwordless root is unmeasured, and shipping `required` on an assumption reddens a lane for someone else's runner image — the discipline §15.52 set for `SNX_RIG_FLOW`, whose precondition was measured before it was demanded |
+| `SNX_PACKAGING_ROOT` | Item 31's owed measurement: the `/var/lib/private/` indirection under `DynamicUser=`, and the EACCES-versus-EROFS pair proving `ReadWritePaths=` flips the mount without chowning | Self-skip naming the precondition that failed — PID 1's name, the effective uid, or `systemd-run`'s absence | Skip is a failure | **Set on CI's packaging root step since 2026-08-15** (notes §3.104), and the demand followed the measurement exactly as §15.52 required of `SNX_RIG_FLOW`: run 31695823765 (2026-08-13) read `PID 1: systemd`, `sudo: passwordless`, and six passing root-arm tests before `required` was asked for. Until then it was set by **no lane**, which left that step's passing output identical to its self-skipping output — rule 22's tell, in the one step that had just been un-escaped from `continue-on-error` in order to gate. **It is spelled at the call, `sudo -n env SNX_PACKAGING_ROOT=required "$BIN"`, and a step-level `env:` block would be wrong**: `sudo` runs `env_reset`, so the variable would never reach the test, the test would find root and run anyway, and `required` would assert nothing — a fix for a gate that asserts nothing, itself asserting nothing, one layer down |
 | `SNX_SERIAL_PAIR=rig` | Forces `serial_pair_or_rig()` onto hardware (§15.48) — not a required mode | Software wins by default | Forcing with no rig visible is a hard failure, never a silent fallback | Provider printed before transmit |
 
 **Four** further variables are parameters, not gates. `SNX_CROSSOVER_A`/`_B` name the two rig port
@@ -2426,7 +2426,32 @@ cannot check was fixed (item 16's lesson).
     unknown endpoint). Fail-first reproduced the item's own measurement exactly: with the
     ack-swallow planted in `tap_stream`, both new guards redden while `p12_ctl_subscribe`,
     `p12_tap_replay` and `p8_replay_ring` stay green — which is what said the tap half was
-    unguarded in the first place. **(b), (c) and (d) remain open** (S; four independent clauses, none blocked on anything). Filed 2026-08-12 by item
+    unguarded in the first place. **(b), (c) and (d) EXECUTED 2026-08-15** (notes §3.106), closing the item.
+    *(b)* `core/src/state.rs`'s head is restated — **and the item's reason was imprecise**: "the
+    counters exist" is true, but they deliberately never landed *in that file*. They live at each
+    node kind's boundary and surface through `state_extra`, because one shared struct would give a
+    single name to losses §5 specifies as different (`discarded_unattached` against
+    `discarded_hostward`). The header predicted a shape the tree **rejected**; the second staleness
+    stands as filed.
+    *(c)* the ack rendering is spelled **once** now, in `RpcError`'s `Display`, both clients calling
+    it — **and the item undercounted: it was spelled four times, not two.** The unnamed instance is
+    `ctl`'s one-shot verb path, so `ctl` shipped **two renderings of the same object in the same
+    binary for the same operator**, and the premise was already false inside `ctl` before the web
+    client entered it. The guard meant to hold this could not: it pinned the line's bytes with an
+    `assert_eq!` and then asserted the tail, which no later assertion about that string can fail.
+    **No runtime assertion can see this defect** — a byte-identical copy is equal, which is all a
+    runtime check measures — so the claim moved to a source-level guard requiring zero
+    `.message`/`.code` field reads outside tests. A destructuring spelling is uncovered and the doc
+    says so.
+    *(d)* `codec.rs`'s framing is restated and `UnboundSet`/`UnconfiguredChannels` hoisted onto one
+    `IdentitySet`, copy count 2 → 1, proven by a single planted defect reddening tests in **both**
+    `leg.rs` and `codec.rs`. **The hoist moved a predicate and nothing asserted it:** the codec's
+    log-once WARN rides `insert`'s `Option`, which now lives in another file whose other caller
+    discards it. A repeat made to report itself as a first sighting left the daemon's 213 unit tests
+    and fourteen itests — the golden transcript included — green, while the daemon logged at WARN
+    once per frame on an operator-reachable path at wire rate. Two guards hold it now, deliberately
+    not one: a deterministic pin on the predicate, and a `tracing`-capture pin on the consequence
+    which proves its own instrument before trusting a count. The superseded filing follows: filed 2026-08-12 by item
     55's own execution rather than swept into it, because three of the four are outside that
     item's filed scope and the fourth is a file-ownership conflict, not a difficulty.
     *(a) The tap half of the 37-TOOL-2 rule has no guard at all* — **measured, not inferred**:
@@ -2493,7 +2518,23 @@ transcripts, the pattern-wait maxima). What follows is the residue.
     naming the amend-first order, and **fail-first proven**: planting `cap_sys_admin` reddens it
     (plus three sibling tests), restored byte-identical, 18 passed.
 
-61. **The throughput axis has no guard at its recorded value** — **open** (M; a measurement, then
+61. **The throughput axis has no guard at its recorded value** — **EXECUTED 2026-08-15 with its
+    central claim REFUTED** (notes §3.106). *The item's premise was that the existing tripwire misses
+    a throughput regression. It does not:* a `VecDeque` drain+extend rewrite **stalls** at 13–43 %,
+    3 of 3, with the daemon reporting `usb0 waiting (device lost: read returned EOF)`; a
+    byte-at-a-time circular `Vec` reads 0.69–0.75 MiB/s. The old guard catches its named defect. Two
+    of the item's three complaints stand — no reading was printed, and the recorded 183.0 has no
+    provenance — and both are fixed. *The filed remedy could not be built:* under 20 hogs on 20
+    cores throughput moves **30×** (11.9–62.9 MiB/s against 460–558 unloaded), so the proposed
+    30 MiB/s criterion would redden a healthy tree in 5 of 12 runs; CPU-per-MiB was rejected too, at
+    a 7× spread. **What was found instead is worth more than the item asked for: the pipeline is
+    bistable.** Across ~20 builds over five regression classes nothing lands between 4.3 and
+    108 MiB/s, and three plants stalled at 267.8/268.4 MB — caught by **0.2 % of margin**. So the
+    shipped `(throughput regression)` message is *actively wrong* for the failure that actually
+    occurs, and notes §3.69's recorded flake carries this signature and may be a tail stall rather
+    than load. A ratio backstop ships against slow-without-stalling, with its own unproven half
+    stated: every code plant arrives as a stall the deadline catches first, so only the criterion
+    was planted. The superseded filing follows. *Original state:* open (M; a measurement, then
     a guard). *Evidence:* `docs/benchmarks/phase3.json` records **183.0 MiB/s** and an exit
     criterion of **30 MiB/s**; the only test on that axis, `p3_firehose.rs`, streams 256 MiB under
     a 60 s deadline, so it fails only below **4.27 MiB/s** — 43× under the recorded figure and
@@ -2509,7 +2550,19 @@ transcripts, the pattern-wait maxima). What follows is the residue.
     of a **measured** `throughput` provenance block. The ceiling must be measured before the
     factor is chosen (AGENTS §8), and the sim source's own rate is the confound to check first.
 
-62. **§16.12's exhaustiveness is per-field, and is already violated** — **open** (S/M).
+62. **§16.12's exhaustiveness is per-field, and is already violated** — **EXECUTED 2026-08-15**
+    (notes §3.106). **A bound that is written is not a bound that constrains**, and gate (e) could
+    not tell the difference: it derived the roster from the schema as asked, then read only the
+    *name* out of each `range_error(…)`, so replacing `baud`'s `1, u32::MAX as u64` with
+    `0, u64::MAX` left it green over a call that can never fire. **Measured, and worse than the item
+    filed:** exactly one hand-written unit test caught that edit and `validate`'s **property test did
+    not** — the item named the hand-kept layer as unreliable, and the other automated layer was blind
+    too. The gate now recovers each window in both spellings plus the exec codec's `> MAX_*`
+    comparison, resolves both ends (literals in any base, `uN::MAX`, `as` casts, the four `MAX_*`
+    constants) and reports any window spanning the whole of the field's declared type. **An unreadable
+    window is reported, never skipped** — an unread bound must not count as a checked one. *Stated
+    residual, in the gate's doc and its verdict:* it does not judge whether a window is the *right*
+    one. The superseded filing follows. *Original state:* open (S/M).
     *Evidence:* the promise is "**every** numeric attribute and every wire-riding identifier
     carries a stated, structurally checked maximum", but enforcement is seven hand-written
     `range_error(…)` sites inside `GraphConfig::validate()`, each behind an `if let NodeConfig::X
@@ -2524,7 +2577,19 @@ transcripts, the pattern-wait maxima). What follows is the residue.
     missing check. *Validation:* the gate reddens on a planted unchecked field; the exemption list
     is two-sided.
 
-63. **The observation surface has no doc-parity gate, and has drifted** — **open** (M).
+63. **The observation surface has no doc-parity gate, and has drifted** — **EXECUTED 2026-08-15**
+    (notes §3.106), and the gate found a defect in the commit that introduced it. Twenty-nine keys
+    repaired, seventy-seven enumerated. **Both halves of the first attempt were AGENTS §3's second
+    register — an assertion weaker than its comment.** The matcher was a word-boundary substring
+    search over the whole page, so one appended `TODO(nobody): <all twenty-nine key names>` line
+    turned it green over a page documenting none of them (measured, then reproduced against the
+    repaired page with the serial rows struck). It now requires the key **backticked inside a
+    Markdown table row** — rows rather than first cells, because nested keys are documented in the
+    Description cell of the object that carries them and a first-cell rule would have reddened ~20
+    legitimate keys. Applying it immediately found four this batch had left in prose only —
+    `hostward`, `targetward`, `discarded_no_raw_edge`, `discarded_peer_gone`. The gate was also
+    **one-directional**, where every sibling roster gate is two-sided; a phantom documented row now
+    fails too. The superseded filing follows. *Original state:* open (M).
     *Evidence:* §5 says `docs/rpc/observation.md` is "the authoritative per-kind enumeration and
     **stays so**", and the tree gates the *error-code* table and the *verb index* two ways — but
     the largest surface is checked only by hand-written per-field tests that cite the doc without
@@ -2537,7 +2602,19 @@ transcripts, the pattern-wait maxima). What follows is the residue.
     node `state` builders, require each in `docs/rpc/*.md` or a named exemption, floors on both
     sides.
 
-64. **Second-tier audit residue** — **open** (S each; independent clauses).
+64. **Second-tier audit residue** — **(b), (f) and (h) EXECUTED 2026-08-15** (notes §3.106);
+    **(a), (c), (d), (e), (g) remain open** (S each; independent clauses). *(b)'s filed remedy would
+    have asserted nothing* — confirmed structurally: `fan_out` charges `unattached` only when
+    `!out.live`, and `Echo::start` attaches a `console` pty, so `discarded_unattached` is 0 at that
+    site by construction; an alternative landed instead. *(f)* the fsync claim: test renamed, comment
+    corrected, `sync_all` restored — and the plant that deleted both `sync_all` calls **left the test
+    passing**, which is the finding. *(h)* the bounded join landed at 10 s, with the fourth site
+    correctly left unbounded. **Five of the assertions this sweep itself wrote were instances of what
+    this item is about**, four of them one class: an assertion placed *after* a byte-exact
+    `assert_eq!` on the same string, which cannot fail while the equality passes — the tell in its
+    purest form, and invisible on review because the equality reads as extra rigour rather than as a
+    mask. All were repaired or deleted with their intent folded into the equality's message. The
+    superseded filing follows. *Original state:* open (S each; independent clauses).
     *(a)* The pattern wait's **active-path cost is unmeasured**: `ScanWindow::scan()` rescans the
     whole window per chunk on the single runtime thread, `MAX_LOOKBACK` is a scan cost as well as
     an allocation, and `waits` is iterated per chunk with no cap on its length. Item 46 established

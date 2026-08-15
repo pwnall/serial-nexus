@@ -3615,19 +3615,31 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `atomic_write` durably replaces the target: the bytes round-trip, the temp
+    /// `atomic_write` replaces the target atomically: the bytes round-trip, the temp
     /// sibling is consumed by the rename (no partial file left behind), and a second
     /// write overwrites cleanly.
     ///
-    /// **Comment-pinned (§16.6).** The durability path is: fsync the temp file
-    /// *before* the rename, then fsync the parent directory *after* it. Those
-    /// `sync_all` syscalls are not directly observable from a unit test, so this
-    /// asserts the observable atomic-write contract; the `sync_all` calls themselves
-    /// are pinned by this note against a future refactor that drops them (a
-    /// `strace -e trace=fsync,rename` on this test shows both fsyncs, as an optional
-    /// spot check).
+    /// **This test does not assert durability, and its name no longer says it does**
+    /// (plan §18 item 64(f)). It was `atomic_write_replaces_durably` and carried a note
+    /// claiming the two `sync_all` calls were "comment-pinned … against a future
+    /// refactor that drops them". A comment pins nothing: **measured — delete both
+    /// `sync_all` calls from [`atomic_write`] and this test still passes**, so the
+    /// durability half of §16.6 was guarded by a sentence that a reader would
+    /// reasonably have read as coverage. The atomic-replace half below is real and is
+    /// what the name now claims.
+    ///
+    /// The durability path §16.6 states is still: fsync the temp file *before* the
+    /// rename, then fsync the parent directory *after* it. Nothing in-process can
+    /// observe those syscalls, and the two seams that would fake observability — a
+    /// recorder closure, or an injectable syncer — pin the *narration* beside the call
+    /// rather than the call, which is AGENTS §3's "a guard that pins a decision rather
+    /// than a mechanism" wearing a different hat. The only instrument that pins the
+    /// mechanism is a syscall trace (`strace -e trace=fsync,fdatasync,rename`), which
+    /// needs a lane that can require `strace` the way plan §3 rule 11's `required`
+    /// modes require `curl` and `node`. That is scheduled work, not a comment; until
+    /// it exists the honest statement is this one.
     #[test]
-    fn atomic_write_replaces_durably() {
+    fn atomic_write_replaces_the_target_and_consumes_its_temp_sibling() {
         let dir = scratch_dir();
         let target = dir.join("state.toml");
         let tmp = dir.join("state.toml.tmp");

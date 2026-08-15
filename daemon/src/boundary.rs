@@ -433,6 +433,44 @@ mod tests {
         r.stop_join(); // the thread already exited; join returns at once
     }
 
+    /// How long a bounded teardown may take before [`within`] calls it a hang. Three
+    /// orders of magnitude over the healthy path (the worker polls the flag every
+    /// millisecond and the split guard below sleeps 30 ms on purpose), so a saturated
+    /// box cannot reach it.
+    const TEARDOWN_BUDGET: Duration = Duration::from_secs(10);
+
+    /// Run `f` on a helper thread and fail — *with the test's name attached* — if it
+    /// has not returned inside `budget`.
+    ///
+    /// [`BlockingWorker::join`] is `JoinHandle::join`, which cannot time out, so a stop
+    /// flag that never reaches the worker turns every guard in this pair from a failure
+    /// into a **hang**. Plan §18 item 42 measured exactly that: three boundary guards
+    /// deadlock rather than fail, and `cargo test` has no per-test timeout, so in CI
+    /// the result is a job timeout carrying **no failing test name** — the one thing
+    /// AGENTS §8 says to capture verbatim, absent (plan §18 item 64(h)).
+    ///
+    /// The helper thread is deliberately leaked on the failure path: it is parked in
+    /// `join` on a thread that is never going to exit, there is nothing to interrupt it
+    /// with, and the process is failing anyway. Leaking it is what buys the name.
+    fn within<T: Send + 'static>(
+        what: &str,
+        budget: Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(budget).unwrap_or_else(|_| {
+            panic!(
+                "{what} did not return within {budget:?}: the worker thread never \
+                 observed the stop flag. Without this bound the same defect is a hang — \
+                 `cargo test` has no per-test timeout, so CI reports a job timeout with \
+                 no failing test name (plan §18 items 42 and 64(h), AGENTS §8)."
+            )
+        })
+    }
+
     #[tokio::test]
     async fn blocking_reader_stop_join_ends_a_running_thread() {
         let mut r = BlockingWorker::default();
@@ -442,7 +480,9 @@ mod tests {
             }
         })
         .expect("arm worker");
-        r.stop_join(); // sets the flag, the thread exits, join succeeds
+        // Sets the flag, the thread exits, join succeeds — bounded, so a broken flag
+        // reddens with this test's name instead of wedging the binary.
+        within("stop_join", TEARDOWN_BUDGET, move || r.stop_join());
     }
 
     #[tokio::test]
@@ -460,7 +500,12 @@ mod tests {
             }
         })
         .expect("arm quiet worker");
-        w.stop_join();
+        // Bounded like its two siblings. Item 64(h) named only those two; measured with
+        // the stop flag planted, **this test is the third instance of the same class**
+        // — it holds a `while !stop` body and an unbounded `stop_join`, so bounding the
+        // other two still left the binary wedging here, on a test whose name the CI log
+        // would not have carried either.
+        within("quiet stop_join", TEARDOWN_BUDGET, move || w.stop_join());
         assert!(
             ran.load(Ordering::Relaxed),
             "the body ran and observed stop"
@@ -488,9 +533,14 @@ mod tests {
             !exited.load(Ordering::Relaxed),
             "signal_stop must not wait for the thread"
         );
-        r.join();
+        // Bounded for the reason [`within`] gives: this is the half that blocks, so it
+        // is the half that hangs when the flag does not propagate.
+        let mut r = within("join", TEARDOWN_BUDGET, move || {
+            r.join();
+            r
+        });
         assert!(exited.load(Ordering::Relaxed), "join must wait for it");
-        r.join(); // idempotent: the handle was already taken
+        r.join(); // idempotent: the handle was already taken, so this cannot block
     }
 
     // --- a node's tasks die with the node ---------------------------------------

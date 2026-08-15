@@ -380,6 +380,42 @@ impl GraphConfig {
             {
                 errors.extend(range_error(name, "mode", *mode as u64, 0o600, 0o777));
             }
+            // A pty's cosmetic advertised baud (§7.2). **Cosmetic is not the same as
+            // unbounded**: §16.12/§11 invariant 13 promises *every* numeric attribute a
+            // stated, structurally checked maximum, and until plan §18 item 62 this was
+            // the one field in the whole node schema that carried neither — it rode the
+            // wire into `state`, fed `apply_baseline` → `standard_baud`, and was
+            // accepted at any value.
+            //
+            // The window is `baud`'s, deliberately, so §7.1's serial rate and §7.2's
+            // advertised one are one sentence rather than two: the ceiling is the
+            // field's own type (§7.1/§13 buy nonstandard rates on purpose, and a pty
+            // advertising one is the same deliberate act), and the floor refuses `0`,
+            // which is not a rate in either place.
+            //
+            // **What this does *not* claim.** Nothing is reachable today, and review 32
+            // said so when it dropped this half of `RV-4`: `standard_baud` answers
+            // `None` for every nonstandard value including `0`, so the speed is simply
+            // never set and no `B0` hang-up reaches the pair. That verdict was right
+            // about the *consequence* and is overturned only on the *promise* — the
+            // safety is an accident of which rates the standard-rate table happens to
+            // list, not a property anything states or checks, and §16.12 exists so that
+            // a field's safety is read off a bound rather than off a lookup table three
+            // modules away. This is a promise closed, not a defect fixed.
+            if let NodeConfig::Pty {
+                name,
+                advertised_baud,
+                ..
+            } = node
+            {
+                errors.extend(range_error(
+                    name,
+                    "advertised_baud",
+                    *advertised_baud as u64,
+                    1,
+                    u32::MAX as u64,
+                ));
+            }
             // A log's rotation-suffix padding (§7.3).
             if let NodeConfig::Log {
                 name,
@@ -2283,6 +2319,46 @@ mod tests {
         );
     }
 
+    /// Plan §18 item 62: a pty's `advertised_baud` is range-checked structurally,
+    /// like every other numeric attribute in the node schema (§16.12).
+    ///
+    /// The window is `baud`'s — `1 ..= u32::MAX` — so the only value this refuses is
+    /// `0`. That is the whole point of the item: the field was safe by accident
+    /// (`standard_baud` returns `None` for it, so nothing is ever set), and §16.12
+    /// asks for a bound rather than an accident. The accepted end of the window is
+    /// asserted at the same time, because a check that refuses a *legitimate*
+    /// nonstandard rate would contradict §7.2's "skipped rather than approximated".
+    #[test]
+    fn pty_advertised_baud_is_range_checked() {
+        let pty = |advertised_baud: u32| NodeConfig::Pty {
+            name: "con".into(),
+            path: "/run/serial_nexus/con".into(),
+            owner: None,
+            group: None,
+            mode: None,
+            advertised_baud,
+            hostward_buffer: 32,
+        };
+        let reported = |baud: u32| {
+            errors_of(vec![pty(baud)], vec![]).iter().any(|e| {
+                matches!(
+                    e,
+                    ValidationError::NumericOutOfRange { node, field: "advertised_baud", value, .. }
+                        if node == "con" && *value == baud as u64
+                )
+            })
+        };
+        assert!(reported(0), "advertised_baud = 0 is not a rate");
+        for baud in [1, 9600, 115_200, 460_800, 1_000_000, 9601, u32::MAX] {
+            assert!(
+                !reported(baud),
+                "advertised_baud = {baud} must be accepted — §7.2 skips a nonstandard \
+                 advertised rate rather than approximating it, and refusing one here \
+                 would make this check contradict the design it enforces"
+            );
+        }
+    }
+
     #[test]
     fn effective_write_mode_reproduces_the_runtime_promotions() {
         // The single source of truth for the two promotions the data plane applies
@@ -3013,6 +3089,11 @@ mod tests {
             depth in prop_oneof![0usize..=MAX_HOSTWARD_BUFFER, (MAX_HOSTWARD_BUFFER + 1)..=usize::MAX],
             timer in prop_oneof![0u64..=MAX_TIMER_MS, (MAX_TIMER_MS + 1)..=u64::MAX],
             mode in prop_oneof![0u32..0o600, 0o600u32..=0o777, 0o1000u32..=u32::MAX],
+            // Plan §18 item 62. Weighted so the single refused value is drawn as
+            // often as the whole accepted half — `any::<u32>()` would hit `0` about
+            // once in four billion, which is a property test that never tests the
+            // property.
+            advertised in prop_oneof![Just(0u32), 1u32..=u32::MAX],
         ) {
             let cfg = GraphConfig {
                 nodes: vec![
@@ -3043,7 +3124,7 @@ mod tests {
                         owner: None,
                         group: None,
                         mode: Some(mode),
-                        advertised_baud: 115_200,
+                        advertised_baud: advertised,
                         hostward_buffer: 32,
                     },
                 ],
@@ -3069,6 +3150,9 @@ mod tests {
             // permission mode's bit width (which catches the decimal-octal typo
             // family) and the floor is the daemon's own `prime_slave` open.
             prop_assert_eq!(reported("mode"), !(0o600..=0o777).contains(&mode));
+            // Item 62: `1 ..= u32::MAX`, the same window `baud` carries — so the
+            // accept/reject split is exactly "is it zero", over the whole domain.
+            prop_assert_eq!(reported("advertised_baud"), advertised == 0);
         }
 
         #[test]

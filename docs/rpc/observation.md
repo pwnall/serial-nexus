@@ -55,8 +55,11 @@ poll that re-reports the same status and reason leaves it alone — so it answer
 "since when has it been faulted?" rather than "when was it last polled?". It is
 wall clock, so it moves with a clock step like every other absolute time on the
 box, and a rebuilt node is re-stamped to now (a rebuilt node has no history).
-The node-type extras are opaque observed detail and vary by kind; treat them as
-informational, except for the loss counters below, which §5 requires to exist.
+The node-type extras vary by kind and are enumerated in full below — §5 makes
+this page "the authoritative per-kind enumeration", so a key the daemon puts in
+`state` and this page does not name is a defect in one of the two, and a
+meta-gate says so (`itest/tests/meta_derive.rs`). Treat them as informational
+except for the loss counters, which §5 *requires* to exist.
 
 Each object in `endpoints`:
 
@@ -92,6 +95,95 @@ for):
 §15.32 every host-facing endpoint carries a ring whether or not anyone is
 watching: a counter only reachable through an open tap would be a §5 loss nobody
 can read.
+
+### The node-type extras, per kind
+
+Every key each node kind puts in its `state` object, in full. The loss counters
+get their own section below, which says what each one *means*; this one exists so
+that the enumeration is complete — §5 names this page the authoritative one, and
+until 2026-08-15 twenty-nine of these keys appeared nowhere on it (plan §18 item
+63). A `null` in the Type column is a real reported value and never an omission:
+it is how a reading the kernel would not give us is distinguished from a zero.
+
+**serial** (§7.1):
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `identity` | string | the configured device identity, verbatim — resolver form or a raw `/dev` path. Configuration, echoed here so it can be read beside the path it actually resolved to |
+| `identity_kind` | string | which identity grammar that is: `usb`, `by-path`, `by-id`, `raw`, or `unknown` (§12) |
+| `resolved_path` | string \| null | the `/dev` node the identity resolves to *now* — state, not configuration (§12). `null` when nothing answers it |
+| `baud` | integer | the rate the port is opened at (§7.1) |
+| `open` | boolean | whether the daemon currently holds the port open. `false` with `status: "waiting"` is an unplugged device, not a failure |
+| `discarded_unattached` | integer | see [loss counters](#loss-counters-in-the-node-type-extras) |
+| `purged_on_reconnect` | integer | see [loss counters](#loss-counters-in-the-node-type-extras) |
+| `discarded_at_teardown` | integer | see [loss counters](#loss-counters-in-the-node-type-extras) |
+| `modem_lines` | object \| null | the live modem-line reading, `null` where the device has no `TIOCMGET` (a pty-backed `raw:` device). Six booleans: `dtr`, `rts` (outputs the daemon asserts, §7.1), `cts`, `dsr`, `dcd`, `ri` (inputs the peer asserts). The *configured* initial assertions are `modem` in `dump`; these are what the line reads back, which is the pair §15.58 keeps apart |
+| `driver_counters` | object \| null | `TIOCGICOUNT`, `null` where the device does not support it — `rx`, `tx` (characters the driver has seen in each direction), `frame`, `overrun`, `parity`, `brk`, `buf_overrun`. Kernel-side loss, reported beside the daemon's own counters so the layer that lost the bytes is named (§5, §7.1) |
+
+**pty** (§7.2):
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `pts_path` | string | the pts node the daemon allocated (e.g. `/dev/pts/7`) — state: it changes on every re-creation |
+| `symlink` | string | the configured stable path pointing at it (`path` in `dump`) |
+| `advertised_baud` | integer | the cosmetic rate reported to a client's `tcgetattr` (§7.2). Applied only when it names a standard rate; a nonstandard value is skipped rather than approximated, so this field can report a rate the pair is not actually set to |
+| `client_present` | boolean | whether a process currently holds the slave. §7.2's presence gate: hostward output is delivered while this is `true` and counted-and-discarded while it is `false` |
+| `client_termios` | object \| null | the *client's* current termios, `null` until a client touches it — `baud` (the debug spelling of the speed, e.g. `B115200`), `char_bits`, `parity` (`none`/`odd`/`even`), `echo`, `icanon`, `extproc`. Observed, never configured: it is what the attached program asked for, which is how a console that has turned canonical mode back on becomes visible |
+| `discarded_no_client`, `dropped_slow_consumer`, `discarded_targetward`, `discarded_at_last_close` | integer | see [loss counters](#loss-counters-in-the-node-type-extras) |
+
+**log** (§7.3):
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `current_file` | string | the path being written now — `directory` and `filename` joined, so a rotation is visible without recomputing it |
+| `rotation` | integer | how many rotations this node has performed; the counter the `rotation_padding` suffix renders |
+| `queued_bytes`, `dropped_bytes`, `write_errors`, `last_write_error` | integer / string \| null | see [loss counters](#loss-counters-in-the-node-type-extras) |
+
+**codec** (§7.5) and **exec** (§7.6) — one shape, two kinds:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `codec` | string | the registry name selecting the transform; literally `"exec"` for an exec codec |
+| `faces` | string | `host` or `target`: which way the multiplexed side points (§7.5) |
+| `framing_errors`, `demux_errors`, `last_demux_error` | integer / string \| null | codec only — see [loss counters](#loss-counters-in-the-node-type-extras) |
+| `restart_count` | integer | exec only: how many times the child has been respawned (§7.6) |
+| `discarded_unframable` | integer | exec only — see [loss counters](#loss-counters-in-the-node-type-extras) |
+| `multiplexed` | object | the multiplexed side's own counters: `dropped_slow_consumer`, `discarded_targetward`, and (codec only) `discarded_hostward` |
+| `channels` | object | keyed by channel identity. Each carries `status` (`active` once any data has crossed it, else `waiting`), `delivered_hostward`, `discarded_unattached`, and — codec only — `accepted_targetward` and `discarded_targetward` |
+| `discarded_at_teardown`, `discarded_unconfigured_channel`, `unconfigured_channels`, `unconfigured_overflow` | integer / array | see [loss counters](#loss-counters-in-the-node-type-extras) |
+
+`delivered_hostward` and `accepted_targetward` are the two counters §5's
+head-of-line clause is pinned against (`itest/tests/p6_head_of_line.rs`), and
+they are asymmetric on purpose: `delivered_hostward` counts channel bytes handed
+*to* the consumer boundary — a slow consumer's own drops are counted at that
+boundary, not here — while `accepted_targetward` counts channel bytes handed
+*into* the device-side channel, which is a handoff and not device consumption. It
+freezes while the transform does not hold the write lock, which is §6's stall
+made visible rather than a stuck counter.
+
+**leg** (§7.4):
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `role` | string | `listen` or `connect` |
+| `transport` | string | `tcp` or `unix` |
+| `faces` | string | `host` or `target`: which way every channel endpoint points |
+| `connection` | string | the socket's observed condition — `connected`, `connecting`, `listening`, or `disconnected`. Distinct from the node's `status`, which is about the node |
+| `peer_address` | string \| null | the peer actually on the far end, `null` while there is none. The *configured* `address` is in `dump`; on a `listen` leg the two are different by nature |
+| `protocol_version` | integer \| null | the wire protocol version the peer announced in its hello (§9), `null` before one arrives. §15.16's version-skew signal, read here rather than out of a log line |
+| `capabilities` | integer \| null | the peer's announced capability bitmap (§9), `null` before a hello. Reported as the peer sent it: an unknown bit is a peer that is newer, which is the thing worth seeing |
+| `reconnect_count` | integer | how many times this leg has re-established its connection. A leg that is `connected` with a rising count is a flapping link, which is invisible in `status` alone |
+| `insecure_bind` | `true` | **present only when set** — §9's named footgun, surfaced as a greppable confession that this leg bound or dialled off-loopback (§15.12). Absent, never `false`: the whole point is that it appears exactly where it was opted into |
+| `channels` | object | keyed by channel identity. Each carries `binding` (`bound`, `waiting`, or `unbound` for an identity the peer announced that this leg is not configured for), `active` (whether data has crossed it), and its counters — `discarded_hostward`, `discarded_targetward`, `discarded_unframable`, `discarded_peer_gone`, `purged_on_reconnect`, `dropped_slow_consumer` and `discarded_at_teardown`, all described under [loss counters](#loss-counters-in-the-node-type-extras) |
+| `unbound_overflow`, `discarded_at_teardown` | integer | see [loss counters](#loss-counters-in-the-node-type-extras) |
+
+**map** (§7.8) — three objects, each enumerated in [its own section](#map-node-state):
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `hostward` | object | the hostward direction's transform activity — `bytes_in`, `bytes_out`, `rules` — and its §5 loss counter `discarded_unattached` |
+| `targetward` | object | the same three for the targetward direction, and its §5 loss counter `discarded_no_raw_edge` |
+| `raw` | object | the raw side's own counter, `dropped_slow_consumer`: hostward bytes the upstream dropped because the map's raw-side intake was full |
 
 ### Loss counters in the node-type extras
 
@@ -173,13 +265,18 @@ where it happens") makes one family of them meaningful everywhere. Per kind:
   silence (`docs/implementation-notes.md` §3.31). What each kind's figure covers:
 
   * **map** and **codec** — their whole host-facing targetward exposure, exactly.
-  * **exec** — a **floor, not a total**, and deliberately so. What is counted is the
-    per-channel host-facing queues its forwarders read from. Those forwarders then push
-    into a second, *internal* merged queue that `pump_child` reads, and a chunk that has
-    already moved into that stage is beyond this handle's reach — so a torn-down `exec`
-    can destroy more than it reports, never less. Closing the rest means giving the
-    merge stage the same treatment. Stated here rather than left to be discovered by
-    someone diffing the counter against a conservation sum.
+  * **exec** — a **total**, since plan §18 item 21; it was a floor until then, and the one
+    kind whose figure was. Both watched stages are counted now: the per-channel host-facing
+    queues its forwarders read from, *and* the internal merged queue they push into, which
+    `pump_child` reads. Two exclusions remain, and neither is a shortfall in this figure —
+    they are bytes that are not this counter's to claim. The merge queue is *bidirectional*,
+    so roughly half of it is the device stream travelling hostward on its way into the
+    child; charging that would report a hostward loss under a targetward name. And bytes
+    already written into the child's stdin pipe have left the daemon exactly as bytes
+    written to a device fd have, which makes them delivery rather than loss — the same line
+    the serial node already draws. *(This paragraph said "a floor, not a total, and
+    deliberately so" until 2026-08-15: item 21 corrected the counter and the doc comment
+    beside it and left this page, which is the one an operator reads. Plan §18 item 63.)*
   * **serial** — the backlog a `waiting` node accumulates, which is the deepest one the
     daemon legally holds: §5/§7.1's whole answer to an absent device is that its origins
     backpressure rather than lose their commands, so those bytes are owed until the node
@@ -281,6 +378,8 @@ quirk a mystery console actually has (§7.8). Each direction (`hostward`,
 | `bytes_in` | integer | input bytes seen in this direction |
 | `bytes_out` | integer | output bytes produced (differs from `bytes_in` when rules expand or delete) |
 | `rules` | object | per-rule substitution counts, keyed by mapping name — how many input bytes each configured rule actually substituted (a shadowed rule stays `0`) |
+| `discarded_unattached` | integer | **hostward only** — mapped bytes that reached no live consumer of the mapped endpoint |
+| `discarded_no_raw_edge` | integer | **targetward only** — bytes discarded because the map has no writable raw edge |
 
 Each direction also carries its own §5 loss counter, because a map is a producer
 like any other and §7.8 gives it a default ring — uncounted loss would be visible

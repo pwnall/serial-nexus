@@ -322,7 +322,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let envelope = json!({ "error": serde_json::to_value(&err)? });
             println!("{}", serde_json::to_string_pretty(&envelope)?);
         } else {
-            eprintln!("error {}: {}", err.code, err.message);
+            // One rendering for a refused request, spelled in `serial_nexus_rpc` beside
+            // the type (plan §18 item 59(c)). This line used to read
+            // `error <code>: <message>` while [`read_ack`] below read
+            // `<verb> failed: <message> (<code>)` — the same object, the same binary,
+            // the same operator, two shapes. `data` still follows on its own lines
+            // rather than riding this one; it is the half that can be large.
+            eprintln!("error: {err}");
             if let Some(data) = err.data {
                 eprintln!("{}", serde_json::to_string_pretty(&data)?);
             }
@@ -827,7 +833,10 @@ fn read_ack<R: BufRead>(reader: &mut R, line: &mut String, verb: &str) -> anyhow
         }
         if let Ok(Incoming::Response(resp)) = serde_json::from_str::<Incoming>(line.trim()) {
             if let Some(err) = resp.error {
-                anyhow::bail!("{verb} failed: {} ({})", err.message, err.code);
+                // The rendering is `serial_nexus_rpc`'s, not this file's: the same
+                // object is turned into the same line by the one-shot path below and by
+                // the web console's headless client (plan §18 item 59(c)).
+                anyhow::bail!("{verb} failed: {err}");
             }
             return Ok(resp.result.unwrap_or(Value::Null));
         }
@@ -1294,5 +1303,152 @@ mod tests {
         let params = params.unwrap();
         assert_eq!(params["dtr"], json!(false));
         assert_eq!(params["rts"], Value::Null);
+    }
+
+    /// **What a refused streaming ack prints, to the byte** (plan §18 item 59(c)).
+    ///
+    /// The two itest guards that already watch this path assert
+    /// `stderr.contains("-32601")` — which is what they claim and all they claim.
+    /// Every candidate rendering satisfies it, the raw JSON object included, so the
+    /// rendering itself was asserted by nothing at either client and diverged between
+    /// them unnoticed. This pins the whole line.
+    ///
+    /// It does **not** pin the tail structurally, and the assertion that claimed to is
+    /// gone rather than reworded — see
+    /// [`no_second_spelling_of_the_refusal_rendering_lives_in_this_file`], which is
+    /// where that claim is kept now.
+    ///
+    /// It needs no socket: `read_ack` is generic over [`BufRead`], and a `&[u8]` is one.
+    #[test]
+    fn a_refused_ack_names_the_verb_and_renders_the_error_once() {
+        let refusal = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":\
+                       {\"code\":-32601,\"message\":\"method not found: subscribe\"}}\n";
+        let mut reader = refusal.as_bytes();
+        let mut line = String::new();
+        let err = read_ack(&mut reader, &mut line, "subscribe")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "subscribe failed: method not found: subscribe (-32601)"
+        );
+
+        // `data` is printed by the one-shot path on its own lines; it must not be
+        // spliced into this one, where it would ride a single stderr line unbounded.
+        let with_data = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\
+                         \"message\":\"unknown endpoint: nope\",\
+                         \"data\":{\"available\":[\"usb0\"]}}}\n";
+        let mut reader = with_data.as_bytes();
+        let err = read_ack(&mut reader, &mut line, "tap.open")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "tap.open failed: unknown endpoint: nope (-32602)");
+
+        // The rest of the helper's stated contract, which nothing else asserts: a
+        // stray notification ahead of the ack is skipped rather than mistaken for it,
+        // the result comes back on success, and an EOF before the ack is an error
+        // naming the verb rather than a successful empty stream.
+        let with_note = "{\"jsonrpc\":\"2.0\",\"method\":\"node.status\",\"params\":{}}\n\
+                         {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"subscribed\":true}}\n";
+        let mut reader = with_note.as_bytes();
+        let ack = read_ack(&mut reader, &mut line, "subscribe").expect("the ack is the response");
+        assert_eq!(ack, json!({"subscribed": true}));
+
+        let mut empty = &b""[..];
+        let err = read_ack(&mut empty, &mut line, "tap.open")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "connection closed before the tap.open acknowledgement");
+    }
+
+    /// This file's own source, read at compile time. Its non-test half is the subject
+    /// of the guard below.
+    const CTL_SOURCE: &str = include_str!("main.rs");
+
+    /// `CTL_SOURCE` with the `mod tests` block dropped and `//` comment tails removed.
+    ///
+    /// Same shape and same accepted limits as the strippers in
+    /// `itest/tests/meta_derive.rs` and `meta_gates.rs`: no `/* … */` handling, and a
+    /// `//` inside a string literal truncates its line. Both only ever *remove* text,
+    /// so they can weaken this guard on a line and can never manufacture a hit — and
+    /// the test module has to go because it is where the needles below are written.
+    fn ctl_code_only() -> String {
+        CTL_SOURCE
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(CTL_SOURCE)
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(i) => &line[..i],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **One refusal rendering in this binary, kept structurally** (plan §18 item
+    /// 59(c)).
+    ///
+    /// The claim this holds used to sit in
+    /// [`a_refused_ack_names_the_verb_and_renders_the_error_once`] as an `ends_with`
+    /// against `RpcError`'s `Display`, under a comment saying a second spelling of
+    /// `<message> (<code>)` re-entering this file would redden there. It would not: the
+    /// `assert_eq!` two lines above pins those exact bytes, so *every* later assertion
+    /// about the same string is subsumed by it, and a reviewer planted a second
+    /// `format!` spelling and watched all six assertions stay green. A copy that agrees
+    /// byte-for-byte is invisible at runtime **by construction** — the two renderings
+    /// are equal, which is the only thing a runtime assertion can see. So the property
+    /// is kept where it lives: in the source.
+    ///
+    /// To spell `<message> (<code>)` for itself, a second rendering has to take those
+    /// two fields off the error object. Outside its tests this file takes neither: the
+    /// one-shot path prints `{err}` and [`read_ack`] bails with `{err}`, both of which
+    /// are `serial_nexus_rpc`'s `Display` — the one place that rendering exists.
+    ///
+    /// **Residual, stated rather than implied.** A spelling that *destructures*
+    /// (`let RpcError { code, message, .. } = err;` and then `format!("{message}
+    /// ({code})")`) reads no field and is not covered here. Nothing short of a
+    /// compiler plugin sees that; what does see it is the byte-exact `assert_eq!` in
+    /// the guard above, on every path a test drives — which is why the two guards are
+    /// kept as a pair rather than merged.
+    #[test]
+    fn no_second_spelling_of_the_refusal_rendering_lives_in_this_file() {
+        let code = ctl_code_only();
+        assert!(
+            code.len() > 10_000 && code.contains("fn read_ack"),
+            "the stripper returned {} bytes and no `read_ack` — it ate the file, and a \
+             gate that scans nothing passes forever",
+            code.len()
+        );
+
+        // The needles are the field accesses a hand-spelled rendering must make. They
+        // are written literally because `ctl_code_only` cuts at `#[cfg(test)]`, so this
+        // module is not part of what is scanned; moving that boundary would make this
+        // test its own first violation, which is a loud failure rather than a quiet one.
+        let needles = [".message", ".code"];
+
+        // The matcher, proved before the verdict is trusted (AGENTS §3): the exact
+        // spelling this guard exists to catch must be found in text this test owns.
+        let planted =
+            "anyhow::bail!(\"{verb} failed: {} ({})\", err.message, err.code);".to_owned();
+        for needle in needles {
+            assert!(
+                planted.contains(needle),
+                "the matcher does not find `{needle}` in a hand-spelled \
+                 `<message> (<code>)` rendering, so the verdict below means nothing"
+            );
+        }
+
+        for needle in needles {
+            assert!(
+                !code.contains(needle),
+                "`{needle}` is read off an error object in ctl/src/main.rs. The refusal \
+                 rendering `<message> (<code>)` is `serial_nexus_rpc::RpcError`'s \
+                 `Display` and is spelled once, there: this binary printed \
+                 `error <code>: <message>` from its one-shot path and \
+                 `<verb> failed: <message> (<code>)` from `read_ack` until plan §18 item \
+                 59(c), two shapes for one object in one binary. Print `{{err}}`."
+            );
+        }
     }
 }

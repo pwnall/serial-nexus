@@ -879,6 +879,172 @@ fn an_armed_wait_observes_a_ring_off_untapped_endpoint() {
     );
 }
 
+/// One node's `state` counter, or 0 if the node or the field is absent.
+fn node_u64(rpc: &Rpc, node: &str, field: &str) -> u64 {
+    rpc.node(node)
+        .and_then(|n| n.get(field).and_then(Value::as_u64))
+        .unwrap_or(0)
+}
+
+/// A lone host-facing endpoint with **no graph consumer at all** — no edge, no pty,
+/// ring off — so every hostward byte the reader takes off the device lands on
+/// `discarded_unattached` (§5). `arbitration = "free-for-all"` so a control-plane
+/// `send` can drive the echo double without holding a lock.
+///
+/// This is the fixture §10 clause 7's second half needs and the [`Echo`] fixture
+/// cannot provide: `Echo` attaches a `console` pty, so `discarded_unattached` is
+/// structurally 0 there whatever the mirror does, and an assertion over it would pass
+/// just as happily with the counter deleted.
+struct Unattached {
+    daemon: Daemon,
+    _echo: serial_nexus_itest::SerialEcho,
+}
+
+impl Unattached {
+    fn start() -> Option<Unattached> {
+        let echo = serial_echo()?;
+        let d = Daemon::start();
+        let cfg = format!(
+            r#"
+[[node]]
+type = "serial"
+name = "usb0"
+device = "{device}"
+arbitration = "free-for-all"
+replay_ring = 0
+"#,
+            device = echo.device().display(),
+        );
+        d.rpc()
+            .load_toml(&cfg, false)
+            .expect("load the unattached endpoint");
+        assert!(
+            d.rpc()
+                .wait_status("usb0", "active", Duration::from_secs(10)),
+            "usb0 not active: {:?}",
+            d.rpc().node("usb0")
+        );
+        Some(Unattached {
+            daemon: d,
+            _echo: echo,
+        })
+    }
+
+    fn rpc(&self) -> &Rpc {
+        self.daemon.rpc()
+    }
+
+    /// Write one line targetward and wait for `discarded_unattached` to account for
+    /// the echo coming back, returning how much it grew by.
+    fn emit_and_measure(&self, line: &str) -> u64 {
+        let before = node_u64(self.rpc(), "usb0", "discarded_unattached");
+        self.rpc()
+            .send("usb0", line, false, 5_000)
+            .unwrap_or_else(|e| panic!("send {line:?}: [{}] {}", e.code, e.message));
+        let want = before + line.len() as u64 + 1; // `send` appends \n
+        assert!(
+            wait_until(MATCH_BOUND, || {
+                node_u64(self.rpc(), "usb0", "discarded_unattached") >= want
+            }),
+            "discarded_unattached never reached {want} (it is {}) — with no graph \
+             consumer every echoed byte must land there (§5)",
+            node_u64(self.rpc(), "usb0", "discarded_unattached")
+        );
+        node_u64(self.rpc(), "usb0", "discarded_unattached") - before
+    }
+}
+
+/// §10 clause 7's other half: an armed wait **never affects `discarded_unattached`**
+/// — the tap/ring mirror is a spy *outside* the graph, so a wait observing an
+/// endpoint must not make its bytes look consumed (§15.32's tripwire, AGENTS §4's
+/// purge invariant, plan §18 item 64(b)).
+///
+/// Asserted by nothing until 2026-08-15: a `grep` of the acceptance battery for
+/// `discarded_unattached` returned zero. **And the remedy as filed — "two lines in the
+/// existing ring-off guard" — would have asserted nothing**, because that guard runs
+/// on the [`Echo`] fixture, which attaches a `console` pty; with a graph consumer
+/// present the counter is 0 with the mirror working, broken, or deleted. Hence
+/// [`Unattached`], where the counter is the *only* place the bytes can go.
+///
+/// **Two arms, because "never affects" is a comparison, not a value.** The same line
+/// is echoed with no wait armed and then with one armed, and the two deltas must be
+/// equal. A single-arm assertion (`delta == 9`) would pin the arithmetic of this
+/// fixture rather than the independence the clause promises.
+///
+/// **What the fail-first proof covers, and what it does not.** Planting the defect the
+/// `fan_out` doc warns about — the mirror handed the unattached charge instead of the
+/// graph, so a spy masks a real consumer's absence — reddens this guard *and four
+/// others* (`lone_serial_discards_unattached_bytes_with_counter`,
+/// `a_mid_stream_connect_captures_from_the_join_point`,
+/// `an_oversize_ring_replays_its_newest_bytes_and_lands_on_the_live_edge`,
+/// `tap_close_stops_the_stream_while_bytes_keep_flowing`), measured. So the *class* is
+/// not unguarded, and plan §18 item 64(b)'s premise is half right: what nothing else
+/// covers is the **carrier**. All four of those mirror through a tap or a ring, and a
+/// wait-specific regression — `arm_wait` attaching its matcher as a hostward
+/// `AttachedSink`, which is the obvious wrong way to build it and would make
+/// `FanOut::live` true — is invisible to every one of them. This guard is the only
+/// place that would see it. It has no plant of its own, because building that one
+/// means writing the wrong implementation; say that when quoting it.
+#[test]
+fn an_armed_wait_never_affects_discarded_unattached() {
+    let Some(e) = Unattached::start() else {
+        eprintln!(
+            "SKIP an_armed_wait_never_affects_discarded_unattached: no serial device \
+             on this platform"
+        );
+        return;
+    };
+
+    // Arm 1 — the control. No wait, no tap, no ring: the mirror is off entirely.
+    let quiet = e.emit_and_measure("UNWATCHED");
+    assert_eq!(
+        node_u64(e.rpc(), "usb0", "delivered_hostward"),
+        0,
+        "the fixture must have no graph consumer, or this test is measuring nothing"
+    );
+
+    // Arm 2 — the same line, the same length, with a wait armed over it. Arming the
+    // wait switches the endpoint's mirror ON (that is the clause's first half, which
+    // `an_armed_wait_observes_a_ring_off_untapped_endpoint` covers), so this is
+    // exactly the state in which a mirror that suppressed the counter would show.
+    let mut conn = WaitConn::connect(&e.daemon.socket());
+    let id = park(
+        &mut conn,
+        "usb0",
+        json!([literal("watched", b"WATCHEDXX")]),
+        5_000,
+        false,
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || !state_waits(e.rpc()).is_empty()),
+        "the wait must be armed before the bytes it is meant to hear"
+    );
+    let watched = e.emit_and_measure("WATCHEDXX");
+
+    // The wait heard them — so the mirror really was carrying this traffic, and the
+    // equality below is about a live mirror rather than an inert one.
+    let resp = conn
+        .response(id, MATCH_BOUND)
+        .expect("the wait must answer");
+    assert_eq!(
+        resp["result"]["timed_out"],
+        json!(false),
+        "the armed wait did not observe the bytes, so the comparison below would be \
+         between two unmirrored runs: {resp}"
+    );
+
+    assert_eq!(
+        watched, quiet,
+        "an armed wait moved `discarded_unattached`: {quiet} B were charged for an \
+         unwatched line and {watched} B for a watched one of the same length. The \
+         tap/ring mirror is a spy OUTSIDE the graph (§5, §15.32, §10 clause 7): it \
+         must neither suppress the unattached charge (a mirror counted as a consumer \
+         — the bytes were still lost to the graph) nor add to it (the mirror is not \
+         a second discard). `runtime::fan_out` is where that charge is made, and its \
+         `sinks` argument must carry graph sinks only."
+    );
+}
+
 /// The CLI's match path, end to end: exit `0`, and the verdict on stdout.
 #[test]
 fn ctl_exits_zero_when_the_pattern_matches() {
