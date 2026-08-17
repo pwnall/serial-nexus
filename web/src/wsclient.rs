@@ -188,6 +188,14 @@ async fn connect(
     let (ws, _resp) = tokio_tungstenite::connect_async(req)
         .await
         .map_err(|e| anyhow::anyhow!("WebSocket connect failed: {e}"))?;
+    // The mirror of the server's own `set_nodelay` (§15.63). This client is
+    // request/response for `--rpc` and read-mostly for the tap stream, so every frame
+    // it writes is sub-MSS and unaccompanied — precisely the shape Nagle holds until
+    // the peer's delayed-ACK timer fires. The server's socket is a *different* socket
+    // and its option does not reach this one. `get_ref()` unwraps whichever tier the
+    // URL selected down to the `TcpStream` underneath, so `ws://` and `wss://` are
+    // covered by one line.
+    let _ = ws.get_ref().get_ref().set_nodelay(true);
     Ok(ws)
 }
 

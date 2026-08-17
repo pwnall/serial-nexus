@@ -386,11 +386,15 @@ test("the rail carries each console's node status and says why", async ({ page }
   }
 });
 
-// Review 37-WEBC-7. §17's send contract is one sentence — "a LOCKED refusal shows the
-// holder by name with an explicit steal affordance — never an automatic steal" — and the
-// only automated coverage it had was negative: WEBUI-1's spec asserts that a *non*-lock
-// refusal raises no dialog. Nothing at any layer drove the `-32003` branch itself, so the
-// holder naming, the decline path and the steal retry rested on a manual checklist.
+// Review 37-WEBC-7, rewritten for §15.66. §17's send contract used to end "…with an
+// explicit steal affordance — never an automatic steal", and the affordance was a
+// `confirm()` per refused line. It is now a standing, visible preference — the checkbox
+// beside the send box, checked by default — and this spec drives both of its positions.
+//
+// What did *not* change, and is asserted here because it is the half that mattered: the
+// first attempt never carries `steal`, the holder is named from the daemon's own answer,
+// and a steal is announced in the terminal rather than performed silently. What did
+// change is that the operator answers once, in advance, instead of per line.
 //
 // The subject is built rather than borrowed. A map's edge into its upstream endpoint is
 // `held` by default (§7.8), and a registered `held` origin denies acquisition to every
@@ -398,7 +402,7 @@ test("the rail carries each console's node status and says why", async ({ page }
 // a console whose `send` is refused with `AppError::Locked` by a holder the daemon can be
 // asked to name. Device-free, and it does not touch the fixture graph the sibling specs
 // assert against.
-test("a LOCKED send names the holder and steals only when the operator says so", async ({
+test("a LOCKED send names the holder and follows the standing steal preference", async ({
   page,
 }) => {
   const stamp = Date.now().toString(36);
@@ -406,9 +410,9 @@ test("a LOCKED send names the holder and steals only when the operator says so",
   const holderNode = addLoneMap(`lk${stamp}h`);
   ctl("connect", endpoint, `${holderNode}/raw`);
   try {
-    // The daemon's own answer to "who holds it", which is what the dialog has to say. Read
-    // from `state` rather than restated, so a spec that passes cannot be one that agrees
-    // with the client's guess.
+    // The daemon's own answer to "who holds it", which is what the console has to say.
+    // Read from `state` rather than restated, so a spec that passes cannot be one that
+    // agrees with the client's guess.
     const holder = (ctl("state").nodes || []).find((n) => n.name === endpoint)?.lock?.holder;
     expect(
       holder,
@@ -417,45 +421,65 @@ test("a LOCKED send names the holder and steals only when the operator says so",
     ).toBeTruthy();
 
     const sentSends = await recordSentFrames(page);
+    // Any dialog at all is now a defect: the whole point of §15.66 is that this flow no
+    // longer interrupts the operator. Recorded rather than merely dismissed, so the
+    // assertion below can name what appeared.
     const dialogs = [];
-    await open(page);
-    await selectConsole(page, endpoint);
-
-    // 1. Refused, and the refusal is *named*. WEBUI-1 was the console inventing a holder;
-    //    the other half of that finding is the console that has one and does not say it.
-    const line = token("locked");
-    page.once("dialog", (d) => {
+    page.on("dialog", (d) => {
       dialogs.push(d.message());
       d.dismiss();
     });
-    await send(page, line);
-    await expect.poll(() => dialogs.length, { timeout: 30_000 }).toBe(1);
-    expect(dialogs[0]).toContain(holder);
-    expect(dialogs[0], "the dialog must offer the steal, not perform it").toMatch(/steal/i);
+    await open(page);
+    await selectConsole(page, endpoint);
 
-    // 2. Declining puts the line back in the box. A refused line was never delivered, so
-    //    binning it costs the operator the typing and the knowledge that it did not land.
-    await expect(page.locator("#sendline")).toHaveValue(line);
+    // 0. The preference is on by default, and it is the markup that says so — not a
+    //    script that runs later, which would leave the first paint unticked.
+    const box = page.locator("#stealbox");
+    await expect(box, "the steal preference must ship checked (§15.66)").toBeChecked();
+    await expect(page.locator("#stealopt")).toContainText("automatically steal");
+
+    // 1. Unticked: refused, named, and the line comes back. WEBUI-1 was the console
+    //    inventing a holder; the other half of that finding is the console that has one
+    //    and does not say it.
+    await box.uncheck();
+    const declined = token("locked");
+    await send(page, declined);
+    await expect(page.locator("#term")).toContainText(holder, { timeout: 30_000 });
+    await expect(page.locator("#term")).toContainText("send refused");
+    await expect(page.locator("#sendline")).toHaveValue(declined);
     expect(
       (await sentSends("send")).filter((m) => m.params.steal),
-      "nothing may be stolen before the operator accepts — §17 forbids the automatic steal",
+      "with the preference off, nothing may be stolen — §17's never-automatic clause is " +
+        "what §15.66 kept",
     ).toEqual([]);
 
-    // 3. Accepting retries — with the steal flag, which is the whole difference between
-    //    the two attempts and therefore the only thing that can explain the second one
-    //    succeeding where the first was refused.
-    page.once("dialog", (d) => {
-      dialogs.push(d.message());
-      d.accept();
-    });
+    // 2. Ticked: the same line goes over the holder, and the console *says* it did. A
+    //    steal displaces another origin's floor (§6), so a silent one is exactly what §5
+    //    forbids — the announcement is the property, not decoration.
+    await box.check();
     await page.locator("#sendbtn").click();
-    await expect.poll(() => dialogs.length, { timeout: 30_000 }).toBe(2);
+    await expect(page.locator("#term")).toContainText(`stealing the write lock from ${holder}`, {
+      timeout: 30_000,
+    });
     await expect(page.locator("#sendline")).toHaveValue("");
     await expect(page.locator("#term")).not.toContainText("steal refused");
+
+    // 3. The retry is what carried the steal — the only difference between the two
+    //    attempts, and therefore the only thing that can explain the second succeeding
+    //    where the first was refused. And the *first* attempt of each pair never did.
     const steals = (await sentSends("send")).filter((m) => m.params.steal);
-    expect(steals.length, "exactly one retry, carrying the steal the operator granted").toBe(1);
-    expect(steals[0].params.line).toBe(line);
+    expect(steals.length, "exactly one send carried the steal").toBe(1);
+    expect(steals[0].params.line).toBe(declined);
     expect(steals[0].params.endpoint).toBe(endpoint);
+    const plain = (await sentSends("send")).filter((m) => !m.params.steal);
+    expect(
+      plain.length,
+      "each attempt opens with a steal-free send: that refusal is what names the holder",
+    ).toBe(2);
+
+    // 4. No modal, in either position. This is the affordance §15.66 removed, and a
+    //    console that grew one back would still pass every assertion above.
+    expect(dialogs, "the steal flow must not open a modal dialog (§15.66)").toEqual([]);
   } finally {
     ctl("remove-node", holderNode, "--cascade");
     ctl("remove-node", endpoint, "--cascade");
@@ -756,3 +780,81 @@ test("an over-cap message closes the browser's own socket, and only that one", a
 // turns a coded close into the badge text, and no spec drives it — the console's own
 // socket never sends anything near a cap and the page does not expose it. The mapping is
 // read, not run.
+
+// §15.65. The rail was rebuilt from scratch on every `state` snapshot — five times a
+// second, unconditionally, on an idle graph — so a click whose `mousedown` landed on a
+// row that was destroyed before `mouseup` produced **no `click` event on that row at
+// all**. The operator pressed a console name and nothing whatsoever happened.
+//
+// Nothing in this suite could see it, and that is structural. `fixture.mjs`'s
+// `selectConsole` uses Playwright's `.click()`, which presses and releases in the same
+// tick and auto-retries on a detached element — forgiving in exactly the two ways a mouse
+// is not. Measured against the unfixed page with a synthetic press of human duration:
+// 0/20 lost at 0 ms of dwell, 9/20 at 60 ms, 10/20 at 100 ms, 16/20 at 150 ms.
+//
+// So this spec presses the way a hand does: `mouse.down`, hold, `mouse.up`. The dwell is
+// deliberately longer than a brisk human click, because the property is "the row is not
+// destroyed under the press" and a longer hold spans more snapshots — at 5 Hz, a 400 ms
+// hold spans two of them and cannot pass by racing.
+test("a rail click with a human's press duration selects the console", async ({ page }) => {
+  await open(page);
+  const names = await page.locator("#consoles li .cname").allTextContents();
+  expect(names.length, "the fixture graph must offer at least two consoles").toBeGreaterThan(1);
+  const [a, b] = names;
+
+  for (const [from, to] of [
+    [a, b],
+    [b, a],
+    [a, b],
+  ]) {
+    await selectConsole(page, from);
+    // One synchronous read in the page: a Playwright locator would re-resolve after a
+    // rebuild, which is the forgiveness under test.
+    const box = await page.evaluate((n) => {
+      for (const li of document.querySelectorAll("#consoles li")) {
+        if (li.querySelector(".cname")?.textContent === n) {
+          const r = li.getBoundingClientRect();
+          return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+        }
+      }
+      return null;
+    }, to);
+    expect(box, `no rail row for ${to}`).not.toBeNull();
+    await page.mouse.move(box.x, box.y);
+    await page.mouse.down();
+    await page.waitForTimeout(400); // two state snapshots at the daemon's 5 Hz
+    await page.mouse.up();
+    await expect(
+      page.locator("#pane-title"),
+      `pressing ${to} for 400 ms did not select it — the row was rebuilt under the press`,
+    ).toHaveText(to, { timeout: 10_000 });
+  }
+});
+
+// The *mechanism* behind the spec above, pinned separately (AGENTS §3: a guard that
+// asserts the decision rather than the mechanism is one a later change silently converts
+// into the thing holding the defect in place). "The click landed" is an outcome that a
+// hundred implementations could produce, including a future one that rebuilds the rail
+// and papers over it with a retry. What must stay true is narrower and checkable: the
+// element itself survives the snapshots.
+test("a rail row survives the daemon's state snapshots rather than being rebuilt", async ({
+  page,
+}) => {
+  await open(page);
+  const first = page.locator("#consoles li").first();
+  await expect(first).toBeVisible();
+  // Stamp the live element, then look for the stamp a second later. A rebuild replaces
+  // the node, and a replaced node cannot carry a property set on its predecessor.
+  await first.evaluate((el) => {
+    el.__snxIdentity = "kept";
+  });
+  // Five snapshots at the daemon's 5 Hz. Long enough that a rebuilding rail cannot
+  // survive by luck.
+  await page.waitForTimeout(1000);
+  const kept = await page.locator("#consoles li").first().evaluate((el) => el.__snxIdentity);
+  expect(
+    kept,
+    "the first rail row is a different element than it was a second ago, so the rail is " +
+      "being rebuilt on every state snapshot — a click held across one is lost (§15.65)",
+  ).toBe("kept");
+});

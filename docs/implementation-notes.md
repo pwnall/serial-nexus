@@ -13080,3 +13080,104 @@ transport. `SNX_RIG_FLOW=required` must stay dropped here, and the two `rts-cts`
 `UNREADABLE handshake: …` printed. DTR remains unwired on this cabling too, so item 28 stays
 blocked for the third consecutive bench. Nothing measured here may be diffed against a `ttyUSB` row:
 chip, driver, device class, node name, cable and adapter pair all moved at once.
+
+### 3.113 The console was not slow; the socket under it was waiting to be thanked
+
+An operator reported the web console as sluggish — "a few seconds" between clicking a console in
+the rail and seeing it, and again between pressing Enter and the device answering — and asked
+whether there were time-based delays anywhere. There were. Not one of them was in the daemon, and
+the first hour of this session was spent establishing that rather than assuming it.
+
+**Measure the far end first.** A Python client on the daemon's own control socket, against a
+`pty --echo` device on the same box: `subscribe` 0.53 ms, `info` 0.29 ms, `state` 0.50 ms,
+`tap.open` 0.25 ms, `send` reply 0.16–0.33 ms, and the echoed line arriving as `tap.data` in
+**0.45–0.75 ms**, six of six. Whatever the operator was feeling, the data plane was not producing
+it. Every later measurement is therefore attributable to the web tier, and that attribution is a
+measurement rather than a deduction.
+
+**Then instrument the thing that is actually slow, from inside it.** A real Chromium under
+Playwright, with the page's own `WebSocket` wrapped by an init script so every frame it sends and
+receives is timestamped in-page. The trace is what named the defect:
+
+```
+505.7  tx   send {"endpoint":"usb0","line":"PROBE0-…","steal":false}
+506.8  rx   {"id":13,"result":{"delivered":true,"sent":14}}      ← +1.1 ms
+548.2  rx   lock  (origins:[{origin:"send"}])                    ← +41.4 ms
+550.2  rx   tap.data  "PROBE0-…"                                 ← the echo, 43.4 ms after the answer
+```
+
+The daemon had produced all four of those in under a millisecond. The 41.4 ms is not a distribution
+with a tail; it is a constant, and the constant is `TCP_DELACK_MIN`. The accepted `TcpStream` never
+had `set_nodelay`, and the bridge's writer flushes one sub-MSS segment per message, so every message
+after the first waited for a browser that was inside `await rpc(…)` and had nothing to piggyback an
+acknowledgement on. §15.63 has the numbers on both sides; the repair is one line at the accept, plus
+its mirror in `wsclient.rs`, and it moved that echo gap to **0.4 ms**.
+
+**The reason it survived this long is worth more than the fix.** "Nagle cannot bite on loopback" is
+a true sentence about a *fresh* connection — a twelve-frame burst there coalesces into one segment
+delivered in 0.18 ms — and false about every connection a console has actually used, because one
+round trip takes the socket out of quickack and arms the delayed-ACK timer. The first draft of the
+guard therefore passed on the unfixed tree, and I only know that because I *checked*: with the
+warm-up round trip commented out, the broken binary reports `test result: ok`. That is AGENTS §3's
+"its passing output is identical to its not-running output" arriving in a new register — not a gate
+whose subject never ran, but a gate whose subject was in the wrong *state* — and the warm-up now
+carries a comment saying so, because it is exactly the line a later simplification would delete as
+redundant.
+
+**Refuted, and recorded as such** (AGENTS §9). A fan-out over the whole latency surface produced
+eighteen candidates; sixteen were killed by adversarial verifiers that had the claim and the tree
+and not the diagnosis. Among the dead: `DEFAULT_SEND_TIMEOUT_MS = 2000` (real constant, unreachable
+here — an uncontended `send` never waits on it); the boundary backoff saturating at `IDLE_POLL`
+(5 ms, and not on a serial node's path at all); `RECONCILE_INTERVAL = 3 s` in the pty node (an
+elapsed-time *gate* inside a loop, never an await); the leg's 1 s idle lock release (no leg in the
+graph); and `SNAPSHOT_INTERVAL = 200 ms` (a notification cadence, not a reply path). Every one of
+them is the shape a `grep` for `from_secs` finds first, and none of them was the answer. The answer
+had no constant in this repository at all — it was a kernel default we had never turned off.
+
+### 3.114 Nothing was slow: half the clicks were not arriving
+
+The operator's first sentence was "it takes a few seconds to show a serial console after clicking
+its name", and every instrument I pointed at it said the selection path was fast: 60 ms end to end
+through Playwright, 15–20 ms from press to `#pane-title` measured in the page. Both readings were
+correct and neither answered the report, because the question they answer is *how long does a click
+take* and the operator's problem was *whether it happens at all*.
+
+**The rail was destroyed and rebuilt five times a second.** `renderConsoles` opened with
+`consolesEl.innerHTML = ""` and re-attached a fresh `onclick` to every new row, and it runs on every
+`state` notification — which the daemon publishes every 200 ms whether or not anything changed
+(`emit_state_snapshot` returns early only when nobody is subscribed, and the bridge subscribes at
+connect). A pointer press spans `mousedown` and `mouseup`. Destroy the element in between and there
+is no row left for the `click` to be dispatched to.
+
+Measured on the shipped page, pressing with `page.mouse.down()` / hold / `page.mouse.up()` rather
+than `.click()`, 20 trials per dwell:
+
+```
+  dwell   0 ms:  lost  0/20        dwell 100 ms:  lost 10/20  (50%)
+  dwell  30 ms:  lost  1/20         dwell 150 ms:  lost 16/20  (80%)
+  dwell  60 ms:  lost  9/20 (45%)
+```
+
+After keying the rows and patching them in place: **0/20 at every dwell, and 0/40 at each of
+60/150/300/500 ms**. The median latency of a landed click did not move (9–22 ms throughout), which
+is the tell that this was never a latency defect at all.
+
+**Why I did not find it and a fan-out did.** I had measured the daemon (fast), the transport (41 ms
+of Nagle, real, §15.63), the render path (saturates only above ~100 KiB/s, which an ordinary
+115200-baud console never reaches — 2 frames/s at 12.8 KiB/s, 0 % of the main thread), and the OPFS
+layer (idle). Every one of those measurements was taken **through Playwright**, whose `.click()`
+presses and releases in the same tick and retries on a detached element. My instrument had the
+defect's blind spot built into it, and I would have kept measuring latency on a path whose real
+failure was a dropped event. The finding came from a reader that started from the code rather than
+from the clock, and it was then confirmed here against the live page before anything was changed.
+
+**The general shape, worth more than the instance.** AGENTS §3 collects tells for gates that assert
+nothing: `jq` without `-e`, a step that never ran, a grep whose subject was captured, a guard
+pinning a decision rather than a mechanism, an assertion weaker than its comment. This is a sixth:
+**a gate whose stimulus is gentler than the product's.** `fixture.mjs`'s `selectConsole` was
+forgiving in exactly the two ways a mouse is not — no dwell, and auto-retry on detachment — so the
+suite could not have caught this no matter how many specs it grew. The remedy is the same as ever:
+drive the property the way the product is actually driven, and plant the defect to watch it redden.
+The new guards press for 400 ms (two snapshots at 5 Hz) and, separately, stamp the row's DOM element
+and read the stamp a second later — the second one because "the click landed" is an outcome a future
+rebuild-plus-retry could reproduce while putting the defect straight back.

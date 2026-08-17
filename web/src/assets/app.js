@@ -62,6 +62,11 @@ const clearBtn = document.getElementById("clearbtn");
 const sendForm = document.getElementById("sendform");
 const sendLine = document.getElementById("sendline");
 const sendBtn = document.getElementById("sendbtn");
+/// The standing steal preference (§15.66), replacing the per-line `confirm()`. Its
+/// default lives in `index.html` as the `checked` attribute rather than being assigned
+/// here, so it holds from the first paint instead of from whenever this module finishes
+/// loading — and so a reader of the markup can see what the console does by default.
+const stealBox = document.getElementById("stealbox");
 const graphViewEl = document.getElementById("graphview");
 const editorViewEl = document.getElementById("editorview");
 const viewBtns = Array.from(document.querySelectorAll(".viewbtn"));
@@ -368,6 +373,116 @@ function endpointsFromState(st) {
   return out;
 }
 
+// ---- the left rail, reconciled rather than rebuilt (§15.65) -------------------------
+//
+// This function used to open with `consolesEl.innerHTML = ""` and rebuild every row,
+// re-attaching a fresh `li.onclick` to each. It is driven by `state`, and the daemon
+// publishes a state snapshot **every 200 ms, unconditionally, whether or not anything
+// changed** (§10) — so on a completely idle graph the rail was destroyed and rebuilt five
+// times a second, forever.
+//
+// The cost was not the DOM work. It was that a click whose `mousedown` landed on a row
+// that was destroyed before `mouseup` produces **no `click` event on that row at all**:
+// the browser dispatches to the nearest common ancestor of the two targets, and with the
+// pressed element detached there is no handler to reach. The operator pressed the console
+// name, nothing whatsoever happened, and they pressed again — which is what "it takes a
+// few seconds to show a console after clicking it" actually was. Measured against this
+// page with a synthetic press of a human's duration: 0/20 lost at 0 ms of dwell, **9/20
+// at 60 ms, 10/20 at 100 ms, 16/20 at 150 ms**. The median latency of a click that *did*
+// land was 9–18 ms, so nothing here was ever slow; roughly half of the operator's clicks
+// simply never arrived.
+//
+// **Nothing in the tree could see it**, and that is structural rather than unlucky:
+// `ui-tests/tests/fixture.mjs` selects with Playwright's `.click()`, which presses and
+// releases in the same tick (0 ms dwell — measured lossless) *and* auto-retries when an
+// element goes detached. The gate was forgiving in exactly the two ways a mouse is not.
+//
+// So rows are now **keyed by display address and patched in place**: an `<li>` for a
+// console that still exists is the same `<li>` it was a tick ago, and only the fields
+// that actually changed are written. A row is created when a console appears and removed
+// when it leaves; nothing else is touched. `endpointsFromState` still runs per tick — it
+// walks a handful of nodes and allocates a small array, which is not what this was about.
+const railRows = new Map(); // display -> { li, dot, name, lock, waiters }
+
+// One delegated listener, registered once, instead of a handler per row.
+//
+// Belt and braces rather than the fix: with rows reconciled the `<li>` survives, so a
+// per-row handler would work too. But a listener on the container cannot be detached by
+// any future rebuild of its children, which is precisely the failure mode above — and it
+// is one listener instead of one per console. `closest` walks up from whatever the click
+// landed on (the glyph, the name, a badge).
+consolesEl.addEventListener("click", (ev) => {
+  const li = ev.target instanceof Element ? ev.target.closest("li[data-display]") : null;
+  if (li && consolesEl.contains(li)) selectConsole(li.dataset.display);
+});
+
+/// Set `prop` on `node` only when it differs. Assigning `textContent` replaces the child
+/// text node whether or not the string changed, and assigning `className` invalidates
+/// style whether or not the class list changed; on a surface repainted five times a
+/// second that is the difference between a stable DOM and a churning one.
+function setIfChanged(node, prop, value) {
+  if (node[prop] !== value) node[prop] = value;
+}
+
+/// Build the fixed skeleton of one rail row. The badges are created lazily by
+/// [`patchRow`], because most consoles have neither.
+function newRow(display) {
+  const li = document.createElement("li");
+  li.dataset.display = display;
+  const dot = document.createElement("span");
+  li.appendChild(dot);
+  const name = document.createElement("span");
+  name.className = "cname";
+  name.textContent = display;
+  li.appendChild(name);
+  return { li, dot, name, lock: null, waiters: null };
+}
+
+/// Update one row to match `ep`, touching only what moved.
+function patchRow(row, ep, isSelected) {
+  setIfChanged(row.li, "className", isSelected ? "console selected" : "console");
+  // §17's rail is "display address, node status, lock holder and waiter count", and
+  // the status was the one it never rendered (DEVR-2) — so on a lost device every
+  // field the rail showed was byte-identical to before and its only live signal was
+  // nothing at all. Same glyphs and classes as the graph page, so the two views read
+  // alike; `reason` rides along as the tooltip, which is where "device … lost" becomes
+  // visible without leaving the console.
+  const status = (ep.node && ep.node.status) || "unknown";
+  setIfChanged(row.dot, "className", `gstatus ${status}`);
+  setIfChanged(row.dot, "textContent", STATUS_GLYPH[status] || "?");
+  setIfChanged(row.dot, "title", (ep.node && ep.node.reason) || status);
+
+  const holder = ep.lock && ep.lock.holder ? `🔒 ${ep.lock.holder}` : null;
+  if (holder === null) {
+    if (row.lock) {
+      row.lock.remove();
+      row.lock = null;
+    }
+  } else {
+    if (!row.lock) {
+      row.lock = document.createElement("span");
+      row.lock.className = "lockbadge";
+      row.li.appendChild(row.lock);
+    }
+    setIfChanged(row.lock, "textContent", holder);
+  }
+
+  const waiters = ep.lock && ep.lock.waiters ? ep.lock.waiters.length : 0;
+  if (waiters === 0) {
+    if (row.waiters) {
+      row.waiters.remove();
+      row.waiters = null;
+    }
+  } else {
+    if (!row.waiters) {
+      row.waiters = document.createElement("span");
+      row.waiters.className = "waiters";
+      row.li.appendChild(row.waiters);
+    }
+    setIfChanged(row.waiters, "textContent", `+${waiters}`);
+  }
+}
+
 function renderConsoles() {
   const eps = endpointsFromState(lastState);
   // The selected endpoint can leave the graph under the operator's feet — `remove-node`,
@@ -376,41 +491,33 @@ function renderConsoles() {
   // reported it as a lock conflict with a steal offer for a lock that did not exist
   // (WEBUI-1). Drop the selection; `tap.closed` has already said why in the pane.
   if (selected !== null && !eps.some((e) => e.display === selected)) selected = null;
-  consolesEl.innerHTML = "";
+
+  // Walk the desired list against the live children, moving a row only when it is out of
+  // order. A rail whose contents did not change performs zero DOM mutations.
+  let cursor = consolesEl.firstChild;
+  const live = new Set();
   for (const ep of eps) {
-    const li = document.createElement("li");
-    li.className = ep.display === selected ? "console selected" : "console";
-    // §17's rail is "display address, node status, lock holder and waiter count", and
-    // the status was the one it never rendered (DEVR-2) — so on a lost device every
-    // field the rail showed was byte-identical to before and its only live signal was
-    // nothing at all. Same glyphs and classes as the graph page, so the two views read
-    // alike; `reason` rides along as the tooltip, which is where "device … lost" becomes
-    // visible without leaving the console.
-    const status = (ep.node && ep.node.status) || "unknown";
-    const dot = document.createElement("span");
-    dot.className = `gstatus ${status}`;
-    dot.textContent = STATUS_GLYPH[status] || "?";
-    dot.title = (ep.node && ep.node.reason) || status;
-    li.appendChild(dot);
-    const name = document.createElement("span");
-    name.className = "cname";
-    name.textContent = ep.display;
-    li.appendChild(name);
-    if (ep.lock && ep.lock.holder) {
-      const badge = document.createElement("span");
-      badge.className = "lockbadge";
-      badge.textContent = `🔒 ${ep.lock.holder}`;
-      li.appendChild(badge);
+    live.add(ep.display);
+    let row = railRows.get(ep.display);
+    if (!row) {
+      row = newRow(ep.display);
+      railRows.set(ep.display, row);
     }
-    const waiters = ep.lock && ep.lock.waiters ? ep.lock.waiters.length : 0;
-    if (waiters > 0) {
-      const w = document.createElement("span");
-      w.className = "waiters";
-      w.textContent = `+${waiters}`;
-      li.appendChild(w);
+    patchRow(row, ep, ep.display === selected);
+    if (row.li === cursor) {
+      cursor = cursor.nextSibling;
+    } else {
+      consolesEl.insertBefore(row.li, cursor);
     }
-    li.onclick = () => selectConsole(ep.display);
-    consolesEl.appendChild(li);
+  }
+  // Whatever is left past the cursor is a console that has gone.
+  while (cursor) {
+    const next = cursor.nextSibling;
+    cursor.remove();
+    cursor = next;
+  }
+  for (const display of railRows.keys()) {
+    if (!live.has(display)) railRows.delete(display);
   }
   updateHead();
 }
@@ -1094,18 +1201,41 @@ function holderOf(display, err) {
   return (ep && ep.lock && ep.lock.holder) || null;
 }
 
-// §17: "a LOCKED refusal shows the holder by name with an explicit steal affordance —
-// never an automatic steal." Every *other* refusal is a different failure and gets the
-// daemon's own words, the stance editor.mjs already takes: a structural refusal names
-// the rule it broke, and paraphrasing it into "locked by someone" cost the operator the
-// only precise thing they had. This goes through `rpcFull`, which exists for exactly
-// that and had only one caller (WEBUI-1).
+// §17 clause 3, as amended by §15.66: "a LOCKED refusal shows the holder by name, and
+// whether the line is then sent over that holder follows a **standing, visible operator
+// preference** — never an automatic steal the operator did not set."
+//
+// The affordance used to be a `confirm()` per refused line, and the modal was the wrong
+// shape for the question in two ways. It asked at the worst moment — a lock conflict is
+// discovered *after* the operator has typed and pressed Enter, so the dialog lands on top
+// of the console and has to be dismissed before anything can be read — and it asked the
+// same question every time, of an operator whose answer is a property of how they work
+// rather than of this particular line. Worse, `confirm()` blocks the renderer, which this
+// client has had to design around twice already (37-WEBC-1, HISTC-2): the OPFS clear race
+// exists precisely because a dialog can park a continuation for as long as a human takes
+// to read it.
+//
+// So the answer moves to a checkbox beside the send box, **checked by default**. What is
+// preserved from §17's original clause is the part that mattered: the steal is never
+// silent — it is announced in the terminal, naming the holder that was displaced — and it
+// never happens on a refusal that is not a lock conflict. What is given up is the
+// per-line confirmation, deliberately and with the reasons above recorded at §15.66.
+//
+// Every *other* refusal is a different failure and gets the daemon's own words, the
+// stance editor.mjs already takes: a structural refusal names the rule it broke, and
+// paraphrasing it into "locked by someone" cost the operator the only precise thing they
+// had. This goes through `rpcFull`, which exists for exactly that (WEBUI-1).
 sendForm.onsubmit = async (e) => {
   e.preventDefault();
   if (!selected) return;
   const endpoint = selected;
   const line = sendLine.value;
   sendLine.value = "";
+  // The first attempt never steals, whatever the preference says. The refusal is what
+  // carries the holder's name (`data.held_by`), and an operator who has left the box
+  // ticked is still owed the sentence saying whose lock was taken — which is only
+  // obtainable by being refused once. It costs one round trip on a contended endpoint
+  // and nothing at all on an uncontended one, which is every ordinary send.
   const msg = await rpcFull("send", { endpoint, line, steal: false });
   if (msg && !msg.error) return;
   const err = (msg && msg.error) || { code: 0, message: "no reply from the daemon" };
@@ -1118,10 +1248,27 @@ sendForm.onsubmit = async (e) => {
     return;
   }
   const holder = holderOf(endpoint, err);
-  const ask = holder
-    ? `${endpoint} is locked by ${holder}. Steal the lock and send?`
-    : `${err.message}\n\nSteal the lock and send?`;
-  if (!confirm(ask)) return;
+  if (!stealBox.checked) {
+    // Declined by the standing preference. Say who holds it — that is the whole of what
+    // the dialog used to contribute — and leave the line in the box.
+    appendMarker(
+      holder
+        ? `\n— send refused: ${endpoint} is locked by ${holder}; tick "automatically ` +
+            `steal during line write" to send over it —\n`
+        : `\n— send refused: ${err.message} —\n`,
+    );
+    return;
+  }
+  // Announced before the retry, not after: a steal displaces another origin's floor
+  // (§6), and §5's honesty says the operator sees that happen rather than inferring it
+  // from a line that went through. Named where it is nameable; a LOCKED refusal with no
+  // holder is a real outcome (a send that timed out behind a queue) and inventing a name
+  // for it is WEBUI-1.
+  appendMarker(
+    holder
+      ? `\n— stealing the write lock from ${holder} —\n`
+      : "\n— stealing the write lock —\n",
+  );
   const retry = await rpcFull("send", { endpoint, line, steal: true });
   if (retry && retry.error) {
     // The old code inspected nothing here, so an operator who accepted the steal saw

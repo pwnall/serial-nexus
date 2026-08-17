@@ -136,7 +136,21 @@ body {
 .a-bg14 { background: #7fd4de; }
 .a-bg15 { background: #ffffff; }
 
-#sendform { display: flex; padding: 8px; gap: 8px; border-top: 1px solid #34383f; }
+#sendform { display: flex; align-items: center; padding: 8px; gap: 8px; border-top: 1px solid #34383f; }
+/* The steal preference (§15.66). It sits beside the box it governs, because what it
+   changes is what happens to the line in that box; the whole label is the hit target,
+   which is what `<label>` wrapping the input buys. */
+#stealopt {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: #9aa3af;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+#stealopt input { cursor: pointer; margin: 0; }
 #sendline {
   flex: 1;
   padding: 8px 10px;

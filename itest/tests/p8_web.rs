@@ -142,6 +142,52 @@ fn http_status(port: u16, method: &str, target: &str, host: &str, headers: &[(&s
         .unwrap_or_else(|| panic!("no HTTP status for {method} {target} (Host: {host})"))
 }
 
+/// One raw HTTP/1.1 exchange, returning `(status, head, body_len)`.
+///
+/// [`try_http_status`] reads the status line and stops, which cannot answer the question
+/// §15.64 asks: a 304 and a 200 differ in the *headers* and in whether a body followed.
+/// The server answers `Connection: close`, so reading to EOF is the whole response and
+/// needs no `Content-Length` to be believed — which matters here, because a 304 must not
+/// carry one.
+fn http_exchange(
+    port: u16,
+    target: &str,
+    headers: &[(&str, &str)],
+) -> Option<(u16, String, usize)> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set read timeout");
+    let mut req = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes()).ok()?;
+    stream.flush().ok()?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).ok()?;
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("a complete response head");
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())?;
+    Some((status, head, raw.len() - (split + 4)))
+}
+
+/// The value of one header from a response head, lowercase-matched on the name.
+fn head_value(head: &str, name: &str) -> Option<String> {
+    head.lines().skip(1).find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        (k.trim().eq_ignore_ascii_case(name)).then(|| v.trim().to_string())
+    })
+}
+
 /// The `Cookie` header carrying a valid session token.
 fn cookie_header() -> String {
     format!("nexus_session={TOKEN}")
@@ -356,22 +402,48 @@ impl Ws {
 
     /// Send one text frame, masked as RFC 6455 requires of a client.
     fn send_text(&mut self, text: &str) {
-        let payload = text.as_bytes();
-        let mut frame = vec![0x81u8]; // FIN + opcode 1 (text)
-        let mask = [0x37u8, 0xfa, 0x21, 0x3d];
-        if payload.len() < 126 {
-            frame.push(0x80 | payload.len() as u8);
-        } else {
-            assert!(payload.len() <= u16::MAX as usize, "test frame too large");
-            frame.push(0x80 | 126);
-            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        }
-        frame.extend_from_slice(&mask);
-        for (i, b) in payload.iter().enumerate() {
-            frame.push(b ^ mask[i % 4]);
-        }
+        let frame = client_text_frame(text);
         self.stream.write_all(&frame).expect("write WS frame");
         self.stream.flush().expect("flush WS frame");
+    }
+
+    /// Send several text frames in **one** `write(2)`.
+    ///
+    /// The single write is the point, not an optimisation (§15.63's guard). Writing
+    /// them one at a time would put this client's *own* Nagle in the picture: its
+    /// second frame would be held until the server acknowledged the first, the server's
+    /// replies would be spaced by that instead of arriving back to back, and each reply
+    /// would then leave with nothing unacknowledged ahead of it — which is precisely the
+    /// shape in which the defect under test is invisible. One write puts every request
+    /// on the wire at once, so the server produces its answers back to back and the
+    /// second answer is the one Nagle can hold.
+    fn send_text_burst(&mut self, texts: &[String]) {
+        let mut wire = Vec::new();
+        for t in texts {
+            wire.extend_from_slice(&client_text_frame(t));
+        }
+        self.stream.write_all(&wire).expect("write WS burst");
+        self.stream.flush().expect("flush WS burst");
+    }
+
+    /// Read until every id in `ids` has answered, recording *when* each answer arrived.
+    /// Notifications (the daemon's 5 Hz `state`, `lock`) are skipped — they share the
+    /// socket but are nobody's reply. `None` if the deadline passes first.
+    fn reply_arrivals(&mut self, ids: &[i64], deadline: Instant) -> Option<Vec<(i64, Instant)>> {
+        let mut out: Vec<(i64, Instant)> = Vec::new();
+        while out.len() < ids.len() {
+            let msg = self.recv_message(deadline)?;
+            let Ok(v) = serde_json::from_slice::<Value>(&msg) else {
+                continue;
+            };
+            let Some(id) = v.get("id").and_then(Value::as_i64) else {
+                continue;
+            };
+            if ids.contains(&id) && !out.iter().any(|(seen, _)| *seen == id) {
+                out.push((id, Instant::now()));
+            }
+        }
+        Some(out)
     }
 
     /// The next complete server message's payload (continuation frames reassembled,
@@ -477,6 +549,26 @@ impl Ws {
 //
 // Each guard therefore expires a deadline at a different point inside one frame and
 // asserts the very next `recv_message` still yields that frame, whole and correct.
+
+/// Encode one **masked** FIN text frame, as RFC 6455 requires of a client. Split out of
+/// [`Ws::send_text`] so [`Ws::send_text_burst`] can lay several of them into one write.
+fn client_text_frame(text: &str) -> Vec<u8> {
+    let payload = text.as_bytes();
+    let mut frame = vec![0x81u8]; // FIN + opcode 1 (text)
+    let mask = [0x37u8, 0xfa, 0x21, 0x3d];
+    if payload.len() < 126 {
+        frame.push(0x80 | payload.len() as u8);
+    } else {
+        assert!(payload.len() <= u16::MAX as usize, "test frame too large");
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    frame.extend_from_slice(&mask);
+    for (i, b) in payload.iter().enumerate() {
+        frame.push(b ^ mask[i % 4]);
+    }
+    frame
+}
 
 /// Encode one unmasked FIN text frame, exactly as a server sends it (RFC 6455 §5.1:
 /// server frames carry no mask).
@@ -810,6 +902,229 @@ path = "{console}"
         node_names(&rpc.state()),
         daemon_names,
         "a refused load must not have reached the daemon"
+    );
+}
+
+// ---- (4b) §15.64: the console stops re-shipping itself on every load --------------
+
+/// **A browser that already holds the console is not sent it again** (§15.64).
+///
+/// Nine files and 117 KB reached the browser on every navigation, because `write_asset`
+/// hard-coded `Cache-Control: no-store` and no conditional-request path existed anywhere
+/// in the tree. And a navigation is not a rare event here: there is no auto-reconnect, so
+/// every dropped socket and every daemon restart routes the operator through a full
+/// reload — which `scripts/bless` makes routine.
+///
+/// The assertions are on the **mechanism**, not on the decision (AGENTS §3): that the
+/// 200 carries a validator and does not forbid storage, that presenting that validator
+/// yields a bodiless 304, and that a *wrong* validator still yields the bytes. The last
+/// one is what separates "revalidation works" from "the server 304s whatever it is
+/// asked", which is a far worse defect than the one being fixed and would otherwise
+/// share a passing test with it.
+#[test]
+fn a_browser_holding_the_console_revalidates_instead_of_refetching_it() {
+    let d = Daemon::start();
+    let server = WebServer::spawn("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
+    let port = server
+        .port_for("http", Duration::from_secs(10))
+        .expect("web server never printed its bound http URL");
+    let cookie = cookie_header();
+
+    for path in ["/", "/app.js", "/app.css", "/ansi.mjs"] {
+        let (status, head, len) = http_exchange(port, path, &[("Cookie", &cookie)])
+            .unwrap_or_else(|| panic!("no response for {path}"));
+        assert_eq!(status, 200, "{path} should be served: {head}");
+        assert!(len > 0, "{path} answered 200 with no body");
+
+        // The mechanism, half one: a validator exists, and storage is not forbidden.
+        // `no-store` would make every assertion below unreachable *in a browser* while
+        // leaving them all green here, which is exactly the register AGENTS §3 warns
+        // about — a gate that agrees with a page nobody can cache.
+        let etag =
+            head_value(&head, "etag").unwrap_or_else(|| panic!("{path} carries no ETag: {head}"));
+        assert!(
+            etag.starts_with('"') && etag.ends_with('"') && etag.len() > 2,
+            "{path}'s ETag must be a quoted strong validator, got {etag:?}"
+        );
+        let cache = head_value(&head, "cache-control").unwrap_or_default();
+        assert!(
+            !cache.contains("no-store"),
+            "{path} still forbids storing the body ({cache:?}), so no browser can ever \
+             present the ETag this response carries"
+        );
+
+        // The mechanism, half two: presenting it is answered with a bodiless 304 — and
+        // with no `Content-Length`, which RFC 9110 §15.4.5 forbids on a 304.
+        let (status, head304, len304) =
+            http_exchange(port, path, &[("Cookie", &cookie), ("If-None-Match", &etag)])
+                .unwrap_or_else(|| panic!("no conditional response for {path}"));
+        assert_eq!(status, 304, "{path} with a matching ETag: {head304}");
+        assert_eq!(len304, 0, "a 304 for {path} must carry no body");
+        assert!(
+            head_value(&head304, "content-length").is_none(),
+            "a 304 for {path} must not claim a Content-Length: {head304}"
+        );
+        assert_eq!(
+            head_value(&head304, "etag").as_deref(),
+            Some(etag.as_str()),
+            "the 304 must repeat the validator it matched: {head304}"
+        );
+        // A 304 refreshes the stored response's headers, so dropping the CSP here would
+        // let a cached page run without the policy the 200 that filled the cache carried.
+        assert!(
+            head_value(&head304, "content-security-policy").is_some(),
+            "a 304 for {path} must carry the CSP it is refreshing: {head304}"
+        );
+
+        // The anti-tautology half: a validator that does *not* match must be answered
+        // with the bytes. Without this, a server that 304s unconditionally passes
+        // everything above and serves an empty console.
+        let (status, _, len_stale) = http_exchange(
+            port,
+            path,
+            &[
+                ("Cookie", &cookie),
+                ("If-None-Match", "\"0000000000000000\""),
+            ],
+        )
+        .unwrap_or_else(|| panic!("no stale-validator response for {path}"));
+        assert_eq!(status, 200, "{path} with a stale ETag must be re-sent");
+        assert_eq!(len_stale, len, "{path} re-sent a different body");
+    }
+
+    // Two different assets must not share a validator, or a browser holding one would be
+    // told it already has the other. The hash is over the body, so this is a property of
+    // the construction rather than of a list someone maintains.
+    let mut tags = Vec::new();
+    for path in ["/", "/app.js", "/app.css", "/history.mjs", "/ansi.mjs"] {
+        let (_, head, _) = http_exchange(port, path, &[("Cookie", &cookie)]).expect("served");
+        tags.push(head_value(&head, "etag").expect("an ETag"));
+    }
+    let mut sorted = tags.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        tags.len(),
+        "two assets share an ETag, so a browser holding one would be told it has the \
+         other: {tags:?}"
+    );
+}
+
+// ---- (6b) §15.63: the bridge answers at write rate, not at the peer's ACK rate ----
+
+/// How many answers a burst asks for. Two would do — the defect is "frame N+1 waits for
+/// frame N's acknowledgement" — but a handful makes the *shape* of a failure legible in
+/// the assertion message: with Nagle on, one answer leaves immediately and the rest
+/// arrive together, one delayed-ACK later.
+const NODELAY_BURST: usize = 6;
+
+/// The ceiling on how long the whole burst may take to arrive, measured from the first
+/// answer to the last.
+///
+/// The two populations this separates are three orders of magnitude apart and neither is
+/// a guess: with Nagle on the tail lands at 40–42 ms (`TCP_DELACK_MIN` on Linux, hit dead
+/// on, 18 of 18); with `TCP_NODELAY` set it lands at 0.13 ms. 15 ms is well under the
+/// defect's floor and well over the fixed path's ceiling, which is what keeps this from
+/// becoming a timing test that has to be tuned.
+const NODELAY_CEILING: Duration = Duration::from_millis(15);
+
+/// Best of this many bursts. The defect is deterministic — every burst pays the same
+/// delayed-ACK wait, so taking the minimum still reddens on an unfixed tree — while a
+/// *green* tree only needs one burst to land under the ceiling, which is what makes this
+/// robust under the suite's own parallelism (plan §3).
+const NODELAY_ATTEMPTS: usize = 3;
+
+/// **The console's answers must be clocked by the server's writes, not by the browser's
+/// acknowledgements** (§15.63).
+///
+/// The bridge writes and flushes every browser-bound message individually, so each is
+/// its own sub-MSS segment. Without `TCP_NODELAY` the kernel holds the second one until
+/// the first is acknowledged — and a browser awaiting an RPC answer sends nothing to
+/// piggyback that acknowledgement on, so the wait is its delayed-ACK timer. Measured
+/// through a real Chromium before the fix: a `send` was answered `delivered: true` in
+/// 1.1 ms and the device's echo, which the daemon had already produced, reached the page
+/// 43.4 ms later. After: 0.4 ms.
+///
+/// **The prior round trip below is load-bearing and must not be "simplified" away.** A
+/// freshly accepted connection is still in quickack mode, where the effect does not
+/// appear at all; one request/response exchange puts the socket into pingpong mode and
+/// arms the delayed-ACK timer. A version of this guard without it passes on both trees —
+/// §3's "its passing output is identical to its not-running output" tell, in its purest
+/// form.
+///
+/// Proved fail-first by reverting the `set_nodelay` line in `web/src/server.rs` in place
+/// (AGENTS §8): the burst tail moves to ~41 ms and this reddens.
+#[test]
+fn the_bridge_does_not_wait_for_the_browsers_acknowledgement_between_answers() {
+    let d = Daemon::start();
+    let rpc = d.rpc();
+    // Device-free: the property is transport timing, and it wants a daemon that answers,
+    // not a graph. A pty console keeps the fixture identical to (6a)'s.
+    let console = d.run().join("console");
+    let cfg = format!(
+        r#"
+[[node]]
+type = "pty"
+name = "console"
+path = "{console}"
+"#,
+        console = console.display(),
+    );
+    rpc.load_toml(&cfg, false).expect("load pty config");
+
+    let server = WebServer::spawn("127.0.0.1:0", TOKEN, &d.socket(), d.run().path(), &[]);
+    let port = server
+        .port_for("http", Duration::from_secs(10))
+        .expect("web server never printed its bound http URL");
+
+    let mut ws = Ws::connect(port, "127.0.0.1", Some(&cookie_header()), None)
+        .expect("the WS upgrade should succeed with the session cookie");
+
+    let mut best: Option<Duration> = None;
+    let mut readings = Vec::new();
+    for attempt in 0..NODELAY_ATTEMPTS {
+        // (1) One round trip *first*. This is what moves the socket out of quickack and
+        //     into pingpong mode; without it the delayed-ACK timer never arms and the
+        //     burst below cannot show the defect on either tree.
+        let warm = 1000 + attempt as i64 * 100;
+        ws.send_text(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{warm},\"method\":\"info\"}}"
+        ));
+        assert!(
+            ws.reply_arrivals(&[warm], Instant::now() + Duration::from_secs(10))
+                .is_some(),
+            "the bridge did not answer the warm-up `info` (attempt {attempt})"
+        );
+
+        // (2) The burst: every request on the wire in one write, so the server produces
+        //     its answers back to back. `info` because its answer is a couple of hundred
+        //     bytes — comfortably sub-MSS, which is the regime Nagle governs.
+        let ids: Vec<i64> = (0..NODELAY_BURST).map(|i| warm + 1 + i as i64).collect();
+        let reqs: Vec<String> = ids
+            .iter()
+            .map(|id| format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"info\"}}"))
+            .collect();
+        ws.send_text_burst(&reqs);
+
+        let arrivals = ws
+            .reply_arrivals(&ids, Instant::now() + Duration::from_secs(20))
+            .unwrap_or_else(|| panic!("the bridge answered fewer than {NODELAY_BURST} requests"));
+        let first = arrivals.iter().map(|(_, t)| *t).min().expect("nonempty");
+        let last = arrivals.iter().map(|(_, t)| *t).max().expect("nonempty");
+        let spread = last.duration_since(first);
+        readings.push(spread);
+        best = Some(best.map_or(spread, |b: Duration| b.min(spread)));
+    }
+
+    let best = best.expect("at least one attempt ran");
+    assert!(
+        best < NODELAY_CEILING,
+        "the bridge's answers are ACK-clocked, not write-clocked: the best of \
+         {NODELAY_ATTEMPTS} bursts of {NODELAY_BURST} took {best:?} from first answer to \
+         last, against a {NODELAY_CEILING:?} ceiling (all readings: {readings:?}). \
+         A tail landing near 40 ms is Linux's TCP_DELACK_MIN and means the accepted \
+         socket lost its `set_nodelay(true)` — see web/src/server.rs and §15.63."
     );
 }
 

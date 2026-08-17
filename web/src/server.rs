@@ -291,6 +291,28 @@ pub async fn run(
                 continue;
             }
         };
+        // **Nagle off, before either tier can wrap this socket** (§15.63). Every
+        // browser-bound message is written *and flushed individually* by the bridge's
+        // writer task (`bridge.rs`: one `ws_sink.send().await` per message, and
+        // tungstenite's `Sink::poll_flush` turns that into one `write(2)`), so every
+        // frame is its own sub-MSS segment. With Nagle on, frame N+1 is held in the
+        // send queue until the browser acknowledges frame N — and a browser that has
+        // just issued an RPC and is awaiting its answer sends nothing to piggyback that
+        // ACK on, so the wait is the peer's *delayed-ACK* timer. Measured on this kernel
+        // over loopback, after a single prior round trip has put the socket into
+        // pingpong mode: **41 ms**, 18 of 18, which is `TCP_DELACK_MIN` dead on. That is
+        // one fixed 41 ms tax on every console interaction whose answer is more than one
+        // frame — a `tap.open` and its replay, a `send` and the device's echo — and a
+        // firehose is worse still: twelve frames written 2 ms apart arrived in a single
+        // lump at 42 ms, so the stream was ACK-clocked rather than write-clocked.
+        //
+        // Set here rather than in either tier: line 315's `acc.accept(stream)` moves the
+        // same `TcpStream` into the TLS acceptor, so this is the one place both the `ws`
+        // and `wss` tiers share. `let _ =` matches the precedent in
+        // `daemon/src/nodes/leg.rs` — a socket that refuses the option is still a
+        // perfectly serviceable socket, and dropping a healthy connection over a
+        // latency hint would be the worse trade.
+        let _ = stream.set_nodelay(true);
         // The single pre-authentication deadline, taken here so it covers everything
         // this connection may do before it shows a credential (review 37-WEBS-5): the
         // TLS handshake and the request head are two phases of one budget, not two
@@ -592,6 +614,19 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     if req.method == "GET"
         && let Some(asset) = crate::assets::lookup(&req.path)
     {
+        // §15.64: a browser that already holds this exact body says so, and is told to
+        // keep it rather than being sent 53 KB of JavaScript it has. `If-None-Match` is
+        // a comma-separated list and `*` matches anything cached, both per RFC 9110
+        // §13.1.2 — and the value carries its own quotes, so this is a byte comparison
+        // and not a parse.
+        let known = req.header("if-none-match").is_some_and(|v| {
+            v.split(',')
+                .map(str::trim)
+                .any(|t| t == asset.etag || t == "*")
+        });
+        if known {
+            return write_not_modified(&mut stream, asset.etag).await;
+        }
         return write_asset(&mut stream, asset).await;
     }
     write_simple(&mut stream, 404, "Not Found", "no such resource").await
@@ -717,6 +752,22 @@ const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
                    connect-src 'self'; img-src 'self' data:; \
                    base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
+/// The caching directive every asset response carries, 200 and 304 alike (§15.64).
+///
+/// `no-cache` is "store it, but ask me before you use it" — not "do not store it". The
+/// browser keeps the body and revalidates with `If-None-Match`, which is what turns the
+/// nine-file page load into nine ~200-byte answers instead of 117 KB. It is deliberately
+/// **not** a `max-age`: the URLs carry no content hash, and this console is served by a
+/// binary the operator reinstalls (`scripts/bless` does it whenever `sys/` changes), so
+/// any freshness lifetime is a window in which a reloaded page runs the previous build's
+/// JavaScript against the current daemon. Revalidation costs a round trip that
+/// `Connection: close` was already spending; staleness would cost correctness.
+///
+/// *This line read `no-store` until 2026-08-17*, which forbids storing the body at all —
+/// so every navigation re-shipped all nine files, and there was no conditional-request
+/// path anywhere in the tree for a browser to use even if it had tried.
+const ASSET_CACHE: &str = "no-cache";
+
 async fn write_asset<S: AsyncWrite + Unpin>(
     stream: &mut S,
     asset: crate::assets::Asset,
@@ -724,13 +775,35 @@ async fn write_asset<S: AsyncWrite + Unpin>(
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
          Content-Security-Policy: {CSP}\r\nX-Content-Type-Options: nosniff\r\n\
-         Referrer-Policy: no-referrer\r\n\
-         Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+         Referrer-Policy: no-referrer\r\nETag: {}\r\n\
+         Cache-Control: {ASSET_CACHE}\r\nConnection: close\r\n\r\n",
         asset.content_type,
-        asset.body.len()
+        asset.body.len(),
+        asset.etag
     );
     stream.write_all(resp.as_bytes()).await?;
     stream.write_all(asset.body).await?;
+    Ok(())
+}
+
+/// `304 Not Modified`: the validator matched, so the browser keeps what it has.
+///
+/// No body and **no `Content-Length`** — RFC 9110 §15.4.5 forbids a 304 from carrying
+/// content, and a `Content-Length: 0` here would be a claim about a representation whose
+/// real length is not zero. The security headers ride along because a 304 updates the
+/// cached response's headers: dropping them would let a page served from cache run
+/// without the CSP that the 200 which filled that cache carried.
+async fn write_not_modified<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    etag: &str,
+) -> anyhow::Result<()> {
+    let resp = format!(
+        "HTTP/1.1 304 Not Modified\r\n\
+         Content-Security-Policy: {CSP}\r\nX-Content-Type-Options: nosniff\r\n\
+         Referrer-Policy: no-referrer\r\nETag: {etag}\r\n\
+         Cache-Control: {ASSET_CACHE}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(resp.as_bytes()).await?;
     Ok(())
 }
 

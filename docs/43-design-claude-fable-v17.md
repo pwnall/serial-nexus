@@ -2996,8 +2996,13 @@ queue, counted drops) is §10's; this section is its consumer.
 2. Selecting a console opens (or foregrounds) its tap: a terminal view of the hostward stream,
    preceded by the replay ring — present by default (§5) — with a visible marker at the splice;
    the quiet affordance survives only where an operator set `replay_ring = 0`.
-3. The single-line input drives `send`; a LOCKED refusal shows the holder by name with an
-   explicit steal affordance — never an automatic steal.
+3. The single-line input drives `send`; a LOCKED refusal shows the holder by name, and whether the
+   line is then sent over that holder follows a **standing, visible operator preference** —
+   never a steal the operator did not set. *(Amended 2026-08-17 by §15.66. This clause read
+   "…with an explicit steal affordance — never an automatic steal", and the affordance was a
+   `confirm()` per refused line; the affordance is now a checkbox beside the send box, checked by
+   default. The steal stays announced and stays confined to `-32003`; what is given up is the
+   per-line confirmation. Read §15.66 for why the modal was the wrong shape for the question.)*
 4. The tab's own tap drop counter is shown when nonzero — §5's honesty applies to browsers too.
 5. The *graph page* renders the whole graph — types and facing, edges with write modes,
    `active`/`waiting`/`faulted` as live indicators via `subscribe`, lock holders badged — and
@@ -4717,6 +4722,216 @@ of. Keeping it would have been the third.
 roster did not move, and §13's era law turns on the roster and not on the hardware. `field_set`
 does move — adapter identities ride as observation *keys* — which is the ladder working as
 described, not an era event.
+
+### 15.63 The browser link is write-clocked: Nagle off, on the socket both tiers share
+
+**Status:** DECIDED — one line in `web/src/server.rs`, its mirror in `web/src/wsclient.rs`, and the
+guard that keeps them. Construction is plan §18 item 86.
+
+**The reading.** An operator reported the console as sluggish: a second or more between clicking a
+console in the rail and seeing it, and again between pressing Enter and the device answering. The
+first thing the investigation established is that **the daemon is not slow.** Driven directly over
+its control socket, on the same box and the same graph: `tap.open` 0.25 ms, `send` reply 0.19 ms,
+and a `send`'s echo returning through a `pty --echo` device as `tap.data` in **0.45–0.75 ms**, six
+of six. Everything below is therefore the web tier's, and none of it is the data plane's.
+
+**What the browser saw instead.** The same round trip, instrumented inside a real Chromium by
+timestamping every frame the page's own `WebSocket` sent and received: the `send` was answered
+`{"delivered":true}` at **1.1 ms**, and the device's echo — which the daemon had already produced
+and handed to the bridge — reached the page **43.4 ms** later. The two `lock` notifications the
+verb emits arrived in the same lump, 41.4 ms after the answer that preceded them. That is not a
+distribution; it is a constant, and the constant is `TCP_DELACK_MIN`.
+
+**The mechanism.** The bridge's writer task drains one funnel into the WebSocket sink with one
+`ws_sink.send(msg).await` per message, and tungstenite's `Sink::poll_flush` turns each of those into
+one `write(2)`. So every browser-bound message is its own segment, and at console sizes every one of
+them is sub-MSS. Nagle then holds message N+1 until message N is acknowledged — and the peer that
+owes the acknowledgement is a browser sitting inside `await rpc(…)`, which by construction sends
+nothing for the acknowledgement to ride on. The wait is therefore the browser's *delayed-ACK* timer,
+and it is paid by every console interaction whose answer is more than one frame: a `tap.open` and
+the replay behind it, a `send` and the device's echo, a graph edit and the `state` that follows it.
+
+**Measured, on this kernel, both ways.** With Nagle on, after a single prior round trip has taken
+the socket out of quickack and into pingpong mode: **40.1–42.0 ms**, 18 of 18, always exactly two
+segments. With `TCP_NODELAY` set: **0.13 ms**. A firehose shape — twelve frames written 2 ms apart,
+which is the daemon's own reader cadence — arrived as **one lump at 42.08 ms** with Nagle on and
+spread 0.03–23.18 ms with it off, so a streaming console was ACK-clocked rather than write-clocked.
+Through the browser, end to end, the echo gap named above went from **43.4 ms to 0.4 ms**.
+
+**Why the option is set at accept and not in either tier.** The TLS acceptor wraps the *same*
+`TcpStream`, so the accept loop is the one place `ws` and `wss` share; setting it inside the
+plaintext arm would leave the sanctioned off-loopback mode still stalling. It is `let _ =`, matching
+the precedent in `daemon/src/nodes/leg.rs`: a socket that refuses a latency hint is still a
+perfectly serviceable socket, and dropping a healthy connection over one would be the worse trade.
+`serial-nexus-web wsclient` makes its own outbound socket and had the mirror-image problem; it gets
+the same line, unwrapped through `MaybeTlsStream::get_ref()` so one spelling covers both tiers.
+
+**Loopback is not an exemption, and that is the part worth keeping.** The intuition that says
+"Nagle cannot bite at microsecond RTT" is the reason this survived: it is *true on a fresh
+connection*, where the socket is still in quickack mode — a twelve-frame burst there coalesces into
+a single segment delivered in 0.18 ms. It stops being true after one round trip, which every real
+console performs before it does anything interesting. **The guard therefore performs a round trip
+before it measures, and that step is load-bearing rather than decorative: removed, the guard passes
+on the unfixed tree** — measured, not reasoned — which is §3's *passing output identical to
+not-running output* tell in its purest form. The guard states this at its own definition, because a
+future simplification that deletes the warm-up as redundant would silently convert a real gate into
+a vacuous one.
+
+### 15.64 The console stops re-shipping itself: assets gain a validator
+
+**Status:** DECIDED — `no-store` becomes `no-cache`, every asset gains a content `ETag`, and the
+server learns to answer `304`. Construction is plan §18 item 87.
+
+**What it was.** `write_asset` hard-coded `Cache-Control: no-store`, and `grep` over the whole
+repository found that string in exactly one place and found `ETag`, `If-None-Match`,
+`Last-Modified` and `304` in none. So there was no conditional-request path for a browser to take
+even if it had tried, and `no-store` forbade it from keeping the bytes to revalidate. Every
+navigation therefore re-shipped all nine served files — **116 876 bytes**, measured — in three
+serial waves, since `index.html` names only `/app.css` and `/app.js` and the six `.mjs` specifiers
+are not discoverable until `app.js`'s 52 981 bytes have landed and parsed. Each of the nine rode a
+fresh TCP connection (`Connection: close`), hence a fresh congestion window.
+
+**Why it matters more here than the arithmetic suggests.** The console has no auto-reconnect: every
+`onclose` message ends in "reload to reconnect" and `connect()` is called exactly once. So a
+daemon restart, a dropped socket, or a `scripts/bless` reinstall — routine on a workbench — routes
+the operator into a full page load. Repeat loads are designed in, not incidental.
+
+**What it is now.** Each asset carries a strong `ETag` over its own body, and a browser presenting a
+matching `If-None-Match` gets a bodiless `304`. Measured through a real Chromium: a reload's
+transfer went from **116 876 B to 2 627 B**, the whole remainder being `index.html`, which a reload
+revalidates unconditionally.
+
+**Three choices in the tag, each of which the obvious alternative gets wrong.** A **content** hash,
+not a per-run nonce — a nonce invalidates every entry on every restart, and restart is exactly the
+event this is meant to absorb. Not `CARGO_PKG_VERSION` either, which fails in the worse direction:
+it does not move across the dev rebuilds that change these files most often, so a browser would
+hold a stale console and the tag would swear it was current. And it is derived from a **table** row
+rather than written per arm, so an asset added tomorrow gets a validator by construction — the
+two-copies-that-must-agree shape §16.5 bans.
+
+**`no-cache`, deliberately, and not a `max-age`.** `no-cache` means "store it, but ask before using
+it": the bytes are saved and revalidated, which is where the whole 114 KB comes from. A freshness
+lifetime would additionally save the *round trip*, and is refused: these URLs carry no content
+hash, so any `max-age` is a window in which a reloaded page runs the previous build's JavaScript
+against the current daemon — and §17 grew its provenance line precisely because a version mismatch
+is otherwise invisible. Revalidation costs a round trip that `Connection: close` was already
+spending; staleness would cost correctness. The 304 carries the CSP and the other security headers,
+because a 304 refreshes the stored response's headers and a bare one would let a cached page run
+without the policy the 200 that filled the cache carried.
+
+**The guard's anti-tautology arm is the load-bearing half.** Asserting "a matching validator yields
+304" is satisfied just as well by a server that answers 304 to *everything* — a far worse defect,
+serving an empty console, and one that would share a passing test with the fix. So the guard also
+presents a **wrong** validator and demands the bytes, and demands that two assets never share a
+tag. All three arms were proved fail-first by planting the corresponding defect in place.
+
+### 15.65 The rail is reconciled, not rebuilt: a click held across a snapshot was lost
+
+**Status:** DECIDED — the left rail's rows are keyed and patched in place, and its click handler
+moves to the container. Construction is plan §18 item 88.
+
+**This is the defect the operator was actually reporting**, and neither of its two obvious
+descriptions is right: nothing was slow, and nothing was waiting. Roughly half the operator's clicks
+on a console name **never reached a handler at all.**
+
+**The mechanism.** `renderConsoles` opened with `consolesEl.innerHTML = ""` and rebuilt every row,
+attaching a fresh `onclick` to each new `<li>`. It is driven by `state`, and §10's snapshot is
+published **every 200 ms unconditionally** — `emit_state_snapshot` returns early only when there is
+no subscriber, and the bridge subscribes at connect — so on a graph where nothing whatsoever was
+happening the rail was destroyed and rebuilt five times a second for the life of the page. A pointer
+press spans `mousedown` and `mouseup`; the `click` event goes to the nearest common ancestor of the
+two targets, and when the element under the press has been detached in between there is no row left
+to receive it. The operator pressed the name, nothing happened, and they pressed again.
+
+**Measured against the shipped page**, with a synthetic press held for a human's duration (20 trials
+per row, alternating targets, counting presses after which the pane title never changed):
+
+| press dwell | clicks lost, before | after |
+|---|---|---|
+| 0 ms | 0/20 | 0/20 |
+| 30 ms | 1/20 | 0/20 |
+| 60 ms | 9/20 | 0/20 |
+| 100 ms | 10/20 | 0/20 |
+| 150 ms | 16/20 | 0/20 |
+
+and 0/40 at each of 60/150/300/500 ms after the fix. The median latency of a click that *did* land
+was 9–22 ms throughout, before and after: **the code on the selection path was never the subject.**
+
+**Why no gate caught it, which is the part worth generalising.** `ui-tests/fixture.mjs` selects with
+Playwright's `.click()`, which presses and releases within one tick — 0 ms of dwell, the one row of
+the table where the defect does not appear — *and* auto-retries when an element goes detached. The
+harness was forgiving in exactly the two ways a mouse is not. This is a new register of §3's
+recurring tell: not a gate whose subject never ran, nor one whose assertion was weaker than its
+comment, but a gate whose **stimulus was gentler than the product's real one**. The guard therefore
+presses with `mouse.down` / hold / `mouse.up` and holds for 400 ms — two snapshots at 5 Hz, so it
+cannot pass by winning a race.
+
+**The construction.** Rows are keyed by display address and patched: an `<li>` for a console that
+still exists is the same `<li>` it was a tick ago, fields are written only when they differ, and
+badges are created and removed rather than re-created. A rail whose contents did not change performs
+**zero** DOM mutations. The click handler moves to the container as one delegated listener — belt
+and braces rather than the fix itself, since a reconciled row is never detached, but a listener on
+the container cannot be lost to any future rebuild of its children, and it is one listener instead
+of one per console.
+
+**A second guard pins the mechanism rather than the outcome** (AGENTS §3). "The click landed" is an
+outcome a later implementation could reproduce by rebuilding the rail and papering over it with a
+retry, at which point the guard would hold the defect in place. So the row's DOM element is stamped
+and the stamp is read a second later: a rebuilt row cannot carry a property set on its predecessor.
+Both guards were proved fail-first by restoring the destroy-and-rebuild in place.
+
+### 15.66 The steal affordance is a preference, not a modal
+
+**Status:** DECIDED — **amends §17 clause 3**, which is annotated at its own site rather than
+rewritten. Construction is plan §18 item 89. Asked for by the operator.
+
+**What it was.** A refused line raised `confirm("<endpoint> is locked by <holder>. Steal the lock
+and send?")`. The clause it implemented — "an explicit steal affordance — never an automatic steal"
+— was right about the *policy* and wrong about the *shape*, in three ways.
+
+1. **It asks at the worst moment.** A lock conflict is discovered only after the operator has typed
+   a line and pressed Enter. The dialog therefore lands on top of the console, over the output the
+   operator is presumably reading, and must be dismissed before anything else can happen.
+2. **It asks the same question every time**, of an operator whose answer is a property of how they
+   work — one bench, one person, one device — and not of this particular line. A question with a
+   stable answer belongs in a setting.
+3. **`confirm()` blocks the renderer**, and this client has had to be designed around that twice
+   already: 37-WEBC-1 and HISTC-2 are both races that exist *because* a dialog can park a
+   continuation for as long as a human takes to read it. The clear button's synchronous-before-the-
+   delete ordering is a scar from exactly this. Adding no new instances of a hazard the code
+   already carries two documented workarounds for is worth something on its own.
+
+**What it is.** A checkbox beside the send box, labelled *automatically steal during line write*,
+**checked by default**, with the full sentence in its `title`. Its default is the `checked`
+attribute in the markup rather than an assignment in script, so it holds from the first paint and a
+reader of the HTML can see what the console does.
+
+**What is deliberately preserved, because it is the half that mattered.**
+
+- **The first attempt never carries `steal`.** It costs one round trip on a contended endpoint and
+  nothing on an uncontended one, and it is what obtains the holder's name: `data.held_by` arrives
+  *on the refusal*. An operator who leaves the box ticked is still owed the sentence naming whose
+  lock was taken, and that sentence is only purchasable by being refused once.
+- **The steal is announced**, in the terminal, before the retry — `— stealing the write lock from
+  <holder> —`. A steal displaces another origin's floor (§6); §5's honesty is that the operator
+  watches that happen rather than inferring it from a line that went through. Unticked, the same
+  refusal is reported with the holder named and the remedy stated, and the line goes back in the
+  box.
+- **It stays confined to `-32003`.** Every other refusal is a different failure and still gets the
+  daemon's own words (WEBUI-1). Widening this to any other code would re-create the defect that
+  finding closed.
+
+**What is given up, stated plainly:** per-line confirmation. An operator who leaves the default in
+place will steal a lock without being asked at the moment it happens. That is the operator's
+setting, visible on screen while they type, and §17 has always held that web access *is* operator
+access — the same session may already `add-node` an exec codec. The other two confirmations on this
+page — clearing stored scrollback, and a cascading `remove-node` — are **not** touched: both destroy
+something that cannot be recovered by re-typing it, which is the distinction that makes a modal the
+right shape there and the wrong one here.
+
+**The guard's fourth arm is the one that keeps this honest.** Asserting the two positions of the
+checkbox would be satisfied by a console that also opened a dialog, so the spec registers a `dialog`
+handler for the whole test and demands it never fired.
 
 ## 16. Post-completion review: reliability through simplification
 
