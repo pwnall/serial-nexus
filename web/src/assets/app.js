@@ -1374,11 +1374,12 @@ sendForm.onsubmit = async (e) => {
   const endpoint = selected;
   const line = sendLine.value;
   sendLine.value = "";
-  // The first attempt never steals, whatever the preference says. The refusal is what
-  // carries the holder's name (`data.held_by`), and an operator who has left the box
-  // ticked is still owed the sentence saying whose lock was taken — which is only
-  // obtainable by being refused once. It costs one round trip on a contended endpoint
-  // and nothing at all on an uncontended one, which is every ordinary send.
+  // The first attempt never steals, whatever the preference says. An operator who has
+  // left the box ticked is still owed the sentence saying whose lock was taken, and that
+  // sentence needs the refusal: it is what establishes there *is* a holder to name (see
+  // `holderOf` for where the name itself comes from, which today is the `state` snapshot
+  // and not the error). It costs one round trip on a contended endpoint and nothing at
+  // all on an uncontended one, which is every ordinary send.
   const msg = await rpcFull("send", { endpoint, line, steal: false });
   if (msg && !msg.error) return;
   const err = (msg && msg.error) || { code: 0, message: "no reply from the daemon" };
