@@ -976,6 +976,23 @@ fn a_browser_holding_the_console_revalidates_instead_of_refetching_it() {
             "a 304 for {path} must carry the CSP it is refreshing: {head304}"
         );
 
+        // The **weak** form of the same tag must be answered the same way. RFC 9110
+        // §13.1.2 requires `If-None-Match` to use the weak comparison function, so
+        // `W/"x"` matches the `"x"` this server issued — and a strong byte comparison,
+        // which is what this shipped with, silently degrades such a peer to a full
+        // re-send while every other assertion here stays green.
+        let (status, _, len_weak) = http_exchange(
+            port,
+            path,
+            &[("Cookie", &cookie), ("If-None-Match", &format!("W/{etag}"))],
+        )
+        .unwrap_or_else(|| panic!("no weak-validator response for {path}"));
+        assert_eq!(status, 304, "{path} with the weak form of its own ETag");
+        assert_eq!(
+            len_weak, 0,
+            "a weak-match 304 for {path} must carry no body"
+        );
+
         // The anti-tautology half: a validator that does *not* match must be answered
         // with the bytes. Without this, a server that 304s unconditionally passes
         // everything above and serves an empty console.

@@ -170,15 +170,37 @@ mod tests {
 
     /// The tag has to move when the bytes move, or a browser holds a stale console and
     /// the validator swears it is current — the failure mode `CARGO_PKG_VERSION` would
-    /// have had across every dev rebuild. Asserted on the hash rather than through
-    /// `lookup`, whose inputs are compile-time constants.
+    /// have had across every dev rebuild.
+    ///
+    /// **The wiring is asserted, not only the hash.** A first draft of this test exercised
+    /// `fnv1a` alone, which a validator derived from the *path* would have passed just as
+    /// happily — and so would the injectivity test above, since paths are distinct too. So
+    /// the served tag is compared against the hash of the served **body**: nothing but a
+    /// body-derived validator satisfies both halves. The bodies are compile-time constants
+    /// and cannot be mutated at runtime, which is exactly why the wiring has to be pinned
+    /// here rather than inferred from a mutation that is impossible to perform.
     #[test]
     fn the_validator_follows_the_bytes() {
+        for (paths, _, body) in TABLE {
+            let served = lookup(paths[0]).expect("a table row resolves");
+            assert_eq!(
+                served.etag,
+                format!("\"{:016x}\"", fnv1a(body.as_bytes())),
+                "{}'s ETag is not derived from the bytes it serves",
+                paths[0]
+            );
+            assert_eq!(
+                served.body,
+                body.as_bytes(),
+                "{} serves another row's body",
+                paths[0]
+            );
+        }
+        // And the hash itself distinguishes what it must: different bodies, and a single
+        // flipped byte deep in a long one — the case a length or a first-block checksum
+        // would pass.
         assert_ne!(fnv1a(b"a"), fnv1a(b"b"));
         assert_ne!(fnv1a(APP_JS.as_bytes()), fnv1a(APP_CSS.as_bytes()));
-        assert_eq!(fnv1a(APP_JS.as_bytes()), fnv1a(APP_JS.as_bytes()));
-        // One flipped byte in a long body must change it, which is the case a weak
-        // "hash" like a length or a checksum of the first block would fail.
         let mut mutated = APP_JS.as_bytes().to_vec();
         let last = mutated.len() - 1;
         mutated[last] ^= 0x01;

@@ -840,6 +840,23 @@ test("a rail click with a human's press duration selects the console", async ({ 
 test("a rail row survives the daemon's state snapshots rather than being rebuilt", async ({
   page,
 }) => {
+  // Count the snapshots, because the property is "the row survives *them*". Without this
+  // the spec passes on a page whose `state` stream is dead — nothing to rebuild the rail,
+  // nothing to survive — which is a worse defect wearing this one's green tick.
+  await page.addInitScript(() => {
+    window.__stateFrames = 0;
+    const Native = window.WebSocket;
+    window.WebSocket = function (...args) {
+      const ws = new Native(...args);
+      ws.addEventListener("message", (e) => {
+        if (String(e.data).includes('"method":"state"')) window.__stateFrames += 1;
+      });
+      return ws;
+    };
+    window.WebSocket.prototype = Native.prototype;
+    Object.assign(window.WebSocket, Native);
+  });
+
   await open(page);
   const first = page.locator("#consoles li").first();
   await expect(first).toBeVisible();
@@ -848,13 +865,116 @@ test("a rail row survives the daemon's state snapshots rather than being rebuilt
   await first.evaluate((el) => {
     el.__snxIdentity = "kept";
   });
+  const before = await page.evaluate(() => window.__stateFrames);
   // Five snapshots at the daemon's 5 Hz. Long enough that a rebuilding rail cannot
   // survive by luck.
   await page.waitForTimeout(1000);
+  const arrived = (await page.evaluate(() => window.__stateFrames)) - before;
+  expect(
+    arrived,
+    "no `state` notification arrived in a whole second, so the rail was never asked to " +
+      "repaint and this spec asserted nothing (§10 publishes one every 200 ms)",
+  ).toBeGreaterThan(1);
   const kept = await page.locator("#consoles li").first().evaluate((el) => el.__snxIdentity);
   expect(
     kept,
-    "the first rail row is a different element than it was a second ago, so the rail is " +
-      "being rebuilt on every state snapshot — a click held across one is lost (§15.65)",
+    `the first rail row is a different element than it was a second ago (${arrived} state ` +
+      "snapshots), so the rail is being rebuilt on every snapshot — a click held across " +
+      "one is lost (§15.65)",
   ).toBe("kept");
+});
+
+// §15.67. `writeTerminal` used to run to completion inside the `tap.data` handler, and it
+// brackets its DOM work with a *read* of the pane's scroll metrics — which forces a
+// synchronous layout of a `<pre>` holding up to `TERM_CHAR_CAP` characters. That cost is
+// per notification and nearly independent of how many bytes the notification carried, so
+// a console delivering 49 KiB/s in ~5 KB notifications spent 78% of the main thread on
+// it, the event-loop backlog grew without bound, and a rail click took 15.4 s to be
+// answered. Rendering now drains once per animation frame.
+//
+// The property is **where the painting happens**, not how fast it is: a timing assertion
+// here would be a tuning exercise on whatever machine CI happens to give us. So the spec
+// checks that a `tap.data` notification does not paint inside its own task.
+//
+// **Two listeners, bracketing the client's handler, and the arrangement is load-bearing.**
+// The first is registered at construction, so it precedes the `onmessage` app.js assigns
+// and reads the terminal as it stood before the client saw the frame. The second is
+// registered from a *microtask*, i.e. after the task in which app.js assigned
+// `onmessage`, so it runs last and reads the terminal after the client is done. The
+// difference is exactly what the client painted synchronously.
+//
+// The obvious spelling — one listener recording `before`, and a `queueMicrotask` reading
+// `after` — was written first and **passed on the unfixed tree**: a microtask checkpoint
+// runs when the JS stack empties, which is *between* event listeners, so the reading was
+// taken before app.js's handler had run at all. Measured, not reasoned: the synchronous
+// build reported `before === after` six times out of six. That is AGENTS §3's tell again,
+// and a third register of it — an observation taken at the wrong *point in the task*
+// rather than of the wrong thing. Both spellings were run against both trees before this
+// one was kept.
+//
+// Device-gated, because a `tap.data` needs a device to have produced bytes.
+test("a tap.data notification does not paint inside its own task", async ({ page }) => {
+  test.skip(!ECHO, "no serial device on this platform (§5): nothing to echo");
+
+  await page.addInitScript(() => {
+    window.__paints = [];
+    const termLen = () => (document.getElementById("term").textContent || "").length;
+    const Native = window.WebSocket;
+    window.WebSocket = function (...args) {
+      const ws = new Native(...args);
+      let before = null;
+      ws.addEventListener("message", (e) => {
+        before = String(e.data).includes('"tap.data"') ? termLen() : null;
+      });
+      queueMicrotask(() => {
+        ws.addEventListener("message", () => {
+          if (before === null) return;
+          window.__paints.push({ before, after: termLen() });
+          before = null;
+        });
+      });
+      return ws;
+    };
+    window.WebSocket.prototype = Native.prototype;
+    Object.assign(window.WebSocket, Native);
+  });
+
+  await open(page);
+  await selectConsole(page, ECHO);
+  await page.evaluate(() => {
+    window.__paints.length = 0;
+  });
+
+  // Distinct tokens, so "all of them, in order, exactly once" is checkable rather than
+  // approximate — batching that dropped or reordered a chunk would be a far worse defect
+  // than the one being fixed.
+  const tokens = Array.from({ length: 6 }, (_, i) => token(`batch${i}`));
+  for (const t of tokens) sendBytes(ECHO, t);
+
+  const last = tokens[tokens.length - 1];
+  await expect(page.locator("#term")).toContainText(last, { timeout: 30_000 });
+
+  // Correctness first: nothing lost, nothing duplicated, nothing reordered.
+  for (const t of tokens) {
+    expect(await countInTerminal(page, t), `${t} should appear exactly once`).toBe(1);
+  }
+  const text = await page.locator("#term").textContent();
+  const order = tokens.map((t) => text.indexOf(t));
+  expect(order, "the batched writes must keep the device's order").toEqual(
+    [...order].sort((a, b) => a - b),
+  );
+
+  // The mechanism: not one of those notifications painted inside its own task.
+  const paints = await page.evaluate(() => window.__paints);
+  expect(
+    paints.length,
+    "no tap.data frame was observed, so this spec asserted nothing about painting",
+  ).toBeGreaterThan(0);
+  const synchronous = paints.filter((p) => p.after !== p.before);
+  expect(
+    synchronous,
+    `${synchronous.length} of ${paints.length} tap.data notifications painted the ` +
+      "terminal inside their own task — rendering is no longer deferred to a frame, so " +
+      "every notification pays its own forced layout again (§15.67)",
+  ).toEqual([]);
 });

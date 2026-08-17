@@ -31,6 +31,7 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 
 | Figure | Scope | Date | Commit / record | Caveat |
 |---|---|---|---|---|
+| **A busy console's cost: 78 % → 36 % of the main thread, 49.0 → 110.9 KiB/s absorbed, main-thread latency 1145–2591 ms → 2–112 ms, a rail selection while streaming 15 383 ms → 48 ms** | Linux, headless Chromium, one serial node fed by `serial-nexus-sim pty --source`, same box and same 15-second window on both sides | 2026-08-17 | the web console latency session (§15.67, notes §3.115) | **The rate is the scope.** At 12.8 KiB/s (115200 baud) the unfixed client is idle — 2 notifications/s, 0 % of the main thread — and every interaction is under 100 ms; the step between that and the row's figures is not gradual, because work arriving faster than it drains backs up rather than degrading. On the unpaced 64 MiB firehose, the fixture's worst case: selection **17 952 ms → 79 ms**, long tasks **300 totalling 32.6 s → 41 totalling 4.8 s**. The throughput figure is a *side effect*, not a target, and is bounded by the sim's pacing rather than by the client after the fix. |
 | **A browser-bound frame after the first: 41 ms → 0.4 ms.** Bridge burst tail 40.1–42.0 ms with Nagle on (18/18) against 0.13 ms with `TCP_NODELAY`; through a real Chromium, a `send`'s device echo arrived 43.4 ms after the `delivered:true` answer and now arrives 0.4 ms after it | Linux 7.0.0-29, loopback, `serial-nexus-web` in front of a `pty --echo` serial node, **after at least one prior RPC round trip** | 2026-08-17 | the web console latency session (§15.63, notes §3.113) | **The prior round trip is part of the scope, not an incidental.** On a fresh connection the socket is in quickack mode and the effect is absent — a twelve-frame burst there coalesces into one segment at 0.18 ms — so a figure quoted without it describes a different regime. 41 ms is `TCP_DELACK_MIN` on this kernel and is hit dead on rather than approached. Loopback MSS is ~65483, so a single large replay piece can exceed it and escape Nagle; both hot paths named are sub-MSS. |
 | **A reload's transfer: 116 876 B → 2 627 B**, nine responses either way | Linux, loopback, headless Chromium, `page.reload()` on an already-loaded console | 2026-08-17 | the web console latency session (§15.64, notes §3.113) | The 2 627 B remainder is `index.html`, which a reload revalidates unconditionally; the other eight answer `304`. This is **bytes, not round trips** — `no-cache` is deliberate and a freshness lifetime is refused (§15.64), so the nine requests remain. Page-load cost only: it contributes nothing to console select or to a `send`. |
 | **Rail clicks lost at a human press dwell: 9/20 at 60 ms, 10/20 at 100 ms, 16/20 at 150 ms → 0/20 at each, and 0/40 at each of 60/150/300/500 ms** | Linux, headless Chromium, synthetic `mouse.down` / hold / `mouse.up` on the left rail of the live console, alternating targets | 2026-08-17 | the web console latency session (§15.65, notes §3.114) | **A dropped event, not a latency**: the median latency of a click that *did* land was 9–22 ms before and after. 0 ms of dwell loses nothing on either tree, which is why `.click()` — what this suite used — could not see it. The rate depends on the daemon's 200 ms snapshot cadence and on how long the press is held; quote the shape (roughly half at ordinary dwell), not a single percentage. |
@@ -3533,13 +3534,13 @@ different mechanisms and a later reader chasing any one of them wants its own ev
     the wire must be separated from one where it is honoured and functional, by an instrument that
     moves bytes — and the second half of that pair needs an adapter this record does not yet have.
 
-### Items 86–89 — the web console latency session (2026-08-17)
+### Items 86–90 — the web console latency session (2026-08-17)
 
 Filed by the session that took an operator's report of a sluggish console and measured it end to
 end: the daemon first, over its own control socket; then the same operations through a real
 Chromium with every WebSocket frame timestamped in-page. **The daemon was never the subject** —
 `tap.open` 0.25 ms, `send` reply 0.19 ms, a device echo returning as `tap.data` in 0.45–0.75 ms, six
-of six — so all four items are the web tier's.
+of six — so all five items are the web tier's.
 
 86. **The browser link was ACK-clocked, not write-clocked** — **executed 2026-08-17** (§15.63).
     *Evidence:* through the browser, a `send` answered `{"delivered":true}` at 1.1 ms and its echo
@@ -3585,7 +3586,36 @@ of six — so all four items are the web tier's.
     dwell **and** auto-retries on a detached element — a stimulus gentler than the product's real
     one, which is a new register of §3's tell and is recorded as such at §15.65.
 
-89. **The steal affordance was a modal dialog** — **executed 2026-08-17** (§15.66).
+89. **The steal affordance was a modal dialog** — **executed 2026-08-17** (§15.66). Asked for by the
+    operator; **amends §17 clause 3**, annotated at its own site.
+    *Construction:* a defaulted-on checkbox beside the send box. The first attempt still never
+    carries `steal` (that refusal is what names the holder), the steal is still announced in the
+    terminal before the retry, and it stays confined to `-32003`.
+    *Guard:* `a LOCKED send names the holder and follows the standing steal preference`
+    (`web/ui-tests/tests/console.spec.mjs`), driving both positions of the checkbox. **Its fourth arm
+    is the load-bearing one**: a `dialog` handler registered for the whole test that must never
+    fire, because every other assertion would be satisfied by a console that also opened a modal.
+    Proved fail-first by restoring the `confirm()` in place.
+
+90. **The terminal painted once per notification, and the paint cost was per notification** —
+    **executed 2026-08-17** (§15.67).
+    *Evidence:* `writeTerminal` ran inside the `tap.data` handler and forces a synchronous layout of
+    the whole pane, so a 5 KB notification cost ~120 ms — 23 µs per byte. At **49 KiB/s**, an
+    ordinary 460800-baud device, that is 78 % of the main thread, an unbounded event-loop backlog,
+    1.1–2.6 s of main-thread latency and a **15.4 s** rail selection.
+    *Construction:* arrivals are queued and drained once per animation frame, with a timer alongside
+    for hidden tabs and a discard on `resetTerminal`. Consecutive text is concatenated before
+    parsing, which is exactly equivalent for a resumable machine and strictly better across a split
+    escape sequence.
+    *Measured after:* 110.9 KiB/s absorbed, 36 % of the main thread, 2–112 ms latency, **48 ms**
+    selection; on the unpaced firehose, selection **17 952 ms → 79 ms** and long tasks
+    **300/32.6 s → 41/4.8 s**.
+    *Guard:* `a tap.data notification does not paint inside its own task`, device-gated, asserting
+    correctness under batching (all lines, in order, exactly once) and then the mechanism. Proved
+    fail-first: the synchronous build reports "6 of 6 … painted the terminal inside their own task".
+    **The guard's first draft passed on the unfixed tree** and the reason is recorded at §15.67 — a
+    microtask checkpoint runs between event listeners, so the reading was taken before the client's
+    handler had run.
 
 ### Evaluated and deliberately not scheduled — the closing register
 

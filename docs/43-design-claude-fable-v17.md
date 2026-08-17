@@ -4825,6 +4825,22 @@ serving an empty console, and one that would share a passing test with the fix. 
 presents a **wrong** validator and demands the bytes, and demands that two assets never share a
 tag. All three arms were proved fail-first by planting the corresponding defect in place.
 
+**Two things the adversarial pass changed, both of the same shape.** First, the comparison was
+*strong*, while RFC 9110 §13.1.2 — the section the code's own comment cited as licence — requires
+the **weak** comparison function for `If-None-Match`: a peer presenting `W/"x"` for a tag issued as
+`"x"` must be answered `304`. It failed safe (a correct 200, and the pre-fix 116 876 B) and
+**silently**, which is the half that mattered, since nothing could observe that revalidation had
+stopped working for a class of peer. Our own tags are always strong, so stripping the request-side
+prefix *is* the weak comparison and can never grant a 304 that strong comparison would have refused.
+The guard gains a weak-form arm, proved fail-first.
+
+Second, `the_validator_follows_the_bytes` exercised the hash function and not the **wiring**: a
+validator derived from the request *path* would have passed it, and passed the injectivity test too,
+since paths are distinct. The bodies are compile-time constants and cannot be mutated at runtime,
+which is precisely why the wiring has to be pinned rather than inferred — the test now compares the
+*served* tag against the hash of the *served body*. Measured: a planted path-derived validator
+passes the injectivity test and reddens this one.
+
 ### 15.65 The rail is reconciled, not rebuilt: a click held across a snapshot was lost
 
 **Status:** DECIDED — the left rail's rows are keyed and patched in place, and its click handler
@@ -4873,6 +4889,16 @@ badges are created and removed rather than re-created. A rail whose contents did
 and braces rather than the fix itself, since a reconciled row is never detached, but a listener on
 the container cannot be lost to any future rebuild of its children, and it is one listener instead
 of one per console.
+
+**One defect keying the rows introduced, found by the adversarial pass and fixed.** The badges are
+created lazily, and both were appended — so a row that gained waiters while the lock was free and
+*then* gained a holder carried them in the opposite order from a row built holder-first, which the
+rebuild-per-tick version could not produce. The free-but-queued state is a real wire state
+(`release` nulls the holder and deliberately keeps the queue), so a 5 Hz snapshot can observe it.
+The lock badge is now anchored ahead of the waiter count; `insertBefore(x, null)` appends, so the
+common case needs no branch. Transient and cosmetic — the transposition un-does itself when waiters
+next reach zero — but it is exactly the class of drift that reconciliation trades for, and it is
+cheaper to remove than to remember.
 
 **A second guard pins the mechanism rather than the outcome** (AGENTS §3). "The click landed" is an
 outcome a later implementation could reproduce by rebuilding the rail and papering over it with a
@@ -4929,9 +4955,88 @@ page — clearing stored scrollback, and a cascading `remove-node` — are **not
 something that cannot be recovered by re-typing it, which is the distinction that makes a modal the
 right shape there and the wrong one here.
 
+**No holder, no steal — a rule about the verb, added by the adversarial pass.** `-32003` is the
+daemon's answer to *three* situations: the floor is held by someone else, the target would not
+accept the write inside the deadline, and the endpoint was torn down mid-send. Only the first has
+anything for a steal to take. With the box ticked, the other two would have been retried identically
+and — worse — had the daemon's own words replaced by a lock narration that was never true, which is
+WEBUI-1 exactly: the console telling the operator a false story about why the line did not land. So
+the preference is consulted only where a holder is actually *named*; otherwise the refusal is
+reported in the daemon's words, like every other refusal. The `title` also moved from the wrapping
+`<label>` to the control, since it is the input's accessible description that a screen reader reads.
+
 **The guard's fourth arm is the one that keeps this honest.** Asserting the two positions of the
 checkbox would be satisfied by a console that also opened a dialog, so the spec registers a `dialog`
 handler for the whole test and demands it never fired.
+
+### 15.67 The terminal paints on a frame boundary, not on a notification's arrival
+
+**Status:** DECIDED — arrivals are queued and drained once per animation frame. Construction is
+plan §18 item 90.
+
+**The cost was per notification, not per byte, and that is the whole finding.** `writeTerminal` ran
+to completion inside the `tap.data` handler, and it brackets its DOM work with a **read** of the
+pane's scroll metrics — which forces the browser to lay out a `<pre>` holding up to `TERM_CHAR_CAP`
+characters, synchronously, before the read can answer. Whether the notification carried 40 bytes or
+5 000, it paid that layout once. Measured against a serial node delivering **49 KiB/s** — an
+ordinary 460800-baud device, not a stress case — the shipped client spent **78 % of the main
+thread** on ten notifications a second at ~120 ms each: **23 µs per byte**, which no amount of text
+processing accounts for.
+
+Work arriving faster than it drains does not degrade gracefully; the event-loop backlog grows
+without bound. Main-thread latency reached **1.1–2.6 s** and one rail selection took **15.4 s**. The
+console had stopped being merely behind its device and started failing to answer its operator —
+which is the same symptom §15.65 produces by a completely different mechanism, and one reason this
+investigation had to measure rather than reason.
+
+**Before and after, same box, same device, same 15-second window:**
+
+| | before | after |
+|---|---|---|
+| absorbed | 49.0 KiB/s | **110.9 KiB/s** |
+| main thread busy | 78 % | **36 %** |
+| main-thread latency while streaming | 1145–2591 ms | **2–112 ms** |
+| rail selection while streaming | 15 383 ms | **48 ms** |
+
+and on the unpaced 64 MiB firehose, which is the worst case this fixture can produce: selection
+**17 952 ms → 79 ms**, long tasks **300 totalling 32.6 s → 41 totalling 4.8 s**. The client is no
+longer the bottleneck in either case; throughput more than doubled as a side effect of not paying a
+layout per notification.
+
+**Why concatenating is not merely cheaper but *more* correct.** `parseAnsi` is a resumable state
+machine over a character stream, so parsing `a + b` is identical to parsing `a` then `b` — and an
+escape sequence split across two notifications, which §17 already calls the ordinary case at serial
+rates, no longer crosses a call boundary at all. Markers keep their position in the queue, so a gap
+annotation still lands exactly where the gap was. The batch pays **one** layout read and one scroll
+write whatever it contains.
+
+**Three things the queue must not do, each handled rather than hoped at.** It must not stall in a
+hidden tab — `requestAnimationFrame` does not fire there, so a timer is armed alongside it and
+whichever runs first performs the flush. It must not grow without bound while visible — a flush
+drains everything queued rather than a fixed slice, so the queue holds one frame's arrivals. And it
+must not paint the *previous* console's bytes into the pane of the one just selected —
+`resetTerminal` discards the queue, which is safe because the bytes are in `history` and the OPFS
+record, and the screen is what the caller is deliberately clearing.
+
+**Batching widened one bound, and the adversarial pass caught it.** `commitNode` enforces the
+rendered-scrollback cap by dropping whole committed nodes and never drops the last one — a cap
+smaller than one node has to shrink the screen, not blank it. Before batching a node was one
+notification's output, single-digit KB, so that exception was invisible; afterwards a node is one
+*flush*'s output, which under a backlogged main thread is however much arrived while the previous
+flush ran. The bound would quietly have become "the cap, or one flush, whichever is larger". A
+flush's committed output is therefore split at `TERM_BLOCK_CAP` (32 KiB), which costs a handful of
+extra nodes and restores the bound to `TERM_CHAR_CAP + TERM_BLOCK_CAP`.
+
+**The guard's own first draft was vacuous, and finding that out is the recorded lesson.** The
+property is *where* the painting happens, so the spec brackets the client's `onmessage` handler with
+two listeners — one registered at construction (first) and one from a microtask (last) — and asserts
+the terminal did not grow between them. The obvious spelling instead recorded `before` in one
+listener and `after` in a `queueMicrotask`, which **passes on the unfixed tree**: a microtask
+checkpoint runs whenever the JS stack empties, which is *between* event listeners, so the reading
+was taken before the client's handler had run at all. Measured: the synchronous build reported
+`before === after`, six of six. That is a third register of §3's tell — an observation taken at the
+wrong *point in the task* rather than of the wrong thing — and both spellings were run against both
+trees before one was kept.
 
 ## 16. Post-completion review: reliability through simplification
 

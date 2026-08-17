@@ -94,6 +94,13 @@ let selectGen = 0;                  // selectConsole re-entrancy generation (see
 let view = "console";               // console | graph | editor (§17, §15.35)
 let lastDump = { node: [], edge: [] };
 let lastPorts = [];
+/// The terminal's render queue and its one-shot flush flag (§15.67 — the reasoning lives
+/// with `scheduleRender`, far below). Declared here, with the rest of the module state,
+/// because `resetTerminal` discards the queue and is itself declared above that code: a
+/// `let` in its own section would put both inside a temporal dead zone that only a
+/// future caller would discover.
+let renderQueue = [];
+let renderScheduled = false;
 
 /// `AppError::Locked`'s code, from `serial-nexus-rpc`'s single error registry (§16.8): the one
 /// `send` refusal that means contention, and therefore the only one that may offer a
@@ -122,6 +129,18 @@ const TAP_GRACE_MS = 60_000;
 /// held flat (121–144 KiB/s, against 34.9 → 14.4 KiB/s decaying with an unbounded pane).
 /// `export` still hands back the whole retained buffer; the screen is a window onto it.
 const TERM_CHAR_CAP = 256 * 1024;
+
+/// The largest node one flush may commit before it starts a new one (§15.67).
+///
+/// `commitNode` enforces `TERM_CHAR_CAP` by dropping whole committed nodes, and it never
+/// drops the last one — a cap smaller than one node has to shrink the screen, not blank
+/// it. Before batching, a node was one notification's worth of output (single-digit KB),
+/// so that exception was invisible. Batching makes a node one *flush*'s worth, which under
+/// a backlogged main thread is however much arrived while the previous flush ran — so
+/// without this the rendered scrollback's bound would have quietly become "the cap, or one
+/// flush, whichever is larger". Splitting at 32 KiB keeps the trim granular for a handful
+/// of extra nodes, and restores the bound to `TERM_CHAR_CAP + TERM_BLOCK_CAP`.
+const TERM_BLOCK_CAP = 32 * 1024;
 
 /// How far back a carriage return can reach. Only the incomplete last line is editable,
 /// and a line this long is committed as it stands so an unterminated multi-megabyte
@@ -462,7 +481,13 @@ function patchRow(row, ep, isSelected) {
     if (!row.lock) {
       row.lock = document.createElement("span");
       row.lock.className = "lockbadge";
-      row.li.appendChild(row.lock);
+      // Before the waiter count, not merely at the end. A row that gained waiters while
+      // the lock was free and *then* gained a holder would otherwise carry its badges in
+      // the opposite order from a row built holder-first — an ordering the rebuild-per-
+      // tick version could not produce, and which is exactly the class of drift keying
+      // rows introduces. `insertBefore(x, null)` appends, so the no-waiters case needs no
+      // branch of its own.
+      row.li.insertBefore(row.lock, row.waiters);
     }
     setIfChanged(row.lock, "textContent", holder);
   }
@@ -920,6 +945,11 @@ function termCharCap() {
 }
 
 function resetTerminal() {
+  // Before anything else: text queued for the console being torn down must not be
+  // painted into the one replacing it (§15.67). The bytes are not lost — `history` and
+  // the OPFS record hold them, and this is the *screen*, which the caller is clearing on
+  // purpose.
+  discardQueuedRender();
   termEl.replaceChildren();
   ansi = newAnsiState();
   committed = [];
@@ -993,6 +1023,14 @@ function commitPending(withNewline) {
     if (block) {
       runsInto(block, runs);
       blockChars += chars;
+      // Keep this flush's committed output in nodes the trim can actually drop
+      // (`TERM_BLOCK_CAP`). Committing here rather than only at the end of the chunk is
+      // what keeps `#term` bounded when a flush carries a whole backlog.
+      if (blockChars >= TERM_BLOCK_CAP) {
+        commitNode(block, blockChars);
+        block = document.createElement("span");
+        blockChars = 0;
+      }
     } else {
       const node = document.createElement("span");
       runsInto(node, runs);
@@ -1094,11 +1132,111 @@ function applyOps(ops) {
   }
 }
 
+// ---- one paint per frame, not one per notification (§15.67) -------------------------
+//
+// `writeTerminal` used to run to completion inside the `tap.data` handler, and it brackets
+// its DOM work with a **read** of `scrollHeight`/`clientHeight`/`scrollTop` and a write of
+// `scrollTop`. Reading a scroll metric forces the browser to lay out the whole `<pre>`
+// synchronously, and that pane holds up to `TERM_CHAR_CAP` characters — so the cost is
+// per *notification* and almost independent of how many bytes the notification carried.
+//
+// The daemon coalesces on its own schedule, which at console rates is one frame every few
+// milliseconds. Measured against a serial node delivering **49 KiB/s** — an ordinary
+// 460800-baud device, not a stress case — the shipped client spent **78 % of the main
+// thread** on 10 notifications a second, ~120 ms each for 5 KB apiece (23 µs per byte,
+// which no amount of text processing accounts for). Work arrived faster than it drained,
+// so the event-loop backlog grew without bound: main-thread latency reached **1.1–2.6 s**
+// and one console selection took **15.4 s**. The console was not merely behind its device;
+// it had stopped answering the operator.
+//
+// So arrivals are queued and drained once per animation frame. Consecutive text is
+// concatenated before parsing — `parseAnsi` is a resumable machine over a character
+// stream, so parsing `a + b` is *identical* to parsing `a` then `b`, and in fact strictly
+// better: an escape sequence split across two notifications no longer crosses a call
+// boundary. Markers keep their place in the order. The whole batch pays **one** layout
+// read and one scroll write, whatever it contains.
+//
+// **The queue cannot stall a hidden tab into unbounded growth**: `requestAnimationFrame`
+// does not fire while the document is hidden, so a timer is armed alongside it and
+// whichever runs first performs the flush. It cannot grow unboundedly *while visible*
+// either, because a flush drains everything queued rather than a fixed slice.
+//
+// (`renderQueue` and `renderScheduled` are declared with the other module state at the top
+// of the file rather than here, beside the code that uses them, for one reason: `let` has a
+// temporal dead zone, and `resetTerminal` — declared far above — touches the queue.
+// Nothing calls `resetTerminal` during module evaluation today, so the hazard is currently
+// unreachable; declaring the state where it cannot bite is cheaper than depending on that
+// staying true.)
+
+function scheduleRender() {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  let ran = false;
+  const once = () => {
+    if (ran) return;
+    ran = true;
+    renderScheduled = false;
+    flushRender();
+  };
+  // Both, deliberately. rAF is the right cadence when the tab is visible and never fires
+  // when it is not; the timer is the floor that keeps a backgrounded console draining.
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(once);
+  setTimeout(once, 50);
+}
+
+/// Queue decoded device text for the terminal. The stream's bytes are already in
+/// `history` by the time this is called; this is presentation only.
 function writeTerminal(s) {
+  if (!s) return;
+  const last = renderQueue[renderQueue.length - 1];
+  // Join here rather than in the flush: one growing string beats an array of thousands
+  // of small ones when a console is genuinely busy.
+  if (last && last.t === "text") last.s += s;
+  else renderQueue.push({ t: "text", s });
+  scheduleRender();
+}
+
+/// Queue an annotation *about* the stream. Ordered against the text around it, so a gap
+/// marker still lands exactly where the gap was.
+function appendMarker(s) {
+  renderQueue.push({ t: "marker", s });
+  scheduleRender();
+}
+
+function flushRender() {
+  if (!renderQueue.length) return;
+  const batch = renderQueue;
+  renderQueue = [];
+  // The one layout read, for the whole batch. Taken before any of the batch's DOM work,
+  // so it answers "was the operator at the tail *before* this arrived" exactly as the
+  // per-notification version did.
+  const atBottom = termEl.scrollTop + termEl.clientHeight >= termEl.scrollHeight - 4;
+  let sawMarker = false;
+  for (const op of batch) {
+    if (op.t === "text") writeTerminalNow(op.s);
+    else {
+      appendMarkerNow(op.s);
+      sawMarker = true;
+    }
+  }
+  renderUnknownBadge();
+  // A marker scrolls unconditionally — it is the client speaking, and §5's honesty is
+  // only served if the operator sees it — which is what `appendMarker` did before it was
+  // batched.
+  if (atBottom || sawMarker) termEl.scrollTop = termEl.scrollHeight;
+}
+
+/// Everything a flush drops on the queue is discarded here as well as on screen: a
+/// selection tears the terminal down synchronously, and text queued for the console the
+/// operator just left must not be painted into the one they just chose.
+function discardQueuedRender() {
+  renderQueue = [];
+}
+
+function writeTerminalNow(s) {
   if (!s) return;
   const ops = parseAnsi(ansi, s);
   if (!ops.length) return;
-  const atBottom = termEl.scrollTop + termEl.clientHeight >= termEl.scrollHeight - 4;
   block = document.createElement("span");
   blockChars = 0;
   applyOps(ops);
@@ -1108,20 +1246,17 @@ function writeTerminal(s) {
   blockChars = 0;
   if (chars > 0) commitNode(node, chars);
   renderPending();
-  renderUnknownBadge();
-  if (atBottom) termEl.scrollTop = termEl.scrollHeight;
 }
 
 // A marker is an annotation *about* the stream, so it lands after the bytes already on
 // screen: freeze the incomplete line first rather than inserting in front of it.
-function appendMarker(s) {
+function appendMarkerNow(s) {
   commitPending(false);
   const span = document.createElement("span");
   span.className = "marker";
   span.textContent = s;
   commitNode(span, s.length);
   renderPending();
-  termEl.scrollTop = termEl.scrollHeight;
 }
 
 // One wording for one kind of hole, wherever it is noticed: bytes that existed in the
@@ -1189,11 +1324,19 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("pagehide", flushSave);
 
-/// The lock holder a refusal names, from the daemon's own answer first (`data.held_by`,
-/// which `locked_error` fills in) and from the live `state` second. `null` when nobody
-/// holds it — which is a real outcome for a LOCKED refusal (a `send` that timed out
-/// behind a queue, an endpoint torn down mid-send), and inventing a name for it is
-/// precisely what WEBUI-1 was.
+/// The lock holder a refusal names: the daemon's own answer first, the live `state`
+/// second. `null` when nobody holds it — which is a real outcome for a LOCKED refusal (a
+/// `send` that timed out behind a queue, an endpoint torn down mid-send, a write the
+/// target would not accept), and inventing a name for it is precisely what WEBUI-1 was.
+///
+/// **The first source is aspirational today and is kept deliberately.** This comment used
+/// to say `data.held_by` was filled in by `locked_error`; no such field is emitted
+/// anywhere in the workspace (`grep held_by` finds only `core/src/lock.rs`'s prose and an
+/// unrelated `held_bytes`), so every holder this function returns comes from the `state`
+/// snapshot. That is a *stale claim*, corrected here rather than left standing — but the
+/// branch stays, because a refusal that names its own holder is strictly better than one
+/// inferred from a snapshot that may be up to 200 ms old, and this is the site that would
+/// consume it the day §10 grows it.
 function holderOf(display, err) {
   const named = err && err.data ? err.data.held_by : null;
   if (named) return named;
@@ -1248,9 +1391,17 @@ sendForm.onsubmit = async (e) => {
     return;
   }
   const holder = holderOf(endpoint, err);
-  if (!stealBox.checked) {
-    // Declined by the standing preference. Say who holds it — that is the whole of what
-    // the dialog used to contribute — and leave the line in the box.
+  // **No holder, no steal**, whatever the preference says — and this is a rule about the
+  // verb, not a caution. `-32003` is the daemon's answer to three different situations
+  // (§6): the floor is held by someone else; the target would not accept the write inside
+  // the deadline (`targetward backpressure`); and the endpoint was torn down mid-send.
+  // Only the first has anything for a steal to take. Retrying the other two with
+  // `steal: true` re-runs the identical failure, and — worse — replaces the daemon's own
+  // words with a lock narration that was never true, which is WEBUI-1 exactly: the console
+  // telling the operator a false story about why their line did not land. So the steal
+  // follows the preference only where a holder is actually named; otherwise the refusal is
+  // reported in the daemon's words, which is what every other refusal already gets.
+  if (!stealBox.checked || !holder) {
     appendMarker(
       holder
         ? `\n— send refused: ${endpoint} is locked by ${holder}; tick "automatically ` +
@@ -1261,14 +1412,8 @@ sendForm.onsubmit = async (e) => {
   }
   // Announced before the retry, not after: a steal displaces another origin's floor
   // (§6), and §5's honesty says the operator sees that happen rather than inferring it
-  // from a line that went through. Named where it is nameable; a LOCKED refusal with no
-  // holder is a real outcome (a send that timed out behind a queue) and inventing a name
-  // for it is WEBUI-1.
-  appendMarker(
-    holder
-      ? `\n— stealing the write lock from ${holder} —\n`
-      : "\n— stealing the write lock —\n",
-  );
+  // from a line that went through.
+  appendMarker(`\n— stealing the write lock from ${holder} —\n`);
   const retry = await rpcFull("send", { endpoint, line, steal: true });
   if (retry && retry.error) {
     // The old code inspected nothing here, so an operator who accepted the steal saw

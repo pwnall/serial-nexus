@@ -63,12 +63,15 @@ const HOSE_BYTES: &str = "64MiB";
 /// The floor the browser suite must clear, **as a function of the fixture this gate
 /// built** (review 32 ITEST-4).
 ///
-/// `web/ui-tests/tests/` declares **29** specs (console 17, history 6, graph-editor 5,
+/// `web/ui-tests/tests/` declares **30** specs (console 18, history 6, graph-editor 5,
 /// lifecycle 1). Exactly **two** are tagged `@slow` and excluded per push
-/// (`--grep-invert @slow` below), leaving **27**; ten of those 27 `test.skip` themselves
-/// when the fixture has no serial device (`!ECHO` / `!HOSE`), leaving **17** that run on
-/// any platform. (The two added 2026-08-17 are §15.65's rail-click pair, both
-/// device-free, so both floors rise by exactly two.) (Eleven specs carry a device skip in all, but one of them is `@slow` and
+/// (`--grep-invert @slow` below), leaving **28**; eleven of those 28 `test.skip`
+/// themselves when the fixture has no serial device (`!ECHO` / `!HOSE`), leaving **17**
+/// that run on any platform. (Twelve carry a device skip in all; one of those is `@slow`
+/// and is not in the per-push run, so both counts above are per-push counts. Of the three
+/// specs added 2026-08-17, §15.65's rail-click pair is device-free and raises both floors
+/// by two; §15.67's paint-deferral spec needs a device to have produced a `tap.data` and
+/// so raises only `SPECS_WITH_DEVICE`.) (Eleven specs carry a device skip in all, but one of them is `@slow` and
 /// is not in the per-push run; both counts below are per-push counts. Recounted against
 /// the suite on 2026-08-12: this prose had said 23/21/11, four specs behind the tree,
 /// while the 15-passed/10-skipped measurement below — which is what 25 per-push specs
@@ -93,7 +96,7 @@ const HOSE_BYTES: &str = "64MiB";
 /// Re-measure both on a Linux rig and set them
 /// to the counts it reports; the comment above describes what they are *for*, and that
 /// intent is right even while the constants lag.
-const SPECS_WITH_DEVICE: usize = 24;
+const SPECS_WITH_DEVICE: usize = 25;
 const SPECS_DEVICE_FREE: usize = 14;
 
 #[test]

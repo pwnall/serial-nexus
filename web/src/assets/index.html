@@ -43,11 +43,14 @@
       <!-- §17 clause 3 / §15.66: the steal affordance is a standing, visible preference
            rather than a modal that interrupts the line it is asked about. Checked by
            default, and `checked` is set here rather than in script so the default holds
-           from the first paint. The title carries what the label has no room for. -->
+           from the first paint. The `title` carries what the label has no room for, and
+           it sits on the *input* rather than on the wrapping `<label>`: a title on the
+           label describes the label, and it is the control whose accessible description
+           an assistive technology reads out. -->
       <form id="sendform">
         <input id="sendline" type="text" placeholder="send a line…" autocomplete="off" disabled>
-        <label id="stealopt" title="When a line is refused because another origin holds the endpoint's write lock, take the lock and send it (§6). Unchecked, the refusal is reported and the line is put back in the box.">
-          <input id="stealbox" type="checkbox" checked>
+        <label id="stealopt">
+          <input id="stealbox" type="checkbox" checked title="When a line is refused because another origin holds the endpoint's write lock, take the lock and send it (§6). Unchecked — or when the refusal names no holder — the refusal is reported in the daemon's words and the line is put back in the box.">
           <span>automatically steal during line write</span>
         </label>
         <button id="sendbtn" type="submit" disabled>send</button>

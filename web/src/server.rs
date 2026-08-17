@@ -615,14 +615,26 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + 'static>(
         && let Some(asset) = crate::assets::lookup(&req.path)
     {
         // §15.64: a browser that already holds this exact body says so, and is told to
-        // keep it rather than being sent 53 KB of JavaScript it has. `If-None-Match` is
-        // a comma-separated list and `*` matches anything cached, both per RFC 9110
-        // §13.1.2 — and the value carries its own quotes, so this is a byte comparison
-        // and not a parse.
+        // keep it rather than being sent 53 KB of JavaScript it has. `If-None-Match` is a
+        // comma-separated list and `*` matches anything cached, both per RFC 9110 §13.1.2.
+        //
+        // **That section also requires the *weak* comparison function**, which is the one
+        // transformation this cannot skip: a peer is entitled to present `W/"x"` for a tag
+        // we issued as `"x"`, and a conformant server answers `304`. Our own tags are
+        // always strong (`assets.rs`), so stripping the prefix on the *request* side alone
+        // is exactly the weak comparison and can never grant a 304 that strong comparison
+        // would otherwise have refused. Nothing else needs parsing — the values carry
+        // their own quotes, so the rest is a byte comparison.
+        //
+        // *This was a strong comparison until it was reviewed, with the paragraph above
+        // citing §13.1.2 as licence for the very thing that section forbids.* It failed
+        // safe — a peer sending the weak form got a correct `200` and the pre-§15.64
+        // 116 876 B — but silently, which is the half that mattered: nothing in the tree
+        // could see that revalidation had stopped working for a class of peer.
         let known = req.header("if-none-match").is_some_and(|v| {
             v.split(',')
                 .map(str::trim)
-                .any(|t| t == asset.etag || t == "*")
+                .any(|t| t == "*" || t.strip_prefix("W/").unwrap_or(t) == asset.etag)
         });
         if known {
             return write_not_modified(&mut stream, asset.etag).await;

@@ -13181,3 +13181,89 @@ drive the property the way the product is actually driven, and plant the defect 
 The new guards press for 400 ms (two snapshots at 5 Hz) and, separately, stamp the row's DOM element
 and read the stamp a second later — the second one because "the click landed" is an outcome a future
 rebuild-plus-retry could reproduce while putting the defect straight back.
+
+### 3.115 A cost per notification, and a guard that measured the wrong instant
+
+The rail defect (§3.114) explained the operator's report, and the Nagle one (§3.113) explained a
+fixed 41 ms on every interaction. Neither explained what happens when a console is *busy*, and that
+turned out to be the largest number of the session.
+
+**Measure at a rate a real device produces, not at a rate that is convenient.** At 12.8 KiB/s —
+115200 baud — the client is idle: 2 notifications a second, 0 % of the main thread, and every
+interaction under 100 ms. That reading is true and it is the reason this was nearly missed. At
+**49 KiB/s**, which is an ordinary 460800-baud console, the same client spends **78 % of the main
+thread**, main-thread latency climbs to **1.1–2.6 s**, and a rail selection takes **15.4 s**. The
+step between those two rates is not gradual: work arriving faster than it drains does not degrade,
+it backs up.
+
+**The cost was per notification.** Ten notifications a second at ~120 ms each, carrying ~5 KB apiece
+— 23 µs per byte, which nothing in a text pipeline accounts for. `writeTerminal` brackets its DOM
+work with a *read* of the pane's scroll metrics, and reading a scroll metric forces a synchronous
+layout of a `<pre>` holding up to 256 KiB. That layout is paid once per call whatever the call
+carried. §15.67 has the construction; the summary is that arrivals are queued and drained once per
+animation frame, and the batch pays one layout.
+
+Two side effects worth recording because neither was the goal. Throughput **more than doubled**
+(49.0 → 110.9 KiB/s at the same 36 %-busy main thread), so the pane is no longer what limits how
+fast a console can be read. And the unpaced 64 MiB firehose — the fixture's worst case, which
+previously made a console selection take **17.9 s** — now answers in **79 ms**.
+
+**The guard I wrote first was vacuous, and I only know that because I ran it against the broken
+tree.** The property is *where* the paint happens, so the natural instrument is: record the
+terminal's length when a `tap.data` frame arrives, record it again once the client has handled the
+frame, and compare. I took the second reading in a `queueMicrotask`, reasoning that a microtask runs
+after every listener for the event. It does not: a microtask checkpoint runs whenever the JS stack
+empties, which is *between* listeners — so my reading was taken before `app.js`'s handler had run at
+all. The synchronous build reported `before === after` **six times out of six**, and the whole
+browser suite went green on a tree with the defect fully present.
+
+The working instrument brackets the client's handler with two listeners: one registered at
+construction, which precedes the `onmessage` `app.js` assigns, and one registered from a microtask,
+which therefore lands *after* it. The same measurement then reads `after > before`, six of six, on
+the broken tree and `after === before` on the fixed one. AGENTS §3 collects tells for gates that
+assert nothing; this session contributed two of them — a stimulus gentler than the product's
+(§3.114) and, here, an observation taken at the wrong instant *within* the task. Both were found the
+same way, which is the only way: plant the defect and watch the guard.
+
+### 3.116 What an adversarial pass over this session's own work found
+
+Five reviewers with different lenses over the changes, each finding verified by a separate agent
+that had the claim and the tree but not the diagnosis (AGENTS §9). Seven findings survived, all
+low-to-medium, and every one is the same shape: **a claim in a comment that the code beside it did
+not keep.** They are worth listing because none was found by running anything.
+
+* **A strong comparison under a citation that forbids it.** `If-None-Match` was compared byte for
+  byte, and the comment three lines above cited RFC 9110 §13.1.2 as licence — which is the section
+  whose text requires the *weak* comparison function. A peer presenting `W/"x"` for a tag issued as
+  `"x"` got a full re-send. It fails safe and it fails **silently**, which is why it needed a guard
+  and not just a fix.
+* **A test of the hash instead of the wiring.** `the_validator_follows_the_bytes` exercised `fnv1a`
+  directly. A validator derived from the request *path* would have passed it — and would have passed
+  the injectivity test too, since paths are distinct. Measured by planting exactly that: the
+  injectivity test stayed green and the strengthened test reddened.
+* **`-32003` is three situations, not one.** The daemon answers `LOCKED` for contention, for
+  targetward backpressure, and for a teardown mid-send. A defaulted-on steal would have retried the
+  latter two identically while replacing the daemon's own words with a lock narration that was never
+  true — WEBUI-1's exact failure, arriving through the door that finding did not cover. The
+  preference is now consulted only where a holder is *named*.
+* **A bound that batching widened.** `commitNode` never drops its last node, which was invisible
+  while a node was one notification's output and is not once a node is one flush's. Split at 32 KiB.
+* **Badges that reorder themselves.** Keyed rows create badges lazily and appended both, so a row
+  that saw waiters-without-a-holder and then a holder carried them in the opposite order. The
+  free-but-queued lock state is real — `release` nulls the holder and keeps the queue — so a 5 Hz
+  snapshot can observe it. Cosmetic, self-healing, and removed anyway.
+* **A comment naming a field that does not exist.** `holderOf` claimed `data.held_by` as its primary
+  source, "which `locked_error` fills in". `grep held_by` over the workspace finds prose and an
+  unrelated `held_bytes`; every holder the console has ever named came from the `state` snapshot.
+  The branch stays — a refusal that names its own holder beats one inferred from a snapshot up to
+  200 ms old — but the comment now says which of the two is real.
+* **A `title` on the wrong element**, and a spec-count parenthetical that contradicted its own
+  sentence.
+
+**One methodological mistake of mine is worth recording beside them.** AGENTS §9 requires that the
+tree not move while verification runs, and I was performing fail-first mutations *while* the
+reviewers read. Two verifiers duly "confirmed" a path-derived ETag that existed only in my planted
+defect, and a third — reading a moment later — refuted it with `web/src/assets.rs is byte-identical
+to HEAD`. The refutation was right and the confirmations were artefacts of my own edits. The rule
+is not a formality: a moving tree turns a verifier into a random number generator, which is what
+the v12 audit's 35-of-43 wrong verdicts were.
