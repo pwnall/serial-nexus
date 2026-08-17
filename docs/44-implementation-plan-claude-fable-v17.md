@@ -3617,6 +3617,28 @@ of six — so all five items are the web tier's.
     microtask checkpoint runs between event listeners, so the reading was taken before the client's
     handler had run.
 
+### Item 91 — filed, not fixed, by the web console latency session (2026-08-17)
+
+91. **The graph page is rebuilt from scratch five times a second** — **open** (S). *Evidence:*
+    `onMessage`'s `case "state"` calls `refreshTopology()` while the graph view shows, and that calls
+    `renderView()` on every snapshot — throttling only the `dump` *fetch* to 1 Hz, not the render. So
+    `graph.mjs`'s `root.replaceChildren()` and the whole card list run at the daemon's 5 Hz on a
+    graph where nothing changed, exactly as the rail did before §15.65.
+    *Why it is filed rather than fixed with its sibling:* §15.65's harm was **swallowed clicks**, and
+    `graph.mjs` has no click handler, no button and no input — checked, not assumed — so no
+    interaction can be lost there. What remains is wasted main-thread time proportional to the graph,
+    on a page an operator watches rather than drives. That is a different item with a different
+    justification, and folding it into a fix whose evidence is a measured click-loss rate would be
+    borrowing that evidence for a claim it does not support.
+    *What it needs first:* a measurement. Nobody has established that the graph page's rebuild costs
+    anything an operator notices, and §15.65's numbers say nothing about it — the rail is a handful
+    of `<li>`, the graph is a card per node and a row per edge. Measure a graph of the size this is
+    supposed to hurt at (dozens of nodes) before choosing between the three obvious answers: skip the
+    render when `graphModel(lastDump, lastState)` is unchanged, reconcile the cards as §15.65
+    reconciles the rows, or throttle the *render* to the same 1 Hz the `dump` fetch already uses.
+    *Do not "fix" this by throttling `state` itself:* the 5 Hz snapshot is §10's contract and the
+    rail's live status depends on it.
+
 ### Evaluated and deliberately not scheduled — the closing register
 
 Carried so the choices cannot be mistaken for oversights. Overturning any entry here is a
