@@ -562,6 +562,39 @@ fn crossover_rig_actual_baud_is_a_read_back_not_an_echo() {
         "rig @ {RIG_REFUSED_BAUD}: status={} reason={} baud={} actual_baud={}",
         node["status"], node["reason"], node["baud"], node["actual_baud"]
     );
+    // ---- A transport on which this property cannot be asked about. ----
+    //
+    // The arm below separates two causes of an `active` node; there is a third, and
+    // a CDC-ACM bench is it. `cdc_acm` accepted every rate P14 asked it for and
+    // reported each request straight back, so `actual_baud` **is** the echo this
+    // test is named against and no rung of any ladder can separate a read-back from
+    // one. Measured, not inferred from a driver name: on this pair P14 took 15 of
+    // the ladder's 16 body rungs — it stops at the first failure, so 12 Mbaud was
+    // never asked for — plus four refinements, without a single `adapter-refused`
+    // outcome, ceiling `unreliable-timed-out` at 6 Mbaud (§15.62, plan §18 item 82).
+    //
+    // So the property is **unmeasurable here rather than violated**, which is a
+    // skip with its reading printed — the same disposition a 3-wire bench gets, and
+    // for the same reason (§15.52: not wired is a valid answer). Keying the skip on
+    // the *reading* rather than on `ftdi_sio`-vs-`cdc_acm` is what stops it hiding a
+    // real regression: a port that still refuses the rung never reaches this arm,
+    // and a `serial2` that loosened its verification would surface as an `active`
+    // node whose `actual_baud` **diverged**, which falls through to the assert below
+    // exactly as before.
+    if node.get("status").and_then(Value::as_str) == Some("active")
+        && node.get("actual_baud") == node.get("baud")
+    {
+        eprintln!(
+            "SKIP crossover_rig_actual_baud_is_a_read_back_not_an_echo: this port \
+             accepted {RIG_REFUSED_BAUD} and reported it straight back \
+             (actual_baud={}), so this driver echoes the ask instead of reading the \
+             rate back and no rung separates the two. If this adapter refuses some \
+             rung, take it with `serial-nexus-doctor --port A --port B` (P14) and \
+             point `RIG_REFUSED_BAUD` at it: {node}",
+            node["actual_baud"]
+        );
+        return;
+    }
     assert_ne!(
         node.get("status").and_then(Value::as_str),
         Some("active"),
@@ -946,30 +979,61 @@ fn drive_rts_read_far(rpc: &serial_nexus_itest::Rpc, node: &str, far: &str, rts:
 /// `set-modem` fights the line discipline for the same pin, so the reading would be
 /// the discipline's answer rather than the wire's.
 fn handshake_measured(rpc: &serial_nexus_itest::Rpc) -> (bool, String) {
-    let measure = |near: &str, far: &str| -> (bool, String) {
+    // **P5's four cell words, not two.** `crosses()` in `doctor/src/probes.rs`
+    // reports `true` / `false` / `stuck-high` / `inverted` from exactly this pair
+    // of polarities, and this helper used to reduce them to carries/does-not-carry
+    // — so the comment below, which promises an operator will not have to
+    // translate between this line and a doctor report, was false in the one case
+    // where translating matters. A CDC-ACM bench reads `stuck-high` in both
+    // directions, and both instruments called a physically 5-wire rig 3-wire
+    // (§15.62, plan §18 item 80).
+    // **All five of P5's words, `?` included.** `read_modem_lines` returns `null`
+    // for the whole object when `TIOCMGET` fails (`daemon/src/nodes/serial.rs`), and
+    // an earlier spelling compared `== json!(true)`, which collapses `null` into
+    // `false`. That made a failed *high* reading indistinguishable from a measured
+    // low one, so a port whose modem reads were erroring could report `true` —
+    // a precondition claiming a crossing it never saw.
+    let cell_word = |hi: &Value, lo: &Value| -> &'static str {
+        match (hi.as_bool(), lo.as_bool()) {
+            (Some(true), Some(false)) => "true",
+            (Some(false), Some(false)) => "false",
+            (Some(true), Some(true)) => "stuck-high",
+            (Some(false), Some(true)) => "inverted",
+            _ => "?",
+        }
+    };
+    let measure = |near: &str, far: &str| -> (&'static str, String) {
         let hi = drive_rts_read_far(rpc, near, far, true);
         let lo = drive_rts_read_far(rpc, near, far, false);
-        let carries = hi["cts"] == json!(true) && lo["cts"] == json!(false);
+        let word = cell_word(&hi["cts"], &lo["cts"]);
         (
-            carries,
+            word,
             format!(
-                "{near} RTS high -> {far} cts={}, RTS low -> {far} cts={}: {}",
-                hi["cts"],
-                lo["cts"],
-                if carries { "carries" } else { "does not carry" }
+                "{near} RTS high -> {far} cts={}, RTS low -> {far} cts={}: {word}",
+                hi["cts"], lo["cts"],
             ),
         )
     };
     // `port1 → port0` first, because that is the direction the stall test's promise
     // rides on and a reader chasing a skip reads left to right.
-    let (b_to_a, b_cell) = measure("port1", "port0");
-    let (a_to_b, a_cell) = measure("port0", "port1");
+    let (b_word, b_cell) = measure("port1", "port0");
+    let (a_word, a_cell) = measure("port0", "port1");
+    let (b_to_a, a_to_b) = (b_word == "true", a_word == "true");
+    // A cell that answered `stuck-high`, `inverted` or anything else non-boolean
+    // said the instrument could not read the wire — never that the wire is bare.
+    let inconclusive = [b_word, a_word]
+        .iter()
+        .any(|w| *w != "true" && *w != "false");
     // P5's own vocabulary, deliberately: an operator holding this skip line and a
     // doctor report should not have to translate between them (§15.52).
     let shape = match (b_to_a, a_to_b) {
         (true, true) => "5-wire: RTS/CTS carries both ways",
         (true, false) => "HALF-CROSSED handshake: RTS/CTS carries port1->port0 only",
         (false, true) => "HALF-CROSSED handshake: RTS/CTS carries port0->port1 only",
+        (false, false) if inconclusive => {
+            "UNREADABLE handshake: RTS/CTS gave no usable reading at either drive \
+             level — this is not a 3-wire answer"
+        }
         (false, false) => "3-wire: no RTS/CTS handshake in either direction",
     };
     (b_to_a && a_to_b, format!("{shape} [{b_cell} | {a_cell}]"))
@@ -1747,7 +1811,6 @@ fn a_break_on_one_port_is_counted_at_the_far_ports_driver() {
     let rx1 = run_dir.join("rx1.log");
     let bytes_before = file_len(&rx1);
     let far_base = icount(&far_quiet, "brk");
-    let near_base = icount(&near_quiet, "brk");
 
     let echo = rpc
         .send_break("port0", BREAK_MS)
@@ -1758,8 +1821,16 @@ fn a_break_on_one_port_is_counted_at_the_far_ports_driver() {
     // status packet carrying it arrives on the adapter's own latency timer (16 ms by
     // default on an FT232R) rather than synchronously with the verb's return. The
     // poll is bounded by `OBSERVE` and the quiet control ran for exactly that long.
+    // Poll for the break on **any** of the three error counters, not on `brk`
+    // alone: which one a driver moves is its own choice (see `break_counter`
+    // below), and a poll that watches only `brk` burns the whole `OBSERVE` window
+    // on a driver that answers on `frame` and then reports `rose=false` about a
+    // break it did in fact receive.
     let rose = wait_until(OBSERVE, || {
-        icount(&driver_counters(rpc, "port1"), "brk") > far_base
+        let c = driver_counters(rpc, "port1");
+        icount(&c, "brk") > far_base
+            || icount(&c, "frame") > icount(&far_quiet, "frame")
+            || icount(&c, "parity") > icount(&far_quiet, "parity")
     });
     let far_after = driver_counters(rpc, "port1");
     let near_after = driver_counters(rpc, "port0");
@@ -1775,20 +1846,24 @@ fn a_break_on_one_port_is_counted_at_the_far_ports_driver() {
          {far_after}, near counters {near_after}"
     );
 
-    // The three readings this arm can produce are separated, because they are three
-    // different findings and they want three different next steps.
-    if brk_delta == 0 {
-        assert!(
-            frame_delta == 0 && parity_delta == 0,
-            "**REFUTATION, not a product defect.** The far port observed the break as \
-             a framing/parity error rather than as a break: brk +0, frame \
-             +{frame_delta}, parity +{parity_delta}. The pre-registration for this \
-             test named `brk`, on the reading of `ftdi_sio`'s error handling that \
-             break takes precedence over parity which takes precedence over framing. \
-             That precedence is what is refuted; break *reception* is confirmed, and \
-             the assertion below should be rewritten to name the counter this driver \
-             actually moves. Record the reading before changing anything (AGENTS §9)"
-        );
+    // **Which counter a driver moves for a received break is the driver's choice,
+    // and this test now names the one it found rather than the one it expected.**
+    // The pre-registration named `brk`, on `ftdi_sio`'s precedence — break over
+    // parity over framing. That precedence is **refuted**: on `cdc_acm` a 250 ms
+    // break arrives as a *framing* error, brk +0 frame +1 parity +0, measured on a
+    // CDC-ACM crossover 2026-08-16 (§15.62, plan §18 item 81). Break *reception* is
+    // confirmed on both drivers, which is the clause §15.21 actually asks about;
+    // only the counter differs, so the counter is the parameter.
+    //
+    // The genuinely-nothing case keeps its own panic and its own next step, because
+    // "answered on a different counter" and "did not answer" are two findings.
+    let break_counter = if brk_delta > 0 {
+        "brk"
+    } else if frame_delta > 0 {
+        "frame"
+    } else if parity_delta > 0 {
+        "parity"
+    } else {
         panic!(
             "the far port observed **nothing** from a {BREAK_MS} ms break asserted on \
              port0 (rose={rose}): brk, frame and parity all unmoved on port1, and \
@@ -1799,32 +1874,67 @@ fn a_break_on_one_port_is_counted_at_the_far_ports_driver() {
              and is worth recording as such rather than repairing blindly. \
              far={far_after} near={near_after}"
         );
+    };
+    if break_counter != "brk" {
+        eprintln!(
+            "REFUTED and recorded rather than repaired: this driver reports a received \
+             break on `{break_counter}` (brk +{brk_delta} frame +{frame_delta} parity \
+             +{parity_delta}), so `ftdi_sio`'s break-over-parity-over-framing \
+             precedence is not universal. Reception is confirmed either way"
+        );
+    }
+    // **The idle-window control, re-run against the counter that actually carries
+    // the signal.** Control 1 above watches `brk`; on a driver that answers on
+    // `frame`, `brk` being quiet says nothing about the counter this test is now
+    // reading, and a framing counter that free-runs would let `break_counter` be
+    // chosen by noise and its rise attributed to the verb. The snapshots are
+    // already in hand, so this costs nothing but the assertion.
+    for (node, before, after) in [
+        ("port0", &near_before, &near_quiet),
+        ("port1", &far_before, &far_quiet),
+    ] {
+        assert_eq!(
+            icount(before, break_counter),
+            icount(after, break_counter),
+            "{node}'s `{break_counter}` counter — the one this driver moves for a \
+             received break — free-ran across a {QUIET:?} idle window ({before} -> \
+             {after}), so the rise attributed to the break verb is not attributable \
+             to it"
+        );
     }
 
     // ---- Control 2: quiet in space. ----
     assert_eq!(
-        icount(&near_after, "brk"),
-        near_base,
+        icount(&near_after, break_counter),
+        icount(&near_quiet, break_counter),
         "the **transmitting** port counted a break on its own receiver while it was \
-         asserting one ({near_base} -> {}). Its RX is wired to the far port's TX, \
-         which was idle, so this rig is not the crossover the variables claim — a \
-         loopback, or an adapter echoing its own TX — and the far-side rise above \
-         proves nothing about a wire: near={near_after}",
-        icount(&near_after, "brk")
+         asserting one ({} -> {}, counter `{break_counter}`). Its RX is wired to the \
+         far port's TX, which was idle, so this rig is not the crossover the \
+         variables claim — a loopback, or an adapter echoing its own TX — and the \
+         far-side rise above proves nothing about a wire: near={near_after}",
+        icount(&near_quiet, break_counter),
+        icount(&near_after, break_counter)
     );
 
     // ---- Recorded, never asserted: what the delta's size tracks. ----
-    let short_base = icount(&far_after, "brk");
+    let short_base = icount(&far_after, break_counter);
     const SHORT_BREAK_MS: u64 = 25;
     rpc.send_break("port0", SHORT_BREAK_MS)
         .expect("the second, shorter send-break");
     wait_until(OBSERVE, || {
-        icount(&driver_counters(rpc, "port1"), "brk") > short_base
+        icount(&driver_counters(rpc, "port1"), break_counter) > short_base
     });
-    let short_delta = icount(&driver_counters(rpc, "port1"), "brk") - short_base;
+    let short_delta = icount(&driver_counters(rpc, "port1"), break_counter) - short_base;
+    let long_delta = if break_counter == "brk" {
+        brk_delta
+    } else if break_counter == "frame" {
+        frame_delta
+    } else {
+        parity_delta
+    };
     eprintln!(
-        "recorded, never asserted: a {BREAK_MS} ms break moved port1's brk by \
-         {brk_delta} and a {SHORT_BREAK_MS} ms one by {short_delta}. Equal deltas mean \
+        "recorded, never asserted: a {BREAK_MS} ms break moved port1's {break_counter} by \
+         {long_delta} and a {SHORT_BREAK_MS} ms one by {short_delta}. Equal deltas mean \
          the driver counts one per break *event*; a delta that scales with duration \
          means it counts one per flagged USB packet. Measured 1 and 1 on this bench — \
          per event — and re-measured here every run rather than remembered, because \
@@ -2032,12 +2142,16 @@ fn a_parity_mismatch_is_counted_at_the_far_ports_driver() {
     match (noticed, intact) {
         (true, true) => eprintln!(
             "the receiver counted the mismatch (parity +{parity_delta}, frame \
-             +{frame_delta}) and delivered the payload byte-exact — the expected \
-             reading on ftdi_sio / Linux 7.0.0-29. The counter and the per-character \
-             TTY_PARITY flag are independent in this driver, so IGNPAR — set, and read \
-             back verified: iflag 0x5 on both ports in \
-             docs/doctor/linux-7.0-2026-08-14-b58a1c4-tier3.json, P15 — never receives \
-             a flagged character to drop. §15.21's clause is answered COUNTED, NOT LOST"
+             +{frame_delta}) and delivered the payload byte-exact. §15.21's clause is \
+             answered COUNTED, NOT LOST. The mechanism, where it has been measured: on \
+             `ftdi_sio` / Linux 7.0.0-29 the counter and the per-character TTY_PARITY \
+             flag are independent, so `IGNPAR` — set, and read-back verified as iflag \
+             0x5 on both ports in docs/doctor/linux-7.0-2026-08-14-b58a1c4-tier3.json, \
+             P15 — never receives a flagged character to drop. **That artifact is an \
+             FTDI pair's**, so it explains this arm rather than certifying it: on any \
+             other adapter the same reading is this run's own measurement and the \
+             mechanism behind it is unmeasured here (§15.62 — do not diff a cell across \
+             transports)"
         ),
         (true, false) => eprintln!(
             "the receiver counted the mismatch (parity +{parity_delta}, frame \

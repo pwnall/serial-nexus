@@ -892,7 +892,11 @@ modem-line assertions, and hostward-consumer drop policy — including `hostward
 per-node hostward buffer (a depth in chunks) that plan §3's completeness doctrine provisions.
 State: resolved `/dev` path, status, daemon discard counters, driver overrun counters where the
 kernel supports them (`TIOCGICOUNT`, surfaced beside the daemon's own counters per §5), and current
-modem-line readings. Write arbitration is deliberately not restated here: acquisition, idle
+modem-line readings — which are `TIOCMGET`'s answer and therefore the *driver's*, not the wire's:
+on `cdc_acm` the CTS bit is synthesised and reads asserted unconditionally, even with the peer
+closed, because the CDC `SERIAL_STATE` notification has no CTS field to carry it (§15.62). Reported,
+never judged; no verdict in this tree moves on a modem line. Write arbitration is deliberately not
+restated here: acquisition, idle
 release, and a peer disconnect releasing an implicitly-held floor are §6's Write modes (clause 2),
 and thirteen code sites once cited this section for that rule — one of them quoting a sentence
 this section has never contained (notes §3.75).
@@ -955,6 +959,15 @@ this section has never contained (notes §3.75).
    platform the field earns its keep as *the `null` that refuses to claim a rate*, plus the truthful
    answer wherever a driver reports a quantized one; the wire's realized rate stays P14's
    `achieved_baud_floor`.
+   **Scoped 2026-08-16 (§15.62): the example above is `ftdi_sio`'s, and the field's usefulness is
+   the driver's to grant.** `cdc_acm` accepted every rate P14 asked it for and reported each ask
+   straight back — measured `status="active" baud=4000000 actual_baud=4000000`, over 15 of the
+   ladder's 16 body rungs plus four refinements on that pair, without one `adapter-refused`
+   outcome. (Every rate *tried*, not every rate the field can spell: the field spells `1 ..= u32::MAX`
+   and the highest rate ever asked here was 8 Mbaud.) There
+   `actual_baud` is exactly the echo this clause distinguishes itself from, so it carries no
+   information and the suite's guard **skips on the measured reading** rather than failing: the
+   property is unmeasurable on that transport, not violated by it.
 
 **Ordered release.** Giving back what the node asserted *on the tty* belongs to the port rather
 than to whichever exit path someone remembered:
@@ -4104,8 +4117,11 @@ was computed from four of the six crossings it prints (B→A was measured agains
 missing crossings are now measured, the pre-registered reading holding exactly
 (`dtr_b_to_dcd_a=false`, `dtr_b_to_ri_a=false`, verdict unchanged) — and neither digest could see
 the change, because the handshake is one string cell: the residual blindness §13 names.
-**Re-measured (notes §3.80, 2026-08-12):** the same adapter pair, same probe, same `probe_set`
-era answered **3-wire** — no handshake lines carried — by two independent instruments: P5's
+**Re-measured (notes §3.80, 2026-08-12):** a different adapter pair (`ABSCDGL6` ↔ `BH00L4KU` —
+this clause read "the same adapter pair" until 2026-08-16 and **contradicted the paragraph twelve
+lines below it**, which has always named both pairs correctly; the error originates in notes §3.80,
+which says "this same adapter pair" twenty lines after recording `ABSCDGL6` on that bench), same
+probe, same `probe_set` era answered **3-wire** — no handshake lines carried — by two independent instruments: P5's
 port-to-port continuity, and the daemon-path RTS/CTS read whose positive control (`rts: true`,
 both polarities) proves the reader lives. The cabling explanation is favoured, not proven; no
 diagnosis is claimed. The 5-wire discovery above stays what it was — a dated record of that bench
@@ -4131,6 +4147,11 @@ That is rule 14 working, and it has a consequence worth stating plainly — **no
 tell a 5-wire bench from a 3-wire one, by design.** The only instruments that can are the committed
 P5 artifact and the two `rts-cts` end-to-end tests under `SNX_RIG_FLOW=required`, which is the whole
 reason that spelling exists and not a redundancy in it.
+**Scoped 2026-08-16 (§15.62):** that last sentence is `ftdi_sio`'s. Both named instruments read CTS
+through `TIOCMGET`, and on `cdc_acm` the driver synthesises that bit — so on a CDC-ACM bench
+**neither can tell**, and a physically 5-wire rig read `stuck-high` in both directions. The
+instruments are not wrong; their subject has to be able to report CTS, and one whole device class
+cannot. §15.62 carries the reading, the vocabulary repair, and the scope.
 
 ### 15.53 A transport's contract is refused, not degraded: hardware flow control at load
 
@@ -4573,6 +4594,123 @@ rule), and calling it one here would be the mistake this document keeps catalogu
 no era row is owed — which is precisely why this entry exists: the answer came from reading
 committed artifacts rather than from taking a new measurement, and an answer nobody wrote down is
 one the next session pays for again.
+
+### 15.62 A transport that cannot report CTS, and the vocabulary that mistook it for a bare cable
+
+**Status:** DECIDED — scopes §15.52's closing claim and §7.1's `modem_lines`/`actual_baud` clauses;
+annotates neither away. Construction is plan §18 items 80–83.
+
+**The hardware.** Two WCH `1a86:55d3` adapters — `bDeviceClass=02`, two interfaces, bound to
+`cdc_acm`, enumerating `/dev/ttyACM0` and `/dev/ttyACM1` — cabled by the operator as a **5-wire**
+crossover and attached 2026-08-16. The adapter pair is new to the record and shares nothing with
+`BH00L4KU`/`BH00LW9U`: chip, driver, device class, node name, cable and pair all moved at once, so
+**no cell here may be diffed against a `ttyUSB` row** as though one variable had.
+
+**What was measured, before any of it was diagnosed.** Data crosses byte-exact in both directions,
+so TX/RX are genuinely wired. But CTS, read through `TIOCMGET`, is **asserted in every state**: at
+both drive levels of the peer's RTS, in every one of the eight drive states an independent probe put
+it through (two owners x two lines x two levels), and *with the peer closed entirely*. It never once
+read low. (Eight *drive states*, not eight P5 cells — P5 prints eight cells of which only two are
+CTS, and both read `stuck-high`.) `CRTSCTS` is accepted and **persists in the `termios` read-back**, and does
+nothing: a 2×2 control — peer RTS low/high × `CRTSCTS` on/off, peer never reading — wrote **44672
+bytes in every one of the four cells, spread 0**. The first reading of that experiment was a
+*stall*, and the stall was buffer backpressure from a peer that was not reading; the control is
+what separated them. This is §6's rule in a new register: the symptom was reproducible and the
+mechanism was elsewhere.
+
+The mechanism, not the symptom (the discipline item 76 established) — and this half is a
+**specification** fact, cited rather than measured, flagged so it is not read as another reading:
+the CDC PSTN `SERIAL_STATE` notification carries `bRxCarrier`, `bTxCarrier`, `bBreak`,
+`bRingSignal` and the error bits — and **no CTS field at all**. There is no wire-format in which a conforming CDC-ACM device *can* report
+CTS, so the bit `TIOCMGET` returns is manufactured rather than read.
+
+**The defect this exposed is ours, and it is a vocabulary defect.** `p5_handshake`'s `crosses()`
+already returned five distinct strings — `true`, `false`, `stuck-high`, `inverted`, `?` — and the
+shape fold tested only `== "true"`, putting the last three in the same bucket as a *measured*
+`false`. So a bench whose cells read `rts_a_to_cts_b=stuck-high rts_b_to_cts_a=stuck-high` was
+printed as **`3-wire: no handshake lines carried`** — a claim about the cable, from a reading that
+says only *the instrument could not see it*, with the contradicting cells sitting in the same
+string. The suite's `handshake_measured` had the same hole and a worse one: its comment promised an
+operator would not have to translate between it and a doctor report (§15.52), while it carried two
+cell words against P5's four, so it could not express `stuck-high` at all.
+
+**The rule, stated once so it generalizes past this transport:** *a shape sentence may assert a
+negative only about cells that answered.* Where a cell is `stuck-high`, `inverted` or `?`, the
+sentence says the reading is not determinable and never that the line is bare. Both instruments now
+carry `UNREADABLE handshake: RTS/CTS gave no usable reading at either drive level — this is not a
+3-wire answer`, and `3-wire: no handshake lines carried` is kept byte-for-byte for the all-`false`
+case, which is the design's stated common case and rides in committed artifacts.
+
+**§15.52's closing claim is scoped, not withdrawn.** It reads: *no gate in this tree can tell a
+5-wire bench from a 3-wire one, by design — the only instruments that can are the committed P5
+artifact and the two `rts-cts` end-to-end tests under `SNX_RIG_FLOW=required`.* True on `ftdi_sio`.
+**False on `cdc_acm`, where neither can**, because both read CTS through `TIOCMGET` and that is the
+path the driver synthesises. The correct reading of this bench is *not determinable by any
+instrument here*, and `SNX_RIG_FLOW=required` must be dropped on it — which is the same action a
+3-wire bench calls for, arrived at for a different reason and now said in different words. An
+operator who reads "3-wire" and re-crimps a correct cable is the harm this entry exists to prevent.
+
+**Four product-facing consequences follow. Three are narrowings of promises that were stated flat;
+the fourth is a gap this entry files rather than closes.**
+
+1. **§7.1's `modem_lines.cts` is transport-dependent.** The daemon reads it with the same
+   `TIOCMGET` (`sys/src/lib.rs:166`), so on any `/dev/ttyACM*` node `state` reports `cts: true`
+   unconditionally. The field is not wrong on FTDI and is not a reading anywhere on CDC-ACM. It is
+   **reported, never judged** — no verdict moves on it — but a document that promises "current
+   modem-line readings" without this scope is promising more than the kernel can supply.
+2. **§7.1 clause 7's `actual_baud` example is `ftdi_sio`'s.** The corrected example there — a
+   4 Mbaud ask *failing* on a 9600-capable adapter because `serial2` verifies `set_configuration`
+   by ±2.5 % read-back — depends on a driver that reports back what it will really run. `cdc_acm`
+   echoes the ask: measured `status="active" baud=4000000 actual_baud=4000000`, and P14 accepted
+   **every rate it tried** — 15 of the ladder's 16 body rungs (the search stops at the first failing
+   rung, so 12 Mbaud was never asked for) plus four refinements — **without one `adapter-refused`
+   outcome anywhere**, ceiling `unreliable-timed-out` at 6 Mbaud. That ceiling is quoted from the
+   capture whose search **completed**; the earlier one on the same bench hit its budget and its own
+   verdict disclaims its ceiling as *interrupted*, so it is evidence for the absent refusals and not
+   for the number. On such a transport `actual_baud` *is* the echo the suite's guard is named
+   against, so that property is **unmeasurable there rather than violated** — a skip with its
+   reading printed, keyed on the reading and never on a driver name.
+3. **Break reception is confirmed on both drivers; the counter is not the same one.** `ftdi_sio`'s
+   break-over-parity-over-framing precedence does not hold on `cdc_acm`, which reports a 250 ms
+   break as **`frame` +1, `brk` +0**. §15.21's clause asks whether a break is *received*, and it is;
+   the guard now names the counter it found and re-runs its idle-window control against that
+   counter, so a driver with a free-running framing count cannot have noise chosen for it.
+4. **§15.53's refusal does not protect an operator on this transport, and that is filed, not fixed**
+   (plan §18 item 85). The refusal is built on a read-back: a driver that *accepts* `CRTSCTS` and
+   then drops it from `c_cflag` is `AcceptedThenDropped` and is refused at `load`. `cdc_acm` does
+   neither — it accepts the flag and **keeps** it, measured on both ports of this bench as
+   `honoured_on_readback: true` with a `c_cflag` delta of exactly `0x80000000`, so
+   `serial_nexus_sys::honours_rtscts` answers **`Honoured`** and the daemon loads an `rts-cts` node
+   without complaint. The 2×2 above says that flag does nothing. So this is a **third** state the
+   predicate's two-valued world has no name for — *honoured on paper, inert on the wire* — and it is
+   the §15.61 shape one transport over, with the polarity that matters reversed: §15.61's driver
+   lied by dropping the flag, this one lies by keeping it. **No read-back can catch it**, because
+   the read-back is exactly what the driver satisfies; separating them needs a peer and a transfer,
+   which a load-time pre-check does not have. Recording it as a known limit is therefore the honest
+   disposition, and closing it is a design decision about whether `flow_control` gains a
+   *functionally verified* tier — not a patch.
+
+**A cost, measured and partly repaired.** One P14 search on this pair ran **2089 s** against a
+`P14_BUDGET` documented as "a hard wall-clock stop on the whole search" — of which only **26.9 s**
+was trials. The remainder was inside the rate-apply: `serial2` configures with `TCSETSW`, the
+*drain* spelling, so the call waits for queued output to leave at a rate the adapter accepted and
+cannot achieve. Discarding the output buffer before the ask removes the wait, and **that is the
+whole repair** — the same capture on the same bench, 4148 s to 86.6 s. Two honest caveats on that
+pair: n=1 per side, and P14's *search* is only half of it (2089 s of the 4148 s), the rest being the
+same drain in the baseline restore, which runs after `search_elapsed_ms` is stamped. The post-fix
+run also did strictly **more** work — 19 rungs against 17 — so the ratio understates the repair
+rather than flattering it. The constant's doc now states
+the bound its placement can actually deliver, "the budget plus at most one rung", instead of the
+stronger thing it claimed. A second budget check at the top of the search loop was written and then
+**removed by this entry's own adversarial pass**: the pre-existing check at the loop's end already
+guarantees no rung *begins* over budget, so the new one could never fire — passing behaviour
+identical to not-running behaviour, which is the tell this very entry documents two fresh instances
+of. Keeping it would have been the third.
+
+**No era is owed.** `probe_set` reads `4317ea5ac187f506` on every capture from this bench: the
+roster did not move, and §13's era law turns on the roster and not on the hardware. `field_set`
+does move — adapter identities ride as observation *keys* — which is the ladder working as
+described, not an era event.
 
 ## 16. Post-completion review: reliability through simplification
 

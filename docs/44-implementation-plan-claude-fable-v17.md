@@ -31,6 +31,7 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 
 | Figure | Scope | Date | Commit / record | Caveat |
 |---|---|---|---|---|
+| **1040 passing · 0 failed · 7 ignored**, 129 test-result lines over 125 cargo targets (117 `Running` + 8 doc-test) — **4 self-skips on the rig lane against ~16 at default scope**, the same tree measured at both scopes in one session | Linux, **CDC-ACM rig lane** — `SNX_CROSSOVER`/`SNX_REPLUG`/`SNX_TLS`/`SNX_EXEC_CODEC`/`SNX_WEB_UI` all `required`, **`SNX_RIG_FLOW` dropped**, `--no-fail-fast`, `--nocapture`; **and** default CI scope (`SNX_EXEC_CODEC=required`, `SNX_TLS=required`) on the identical tree | 2026-08-16 | the CDC-ACM bench session (notes §3.112, design §15.62) | **A new adapter class, and not comparable test-for-test with any row below.** The bench is a WCH `1a86:55d3` pair on `cdc_acm` at `/dev/ttyACM0`/`ttyACM1` — chip, driver, device class, node name, cable and adapter pair all differ from the `BH00L4KU`/`BH00LW9U` FTDI pair every other Linux row rests on. **The two scopes give the same pass count on purpose:** a self-skip prints and returns `ok`, so it counts as a pass, and the scopes separate only in *skip count* — 4 against ~16. That is item 30's dual-scope shape, and **no delta is derived across the scopes**. **The +36 over the 1004 row is not this session's and is not decomposed here:** this session adds **zero** `#[test]` functions (checkable from its diff — it adds assertions inside one existing doctor test and nothing else), so the delta belongs to the commits between 2026-08-14 and `8759516`, whose far end nobody measured in this session. **`SNX_RIG_FLOW` is dropped legitimately, not chosen around:** this bench measures `UNREADABLE`, not 3-wire, and no instrument in this tree can read CTS on `cdc_acm` (§15.62) — the two `rts-cts` tests skip with that word printed. `SNX_WEB_UI=required` genuinely ran: the pinned Playwright package and Chromium were installed for it. **Quote the skip counts as approximate**: one name came back spliced as `crossover_rig_actual_baud_is_a_read_back_not_an_echotest` under `--nocapture`, a third instance of notes §3.101's interleaving class, so 16 is a floor rather than an exact count; 4 and ~16 differ by enough that the gap survives the noise. |
 | **1004 passing · 0 failed · 7 ignored**, 126 test-result lines, **14 self-skips** | Linux, default CI scope, `--no-fail-fast`, `--nocapture`, `SNX_EXEC_CODEC=required`, `SNX_TLS=required` | 2026-08-14 | the 5-wire re-cable session, `b58a1c4b7fc8` + this session's doc edits (notes §3.102) | **the Linux default-scope authority row**, and the run that turns §3.101's skip-count instability from an inference into a **direct observation**. 126 result lines over 122 targets (114 `Running` + 8 doc-test). Name extraction yields **13**; the fourteenth, `crossover_rig_signal_verbs`, has **zero** `SKIP <name>` occurrences — and it is identifiable anyway, because the splice that destroyed it is legible in the log: `SKIP test crossover_rig_data_plane_send_and_exclusivity ... crossover_rig_signal_verbsok: no crossover rig (`, which is a `SKIP crossover_rig_signal_verbs: …` line and a `test crossover_rig_data_plane_… ok` line interleaved mid-write by two parallel binaries. **The two prior instances inferred the missing line from "this test must have skipped"; this one shows the interleave itself**, so the 14 the row above carried as a *union across two runs and a floor* is here a single run's actual figure. The instrument is unchanged and still must not be quoted precisely — a splice that landed one byte differently would have destroyed both names instead of one. Same 1004 · 0 · 7 as the rig row above, at the same code (docs-only delta), same session, same box. Supersedes the row below. |
 | **1004 passing · 0 failed · 7 ignored**, 126 test-result lines | Linux, default CI scope, `--no-fail-fast`, `--nocapture`, `SNX_EXEC_CODEC=required`, `SNX_TLS=required` | 2026-08-14 | the macOS-tree validation session (notes §3.101) | **superseded by the row above**, which reproduced this figure at the same code and turned this row's inferred skip count into a directly observed one. Kept because it is the row that established the floor and decomposed the +5. Formerly the Linux authority row. 126 result lines over **122 cargo targets** (114 `Running` + 8 doc-test) and **at least 14 self-skips — a lower bound, deliberately, because the count is not stably obtainable and the "13" carried by every Linux row below is an undercount.** Two runs of *this same tree* read 13 by `grep -c '^SKIP'` and 13 and 14 by a name-extracting grep, and their **name sets differ**: run one is missing `rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes` and run two is missing `crossover_rig_custom_baud_byte_exact`, each absent from its own log *in any form* while both tests must self-skip at this scope (no `SNX_CROSSOVER_A`/`_B`). Their union is 14 and even that is a floor, since a line mangled in both runs is invisible to both. **This is the first Linux instance of the class AGENTS §3 had recorded only for macOS** — under `--nocapture` the suite's parallel binaries interleave writes and break the line anchor mid-message — so the rule "do not quote that skip count precisely" is not a macOS caveat but a property of the instrument (notes §3.101, extending §3.78). **Both ends were measured in this session, so the +5 over the 999 row is quotable rather than reconstructed**: the macOS session's tree read **1003** here before any change of this session's, and it decomposes exactly — four of its new guards compile and run on Linux (`peer_hungup`'s `sys` self-test and the software-arm `sys` test, item 66/67; the `xon-xoff` rig guard, which self-skips at this scope and so *passes*; and `process_cpu_nanos`'s self-test, item 12), while the fifth is this session's `a_held_pts_index_is_never_reallocated_to_a_new_pair` (item 72). **Two of that session's changes are deliberately invisible in this column**: `a_bare_hangup_leaves_the_daemon_cpu_bounded` and `cpu_nanos_reads_this_process_and_never_goes_backwards` were each a `cfg`-paired test before item 12 ungated them, so Linux counted one either way — read them in the skip set, not the total. Item 46's guard reads **0.0792 %/fd** marginal against its 0.1274 %/fd ceiling under full suite parallelism (2.30 % at 8 idle tty fds, 4.20 % at 32), within the band of the artifact's 0.0728 %/fd; `p9_pty_collapse`'s anti-spin guard reads 2.00 % of a core against its 10 % ceiling. Supersedes the 999 row. |
 | **999 passing · 0 failed · 7 ignored**, 126 test-result lines | Linux, default CI scope, `--no-fail-fast`, `--nocapture`, `SNX_EXEC_CODEC=required`, `SNX_TLS=required` | 2026-08-13 | the alignment-pass session's second half (notes §3.87–§3.91) | **superseded by the 1004 row above.** 126 result lines over **122 cargo targets** (114 `Running` + 8 doc-test) and **13 self-skips**. The +32 over the 967 row is this half's work: P16 and P15's software reading, the packaging gate's six, the harness primitives' self-tests, the tap-ack pair (item 59a), the orphan sweep's own proof, and the parked-child exit guard. `SNX_TLS=required` joins the scope for the first time — it was set by no lane at all until item 60(a). **Orphan-clean, and that is now asserted rather than observed:** every `Daemon` sweeps its process group at drop and panics naming survivors, after a run of this suite left 3 processes behind per invocation and 260 on the box (item 65). Supersedes the 967 row. |
@@ -3338,8 +3339,8 @@ number, because the next review cannot check that an unnumbered defect was fixed
 
 ### Item 78 — filed by the privilege inventory (2026-08-15)
 
-78. **The `/dev/ttyACM*` half of the dialout claim** — **open** (S; needs a **CDC-ACM device**,
-    not privilege). Split out of item 31 on 2026-08-15, because that item is routed as "needs a
+78. **The `/dev/ttyACM*` half of the dialout claim** — **(a) EXECUTED 2026-08-16; (b) open**
+    (S; needed a **CDC-ACM device**, not privilege). Split out of item 31 on 2026-08-15, because that item is routed as "needs a
     root box" and root cannot conjure a device node — leaving this clause inside it made the
     blocker unactionable and that item un-closable for a reason unrelated to its subject.
     *Evidence:* `packaging/README.md`'s `SupplementaryGroups=` row reads `measured (partially)` —
@@ -3363,6 +3364,24 @@ number, because the next review cannot check that an unnumbered defect was fixed
     `ls -l` and the resolving udev rule, and move the README row from `measured (partially)` to
     `measured` with its scope named. Reported-never-judged where no such device is attached — this
     must **not** become a fifth `required` spelling, since a box without the device is not a fault.
+    ***(a) EXECUTED 2026-08-16.*** A CDC-ACM pair arrived (WCH `1a86:55d3`, driver `cdc_acm`; the
+    §15.62 bench). Measured: `crw-rw---- 1 root dialout 166, 0 /dev/ttyACM0`, mode **0660**, group
+    **dialout**, resolved by `/usr/lib/udev/rules.d/50-udev-default.rules:47` — the same rule the
+    item quotes, and it sets no `MODE=`. So the driver default is 0660 on **major 166** exactly as
+    it is on `ftdi_sio`'s 188, and the `SupplementaryGroups=dialout` the unit depends on is now
+    measured for both node families rather than for one plus an inference. The README row is
+    `measured` with its scope named: one box, one distro (Ubuntu, udev 259), two drivers, two
+    majors. **The declined inference turned out to give the right answer** — which is not a reason
+    it should have been taken, and is worth recording precisely because a correct guess is the
+    case that makes declining look like ceremony.
+    *No `required` spelling was added*, per the clause above.
+    ***(b) remains open*** and its disposition is unchanged: the `uucp` remark
+    (`packaging/serial-nexus-daemon.service:37`, "If your distro uses `uucp` instead, change it
+    here") is a claim about distros this project has never booted, and this bench does not touch
+    it. A recorded decline — or a rewrite that drops the distro claim while keeping the operator
+    hint — stays the legitimate ending. **Not taken in this session on purpose:** the hardware
+    answered (a) and says nothing about (b), and closing (b) on the momentum of (a) would be
+    exactly the inference the item declined.
 
 ### Item 79 — filed by the final code batch (2026-08-15)
 
@@ -3382,6 +3401,133 @@ number, because the next review cannot check that an unnumbered defect was fixed
     writing vacuous guards, and a third copy is a hazard, not a defect: no behaviour is wrong today.
     *Validation:* one implementation, both callers on it, proven by a single planted defect reddening
     a guard on each side — the shape item 59(d)'s hoist used.
+
+### Items 80–83 — filed and executed by the CDC-ACM bench session (2026-08-16)
+
+All four were found by attaching a device class the record had never held, and all four are
+**executed** in the same session. They are filed rather than folded into one because they are four
+different mechanisms and a later reader chasing any one of them wants its own evidence.
+
+80. **The handshake vocabulary asserted a bare cable from an unreadable line** — **EXECUTED
+    2026-08-16** (§15.62). *Evidence:* `p5_handshake`'s `crosses()` returns five strings and the
+    shape fold tested `== "true"`, so `stuck-high` / `inverted` / `?` shared a bucket with a
+    measured `false`. On a physically 5-wire CDC-ACM bench the shipped binary printed
+    `3-wire: no handshake lines carried [rts_a_to_cts_b=stuck-high rts_b_to_cts_a=stuck-high …]` —
+    a claim about the cable, contradicted by the cells in the same string. `handshake_measured`
+    (`itest/tests/serial_hardware.rs`) had two cell words against P5's four while its comment
+    promised an operator would not have to translate between them, so it could not express the
+    state at all. *Fix:* a three-state `CellReading` (`Carries` / `Absent` / `Inconclusive`) in the
+    doctor and P5's four cell words in the suite; both now print `UNREADABLE handshake: …`, and
+    `3-wire: no handshake lines carried` is kept byte-for-byte for the all-`false` case so
+    committed artifacts and `expectation_gates.rs`'s fixture are unmoved. The same session's two
+    harness blind spots ride here: `p7_replug_hardware.rs`'s `tty_of`/`has_tty` matched `ttyUSB`
+    only and read only `<iface>/`, never `<iface>/tty/` where `cdc_acm` puts the node — a drift
+    from `devprep/src/linux/sysfs.rs::ttys`, which documents checking both "rather than guessing";
+    and `itest/src/lib.rs`'s Darwin scans matched `cu.usbserial` where the product's own resolver
+    matches `cu.`, making `cu.usbmodem*` invisible to the harness alone.
+    *Fail-first, on the bench, before the fix:* three of five `p7_replug_hardware` tests red, the
+    worst of them accusing the privileged helper of writing when it had promised not to; after,
+    **5 of 5**. `serial_hardware` went 9-of-10 to **10 of 10**. All 94 doctor unit tests pass
+    across the change, including the pinned `stuck-high` and `inverted` arms, which the repair was
+    designed not to move.
+
+81. **A break's counter is the driver's choice, and the guard named the wrong one** — **EXECUTED
+    2026-08-16** (§15.62). *Evidence:* `a_break_on_one_port_is_counted_at_the_far_ports_driver`
+    pre-registered `brk` on `ftdi_sio`'s break-over-parity-over-framing precedence. `cdc_acm`
+    reports a 250 ms break as **`frame` +1, `brk` +0**, and the test's own pre-written message
+    called that reading a **REFUTATION, not a product defect** and asked for the counter to be
+    named rather than the assertion repaired. *Fix:* the test measures which counter moved, carries
+    it through Control 2 and the short-break comparison, and **re-runs the idle-window control
+    against that counter** — without which a driver whose framing count free-runs would have the
+    noise chosen for it. §15.21's clause asks whether a break is *received*; it is, on both drivers.
+
+82. **`actual_baud` cannot be asked about on a transport that echoes** — **EXECUTED 2026-08-16**
+    (§15.62, scoping §7.1 clause 7). *Evidence:* `crossover_rig_actual_baud_is_a_read_back_not_an_echo`
+    red on CDC-ACM with `status="active" baud=4000000 actual_baud=4000000`. Its own message
+    separates two causes and prescribes opposite repairs; this is a **third**, which it did not
+    have. P14 is the evidence that it is third and not first: **no `adapter-refused` outcome on any
+    rung it tried** — 15 of the ladder's 16 body rungs (the search stops at the first failure, so
+    12 Mbaud was never asked for) plus four refinements — so there is no rung to re-point
+    `RIG_REFUSED_BAUD` at. Ceiling `unreliable-timed-out` at 6 Mbaud, quoted from the capture whose
+    search completed rather than the earlier one, whose verdict disclaims its own ceiling as
+    *interrupted*. *Fix:* a skip keyed on the
+    **measured reading** (`active` and `actual_baud == baud`), never on a driver name, so a port
+    that still refuses never reaches the arm and a loosened `serial2` verification still falls
+    through to the original assertion.
+
+83. **P14's "hard wall-clock stop" was neither hard nor a wall clock** — **EXECUTED 2026-08-16**
+    (§15.62). *Evidence:* one search on this pair ran **2089 s** against `P14_BUDGET = 180 s`, of
+    which **26.9 s** was trials. The rest was inside `p14_apply_rate`: `serial2` configures with
+    `TCSETSW`, the *drain* spelling, so the ask waits for queued output to leave at a rate the
+    adapter accepted and cannot achieve — one rung alone was ~1900 s of it, and the budget is
+    checked between rungs. This is AGENTS §3's second tell in a new place: the constant's comment
+    claimed a bound its placement could not deliver. *Fix:* discard the output buffer before the
+    ask — correct, not merely expedient: the rung is over and the bytes belong to an abandoned
+    rate. **That is the entire repair.** The constant's doc now states the bound its placement
+    delivers, "the budget plus at most one rung", because a rung is not interruptible.
+    **A second check at the top of the loop was written and then removed by this item's own
+    adversarial review:** the pre-existing check at the loop's end already guarantees no rung
+    *begins* over budget, so the new one could never fire — passing behaviour identical to
+    not-running behaviour, the very tell this session appended two instances of to AGENTS §3.
+    Filing it as half a fix would have made it the third.
+    *Measured:* the same capture on the same bench, **4148 s → 86.6 s**. The two reports are **not**
+    otherwise identical, and an earlier draft of this item said so wrongly: **36 observation keys
+    differ.** Six are P14's own and structural — `rungs_attempted` 17→19, `refinements_used` 2→4,
+    `first_unreliable_baud` 6500000→6125000, `search_budget_exhausted` true→false — because the
+    pre-fix search was cut off by its budget and the post-fix one ran to completion. The rest is
+    ordinary run-to-run movement in P2/P9/P10/P11/P12/P13/P15/P16.
+
+### Item 84 — filed, not fixed, by the CDC-ACM bench session (2026-08-16)
+
+84. **The evidence-table vocabulary gate is weaker than the comment above it** — **open** (S).
+    *Evidence:* `itest/tests/p8_packaging.rs:1026-1027` reads *"The table's own vocabulary is closed:
+    three class words and no others. A row that invents a fourth is a claim nobody can weigh."* What
+    it asserts is `section.matches(class).count() > 0` for each of `measured` / `man-page` /
+    `unverified` — i.e. **each word appears at least once**. A row whose class column reads `assumed`,
+    or `probably`, or nothing at all, passes untouched; so did `measured (partially)` for as long as
+    it stood, because it contains `measured`. This is AGENTS §3's second tell — an assertion strictly
+    weaker than the comment a reviewer actually reads — and it is the fifth recorded instance.
+    *Found by:* the CDC-ACM session, which had to check the gate before moving that very row from
+    `measured (partially)` to `measured` (item 78(a)) and found the check could not have objected to
+    either spelling.
+    *Filed rather than fixed on purpose.* It is unrelated to the bench that found it, and repairing a
+    packaging gate inside a hardware-validation session is how unreviewed scope arrives in a commit
+    described as something else (notes §3.111's lesson, one register over).
+    *Route:* parse the class column per row rather than substring-counting the section, and reject any
+    cell not exactly one of the three words.
+    *Validation:* plant a row whose class is `assumed` and one whose class is `measured (partially)`;
+    both must redden, and the current gate reddens for neither — which is the fail-first proof and is
+    already measured.
+
+### Item 85 — filed, not fixed, by the CDC-ACM bench session's adversarial pass (2026-08-16)
+
+85. **A driver that honours `CRTSCTS` on read-back and ignores it on the wire** — **open** (M;
+    needs a design decision, not a patch). *Evidence:* §15.53's refusal separates two states by
+    read-back — a driver that accepts `CRTSCTS` and drops it from `c_cflag` is `AcceptedThenDropped`
+    and refused at `load`; one that keeps it is `Honoured` and allowed. On this bench `cdc_acm`
+    **keeps** it: P15 reads `honoured_on_readback: true` and `shipped_predicate_agrees: true` on
+    both `/dev/ttyACM*` ports, `c_cflag` moving `0x10021cb2 → 0x90021cb2`, a delta of exactly
+    `0x80000000` (`CRTSCTS`). And the flag does nothing: a 2×2 control — peer RTS low/high ×
+    `CRTSCTS` on/off, peer never reading — wrote **44672 bytes in all four cells, spread 0**,
+    reproduced on an independent re-run.
+    So `serial_nexus_sys::honours_rtscts` answers `Honoured`, the daemon loads the node, and the
+    operator gets a port that reports flow control and does not perform it — precisely the outcome
+    §15.53 and §7.1 clause 2 exist to prevent, arrived at through the one door the predicate cannot
+    watch.
+    **This is §15.61's shape with the polarity reversed**, which is why it is a separate item and
+    not that one re-opened: §15.61's driver lied by *dropping* the flag, and a read-back caught it.
+    This one lies by *keeping* it, and no read-back can — the read-back is what it satisfies.
+    *Filed rather than fixed, for a stated reason:* separating "honoured" from "inert" needs a peer,
+    a transfer and a stall, which a load-time pre-check structurally does not have. The candidate
+    answers are a *functionally verified* tier for `flow_control`, a documented per-driver
+    allowlist, or an accepted limitation stated in §7.1 — a design decision, and taking it inside a
+    hardware-validation session is how an unreviewed contract change lands.
+    *Do not "fix" this by widening the refusal to `cdc_acm` by name:* §15.61's own construction is
+    "one predicate, parameterised", and a driver-name special case is the two-copies-that-must-agree
+    shape §16.5 bans.
+    *Validation, when it is taken:* a bench where `CRTSCTS` is honoured on read-back and inert on
+    the wire must be separated from one where it is honoured and functional, by an instrument that
+    moves bytes — and the second half of that pair needs an adapter this record does not yet have.
 
 ### Evaluated and deliberately not scheduled — the closing register
 

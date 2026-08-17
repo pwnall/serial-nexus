@@ -2136,7 +2136,23 @@ pub fn crossover_ports() -> Option<(String, String)> {
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("cu.usbserial"))
+                    // **`cu.usbmodem` joins `cu.usbserial`; the bare `cu.` prefix
+                    // deliberately does not.** A CDC-ACM adapter comes up as
+                    // `cu.usbmodem*` and was invisible here, which is the §15.62
+                    // blind spot. But this scan **drives what it selects** — the
+                    // caller transmits 32 KiB and pulses DTR on both ports — so it
+                    // may not widen to the resolver's bare `cu.`
+                    // (`core/src/resolver.rs:765`) the way the report-only
+                    // `rig_candidates` below does. Stock macOS ships
+                    // `/dev/cu.Bluetooth-Incoming-Port`, and Apple Silicon adds
+                    // `cu.debug-console` and `cu.wlan-debug`: under a bare `cu.`,
+                    // one adapter plus Bluetooth is "exactly two ports" and the
+                    // harness would drive a Bluetooth node, while two adapters plus
+                    // Bluetooth is three and the scan would find no rig at all —
+                    // a hard failure under `SNX_CROSSOVER=required` on a correctly
+                    // cabled Mac. The prefix *is* the bound `rig_candidates`'s
+                    // "reported, never auto-selected" doctrine relies on here.
+                    .map(|n| n.starts_with("cu.usbserial") || n.starts_with("cu.usbmodem"))
                     .unwrap_or(false)
             })
             .map(|p| p.to_string_lossy().into_owned())
@@ -2215,7 +2231,10 @@ fn rig_candidates() -> Vec<String> {
                 .filter(|p| {
                     p.file_name()
                         .and_then(|n| n.to_str())
-                        .map(|n| n.starts_with("cu.usbserial"))
+                        // `cu.` for the reason given at the sibling scan above:
+                        // the resolver's own prefix, so `cu.usbmodem*` (CDC-ACM)
+                        // is not invisible here (§15.62, plan §18 item 80).
+                        .map(|n| n.starts_with("cu."))
                         .unwrap_or(false)
                 })
                 .map(|p| p.to_string_lossy().into_owned()),

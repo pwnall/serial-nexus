@@ -5203,6 +5203,32 @@ struct HandshakeCells {
     dtr_ba_ri: String,
 }
 
+/// What one cell licenses the shape sentence to say — three states, not two.
+///
+/// [`crosses`] can return five strings: `"true"`, `"false"`, `"stuck-high"`,
+/// `"inverted"` and `"?"`. Only the first two are *answers about the wire*; the
+/// other three say the instrument could not read it. Collapsing them to
+/// "not `true`" is what let a 5-wire bench be reported as 3-wire (§15.62), so the
+/// distinction lives in a type rather than in each `==` at the use site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellReading {
+    /// The line followed the drive at both levels: a crossing.
+    Carries,
+    /// The line followed neither level: measured absent, and sayable as such.
+    Absent,
+    /// `stuck-high`, `inverted` or `?` — the cell answered, the wire did not.
+    Inconclusive,
+}
+
+/// One cell string, reduced to what a sentence may claim from it.
+fn reading(cell: &str) -> CellReading {
+    match cell {
+        "true" => CellReading::Carries,
+        "false" => CellReading::Absent,
+        _ => CellReading::Inconclusive,
+    }
+}
+
 /// The handshake line's shape, split out pure so the wiring vocabulary is
 /// testable without a bench — the reason [`p5_pair_certificate`] is split the same
 /// way. It classifies, it does not judge: every value it can produce is a
@@ -5218,24 +5244,60 @@ fn p5_handshake_line(c: &HandshakeCells) -> String {
         dtr_ba_dcd,
         dtr_ba_ri,
     } = c;
-    let both_rts = rts_ab == "true" && rts_ba == "true";
+    let rts = [reading(rts_ab), reading(rts_ba)];
+    let dtr = [
+        reading(dtr_ab_dsr),
+        reading(dtr_ab_dcd),
+        reading(dtr_ab_ri),
+        reading(dtr_ba_dsr),
+        reading(dtr_ba_dcd),
+        reading(dtr_ba_ri),
+    ];
+    let both_rts = rts.iter().all(|r| *r == CellReading::Carries);
+    let some_rts = rts.contains(&CellReading::Carries);
+    // **The reading can fail to answer, and that is not a `false`.** `crosses()`
+    // returns five distinct strings; this fold used to test only for `"true"`,
+    // which put `stuck-high`, `inverted` and `?` in the same bucket as a measured
+    // `false` and let the sentence claim *not wired* on a cell that says only
+    // *not readable* (§15.62). Measured: a CDC-ACM pair on a physically 5-wire
+    // bench printed `3-wire: no handshake lines carried` beside
+    // `rts_a_to_cts_b=stuck-high rts_b_to_cts_a=stuck-high`.
+    let rts_inconclusive = rts.contains(&CellReading::Inconclusive);
     // **All six DTR crossings, not four.** "DTR moves nothing" is a claim about
     // both directions against all three inputs; computing it from a subset made
     // the verdict stronger than its measurement (notes §3.73).
-    let any_dtr = [
-        dtr_ab_dsr, dtr_ab_dcd, dtr_ab_ri, dtr_ba_dsr, dtr_ba_dcd, dtr_ba_ri,
-    ]
-    .iter()
-    .any(|v| v.as_str() == "true");
+    let any_dtr = dtr.contains(&CellReading::Carries);
+    let dtr_inconclusive = dtr.contains(&CellReading::Inconclusive);
+    // The negative half of every sentence below is only sayable where every cell
+    // it covers actually answered. Where one did not, the sentence says *that*
+    // instead of inventing an absence.
+    let dtr_tail = if dtr_inconclusive {
+        "DTR not determinable"
+    } else {
+        "DTR moves nothing"
+    };
     // The name a reader wants first, then the cells it is computed from — so a
     // half-crossed handshake is named rather than left to be spotted in six
     // fields, exactly as discovery names a half-crossed data pair.
-    let shape = match (both_rts, rts_ab == "true" || rts_ba == "true", any_dtr) {
-        (true, _, true) => "wired: RTS/CTS both ways and at least one DTR line",
-        (true, _, false) => "5-wire crossover: RTS/CTS both ways, DTR moves nothing",
-        (false, true, _) => "HALF-CROSSED handshake: RTS/CTS carries one way only",
-        (false, false, true) => "DTR wired, RTS/CTS not",
-        (false, false, false) => "3-wire: no handshake lines carried",
+    let shape = match (both_rts, some_rts, any_dtr) {
+        (true, _, true) => "wired: RTS/CTS both ways and at least one DTR line".to_owned(),
+        (true, _, false) => format!("5-wire crossover: RTS/CTS both ways, {dtr_tail}"),
+        (false, true, _) => "HALF-CROSSED handshake: RTS/CTS carries one way only".to_owned(),
+        (false, false, true) if rts_inconclusive => {
+            "DTR wired; RTS/CTS not determinable".to_owned()
+        }
+        (false, false, true) => "DTR wired, RTS/CTS not".to_owned(),
+        (false, false, false) if rts_inconclusive => format!(
+            "UNREADABLE handshake: RTS/CTS gave no usable reading at either drive level — \
+             this is not a 3-wire answer, {dtr_tail}"
+        ),
+        // The exact legacy sentence, kept byte-for-byte for the all-`false` case:
+        // it is the design's stated common case and it rides in committed
+        // artifacts and in `expectation_gates.rs`'s fixtures.
+        (false, false, false) if !dtr_inconclusive => {
+            "3-wire: no handshake lines carried".to_owned()
+        }
+        (false, false, false) => format!("3-wire: no RTS/CTS crossing, {dtr_tail}"),
     };
     format!(
         "{shape} [rts_a_to_cts_b={rts_ab} rts_b_to_cts_a={rts_ba} \
@@ -6262,9 +6324,21 @@ const P14_BASELINE_BAUD: u32 = 115_200;
 /// a slack window rather than a prefix comparison.
 const P14_READ_SLACK: usize = 64;
 
-/// A hard wall-clock stop on the whole search. The ladder is finite by
-/// construction, so this fires only on pathology — and when it does the search
-/// is **incomplete**, which the fold refuses to dress up as a measured ceiling.
+/// The wall-clock stop on the search, checked **between rungs**. The ladder is
+/// finite by construction, so this fires only on pathology — and when it does the
+/// search is **incomplete**, which the fold refuses to dress up as a measured
+/// ceiling.
+///
+/// **It bounds "the budget plus at most one rung", not the search**, and the
+/// difference is not academic: a rung is not interruptible, and one rung on a
+/// CDC-ACM pair ran ≥1909 s inside a single `p14_apply_rate`, carrying a whole
+/// search to 2089 s under this 180 s constant (§15.62, plan §18 item 83). This
+/// comment used to say "a hard wall-clock stop on the whole search", which is the
+/// stronger thing its placement cannot deliver — AGENTS §3's second tell, in a
+/// constant's doc rather than a gate's. The repair for that overrun was to stop
+/// the rate-apply from blocking (see `p14_apply_rate`), not to move this check:
+/// moving it earlier in the loop would be dead code, because the check below the
+/// rung already guarantees no rung *begins* over budget.
 const P14_BUDGET: Duration = Duration::from_secs(180);
 
 /// What one rung's trials came to.
@@ -6695,6 +6769,23 @@ fn p14_apply_rate(
     sp: &mut SerialPort,
     baud: u32,
 ) -> (Option<RungOutcome>, Option<i32>, Option<u32>) {
+    // **Drop anything still queued for transmission before asking.** `serial2`
+    // applies a configuration with `TCSETSW` — the *drain* spelling — so the call
+    // blocks until the kernel believes the pending output has gone out at the rate
+    // still in force. On an adapter that accepts a rate it cannot achieve, that
+    // belief is wrong by orders of magnitude and the ask blocks for minutes:
+    // measured on a CDC-ACM pair at §15.62, where one P14 search spent **2089 s**
+    // wall against **26.9 s** of actual trials, the remaining ~2062 s inside this
+    // function, and `P14_BUDGET` — documented as "a hard wall-clock stop on the
+    // whole search" — could not see it, because it is checked between rungs and a
+    // single rung was 1900 s of it (plan §18 item 83).
+    //
+    // Discarding is correct here rather than merely expedient: every caller has
+    // finished the rung it was measuring, each trial judges only its own seeded
+    // payload, and the bytes in flight belong to a rate that is being abandoned.
+    // The old rate's leftovers arriving during the new rate's trial is a confound
+    // this removes, not one it adds.
+    let _ = sp.discard_output_buffer();
     let readback = |sp: &SerialPort| sp.get_configuration().and_then(|c| c.get_baud_rate()).ok();
     let mut settings = match sp.get_configuration() {
         Ok(s) => s,
@@ -9067,6 +9158,107 @@ mod tests {
             stuck.starts_with("5-wire crossover") && stuck.contains("dtr_a_to_dsr_b=stuck-high"),
             "a stuck line was read as wired, or was dropped from the cells: {stuck}"
         );
+        // ...and the sentence beside it no longer claims a negative the cell does
+        // not support: a stuck DTR cell means the DTR reading is **not
+        // determinable**, not that DTR moves nothing (§15.62, plan §18 item 80).
+        assert!(
+            stuck.contains("DTR not determinable"),
+            "the sentence claims DTR moves nothing while a DTR cell reads \
+             stuck-high — the very contradiction this file rejects two arms up: {stuck}"
+        );
+
+        // **The measured case: both RTS/CTS cells unreadable.** `cdc_acm`
+        // synthesises CTS, so a physically 5-wire bench reads `stuck-high` in both
+        // directions and the fold used to print `3-wire: no handshake lines
+        // carried` — a claim about the *cable*, from cells that say only that the
+        // instrument could not see it. Fail-first: against the pre-§15.62 fold
+        // (`rts_ab == "true" && rts_ba == "true"`, everything else falling to the
+        // all-negative arm) this assertion fails and every arm above still passes,
+        // which is why it is here and not folded into one of them.
+        let unreadable = line([
+            "stuck-high",
+            "stuck-high",
+            "false",
+            "false",
+            "false",
+            "false",
+            "false",
+            "false",
+        ]);
+        assert!(
+            unreadable.starts_with("UNREADABLE handshake"),
+            "an unreadable RTS/CTS pair was reported as a wiring answer: {unreadable}"
+        );
+        assert!(
+            !unreadable.contains("3-wire: no handshake lines carried"),
+            "the 3-wire sentence was printed for a bench whose cells never \
+             answered — this is the CDC-ACM defect: {unreadable}"
+        );
+        assert!(
+            unreadable.contains("rts_a_to_cts_b=stuck-high")
+                && unreadable.contains("rts_b_to_cts_a=stuck-high")
+                && unreadable.contains("DTR moves nothing"),
+            "the cells or the DTR half did not survive the new arm: {unreadable}"
+        );
+        // A single unreadable direction beside a real crossing is still
+        // half-crossed: the *carrying* direction is measured and says so.
+        assert!(
+            line([
+                "stuck-high",
+                "true",
+                "false",
+                "false",
+                "false",
+                "false",
+                "false",
+                "false"
+            ])
+            .contains("HALF-CROSSED"),
+            "one measured crossing plus one unreadable direction is half-crossed"
+        );
+        // **The legacy sentence is byte-identical for the all-`false` case.**
+        // It rides in committed artifacts and in `expectation_gates.rs`'s fixture,
+        // so the repair above must not have reworded the common answer.
+        assert!(
+            line(NONE).starts_with("3-wire: no handshake lines carried ["),
+            "the all-false sentence was reworded; committed artifacts and the \
+             expectation-gate fixture spell it exactly: {}",
+            line(NONE)
+        );
+        // **`?` is the fifth reading and the one that means the instrument itself
+        // failed** — `crosses()` returns it when the `set` or the `read` errored.
+        // Without this case, narrowing `reading()` to
+        // `"stuck-high" | "inverted" => Inconclusive, _ => Absent` keeps every
+        // other assertion here green while a bench whose ioctls failed is reported
+        // as a bare cable: the §15.62 defect restored through the one cell that
+        // most explicitly did not answer.
+        let errored = line([
+            "?", "?", "false", "false", "false", "false", "false", "false",
+        ]);
+        assert!(
+            errored.starts_with("UNREADABLE handshake") && errored.contains("rts_a_to_cts_b=?"),
+            "a failed RTS/CTS reading was reported as a wiring answer: {errored}"
+        );
+        // The `rts_inconclusive` + carried-DTR arm. Nothing else in this test pairs
+        // an unreadable RTS cell with a DTR line that answers, so deleting that arm
+        // would silently restore "DTR wired, RTS/CTS not" — a negative about cells
+        // that never answered.
+        let dtr_with_unreadable_rts = line([
+            "stuck-high",
+            "stuck-high",
+            "true",
+            "false",
+            "false",
+            "false",
+            "false",
+            "false",
+        ]);
+        assert!(
+            dtr_with_unreadable_rts.contains("RTS/CTS not determinable")
+                && !dtr_with_unreadable_rts.contains("DTR wired, RTS/CTS not"),
+            "a carried DTR line beside an unreadable RTS/CTS pair claimed the \
+             RTS/CTS lines are absent: {dtr_with_unreadable_rts}"
+        );
         // `inverted` is the **fourth** reading `crosses()` can return — a line
         // that followed both levels backwards — and it gets `stuck-high`'s
         // treatment for the same reason: it is not a crossing, and it must still
@@ -9080,6 +9272,14 @@ mod tests {
             inverted_dtr.starts_with("3-wire") && inverted_dtr.contains("dtr_a_to_dsr_b=inverted"),
             "an inverted DTR reading was counted as a wired line, or was dropped \
              from the cells: {inverted_dtr}"
+        );
+        // The DTR tail on the **all-negative** arm, which was otherwise pinned only
+        // inside the `5-wire` sentence: collapsing the two `3-wire` arms back into
+        // the single legacy string would pass every other assertion here.
+        assert!(
+            inverted_dtr.contains("DTR not determinable"),
+            "the 3-wire sentence claimed DTR moves nothing while a DTR cell reads \
+             inverted: {inverted_dtr}"
         );
         let inverted_rts = line([
             "inverted", "true", "false", "false", "false", "false", "false", "false",

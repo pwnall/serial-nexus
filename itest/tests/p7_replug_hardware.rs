@@ -269,40 +269,64 @@ fn while_deauthorized_many<T>(
     (down, up, observed)
 }
 
-/// The tty this port currently owns (`ttyUSB0`), or `None` while it is down.
-fn tty_of(port: &str) -> Option<String> {
-    let entries = std::fs::read_dir(format!("/sys/bus/usb/devices/{port}")).ok()?;
+/// Every tty this port currently owns, read straight from sysfs.
+///
+/// **A deliberate mirror of `devprep/src/linux/sysfs.rs::ttys`, and it must stay
+/// one.** The two copies exist because that one lives in a binary crate the
+/// harness cannot import; the copy that used to stand here had drifted from it in
+/// both of the ways that matter, and a CDC-ACM bench found both at once
+/// (§15.62, plan §18 item 80):
+///
+/// 1. It matched `ttyUSB` only, so a `/dev/ttyACM*` adapter owned no tty as far as
+///    this file was concerned.
+/// 2. It read only `<iface>/`, never `<iface>/tty/` — and `cdc_acm` puts the class
+///    device in the latter (`3-2.4:1.0/tty/ttyACM0`), which is precisely the
+///    layout difference the production helper's own comment says it checks "rather
+///    than guessing".
+///
+/// Both are `false`-returning failures, so the discriminator did not error — it
+/// confidently reported a device that was plainly present as absent. Fail-first on
+/// this bench, before the fix: three of five tests red, the worst of them
+/// `the_replug_discriminator_goes_quiet_when_no_write_happens` accusing the
+/// privileged helper of writing when it had promised not to.
+fn ttys_of(port: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(format!("/sys/bus/usb/devices/{port}")) else {
+        return found;
+    };
     for iface in entries.flatten() {
+        // Interface dirs are named `<port>:<config>.<intf>`; anything else here is
+        // an attribute file or a link we do not care about.
         if !iface.file_name().to_string_lossy().contains(':') {
             continue;
         }
-        if let Ok(kids) = std::fs::read_dir(iface.path()) {
+        for sub in [iface.path(), iface.path().join("tty")] {
+            let Ok(kids) = std::fs::read_dir(&sub) else {
+                continue;
+            };
             for kid in kids.flatten() {
-                let name = kid.file_name().to_string_lossy().into_owned();
-                if name.starts_with("ttyUSB") {
-                    return Some(name);
+                let n = kid.file_name().to_string_lossy().into_owned();
+                if n.starts_with("ttyUSB") || n.starts_with("ttyACM") {
+                    found.push(n);
                 }
             }
         }
     }
-    None
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// The tty this port currently owns (`ttyUSB0`, `ttyACM0`), or `None` while it is down.
+fn tty_of(port: &str) -> Option<String> {
+    ttys_of(port).into_iter().next()
 }
 
 /// Whether the port currently owns any tty, read straight from sysfs.
 ///
 /// Unprivileged, which is the point: the discriminator belongs to the test.
 fn has_tty(port: &str) -> bool {
-    std::fs::read_dir(format!("/sys/bus/usb/devices/{port}"))
-        .map(|entries| {
-            entries.flatten().any(|iface| {
-                iface.file_name().to_string_lossy().contains(':')
-                    && std::fs::read_dir(iface.path()).is_ok_and(|kids| {
-                        kids.flatten()
-                            .any(|k| k.file_name().to_string_lossy().starts_with("ttyUSB"))
-                    })
-            })
-        })
-        .unwrap_or(false)
+    !ttys_of(port).is_empty()
 }
 
 /// A daemon holding one free-for-all serial node addressed **by identity**, cross-wired

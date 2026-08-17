@@ -12980,3 +12980,103 @@ worktree so the agents' live checkout was never touched. **Stage by explicit pat
 else may be writing.** And pushing again while CI is still running cancels the earlier run
 (`cancel-in-progress` on pushes) — harmless when the newer commit is a superset, which must be
 *checked* rather than assumed.
+
+### 3.112 A device class the record had never held, and four guards that agreed with each other and with nothing
+
+The operator attached two WCH `1a86:55d3` adapters — `bDeviceClass=02`, two interfaces, bound to
+`cdc_acm`, `/dev/ttyACM0` and `/dev/ttyACM1` — cabled as a **5-wire** crossover, and asked for
+CDC-ACM hardware validation. The FTDI pair every current Status row rests on was not attached. The
+session closed plan §18 item 78(a), found and executed items 80–83, and is the design's §15.62.
+
+**The pre-registration mattered, and it was wrong in the useful direction.** Written before anything
+touched the ports, it predicted (60/40, the odds recorded on purpose) that CTS would read **dead**
+on correct wiring, because the CDC PSTN `SERIAL_STATE` bitmap has no CTS field. The polarity was
+backwards: CTS reads **asserted in every state** — both drive levels, all eight cells, and with the
+peer closed entirely. It never once read low. The prediction that a test would hardcode `ttyUSB`
+was filed as "predict none does" and **refuted** within the hour: `p7_replug_hardware.rs`'s
+`tty_of`/`has_tty` matched `ttyUSB` only *and* read only `<iface>/`, never `<iface>/tty/`, which is
+where `cdc_acm` puts the node. Two wrong predictions, both cheap, both faster to correct than the
+guesses would have been to defend.
+
+**The measurement that cost the most and was worth it.** The first flow-control experiment printed
+`STALLED`, which reads like a finding: A wrote 44672 of 65536 bytes with the peer's RTS low and
+`CRTSCTS` on. It is not a finding. A peer that never reads backpressures the sender through buffer
+exhaustion alone, so the reading needed a control before it meant anything. The 2×2 — peer RTS
+low/high × `CRTSCTS` on/off — read **44672 bytes in all four cells, spread 0**. `CRTSCTS` is
+accepted, *persists in the `termios` read-back*, and does nothing. This is §6's discipline arriving
+by a new road: the symptom reproduced perfectly and pointed at the wrong mechanism, and only the
+cell that was supposed to differ proved it.
+
+**What the tree got wrong was not the reading — it was the vocabulary.** `crosses()` already
+returned `stuck-high` for a line true at both levels; the shape fold tested `== "true"` and dropped
+it into the same bucket as a measured `false`. The shipped binary therefore printed
+`3-wire: no handshake lines carried` **beside its own contradicting cells**, on a bench the
+operator had wired 5-wire. The suite's `handshake_measured` was worse in a specific way: its comment
+promised an operator would not have to translate between it and a doctor report, and it carried two
+cell words against P5's four. **A comment that names a property is not a guard on it** — the third
+time this record has written that sentence, and the first where the two implementations were
+*designed* to agree and had simply never been given a case where they could differ.
+
+The repair generalizes past the transport: *a shape sentence may assert a negative only about cells
+that answered.* The pinned `stuck-high` and `inverted` unit arms still pass, but saying they were "left unmoved"
+would be wrong and an earlier draft did: the `stuck-high` arm's asserted *output* changed, since a
+stuck DTR cell now yields "DTR not determinable" where it used to say "DTR moves nothing", and the
+arm gained an assertion pinning exactly that. What was preserved is their verdicts and the
+all-`false` sentence — the repair was shaped so all 94 doctor tests pass across it, and `3-wire: no handshake lines
+carried` is byte-identical for the all-`false` case so committed artifacts and
+`expectation_gates.rs` do not move.
+
+**Fail-first, in the form the bench made available.** Three of five `p7_replug_hardware` tests red
+before the fix and **5 of 5** after; `serial_hardware` 9-of-10 before and **10 of 10** after. The
+most instructive red was `the_replug_discriminator_goes_quiet_when_no_write_happens`, which
+accused the privileged helper of *writing when it promised not to*. The helper had done nothing.
+A blind discriminator does not fail quietly — it produces a confident accusation against innocent
+code, which is a worse failure than a panic and the reason `has_tty` returning `false` on a present
+device is not a small bug.
+
+**Three promises turned out to be one driver's, and are now scoped rather than withdrawn**:
+`modem_lines.cts` (synthesised on `cdc_acm`), §7.1 clause 7's `actual_baud` example (echoed, with
+P14's zero `adapter-refused` outcomes across every rung it tried as the evidence that none could be
+re-pointed at), and the break counter (`frame` +1, `brk` +0 — the test's own pre-written message
+called that a **REFUTATION, not a product defect** and asked for the counter to be named, which is
+what was done).
+
+**A cost nobody had a number for.** One P14 search ran **2089 s** against a `P14_BUDGET` documented
+as "a hard wall-clock stop on the whole search", of which **26.9 s** was trials. The rest sat inside
+the rate-apply: `serial2` configures with `TCSETSW`, the *drain* spelling, so the ask waits for
+queued output to leave at a rate the adapter accepted and cannot achieve. `wchan=set_termios` under
+`strace` is what named it, after a `gdb` attach was refused by `ptrace_scope=1` — relaunching under
+the tracer rather than attaching to it is the move worth remembering. Discarding the output buffer
+before the ask took the same capture on the same bench from **4148 s to 86.6 s**, and its doc now
+claims only what its placement can deliver: *the budget plus at most one rung*. **I also added a
+second budget check at the loop's top and filed it as half the fix; the adversarial pass showed it
+could never fire** — the existing end-of-loop check already guarantees no rung begins over budget —
+and it was removed. Writing a guard whose passing output is identical to its not-running output, in
+the session appending two instances of exactly that tell to AGENTS §3, is the most humbling thing
+here and the reason the pass was worth running against my own work.
+
+**Two defects found in passing and handled differently.** §15.52's re-measure clause said "the same
+adapter pair" while the paragraph twelve lines below it named two different pairs — corrected in
+place, with the origin (notes §3.80, which says "this same adapter pair" twenty lines after
+recording `ABSCDGL6` on that bench, three lines above it) named rather than quietly fixed. And `p8_packaging.rs:1029`'s
+"the table's own vocabulary is closed: three class words and no others" is enforced as *each of
+three words appears at least once*, so a row inventing a fourth class passes — AGENTS §3's second
+tell, **filed and not fixed here** because it is unrelated to this bench and repairing it inside a
+hardware session is how unreviewed scope arrives.
+
+**The finding the adversarial pass produced that the session had missed entirely.** P15 reads
+`honoured_on_readback: true` for `rts-cts` on both ACM ports — `c_cflag` gains exactly `0x80000000`
+and keeps it — so `honours_rtscts` answers `Honoured` and the daemon will happily `load` an
+`rts-cts` node on a transport where the 2×2 above proves the flag inert. §15.53's refusal is built
+on a read-back, and this driver *satisfies* the read-back; no pre-check can separate honoured from
+inert without moving bytes. It is §15.61's shape with the polarity reversed — that driver lied by
+dropping the flag, this one lies by keeping it — and it is **filed as item 85, not fixed**, because
+the repair is a contract decision rather than a patch. I had measured every input to this and drawn
+no conclusion from it; a reviewer reading the same artifact did.
+
+**What this bench cannot do, stated so nobody re-derives it.** It cannot answer flow control: not
+because it is 3-wire — it is not — but because no instrument in this tree can read CTS on this
+transport. `SNX_RIG_FLOW=required` must stay dropped here, and the two `rts-cts` tests skip with
+`UNREADABLE handshake: …` printed. DTR remains unwired on this cabling too, so item 28 stays
+blocked for the third consecutive bench. Nothing measured here may be diffed against a `ttyUSB` row:
+chip, driver, device class, node name, cable and adapter pair all moved at once.
