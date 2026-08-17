@@ -4605,6 +4605,12 @@ annotates neither away. Construction is plan §18 items 80–83.
 crossover and attached 2026-08-16. The adapter pair is new to the record and shares nothing with
 `BH00L4KU`/`BH00LW9U`: chip, driver, device class, node name, cable and pair all moved at once, so
 **no cell here may be diffed against a `ttyUSB` row** as though one variable had.
+**The artifacts are committed** (§16.13): `docs/doctor/linux-7.0-2026-08-17-a7e6070-{tier3,tier3-2,
+tier3-3,passive-1,passive-2,passive-3}.json` for the repaired build, and
+`docs/doctor/linux-7.0-2026-08-16-8759516-{tier3,passive-1,passive-2,passive-3}.json` for the build
+that carried the defect — kept deliberately, because the sentence this entry repairs is only legible
+beside the reading that produced it. `jq -e -f expectations/linux.jq` exits 0 on all ten. Every
+driver and kernel claim below is quotable from those, and from no scrollback.
 
 **What was measured, before any of it was diagnosed.** Data crosses byte-exact in both directions,
 so TX/RX are genuinely wired. But CTS, read through `TIOCMGET`, is **asserted in every state**: at
