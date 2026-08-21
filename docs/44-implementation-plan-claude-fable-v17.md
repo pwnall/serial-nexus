@@ -31,6 +31,9 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 
 | Figure | Scope | Date | Commit / record | Caveat |
 |---|---|---|---|---|
+| **1000 passing · 0 failed · 7 ignored**, **91 distinct self-skip names** | **macOS**, x86_64 Mac rig box, **FT232R 5-wire bench** (`BH00L4KU` ↔ `BH00LW9U`) — `SNX_CROSSOVER=required` `SNX_CROSSOVER_A`/`_B` **`SNX_RIG_FLOW=required`** `SNX_TLS=required` `SNX_WEB_UI=required` `SNX_EXEC_CODEC=required`, `--no-fail-fast`, `--nocapture` | 2026-08-21 | the Darwin CDC-ACM bench session's cable-move control (notes §3.118, design §15.68) | `3a39896`. **The first macOS lane to carry `SNX_RIG_FLOW=required`**, which became settable only because the handshake precondition now *measures* true on this bench. **Still not the documented lane** (AGENTS §3), which also spells `SNX_REPLUG=required` with two device paths — Linux-only here — so this is **the fullest lane macOS can run**, not a fully-spelled one. **The equality with the 1000 default-scope row above is not a delta and must not be mined as one**: a self-skipped test still passes, so the count is unchanged while the work is not; what moved is 105 → 91 distinct self-skip names. `crossover_rig_rts_crosses_to_the_far_ports_cts` **ran** here rather than self-skipping. Same tree and same session as the 997 · 3 · 7 CDC-ACM row — **the three failures there are a transport defect that this bench does not have**, measured by the same probe reading 128 of 128 distinct records with 0 lost and 0 duplicated (design §15.68 clause 3). |
+| **1000 passing · 0 failed · 7 ignored**, 129 test-result lines, **105 distinct self-skip names** | **macOS**, x86_64 Mac rig box, default CI scope, `--no-fail-fast`, `--nocapture` | 2026-08-21 | the Darwin CDC-ACM bench session (notes §3.117) | **The macOS authority row.** `3a39896`. **Not comparable test-for-test with any Linux row** — this box self-skips ~105 device- and Linux-gated tests against Linux's ~14 at the same scope (AGENTS §2). **No delta is quotable against the 2026-08-13 row below**: only this end was measured this session, and that row's own arithmetic does not close (item 94). The self-skip figure is a count of **distinct names**, never of anchored `^SKIP` lines — the same log reads **978** by `grep -cE '^test .* \.\.\. ok$'` and **1000** by summing its `test result:` lines, which is notes §3.78/§3.101's hazard reproduced. |
+| **997 passing · 3 failed · 7 ignored**, **92 distinct self-skip names** | **macOS**, x86_64 Mac rig box, **rig lane** — `SNX_CROSSOVER=required` `SNX_CROSSOVER_A`/`_B` `SNX_TLS=required` `SNX_WEB_UI=required` `SNX_EXEC_CODEC=required`, `--no-fail-fast`, `--nocapture` | 2026-08-21 | the Darwin CDC-ACM bench session (notes §3.117, design §15.68) | `3a39896`. **`SNX_RIG_FLOW` is dropped and `SNX_REPLUG` is dropped, so this is not the fully-spelled lane and is not quotable as one** — P5 reads no handshake on this bench and both flow modes are refused at `load`, and the replug lane is Linux-only (`itest/src/lib.rs:2773`). **The three failures are one platform defect seen three times**, not a regression: `crossover_rig_data_plane_send_and_exclusivity`, `crossover_rig_custom_baud_byte_exact` and `exclusive_write_lock_is_byte_exact`, each a SHA-256 mismatch reported as *bytes lost/reordered across the wire*. The transport loses a 32-byte block and delivers the next one twice at a constant byte count (design §15.68 clause 3), so **a length check passes all three** and plan §3's loss fingerprint `received + dropped_slow_consumer == sent` balances. **The guard is working; the bench cannot go green until the platform does.** |
 | **A busy console's cost: 78 % → 36 % of the main thread, 49.0 → 110.9 KiB/s absorbed, main-thread latency 1145–2591 ms → 2–112 ms, a rail selection while streaming 15 383 ms → 48 ms** | Linux, headless Chromium, one serial node fed by `serial-nexus-sim pty --source`, same box and same 15-second window on both sides | 2026-08-17 | the web console latency session (§15.67, notes §3.115) | **The rate is the scope.** At 12.8 KiB/s (115200 baud) the unfixed client is idle — 2 notifications/s, 0 % of the main thread — and every interaction is under 100 ms; the step between that and the row's figures is not gradual, because work arriving faster than it drains backs up rather than degrading. On the unpaced 64 MiB firehose, the fixture's worst case: selection **17 952 ms → 79 ms**, long tasks **300 totalling 32.6 s → 41 totalling 4.8 s**. The throughput figure is a *side effect*, not a target, and is bounded by the sim's pacing rather than by the client after the fix. |
 | **A browser-bound frame after the first: 41 ms → 0.4 ms.** Bridge burst tail 40.1–42.0 ms with Nagle on (18/18) against 0.13 ms with `TCP_NODELAY`; through a real Chromium, a `send`'s device echo arrived 43.4 ms after the `delivered:true` answer and now arrives 0.4 ms after it | Linux 7.0.0-29, loopback, `serial-nexus-web` in front of a `pty --echo` serial node, **after at least one prior RPC round trip** | 2026-08-17 | the web console latency session (§15.63, notes §3.113) | **The prior round trip is part of the scope, not an incidental.** On a fresh connection the socket is in quickack mode and the effect is absent — a twelve-frame burst there coalesces into one segment at 0.18 ms — so a figure quoted without it describes a different regime. 41 ms is `TCP_DELACK_MIN` on this kernel and is hit dead on rather than approached. Loopback MSS is ~65483, so a single large replay piece can exceed it and escape Nagle; both hot paths named are sub-MSS. |
 | **A reload's transfer: 116 876 B → 2 627 B**, nine responses either way | Linux, loopback, headless Chromium, `page.reload()` on an already-loaded console | 2026-08-17 | the web console latency session (§15.64, notes §3.113) | The 2 627 B remainder is `index.html`, which a reload revalidates unconditionally; the other eight answer `304`. This is **bytes, not round trips** — `no-cache` is deliberate and a freshness lifetime is refused (§15.64), so the nine requests remain. Page-load cost only: it contributes nothing to console select or to a `send`. |
@@ -3638,6 +3641,100 @@ of six — so all five items are the web tier's.
     reconciles the rows, or throttle the *render* to the same 1 Hz the `dump` fetch already uses.
     *Do not "fix" this by throttling `state` itself:* the 5 Hz snapshot is §10's contract and the
     rail's live status depends on it.
+
+### Items 92–96 — filed by the Darwin CDC-ACM bench session (2026-08-21)
+
+Five items from reading the §15.62 adapters on a second CDC stack (design §15.68, notes §3.117).
+**None is a product defect**: two are platform characterizations the tree already detects, two are
+instrument defects, and one is clerical. They are filed separately because a later reader chasing
+any one of them wants its own evidence.
+
+92. **Two instruments print a determinate cabling sentence from cells that cannot carry one** —
+    **open** (M). *Evidence:* `crosses()` (`doctor/src/probes.rs:5162-5167`) maps `(false,false)`
+    to `"false"` and the shape fold (`:5297-5299`) prints `3-wire: no handshake lines carried`;
+    `handshake_measured` (`itest/tests/serial_hardware.rs:996-1037`) does the same and printed
+    `3-wire: no RTS/CTS handshake in either direction` as this bench's skip reason. §15.62's repair
+    is **reading-keyed** — `stuck-high`, `inverted` and `?` fold to `Inconclusive` — which suffices
+    only where the manufactured constant is one a wire cannot produce. Apple's CDC-ACM stack
+    manufactures CTS **low**, which is bit-identical to an absent conductor, so the fold falls
+    through to the cabling sentence. **The same two adapters produce two mutually exclusive
+    sentences about one physical bench** — `UNREADABLE … this is not a 3-wire answer` on Linux,
+    `3-wire: no handshake lines carried` on Darwin — and both cannot be licensed.
+    ***The motivating case is measured, not epistemic (2026-08-21).*** This item was filed while the
+    bench's cabling was operator testimony. The operator then moved that cable to the FTDI fixture
+    (`BH00L4KU` ↔ `BH00LW9U`) and both instruments read it as a true crossover, 3 of 3 captures:
+    P5 prints `5-wire crossover: RTS/CTS both ways, DTR moves nothing`
+    (`rts_a_to_cts_b=true rts_b_to_cts_a=true`), and an independent `TIOCMGET` probe follows the
+    far CTS at both drive levels in both directions and sees it drop when the peer closes
+    (`docs/doctor/macos-24.6.0-2026-08-21-3a39896-ftdi5w-tier3{,-2,-3}.json`). **So the cable P5
+    called `3-wire` is a measured 5-wire crossover**, and §15.62's stated harm is demonstrated.
+    *What that still does not decide:* whether the CDC-ACM bench failed at the WCH module's header
+    or in Apple's stack. Undecided, and the defect does not depend on it — the sentence is a
+    cabling claim and the cabling is correct.
+    *Why it cannot be closed from the eight cells:* no reading distinguishes constant-low from
+    bare. The candidate answers, none free: (a) key on transport capability, which §15.62
+    explicitly refused ("keyed on the reading and never on a driver name"); (b) require a positive
+    control — a state in which this port's CTS has ever read high — before licensing a cabling
+    negative; (c) weaken the all-`false` sentence for every bench, which costs §5's stated common
+    case and the wording §15.62 preserved byte-for-byte.
+    *Declined here:* deciding between them on one session's evidence.
+    *Not a gate defect:* nothing reddens. `expectations/{linux,macos}.jq` do not pin the shape
+    word and `itest/tests/expectation_gates.rs:1288-1300` plants the all-`false` sentence and
+    asserts the gate must accept it. The harm is a misled reader and a wrong skip reason.
+    *Validation:* fail-first against the **stated** property (AGENTS §3's sixth register) — plant a
+    constant-low CTS and show the chosen instrument stops asserting a cable fact, on both
+    instruments, since item 56's lesson is that two implementations of one question drift.
+
+93. **A rate this stack accepts and echoes exactly can carry nothing, and `actual_baud` cannot
+    see it** — **open** (M; needs the Linux arm). *Evidence:* §15.68 clause 4. With payload held
+    constant at 240 bytes, 15000 / 15600 / 16800 / 20000 delivered **0 or 1 byte** while 9600,
+    14400, 19200, 38400, 57600 and 115200 were byte-exact; `IOSSIOSPEED` returned success at every
+    one and `tcgetattr` echoed the ask. `serial2` uses that same path on macOS, so a node at 15000
+    comes up `status="active" actual_baud=15000` and is dead — **§7.1 clause 7's ±2.5 % read-back
+    verified against an exact echo**, which is item 85's accept-echo-do-not-perform class one layer
+    up. This answers the arm `crossover_rig_actual_baud_is_a_read_back_not_an_echo` asks for in its
+    own skip line.
+    *Scoped, deliberately:* this is **not** "non-standard rates are dead". P5's ladder round-trips
+    the non-standard `CUSTOM_BAUD = 250_000` on this same pair in the same captures. Four rates
+    were asked and four carried nothing; what selects them is **unknown**.
+    *Remainder:* (a) what selects a dead rate — divisor reachability is the obvious hypothesis and
+    is untested; (b) **the Linux arm**, which is a genuine gap rather than a formality: that
+    ladder steps 9600 → 19200 → 38400 and has never asked 15000/15600/16800 on any kernel, so
+    device-versus-stack is undecided and no Darwin/Linux contrast may be drawn.
+    *Validation:* the same 240-byte constant-payload sweep on Linux with these adapters, then a
+    decision about whether `load` can refuse a rate it cannot verify.
+
+94. **The plan's Status table cannot say what the macOS rig-box figure is** — **open** (S;
+    clerical, and it blocked a delta this session). *Evidence:* the 2026-08-13 row carries **six**
+    cells against a five-column header; cell 5 reads "the **+6** over the 955 row" (→ 961) and the
+    orphan sixth reads "the **+1** over the 959 row" (→ 960), while cell 5 also claims to supersede
+    a **960** row that does not exist and two later rows point up at one. `docs/macos.md:67` quotes
+    **955** for the same session. **This session measured 1000 · 0 · 7 at default scope on that box
+    and could not quote a delta**, because the prior end is ambiguous in the one surface plan §3
+    rule 19 makes authoritative for figures.
+    *Validation:* reconstruct from the session's own record, or mark the row unreconciled in the
+    shape the 835 row already uses.
+
+95. **AGENTS §2's open-item list is stale for roughly sixteen items and self-contradictory for
+    one** — **open** (S). *Evidence:* §2 lists 12–20, 22, 24, 25, 26, 30, 41, 42, 50 as open where
+    the ledger records them executed (12 at `plan:1179`, 13 at `:1228`, 14 at `:1262`, 16 at
+    `:1333`, 17 at `:1363`, 18 at `:1410`, 19 both halves at `:1437`, 20 at `:1497`, 22 at `:1566`,
+    24 at `:1617`, 25 at `:1634`, 26 at `:1652`, 30 at `:1755`, 41 at `:1947`, 42 at `:1981`,
+    50 at `:2237`). **Item 41 is contradicted inside one sentence** — the same paragraph says it
+    was executed 2026-08-15 "so the design now carries none" and then lists 41 as open. §2
+    self-flags a stale-claim defect for 64(a)/79 while carrying a wider one, and its own closing
+    rule applies: *a stale claim is a defect.* Also `plan:85` still reads "the equivalence must not
+    be asserted at any era until plan §18 item 30's run exists" — item 30's run exists.
+    *Validation:* §18's item entries are the only currently-accurate surface; reconcile the two
+    summary surfaces against them and add whatever gate would have caught the drift.
+
+96. **A symbol renamed by §15.61 still stands in normative prose** — **open** (S). *Evidence:*
+    plan item 85 and design §15.62 consequence 4 both name `serial_nexus_sys::honours_rtscts`,
+    which no longer exists — §15.61 parameterised it to
+    `honours_flow_control(path, FlowMode::RtsCts)`. `grep` finds the old spelling only under
+    `docs/`, never in a `.rs` file. Annotated at §15.62 rather than rewritten (AGENTS §5).
+    *Validation:* the citation gate already scopes filename-keyed claims; a symbol-keyed one has no
+    equivalent, and whether that is worth building is the item's real question.
 
 ### Evaluated and deliberately not scheduled — the closing register
 

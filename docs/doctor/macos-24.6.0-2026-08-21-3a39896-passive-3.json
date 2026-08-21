@@ -1,0 +1,1065 @@
+{
+  "tool": "serial-nexus-doctor",
+  "version": "0.3.0",
+  "build": {
+    "commit": "3a39896ca7cc",
+    "probe_set": "4317ea5ac187f506",
+    "field_set": "83bdc79c944b8534"
+  },
+  "generated_unix_ms": 1787273978717,
+  "generated_utc": "2026-08-21T00:59:38Z",
+  "environment": [
+    {
+      "name": "kernel",
+      "value": "24.6.0",
+      "status": "supported"
+    },
+    {
+      "name": "os",
+      "value": "Darwin 24.6.0 (x86_64)",
+      "status": "supported"
+    },
+    {
+      "name": "XDG_RUNTIME_DIR",
+      "value": "unset",
+      "status": "degraded"
+    },
+    {
+      "name": "daemon socket (default)",
+      "value": "/tmp/serial-nexus-daemon-501.sock — no XDG_RUNTIME_DIR and not root, so the per-uid /tmp fallback",
+      "status": "supported"
+    },
+    {
+      "name": "/dev/serial/by-id",
+      "value": "absent — 4 serial device(s) visible another way (sysfs / by-path / cu.*); identities come from those instead of udev's stable names (§12). No 60-serial.rules here — a container's bare --device=…, a busybox-mdev image; macOS has no by-id tree at all (§13)",
+      "status": "degraded"
+    },
+    {
+      "name": "user",
+      "value": "pwnall",
+      "status": "supported"
+    },
+    {
+      "name": "group:dialout",
+      "value": "group not present on system",
+      "status": "skipped",
+      "reason": "no such group"
+    },
+    {
+      "name": "group:plugdev",
+      "value": "group not present on system",
+      "status": "skipped",
+      "reason": "no such group"
+    },
+    {
+      "name": "access:/dev/cu.BLTH",
+      "value": "read+write",
+      "status": "supported"
+    },
+    {
+      "name": "access:/dev/cu.Bluetooth-Incoming-Port",
+      "value": "read+write",
+      "status": "supported"
+    },
+    {
+      "name": "access:/dev/cu.usbmodem5A7C2979541",
+      "value": "read+write",
+      "status": "supported"
+    },
+    {
+      "name": "access:/dev/cu.usbmodem5A7C2988541",
+      "value": "read+write",
+      "status": "supported"
+    }
+  ],
+  "probes": [
+    {
+      "id": "P1",
+      "title": "EXTPROC / TIOCPKT signaling",
+      "question": "Does a client tcsetattr surface as a TIOCPKT_IOCTL packet on the master; does clearing EXTPROC emit a final packet; can the master re-assert EXTPROC?",
+      "observations": [
+        {
+          "key": "ioctl_packet_on_tcsetattr",
+          "value": false
+        },
+        {
+          "key": "clear_extproc_produces_packet",
+          "value": false
+        },
+        {
+          "key": "reassert_extproc_via_master",
+          "value": false
+        }
+      ],
+      "status": "degraded",
+      "consequence": "EXTPROC notification incomplete → §7.2 runs poll-only; client-termios observation latency degrades, nothing else."
+    },
+    {
+      "id": "P2",
+      "title": "PTY presence / POLLHUP semantics",
+      "question": "Does the master report POLLHUP only when no client holds the slave; does HUP clear on reopen; is termios settable with no slave open?",
+      "observations": [
+        {
+          "key": "hup_when_never_opened",
+          "value": false
+        },
+        {
+          "key": "hup_while_open",
+          "value": false
+        },
+        {
+          "key": "hup_after_close",
+          "value": true
+        },
+        {
+          "key": "hup_after_reopen",
+          "value": false
+        },
+        {
+          "key": "termios_settable_without_slave",
+          "value": false
+        },
+        {
+          "key": "zero_timeout_poll_ns_median",
+          "value": 2071
+        }
+      ],
+      "status": "degraded",
+      "consequence": "POLLHUP presence works once the slave is primed, but this kernel's master is not a terminal (ENOTTY): the baseline is applied via the slave and re-asserted on the client's rising edge (§7.2). The PTY node handles it (§13); presence-gated output is available."
+    },
+    {
+      "id": "P4",
+      "title": "device identity resolution",
+      "question": "Does the resolver's one source — the <sys>/class/tty listing plus a dependency-free sysfs walk, with /dev/serial/by-id as a fast path over it — yield the canonical usb:vid:pid:serial:iface identity (§12)?",
+      "observations": [
+        {
+          "key": "by_id_tree",
+          "value": "absent"
+        },
+        {
+          "key": "sysfs_tty_listing",
+          "value": "absent"
+        },
+        {
+          "key": "count",
+          "value": 0
+        },
+        {
+          "key": "sysfs_only",
+          "value": 0
+        },
+        {
+          "key": "other_candidates",
+          "value": 4
+        },
+        {
+          "key": "canonical",
+          "value": 0
+        },
+        {
+          "key": "topology_only",
+          "value": 0
+        },
+        {
+          "key": "unidentified",
+          "value": 4
+        },
+        {
+          "key": "/dev/cu.BLTH",
+          "value": "raw:/dev/cu.BLTH"
+        },
+        {
+          "key": "/dev/cu.Bluetooth-Incoming-Port",
+          "value": "raw:/dev/cu.Bluetooth-Incoming-Port"
+        },
+        {
+          "key": "/dev/cu.usbmodem5A7C2979541",
+          "value": "raw:/dev/cu.usbmodem5A7C2979541"
+        },
+        {
+          "key": "/dev/cu.usbmodem5A7C2988541",
+          "value": "raw:/dev/cu.usbmodem5A7C2988541"
+        }
+      ],
+      "status": "degraded",
+      "consequence": "0 of 4 visible serial device(s) resolve to a canonical usb:vid:pid:serial:iface identity (0 by-path only, 4 raw path only): the identity a config would store here does NOT survive replug or renumbering, and carries the documented instability warning (§12). Neither /dev/serial/by-id nor <sys>/class/tty exists here, so the resolver's Linux backend has no source at all: the BSD/macOS shape, where a cu.* raw path is the interim identity and a node configured with a usb: or by-path: identity resolves to nothing and stays `waiting` (§12, §13; the IOKit backend that would supply canonical identities off Linux is deferred, §14)."
+    },
+    {
+      "id": "P3",
+      "title": "serial-port fit",
+      "question": "Custom baud acceptance, TIOCEXCL exclusivity, modem-line set/read, and break toggling on a real port (§7.1).",
+      "observations": [],
+      "status": "skipped",
+      "reason": "no --port named",
+      "consequence": "Re-run with --port /dev/ttyUSB0 (a dangling converter is enough — no target device needed, §13)."
+    },
+    {
+      "id": "P5",
+      "title": "rig discovery and certification",
+      "question": "Classify each named port (dangling/loopback/paired, both directions) and certify the rig for a tiered checklist run (§13, §15.21).",
+      "observations": [],
+      "status": "skipped",
+      "reason": "no --port named",
+      "consequence": "Re-run with the rig's --ports (dangling converters and jumper wires suffice — no target device, §13)."
+    },
+    {
+      "id": "P6",
+      "title": "pty-master readiness after the last slave closes",
+      "question": "Once a pty's last slave fd closes, does the master keep asserting POLLIN with nothing to read (the shape that spins a close-triggered poll loop)?",
+      "observations": [
+        {
+          "key": "after_last_close",
+          "value": {
+            "bytes_read": 0,
+            "elapsed_ms": 165,
+            "passes": 64,
+            "pollhup_passes": 64,
+            "pollin_passes": 64,
+            "pollin_with_no_data_passes": 64,
+            "read_outcomes": {
+              "eof": 64
+            },
+            "revents_seen": {
+              "POLLIN|POLLHUP": 64
+            }
+          }
+        },
+        {
+          "key": "client_session_baseline",
+          "value": {
+            "baseline_packet_bytes_drained": 1,
+            "baseline_via_master": false,
+            "extproc_set_at_shape": false,
+            "reasserted_on_client_slave": true,
+            "slave_termios_mode": "raw"
+          }
+        },
+        {
+          "key": "handler_reset_applied",
+          "value": true
+        },
+        {
+          "key": "handler_reset_extproc_retained",
+          "value": false
+        },
+        {
+          "key": "handler_reset_path_probe",
+          "value": "master"
+        },
+        {
+          "key": "handler_reset_path_node",
+          "value": "momentary-slave"
+        },
+        {
+          "key": "handler_reset_readable_bytes",
+          "value": 0
+        },
+        {
+          "key": "after_handler_termios_reset",
+          "value": {
+            "bytes_read": 0,
+            "elapsed_ms": 163,
+            "passes": 64,
+            "pollhup_passes": 64,
+            "pollin_passes": 64,
+            "pollin_with_no_data_passes": 64,
+            "read_outcomes": {
+              "eof": 64
+            },
+            "revents_seen": {
+              "POLLIN|POLLHUP": 64
+            }
+          }
+        }
+      ],
+      "status": "degraded",
+      "consequence": "The master keeps asserting POLLIN with nothing to read after the last close (64 of 64 passes): an ungated `closed`-only arm WOULD re-fire every pass here — the 99%-CPU shape `b8d8ed8` records. pty.rs's `saw_session` latch (and the drain that consumes the handler's own control packet) is load-bearing on this kernel: do not simplify it. The node's own last-close termios reset was ACCEPTED through the master here, but this kernel did not retain EXTPROC afterwards (`handler_reset_extproc_retained: false`) — so the EXTPROC-gated `TIOCPKT_IOCTL` re-arm cannot fire at all, and the 0 byte(s) read below say nothing about whether `pty.rs`'s drain is load-bearing. P1 is the probe for that mechanism, and §7.2 already runs poll-only where it is degraded. Read `handler_reset_applied: true` as \"the syscall was accepted\", never as \"the reset took effect\". The shipped code is correct as it stands; this is a warning about a pending simplification, not a fault. The client session was measured with the pair in `raw` and EXTPROC **NOT set — this kernel does not retain it** (P1) — the §7.2 baseline re-asserted on the client's own slave, having reached the pair through the momentary-slave fallback at setup — so this reading is of the daemon's pty and not of whatever discipline the kernel left behind."
+    },
+    {
+      "id": "P7",
+      "title": "evidence a collapsed client session leaves on the master",
+      "question": "After a pty client hangs up, which session shapes (bare open/close, tcsetattr-only, one byte written) leave a readable packet on the packet-mode master?",
+      "observations": [
+        {
+          "key": "a_open_close",
+          "value": {
+            "baseline_packet_bytes_drained": 1,
+            "baseline_via_master": false,
+            "bytes_readable_after_close": 0,
+            "data_packet_seen": false,
+            "extproc_set_at_shape": false,
+            "ioctl_bit_set": false,
+            "leading_bytes_hex": [],
+            "reads": 0,
+            "reasserted_on_client_slave": true,
+            "slave_termios_mode": "raw",
+            "terminal_read": "eof"
+          }
+        },
+        {
+          "key": "b_open_tcsetattr_close",
+          "value": {
+            "baseline_packet_bytes_drained": 1,
+            "baseline_via_master": false,
+            "bytes_readable_after_close": 0,
+            "data_packet_seen": false,
+            "extproc_set_at_shape": false,
+            "ioctl_bit_set": false,
+            "leading_bytes_hex": [],
+            "reads": 0,
+            "reasserted_on_client_slave": true,
+            "slave_termios_mode": "raw",
+            "terminal_read": "eof"
+          }
+        },
+        {
+          "key": "c_open_write_close",
+          "value": {
+            "baseline_packet_bytes_drained": 1,
+            "baseline_via_master": false,
+            "bytes_readable_after_close": 0,
+            "data_packet_seen": false,
+            "extproc_set_at_shape": false,
+            "ioctl_bit_set": false,
+            "leading_bytes_hex": [],
+            "reads": 0,
+            "reasserted_on_client_slave": true,
+            "slave_termios_mode": "raw",
+            "terminal_read": "eof"
+          }
+        },
+        {
+          "key": "latch_covers_termios_only_session",
+          "value": false
+        },
+        {
+          "key": "latch_covers_data_session",
+          "value": false
+        },
+        {
+          "key": "extproc_retained_at_shape",
+          "value": false
+        },
+        {
+          "key": "measured_in_daemon_baseline",
+          "value": false
+        },
+        {
+          "key": "silence_cause",
+          "value": "hangup-destroys-evidence"
+        }
+      ],
+      "status": "degraded",
+      "consequence": "NOTHING is readable on the master after the hangup for ANY of the three shapes on this kernel — not the termios-only session, and not the one that wrote a byte. That second fact is what makes this a different finding from a lost baseline: a written byte is not EXTPROC-gated (measured on Linux 7.0.0-29: planting a baseline with no EXTPROC silences the termios shape and leaves the write shape at 2 bytes; a fully cooked pair also leaves it at 2). Both silent means this kernel destroys the pair's queues at the last close — the disposition **P13** measures — so no termios repair can move these numbers and this is **not** evidence that §6 detach-release is broken here. On such a kernel the session boundary is carried as an *edge* rather than as readable state: read **P12** in this same report, which measures exactly that, before drawing any conclusion about the write lock (§15.39). Measured with the pair in `raw`, EXTPROC **NOT set — this kernel did not retain it**, the §7.2 baseline re-asserted on the client's own slave (applied) and reaching the pair through the momentary-slave fallback at setup; the re-assert's own 1 byte(s) were drained before the session ran, so nothing below is the probe's own footprint."
+    },
+    {
+      "id": "P12",
+      "title": "session-boundary edge on a pty master",
+      "question": "Does an edge latch report a collapsed client session that left nothing readable on the master, and does it stay silent while idle?",
+      "observations": [
+        {
+          "key": "a_open_close_edge",
+          "value": true
+        },
+        {
+          "key": "b_open_tcsetattr_close_edge",
+          "value": true
+        },
+        {
+          "key": "c_open_write_close_edge",
+          "value": true
+        },
+        {
+          "key": "idle_edges_in_200_passes",
+          "value": 0
+        },
+        {
+          "key": "idle_window_tight",
+          "value": {
+            "edges": 0,
+            "elapsed_us": 4981,
+            "pass_pause_us": 0,
+            "passes": 200,
+            "poll_event_passes": 200,
+            "read_outcomes": {
+              "eof": 200
+            }
+          }
+        },
+        {
+          "key": "idle_window_paced",
+          "value": {
+            "edges": 0,
+            "elapsed_us": 392673,
+            "pass_pause_us": 5000,
+            "passes": 64,
+            "poll_event_passes": 64,
+            "read_outcomes": {
+              "eof": 64
+            }
+          }
+        },
+        {
+          "key": "live_session_window",
+          "value": {
+            "edges": 0,
+            "elapsed_us": 394229,
+            "pass_pause_us": 5000,
+            "passes": 64,
+            "poll_event_passes": 1,
+            "read_outcomes": {
+              "EAGAIN": 63,
+              "bytes": 1
+            }
+          }
+        },
+        {
+          "key": "control_session_edge",
+          "value": true
+        },
+        {
+          "key": "control_session_edge_pass",
+          "value": 1
+        },
+        {
+          "key": "control_session_edge_us",
+          "value": 38
+        }
+      ],
+      "status": "supported",
+      "consequence": "A collapsed termios-only session posts a session-boundary edge; an idle hung-up master posts NONE across 264 reader-shaped passes covering 397654 us of wall clock, one window of them paced at the daemon's own 5 ms `IDLE_POLL`; a master with a client attached and idle posts none either; and the same latch DID post the boundary this probe then produced on purpose, which is what makes those zeros a measurement rather than an inert instrument. `pty.rs`'s `saw_session` latch is armed by the edge where this kernel keeps no readable evidence, so detach-release covers the `stty`/health-check/scripted shape (§6, §15.39). This is the mechanism `p9_pty_collapse` asserts end to end here."
+    },
+    {
+      "id": "P13",
+      "title": "disposition of unread client bytes at a pts last close",
+      "question": "When a pty client writes bytes the master has not read and then closes, does this kernel retain them, discard them, or block the close waiting for the reader?",
+      "observations": [
+        {
+          "key": "a_no_reader_blocking_slave",
+          "value": {
+            "baseline_packet_bytes": 1,
+            "bytes_lost": 64,
+            "bytes_recovered_after_close": 0,
+            "bytes_recovered_before_close": 0,
+            "bytes_recovered_total": 0,
+            "bytes_written_by_slave": 64,
+            "close_microseconds": 601086,
+            "slave_termios_mode": "raw",
+            "terminal_read": "eof"
+          }
+        },
+        {
+          "key": "b_reader_drains_before_close",
+          "value": {
+            "baseline_packet_bytes": 1,
+            "bytes_lost": 0,
+            "bytes_recovered_after_close": 0,
+            "bytes_recovered_before_close": 64,
+            "bytes_recovered_total": 64,
+            "bytes_written_by_slave": 64,
+            "close_microseconds": 22,
+            "slave_termios_mode": "raw",
+            "terminal_read": "eof"
+          }
+        },
+        {
+          "key": "c_no_reader_nonblocking_slave",
+          "value": {
+            "baseline_packet_bytes": 1,
+            "bytes_lost": 64,
+            "bytes_recovered_after_close": 0,
+            "bytes_recovered_before_close": 0,
+            "bytes_recovered_total": 0,
+            "bytes_written_by_slave": 64,
+            "close_microseconds": 16,
+            "slave_termios_mode": "raw",
+            "terminal_read": "eof"
+          }
+        },
+        {
+          "key": "d_no_reader_second_fd_held",
+          "value": {
+            "baseline_packet_bytes": 1,
+            "bytes_lost": 0,
+            "bytes_recovered_after_close": 64,
+            "bytes_recovered_before_close": 0,
+            "bytes_recovered_total": 64,
+            "bytes_written_by_slave": 64,
+            "close_microseconds": 21,
+            "slave_termios_mode": "raw",
+            "terminal_read": "EAGAIN"
+          }
+        },
+        {
+          "key": "e_reader_arrives_during_close_wait",
+          "value": {
+            "baseline_packet_bytes": 1,
+            "bytes_lost": 0,
+            "bytes_recovered_after_close": 0,
+            "bytes_recovered_before_close": 0,
+            "bytes_recovered_by_arriving_reader": 64,
+            "bytes_recovered_total": 64,
+            "bytes_written_by_slave": 64,
+            "close_microseconds": 24,
+            "reader_arrival": {
+              "arrived_before_close_returned": true,
+              "close_returned_us": 24,
+              "does_not_license": "the bytes and the close time here belong to a reader that arrived INSIDE the close; they say nothing about a reader that never arrives — that is shape `a`",
+              "reader_arm_microseconds": 358,
+              "reader_first_read_offset_us": 1,
+              "reader_terminal_read": "eof",
+              "reading": "arrived-inside-the-close-window"
+            },
+            "slave_termios_mode": "raw",
+            "terminal_read": "eof"
+          }
+        },
+        {
+          "key": "policy",
+          "value": "waits-then-discards"
+        },
+        {
+          "key": "close_waits_for_reader",
+          "value": true
+        }
+      ],
+      "status": "supported",
+      "consequence": "This kernel **waits-then-discards** bytes a pts client wrote but the master never read: with no reader, 0 of 64 byte(s) survive the last close and `close(2)` takes 601086 µs (terminal read `eof`). With a master that drains before the close, 64 of 64 byte(s) are recovered and the close takes 22 µs — the healthy-reader case, and the one the daemon is in. Numbers, not a verdict — every policy is legitimate and the daemon is correct under each (§7.2 drains before finalizing a close, §5 accounts what it reads). Read it for two things: a cross-kernel diff, and the reason a harness reads a byte counter while its client is still open rather than after (notes §3.29). A `waits-then-*` kernel additionally means a lost byte implies a reader stalled for the whole timeout, not a lost microsecond race. **The last-close reference count** is measured too, by holding a second fd on the same pts across the writer's close (`d_no_reader_second_fd_held` against `a_no_reader_blocking_slave`): 64 of 64 byte(s) survive with the witness held against 0 without it, and the terminal read is `EAGAIN` against `eof`. Compare the two rows rather than reading either alone — that pair is the whole measurement, and if *neither* the bytes nor the terminal move on some kernel, a held fd buys nothing there and the harness rule that depends on it (notes §3.56) is resting on nothing. **A reader that arrives *during* the close** (`e_reader_arrives_during_close_wait`) got its first `read(2)` in 1 µs after the close was entered and before it returned, recovered 64 of 64 byte(s) there, and the close then took 24 µs against 601086 µs with no reader at all. On a kernel whose close waits for a reader, that difference is the whole finding: it is the daemon's own reader cadence (200 µs–5 ms) landing inside the wait, and a run where the close still pays its full timeout means the reader stalled — a daemon-side event, not a kernel one (notes §3.29)."
+    },
+    {
+      "id": "P8",
+      "title": "epoll vs read(2) on a pty master",
+      "question": "Does epoll report a pty master readable while read(2) returns EAGAIN — the busy-loop shape that made the data plane use poll(2) instead (invariant 1, §15.18)?",
+      "observations": [],
+      "status": "skipped",
+      "reason": "epoll is Linux-only",
+      "consequence": "epoll(7) has no portable equivalent, and the data plane is forbidden from using it anyway (invariant 1) — nothing here is untested, only unmeasurable on this platform (§13)."
+    },
+    {
+      "id": "P9",
+      "title": "poll(2) timeout granularity",
+      "question": "For a never-ready tty fd, what does a requested poll(2) timeout of 0/1/5/10 ms actually cost (min/median/max, µs)?",
+      "observations": [
+        {
+          "key": "poll_timeout_0ms",
+          "value": {
+            "max_us": 68,
+            "median_ns": 24905,
+            "median_us": 24,
+            "min_us": 22,
+            "overshoot_median_us": 24,
+            "ready_passes": 0,
+            "requested_ms": 0,
+            "requested_us": 0,
+            "samples": 16
+          }
+        },
+        {
+          "key": "poll_timeout_1ms",
+          "value": {
+            "max_us": 1225,
+            "median_ns": 1192600,
+            "median_us": 1192,
+            "min_us": 1172,
+            "overshoot_median_us": 192,
+            "ready_passes": 0,
+            "requested_ms": 1,
+            "requested_us": 1000,
+            "samples": 16
+          }
+        },
+        {
+          "key": "poll_timeout_5ms",
+          "value": {
+            "max_us": 5742,
+            "median_ns": 5691964,
+            "median_us": 5691,
+            "min_us": 5363,
+            "overshoot_median_us": 691,
+            "ready_passes": 0,
+            "requested_ms": 5,
+            "requested_us": 5000,
+            "samples": 16
+          }
+        },
+        {
+          "key": "poll_timeout_10ms",
+          "value": {
+            "max_us": 11074,
+            "median_ns": 11066737,
+            "median_us": 11066,
+            "min_us": 10130,
+            "overshoot_median_us": 1066,
+            "ready_passes": 0,
+            "requested_ms": 10,
+            "requested_us": 10000,
+            "samples": 16
+          }
+        },
+        {
+          "key": "median_us_for_1ms_request",
+          "value": 1192
+        },
+        {
+          "key": "median_ns_for_0ms_request",
+          "value": 24905
+        },
+        {
+          "key": "ready_passes_total",
+          "value": 0
+        },
+        {
+          "key": "zero_timeout_by_fd_state",
+          "value": {
+            "hangup_delivered_to_a_mask_that_requested_nothing": false,
+            "headline_offset_is": "sample count and warmup only: median_ns_for_0ms_request is n=16 taken cold, unready_master_pollin_ns is n=4096 on the same fd, same mask, same wrapper",
+            "headline_over_matched_cell_x100": 150,
+            "isolated_variable": "ready-vs-not-ready",
+            "mask_role": "measured: a poll requesting nothing received NOTHING on a master that a POLLHUP-requesting poll on the same fd reported hung up, so this kernel gates the hangup on the requested mask and the mask cells are LEVELS, not replicates. The table does not collapse here. **This is not a disagreement with the kernels that do deliver it — it is a third state, and reading it as a mask level is what makes it look like one.** Compare only the `*_requesting_*` figures: the empty-mask cell is never made ready here, so folding it into the ready group collapses the fd-state contrast to ~1x, and dropping it recovers the same shape a delivering kernel reports — fd state dominating (~10x) with the mask not mattering (~1.1x) among the cells that asked for something.",
+            "mask_spread_not_ready_requesting_x100": 108,
+            "mask_spread_not_ready_x100": 108,
+            "mask_spread_ready_requesting_x100": 127,
+            "mask_spread_ready_x100": 985,
+            "nonblocking_offset_x100": 143,
+            "not_ready_cells": [
+              "unready_master_pollin_ns",
+              "unready_master_pollhup_ns",
+              "unready_master_empty_mask_ns"
+            ],
+            "order_control_does_not_license": "a within-group ordering, not a mechanism. `consistent-with-warmup` says the cells decline in the order they ran and does NOT name what declined — a cold cache, a frequency ramp and a genuine kernel cost are indistinguishable here. `flat` says only that nothing exceeded `order_control_tolerance_x100`, which is a fitted resolution and not a noise floor. `not-comparable` means the group's cells did not observe one kernel state, which on a hangup-gating kernel is the mask being a level rather than any instrument fault.",
+            "order_control_not_ready": "flat",
+            "order_control_ready_hungup": "not-comparable",
+            "order_control_says": "excludes-warmup-above-tolerance",
+            "order_control_tolerance_x100": 150,
+            "p2_instrument_blocking_fd_ns": 2085,
+            "p2_instrument_ready_passes": 4096,
+            "p2_instrument_same_fd_ns": 1454,
+            "p2_instrument_verbatim_is": "p2_instrument_blocking_fd_ns",
+            "p2_reports_the_shape": "ready_hungup_master_pollhup_ns",
+            "read_the_mask_spread_from": "mask_spread_not_ready_requesting_x100 / mask_spread_ready_requesting_x100",
+            "read_the_separation_from": "worst_case_separation_requesting_masks_x100",
+            "ready_cells": [
+              "ready_hungup_master_pollin_ns",
+              "ready_hungup_master_pollhup_ns",
+              "ready_hungup_master_empty_mask_ns"
+            ],
+            "ready_hungup_master_empty_mask_ns": 15920,
+            "ready_hungup_master_empty_mask_ready_passes": 0,
+            "ready_hungup_master_empty_mask_revents": "none",
+            "ready_hungup_master_pollhup_ns": 1615,
+            "ready_hungup_master_pollhup_ready_passes": 4096,
+            "ready_hungup_master_pollhup_revents": "POLLHUP",
+            "ready_hungup_master_pollin_ns": 2063,
+            "ready_hungup_master_pollin_ready_passes": 4096,
+            "ready_hungup_master_pollin_revents": "POLLIN|POLLHUP",
+            "ready_passes_on_unready_fd": 0,
+            "samples_each": 4096,
+            "shape": "2x3",
+            "the_data_plane_parks_on": "unready_master_pollin_ns",
+            "unready_master_empty_mask_ns": 16006,
+            "unready_master_empty_mask_ready_passes": 0,
+            "unready_master_empty_mask_revents": "none",
+            "unready_master_pollhup_ns": 15264,
+            "unready_master_pollhup_ready_passes": 0,
+            "unready_master_pollhup_revents": "none",
+            "unready_master_pollin_ns": 16555,
+            "unready_master_pollin_ready_passes": 0,
+            "unready_master_pollin_revents": "none",
+            "worst_case_separation_requesting_masks_x100": 739,
+            "worst_case_separation_x100": 95,
+            "wrapper_offset_x100": 90
+          }
+        }
+      ],
+      "status": "supported",
+      "consequence": "A zero timeout costs 24905 ns median (the cost of asking) and a requested 1 ms costs 1192 µs median on this kernel — that is the floor §15.19's hybrid data plane was built around and the floor poll_ready's idle backoff steps against. 16 samples per timeout: enough to see the floor, not enough to characterize a tail. `zero_timeout_by_fd_state` is a **2x3** here: the isolated variable is ready-versus-not-ready, and whether the mask column is a control or a second axis is decided by `hangup_delivered_to_a_mask_that_requested_nothing`, which this kernel answers **false** — see `mask_role`. Read `worst_case_separation_requesting_masks_x100` against `mask_spread_not_ready_requesting_x100 / mask_spread_ready_requesting_x100`: the finding survives only where the first exceeds the second, and the two must come from the SAME cell set — `read_the_separation_from` and `read_the_mask_spread_from` name the matching pair, because comparing a figure that drops the empty-mask cell against one that keeps it is not a comparison. `median_ns_for_0ms_request` above is n=16 taken cold and is NOT comparable to P2's headline — `p2_instrument_blocking_fd_ns` is, and `wrapper_offset_x100` / `nonblocking_offset_x100` say how much of any residual is this probe's instrument rather than the kernel's. The empty-mask cell runs last at each fd state, so it doubles as a within-group warmup control, and **`order_control_says` is that control's outcome** — `flat` is the usual answer and is not a strong pass, only a statement that nothing exceeded `order_control_tolerance_x100`; read `order_control_does_not_license` before drawing a mechanism from it. Diff these against the other kernel of record (6.18 or 7.0, whichever this run is not) before tuning any backoff step or timer against them."
+    },
+    {
+      "id": "P10",
+      "title": "pty buffer depth",
+      "question": "How many bytes does a pty accept in each direction before it would block, with nothing draining the other end?",
+      "observations": [
+        {
+          "key": "slave_to_master_targetward",
+          "value": {
+            "bytes_accepted_before_eagain": 1024,
+            "bytes_recovered_by_peer": 1024,
+            "bytes_unrecoverable": 0,
+            "ceiling_bytes": 4194304,
+            "ceiling_hit": false,
+            "chunk_bytes": 4096,
+            "peer_pending_input_bytes": 0,
+            "peer_pending_input_bytes_at_drain": 0,
+            "peer_pending_input_trust": "contradicted-empty",
+            "pending_output_bytes": null,
+            "recheck": {
+              "drained_again_bytes": 512,
+              "flat_fields_are_the_rung_draining": 512,
+              "ladder": [
+                {
+                  "carries_a_watermark_bound": true,
+                  "drain_came_up_short": false,
+                  "drain_requested_bytes": 512,
+                  "drained_bytes": 512,
+                  "occupancy_after_drain_bytes": 512,
+                  "refill_terminal_write": "EAGAIN",
+                  "refilled_from_empty_bytes": 1024,
+                  "refilled_from_empty_writes": 1,
+                  "topped_up_bytes": 512,
+                  "topped_up_minus_drained": 0,
+                  "topped_up_writes": 512,
+                  "topup_ceiling_hit": false,
+                  "topup_terminal_write": "EAGAIN"
+                },
+                {
+                  "carries_a_watermark_bound": true,
+                  "drain_came_up_short": false,
+                  "drain_requested_bytes": 1,
+                  "drained_bytes": 1,
+                  "occupancy_after_drain_bytes": 1023,
+                  "refill_terminal_write": "EAGAIN",
+                  "refilled_from_empty_bytes": 1024,
+                  "refilled_from_empty_writes": 1,
+                  "topped_up_bytes": 1,
+                  "topped_up_minus_drained": 0,
+                  "topped_up_writes": 1,
+                  "topup_ceiling_hit": false,
+                  "topup_terminal_write": "EAGAIN"
+                },
+                {
+                  "carries_a_watermark_bound": true,
+                  "drain_came_up_short": false,
+                  "drain_requested_bytes": 128,
+                  "drained_bytes": 128,
+                  "occupancy_after_drain_bytes": 896,
+                  "refill_terminal_write": "EAGAIN",
+                  "refilled_from_empty_bytes": 1024,
+                  "refilled_from_empty_writes": 1,
+                  "topped_up_bytes": 128,
+                  "topped_up_minus_drained": 0,
+                  "topped_up_writes": 128,
+                  "topup_ceiling_hit": false,
+                  "topup_terminal_write": "EAGAIN"
+                },
+                {
+                  "carries_a_watermark_bound": true,
+                  "drain_came_up_short": false,
+                  "drain_requested_bytes": 900,
+                  "drained_bytes": 900,
+                  "occupancy_after_drain_bytes": 124,
+                  "refill_terminal_write": "EAGAIN",
+                  "refilled_from_empty_bytes": 1024,
+                  "refilled_from_empty_writes": 1,
+                  "topped_up_bytes": 900,
+                  "topped_up_minus_drained": 0,
+                  "topped_up_writes": 900,
+                  "topup_ceiling_hit": false,
+                  "topup_terminal_write": "EAGAIN"
+                },
+                {
+                  "carries_a_watermark_bound": false,
+                  "drain_came_up_short": false,
+                  "drain_requested_bytes": null,
+                  "drained_bytes": 1024,
+                  "occupancy_after_drain_bytes": 0,
+                  "refill_terminal_write": "EAGAIN",
+                  "refilled_from_empty_bytes": 1024,
+                  "refilled_from_empty_writes": 1,
+                  "topped_up_bytes": 1024,
+                  "topped_up_minus_drained": 0,
+                  "topped_up_writes": 1024,
+                  "topup_ceiling_hit": false,
+                  "topup_terminal_write": "EAGAIN"
+                }
+              ],
+              "ladder_reading": {
+                "reading": "T is the watermark in `writable iff occupancy < T, then accept up to capacity`. A null `watermark_threshold_le` means no rung refused, so no hysteresis was seen at any drain size probed — bounded by the smallest rung, not proof of a pure capacity. A null `watermark_threshold_gt` means no rung topped up at all. Both are null when no rung freed any bytes, which is what a cooked pty does; nothing is inferred from a rung that freed nothing. Where `rungs_refusing` is 0 the `_gt` bound is the largest occupancy the ladder happened to reach and NOT an occupancy the kernel was observed to accept a write at — on a pipeline kernel it moved under the top-up.",
+                "rungs_carrying_a_bound": 4,
+                "rungs_refusing": 0,
+                "rungs_topping_up": 4,
+                "uniform_shortfall_bytes": null,
+                "watermark_threshold_gt": 1023,
+                "watermark_threshold_le": null
+              },
+              "refill_reproduced_total": true,
+              "refill_terminal_write": "EAGAIN",
+              "refilled_from_empty_bytes": 1024,
+              "refilled_from_empty_writes": 1,
+              "room_republished_minus_room_freed": 0,
+              "topped_up_bytes": 512,
+              "topped_up_writes": 512,
+              "topup_ceiling_bytes": 65536,
+              "topup_ceiling_hit": false,
+              "topup_chunk_bytes": 1,
+              "topup_terminal_write": "EAGAIN"
+            },
+            "settle_ms": 20,
+            "settled_extra_bytes": 0,
+            "settled_extra_writes": 0,
+            "slave_termios_mode": "raw",
+            "terminal_write": "EAGAIN",
+            "terminal_write_after_settle": "EAGAIN",
+            "total_bytes_accepted": 1024,
+            "writer_pending_input_bytes": 0,
+            "writes": 1
+          }
+        },
+        {
+          "key": "master_to_slave_hostward",
+          "value": {
+            "bytes_accepted_before_eagain": 1022,
+            "bytes_recovered_by_peer": 1022,
+            "bytes_unrecoverable": 0,
+            "ceiling_bytes": 4194304,
+            "ceiling_hit": false,
+            "chunk_bytes": 4096,
+            "peer_pending_input_bytes": 1022,
+            "peer_pending_input_bytes_at_drain": 1022,
+            "peer_pending_input_trust": "agrees",
+            "pending_output_bytes": null,
+            "recheck": {
+              "drained_again_bytes": 512,
+              "flat_fields_are_the_rung_draining": 512,
+              "ladder": [
+                {
+                  "carries_a_watermark_bound": true,
+                  "drain_came_up_short": false,
+                  "drain_requested_bytes": 512,
+                  "drained_bytes": 512,
+                  "occupancy_after_drain_bytes": 510,
+                  "refill_terminal_write": "EAGAIN",
+                  "refilled_from_empty_bytes": 1022,
+                  "refilled_from_empty_writes": 1,
+                  "topped_up_bytes": 512,
+                  "topped_up_minus_drained": 0,
+                  "topped_up_writes": 512,
+                  "topup_ceiling_hit": false,
+                  "topup_terminal_write": "EAGAIN"
+                },
+                {
+                  "carries_a_watermark_bound": true,
+                  "drain_came_up_short": false,
+                  "drain_requested_bytes": 1,
+                  "drained_bytes": 1,
+                  "occupancy_after_drain_bytes": 1021,
+                  "refill_terminal_write": "EAGAIN",
+                  "refilled_from_empty_bytes": 1022,
+                  "refilled_from_empty_writes": 1,
+                  "topped_up_bytes": 1,
+                  "topped_up_minus_drained": 0,
+                  "topped_up_writes": 1,
+                  "topup_ceiling_hit": false,
+                  "topup_terminal_write": "EAGAIN"
+                },
+                {
+                  "carries_a_watermark_bound": true,
+                  "drain_came_up_short": false,
+                  "drain_requested_bytes": 128,
+                  "drained_bytes": 128,
+                  "occupancy_after_drain_bytes": 894,
+                  "refill_terminal_write": "EAGAIN",
+                  "refilled_from_empty_bytes": 1022,
+                  "refilled_from_empty_writes": 1,
+                  "topped_up_bytes": 128,
+                  "topped_up_minus_drained": 0,
+                  "topped_up_writes": 128,
+                  "topup_ceiling_hit": false,
+                  "topup_terminal_write": "EAGAIN"
+                },
+                {
+                  "carries_a_watermark_bound": true,
+                  "drain_came_up_short": false,
+                  "drain_requested_bytes": 900,
+                  "drained_bytes": 900,
+                  "occupancy_after_drain_bytes": 122,
+                  "refill_terminal_write": "EAGAIN",
+                  "refilled_from_empty_bytes": 1022,
+                  "refilled_from_empty_writes": 1,
+                  "topped_up_bytes": 900,
+                  "topped_up_minus_drained": 0,
+                  "topped_up_writes": 900,
+                  "topup_ceiling_hit": false,
+                  "topup_terminal_write": "EAGAIN"
+                },
+                {
+                  "carries_a_watermark_bound": false,
+                  "drain_came_up_short": false,
+                  "drain_requested_bytes": null,
+                  "drained_bytes": 1022,
+                  "occupancy_after_drain_bytes": 0,
+                  "refill_terminal_write": "EAGAIN",
+                  "refilled_from_empty_bytes": 1022,
+                  "refilled_from_empty_writes": 1,
+                  "topped_up_bytes": 1022,
+                  "topped_up_minus_drained": 0,
+                  "topped_up_writes": 1022,
+                  "topup_ceiling_hit": false,
+                  "topup_terminal_write": "EAGAIN"
+                }
+              ],
+              "ladder_reading": {
+                "reading": "T is the watermark in `writable iff occupancy < T, then accept up to capacity`. A null `watermark_threshold_le` means no rung refused, so no hysteresis was seen at any drain size probed — bounded by the smallest rung, not proof of a pure capacity. A null `watermark_threshold_gt` means no rung topped up at all. Both are null when no rung freed any bytes, which is what a cooked pty does; nothing is inferred from a rung that freed nothing. Where `rungs_refusing` is 0 the `_gt` bound is the largest occupancy the ladder happened to reach and NOT an occupancy the kernel was observed to accept a write at — on a pipeline kernel it moved under the top-up.",
+                "rungs_carrying_a_bound": 4,
+                "rungs_refusing": 0,
+                "rungs_topping_up": 4,
+                "uniform_shortfall_bytes": null,
+                "watermark_threshold_gt": 1021,
+                "watermark_threshold_le": null
+              },
+              "refill_reproduced_total": true,
+              "refill_terminal_write": "EAGAIN",
+              "refilled_from_empty_bytes": 1022,
+              "refilled_from_empty_writes": 1,
+              "room_republished_minus_room_freed": 0,
+              "topped_up_bytes": 512,
+              "topped_up_writes": 512,
+              "topup_ceiling_bytes": 65536,
+              "topup_ceiling_hit": false,
+              "topup_chunk_bytes": 1,
+              "topup_terminal_write": "EAGAIN"
+            },
+            "settle_ms": 20,
+            "settled_extra_bytes": 0,
+            "settled_extra_writes": 0,
+            "slave_termios_mode": "raw",
+            "terminal_write": "EAGAIN",
+            "terminal_write_after_settle": "EAGAIN",
+            "total_bytes_accepted": 1022,
+            "writer_pending_input_bytes": 1022,
+            "writes": 1
+          }
+        }
+      ],
+      "status": "supported",
+      "consequence": "This kernel's pty accepted 1024 byte(s) slave→master (**targetward** — a client typing, travelling toward the device, first pass ending in `EAGAIN`) and 1022 byte(s) master→slave (**hostward** — the node delivering device output to its client, ending in `EAGAIN`), reaching 1024 and 1022 in total once a short pause has let the tty's asynchronous flip work run. **Of those, 1024 and 1022 byte(s) were actually recoverable by the peer** (all of it / all of it): acceptance is not delivery, and the two are the same number only on a kernel that queues everything it takes. Read the daemon's `hostward_buffer` defaults against the SCALE of these, not their last byte: the pty default is 32 chunks, and a queue far larger than the kernel pipe below it only defers the same backpressure. Both figures move by a chunk or two run to run depending on when that flip work lands, so a one-chunk difference across kernels is noise; only an order-of-magnitude one is signal, **and only between runs whose `slave_termios_mode` agrees** — a cooked pty and a raw one give different depths on one kernel, and in opposite directions — raw accepts less and returns all of it, cooked accepts more and returns none (measured on Linux 7.0.0-29) — so a mode mismatch explains a gap before any kernel difference does, and the `slave_termios_mode` cell beside each direction is what settles it. The `recheck` block under each direction asks the second question the first cannot, at four drain sizes rather than one: after the peer is drained the pair is refilled from empty and handed back 512, 1, 128 and 900 bytes in turn, and then once from empty entirely. `ladder_reading.watermark_threshold_gt` and `_le` bracket the watermark in \"writable iff occupancy < T, then accept up to capacity\" — a rung that tops up floors T at its `occupancy_after_drain`, a rung that refuses caps it there. A null `_le` means no rung refused, which bounds T below capacity only down to the smallest rung probed and is **not** proof of a pure capacity; read `_gt` on such a run as the largest occupancy the ladder reached rather than as one the kernel accepted a write at, because on a pipeline kernel it moved under the top-up. `uniform_shortfall_bytes` names a reservation charged per fill episode; the from-empty rung (`drain_requested_bytes: null`) is the one whose top-up starts at occupancy 0, so a reservation charged at the empty→nonempty transition lands inside its number instead of behind it, and comparing its `topped_up_bytes` against the 4 KiB-chunked `refilled_from_empty_bytes` on the same rung says whether write size changes the accounting. The flat fields beside the ladder are the 512-byte rung alone, kept so older reports still diff, and `room_republished_minus_room_freed` there says whether the kernel gave back exactly the room a reader freed (a fixed queue capacity), or more (an asynchronous pipeline that advanced during the settle — Linux 7.0.0-29 reads +2048 or +9216, bimodal, never 0 across 20 samples), or less. `refill_reproduced_total` says whether the depth above is reproducible on the same pair at all; on Linux it usually is not. Numbers, not a verdict — diff them against the other kernel of record (6.18 or 7.0, whichever this run is not) before changing a default. **INSTRUMENT WARNING — `peer_pending_input_bytes` is provably wrong in the `slave_to_master_targetward` direction on this kernel and must not be read as an answer.** `FIONREAD` on the reading end reported **0** byte(s) immediately before a drain that then recovered **1024**, with both fills finished in `EAGAIN` and no writer in between — so a `0` here does not mean \"the queue was empty\", it means the ioctl does not describe this fd's readable queue (`peer_pending_input_trust: contradicted-empty`). `bytes_recovered_by_peer` is unaffected: it is a drain, not an ioctl, and it is the field to size anything against. The reading is reported rather than dropped because which kernels answer this ioctl correctly on a pty master, and in which direction, is itself the cross-kernel observation (§7) — Linux 7.0.0-29 answers exactly and saturates at 4095 (the n_tty read buffer) with the remainder still recoverable, and reads 0 on the *writing* fd in both directions. **Pre-registered so the next run settles the mechanism:** if a master's `FIONREAD` answers with the tty's *input* queue rather than its readable one, then `writer_pending_input_bytes` in the hostward direction — the master, which has nothing to read — comes back non-zero and equal to that direction's depth; it reads **1022** here, and a 0 there refutes that reading and leaves the mechanism open. Interpretable only with `slave_termios_mode: raw`, which this run reports: with ECHO on, a master legitimately has echoed bytes to read."
+    },
+    {
+      "id": "P16",
+      "title": "pts slave-witness liveness",
+      "question": "Does a held pts slave fd report POLLHUP once the master closes, and stay quiet while it is open (§15.59)?",
+      "observations": [
+        {
+          "key": "quiet_window_tight",
+          "value": {
+            "elapsed_us": 3965,
+            "hangup_passes": 0,
+            "passes": 200,
+            "revents_seen": {
+              "none": 200
+            }
+          }
+        },
+        {
+          "key": "quiet_window_paced",
+          "value": {
+            "elapsed_us": 384288,
+            "hangup_passes": 0,
+            "passes": 64,
+            "revents_seen": {
+              "none": 64
+            }
+          }
+        },
+        {
+          "key": "stat_comparison_while_master_open",
+          "value": {
+            "device_identity_matches": true,
+            "fstat_on_the_held_fd_answers": true,
+            "path_still_resolves": true,
+            "shipped_prove_open_would_refuse": false
+          }
+        },
+        {
+          "key": "hangup_after_master_closed",
+          "value": {
+            "hangup_delivered": true,
+            "microseconds_to_hangup": 4,
+            "read_after_close": "eof",
+            "revents": "POLLHUP"
+          }
+        },
+        {
+          "key": "stat_comparison_after_master_closed",
+          "value": {
+            "device_identity_matches": true,
+            "fstat_on_the_held_fd_answers": true,
+            "path_still_resolves": true,
+            "shipped_prove_open_would_refuse": false
+          }
+        },
+        {
+          "key": "poll_can_tell_a_live_pair_from_a_dead_one",
+          "value": true
+        },
+        {
+          "key": "stat_comparison_can_tell",
+          "value": false
+        },
+        {
+          "key": "does_not_license",
+          "value": "this measures whether a held slave fd can observe its MASTER going away. It says nothing about whether the process on the other side is alive, and nothing about a serial fd, whose peer is a wire and cannot hang up this way (§15.59)."
+        }
+      ],
+      "status": "supported",
+      "consequence": "A held pts slave fd **can** tell that its master has gone, on this kernel, through `poll(POLLHUP)`: quiet in all 200 back-to-back passes over 3965 µs and all 64 paced passes over 384288 µs while the master was open, then `POLLHUP` 4 µs after it closed (`revents` `POLLHUP`, a following `read(2)` answering `eof`). Both arms are the other's control, which is what makes either readable — a zero with no witness is not a measurement, and a hangup that was never absent is not a signal (§15.49). **The shipped `stat` comparison cannot tell them apart here**, and that is this probe's whole reason for existing (§15.59). After the master closed, `fstat` on the held fd answers `true`, the path still resolves `true`, and the identity triple matches `Some(true)` — so `SlaveWitness::prove_open` would return `Ok` on a witness whose pair is gone, degrading to the compile-time borrow it also carries. `poll(POLLHUP)` is the instrument that does tell, and this row is the measurement that says so rather than the prediction notes §3.60 had to leave standing. Read it beside `itest`'s `SlaveWitness::prove_open`, which is the check this measures rather than judges."
+    },
+    {
+      "id": "P11",
+      "title": "real-port line-state counters",
+      "question": "Do TIOCGICOUNT (driver error/edge counters) and TIOCMGET (modem lines) answer on a real port, and what do they currently read (§5, §7.1)?",
+      "observations": [],
+      "status": "skipped",
+      "reason": "no --port named",
+      "consequence": "Re-run with --port /dev/ttyUSB0 to read the driver counters and modem lines a serial node's accounting depends on (a dangling converter is enough — no target device, §13)."
+    },
+    {
+      "id": "P15",
+      "title": "real-port flow-control honouring",
+      "question": "Does a named port honour a requested flow-control mode — hardware (CRTSCTS) or software (IXON/IXOFF) — on read-back, or accept the request and silently drop it (§7.1, §15.53)?",
+      "observations": [],
+      "status": "skipped",
+      "reason": "no --port named",
+      "consequence": "Re-run with `--port /dev/ttyUSB0` to ask whether this driver honours a requested flow-control mode (a dangling converter is enough — no target device, §13)."
+    },
+    {
+      "id": "P14",
+      "title": "maximum reliable rate",
+      "question": "On a P5-verified cross-paired rig, what is the highest baud rate at which a seeded payload still round-trips byte-exact in both directions, and what stopped the search (§15.51)?",
+      "observations": [
+        {
+          "key": "max_reliable_baud",
+          "value": null
+        },
+        {
+          "key": "ceiling_kind",
+          "value": null
+        },
+        {
+          "key": "ceiling_is_a_floor_over",
+          "value": "nothing yet — the search did not run on this path; the verdict says why."
+        },
+        {
+          "key": "pairs_discovered",
+          "value": 0
+        },
+        {
+          "key": "structural_max_baud",
+          "value": 4294967295
+        },
+        {
+          "key": "baseline_baud",
+          "value": 115200
+        }
+      ],
+      "status": "skipped",
+      "reason": "no --port named",
+      "consequence": "Re-run with both of the rig's --ports. P14 transmits at every rate it tries, so it is opt-in exactly as P3/P5/P11 are (§13, §15.51)."
+    }
+  ],
+  "summary": {
+    "supported": 13,
+    "degraded": 7,
+    "unsupported": 0,
+    "skipped": 8
+  }
+}

@@ -13267,3 +13267,165 @@ defect, and a third — reading a moment later — refuted it with `web/src/asse
 to HEAD`. The refutation was right and the confirmations were artefacts of my own edits. The rule
 is not a formality: a moving tree turns a verifier into a random number generator, which is what
 the v12 audit's 35-of-43 wrong verdicts were.
+
+### 3.117 The same two adapters on a Mac, and three of my own four conclusions refuted
+
+**The session.** 2026-08-20/21 on the x86_64 Mac rig box (Darwin 24.6.0, **macOS 15.8 / 24H16** —
+the record's box was 15.7.8, so the OS build moved), tree at `3a39896`, clean throughout. The two
+WCH `1a86:55d3` adapters that produced §15.62 on Linux — serials `5A7C298854` and `5A7C297954`,
+confirmed by `system_profiler`, not by node name — arrived attached to this box on the same cable.
+Design §15.68 carries the findings; this entry carries the method and what it cost.
+
+**A pre-registration was written before any device was opened**, sha256
+`84eadb0ef55ff59155dce0df5f9ea8da28f55862a1ee6358592f2e7b865a1458` at 17:53:08 PDT, against a tree
+whose `git status` was empty. Seven predictions, each labelled **spec** / **driver** / **device**
+so that a reading could tell which kind of claim it was testing. Two were forks with both arms
+written down and odds attached. Of the seven, three were confirmed (CTS does not track; `CRTSCTS`
+is `AcceptedThenDropped` on Darwin, both ports; `actual_baud` echoes the ask), one took the arm I
+had rated second (the polarity is **low**, not high), and the remainder are recorded below.
+
+**The measurements survived; three of the four conclusions I drew from them did not.** Five
+independent refuters, none shown my reasoning, attacked the findings against a tree that did not
+move. This is the useful part of the session and it is recorded before the results.
+
+- **The instrument bug I found myself, and the one I did not.** My first modem probe reported
+  `ENOTTY` from every `TIOCMBIS`: `int req = on ? TIOCMBIS : TIOCMBIC` sign-extends `0x8004746C`
+  into `ioctl`'s `unsigned long`. Caught by a support-matrix probe before any conclusion rested on
+  it. **The one I missed was worse and a refuter found it**: the session's own throwaway probe (a standalone C program, never in this tree) counted *parsed* records
+  and called the total `records_seen`, so a loss masked by an equal duplication read as "every byte
+  delivered, nothing lost". The corrected instrument counts distinct coverage, losses and
+  duplicates separately and reports **8 lost and 8 duplicated per 128 records, 5 of 5**. A metric
+  asserting something weaker than its name claimed — §3's own tell, in my apparatus, while I was
+  using it to audit someone else's.
+- **"P5 asserts 3-wire on a 5-wire bench" is withdrawn.** No instrument in this tree has ever
+  measured RTS/CTS continuity on this cable on either kernel; "5-wire" is operator testimony, and
+  three explanations are byte-identical in every artifact (bare conductor / unbonded header pins /
+  unreportable line). Convicting a report of an unfounded cable claim by means of a cable claim
+  resting on testimony is §15.62's error mirrored. **What survives is the undecidability**, plus a
+  documentation falsification that is decidable: AGENTS §3's *"`UNREADABLE` is the CDC-ACM answer"*
+  is false on Apple's stack, where the answer is `3-wire`.
+- **My C1 "stimulus control" was mislabelled.** It read the *driving* port's own `TIOCMGET`, which
+  on CDC-ACM is the host driver's cached copy of the `SET_CONTROL_LINE_STATE` it composed. A device
+  that ignored the transfer passes it identically. **Failing C1 would have been conclusive; passing
+  it proves nothing about the wire.** C2 likewise licenses "the data pair is crossed", never "the
+  cable is a 5-wire crossover".
+- **My P14 account was refuted arithmetically.** I proposed that the 14400 ceiling was the
+  constant-airtime payload crossing the displacement threshold. `p14_payload_len` is `baud/40`, so
+  14400's payload is **360 bytes** — above the 352-byte offset where displacement first appears —
+  and that rung passed **6 of 6 byte-exact**. The rungs that set the ceiling received **1, 0 and
+  0/1 bytes** of 420/390/375: total silence, which a byte-count-exact defect cannot cause. The
+  refuter's alternative was right and is now measured (§15.68 clause 4).
+- **My "platform-scoped" framing was on the wrong axis and aimed at the wrong sentence.** The
+  experiment moved OS and driver together, so it cannot license a claim about Darwin-the-platform;
+  the capture's own `does_not_license` cell says so. Item 85's gap lives in
+  `FlowOutcome::classify`, which has no `cfg` — **the gap is not scoped, one bench's exposure is.**
+  The genuinely over-scoped sentence is §15.62 consequence 4's *"on this transport"*, now annotated.
+
+**The controls that make the surviving claims safe**, several of them found by refuters rather than
+by me. The RTS/DTR drive is real (the driving port's read-back follows both levels). Data crosses
+byte-exact in both directions, so TX/RX are wired. Darwin's CTS path works on other hardware —
+`docs/doctor/macos-24.6.0-2026-08-05-42eac2a-tier3.json` reads `true`/`true` on FTDI `cu.*` nodes
+on this same kernel and prints `5-wire crossover` — with a true-negative control beside it. The
+`CRTSCTS` negative is not a mask artifact: Darwin's `CRTSCTS` is `0x00030000`, my control used the
+*either-bit* test (strictly more permissive than the shipped `contains()`), and both ports still
+read a delta of exactly zero.
+
+**What is measured and what is not.** Measured: the displacement (54/54 trials, both directions,
+9600/115200/921600; eliminated by ~20 ms write pacing, 0 faults over 3 reps), the dead rates
+(payload held constant at 240 bytes, so rate is the only variable), the flow-control drop on a
+second device class, and the suite figures below. **Not established:** whether the displacement is
+transmit-side or receive-side; whether 15000/15600/16800 are dead on the *device* or only on this
+*stack* — the Linux ladder never asked those rates, stepping 9600 → 19200 → 38400, and its
+6 000 000 rung passed byte-exact. That last one is a pre-registration for the next Linux session,
+not a finding, and it must not be quoted as a Darwin-versus-Linux contrast.
+
+**Suite figures, both at this tree on this box, both with `--no-fail-fast`.**
+**Default CI scope: 1000 passing · 0 failed · 7 ignored.** **Rig lane: 997 · 3 · 7**, with
+`SNX_CROSSOVER=required` `SNX_TLS=required` `SNX_WEB_UI=required` `SNX_EXEC_CODEC=required` and the
+two `SNX_CROSSOVER_A`/`_B` paths — **`SNX_RIG_FLOW` dropped** because P5 reads no handshake and both
+flow modes are refused at load on this stack, and **`SNX_REPLUG` dropped** because the replug lane
+is Linux-only (`itest/src/lib.rs:2773`). The three failures are the same defect seen three times:
+`crossover_rig_data_plane_send_and_exclusivity`, `crossover_rig_custom_baud_byte_exact` and
+`exclusive_write_lock_is_byte_exact`, each a SHA-256 mismatch reported as *"bytes lost/reordered
+across the wire"*. **The guard works and a length check would have passed all three.** No delta is
+quotable against the 2026-08-13 rows: only this end was measured this session, and the plan's
+Status table cannot currently say whether that row is 960 or 961 (item 94).
+
+**A hazard reproduced, usefully.** Counting `^test .* \.\.\. ok$` in the default-scope log gives
+**978**; summing the `test result:` lines of the same log gives **1000**. One log, two figures,
+because `--nocapture` interleaves parallel binaries and breaks the line anchor. This is notes
+§3.78/§3.101's class and it is why the figures above are summed from `test result:` lines and the
+self-skips are reported as **names** (105 distinct at default scope, 92 on the rig lane), never as
+an anchored count.
+
+**Gates.** `cargo build`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`, the
+minimal-daemon clippy, `cargo deny check licenses bans sources`, the macOS doctor gate
+(`jq -e -f expectations/macos.jq`, exit 0 on all six committed captures) and the Linux cross-check
+from this Mac (`--target x86_64-unknown-linux-gnu`, every crate but `serial-nexus-web`) — all green.
+
+### 3.118 The cable moved, and the undecidable half of §3.117 decided itself
+
+**The move.** Same session, same box, same binary, same commit. The operator took the cable off the
+WCH CDC-ACM pair and put it on the FT232R fixture `BH00L4KU` ↔ `BH00LW9U` — the pair AGENTS §2
+records reading `true`/`true` on Linux on 2026-08-14. Only the adapters changed, and that is
+verified by serial number rather than assumed. **Cable identity across the move is operator
+testimony and is stated as such**: nothing here can prove by instrument that this is the same
+physical cable, and re-seating a connector can change continuity in either direction.
+
+**A second pre-registration was written before either FTDI node was opened**, sha256
+`a5ed06eb8f63e6043cc8309c8918906c7343841ded6f23bc4d907cc88f5ae869` at 19:53:16 PDT, with odds
+fixed on four arms and — this is the part that mattered — **an explicit statement of what the
+experiment could not decide**, written while I still had a stake in the answer. §3.117 had just
+recorded me over-claiming from testimony; pre-committing the limit was the cheapest guard against
+doing it twice.
+
+**PR-A took its primary arm (75 %).** Both instruments, 3 of 3 captures:
+`5-wire crossover: RTS/CTS both ways, DTR moves nothing`, `rts_a_to_cts_b=true
+rts_b_to_cts_a=true`, and an independent `TIOCMGET` probe following the far CTS at both drive
+levels in both directions, dropping low when the peer closes. **The cable is a measured 5-wire
+crossover.** Artifacts: `docs/doctor/macos-24.6.0-2026-08-21-3a39896-ftdi5w-tier3{,-2,-3}.json`,
+jq gate exit 0 on all three.
+
+**So the CDC-ACM bench printed `3-wire: no handshake lines carried` about a cable that carries
+them**, and §15.62's stated harm — an operator re-crimping a correct cable — is demonstrated
+rather than hypothesized. Plan §18 item 92 was filed as an epistemic complaint and is now a
+measured one. **What it still does not decide, per the pre-registration:** whether the CDC-ACM
+bench failed at the WCH module's header or in Apple's stack. Undecided, and the defect does not
+depend on it, because the sentence is a claim about cabling and the cabling is correct.
+
+**PR-B, PR-C and PR-E all reproduced as predicted** — all six DTR crossings `false` (so **item 28
+stays blocked for a fourth cabling**), data byte-exact both ways, and `CRTSCTS`
+`AcceptedThenDropped` on both ports with a `c_cflag` delta of zero, reproducing §15.53's FT232R
+finding on this OS. `IXON`/`IXOFF` dropped too.
+
+**PR-D is the one worth the whole move, and it was the control I would not otherwise have had.**
+The identical loss-and-duplication probe, at the identical payload and rate, reads **128 of 128
+distinct records, 0 lost, 0 duplicated, 5 of 5** on FTDI — against 8 lost and 8 duplicated per 128
+on the CDC-ACM bench an hour earlier. Same machine, same USB hubs, same cable, same program.
+**That excludes USB topology, the reader being descheduled, the measuring program and Darwin
+generally**, all of which the adversarial pass had correctly listed as unexcluded alternatives, and
+it lets §15.68 clause 3 drop the topology caveat it was filed with. I had pre-registered the
+opposite outcome as "a far larger finding, and one I would rather learn now than have a reviewer
+find"; it did not happen, and recording that it was asked is the point.
+
+**The methodological note.** §3.117 recorded three of four conclusions refuted, one of them for
+resting a cable claim on testimony. The repair was not to argue harder — it was to make the claim
+decidable by moving one variable, and the operator's move is what made that possible. **The
+refuters' "decisive cheap test that was available and not run" was right, and it cost one cable
+swap and six minutes of captures.**
+
+**The rig lane, and the third instrument.** With the handshake now measuring true, `SNX_RIG_FLOW=required`
+became legitimately settable on this Mac for the first time, and the lane reads **1000 passing · 0 failed
+· 7 ignored** with `SNX_CROSSOVER` / `SNX_RIG_FLOW` / `SNX_TLS` / `SNX_WEB_UI` / `SNX_EXEC_CODEC` all
+`required` — **the fullest lane macOS can run, and still not the documented lane**, which also spells
+`SNX_REPLUG=required` and its two device paths and is Linux-only here. `crossover_rig_rts_crosses_to_the_far_ports_cts`
+**ran and passed** rather than self-skipping, which is a third instrument on the cable — the daemon's own
+`state.modem_lines`, independent of both P5 and the standalone probe — and it is the arm §7.1 actually
+promises an operator. `rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes` passed on its
+*load-refusal* arm, because Apple drops the flag: a 5-wire bench does not make `rts-cts` usable on this OS.
+
+**Read the passing counts carefully.** Default scope and this lane both read **1000**, and that equality is
+not a coincidence to be mined: a self-skipped test still *passes*, so the count is unchanged while the work
+is not. What moved is the number of distinct self-skip names — **105** at default scope, **92** on the
+CDC-ACM lane, **91** here — and even those are a floor, extracted as names because the anchored `^SKIP`
+count is unstable under `--nocapture` (notes §3.78/§3.101).

@@ -5,6 +5,90 @@ the one every mechanism is specified against; macOS is supported where plain
 POSIX carries the design, and degrades — never crashes, never silently misbehaves
 — everywhere the design leans on a Linux-only facility.
 
+## Update — 2026-08-21 at `3a39896`: the §15.62 adapters on Apple's CDC stack, and three refuted conclusions
+
+**The box.** The same x86_64 MacBookPro15,1 rig box as the `b346188` block below, now on **macOS 15.8
+(24H16)** — that block reads 15.7.8, so the OS build moved and provenance here says so. Darwin 24.6.0.
+
+**The rig is new to this page and is not new hardware.** The two WCH `1a86:55d3` CDC-ACM adapters
+that produced design §15.62 on Linux — serials `5A7C297954` and `5A7C298854`, confirmed by
+`system_profiler` rather than by node name — arrived attached to this box on the same cable, as
+`/dev/cu.usbmodem5A7C2979541` and `/dev/cu.usbmodem5A7C2988541` on `AppleUSBCDCCompositeDevice` →
+`AppleUSBACMData` → `IOSerialBSDClient`. Hardware and cable fixed; kernel and driver moved. Six
+artifacts are committed at `docs/doctor/macos-24.6.0-2026-08-21-3a39896-*`, and
+`jq -e -f expectations/macos.jq` exits 0 on all six.
+
+**Figures.** **1000 passing · 0 failed · 7 ignored** at default CI scope. **997 · 3 · 7** on a rig
+lane spelled `SNX_CROSSOVER=required` + `SNX_CROSSOVER_A`/`_B` + `SNX_TLS=required` +
+`SNX_WEB_UI=required` + `SNX_EXEC_CODEC=required`, **with `SNX_RIG_FLOW` and `SNX_REPLUG` dropped** —
+the first legitimately (no handshake is readable on this transport and both flow modes are refused
+at `load`), the second because the replug lane is Linux-only. **This page's older figure of 955 for
+the 2026-08-13 session disagrees with the plan's Status row for the same session, and that row's own
+arithmetic does not close** — filed as plan §18 item 94; no delta is quotable across the two.
+
+**Four deltas this platform adds, all in the transport rather than in the tree.**
+
+1. **A byte-exact count is not a whole transfer.** 1024 bytes in, 1024 bytes out, **8 of 128
+   position-tagged records missing and 8 delivered twice**, 5 of 5 runs at 115200. Present in 54 of
+   54 trials across both directions and 9600/115200/921600; **eliminated by pacing writes ~20 ms
+   apart** (0 faults over 3 reps), which puts it in concurrent in-flight transfers rather than the
+   wire. Transmit-side versus receive-side is **not established**, and both adapters hang off USB
+   hubs here, which no run separated. **The tree detects it**: three rig guards fail with a SHA-256
+   mismatch — `crossover_rig_data_plane_send_and_exclusivity`,
+   `crossover_rig_custom_baud_byte_exact`, `exclusive_write_lock_is_byte_exact`. A length check
+   passes all three, and so does plan §3's `received + dropped_slow_consumer == sent` fingerprint.
+2. **A rate this stack accepts and echoes exactly can carry nothing.** With payload held constant at
+   240 bytes: 15000, 15600, 16800 and 20000 delivered **0 or 1 byte**; 9600, 14400, 19200, 38400,
+   57600 and 115200 were byte-exact. `IOSSIOSPEED` returns success at every one and `tcgetattr`
+   echoes the ask — and `serial2` uses that same path here, so a node at 15000 comes up
+   `status="active" actual_baud=15000` and is dead, past §7.1 clause 7's ±2.5 % read-back. **This is
+   not "non-standard rates are dead":** P5's ladder round-trips the non-standard `CUSTOM_BAUD =
+   250_000` on this same pair. Four rates were asked and four carried nothing; what selects them is
+   unknown, and **the Linux arm is untested because that ladder has never asked these rates.**
+3. **P14's `max_reliable_baud = 14400` on this bench is not a rate ceiling** and must not be quoted
+   as one. Two probe policies met two transport defects: the constant-airtime payload (`baud/40`)
+   handed the 19200 rung 480 bytes, which delta 1 breaks, and refinement then landed every midpoint
+   between 14400 and 19200 on a line coding delta 2 kills.
+4. **Apple's `IOSerialFamily` drops `CRTSCTS` on a second device class.** Both ports read
+   `honoured_on_readback: false`, `silently_dropped: true`, `c_cflag 0x4b00 → 0x4b00` — so
+   §15.53's refusal **fires** here where it does not on Linux `cdc_acm`, and an `rts-cts` node is
+   refused at `load`. `IXON`/`IXOFF` are dropped too. The protection is real and **not aimed**: it
+   fires on this driver being honest about dropping the flag, not on any instrument that can see
+   wire inertness.
+
+**P5 prints `3-wire: no handshake lines carried` here**, on a bench the operator reports as 5-wire
+and which Linux calls `UNREADABLE … this is not a 3-wire answer`. Both sentences describe one
+physical bench and both cannot be licensed; §15.68 and plan §18 item 92 carry it. **Darwin's CTS
+path itself works** — `macos-24.6.0-2026-08-05-42eac2a-tier3.json` reads `true`/`true` on an FTDI
+pair on this same OS — so this is a device-class limit, not a platform one.
+
+**The cable was then moved, and it settles the cabling question** (notes §3.118). On the FT232R
+fixture `BH00L4KU` ↔ `BH00LW9U`, three independent instruments read the same thing: P5 prints
+`5-wire crossover: RTS/CTS both ways, DTR moves nothing`, a standalone `TIOCMGET` probe follows the
+far CTS at both drive levels in both directions, and the suite's
+`crossover_rig_rts_crosses_to_the_far_ports_cts` — the daemon's own `state.modem_lines`, which is
+the field §7.1 promises an operator — **runs and passes** instead of self-skipping. **So the cable
+the CDC-ACM bench called `3-wire` carries RTS/CTS**, and the re-crimp harm is demonstrated. All six
+DTR crossings are `false`, so **item 28 stays blocked for a fourth cabling**. Artifacts:
+`docs/doctor/macos-24.6.0-2026-08-21-3a39896-ftdi5w-tier3{,-2,-3}.json`.
+
+**That move is also the control for delta 1.** The identical probe reads **128 of 128 distinct
+records, 0 lost, 0 duplicated, 5 of 5** on FTDI — same box, same USB hubs, same cable, same payload
+and rate — against 8 lost and 8 duplicated on the CDC-ACM bench. Not topology, not the harness, not
+Darwin generally: **this transport.**
+
+**The FTDI lane reads 1000 · 0 · 7** with `SNX_CROSSOVER` / **`SNX_RIG_FLOW`** / `SNX_TLS` /
+`SNX_WEB_UI` / `SNX_EXEC_CODEC` all `required` — **the first macOS lane here to carry
+`SNX_RIG_FLOW=required`**, and still **not** the documented lane, which also spells
+`SNX_REPLUG=required` and is Linux-only on this platform. `rts_cts_flow_control_stalls_the_writer…`
+passes on its *load-refusal* arm: a 5-wire bench does not make `rts-cts` usable on an OS that drops
+the flag.
+
+**The method note worth carrying.** Three of the session's four conclusions were refuted by its own
+adversarial pass, including one bug in its measuring program that inverted a finding's severity: a
+counter named `records_seen` counted *parsed* records rather than *distinct* ones, so a loss masked
+by an equal duplication read as "nothing lost". Notes §3.117 records all of it.
+
 ## Update — 2026-08-13 at `b346188`: the era's macOS capture, two Linux-shaped guards found, and three pre-registrations answered
 
 Same box (MacBookPro15,1, Darwin 24.6.0 / macOS 15.7.8, x86_64, 12 cores), tree clean at

@@ -4605,6 +4605,17 @@ one the next session pays for again.
 **Status:** DECIDED — scopes §15.52's closing claim and §7.1's `modem_lines`/`actual_baud` clauses;
 annotates neither away. Construction is plan §18 items 80–83.
 
+**Scoped 2026-08-21 (§15.68):** the same two adapters were read on a second CDC-ACM stack
+(Apple's, on Darwin 24.6.0). Three sentences below are narrower than they read. (a) The
+`stuck-high` reading is this **driver's** constant, not the device class's — Apple's stack reads
+the same wire **low**, and the low case is indistinguishable from a bare cable, so `UNREADABLE` is
+not "the CDC-ACM answer". (b) Consequence 4's *"on **this transport**"* attributes to CDC-ACM the
+termios behaviour of Linux `cdc_acm` specifically: **these same two devices are caught** on
+Apple's CDC-ACM driver, which drops the flag and lets §15.53's refusal fire. The gap in
+`FlowOutcome::classify` is not platform-scoped — one bench's *exposure* to it is. (c) Consequence
+2's echo is not merely uninformative on Apple's stack: it conceals rates at which the link is
+dead. §15.68 carries all three with their artifacts.
+
 **The hardware.** Two WCH `1a86:55d3` adapters — `bDeviceClass=02`, two interfaces, bound to
 `cdc_acm`, enumerating `/dev/ttyACM0` and `/dev/ttyACM1` — cabled by the operator as a **5-wire**
 crossover and attached 2026-08-16. The adapter pair is new to the record and shares nothing with
@@ -4691,7 +4702,7 @@ the fourth is a gap this entry files rather than closes.**
    then drops it from `c_cflag` is `AcceptedThenDropped` and is refused at `load`. `cdc_acm` does
    neither — it accepts the flag and **keeps** it, measured on both ports of this bench as
    `honoured_on_readback: true` with a `c_cflag` delta of exactly `0x80000000`, so
-   `serial_nexus_sys::honours_rtscts` answers **`Honoured`** and the daemon loads an `rts-cts` node
+   `serial_nexus_sys::honours_rtscts` answers **`Honoured`** [**stale symbol, noted 2026-08-21**: §15.61 parameterised it to `honours_flow_control(path, FlowMode::RtsCts)`; the name in this sentence no longer exists in any `.rs` file — plan §18 item 96] and the daemon loads an `rts-cts` node
    without complaint. The 2×2 above says that flag does nothing. So this is a **third** state the
    predicate's two-valued world has no name for — *honoured on paper, inert on the wire* — and it is
    the §15.61 shape one transport over, with the polarity that matters reversed: §15.61's driver
@@ -5037,6 +5048,174 @@ was taken before the client's handler had run at all. Measured: the synchronous 
 `before === after`, six of six. That is a third register of §3's tell — an observation taken at the
 wrong *point in the task* rather than of the wrong thing — and both spellings were run against both
 trees before one was kept.
+
+### 15.68 The same two adapters on a second CDC stack: what that scoped, and two transport defects the first stack hid
+
+**Status:** DECIDED — scopes §15.62's generalization and its consequence 4; annotates neither away.
+Files plan §18 items 92–96. **No product code changes on this finding**: both defects are in the
+platform, and the tree's own byte-exactness guard already reddens on one of them.
+
+**The experiment §15.62 could not run.** §15.62 was measured on Linux `cdc_acm` with two WCH
+`1a86:55d3` adapters, serials `5A7C298854` and `5A7C297954`. **Those same two adapters, on the same
+cable, were attached to the x86_64 Mac rig box on 2026-08-20** and enumerate as
+`/dev/cu.usbmodem5A7C2988541` / `/dev/cu.usbmodem5A7C2979541` on
+`AppleUSBCDCCompositeDevice` → `AppleUSBACMData` → `IOSerialBSDClient`. Hardware and cable are held
+fixed; the kernel and the driver move. That is the one variable §15.62 had to hold, and it is
+exactly the variable that separates its **specification** claims from its **driver** claims.
+**The artifacts are committed** (§16.13): `docs/doctor/macos-24.6.0-2026-08-21-3a39896-{tier3,
+tier3-2,tier3-3,passive-1,passive-2,passive-3}.json`. `jq -e -f expectations/macos.jq` exits 0 on
+all six, and the three Tier 3 captures agree byte-for-byte on every cell quoted here.
+
+**1. The CTS bit is manufactured, and *which constant* is stack-dependent.** On Linux these
+adapters read `stuck-high`; on Darwin they read low at both drive levels of the peer's RTS and
+with the peer closed entirely. Two independent CDC-ACM stacks, one wire, opposite constants —
+which is a stronger argument for §15.62's specification claim than §15.62 could make, because it
+does not depend on reading the CDC PSTN table correctly. If CTS were carried on the wire, both
+stacks would read it and agree.
+
+**And the low case is the dangerous one, because it is indistinguishable from a bare cable.**
+`crosses()` returns `false` for `(false, false)` and the shape fold calls that *measured absent*,
+so P5 prints **`3-wire: no handshake lines carried`** — a claim about the cable — and
+`handshake_measured` prints the same. **This is not the defect §15.62 repaired, and saying so
+precisely matters:** that repair covered `stuck-high`, `inverted` and `?`, all three of which are
+*self-refuting* readings (a line that stays high with the peer closed is doing something no wire
+can do, so the cell announces its own failure). A constant low announces nothing — it is exactly
+what an absent conductor looks like. **The gap is observability, not coverage**, and nothing
+available to this instrument closes it: three explanations are byte-identical in every artifact —
+the cable lacks RTS/CTS, the WCH module does not bond those pins to the header, or the stack never
+surfaces CTS. **The first of the three was eliminated later the same day by moving the cable; read
+on before quoting this sentence.**
+
+**No gate reddens on this, and that is part of the finding.** Neither `expectations/linux.jq` nor
+`expectations/macos.jq` pins the shape word, and `itest/tests/expectation_gates.rs:1288-1300`
+*plants* the all-`false` sentence and asserts the gate must accept it. The harm is to a human
+reader and to a skip reason — `crossover_rig_rts_crosses_to_the_far_ports_cts` skipped on this
+bench citing `3-wire: no RTS/CTS handshake in either direction` — never to CI.
+
+**The cable was then measured, and the sentence is wrong about its own subject.** This clause was
+first written to claim only undecidability — no instrument in this tree had ever measured RTS/CTS
+continuity on this cable, so "5-wire" was operator testimony and convicting a report of an
+unfounded cable claim by means of a cable claim resting on testimony would have been §15.62's own
+error run backwards. **The operator then moved that cable to the FTDI fixture (`BH00L4KU` ↔
+`BH00LW9U`) and the question became decidable.** Both instruments answer the same way, 3 of 3
+captures: P5 prints **`5-wire crossover: RTS/CTS both ways, DTR moves nothing`** with
+`rts_a_to_cts_b=true rts_b_to_cts_a=true`, and an independent `TIOCMGET` probe reads the far CTS
+following the near RTS at **both** drive levels in **both** directions, dropping low when the peer
+closes. Artifacts: `docs/doctor/macos-24.6.0-2026-08-21-3a39896-ftdi5w-tier3{,-2,-3}.json`,
+`jq -e -f expectations/macos.jq` exit 0 on all three.
+
+**So the cable is a measured 5-wire crossover, and the CDC-ACM bench printed `3-wire: no handshake
+lines carried` about it.** §15.62's stated harm — *"An operator who reads '3-wire' and re-crimps a
+correct cable"* — is therefore **demonstrated rather than hypothesized**, and plan §18 item 92
+carries a measured motivating case.
+
+**What the FTDI reading still does not decide, stated because it is the obvious over-read.** It
+eliminates only the first of clause 1's three explanations. Whether the CDC-ACM bench failed
+because the WCH module does not bond RTS/CTS to its header, or because Apple's stack never
+surfaces CTS, remains undecided and no instrument here separates them. **It does not need to be
+decided for the defect to stand:** P5's sentence is a claim about cabling, the cabling is correct,
+and the operator harm follows from that alone. Cable identity across the move is operator
+testimony — the adapters are verified changed by serial number, the cable is not verifiable by
+instrument — and re-seating a connector can change continuity in either direction.
+
+**And the same move is the control that scopes clause 3** — see there.
+
+**The positive control that makes the transport scoping safe:** on this same Darwin 24.6.0 box,
+FTDI `/dev/cu.*` nodes read `rts_a_to_cts_b=true rts_b_to_cts_a=true` and print `5-wire crossover`
+(`docs/doctor/macos-24.6.0-2026-08-05-42eac2a-tier3.json`), and a true-negative control exists too
+(`macos-24.6.0-2026-08-13-b346188-tier3.json` reads all-`false` for a pair that `ftdi_sio` also
+reads all-`false`, so that cable really is 3-wire). **Darwin's CTS path works.** The low reading is
+a property of this transport, not of this kernel.
+
+**2. `UNREADABLE` is not "the CDC-ACM answer", and the generalization that said so is retired.**
+AGENTS §3 carried *"`UNREADABLE` is the CDC-ACM answer and it is not a cabling statement … Do not
+re-crimp a bench on that reading."* On Darwin the same device class and the same two adapters
+answer **`3-wire`**, which *is* a cabling statement, so the operator guidance was inverted on the
+platform it most needed to hold for. The corrected form, stated once so it survives the next
+stack: **the CDC-ACM CTS bit is manufactured; which constant it is manufactured as is
+stack-dependent — Linux `cdc_acm` high, Apple's CDC-ACM low — and only the high case is legible as
+an instrument failure.** A bench that reads all-`false` on a CDC-ACM transport is *undetermined*,
+and no reading in this tree resolves it.
+
+**3. A byte-exact transfer is not a whole transfer: this stack loses and duplicates in equal
+measure.** Writing 1024 bytes port-to-port and reading them back delivers **1024 bytes**, of which
+**8 of 128 position-tagged records are missing and 8 are delivered twice** — 5 of 5 runs at 115200,
+byte count exact every time, alignment intact every time. The effect appears in **54 of 54** trials
+across both directions and 9600 / 115200 / 921600, and **pacing the writes ~20 ms apart eliminates
+it** (0 faults over 3 reps, against 12 for one burst write and 20 for unpaced 64-byte chunks), which
+localizes it to concurrent in-flight transfers rather than the wire, the cable, the device or the
+rate. Whether the displacement happens on the transmit or the receive side is **not established**.
+
+**The topology, the harness and the platform are all excluded by a same-box control.** When the
+operator moved this cable to the FTDI fixture, the identical program at the identical payload and
+rate read **128 of 128 distinct records, 0 lost, 0 duplicated, 5 of 5 runs** — same machine, same
+USB hubs, same cable, same 1024-byte payload, same 115200. So this is not USB topology, not the
+reader being descheduled, not the measuring program, and not Darwin generally. **It is this
+transport**, and on the two device classes now measured here Apple's CDC-ACM path has it and
+Apple's FTDI path does not.
+
+**The loss is invisible to the tree's own loss fingerprint.** Plan §3's fingerprint is
+`received + dropped_slow_consumer == sent`, and this defect preserves the byte count exactly — so
+the fingerprint balances while an eighth of a 1024-byte payload is wrong. Only a content
+comparison sees it, which is why the three guards that redden are the SHA-256 ones.
+
+**Why this entry states it as loss-and-duplication and not as reordering:** the session's first
+instrument counted *parsed* records rather than *distinct* ones and therefore reported "every byte
+delivered, nothing lost". It was a metric asserting something weaker than its name claimed — §3's
+tell, in the measuring apparatus rather than in the product — and it inverted the severity of the
+finding. The corrected instrument counts distinct coverage, losses and duplicates separately.
+
+**The tree already catches this, which is the one reassuring sentence here.** `inject_verify`
+compares a SHA-256 of the sent stream against the capture and fails with *"bytes lost/reordered
+across the wire"*; on the rig lane three guards redden on this bench —
+`crossover_rig_data_plane_send_and_exclusivity`, `crossover_rig_custom_baud_byte_exact` and
+`exclusive_write_lock_is_byte_exact` — end to end through the daemon. A length check would have
+passed all three.
+
+**4. A rate this stack cannot realize is accepted, echoed back, and then transmits nothing.**
+With the payload held constant at 240 bytes so that rate is the only variable: 9600, 14400, 19200,
+38400, 57600 and 115200 are byte-exact; **15000, 15600, 16800 and 20000 deliver 0 or 1 byte of
+240**. `IOSSIOSPEED` returns success at every one of them and the `tcgetattr` read-back **echoes
+the requested rate**, so nothing anywhere in the stack reports a problem — the operator gets
+`status="active"`, an `actual_baud` equal to the ask, and a link that is completely dead.
+
+**Scoped to the four rates measured, because a fifth contradicts the tempting generalization:**
+this is *not* "non-standard rates are dead here". P5's own ladder round-trips the non-standard
+`CUSTOM_BAUD = 250_000` on this same pair in the same captures (`rate_ladder=true`). Four rates
+were asked and four carried nothing; what selects them is unknown.
+
+**The product-facing half, which is what makes this more than a probe curiosity:** `serial2` sets
+baud on macOS through this same `IOSSIOSPEED` path, so a serial node configured at 15000 on this
+box **sets successfully, satisfies §7.1 clause 7's ±2.5 % read-back verification against an exact
+echo, comes up `status="active" actual_baud=15000`, and carries nothing.** That is the
+accept-echo-do-not-perform class of plan §18 item 85, one layer above the flow-control flag, and
+it defeats the read-back that §15.58 built the clause on. **The suite asked for exactly this
+measurement**: `crossover_rig_actual_baud_is_a_read_back_not_an_echo` skips on this bench saying
+*"which rungs it refuses there is not measured — take it with `serial-nexus-doctor --port A
+--port B` (P14) and file the Darwin arm rather than assuming this one carries over"*. This is that
+arm.
+
+**This sharpens §15.62 consequence 2 rather than contradicting it.** That clause records the echo
+and calls the read-back property *unmeasurable* on this transport rather than violated. True; and
+the echo is not merely uninformative here, it is **actively concealing**. **What is not
+established is the axis:** the Linux ladder never asked 15000, 15600 or 16800 — it steps
+9600 → 19200 → 38400 — and its 6 000 000 rung passed byte-exact, so whether these rates are dead
+on the *device* or only on this *stack* is untested. That is a pre-registration for the next Linux
+session, not a finding.
+
+**5. It also explains P14's number, and the explanation is not the one first proposed.** P14
+reported `max_reliable_baud = 14400` on hardware that reached 6 000 000 on Linux. The tempting
+account — that P14's constant-airtime payload (`baud/40`) crosses the displacement threshold — is
+**refuted by P14's own table**: 14400's payload is 360 bytes, above the 352-byte offset where
+displacement first appears, and that rung passed **6 of 6 byte-exact in both directions**. Payload
+and rate are perfectly collinear inside P14, so its table cannot separate them in either
+direction. What actually happened is both defects at once: clause 3 knocked out the 19200 rung
+(480 bytes received, `failure: "corrupt"`), refinement then descended into 15000/15600/16800, and
+clause 4 made those silent — so `ceiling_kind = "unreliable-timed-out"` is read off a rung that
+received **zero** bytes — which makes it the *correct* word for a genuine stall, and evidence
+**against** a payload account rather than for one, since the displacement defect classifies as
+`Corrupt` and not `TimedOut`. **`max_reliable_baud` on this bench is not this adapter's maximum rate**,
+and no wording in P14 can currently say so.
 
 ## 16. Post-completion review: reliability through simplification
 
