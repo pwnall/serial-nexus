@@ -13613,6 +13613,17 @@ failure. The lesson is one line: **a pipeline that summarises a test run destroy
 that makes its failures actionable**, and it destroys it silently, which is the same register as the
 `grep -c '^SKIP'` hazard this same session reproduced two paragraphs above.
 
+***And then it happened again, an hour after that sentence was written.*** A later run read
+**1088 · 1 · 7** and was also piped through `awk`, so that name is lost too. Six captured runs since
+read 1089 · 0 · 7 at loads of 20.54, 12.41, 4.62, 3.26 and idle, and the failure has not reproduced.
+**Two occurrences, both unnamed, both by the same self-inflicted mechanism, the second after the
+remedy was recorded** — which says the remedy was written as a lesson and not as a habit. Under
+AGENTS §2's standing rule both are the recorded unnamed-load-sensitive class and neither is a
+finding; what is new here is only the failure of a note to change behaviour. The habit that would
+have worked is mechanical rather than remembered: **redirect the run to a file, always, and summarise
+from the file** — `cargo test … > run.log 2>&1` then read `run.log`, never `cargo test … | awk`. It
+costs nothing on a green run and it is the only thing that pays on a red one.
+
 *The baseline's first reading was 709 · 342 · 7 and is a harness reading, not a tree reading.* A fresh
 worktree without `cargo build --workspace` has no plain binaries, and 94 targets fail naming exactly
 that — `itest/src/lib.rs:66` says so in its own panic text, which is why it cost one re-run and not an
