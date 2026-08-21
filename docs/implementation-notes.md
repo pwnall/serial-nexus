@@ -13869,6 +13869,29 @@ fail-first proven by restoring the single-remedy behaviour in place, which redde
 compared against is the one this script would install* — is now true by construction, and a test
 asserting the build is not gated would be a proxy for it rather than the thing (AGENTS §9).
 
+**The proof the filing session could not finish, completed after the operator re-blessed.** The
+end-to-end check needs an installed copy that matches the reference build, and item 101's own fix
+changed `devprep/`, so none existed until `scripts/bless` ran — **and that run genuinely needed the
+`sudo`**, which is §15.45 working: a rewritten binary is never silently still blessed. With a matching
+copy in place: `cargo build --workspace --locked` re-pointed the hardlink to `de5eb6b9…`, a different
+binary from the installed one, and `--verify` read **already blessed, exit 0**. Reverting the fix in
+place (AGENTS §8, never a stash) and repeating the same sequence read **`Stale`, exit 1**; restored
+byte-identical. Both halves of the repair are now demonstrated on the bench rather than argued from
+the diff, and the **fully-spelled documented rig lane reads 1089 · 0 · 7 with a single self-skip** at
+`6e6dcd0`, all twelve hardware tests passing.
+
+**One diagnosis of my own was refuted in passing, and it is the cheaper kind of lesson.** The
+verification capture stamped `6e6dcd094fc4-dirty` while `git status` reported the tree clean. I
+proposed that `--no-optional-locks` — which `doctor/build.rs` passes deliberately, so a build never
+takes `.git/index.lock` from a concurrent commit — skips the index refresh and therefore reads a
+stale stat cache as a modification. **Measured: it does not.** A `touch` on a tracked file leaves
+`git --no-optional-locks status --porcelain` empty, because the flag suppresses *writing* the
+refreshed index and not the content comparison. The real cause was mine: the fail-first proof above
+ran `cargo build --workspace` while `scripts/bless` was modified, so the doctor binary was stamped
+from a genuinely dirty tree and kept that stamp. Rebuilding on the clean tree stamps `6e6dcd094fc4`.
+**The provenance stamp was right, my theory about it was wrong, and it took two commands to tell
+them apart** — which is the whole argument for the stamp existing.
+
 **The register, which this repository already has a name for.** AGENTS §3 collects gates whose
 passing output is indistinguishable from their not-running output. This is the mirror: **a check
 whose failing output is indistinguishable from a real failure, produced by a predicate that was
