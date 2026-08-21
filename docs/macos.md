@@ -23,8 +23,11 @@ lane spelled `SNX_CROSSOVER=required` + `SNX_CROSSOVER_A`/`_B` + `SNX_TLS=requir
 `SNX_WEB_UI=required` + `SNX_EXEC_CODEC=required`, **with `SNX_RIG_FLOW` and `SNX_REPLUG` dropped** —
 the first legitimately (no handshake is readable on this transport and both flow modes are refused
 at `load`), the second because the replug lane is Linux-only. **This page's older figure of 955 for
-the 2026-08-13 session disagrees with the plan's Status row for the same session, and that row's own
-arithmetic does not close** — filed as plan §18 item 94; no delta is quotable across the two.
+the 2026-08-13 session is that session's FIRST reading, not its last** — the session closed at
+**961** at `ad4dfb2` after four more guards landed, and the Status table is the only home from
+which either figure is quotable (plan §3 rule 19). The row's arithmetic was also malformed and
+is repaired: plan §18 item 94, notes §3.120. **No delta is quotable across the two** — rule 19
+requires one session to have measured both ends.
 
 **Four deltas this platform adds, all in the transport rather than in the tree.**
 
@@ -57,7 +60,10 @@ arithmetic does not close** — filed as plan §18 item 94; no delta is quotable
    wire inertness.
 
 **P5 prints `3-wire: no handshake lines carried` here**, on a bench the operator reports as 5-wire
-and which Linux calls `UNREADABLE … this is not a 3-wire answer`. Both sentences describe one
+and which Linux calls `UNREADABLE … this is not a 3-wire answer`. *(Annotated 2026-08-21: that is
+what the binary of this date printed. It no longer prints it — design §15.69 clause 1 replaced the
+all-`false` sentence, because a bare FT232R input and a manufactured-low one were measured
+bit-identical. The observation this paragraph rests on is unchanged; only the quoted output moved.)* Both sentences describe one
 physical bench and both cannot be licensed; §15.68 and plan §18 item 92 carry it. **Darwin's CTS
 path itself works** — `macos-24.6.0-2026-08-05-42eac2a-tier3.json` reads `true`/`true` on an FTDI
 pair on this same OS — so this is a device-class limit, not a platform one.
@@ -100,7 +106,8 @@ Same box (MacBookPro15,1, Darwin 24.6.0 / macOS 15.7.8, x86_64, 12 cores), tree 
 **The rig proven on the wire first**, per the protocol §3.45 set: `SNX_CROSSOVER=required` with
 both ports named, `serial_hardware.rs` **6 passed** in 19.88 s, 32768 bytes byte-exact each way at
 250000 baud. P5's handshake block reads `3-wire: no handshake lines carried` on all eight
-crossings, and `rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes` prints "driver
+crossings *(the wording of that date; §15.69 clause 1 has since replaced it — the eight cells and
+the finding are unchanged)*, and `rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes` prints "driver
 accepts rts-cts and drops it — asserting the load refusal instead", which is §15.53's shipped
 behaviour meeting the driver it was written for.
 
@@ -150,7 +157,14 @@ sense — guards written on Linux by sessions that could not run them here, whic
 
 **955 passing · 0 failed · 7 ignored** at default CI scope with `--no-fail-fast --nocapture`, 126
 result lines over 122 cargo targets. The run before the two repairs read 953 · 2 · 7 and is kept in
-the Status table, because it is the measurement that found them. **105 self-skips**, against the
+the Status table, because it is the measurement that found them. *(**Annotated 2026-08-21, plan §18
+item 94:** 955 is this session's **first** figure, not its closing one — four more guards landed the
+same day and the session closed at **961** at `ad4dfb2`. The Status table carries the ladder and is
+the only surface either figure is quotable from, plan §3 rule 19. The **105 self-skips** below is a
+**withdrawn** figure and must not be re-quoted or replaced with another number: `grep -c '^SKIP'` is
+unstable under `--nocapture` because parallel binaries interleave their writes and break the line
+anchor — two runs of this box at adjacent trees read 105 and 102. Read it as "on the order of a
+hundred", which is all the claim beside it ever needed.)* **105 self-skips**, against the
 Linux authority row's 13 at the same scope: the rig is attached but `SNX_CROSSOVER_A`/`_B` are
 unexported at default scope, so every serial test skips by design — which is why a macOS
 default-scope figure is not comparable to a Linux one test-for-test, and no delta between them is

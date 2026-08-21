@@ -4167,7 +4167,9 @@ declines, and the falsified claim here.
 produced a `faulted` node *after `load` had returned success* — measured, not hypothetical: Apple's
 `IOSerialFamily` does exactly this on an FT232R (P15, notes §3.65 E) while Linux honours the flag
 (`cflag` delta exactly `CRTSCTS`, notes §3.68). The decision — refuse at `load`/`add-node`, before
-anything is created, through the one predicate `serial_nexus_sys::honours_rtscts` and its four
+anything is created, through the one predicate `serial_nexus_sys::honours_rtscts` [**stale symbol, noted 2026-08-21**: §15.61 parameterised it to `honours_flow_control(path, FlowMode::RtsCts)`; the name in this sentence no longer exists in any `.rs` file — plan §18 item 96; the
+*four states* half of this sentence is correct and survives — three `FlowOutcome` variants plus the
+`Err` arm] and its four
 states (`Honoured`, `Refused`, `AcceptedThenDropped`, and `Err` for unmeasured — §7.1 clause 2,
 restated 2026-08-12 when the tree gained the third measured arm the contract had always named)
 — is stated at §7.1/§11, with §7 as the reason rather than an exception: what §7 forbids is
@@ -4662,6 +4664,7 @@ sentence says the reading is not determinable and never that the line is bare. B
 carry `UNREADABLE handshake: RTS/CTS gave no usable reading at either drive level — this is not a
 3-wire answer`, and `3-wire: no handshake lines carried` is kept byte-for-byte for the all-`false`
 case, which is the design's stated common case and rides in committed artifacts.
+*[**Superseded 2026-08-21 by §15.69 clause 1** (plan §18 item 92): the all-`false` case no longer prints that sentence — a bare FT232R input and a manufactured-low one were measured bit-identical, so the wording it preserved was preserving a cabling claim the cells cannot carry.]*
 
 **§15.52's closing claim is scoped, not withdrawn.** It reads: *no gate in this tree can tell a
 5-wire bench from a 3-wire one, by design — the only instruments that can are the committed P5
@@ -5248,6 +5251,178 @@ closes no era (§13's era law clause 4). The FT232R bench reads the difference i
 ceiling rung printed `timed-out` and now prints `starved`, `written: 37500`, `received: 37482` — a
 receive-side stall eighteen bytes short of a completed write, which is a different sentence from the
 one the CDC-ACM bench's `silent` rungs earn.
+### 15.69 The FT232R bench answers three of the Darwin session's open questions, and refuses one
+
+**Status:** DECIDED — overturns one decline at §15.62/item 92 by measurement, adds one wire-rate
+finding that scopes §7.1 clause 7 on **both** kernels, and records one experiment whose accepted
+half was measured to buy nothing. Notes §3.121 (clause 1), §3.122 (clause 2), §3.123 (clause 3). Closes plan §18 items 92, 93, 96 and 98; items 94 and 95 are
+record repairs and carry no design consequence. **One product surface changes** — the handshake
+shape sentence, clause 1 — and it changes a word, never a classification.
+
+**The bench.** The FT232R pair `BH00L4KU` ↔ `BH00LW9U`, the fixture the Darwin session moved its
+cable onto (notes §3.118), read on Linux 7.0.0-30 at `432aa0c`. P5 measures
+`5-wire crossover: RTS/CTS both ways, DTR moves nothing`
+(`rts_a_to_cts_b=true rts_b_to_cts_a=true`, all six DTR crossings `false`), P14's ceiling is
+`3000000` `adapter-refused`, and `icounts_measurable=true`. So the same two adapters and the same
+cable have now been read on Darwin and on Linux within one day, and **the wiring is not a variable
+in anything below**. Artifacts are committed (§16.13).
+
+**1. An all-`false` handshake stops asserting a cabling fact, because a bare input and a
+manufactured-low input are bit-identical — and that is measured, not argued.** §15.62 keyed its
+repair on the *reading*: `stuck-high`, `inverted` and `?` fold to `Inconclusive` because a line
+that stays high with its peer closed is doing something no wire can do, so the cell announces its
+own failure. **A constant low announces nothing**, and plan §18 item 92 filed the consequence —
+Apple's CDC-ACM stack manufactures CTS low, which is bit-identical to an absent conductor, so the
+fold fell through to `3-wire: no handshake lines carried` about a cable three instruments had
+measured as a true crossover.
+
+Item 92 left three candidates and **declined deciding between them on one session's evidence**:
+(a) key on transport capability, which §15.62 explicitly refused; (b) require a positive control —
+a state in which this port's CTS has ever read high — before licensing a cabling negative; (c)
+weaken the all-`false` sentence for every bench. **The decline is overturned here, and what
+overturns it is that (b) is (c) wearing another name.** Two readings show it:
+
+* `docs/doctor/linux-7.0-2026-08-13-8c00078-dirty-tier3{,-2,-3}.json` is a genuine **3-wire FT232R**
+  bench on this kernel, and it reads **all eight cells `false`, CTS included**. A bare FT232R CTS
+  input reads constant low.
+* This session's own capture is a **5-wire** bench, so its DSR/DCD/RI pins are bare — six
+  unconnected modem inputs — and every one of them reads `false` at both peer drive levels.
+
+So a positive control asking *has this port's CTS ever read high* fails on every legitimate 3-wire
+bench exactly as it fails on a synthesising transport. It licenses the legacy sentence **nowhere**,
+which makes it (c) with extra machinery. The repair is therefore (c), and the cost §15.62 named —
+the byte-for-byte wording of the design's stated common case — is paid on measured grounds rather
+than on preference.
+
+**What changes is one word and nothing else.** The all-`false` arms of `p5_handshake_line` and of
+the suite's `handshake_measured` now read *no handshake crossing read: 3-wire, or a transport that
+manufactures these lines — this reading cannot separate them*, with the eight-cell suffix
+unchanged. `CellReading`, `crosses()`, `cell_word` and the other five shape arms are untouched; a
+3-wire bench lands in the same arm, skips the same tests, and hard-fails under
+`SNX_RIG_FLOW=required` exactly as before (§15.52 stands). **`CellReading::Absent`'s doc comment was
+the defect in one line** — it read *measured absent, and sayable as such* — and it is corrected at
+the variant.
+
+***The sentence was the easy half, and this is the clause's real content.*** The first repair
+changed both diagnostics and left `skip_no_rig_flow`'s hard-fail message ending *"Cross-wire RTS↔CTS
+both ways — a half-crossed bench … is a miswiring, not a 3-wire rig"*. So under
+`SNX_RIG_FLOW=required` the tool pasted the newly hedged reading into a message that then **told the
+operator to re-cable a bench it had just said it could not judge**, in the two-state world this entry
+refutes. **The harm survived the repair, in the one sentence an operator acts on.** The rule this
+entry binds is therefore stated on the imperative and not on the diagnostic: *a re-cabling
+instruction may be issued only on a reading that identifies a miswiring.* A HALF-CROSSED reading
+does; an all-`false` or `UNREADABLE` one does not, and no longer carries one. (Notes §3.121 carries
+the three further defects the same adversarial pass found, including a swap of the two half-crossed
+direction strings that no guard caught.)
+
+**What this does not decide, stated because it is the obvious over-read:** nothing here says the
+CDC-ACM benches are correctly cabled or incorrectly cabled. It says the instrument cannot tell, and
+now says so. **Do not re-crimp a bench on this sentence** — that was the harm.
+
+**2. A rate can be accepted, echoed back exactly, and put the wire a megabaud away — on Linux, on
+FTDI, and by 41 %.** Plan §18 item 93 recorded four rates that Apple's CDC-ACM stack accepted,
+echoed and could not carry, and asked for the Linux arm. It was run at 240 bytes held constant
+across every rate, the payload byte-identical throughout so rate is the only variable.
+
+*The four Darwin-dead rates are alive here.* 15000, 15600, 16800 and 20000 are byte-exact 3 of 3 in
+both directions, as are 9600, 14400, 19200, 38400, 57600, 115200, 230400, 250000, 460800, 921600.
+**No Darwin-versus-Linux contrast may be drawn from that** and the pre-registration forbade it in
+advance: the Darwin cell moved device *and* stack, this one moves neither back, and the fourth cell
+of that 2×2 — WCH on Linux — needs hardware this bench does not have. Item 93's remainder (b) is
+answered for this cell and stays open as a comparison.
+
+*The finding is at the top of the range instead.* `set_baud_rate(2_823_529)` succeeds, reads back
+`2823529`, and puts the wire at the rate a peer asked for `2000000` runs at — proved by byte-exact
+round-trips 3 of 3 in both directions against that peer, and by garbage in both directions against a
+peer asked for `3000000`. One baud higher, `2_823_530`, and the wire is at 3 Mbaud. The negative
+controls garble as they must: `(2000000, 1500000)`, `(921600, 460800)`, `(2823530, 2000000)`.
+
+*What selects it is `ftdi_sio`'s rounding, and the boundary was predicted before it was asked.*
+`divisor3 = DIV_ROUND_CLOSEST(24_000_000, baud)`; integer part 1 with a nonzero eighths fraction is
+a divisor an FT232R cannot run, so every such ask lands at 2 Mbaud. `divisor3 == 8` requires
+`baud > 24_000_000 / 8.5 = 2_823_529.4`. **Both predicted boundaries were confirmed to the baud, in
+both arms** — 2823529 → 2 Mbaud / 2823530 → 3 Mbaud, and 1548387 → 1.5 Mbaud / 1548388 → 2 Mbaud.
+Item 93's remainder (a), *what selects a dead rate*, is answered for this adapter: divisor
+reachability, with the grid spelled.
+
+**The consequence for §7.1 clause 7, and it is the reason this is a design entry.** The clause
+verifies a configured rate by read-back within ±2.5 %. On this platform that check is satisfied by
+an **echo**: `ftdi_sio` reports the rate it was *asked* for, which `doctor/src/probes.rs` already
+recorded for the accepted rungs and which is now quantified — a **41 %** error reported as
+verified. Darwin's `IOSSIOSPEED` path does the same (§15.68 clause 4). **So the read-back is not a
+wire-rate verification on either kernel**, and the clause's guarantee is narrower than its wording
+invites: it catches a rate the driver *refuses* or *answers differently* (4000000 reads back 9600
+and the open fails — §15.58's corrected example), and it says nothing about a rate the driver
+accepted.
+
+***Declined: making `load` refuse a rate it cannot verify.*** Recorded so it is not re-proposed as
+hardening. The only honest predicate is *this ask lands on this chip's divisor grid*, which needs a
+per-chip divisor model in the daemon — FT232R's `3 MHz / (n + f)` with sub-integer divisors barred
+below 2 is one chip in one family, and the design's §13 position is that the daemon does not carry
+silicon tables. The alternative, refusing every non-standard rate, would refuse `250000`, which
+this very bench round-trips byte-exact and which P5's ladder has exercised since the beginning.
+**What is done instead is to stop the surface from over-promising**: `actual_baud` is a read-back
+and the clause now says what a read-back does and does not establish, with this measurement cited.
+An operator who needs the wire rate reads `achieved_baud_floor`, which is timed from the trials —
+and note that cell is only meaningful under P14's *constant-airtime* payload; see clause 3.
+
+**3. The pattern-stimulus experiment is a measured decline, and P14's payload does not move.** Plan
+§18 item 98 accepted the stimulus half of the operator's battery proposal and specified its shape:
+a 12-byte `0x00` run, a 12-byte `0xFF` run, a 16-byte `0x55`/`0xAA` alternation, LCG elsewhere, with
+position tags shipping alongside or not at all. Its own pre-registration predicted the inlay would
+change nothing on a short TTL-level crossover, and said a measured decline would be worth more than
+an untested entry. **It was measured on a throwaway instrument first, deliberately**, because
+landing it re-bases `max_reliable_baud` across every committed artifact under an unchanged digest
+pair (§15.44's residual) and owes a hand-announcement — a cost that must not be paid for a stimulus
+measured to buy nothing.
+
+Three hypotheses, one per block, each predicting something the others do not: the `0x00` run is the
+sustained-low-duty stimulus that bites an AC-coupled path; the `0xFF` run is the only one whose
+distinctive counter is `brk`; the alternation is the transition-density stimulus that bites clock
+recovery at the top of the ladder. **Result: the inlay separates from the LCG on nothing this bench
+can read.** Both arms byte-exact 3 of 3 in both directions at 9600, 19200, 115200, 460800, 921600,
+1500000, 2000000 and 3000000, with `frame`, `overrun`, `parity` and `brk` deltas all zero for both,
+at P14's own constant-airtime lengths.
+
+**The null is evidence because every counter it rests on was moved on the same bench in the same
+session.** A rate mismatch moved `frame` by 18; `tcsendbreak` moved `brk` by 1; a present-but-slow
+reader moved `overrun` by 5 at 460800 and again at 3000000; a receiver demanding even parity against
+a sender using none moved `parity` by 41. Without those, an all-zero table would be AGENTS §3's
+tell — a passing output identical to a not-running output. `buf_overrun` moved in none of them and
+is **not** claimed as exercised.
+
+*Scope, stated rather than implied:* this is a null on a DC-coupled ~30 cm TTL crossover. The
+`0x00` run's mechanism needs an AC-coupled, opto-isolated, RS-232-transceiver or long-cable path to
+bite, and none was available. The decline is to the *stimulus on this class of bench*, not to the
+hypothesis.
+
+*One instrument defect, recorded because it is the more useful half.* The first version of the
+comparison wrote each payload whole and only then read, which overran the receiver above 115200 and
+made **both** arms fail identically — `overrun=30` and a byte count identical at four different
+rates and four different lengths. A comparison whose two arms are broken by the apparatus says
+nothing, and it says it in the shape of agreement. The repair was to interleave read and write
+under `poll`, structurally as `p14_trial` already does. **The same trap has a second instance in
+this session**: item 93's constant-**payload** requirement destroys the timed `achieved_baud_floor`
+readout, because 240 bytes at 2 Mbaud is 1.2 ms of wire time against a comparable USB turnaround —
+the column reads 33459 for an ask of 38400 and saturates near 145000 for every ask above it. P14
+avoids this with a constant-**airtime** payload. The two requirements are in direct conflict and a
+figure from the wrong one is not a slow reading but a meaningless one.
+
+**4. A symbol-keyed citation gate is declined, with the count rather than an argument.** Plan §18
+item 96 asks whether the filename-keyed citation gate has a symbol-keyed sibling worth building,
+after §15.61's rename left `serial_nexus_sys::honours_rtscts` standing in normative prose. Measured
+over the two normative documents: **937 identifier-shaped backtick tokens, 63 flagged by a naive
+"must exist in some `.rs` file" check, 24 surviving five mechanical filters, and 1 true positive.**
+The residue is not noise to be tuned away — it includes a **verbatim quote of corrupted test-runner
+output** (`crossover_rig_actual_baud_is_a_read_back_not_an_echotest`, plan §18 item 95's own
+evidence for the interleaving hazard, symbol-shaped and wrong on purpose) and several names quoted
+*in the sentence that records their rename*, where the stale spelling is the subject. A gate would
+cost a 23-entry counted allowance on day one and a doc edit in every commit renaming any of 937
+tracked tokens, to catch one defect that an alignment pass catches for free. **Declined**, and the
+declining rule is the one already on the books: nothing reads prose, and §16.13's discipline plus
+each generation's alignment pass is the practical guard. Re-opened on a second recurrence, not
+before. The three live stale sites are annotated where they stand (AGENTS §5) rather than rewritten.
+
 
 ## 16. Post-completion review: reliability through simplification
 

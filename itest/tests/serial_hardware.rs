@@ -62,8 +62,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use serial_nexus_itest::{
-    Daemon, Sim, attach_slave, crossover_ports, file_len, settled_while_open, sha256_hex,
-    skip_no_rig, wait_until,
+    Daemon, RigFlowReading, Sim, attach_slave, crossover_ports, file_len, settled_while_open,
+    sha256_hex, skip_no_rig, wait_until,
 };
 
 /// Serializes the rig tests: each holds the two physical ports exclusively, so they must
@@ -971,72 +971,741 @@ fn drive_rts_read_far(rpc: &serial_nexus_itest::Rpc, node: &str, far: &str, rts:
 ///
 /// A half-crossed bench therefore **skips** here and, under `SNX_RIG_FLOW=required`,
 /// **fails** naming that state — which is the right verdict for an operator who
-/// asserted the bench is 5-wire: 3-wire is a legitimate cabling under §5's stated
-/// assumption, half-crossed is a miswiring.
+/// asserted the bench is 5-wire: half-crossed is a miswiring, and it is the one
+/// reading whose remedy is an instruction to re-cable.
+///
+/// **The other negative reading is not a cabling verdict, and this doc used to say
+/// it was** (design §15.69 clause 1, plan §18 item 92). It offered two states —
+/// "3-wire is a legitimate cabling under §5's stated assumption, half-crossed is a
+/// miswiring" — and the all-`false` reading is not either of them, because it is not
+/// a reading about a cable at all. A bare CTS input and a transport manufacturing
+/// the bit low produce the same two bits; the sentence [`handshake_shape`] returns
+/// for that case names both possibilities and says it cannot choose, and
+/// [`RigFlowReading`] carries the distinction to the one place that acts on it.
+/// §5's stated 3-wire assumption still holds and such a bench still skips as a
+/// legitimate rig — what changed is that the tool no longer claims to know which
+/// rig it is.
 ///
 /// **Call it only on a graph where the *test* owns both RTS pins** — both ports at
 /// `flow_control = "none"`. Under `rts-cts` the kernel owns that port's RTS and a
 /// `set-modem` fights the line discipline for the same pin, so the reading would be
 /// the discipline's answer rather than the wire's.
-fn handshake_measured(rpc: &serial_nexus_itest::Rpc) -> (bool, String) {
-    // **P5's four cell words, not two.** `crosses()` in `doctor/src/probes.rs`
-    // reports `true` / `false` / `stuck-high` / `inverted` from exactly this pair
-    // of polarities, and this helper used to reduce them to carries/does-not-carry
-    // — so the comment below, which promises an operator will not have to
-    // translate between this line and a doctor report, was false in the one case
-    // where translating matters. A CDC-ACM bench reads `stuck-high` in both
-    // directions, and both instruments called a physically 5-wire rig 3-wire
-    // (§15.62, plan §18 item 80).
-    // **All five of P5's words, `?` included.** `read_modem_lines` returns `null`
-    // for the whole object when `TIOCMGET` fails (`daemon/src/nodes/serial.rs`), and
-    // an earlier spelling compared `== json!(true)`, which collapses `null` into
-    // `false`. That made a failed *high* reading indistinguishable from a measured
-    // low one, so a port whose modem reads were erroring could report `true` —
-    // a precondition claiming a crossing it never saw.
-    let cell_word = |hi: &Value, lo: &Value| -> &'static str {
-        match (hi.as_bool(), lo.as_bool()) {
-            (Some(true), Some(false)) => "true",
-            (Some(false), Some(false)) => "false",
-            (Some(true), Some(true)) => "stuck-high",
-            (Some(false), Some(true)) => "inverted",
-            _ => "?",
-        }
-    };
-    let measure = |near: &str, far: &str| -> (&'static str, String) {
+fn handshake_measured(rpc: &serial_nexus_itest::Rpc) -> (RigFlowReading, String) {
+    let measure = |near: &str, far: &str| -> Direction {
         let hi = drive_rts_read_far(rpc, near, far, true);
         let lo = drive_rts_read_far(rpc, near, far, false);
         let word = cell_word(&hi["cts"], &lo["cts"]);
-        (
+        Direction {
             word,
-            format!(
+            cell: format!(
                 "{near} RTS high -> {far} cts={}, RTS low -> {far} cts={}: {word}",
                 hi["cts"], lo["cts"],
             ),
-        )
+        }
     };
     // `port1 → port0` first, because that is the direction the stall test's promise
-    // rides on and a reader chasing a skip reads left to right.
-    let (b_word, b_cell) = measure("port1", "port0");
-    let (a_word, a_cell) = measure("port0", "port1");
-    let (b_to_a, a_to_b) = (b_word == "true", a_word == "true");
+    // rides on and a reader chasing a skip reads left to right. Which slot each
+    // measurement lands in is checked by [`handshake_line`] rather than trusted:
+    // transposing these two arguments names the wrong wire to an operator debugging
+    // a miswiring, and it is invisible in every reading but the half-crossed pair.
+    handshake_line(&HandshakeDirections {
+        port1_to_port0: measure("port1", "port0"),
+        port0_to_port1: measure("port0", "port1"),
+    })
+}
+
+/// One direction's measurement: the [`cell_word`], and the operator-facing cell text
+/// that opens by naming the direction it was taken in.
+///
+/// A struct rather than a `(word, cell)` tuple for the reason the doctor's
+/// `HandshakeCells` is one: this pair is passed twice, once per direction, and a
+/// transposition is exactly what a positional call hides.
+struct Direction {
+    word: &'static str,
+    cell: String,
+}
+
+/// Both directions, in named fields.
+///
+/// The doctor's `HandshakeCells` is a struct for this exact reason — "the fold is
+/// the place a transposed argument would be invisible" — and this fold is the same
+/// place one field over: the argument transposed here is not the pair but the ports
+/// handed to one `measure` call. Named fields do not make that impossible, they make
+/// it *legible*; [`handshake_line`] is what makes it impossible, by checking each
+/// cell's own text against the slot it arrived in.
+struct HandshakeDirections {
+    port1_to_port0: Direction,
+    port0_to_port1: Direction,
+}
+
+/// One modem line's **cell word**, from its readings at the peer's two drive levels
+/// — P5's vocabulary, spelled here so an operator holding a skip line and a doctor
+/// report never has to translate between them (§15.52).
+///
+/// **Five words, not two.** `crosses()` in `doctor/src/probes.rs` reports `true` /
+/// `false` / `stuck-high` / `inverted` / `?` from exactly this pair of polarities,
+/// and [`handshake_measured`] used to reduce them to carries/does-not-carry — so the
+/// promise above was false in the one case where translating matters. A Linux
+/// `cdc_acm` bench reads `stuck-high` in both directions, and both instruments
+/// called a physically 5-wire rig 3-wire (§15.62, plan §18 item 80).
+///
+/// **`?` included.** `read_modem_lines` returns `null` for the whole object when
+/// `TIOCMGET` fails (`daemon/src/nodes/serial.rs`), and an earlier spelling compared
+/// `== json!(true)`, which collapses `null` into `false`. That made a failed *high*
+/// reading indistinguishable from a measured low one, so a port whose modem reads
+/// were erroring could report `true` — a precondition claiming a crossing it never
+/// saw.
+///
+/// **What `false` does not mean** (plan §18 item 92). `false` is "low at both of the
+/// peer's drive levels", and that is the whole of it. It is what a **bare** input
+/// reads — `docs/doctor/linux-7.0-2026-08-13-8c00078-dirty-tier3.json` is a genuine
+/// 3-wire FT232R bench and answers `false` in all eight cells, CTS included — and it
+/// is bit-identical to what a transport that **manufactures** the bit low reads.
+/// Nothing downstream of this word may therefore claim a conductor is absent.
+fn cell_word(hi: &Value, lo: &Value) -> &'static str {
+    match (hi.as_bool(), lo.as_bool()) {
+        (Some(true), Some(false)) => "true",
+        (Some(false), Some(false)) => "false",
+        (Some(true), Some(true)) => "stuck-high",
+        (Some(false), Some(true)) => "inverted",
+        _ => "?",
+    }
+}
+
+/// The fold from the two RTS→CTS [`cell_word`]s to *([`RigFlowReading`], shape
+/// sentence)*.
+///
+/// **Split out of [`handshake_measured`] so the sentence has a bench-free seam**
+/// (plan §18 item 92). Everything above this line needs two adapters and a cable;
+/// this is a pure function of two words, so the property item 92 is about — what the
+/// all-`false` reading is allowed to claim — is guardable on a box with no rig, on
+/// both instruments, which is what that item's validation asks for.
+///
+/// **The all-`false` arm states what was observed plus the ambiguity, instead of a
+/// cabling fact.** §15.62's earlier repair was reading-keyed: `stuck-high`,
+/// `inverted` and `?` fold to UNREADABLE because a line that stays high with the peer
+/// closed is doing something no wire can do, so the cell announces its own failure.
+/// A constant **low** announces nothing, and that is measured rather than argued:
+///
+/// * `docs/doctor/linux-7.0-2026-08-13-8c00078-dirty-tier3.json` — a genuine 3-wire
+///   FT232R bench — reads `false` in all eight cells, so a bare FT232R CTS input
+///   reads constant low;
+/// * `docs/doctor/macos-24.6.0-2026-08-21-3a39896-ftdi5w-tier3.json` — a **5-wire**
+///   FT232R crossover — reads `false` on all six of its *unconnected* DTR-family
+///   inputs at both drive levels, on a bench whose RTS/CTS pair reads `true` both
+///   ways in the same capture;
+/// * Apple's CDC-ACM stack manufactures CTS low, so the same box, session and cable
+///   printed a 3-wire cabling sentence one fixture earlier
+///   (`docs/doctor/macos-24.6.0-2026-08-21-3a39896-tier3.json`, notes §3.117).
+///
+/// Item 92 left three candidate remedies and declined to choose between them on one
+/// session's evidence. Those readings overturn the decline by **collapsing the
+/// choice**: (b), requiring a positive control — some state in which this port's CTS
+/// has ever read high — before licensing a cabling negative, fails on every
+/// legitimate 3-wire bench too, because a bare input and a manufactured-low input are
+/// bit-identical. So (b) licenses the legacy sentence nowhere and is (c), weakening
+/// the sentence for every bench, wearing a different name. (a), keying on transport
+/// capability, is what §15.62 explicitly refused ("keyed on the reading and never on
+/// a driver name"). The repair is (c), reached by measurement.
+///
+/// **Only the word moves.** The [`RigFlowReading`] returned here is `Crossed` in the
+/// same one arm the old `bool` was `true` in, so the routing through
+/// [`serial_nexus_itest::skip_no_rig_flow`] is what it was: a 3-wire bench is a
+/// legitimate rig that skips, `SNX_RIG_FLOW=required` turns that skip into a hard
+/// failure, and a half-crossed bench still lands on the miswiring sentence item 74
+/// gave it. What the enum adds over the `bool` is the one thing the `bool` could not
+/// carry — *which* negative reading this is, which is what decides whether the
+/// operator is told to re-cable.
+fn handshake_shape(port1_to_port0: &str, port0_to_port1: &str) -> (RigFlowReading, &'static str) {
+    let (b_to_a, a_to_b) = (port1_to_port0 == "true", port0_to_port1 == "true");
     // A cell that answered `stuck-high`, `inverted` or anything else non-boolean
     // said the instrument could not read the wire — never that the wire is bare.
-    let inconclusive = [b_word, a_word]
+    let inconclusive = [port1_to_port0, port0_to_port1]
         .iter()
         .any(|w| *w != "true" && *w != "false");
-    // P5's own vocabulary, deliberately: an operator holding this skip line and a
-    // doctor report should not have to translate between them (§15.52).
-    let shape = match (b_to_a, a_to_b) {
-        (true, true) => "5-wire: RTS/CTS carries both ways",
-        (true, false) => "HALF-CROSSED handshake: RTS/CTS carries port1->port0 only",
-        (false, true) => "HALF-CROSSED handshake: RTS/CTS carries port0->port1 only",
-        (false, false) if inconclusive => {
+    match (b_to_a, a_to_b) {
+        (true, true) => (RigFlowReading::Crossed, "5-wire: RTS/CTS carries both ways"),
+        (true, false) => (
+            RigFlowReading::HalfCrossed,
+            "HALF-CROSSED handshake: RTS/CTS carries port1->port0 only",
+        ),
+        (false, true) => (
+            RigFlowReading::HalfCrossed,
+            "HALF-CROSSED handshake: RTS/CTS carries port0->port1 only",
+        ),
+        (false, false) if inconclusive => (
+            RigFlowReading::NoCrossingRead,
             "UNREADABLE handshake: RTS/CTS gave no usable reading at either drive \
-             level — this is not a 3-wire answer"
+             level — this is not a 3-wire answer",
+        ),
+        (false, false) => (RigFlowReading::NoCrossingRead, NO_RTS_CTS_CROSSING_READ),
+    }
+}
+
+/// The sentence [`handshake_shape`] returns when both RTS/CTS cells answered, and
+/// both answered a constant low.
+///
+/// **The tail is a cross-instrument invariant** (design §15.69 clause 1, plan §18
+/// items 92 and 56). The doctor spells the same tail in `doctor/src/probes.rs`'s
+/// `HANDSHAKE_AMBIGUITY_TAIL`, and the two crates share no dependency edge — adding
+/// one would be a design change — so the comparison is a source scan:
+/// [`the_doctor_and_the_suite_spell_the_same_handshake_ambiguity_tail`].
+///
+/// **The noun in front of the tail differs from the doctor's, deliberately.** This
+/// helper measures the two RTS/CTS cells and nothing else, so `no RTS/CTS crossing
+/// read` is the whole of what it may claim. The doctor's corresponding arm fires
+/// only when all **eight** cells — RTS/CTS and the six DTR-family crossings —
+/// answered absent, so it says `no handshake crossing read`. That is not drift; do
+/// not "fix" the two into agreement.
+///
+/// **Reviewer's obligation, recorded here because no test can carry it.** The
+/// property §15.69 clause 1 binds is a *meaning*: this sentence may not assert a
+/// cabling fact. Its guard is a byte-pin, which catches an accidental re-word and
+/// judges nothing about what the new words say. **Do not re-crimp a bench on this
+/// sentence** — that was the harm.
+const NO_RTS_CTS_CROSSING_READ: &str = "no RTS/CTS crossing read: 3-wire, or a transport that \
+     manufactures these lines — this reading cannot separate them";
+
+/// The operator-facing handshake line: [`handshake_shape`]'s sentence, then the two
+/// cells it was read from.
+///
+/// **Split out because the composition is a step, and it was an unguarded one**
+/// (plan §18 item 92). The item's first guard drove `handshake_shape` alone, so two
+/// things it never saw were free: dropping the shape from the printed line
+/// altogether, and transposing the two `measure` calls at the one call site so both
+/// half-crossed sentences name the wrong port. The first is asserted by
+/// [`the_composed_handshake_line_keeps_the_shape_and_both_cells`]; the second is
+/// asserted **here**, in the shipped path, because a pure test cannot see a call
+/// site — and the two `#[should_panic]` tests beside that one prove these
+/// assertions are live, fed the exact strings a transposed call site produces.
+///
+/// The direction assertions are cheap and they are not decoration. Each cell text
+/// opens by naming the direction it was measured in, so the slot it arrives in is
+/// checkable rather than being a convention two call sites apart — and a
+/// transposition is invisible in every reading but the half-crossed pair, which is
+/// the one case where this tool still tells an operator which wire to move.
+fn handshake_line(d: &HandshakeDirections) -> (RigFlowReading, String) {
+    let HandshakeDirections {
+        port1_to_port0,
+        port0_to_port1,
+    } = d;
+    assert!(
+        port1_to_port0.cell.starts_with("port1 RTS high -> port0 "),
+        "the port1 -> port0 slot was handed a measurement of some other direction, \
+         so a half-crossed reading would name the wrong wire: {}",
+        port1_to_port0.cell
+    );
+    assert!(
+        port0_to_port1.cell.starts_with("port0 RTS high -> port1 "),
+        "the port0 -> port1 slot was handed a measurement of some other direction, \
+         so a half-crossed reading would name the wrong wire: {}",
+        port0_to_port1.cell
+    );
+    let (reading, shape) = handshake_shape(port1_to_port0.word, port0_to_port1.word);
+    (
+        reading,
+        format!(
+            "{shape} [{} | {}]",
+            port1_to_port0.cell, port0_to_port1.cell
+        ),
+    )
+}
+
+/// **The all-`false` handshake reading names its ambiguity instead of asserting a
+/// cable** (plan §18 item 92, design §15.69 clause 1).
+///
+/// Pure, and deliberately so: this is the half of item 92 that no rig can prove. A
+/// bench that *has* a handshake never reaches the arm under test, and a bench that
+/// does not cannot tell the two readings apart — which is the finding. So the guard
+/// drives the shipped fold from the raw cell readings a bare pin and a
+/// manufactured-low pin **both** produce, and pins what the sentence says.
+///
+/// **What this test is: a byte-pin of all five sentences, and it is worth being
+/// plain about what that buys.** It catches an accidental re-word: any edit to any
+/// arm reddens here, so the operator-facing wording cannot drift by inattention.
+///
+/// **It does not judge meaning, and no assertion in this file could.** "Does not
+/// assert a cabling fact" is semantic. The first spelling of this guard checked
+/// `!shape.starts_with("3-wire")` and three `contains` substrings and presented that
+/// as the judgement; an adversarial pass measured what it was worth, and *"3wire
+/// bench: definitely 3-wire, and NOT a transport that manufactures these lines…"*
+/// passed every one of them. So the meaning is a **review obligation**, recorded
+/// where the words are: [`NO_RTS_CTS_CROSSING_READ`].
+///
+/// **All five arms are pinned, not one.** The earlier spelling claimed "the other
+/// four arms are asserted unchanged in the same breath" and pinned exactly one of
+/// them: gutting either half-crossed sentence to `HALF-CROSSED handshake:`, gutting
+/// UNREADABLE's middle, and — the one that matters — **swapping the two
+/// half-crossed direction strings**, so the tool names the wrong wire to an operator
+/// debugging a miswiring, all measured green. A half-crossed bench is the single
+/// case where this tool still issues a re-cabling instruction, which makes naming
+/// the right wire part of the promise.
+#[test]
+fn the_all_false_handshake_reading_does_not_assert_a_cable() {
+    // From the readings, not from the word: `false` here is exactly what a bare CTS
+    // input and a manufactured-low one both put on the wire, and the chain from bits
+    // to sentence is the thing under guard. `cell_word`'s other four rows are pinned
+    // by `the_cell_word_maps_each_pair_of_readings_to_its_own_word`.
+    let bare_or_manufactured = cell_word(&json!(false), &json!(false));
+    assert_eq!(
+        bare_or_manufactured, "false",
+        "low at both of the peer's drive levels is the `false` cell — if this word \
+         moved, the arm below is no longer the one a 3-wire bench takes"
+    );
+
+    // Spelled out here rather than built from [`NO_RTS_CTS_CROSSING_READ`]: a pin
+    // that quotes the constant it is pinning moves with it and asserts nothing
+    // (AGENTS §3's first register). The shared half of the wording is compared
+    // against the doctor's copy in
+    // `the_doctor_and_the_suite_spell_the_same_handshake_ambiguity_tail`.
+    let table = [
+        (
+            ("true", "true"),
+            RigFlowReading::Crossed,
+            "5-wire: RTS/CTS carries both ways",
+        ),
+        (
+            ("true", "false"),
+            RigFlowReading::HalfCrossed,
+            "HALF-CROSSED handshake: RTS/CTS carries port1->port0 only",
+        ),
+        (
+            ("false", "true"),
+            RigFlowReading::HalfCrossed,
+            "HALF-CROSSED handshake: RTS/CTS carries port0->port1 only",
+        ),
+        // A crossing beside an unreadable direction is still half-crossed: the
+        // carrying direction is measured and says so.
+        (
+            ("true", "stuck-high"),
+            RigFlowReading::HalfCrossed,
+            "HALF-CROSSED handshake: RTS/CTS carries port1->port0 only",
+        ),
+        (
+            ("?", "true"),
+            RigFlowReading::HalfCrossed,
+            "HALF-CROSSED handshake: RTS/CTS carries port0->port1 only",
+        ),
+        // A line stuck high with the peer closed is doing something no wire can do,
+        // so §15.62's reading-keyed arm must claim it rather than the weakened
+        // sentence below.
+        (
+            ("stuck-high", "stuck-high"),
+            RigFlowReading::NoCrossingRead,
+            "UNREADABLE handshake: RTS/CTS gave no usable reading at either drive \
+             level — this is not a 3-wire answer",
+        ),
+        // A failed TIOCMGET is an unreadable instrument, not a bare wire.
+        (
+            ("?", "false"),
+            RigFlowReading::NoCrossingRead,
+            "UNREADABLE handshake: RTS/CTS gave no usable reading at either drive \
+             level — this is not a 3-wire answer",
+        ),
+        (
+            ("false", "inverted"),
+            RigFlowReading::NoCrossingRead,
+            "UNREADABLE handshake: RTS/CTS gave no usable reading at either drive \
+             level — this is not a 3-wire answer",
+        ),
+        (
+            (bare_or_manufactured, bare_or_manufactured),
+            RigFlowReading::NoCrossingRead,
+            "no RTS/CTS crossing read: 3-wire, or a transport that manufactures \
+             these lines — this reading cannot separate them",
+        ),
+    ];
+
+    let mut arms = std::collections::BTreeSet::new();
+    for ((b_to_a, a_to_b), reading, sentence) in table {
+        let got = handshake_shape(b_to_a, a_to_b);
+        arms.insert(got.1);
+        assert_eq!(
+            got,
+            (reading, sentence),
+            "({b_to_a}, {a_to_b}) did not read as the agreed sentence. This is a \
+             re-word check, not a meaning check: if you changed it on purpose, read \
+             NO_RTS_CTS_CROSSING_READ's doc and satisfy yourself the new words still \
+             refuse to state a cable (design §15.69 clause 1)"
+        );
+        // The routing, which is the whole of skip-versus-run: exactly the fully
+        // crossed reading runs the promise. Not implied by the pin above — the pin
+        // takes whatever `reading` the table names.
+        assert_eq!(
+            got.0 == RigFlowReading::Crossed,
+            (b_to_a, a_to_b) == ("true", "true"),
+            "({b_to_a}, {a_to_b}) changed the skip-versus-run routing"
+        );
+    }
+    // **The table reached every arm.** Not implied by the pins: they take whichever
+    // arm the table names, so a table that lost its UNREADABLE rows would pass every
+    // one of them and prove four arms while claiming five.
+    assert_eq!(
+        arms.len(),
+        5,
+        "the table did not reach all five shape arms: {arms:?}"
+    );
+}
+
+/// **[`cell_word`] driven from bits** — the stage below [`handshake_shape`], and the
+/// one item 92's evidence actually lives at (plan §18 item 92).
+///
+/// The `(false, false) -> "false"` row is the one the item rests on: a bare CTS input
+/// and a CTS input a driver manufactures low arrive here as the same two readings and
+/// leave as the same word, so nothing downstream can separate them and nothing
+/// downstream may claim to. `null` is the fifth row and not a sixth spelling of
+/// `false`: `read_modem_lines` answers `null` for the whole object when `TIOCMGET`
+/// fails, and an earlier version of this helper compared `== json!(true)`, which
+/// collapsed a failed read into a measured low.
+#[test]
+fn the_cell_word_maps_each_pair_of_readings_to_its_own_word() {
+    let word = |hi: Value, lo: Value| cell_word(&hi, &lo);
+    assert_eq!(
+        word(json!(true), json!(false)),
+        "true",
+        "a line that followed both of the peer's drive levels"
+    );
+    assert_eq!(
+        word(json!(false), json!(false)),
+        "false",
+        "**the row item 92 rests on**: low at both drive levels, which a bare \
+         conductor and a transport manufacturing the level produce alike"
+    );
+    assert_eq!(
+        word(json!(true), json!(true)),
+        "stuck-high",
+        "a line high with the peer driven low is doing something no wire can do"
+    );
+    assert_eq!(
+        word(json!(false), json!(true)),
+        "inverted",
+        "a line that followed both levels backwards is not a crossing"
+    );
+    assert_eq!(
+        word(Value::Null, json!(false)),
+        "?",
+        "a failed TIOCMGET is an instrument failure, not a measured low"
+    );
+    assert_eq!(
+        word(json!(true), Value::Null),
+        "?",
+        "a failed TIOCMGET is an instrument failure in either position"
+    );
+}
+
+/// **The composed operator-facing line carries the shape and both cells, in the
+/// slots they were measured in** (plan §18 item 92).
+///
+/// Item 92's first guard drove [`handshake_shape`] and stopped there, so the step
+/// that builds the line an operator actually reads had none. Measured green against
+/// that guard: printing `[{b_cell} | {a_cell}]` with the shape deleted outright.
+#[test]
+fn the_composed_handshake_line_keeps_the_shape_and_both_cells() {
+    let (reading, line) = handshake_line(&HandshakeDirections {
+        port1_to_port0: Direction {
+            word: "true",
+            cell: "port1 RTS high -> port0 cts=true, RTS low -> port0 cts=false: true".to_owned(),
+        },
+        port0_to_port1: Direction {
+            word: "false",
+            cell: "port0 RTS high -> port1 cts=false, RTS low -> port1 cts=false: false".to_owned(),
+        },
+    });
+    assert_eq!(reading, RigFlowReading::HalfCrossed);
+    assert_eq!(
+        line,
+        "HALF-CROSSED handshake: RTS/CTS carries port1->port0 only \
+         [port1 RTS high -> port0 cts=true, RTS low -> port0 cts=false: true \
+         | port0 RTS high -> port1 cts=false, RTS low -> port1 cts=false: false]",
+        "the composed line dropped the shape, a cell, or the order they are read in"
+    );
+}
+
+/// The `port1 -> port0` slot refuses a measurement of the other direction — the
+/// transposed call site, caught in the shipped path (plan §18 item 92).
+#[test]
+#[should_panic(expected = "the port1 -> port0 slot was handed a measurement of some other")]
+fn a_transposed_port1_to_port0_measurement_is_refused() {
+    let _ = handshake_line(&HandshakeDirections {
+        port1_to_port0: Direction {
+            word: "true",
+            cell: "port0 RTS high -> port1 cts=true, RTS low -> port1 cts=false: true".to_owned(),
+        },
+        port0_to_port1: Direction {
+            word: "false",
+            cell: "port1 RTS high -> port0 cts=false, RTS low -> port0 cts=false: false".to_owned(),
+        },
+    });
+}
+
+/// The mirror, so the check above is not satisfied by one slot alone: transposing
+/// the pair trips whichever assertion reads first, and both must be live.
+#[test]
+#[should_panic(expected = "the port0 -> port1 slot was handed a measurement of some other")]
+fn a_transposed_port0_to_port1_measurement_is_refused() {
+    let _ = handshake_line(&HandshakeDirections {
+        port1_to_port0: Direction {
+            word: "true",
+            cell: "port1 RTS high -> port0 cts=true, RTS low -> port0 cts=false: true".to_owned(),
+        },
+        port0_to_port1: Direction {
+            word: "false",
+            cell: "port1 RTS high -> port0 cts=false, RTS low -> port0 cts=false: false".to_owned(),
+        },
+    });
+}
+
+/// The declaration the doctor's half of the shared ambiguity tail is spelled on.
+const HANDSHAKE_AMBIGUITY_TAIL_DECL: &str = "const HANDSHAKE_AMBIGUITY_TAIL: &str =";
+
+/// The **value** of the string literal declared by the *one* occurrence of `decl` in
+/// `src`, joined the way rustc joins one.
+///
+/// **Why this is not a `find('"')`-to-`find('"')` scan of the raw source**, which is
+/// what stood here. That scan is correct only while the literal happens to fit on one
+/// line. The doctor's tail sits at 91 columns inside a 100-column `max_width`: one
+/// more word in the sentence, or a longer name on the constant, pushes it past
+/// rustfmt's width, and a Rust literal that outgrows its line wraps on a
+/// `\`-continuation. The raw scan then captures the backslash, the newline and the
+/// next line's indentation as text, and the comparison below reddens with *the two
+/// instruments no longer spell the same handshake ambiguity* **when nothing
+/// diverged**. Measured, against the reader this replaced: wrapping
+/// `HANDSHAKE_AMBIGUITY_TAIL` in `doctor/src/probes.rs` without changing a byte of its
+/// value left the doctor's own tests green and reddened
+/// [`the_doctor_and_the_suite_spell_the_same_handshake_ambiguity_tail`], whose
+/// `right:` side was the sentence with a backslash, a newline and five spaces of
+/// rustfmt indentation sitting in the middle of it.
+///
+/// That is worse than it looks. A gate that reddens for a reformat teaches its next
+/// reader that its red means "reformat the doctor", and the sibling comment two
+/// declarations up says what happens to such a gate: it is the one somebody deletes.
+///
+/// So this reads the literal the way the compiler does. A `\` at end of line drops the
+/// newline **and every whitespace character after it** (rustc's `STRING_CONTINUE`
+/// skips space, tab, CR and LF); `\\`, `\"`, `\'`, `\n`, `\t`, `\r` and `\0` take
+/// their values; and the closing quote is the first *unescaped* one, so an escaped
+/// quote inside the sentence no longer truncates the reading either.
+///
+/// **Every failure is a panic naming the file, never a silent approximation.** An
+/// escape this reader does not know stops it rather than being passed through as
+/// text — passing it through would compare two strings that are not the two literals
+/// and report agreement, which is AGENTS §3's first register wearing a helper's
+/// clothes.
+fn string_literal_after(src: &str, decl: &str, whose: &str) -> String {
+    // **Exactly one, or this reader is quoting whichever copy happens to sit
+    // earliest in the file.** `find` takes the first textual occurrence, and a
+    // doc-comment or a test fixture that spells the declaration is a textual
+    // occurrence. Measured: with the real constant diverged and one earlier line
+    // spelling `decl` beside the *correct* sentence, the cross-instrument
+    // comparison went green, while the identical divergence without that line was
+    // red — this helper's own doc promises "never a silent approximation" and that
+    // was the silent approximation (plan §18 item 92, AGENTS §3's first register).
+    let found = src.matches(decl).count();
+    assert_eq!(
+        found, 1,
+        "{whose} spells `{decl}` {found} times, and this reader takes the first. \
+         With more than one, it quotes whichever copy sits earliest — a doc comment \
+         or a fixture — and reports agreement about a literal nobody compiles; with \
+         none, the doctor's half of the shared handshake tail moved or was renamed \
+         and this comparison went blind rather than red (plan §18 item 92)"
+    );
+    let at = src
+        .find(decl)
+        .expect("the count above proves there is exactly one");
+    let rest = &src[at + decl.len()..];
+    let open = rest
+        .find('"')
+        .unwrap_or_else(|| panic!("{whose}: `{decl}` is not followed by a string literal"));
+    assert!(
+        rest[..open].trim().is_empty(),
+        "{whose}: `{decl}` has {:?} between it and the next literal, so this reader \
+         would be quoting something other than the constant's own value",
+        &rest[..open]
+    );
+
+    let mut chars = rest[open + 1..].chars();
+    let mut out = String::new();
+    loop {
+        let Some(c) = chars.next() else {
+            panic!("{whose}: the literal after `{decl}` never closes");
+        };
+        match c {
+            '"' => return out,
+            '\\' => {
+                let Some(escape) = chars.next() else {
+                    panic!("{whose}: the literal after `{decl}` ends inside an escape");
+                };
+                match escape {
+                    // The line continuation, which is the whole point of this
+                    // reader: the newline goes, and so does the indentation rustfmt
+                    // put on the next line.
+                    '\n' | '\r' => {
+                        let tail = chars.as_str();
+                        let resume = tail
+                            .find(|ch: char| !matches!(ch, ' ' | '\t' | '\n' | '\r'))
+                            .unwrap_or(tail.len());
+                        chars = tail[resume..].chars();
+                    }
+                    '\\' => out.push('\\'),
+                    '"' => out.push('"'),
+                    '\'' => out.push('\''),
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    '0' => out.push('\0'),
+                    other => panic!(
+                        "{whose}: the literal after `{decl}` uses the escape `\\{other}`, \
+                         which this reader does not know. Teach it that escape rather than \
+                         letting the comparison run on text that is not the literal's value"
+                    ),
+                }
+            }
+            _ => out.push(c),
         }
-        (false, false) => "3-wire: no RTS/CTS handshake in either direction",
-    };
-    (b_to_a && a_to_b, format!("{shape} [{b_cell} | {a_cell}]"))
+    }
+}
+
+/// **[`string_literal_after`] reads a wrapped literal the way rustc does** (plan §18
+/// item 92; the register is AGENTS §3's — a gate that reddens for something that did
+/// not happen).
+///
+/// **The oracle is the compiler.** `WRAPPED_BY_RUSTC` is the same sentence written as
+/// a real wrapped Rust literal, so what the middle case asserts is that reading the
+/// source agrees with what rustc makes of it, rather than with what this file's author
+/// believed rustc makes of it. The flat pin under it is the third leg: it says the
+/// wrap changed the formatting and not the value, which is the premise of the whole
+/// complaint.
+///
+/// The two short cases either side are the same bug's siblings, both live against the
+/// reader this replaced: it truncated the declaration at the first `;`, which a `;`
+/// inside the sentence reaches first, and it took an escaped `\"` for the closing
+/// quote.
+#[test]
+fn the_ambiguity_tail_reader_reads_a_literal_the_way_rustc_does() {
+    let read = |src: &str| string_literal_after(src, HANDSHAKE_AMBIGUITY_TAIL_DECL, "<fixture>");
+
+    // One line, which is how the constant is spelled today.
+    assert_eq!(
+        read("const HANDSHAKE_AMBIGUITY_TAIL: &str = \"a — b\";\n"),
+        "a — b"
+    );
+
+    // **The case that reddens the reader this replaced.** The fixture is source text
+    // — a real backslash, a real newline, real indentation — spelled exactly as
+    // rustfmt would leave `doctor/src/probes.rs` if the sentence grew one word.
+    const WRAPPED_BY_RUSTC: &str = "3-wire, or a transport that manufactures these \
+     lines — this reading cannot separate them";
+    let wrapped_src = concat!(
+        "const HANDSHAKE_AMBIGUITY_TAIL: &str =\n",
+        "    \"3-wire, or a transport that manufactures these \\\n",
+        "     lines — this reading cannot separate them\";\n",
+    );
+    assert_eq!(
+        read(wrapped_src),
+        WRAPPED_BY_RUSTC,
+        "a wrapped literal read as something other than its value — the \
+         cross-instrument comparison would now redden for a reformat"
+    );
+    assert_eq!(
+        WRAPPED_BY_RUSTC,
+        "3-wire, or a transport that manufactures these lines — this reading cannot \
+         separate them",
+        "the wrapped fixture is supposed to be a formatting change and nothing else; \
+         if this fails, the case above is proving agreement about the wrong sentence"
+    );
+
+    // More than one continuation, so the reader is not merely tolerating the first.
+    let thrice = concat!(
+        "const HANDSHAKE_AMBIGUITY_TAIL: &str = \"one \\\n",
+        "        two \\\n",
+        "        three\";\n",
+    );
+    assert_eq!(read(thrice), "one two three");
+
+    // A `;` inside the sentence, which truncated the previous reader before it ever
+    // reached the closing quote — it panicked with `the literal closes`, red for a
+    // divergence that had not happened.
+    assert_eq!(
+        read("const HANDSHAKE_AMBIGUITY_TAIL: &str = \"a; b\";"),
+        "a; b"
+    );
+    // An escaped quote, which the previous reader took for the end of the literal and
+    // silently compared the truncation.
+    assert_eq!(
+        read("const HANDSHAKE_AMBIGUITY_TAIL: &str = \"a \\\" b\";"),
+        "a \" b"
+    );
+}
+
+/// The reader stops at an escape it does not know instead of passing it through as
+/// text (plan §18 item 92).
+///
+/// A comparison run on text that is not the literal's value can agree, and its
+/// agreement would mean nothing — AGENTS §3's first register, reached through a
+/// helper rather than through a gate.
+#[test]
+#[should_panic(expected = "which this reader does not know")]
+fn the_ambiguity_tail_reader_refuses_an_escape_it_cannot_read() {
+    let _ = string_literal_after(
+        "const HANDSHAKE_AMBIGUITY_TAIL: &str = \"a \\u{2014} b\";",
+        HANDSHAKE_AMBIGUITY_TAIL_DECL,
+        "<fixture>",
+    );
+}
+
+/// **The doctor and the suite spell one ambiguity tail, and nothing compared them**
+/// (plan §18 item 92, design §15.69 clause 1; the rule is plan §18 item 56's — one
+/// question, two implementations, which must not drift).
+///
+/// The doctor's all-`false` failure message *claimed* this cross-instrument property
+/// while reading only the doctor's own literal, which is AGENTS §3's second register:
+/// an assertion weaker than the comment above it. This is the comparison it claimed.
+///
+/// **Why a source scan and not a shared constant.** A shared constant needs a crate
+/// both instruments depend on. `serial-nexus-doctor` depends on `core`, `rpc` and
+/// `sys`; `serial-nexus-itest` depends on `sys` and, as dev-dependencies, `core`,
+/// `rpc` and `codec-api`. Putting a handshake sentence into any of those three puts a
+/// doctor's operator-facing wording into the daemon's own dependency graph, and the
+/// only alternative — a dependency edge from one of these two crates to the other —
+/// is a change to the workspace's shape, which is a design amendment rather than a
+/// patch (AGENTS §5). So the tail stays spelled once per crate and the comparison
+/// reads the other crate's source, exactly as `meta_names.rs` and `meta_derive.rs`
+/// read files from the tree.
+///
+/// **The first noun in front of the tail differs and must**: the doctor's arm fires
+/// only when all eight cells answered absent (`no handshake crossing read`), while
+/// this file measures the two RTS/CTS cells and nothing else. Only the tail is the
+/// invariant, so only the tail is compared.
+#[test]
+fn the_doctor_and_the_suite_spell_the_same_handshake_ambiguity_tail() {
+    // This file is `<root>/itest/tests/serial_hardware.rs`.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("itest/ has a parent");
+    let probes = root.join("doctor/src/probes.rs");
+    let src = std::fs::read_to_string(&probes)
+        .unwrap_or_else(|e| panic!("read {}: {e}", probes.display()));
+
+    // The doctor keeps its tail in one named constant, so this is a lookup of one
+    // declaration rather than a match on the fold. A constant that stopped being used
+    // would trip `dead_code` under the workspace's `-D warnings`, so it cannot strand
+    // while the fold quietly grows its own copy.
+    let doctor_tail = string_literal_after(
+        &src,
+        HANDSHAKE_AMBIGUITY_TAIL_DECL,
+        &probes.display().to_string(),
+    );
+
+    let (_noun, suite_tail) = NO_RTS_CTS_CROSSING_READ
+        .split_once(": ")
+        .expect("the suite's sentence is `<what was read>: <the ambiguity>`");
+    assert_eq!(
+        suite_tail, doctor_tail,
+        "the two instruments no longer spell the same handshake ambiguity. An \
+         operator holding a doctor report beside a suite skip line reads one \
+         question in two wordings, and the wording is the whole of what item 92 \
+         changed (design §15.69 clause 1)"
+    );
 }
 
 /// **RTS on one node moves CTS on the other, through the daemon's own state**
@@ -1084,10 +1753,11 @@ fn crossover_rig_rts_crosses_to_the_far_ports_cts() {
     let rpc = d.rpc();
     std::thread::sleep(Duration::from_millis(300));
 
-    let (carries, measured) = handshake_measured(rpc);
-    if !carries {
+    let (reading, measured) = handshake_measured(rpc);
+    if reading != RigFlowReading::Crossed {
         serial_nexus_itest::skip_no_rig_flow(
             "crossover_rig_rts_crosses_to_the_far_ports_cts",
+            reading,
             &measured,
         );
         return;
@@ -1423,14 +2093,15 @@ fn rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes() {
     // `set-modem` there would read the discipline's answer rather than the wire's,
     // and `handshake_measured` needs both directions (plan §18 item 74). This
     // daemon is dropped before arm 1 opens the ports.
-    let (carries, measured) = {
+    let (reading, measured) = {
         let (probe, _run_dir, _i0, _i1) = boot_rig(&p0, &p1, 115_200);
         std::thread::sleep(Duration::from_millis(300));
         handshake_measured(probe.rpc())
     };
-    if !carries {
+    if reading != RigFlowReading::Crossed {
         serial_nexus_itest::skip_no_rig_flow(
             "rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes",
+            reading,
             &measured,
         );
         return;

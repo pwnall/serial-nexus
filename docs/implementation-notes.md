@@ -13348,8 +13348,11 @@ is Linux-only (`itest/src/lib.rs:2773`). The three failures are the same defect 
 `crossover_rig_data_plane_send_and_exclusivity`, `crossover_rig_custom_baud_byte_exact` and
 `exclusive_write_lock_is_byte_exact`, each a SHA-256 mismatch reported as *"bytes lost/reordered
 across the wire"*. **The guard works and a length check would have passed all three.** No delta is
-quotable against the 2026-08-13 rows: only this end was measured this session, and the plan's
-Status table cannot currently say whether that row is 960 or 961 (item 94).
+quotable against the 2026-08-13 rows: only this end was measured this session. *(The second
+reason given here — that the Status table could not say whether that row is 960 or 961 — was
+item 94 and was repaired 2026-08-21: the row reads **961** at `ad4dfb2` and the 960 reading is
+an intermediate that was replaced, not a rival. The refusal above stands on rule 19 alone;
+notes §3.120.)*
 
 **A hazard reproduced, usefully.** Counting `^test .* \.\.\. ok$` in the default-scope log gives
 **978**; summing the `test result:` lines of the same log gives **1000**. One log, two figures,
@@ -13487,3 +13490,263 @@ AGENTS §3's remedy, applied to the guard's *stated* property, is what found it.
 really generates. They do **not** drive the poll loop above it: that loop is unchanged by this work
 and a pty-driven test of it would be Linux-only, since `serial2` answers `ENOTTY` on a pts. That
 limit is why item 98's validation is written to read the frame counters rather than the buffer.
+
+### 3.120 The record audits itself: a row that could not be read, and a list nobody re-derived
+
+**Two clerical items, and both turned out to be about the same thing** — a summary surface that
+nobody re-derives drifts, and drifts silently, because nothing renders the drift.
+
+**Item 94, the malformed Status row.** The 2026-08-13 macOS rig-box row carried **six** cells against
+a five-column header. GitHub-flavoured Markdown drops cells past the header count, so the row
+rendered correctly and the surplus was invisible to every reader it had ever had. The ladder closes
+exactly in git — 955 (`28f26ee`) → 957 (`e5a305f`) → 959 (`0c92fe5`) → 960 (`265a3a9`) → **961**
+(`4548881`, measured at `ad4dfb2`) — and one artifact proves the mechanism: `4548881`'s diff is a
+single `-` line and a single `+` line replacing the 960 row with the 961 row, **leaving the 960 row's
+caveat behind**. The orphan cell is that caveat, byte-for-byte minus its opening sentence.
+
+**So the row reconciles and is not marked unreconciled**, which was the item's fallback remedy and
+would have recorded a false uncertainty. Four surfaces agree on 961 — cell 5, AGENTS §2, `4548881`'s
+message and its diff — and only the dead orphan says 960.
+
+***What item 94 asked for could not be done as worded, and that is the more useful finding.*** It
+says to *reconstruct from the session's own record*, and **notes §3.93–§3.100 record no suite figure
+at all**. The reconstruction came from git. A session that reports figures only into a table it also
+malforms leaves nothing behind when the table is the thing under audit.
+
+**The refusal the item said it blocked is not unblocked.** plan §3 rule 19 forbids quoting
+1000 − 961 for its own reason — one session must measure both ends — and that reason was always
+load-bearing on its own. Three surfaces gave two reasons for the refusal; they now give the surviving
+one, worded so that repairing the second cannot be read as removing the first. `docs/macos.md`'s 955
+is annotated as the session's **first** reading rather than corrected to 961, and its **105
+self-skips** is marked withdrawn rather than replaced — a withdrawn figure is never re-quoted, and
+substituting a different anchored count would have re-committed §3.78's error.
+
+**Item 95, the open-item list.** Measured against §18's own entries: AGENTS §2 called **16 executed
+items open** and **omitted 8 open ones**, and contradicted itself on item 41 inside one paragraph.
+Two independent parses — one written by hand for this entry, one by the gate — agree on both sets,
+which is the only reason either is quoted.
+
+***The item's own evidence was wrong twice.*** It lists 13 and 15 as "recorded executed"; 13 reads
+`**MEASURED**` with its gating half carried and a live remainder, and 15 reads `**State:** open
+(S/M)`. And every file:line citation in it is stale by three or four lines — stale *already at
+authoring time*. **A report of a stale-claim defect that carries stale claims is not an irony to
+note and move past; it is the measurement that says the defect is structural rather than careless.**
+
+***A third surface was worse than the two the item names.*** plan §2's Status block claimed to be
+*the authority on what is open* while carrying three stale enumerations, one of which called all of
+48–55 open when every one was executed the same day it was written. **Three surfaces claimed the
+authority and had drifted apart, so the conflict is resolved rather than papered over** (AGENTS §5):
+plan §18's item entries are the authority, because an entry that must be edited to change an item's
+state cannot drift from itself. plan §2 and §18's opening both say so now, and both are held to it by
+`itest/tests/meta_ledger.rs` rather than by care — the only difference that has ever held.
+
+**Both gates failed their own first draft, and the failures are worth more than the gates.**
+`meta_derive.rs`'s row-shape gate walked "lines beginning with a pipe" and stopped at the first line
+without one — but GFM keeps such a line as a row **and keeps every row after it**, verified against a
+real renderer. So a Status row that lost its leading pipe removed itself *and everything below it*
+from the gate's scope while the table still rendered: the walker was gentler than the product's
+parser, AGENTS §3's sixth register, in the one gate written to catch a rendering defect. Its
+delimiter check was a cell count under a comment claiming a structural one, and its row floor of 20
+against 33 rows left thirteen rows of slack in which a truncated walk was silent.
+
+`meta_ledger.rs`'s first draft had the sharper one: every **mixed-clause** entry — 31, 64, 78 — was
+held open by a single hand-listed literal, so rewording that one clause silently reclassified the
+entry EXECUTED **with no error**, and with AGENTS reconciled the gate read green while the ledger's
+own words said open. Its module doc claimed "No default status, ever — a new spelling fails this gate
+loudly"; loudness held for single-status entries and failed in exactly the shape the gate exists to
+handle, the shape AGENTS §2 spells `64(a)` and `78(b)`. Four further mechanisms were proven inert by
+mutation — a word-boundary matcher whose near-miss case never reached it, a title strip whose
+deletion left the derived set byte-identical, a disjunct unsatisfiable against its own normalised
+haystack, and a hand-bumped item floor that structurally could not see a lost tail.
+
+**Four adversarial rounds, and the curve is the record.** Both gates were attacked, repaired,
+re-attacked and repaired again — round 1 found the walker and the silent-green classifier; round 2
+found a blank-line truncator and a punctuation-only escape; round 3 found a third truncator and the
+same escape one spelling over; round 4 found a fourth truncator and a mirror of the escape, and both
+gates were judged sound. **Every round's findings were narrower than the last and none was ever
+empty**, which is the honest shape of this exercise: a scanning gate over prose has no natural
+stopping point, only a point where the next finding costs more than it buys. That point is recorded
+as plan §18 items **99 and 100** rather than chased, with each remaining hole measured and each
+proposed widening priced — accepting a single `*` on a clause continuation refuses three real ledger
+entries, and widening the item-head matcher to `98)` makes it read item 66's wrapped CI run id as a
+head and refuse every parse. **Both narrownesses have a document behind them**, which is what makes
+them items rather than patches. Two of the four rounds also produced a *cry-wolf* finding — a gate
+reddening on a correct document — and those are as load-bearing as the blind spots: AGENTS §9's own
+direction, and the failure mode that gets a gate deleted.
+
+***The ledger gate's most useful output was not a drift report.*** Built to hold AGENTS §2 to §18,
+it went red on **item 13** — which AGENTS listed open and the gate derived as executed — and its own
+header told the reader *"AGENTS §2 is the copy, and the copy is what gets repaired"*. Following that
+instruction would have deleted a genuinely open item from the list the gate exists to keep honest.
+**Item 13 is owed**: its head reads `**MEASURED 2026-08-13** … the gating half is carried` and its
+live record carries a `*Remainder:*`, which §18's own Schema defines as *exactly what is owed*. The
+declaration was legible to a careful reader and to nothing else. The repair is on both sides — the
+entry's declaration now says `(b) open` in words, and the gate reads the ledger's `Remainder` schema
+rather than another spelling — and the lesson is the sharper half: **a gate that names one of its two
+inputs "the copy" has decided which one loses an argument, before any argument happens.** It is the
+only entry in 1–98 in that position; every other executed entry's live region was scanned for owed-work
+vocabulary and cleared.
+
+**One suspected defect was refuted and is recorded as such:** item 48's *"What remains open is the
+second half"* is not a contradiction of its `EXECUTED` head — it sits inside the block the entry
+introduces with *"its record follows unchanged"*, which is the preserved filing, correctly marked.
+
+### 3.121 Item 92: the sentence was the easy half, and the imperative was the harm
+
+**What overturned the decline.** Item 92 filed three candidate remedies and declined choosing on one
+session's evidence. Two readings decide it, and neither needed new hardware: a committed **3-wire**
+FT232R capture on Linux (`linux-7.0-2026-08-13-8c00078-dirty-tier3{,-2,-3}.json`) reads **all eight
+cells `false`, CTS included**, and this session's **5-wire** capture carries six bare DSR/DCD/RI
+inputs reading `false` at both peer drive levels. **A bare FT232R input reads constant low, which is
+bit-identical to the constant low Apple's CDC-ACM manufactures.** So candidate (b)'s positive control
+— *has this port's CTS ever read high* — fails on every honest 3-wire bench too and licenses the
+legacy sentence nowhere. **(b) is (c) wearing another name, and that is what collapses the choice.**
+The evidence for the strongest available repair was sitting in the committed record; what was missing
+was a reason to go and read it.
+
+**The repair, and its scope.** Both instruments' all-`false` arms lost the cabling claim and gained
+the ambiguity. Nothing else moved: a 3-wire bench lands in the same arm, skips the same tests, and
+hard-fails under `SNX_RIG_FLOW=required` exactly as before. `CellReading::Absent`'s doc comment —
+*"measured absent, and sayable as such"* — was the defect stated in one line, and it is corrected at
+the variant rather than in a comment somewhere downstream.
+
+***The finding that justifies the whole adversarial protocol.*** The first pass changed both
+diagnostic sentences and left `skip_no_rig_flow`'s hard-fail message ending *"Cross-wire RTS↔CTS both
+ways — a half-crossed bench … is a miswiring, not a 3-wire rig"*. So under `SNX_RIG_FLOW=required`
+the tool pasted the new, carefully hedged reading into a message that then **told the operator to
+re-cable a bench it had just said it could not judge**, and offered the two-state world {3-wire,
+miswiring} that item 92 exists to refute. **The harm item 92 was filed for survived the repair, in
+the one sentence an operator acts on** — and the file holding it was named in the task and had no
+diff at all. The imperative is now keyed on the reading: a HALF-CROSSED bench still gets it verbatim,
+because there it is correct; an all-`false` or `UNREADABLE` bench does not.
+
+**Three more, all found by mutation and none by reading.** Both item-92 guards were prefix-keyed and
+stayed green against a sentence asserting the cable outright — *"does not assert a cabling fact"* is
+semantic and no keyword check tests it, so the honest guard is an exact pin plus a comment saying
+what a pin does and does not buy. Three of the four arms the guards' comment called "asserted
+unchanged" were unpinned, including a **swap of the two half-crossed direction strings**, which would
+name the wrong wire to the one operator who genuinely is miswired. And `crosses()` was a nested `fn`
+inside `p5_handshake`, so the `(false,false) → "false"` mapping that **is** this item's cited evidence
+had no test anywhere in the tree, while the suite's sibling did start from bits — item 56's shape,
+one implementation driven from readings and one from words.
+
+**Not a gate defect, and measured rather than reasoned:** rewriting P5's handshake value to
+`"BANANA"` in a committed artifact leaves `jq -e -f expectations/linux.jq` at exit 0, while rewriting
+it to `7` exits 1. The jq gates pin the field's presence and type, never the shape word, so nothing
+in the gate set ever read the sentence this item is about.
+
+### 3.122 The Linux arm of item 93: four dead rates that are alive, and a live rate that is a megabaud off
+
+**The bench, and why it is the interesting one.** The FT232R pair `BH00L4KU` ↔ `BH00LW9U` — the
+fixture §3.118's cable was moved onto, hours earlier and on the other kernel — read on Linux
+7.0.0-30 at `432aa0c` with the tree clean. P5 measures `5-wire crossover: RTS/CTS both ways, DTR
+moves nothing`; P14's ceiling is `3000000` `adapter-refused` with `search_elapsed_ms=21982` against
+the 180 s budget; `icounts_measurable=true`. **All six DTR crossings are `false`, so item 28 stays
+blocked for a fifth cabling.**
+
+**Pre-registered before any port was opened**, sha256
+`b8937a28182314e0229e880cdc07d59a9ccf5aa94b6fba226f276d9641b15399` at 06:18:20 UTC, with a second
+addendum (`45640432e9eb3ab40d668c0c738b022fa0fd0473b3d9b5c63efebb2617cbcf60`) and a third
+(`e5c93e3f27978bf4634c18954d16ac40a53d843485a8097e719314b7ef04558d`) each written after a refutation
+and before the rates it predicted were asked. **The first thing every one of them says is what the
+experiment cannot decide**, which is §3.118's lesson applied without being told: the Darwin cell
+moved device and stack together and this cell moves neither back, so no Darwin-versus-Linux contrast
+about the four rates is licensed however they come out.
+
+**PR1, PR2 and PR5 held.** 15000, 15600, 16800 and 20000 are byte-exact 3 of 3 in both directions
+here, as are 9600, 14400, 19200, 38400, 57600, 115200, 230400, 250000, 460800, 921600 — payload held
+constant at 240 bytes throughout, byte-identical at every rate, so rate is the only variable. The
+read-back echoes the ask exactly at every one. `stale_before` is 0 on every trial, which is the
+control that says a byte-identical payload was not being satisfied by the previous rung's residue.
+
+**PR3 was withdrawn as a method, not reinterpreted as a result — and it is the more useful half.**
+PR3 predicted the *timed* achieved rate would expose the gap. The instrument cannot measure that:
+240 bytes at 2 Mbaud is 1.2 ms of wire time against an FT232R latency timer of the same order, so
+the column reads 33459 for an ask of 38400 and saturates near 145000 for every ask above it. It is
+measuring USB turnaround. **The constant-*payload* requirement item 93 imposes for comparability
+with the Darwin cell is exactly what destroys the timed readout, which P14 gets right with a
+constant-*airtime* payload.** The two requirements are in direct conflict; a figure from the wrong
+one is not imprecise but meaningless, and no conclusion here rests on that column.
+
+**PR4 is the finding, and it needs no timing at all.** `(A=2500000, B=2000000)` is byte-exact 3 of 3
+in both directions. So is `(A=2750000, B=2000000)`. A 20 % and a 37.5 % nominal mismatch cannot
+round-trip 240 bytes; both ports are running at one rate. The complementary pairings garble in both
+directions — `(2500000, 3000000)`, `(2750000, 3000000)` — and so do the negative controls
+`(2000000, 1500000)` and `(921600, 460800)`, which is what says the test discriminates rather than
+being permissive. `(2500000, 1500000)` garbles too, excluding the third reachable grid point.
+
+**PR7 and PR8 were refuted, and the refutation is what found the rule.** Truncation predicts
+2900000 → 2 Mbaud; it measures 3 Mbaud, as does 2999999. Nearest-rounding *in rate* predicts a
+boundary at 2500000 and is refuted by 2750000 → 2 Mbaud. What survives is `ftdi_sio`'s own
+arithmetic: `divisor3 = DIV_ROUND_CLOSEST(24_000_000, baud)`, integer part 1 with a nonzero eighths
+fraction being a divisor an FT232R cannot run. That predicts the boundary at
+`24_000_000 / 8.5 = 2_823_529.4`, and **both boundaries were confirmed to the baud, in both arms**:
+2823529 → 2 Mbaud and 2823530 → 3 Mbaud; 1548387 → 1.5 Mbaud and 1548388 → 2 Mbaud, each with its
+complementary pairing garbling. Item 93's remainder (a) is answered for this adapter.
+
+**What it costs §7.1 clause 7, quantified.** `set_baud_rate(2_823_529)` succeeds, reads back
+`2823529`, and puts the wire a megabaud away — **41 %**, inside a ±2.5 % check that reports success.
+`doctor/src/probes.rs` already recorded that `ftdi_sio` echoes the ask for accepted rungs and put
+2500000/2750000 at "~1.9 Mbaud" from the timed floor; this measurement identifies that rate exactly
+(2 Mbaud, the grid point, read at 0.94 by a timed floor) rather than approximately. **The design
+consequence and the decline not to make `load` refuse an unverifiable rate are at §15.69 clause 2**,
+with the reason recorded there so it is not re-proposed as hardening.
+
+**The instrument.** A standalone binary, not in this tree, built against `serial2` pinned to the
+workspace's own `=0.2.37` so the read-back measured is the read-back the product rides on, and using
+`p14_payload`'s generator verbatim with one fixed argument set. Its trial loop was rewritten once —
+see §3.123, which found the same class of apparatus defect and is why this entry states the
+`stale_before` control rather than assuming it.
+
+### 3.123 Item 98 is a measured decline: the inlay changed nothing, on a bench where every counter moved
+
+**Order of work, chosen deliberately and recorded because it is the substance.** Item 98 accepted the
+stimulus half of the operator's pattern-battery proposal and specified its shape. Landing it moves
+P14's payload bytes, which **neither digest can see** (§15.44's residual) and which would silently
+re-base `max_reliable_baud` across every committed artifact, owing a hand-announcement in
+`docs/doctor/README.md`. So the comparison was run on a throwaway instrument **before** the shipped
+payload was touched. Item 98's own pre-registration predicted the inlay would change nothing and said
+a measured decline would be worth more than an untested entry; paying an era-wide re-basing cost for
+a stimulus measured to buy nothing is the trade this project files as a defect.
+
+**Pre-registered** at sha256 `79994a76d27885ff736f27d39fba5735ac032022541e754a989295acadcd61c0`,
+06:28:38 UTC, with a hypothesis per block whose prediction differs from the others' — item 98's
+validation asks for exactly that, *replicates wearing a factor's name are not levels*. The `0x00`
+run holds the line low for 9 of every 10 bit times and is the DC-wander stimulus; the `0xFF` run is
+the only block whose distinctive counter is `brk`; the `0x55`/`0xAA` alternation is the
+transition-density stimulus and is the one predicted to bite first at the top of the ladder.
+
+**Result: the inlay separates from the LCG on nothing this bench can read.** Both arms byte-exact
+3 of 3 in both directions at 9600, 19200, 115200, 460800, 921600, 1500000, 2000000 and 3000000, at
+P14's own constant-airtime lengths (240 … 65536 bytes), with `frame`, `overrun`, `parity` and `brk`
+deltas all zero for both arms at every rung. The two arms alternate trial by trial so any drift
+across the run hits both equally.
+
+**Why that null is evidence rather than an absence of one.** Every counter it rests on was moved on
+this bench, in this session, by this instrument: a deliberate rate mismatch moved `frame` by 18;
+`tcsendbreak` moved `brk` by 1; a present-but-slow reader moved `overrun` by 5 at 460800 and again
+at 3000000; a receiver demanding even parity against a sender using none moved `parity` by 41.
+Without those the table would be AGENTS §3's first tell — a passing output identical to a
+not-running output — and the pre-registration named that failure mode in advance as outcome (3).
+**`buf_overrun` moved in none of them and is not claimed as exercised.** A separate self-test asserts
+the inlay payload actually differs from the LCG at every length used and that each of the three
+blocks is present in the inlay and absent from the control, because a null from a stimulus that was
+never on the wire is the cheapest way to be wrong here.
+
+**The apparatus defect, which is the entry's most useful line.** The first version wrote each payload
+whole and only then read. Above 115200 that overran the receiver and made **both** arms fail
+identically: `overrun=30` and a received-byte total identical at four different rates and four
+different payload lengths. **A comparison whose two arms are broken by the apparatus says nothing,
+and it says it in the shape of agreement** — the arms agreed perfectly, which is what the experiment
+was looking for. What exposed it was not reading the code but noticing that P14 passes those very
+rungs on this bench in this session. The repair was to interleave read and write under `poll`,
+structurally as `p14_trial` already does; on the rewritten loop both arms pass every rung. The
+identical-numbers-at-different-rates signature is the thing to look for, and it is a sibling of
+§3.117's own instrument counting parsed rather than distinct records.
+
+**Scope, stated rather than implied.** This is a null on a DC-coupled ~30 cm TTL crossover. The
+`0x00` run's mechanism needs an AC-coupled, opto-isolated, RS-232-transceiver or long-cable path to
+bite, and none was available. **The decline is to the stimulus on this class of bench, not to the
+hypothesis**, and design §13's rule that an axis must be able to vary is what makes that distinction
+mandatory rather than polite. `p14_payload` is unchanged, `probe_set` and `field_set` are unchanged,
+no era moves, and `docs/doctor/README.md` owes nothing.

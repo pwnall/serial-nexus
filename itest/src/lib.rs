@@ -2900,6 +2900,89 @@ pub fn usb_port_of(by_id_link: &Path) -> Option<String> {
     None
 }
 
+/// What a rig's RTS↔CTS measurement came back as — the three states the two
+/// hardware-flow tests route on, and the input [`skip_no_rig_flow`] keys its
+/// *remedy* on.
+///
+/// **Two of the three call for opposite instructions, and that is why this type
+/// exists** (design §15.69 clause 1, plan §18 item 92). A bench carrying RTS↔CTS
+/// one way only is miswired, and the right thing to tell its operator is to
+/// re-crimp it. A bench where neither direction was read as crossing may be a
+/// perfectly honest 3-wire cable — §5's own stated assumption — or a transport that
+/// manufactures these lines low, which is bit-identical to a bare conductor and
+/// which no instrument in this tree can separate from one. Telling *that* operator
+/// to re-cable is the harm item 92 filed: the same two adapters on the same
+/// measured-5-wire cable printed a cabling sentence on one stack and an
+/// instrument-failure sentence on another.
+///
+/// Item 92's repair softened the two *diagnostic* sentences and left the
+/// **actionable** one — the sentence an operator reads under
+/// `SNX_RIG_FLOW=required` and acts on — telling a bench the tree had just said it
+/// could not judge to cross-wire itself, offering the two-state world (3-wire or
+/// miswiring) that same item had refuted. A softened diagnosis
+/// beside an unchanged imperative is worse than neither: it is the same instruction
+/// with the evidence for it removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RigFlowReading {
+    /// Both directions followed the peer's drive at both levels. The capability the
+    /// `required` word exists to prove is present and nothing skips.
+    Crossed,
+    /// Exactly one direction carried: a **miswiring**, and the one reading whose
+    /// remedy is an instruction to re-cable (plan §18 item 74).
+    HalfCrossed,
+    /// Neither direction was read as crossing — either both cells answered a
+    /// constant low, or neither cell could be read at all.
+    ///
+    /// **Not a statement about a cable.** See this type's own doc: on this reading
+    /// the instrument reports what it read and says outright that it cannot say
+    /// what produced it.
+    NoCrossingRead,
+}
+
+impl RigFlowReading {
+    /// The **actionable** half of the `required`-mode failure, keyed on the reading.
+    ///
+    /// One sentence per state, and the split is the whole point (design §15.69
+    /// clause 1). The [`HalfCrossed`](RigFlowReading::HalfCrossed) sentence is
+    /// carried across from before plan §18 item 92 **verbatim**, because on that
+    /// reading it was always right; the others are new, and the
+    /// [`NoCrossingRead`](RigFlowReading::NoCrossingRead) one carries no re-cabling
+    /// imperative at all.
+    ///
+    /// **Reviewer's obligation, recorded here because no test can carry it.** These
+    /// three strings are byte-pinned by
+    /// `only_a_half_crossed_reading_is_told_to_re_cable`, which catches a re-word
+    /// and judges nothing about what the new words say. Whether a replacement still
+    /// refuses to send an operator to the soldering iron on a reading that cannot
+    /// support it is a decision, and it is yours. **Do not re-crimp a bench on the
+    /// `NoCrossingRead` sentence** — that was the harm.
+    fn remedy(self) -> &'static str {
+        match self {
+            RigFlowReading::HalfCrossed => {
+                "Cross-wire RTS↔CTS both ways — a half-crossed bench reads as one \
+                 of the two directions carrying and is a miswiring, not a 3-wire \
+                 rig — or unset SNX_RIG_FLOW."
+            }
+            RigFlowReading::NoCrossingRead => {
+                "This bench reports no RTS/CTS crossing in either direction, and \
+                 this instrument cannot tell a 3-wire cable from a transport that \
+                 manufactures these lines: a constant low is what both produce, and \
+                 a reading that never went high is what both leave behind (design \
+                 §15.69 clause 1, plan §18 item 92). So this is not a cabling \
+                 verdict and it is not an instruction to re-crimp anything. Confirm \
+                 the wiring by some other means — the adapter's own datasheet, a \
+                 meter across the two headers, a second pair of adapters — or unset \
+                 SNX_RIG_FLOW."
+            }
+            RigFlowReading::Crossed => {
+                "This bench reads as fully crossed, so a caller skipped a capability \
+                 the rig has: that is a defect in the harness and not in the \
+                 cabling. Nothing here is an instruction to the operator."
+            }
+        }
+    }
+}
+
 /// Announce a hardware-flow-control test's self-skip — and refuse to skip when the
 /// operator has said the capability must be exercised.
 ///
@@ -2910,9 +2993,20 @@ pub fn usb_port_of(by_id_link: &Path) -> Option<String> {
 /// RTS↔CTS **in both directions**, which is a property of the operator's cabling
 /// and not of their checkout — and §5's stated design assumption is the **3-wire**
 /// link, so a rig that answers no is a legitimate rig and not a fault. The
-/// measurement is taken first and printed in the skip, so a reader never has to
-/// guess which of the two they have; the doctor reports the same fact
+/// measurement is taken first and printed in the skip, so a reader is shown the
+/// eight readings rather than a bare "skipped"; the doctor reports the same reading
 /// independently in P5's handshake block.
+///
+/// **What the printed reading cannot tell them, and this line used to claim it
+/// could** (design §15.69 clause 1, plan §18 item 92). The sentence here read "so a
+/// reader never has to guess which of the two they have". On the all-`false`
+/// reading they must guess, and that is the finding rather than a gap in the
+/// report: a bare CTS input and a transport that manufactures the bit low are
+/// bit-identical, so `no RTS/CTS crossing read` names two possibilities and says
+/// outright that it cannot choose between them. What the reader is owed is that the
+/// tool not pretend otherwise — which is why the remedy printed under
+/// `SNX_RIG_FLOW=required` is keyed on [`RigFlowReading`], and why the one it
+/// prints for that reading sends nobody to re-cable a bench.
 ///
 /// **Half-crossed lands here too, and that is a deliberate reading of two
 /// different states through one word** (plan §18 item 74). A bench that carries
@@ -2924,22 +3018,22 @@ pub fn usb_port_of(by_id_link: &Path) -> Option<String> {
 /// the right answer to an operator who declared the bench 5-wire. Before item 74
 /// the precondition measured one direction, so this helper never saw a
 /// half-crossed bench at all: the caller passed its gate and then reddened
-/// mid-promise.
+/// mid-promise. It is the one reading whose remedy is still "cross-wire both
+/// ways", and that sentence is carried across item 92 verbatim.
 ///
 /// `SNX_CROSSOVER=required` deliberately does **not** redden this: the rig is
 /// present, the capability is not, and conflating the two would make an honest
 /// 3-wire bench unable to run the rig lane at all. `SNX_RIG_FLOW=required` is the
 /// separate word for "this bench is 5-wire and I want that proven".
-pub fn skip_no_rig_flow(test: &str, measured: &str) {
+pub fn skip_no_rig_flow(test: &str, reading: RigFlowReading, measured: &str) {
     assert!(
         std::env::var("SNX_RIG_FLOW").as_deref() != Ok("required"),
         "SNX_RIG_FLOW=required, but {test} found no fully-crossed RTS/CTS handshake: \
          {measured}.\n\
          Required mode exists so a 5-wire bench cannot report a green run for the \
          one capability that only a 5-wire bench can exercise (§15.52, plan §3 \
-         rule 11). Cross-wire RTS↔CTS both ways — a half-crossed bench reads as one \
-         of the two directions carrying and is a miswiring, not a 3-wire rig — or \
-         unset SNX_RIG_FLOW."
+         rule 11). {}",
+        reading.remedy()
     );
     eprintln!("SKIP {test}: the rig carries no fully-crossed RTS/CTS handshake — {measured}");
 }
@@ -3483,6 +3577,80 @@ mod tests {
         assert!(
             !daemon_answers(&socket),
             "a stale socket file with no listener was read as a live daemon"
+        );
+    }
+
+    /// **Only a half-crossed reading is told to re-cable** (design §15.69 clause 1,
+    /// plan §18 item 92).
+    ///
+    /// Item 92 softened the two instruments' *diagnostic* sentences and left the
+    /// **actionable** one — [`skip_no_rig_flow`]'s `required`-mode failure — saying
+    /// "Cross-wire RTS↔CTS both ways … a miswiring, not a 3-wire rig" to every
+    /// bench that reached it, including the one the same message had just said it
+    /// could not judge. That sentence is now one arm of [`RigFlowReading::remedy`]
+    /// and this pins all three.
+    ///
+    /// **It is a byte-pin and nothing more, which is worth saying plainly.** It
+    /// catches a re-word — including the one that matters, pasting the re-cabling
+    /// imperative back into the `NoCrossingRead` arm, since that changes the arm's
+    /// bytes. It does **not** judge meaning: no assertion here can tell an
+    /// instruction to re-crimp from a sentence that merely mentions crimping, and
+    /// an earlier spelling of item 92's guards dressed exactly that kind of keyword
+    /// check as a semantic judgement and was measured to pass a sentence asserting
+    /// the cable outright. The meaning is a review obligation, recorded at
+    /// [`RigFlowReading::remedy`].
+    #[test]
+    fn only_a_half_crossed_reading_is_told_to_re_cable() {
+        // Spelled out here rather than read back from the source under test: a pin
+        // that quotes the value it is pinning moves with it and asserts nothing
+        // (AGENTS §3's first register).
+        let expected = [
+            (
+                RigFlowReading::HalfCrossed,
+                "Cross-wire RTS↔CTS both ways — a half-crossed bench reads as one of the two \
+                 directions carrying and is a miswiring, not a 3-wire rig — or unset \
+                 SNX_RIG_FLOW.",
+            ),
+            (
+                RigFlowReading::NoCrossingRead,
+                "This bench reports no RTS/CTS crossing in either direction, and this instrument \
+                 cannot tell a 3-wire cable from a transport that manufactures these lines: a \
+                 constant low is what both produce, and a reading that never went high is what \
+                 both leave behind (design §15.69 clause 1, plan §18 item 92). So this is not a \
+                 cabling verdict and it is not an instruction to re-crimp anything. Confirm the \
+                 wiring by some other means — the adapter's own datasheet, a meter across the \
+                 two headers, a second pair of adapters — or unset SNX_RIG_FLOW.",
+            ),
+            (
+                RigFlowReading::Crossed,
+                "This bench reads as fully crossed, so a caller skipped a capability the rig \
+                 has: that is a defect in the harness and not in the cabling. Nothing here is \
+                 an instruction to the operator.",
+            ),
+        ];
+        for (reading, text) in expected {
+            assert_eq!(
+                reading.remedy(),
+                text,
+                "{reading:?}'s remedy was reworded. This is a re-word check, not a \
+                 meaning check: read `RigFlowReading::remedy`'s doc and satisfy \
+                 yourself the new words still send only a miswired bench to the \
+                 soldering iron (design §15.69 clause 1)"
+            );
+        }
+        // **The remedy is a function of the reading, not a constant dressed as
+        // one.** Not implied by the pins: they would all still hold if a future
+        // edit made two arms identical *and* updated both literals above, which is
+        // exactly the shape of an accidental merge of the two.
+        let distinct: std::collections::BTreeSet<&str> = expected
+            .iter()
+            .map(|(reading, _)| reading.remedy())
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "two readings share a remedy, so at least one bench is being told what \
+             a different reading called for: {distinct:?}"
         );
     }
 }

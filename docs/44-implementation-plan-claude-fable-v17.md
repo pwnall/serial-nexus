@@ -33,7 +33,7 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 |---|---|---|---|---|
 | **1007 passing · 0 failed · 7 ignored** | **macOS**, x86_64 Mac rig box, default CI scope, `--no-fail-fast` | 2026-08-21 | the P14 failure-taxonomy session (notes §3.119) | **The macOS authority row**, superseding the 1000 above. **The +7 is quotable because both ends were measured in this session** on this box: it is exactly this change's seven new P14 guards — the count-preserving displacement, the same displacement off the 8-byte window grid, the silent/short-write/starved separation, the garbled suppression, the interleaved class, the payload-window uniqueness sweep, and the passing-trial null. No product behaviour changed: `RungOutcome`'s six words are untouched, so no committed verdict moves. |
 | **1000 passing · 0 failed · 7 ignored**, **91 distinct self-skip names** | **macOS**, x86_64 Mac rig box, **FT232R 5-wire bench** (`BH00L4KU` ↔ `BH00LW9U`) — `SNX_CROSSOVER=required` `SNX_CROSSOVER_A`/`_B` **`SNX_RIG_FLOW=required`** `SNX_TLS=required` `SNX_WEB_UI=required` `SNX_EXEC_CODEC=required`, `--no-fail-fast`, `--nocapture` | 2026-08-21 | the Darwin CDC-ACM bench session's cable-move control (notes §3.118, design §15.68) | `3a39896`. **The first macOS lane to carry `SNX_RIG_FLOW=required`**, which became settable only because the handshake precondition now *measures* true on this bench. **Still not the documented lane** (AGENTS §3), which also spells `SNX_REPLUG=required` with two device paths — Linux-only here — so this is **the fullest lane macOS can run**, not a fully-spelled one. **The equality with the 1000 default-scope row above is not a delta and must not be mined as one**: a self-skipped test still passes, so the count is unchanged while the work is not; what moved is 105 → 91 distinct self-skip names. `crossover_rig_rts_crosses_to_the_far_ports_cts` **ran** here rather than self-skipping. Same tree and same session as the 997 · 3 · 7 CDC-ACM row — **the three failures there are a transport defect that this bench does not have**, measured by the same probe reading 128 of 128 distinct records with 0 lost and 0 duplicated (design §15.68 clause 3). |
-| **1000 passing · 0 failed · 7 ignored**, 129 test-result lines, **105 distinct self-skip names** | **macOS**, x86_64 Mac rig box, default CI scope, `--no-fail-fast`, `--nocapture` | 2026-08-21 | the Darwin CDC-ACM bench session (notes §3.117) | **The macOS authority row.** `3a39896`. **Not comparable test-for-test with any Linux row** — this box self-skips ~105 device- and Linux-gated tests against Linux's ~14 at the same scope (AGENTS §2). **No delta is quotable against the 2026-08-13 row below**: only this end was measured this session, and that row's own arithmetic does not close (item 94). The self-skip figure is a count of **distinct names**, never of anchored `^SKIP` lines — the same log reads **978** by `grep -cE '^test .* \.\.\. ok$'` and **1000** by summing its `test result:` lines, which is notes §3.78/§3.101's hazard reproduced. |
+| **1000 passing · 0 failed · 7 ignored**, 129 test-result lines, **105 distinct self-skip names** | **macOS**, x86_64 Mac rig box, default CI scope, `--no-fail-fast`, `--nocapture` | 2026-08-21 | the Darwin CDC-ACM bench session (notes §3.117) | **The macOS authority row.** `3a39896`. **Not comparable test-for-test with any Linux row** — this box self-skips ~105 device- and Linux-gated tests against Linux's ~14 at the same scope (AGENTS §2). **No delta is quotable against the 2026-08-13 row below**, and the reason narrowed on 2026-08-21 without the refusal moving: that row's arithmetic now closes — it reads **961** at `ad4dfb2`, reconstructed from git and repaired at the row (item 94, notes §3.120) — so what forbids the subtraction is rule 19 alone, *only this end was measured this session*, the two ends being five days and many commits apart. **The repair of item 94 is not a licence to quote 1000 − 961.** The self-skip figure is a count of **distinct names**, never of anchored `^SKIP` lines — the same log reads **978** by `grep -cE '^test .* \.\.\. ok$'` and **1000** by summing its `test result:` lines, which is notes §3.78/§3.101's hazard reproduced. |
 | **997 passing · 3 failed · 7 ignored**, **92 distinct self-skip names** | **macOS**, x86_64 Mac rig box, **rig lane** — `SNX_CROSSOVER=required` `SNX_CROSSOVER_A`/`_B` `SNX_TLS=required` `SNX_WEB_UI=required` `SNX_EXEC_CODEC=required`, `--no-fail-fast`, `--nocapture` | 2026-08-21 | the Darwin CDC-ACM bench session (notes §3.117, design §15.68) | `3a39896`. **`SNX_RIG_FLOW` is dropped and `SNX_REPLUG` is dropped, so this is not the fully-spelled lane and is not quotable as one** — P5 reads no handshake on this bench and both flow modes are refused at `load`, and the replug lane is Linux-only (`itest/src/lib.rs:2773`). **The three failures are one platform defect seen three times**, not a regression: `crossover_rig_data_plane_send_and_exclusivity`, `crossover_rig_custom_baud_byte_exact` and `exclusive_write_lock_is_byte_exact`, each a SHA-256 mismatch reported as *bytes lost/reordered across the wire*. The transport loses a 32-byte block and delivers the next one twice at a constant byte count (design §15.68 clause 3), so **a length check passes all three** and plan §3's loss fingerprint `received + dropped_slow_consumer == sent` balances. **The guard is working; the bench cannot go green until the platform does.** |
 | **A busy console's cost: 78 % → 36 % of the main thread, 49.0 → 110.9 KiB/s absorbed, main-thread latency 1145–2591 ms → 2–112 ms, a rail selection while streaming 15 383 ms → 48 ms** | Linux, headless Chromium, one serial node fed by `serial-nexus-sim pty --source`, same box and same 15-second window on both sides | 2026-08-17 | the web console latency session (§15.67, notes §3.115) | **The rate is the scope.** At 12.8 KiB/s (115200 baud) the unfixed client is idle — 2 notifications/s, 0 % of the main thread — and every interaction is under 100 ms; the step between that and the row's figures is not gradual, because work arriving faster than it drains backs up rather than degrading. On the unpaced 64 MiB firehose, the fixture's worst case: selection **17 952 ms → 79 ms**, long tasks **300 totalling 32.6 s → 41 totalling 4.8 s**. The throughput figure is a *side effect*, not a target, and is bounded by the sim's pacing rather than by the client after the fix. |
 | **A browser-bound frame after the first: 41 ms → 0.4 ms.** Bridge burst tail 40.1–42.0 ms with Nagle on (18/18) against 0.13 ms with `TCP_NODELAY`; through a real Chromium, a `send`'s device echo arrived 43.4 ms after the `delivered:true` answer and now arrives 0.4 ms after it | Linux 7.0.0-29, loopback, `serial-nexus-web` in front of a `pty --echo` serial node, **after at least one prior RPC round trip** | 2026-08-17 | the web console latency session (§15.63, notes §3.113) | **The prior round trip is part of the scope, not an incidental.** On a fresh connection the socket is in quickack mode and the effect is absent — a twelve-frame burst there coalesces into one segment at 0.18 ms — so a figure quoted without it describes a different regime. 41 ms is `TCP_DELACK_MIN` on this kernel and is hit dead on rather than approached. Loopback MSS is ~65483, so a single large replay piece can exceed it and escape Nagle; both hot paths named are sub-MSS. |
@@ -56,8 +56,8 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 | **931 passing · 1 failed · 6 ignored**, four self-skips | Linux, **rig lane minus `SNX_RIG_FLOW` and `SNX_WEB_UI`** | 2026-08-12 | the item-47 landing (notes §3.83) | **the rig-lane authority row**, superseding the 894 below and equal to this session's default-scope figure. Run against a freshly `scripts/bless`ed helper (the operator ran it mid-session; an earlier lane was discarded rather than recorded, because the helper binary was replaced underneath it). Every hardware test passed — both replug tests including `identity_survives_a_replug_that_renumbers_the_tty`, all five crossover tests, `web_tls_round_trip` under `SNX_TLS=required`. The two named drops are measurements taken *in this run*, not conveniences: the four self-skips are the two `rts-cts` tests, which print the reading that justifies them (`port1 RTS high -> port0 cts:false`, low -> `cts:false` — a **3-wire** bench, §15.52's legitimate answer and the third independent confirmation of it), and the two browser tests, on a box with no `node`. The one failure is `p3_idle_cost` (item 46), unrelated to the rig. **One lane before this one hung** and is recorded rather than quietly re-run — see the note under this table. |
 | **894 passing · 1 failed · 6 ignored**, four self-skips | Linux, **rig lane minus `SNX_RIG_FLOW` and `SNX_WEB_UI`** | 2026-08-12 | this session (notes §3.80) | the rig-lane authority row, and the first green one in this record. Both exclusions are measurements, not conveniences: this box has no `node`, and the bench **measures 3-wire**, which §15.52 makes a legitimate answer — so the two `rts-cts` end-to-end tests skip with their reading printed. The one failure is `p3_idle_cost` (item 46), unrelated to the rig. Every hardware test passed, `identity_survives_a_replug_that_renumbers_the_tty` for the first time ever. **Superseded by the 925 rig row above**, taken later the same day at the same scope. |
 | **835 passing · 0 failed · 4 ignored** | Linux, rig lane — and again at default CI scope, same session | 2026-08-05 | `17c6e87` (notes §3.68) | twice on the full rig lane, once at default CI scope, 835/0/4 each time — the last dual-scope measurement; superseded by the 852 re-measure of 2026-08-07; not the current-tree figure. **Attribution unreconciled (v17):** notes §3.68's verbatim session record reads 830 (gates scope) and 834/0 · 833/1 (rig lane), and no 835 appears in it — the figure survives only as a v15 Status-table quotation (the re-cited-not-re-derived class), so neither the number nor the dual-scope equivalence is attributable to §3.68. Superseded either way. |
-| **961 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box**, load 1.14 | 2026-08-13 | this session, measured at `ad4dfb2` (notes §3.93–§3.100) | **the macOS authority row for the rig box, and the session's closing figure.** 126 result lines over **122 cargo targets** (114 `Running` + 8 doc-test). The **+6** over the 955 row is this session's six new guards, counted rather than estimated: `peer_hungup`'s self-test and the Darwin witness guard (item 66); the software-arm `sys` test and the `xon-xoff` rig guard (item 67); `process_cpu_nanos`'s self-test (item 12); and `cpu_nanos`'s wrapper guard, which was Linux-gated before item 12 ungated it. **`p9_pty_collapse`'s anti-spin guard also moved from a self-skip to a pass here without changing the total**, which is item 12's whole point and is invisible in this column — read it in the skip set, not the count. **A self-skip count is deliberately not quoted**: under `--nocapture` the suite's parallel binaries interleave their writes, so a `SKIP` line frequently loses its line start and `grep -c '^SKIP'` undercounts — two runs of this box at adjacent trees read 105 and 102 with every "missing" line present unanchored, which extends notes §3.78 rather than contradicting it. The claim the figure served needs no precision: a macOS default-scope run skips on the order of a hundred device- and Linux-gated tests against Linux's dozen, because the rig is attached but `SNX_CROSSOVER_A`/`_B` are unexported at default scope. So a macOS default-scope figure is **not** comparable to a Linux one test-for-test and no delta between them is derived. Not the CI arm64 runner and not the M4: three machines, none substituting for another (item 18) — and this session measured why that rule has teeth, shipping a `process_cpu_nanos` that was exact here and 24x low on arm64 (notes §3.100). Supersedes the 960, 959, 957 and 955 rows. | The **+1** over the 959 row is item 12's `process_cpu_nanos` self-test; `p9_pty_collapse`'s anti-spin guard moved from a self-skip to a **pass** here without changing the count, which is the item's whole point and is invisible in this column — read it in the skip set, not the total. Every caveat on the 959 row applies unchanged. |
-| **959 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** | 2026-08-13 | this session (notes §3.95) | **superseded by the 960 row above.** The **+4** over the 955 row is that session's four new guards, counted rather than estimated: `peer_hungup`'s self-test and the Darwin witness guard (item 66), the software-arm `sys` test and the `xon-xoff` rig guard (item 67). **A self-skip count is deliberately not quoted, and the reason is a correction to how this table has been reading them.** Under `--nocapture` the suite's parallel binaries interleave their writes, so a `SKIP` line frequently loses its line start and a `grep -c '^SKIP'` undercounts: two runs of this box at adjacent trees read 105 and 102, and all of the "missing" three are present in the log unanchored. So the figure is ~100–105 and is **not stably countable this way** — which extends notes §3.78 rather than contradicting it (that entry established the count is 0 *without* `--nocapture`; this adds that *with* it, and under parallelism, it is approximate). What the figure is *for* still holds and needs no precision: a macOS default-scope run skips on the order of a hundred device- and Linux-gated tests against Linux's dozen, so the two are not comparable test-for-test and no delta between them is derived. Supersedes the 957 and 955 rows. |
+| **961 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box**, load 1.14 | 2026-08-13 | this session, measured at `ad4dfb2` (notes §3.93–§3.100) | **the macOS authority row for the rig box, and the session's closing figure.** 126 result lines over **122 cargo targets** (114 `Running` + 8 doc-test). The **+6** over the 955 row is this session's six new guards, counted rather than estimated: `peer_hungup`'s self-test and the Darwin witness guard (item 66); the software-arm `sys` test and the `xon-xoff` rig guard (item 67); `process_cpu_nanos`'s self-test (item 12); and `cpu_nanos`'s wrapper guard, which was Linux-gated before item 12 ungated it. **`p9_pty_collapse`'s anti-spin guard also moved from a self-skip to a pass here without changing the total**, which is item 12's whole point and is invisible in this column — read it in the skip set, not the count. **A self-skip count is deliberately not quoted**: under `--nocapture` the suite's parallel binaries interleave their writes, so a `SKIP` line frequently loses its line start and `grep -c '^SKIP'` undercounts — two runs of this box at adjacent trees read 105 and 102 with every "missing" line present unanchored, which extends notes §3.78 rather than contradicting it. The claim the figure served needs no precision: a macOS default-scope run skips on the order of a hundred device- and Linux-gated tests against Linux's dozen, because the rig is attached but `SNX_CROSSOVER_A`/`_B` are unexported at default scope. So a macOS default-scope figure is **not** comparable to a Linux one test-for-test and no delta between them is derived. Not the CI arm64 runner and not the M4: three machines, none substituting for another (item 18) — and this session measured why that rule has teeth, shipping a `process_cpu_nanos` that was exact here and 24x low on arm64 (notes §3.100). Supersedes the 959, 957 and 955 rows below, and an intermediate **960** reading that is not carried as a row: 960 was recorded at `265a3a9` (item 12's `process_cpu_nanos` self-test, **+1** over the 959 row) and was replaced by this row when `4548881` landed the re-measure at `ad4dfb2`. **That replacement is how this row came to carry a sixth cell against a five-column header** — the 960 row's caveat was left behind as an orphan and rendered invisibly, because GitHub-flavoured Markdown drops cells past the header count. Repaired 2026-08-21 with the ladder reconstructed from git rather than from the notes, which record no suite figure for that session at all (plan §18 item 94, notes §3.120). |
+| **959 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** | 2026-08-13 | this session (notes §3.95) | **superseded by the 961 row above**, via an intermediate 960 reading that is not carried as a row (item 94, notes §3.120). The **+4** over the 955 row is that session's four new guards, counted rather than estimated: `peer_hungup`'s self-test and the Darwin witness guard (item 66), the software-arm `sys` test and the `xon-xoff` rig guard (item 67). **A self-skip count is deliberately not quoted, and the reason is a correction to how this table has been reading them.** Under `--nocapture` the suite's parallel binaries interleave their writes, so a `SKIP` line frequently loses its line start and a `grep -c '^SKIP'` undercounts: two runs of this box at adjacent trees read 105 and 102, and all of the "missing" three are present in the log unanchored. So the figure is ~100–105 and is **not stably countable this way** — which extends notes §3.78 rather than contradicting it (that entry established the count is 0 *without* `--nocapture`; this adds that *with* it, and under parallelism, it is approximate). What the figure is *for* still holds and needs no precision: a macOS default-scope run skips on the order of a hundred device- and Linux-gated tests against Linux's dozen, so the two are not comparable test-for-test and no delta between them is derived. Supersedes the 957 and 955 rows. |
 | **957 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** | 2026-08-13 | this session (notes §3.94) | item 66's two guards over the 955 row. **Superseded by the 959 row above**, later the same session at the same scope. |
 | **955 passing · 0 failed · 7 ignored**, 126 test-result lines | **macOS, default CI scope**, `--no-fail-fast`, `--nocapture` — the **x86_64 rig box** (MacBookPro15,1, Darwin 24.6.0 / macOS 15.7.8, 12 cores) | 2026-08-13 | this session (notes §3.93) | **superseded by the 959 row above.** The first figure ever taken on this box at a tree whose macOS-only guards pass. 126 result lines over **122 cargo targets** (114 `Running` + 8 doc-test). **This row read "105 self-skips" when written; that figure is withdrawn as a precise count** — see the 959 row for the measurement that found `grep -c '^SKIP'` unstable under `--nocapture` parallelism. The claim it was serving survives unchanged and needs no precision: a macOS default-scope run skips on the order of a hundred device- and Linux-gated tests against Linux's dozen, because the rig is physically attached but `SNX_CROSSOVER_A`/`_B` are unexported at default scope. A macOS default-scope figure is therefore **not** comparable to a Linux one test-for-test, and no delta between them is derived here. **The preceding run at this same tree read 953 · 1+1 · 7** and is kept rather than replaced, because it is the measurement that found the defects: `probes::tests::the_software_readback_reports_unmeasurable_rather_than_answering` (a baseline `Termios` taken off a pty master, which Darwin answers `ENOTTY`) and `both_gates_refuse_an_unsupported_verdict_and_are_shown_able_to` (a report-shaping premise that knew about P12 and not P2) — both item 69, both repaired in the same commit as this row, and both red in CI's `macos` job on every push since they landed. Not the CI arm64 runner and not the M4: three machines, none substituting for another (item 18). |
 | **896 passing · 0 failed · 6 ignored**, 122 test-result lines | **whole workspace (macOS)**, CI `macos-*` arm64 runner | 2026-08-13 | CI run 31657666919, job 94315579211 (notes §3.83) | **the macOS authority row**, superseding the 860 below. No exclusions — the lane runs `cargo test --workspace --locked --no-fail-fast` — on macOS 26.5.2 / arm64. The +36 over the 860 row closes exactly: this session added 37 tests, of which 36 run here (the devprep capability-fold guard is inside the Linux-only platform module). The six device-gated pattern-wait guards run and self-skip, which is why the acceptance battery was deliberately split so six of its twelve need no serial device. Skip count not stated: CI does not pass `--nocapture`, so it cannot be read from that log (notes §3.78). |
@@ -1230,8 +1230,15 @@ dropped. Product-surface deferrals use §14's vocabulary (refused-at-load / acce
     the guard redden there — proving it on Linux is the very substitution this item exists to
     remove.
 13. **Idle CPU on any Mac is unmeasured, and the projection is arithmetic** — **MEASURED
-    2026-08-13** (notes §3.96) on the x86_64 Mac, taken exactly the way item 12's guard takes
-    it, since they now share one instrument; **the gating half is carried**, and that split is
+    2026-08-13**, and **(b) open**: the measuring half is discharged and the gating half is
+    **owed**, per this entry's own live *Remainder* below. *(Declaration made explicit 2026-08-21,
+    item 95: the head read `MEASURED … the gating half is carried` and nothing else, so a reader —
+    and `meta_ledger.rs`, which found it — could not tell from the declaration that work was owed.
+    §18's Schema defines a `Remainder` as exactly what is owed, and this entry has a live one. No
+    state changed; the state became legible. It is the only entry in 1–98 in that position, and it
+    is the one genuinely-open item AGENTS §2's rebuilt list would have dropped had the gate been
+    believed over the ledger.)* Measured (notes §3.96) on the x86_64 Mac, taken exactly the way item
+    12's guard takes it, since they now share one instrument; that split is
     the item's own finding rather than a shortfall.
     **The number, on the box the item names:** 3.72 % of a core at 8 idle tty fds and
     **9.91 %** at 32, each over a 10 s window in one daemon process, giving a marginal
@@ -3428,7 +3435,8 @@ different mechanisms and a later reader chasing any one of them wants its own ev
     state at all. *Fix:* a three-state `CellReading` (`Carries` / `Absent` / `Inconclusive`) in the
     doctor and P5's four cell words in the suite; both now print `UNREADABLE handshake: …`, and
     `3-wire: no handshake lines carried` is kept byte-for-byte for the all-`false` case so
-    committed artifacts and `expectation_gates.rs`'s fixture are unmoved. The same session's two
+    committed artifacts and `expectation_gates.rs`'s fixture are unmoved.
+    *[**Superseded 2026-08-21 by §15.69 clause 1** (plan §18 item 92): the all-`false` case no longer prints that sentence — a bare FT232R input and a manufactured-low one were measured bit-identical, so the wording it preserved was preserving a cabling claim the cells cannot carry. Committed artifacts are frozen and keep the old string; the fixture moved with the code.]* The same session's two
     harness blind spots ride here: `p7_replug_hardware.rs`'s `tty_of`/`has_tty` matched `ttyUSB`
     only and read only `<iface>/`, never `<iface>/tty/` where `cdc_acm` puts the node — a drift
     from `devprep/src/linux/sysfs.rs::ttys`, which documents checking both "rather than guessing";
@@ -3519,7 +3527,9 @@ different mechanisms and a later reader chasing any one of them wants its own ev
     `0x80000000` (`CRTSCTS`). And the flag does nothing: a 2×2 control — peer RTS low/high ×
     `CRTSCTS` on/off, peer never reading — wrote **44672 bytes in all four cells, spread 0**,
     reproduced on an independent re-run.
-    So `serial_nexus_sys::honours_rtscts` answers `Honoured`, the daemon loads the node, and the
+    So `serial_nexus_sys::honours_rtscts` [**stale symbol, noted 2026-08-21**: §15.61 parameterised it to `honours_flow_control(path, FlowMode::RtsCts)`; the name in this sentence no longer exists in any `.rs` file — plan §18 item 96; this item is **open** and its
+    argument — a driver that honours on read-back and is inert on the wire — is untouched by the
+    rename, which is why the sentence is annotated rather than restated] answers `Honoured`, the daemon loads the node, and the
     operator gets a port that reports flow control and does not perform it — precisely the outcome
     §15.53 and §7.1 clause 2 exist to prevent, arrived at through the one door the predicate cannot
     watch.
@@ -3651,7 +3661,38 @@ instrument defects, and one is clerical. They are filed separately because a lat
 any one of them wants its own evidence.
 
 92. **Two instruments print a determinate cabling sentence from cells that cannot carry one** —
-    **open** (M). *Evidence:* `crosses()` (`doctor/src/probes.rs:5162-5167`) maps `(false,false)`
+    **EXECUTED 2026-08-21** (notes §3.121, design §15.69 clause 1). **The item's own decline —
+    *deciding between them on one session's evidence* — is OVERTURNED, and what overturned it is a
+    measurement rather than a second opinion: candidate (b) is candidate (c) wearing another name.**
+    Two readings show it. `docs/doctor/linux-7.0-2026-08-13-8c00078-dirty-tier3{,-2,-3}.json` is a
+    genuine **3-wire FT232R** bench on Linux and reads **all eight cells `false`, CTS included**, so
+    a bare FT232R CTS input reads constant low; and the 2026-08-21 Linux capture of the **5-wire**
+    bench carries six bare DSR/DCD/RI inputs that read `false` at both peer drive levels. Apple's
+    CDC-ACM manufactures CTS low. A bare input and a manufactured-low one are **bit-identical**, so a
+    positive control asking *has this port's CTS ever read high* fails on every legitimate 3-wire
+    bench too and licenses the legacy sentence **nowhere**.
+    *Executed as (c), and only the word moves.* Both instruments' all-`false` arms now print
+    `… crossing read: 3-wire, or a transport that manufactures these lines — this reading cannot
+    separate them`, with the cell suffix unchanged. `CellReading`, `crosses()`, `cell_word` and the
+    other five shape arms are untouched; a 3-wire bench lands in the same arm, skips the same tests
+    and hard-fails under `SNX_RIG_FLOW=required` exactly as before. `CellReading::Absent`'s doc
+    comment — *"measured absent, and sayable as such"* — was the defect in one line and is corrected
+    at the variant.
+    ***The repair reached further than the sentence, and that is the item's most useful finding.***
+    An adversarial pass found that softening the diagnostic left the **actionable** line untouched:
+    `skip_no_rig_flow`'s hard-fail message still ended *"Cross-wire RTS↔CTS both ways … a miswiring,
+    not a 3-wire rig"*, so under `SNX_RIG_FLOW=required` the tool told the operator to re-cable a
+    bench it had just said it could not judge — **the exact harm item 92 was filed for, surviving in
+    the one sentence an operator acts on**. The imperative is now keyed on the reading: a
+    HALF-CROSSED bench still gets it verbatim, an all-`false` or `UNREADABLE` bench does not.
+    *Also found by that pass and repaired:* both item-92 guards were prefix-keyed and admitted a
+    sentence asserting the cable outright; three of the four "unchanged" arms were unpinned, including
+    a **swap of the two half-crossed direction strings** that would name the wrong wire to an operator
+    debugging a miswiring; and `crosses()` was a nested `fn`, so the `(false,false) → "false"` mapping
+    that is this item's cited evidence had no test anywhere.
+    *Not a gate defect, confirmed by measurement rather than by reading:* rewriting P5's handshake
+    value to `"BANANA"` in a committed artifact leaves `jq -e -f expectations/linux.jq` at exit 0.
+    The original filing follows. *Evidence:* `crosses()` (`doctor/src/probes.rs:5162-5167`) maps `(false,false)`
     to `"false"` and the shape fold (`:5297-5299`) prints `3-wire: no handshake lines carried`;
     `handshake_measured` (`itest/tests/serial_hardware.rs:996-1037`) does the same and printed
     `3-wire: no RTS/CTS handshake in either direction` as this bench's skip reason. §15.62's repair
@@ -3687,7 +3728,27 @@ any one of them wants its own evidence.
     instruments, since item 56's lesson is that two implementations of one question drift.
 
 93. **A rate this stack accepts and echoes exactly can carry nothing, and `actual_baud` cannot
-    see it** — **open** (M; needs the Linux arm). *Evidence:* §15.68 clause 4. With payload held
+    see it** — **EXECUTED 2026-08-21** (notes §3.122, design §15.69 clause 2).
+    *The Linux arm was run on the FT232R bench, and it moved the finding rather than confirming it.*
+    The four Darwin-dead rates are byte-exact 3 of 3 in both directions here (payload held constant
+    at 240 bytes, read-back echoing exactly), so remainder (b) is answered **for this cell only** —
+    device and stack moved together in the Darwin cell and neither moves back here, and the
+    pre-registration forbade a cross-kernel contrast in advance. **What the bench does show is worse
+    than four dead rates and is on the platform of record**: `set_baud_rate(2_823_529)` succeeds,
+    reads back `2823529`, and puts the wire at the rate a peer asked for `2_000_000` runs at — a
+    **41 %** error that §7.1 clause 7's ±2.5 % read-back reports as verified. One baud higher and the
+    wire is at 3 Mbaud. Remainder (a), *what selects a dead rate*, is answered for this adapter:
+    `divisor3 = DIV_ROUND_CLOSEST(24_000_000, baud)` with sub-integer divisors barred below 2, whose
+    boundaries were predicted from the arithmetic and **confirmed to the baud in both arms**
+    (2823529/2823530 and 1548387/1548388).
+    *Declined, with the alternative costed rather than argued:* making `load` refuse a rate it cannot
+    verify — the only honest predicate needs a per-chip divisor model in the daemon, and the blunt
+    version would refuse `250000`, which this bench round-trips byte-exact. §15.69 clause 2 carries
+    the reasoning; the repair is to stop `actual_baud`'s surface over-promising, not to add a refusal.
+    *One method failure is recorded and not reinterpreted:* the timed `achieved_baud_floor` readout is
+    **invalid** under this item's own constant-payload requirement (240 bytes at 2 Mbaud is 1.2 ms of
+    wire time against a comparable USB turnaround; the column reads 33459 for an ask of 38400). No
+    conclusion rests on it. The original filing follows. *Evidence:* §15.68 clause 4. With payload held
     constant at 240 bytes, 15000 / 15600 / 16800 / 20000 delivered **0 or 1 byte** while 9600,
     14400, 19200, 38400, 57600 and 115200 were byte-exact; `IOSSIOSPEED` returned success at every
     one and `tcgetattr` echoed the ask. `serial2` uses that same path on macOS, so a node at 15000
@@ -3705,8 +3766,31 @@ any one of them wants its own evidence.
     *Validation:* the same 240-byte constant-payload sweep on Linux with these adapters, then a
     decision about whether `load` can refuse a rate it cannot verify.
 
-94. **The plan's Status table cannot say what the macOS rig-box figure is** — **open** (S;
-    clerical, and it blocked a delta this session). *Evidence:* the 2026-08-13 row carries **six**
+94. **The plan's Status table cannot say what the macOS rig-box figure is** — **EXECUTED
+    2026-08-21** (notes §3.120). **The row reconciles; it is not marked unreconciled**, because the
+    ladder closes exactly in git: 955 (`28f26ee`) → 957 (`e5a305f`, item 66's two guards) → 959
+    (`0c92fe5`, item 67's two guards) → 960 (`265a3a9`, item 12's `process_cpu_nanos` self-test) →
+    **961** (`4548881`, measured at `ad4dfb2`). The mechanism is decisive and is the single artifact
+    that proves it: `4548881`'s diff is one `-` line and one `+` line, replacing the 960 row with the
+    961 row — **and leaving the 960 row's caveat behind as an orphan sixth cell**, which GitHub-
+    flavoured Markdown renders invisibly by dropping cells past the header count. That is why it
+    survived unseen. Cell 5 now carries the ladder and the sixth cell is gone; the 959 row's
+    *superseded by the 960 row above* — a pointer to a row that is not in the table — now points at
+    961 through the named intermediate.
+    ***A second finding, and item 94's own wording could not anticipate it:*** the item says to
+    "reconstruct from the session's own record", and **notes §3.93–§3.100 record no suite figure at
+    all**. The reconstruction came from git. The record's gap is worth more than the repair.
+    *The refusal it blocked is NOT unblocked.* plan §3 rule 19 forbids the subtraction for its own
+    reason — one session must measure both ends — and that reason was always the load-bearing half.
+    The three surfaces that gave two reasons now give the surviving one, worded so it cannot be read
+    as an invitation. `docs/macos.md`'s 955 is annotated as the session's **first** figure, and its
+    **105 self-skips** is marked withdrawn rather than replaced with another number.
+    *Gate:* `every_status_table_row_has_the_headers_cell_count` in `itest/tests/meta_derive.rs`.
+    Its first draft did **not** hold — an adversarial pass proved the row walk stopped at the first
+    line without a leading pipe, which GFM still renders as a row, so a lost pipe removed itself and
+    every row below it from the gate's scope while the table still rendered; and the delimiter check
+    was a cell count where its comment claimed a structural one. Both are repaired and both plants
+    now redden. The original filing follows. *Evidence:* the 2026-08-13 row carries **six**
     cells against a five-column header; cell 5 reads "the **+6** over the 955 row" (→ 961) and the
     orphan sixth reads "the **+1** over the 959 row" (→ 960), while cell 5 also claims to supersede
     a **960** row that does not exist and two later rows point up at one. `docs/macos.md:67` quotes
@@ -3717,7 +3801,38 @@ any one of them wants its own evidence.
     shape the 835 row already uses.
 
 95. **AGENTS §2's open-item list is stale for roughly sixteen items and self-contradictory for
-    one** — **open** (S). *Evidence:* §2 lists 12–20, 22, 24, 25, 26, 30, 41, 42, 50 as open where
+    one** — **EXECUTED 2026-08-21** (notes §3.120). **The drift is wider than the item found, and in
+    both directions**: measured against the ledger's own entries, AGENTS §2 called **16 executed
+    items open** (12, 14, 16, 17, 18, 19, 20, 22, 24, 25, 26, 30, 41, 42, 50, 59) and **omitted 8
+    open ones** (71, 73, 92, 93, 94, 95, 96, 98) — 71 appearing nowhere in §2 at all. Two independent
+    parses, one by hand and one by the gate, agree on both sets.
+    ***And the item's own evidence was wrong twice, which is the class arriving inside the report of
+    the class:*** it lists 13 and 15 among items "the ledger records executed" — 13 reads
+    `**MEASURED**` with its gating half carried and a live remainder, and 15 reads `**State:** open
+    (S/M)` — and every file:line citation in it is stale by three or four lines, having been stale
+    already when written.
+    ***A third surface was worse than the two the item names.*** plan §2's own Status block claimed
+    to be *the authority on what is open* while saying "items 4 (residual only), 8, and 12–15 remain
+    open", "the rest remain open" of 16–46, and "48–55 remain open" — every one of 48–55 executed.
+    **The authority conflict is resolved rather than papered over** (AGENTS §5): *plan §18's item
+    entries are the authority on what is open*, because an entry that must be edited to change an
+    item's state cannot drift from itself, while a summary can and did. plan §2 and §18's opening
+    sentence are amended to say so, and both are now **derived-checked** rather than maintained by
+    care.
+    *Gate:* `itest/tests/meta_ledger.rs`, which parses §18's entries, truncates each at its first
+    superseded marker before classifying — without that step ~24 executed items read open, because
+    their original `**State:** open` filings are preserved verbatim below the cut — and compares both
+    directions against AGENTS §2's list, naming each disagreement with its plan line and verbatim
+    token. Its plant set includes the **negative** one that makes the others mean anything: an
+    `**State:** open` inserted *inside* a superseded block must leave the gate green.
+    *Its first draft did not hold either*, and the defect was the same shape as the one it exists to
+    catch: every **mixed-clause** entry (31, 64, 78) was held open by a single hand-listed literal, so
+    rewording that one clause silently reclassified the entry EXECUTED with no error — the gate
+    reading green while the ledger's own words said open, in exactly the shape AGENTS §2 spells
+    `64(a)` and `78(b)`. Repaired, along with four mechanisms an adversarial pass proved inert.
+    *Two stale sites the item did not name are repaired with it:* plan §18's "the equivalence must
+    not be asserted at any era until item 30's run exists" (it exists), and item 69's "the same shape
+    item 12 is open for" (item 12 was executed 2026-08-13). The original filing follows. *Evidence:* §2 lists 12–20, 22, 24, 25, 26, 30, 41, 42, 50 as open where
     the ledger records them executed (12 at `plan:1179`, 13 at `:1228`, 14 at `:1262`, 16 at
     `:1333`, 17 at `:1363`, 18 at `:1410`, 19 both halves at `:1437`, 20 at `:1497`, 22 at `:1566`,
     24 at `:1617`, 25 at `:1634`, 26 at `:1652`, 30 at `:1755`, 41 at `:1947`, 42 at `:1981`,
@@ -3729,7 +3844,30 @@ any one of them wants its own evidence.
     *Validation:* §18's item entries are the only currently-accurate surface; reconcile the two
     summary surfaces against them and add whatever gate would have caught the drift.
 
-96. **A symbol renamed by §15.61 still stands in normative prose** — **open** (S). *Evidence:*
+96. **A symbol renamed by §15.61 still stands in normative prose** — **EXECUTED 2026-08-21**
+    (design §15.69 clause 4). **Three live sites, not two** — the item names plan item 85 and design
+    §15.62 consequence 4; the third is design §15.53's own decision sentence, whose Status is LIVE
+    and whose tense is present, and closing on the item's own list would have left the defect standing
+    in the design's decision sentence. All three are annotated in place (AGENTS §5), never rewritten;
+    §15.62's was already annotated by the session that filed this. The *four states* half of §15.53's
+    sentence is correct and is preserved explicitly, since a careless repair would have taken it with
+    the name. The six rename-record sites are deliberately left alone and that is now recorded at the
+    item, because the name is the *subject* there.
+    ***The item's real question — is a symbol-keyed citation gate worth building — is DECLINED with
+    the count rather than an argument***, following the precedent AGENTS §2 records for items 45 and
+    27: **937 identifier-shaped backtick tokens across the two normative documents, 63 flagged by a
+    naive "must exist in some `.rs` file" check, 24 surviving five mechanical filters, 1 true
+    positive.** The residue is not noise to be tuned away — it includes a **verbatim quote of
+    corrupted test-runner output** (`crossover_rig_actual_baud_is_a_read_back_not_an_echotest`, which
+    is item 95's own evidence for the interleaving hazard: symbol-shaped and wrong on purpose, and a
+    gate that forced it to resolve would delete a measurement) and several names quoted *in the
+    sentence that records their rename*. Cost: a 23-entry counted allowance on day one plus a doc
+    edit in every commit renaming any of 937 tracked tokens, to catch one defect an alignment pass
+    catches for free. **Re-opened on a second recurrence, not before.**
+    *Declined by name, so it is not reached for:* extending §15.40's retired-name grep. That
+    mechanism answers a different question — *a name that must never come back* — and pointing it at
+    this one would redden all ten current-pair mentions, eight of them legitimate, plus the entire
+    rename record in the notes. The original filing follows. *Evidence:*
     plan item 85 and design §15.62 consequence 4 both name `serial_nexus_sys::honours_rtscts`,
     which no longer exists — §15.61 parameterised it to
     `honours_flow_control(path, FlowMode::RtsCts)`. `grep` finds the old spelling only under
@@ -3762,7 +3900,30 @@ what the reading around it turned up.
     become the judgement.
 
 98. **The pattern-stimulus experiment — open, and it is the first thing to run when this project is
-    next on Linux** — **open** (M; **Linux-gated, and blocked on nothing else**). *Origin:* the
+    next on Linux** — **CLOSED AS A MEASURED DECLINE 2026-08-21** (notes §3.123, design §15.69
+    clause 3). It was the first thing run on Linux, on the FT232R bench, and the entry's own
+    pre-registered prediction held: **the inlay separates from the LCG on nothing this bench can
+    read** — both arms byte-exact 3 of 3 in both directions at 9600 … 3000000 at P14's constant-
+    airtime lengths, with `frame`, `overrun`, `parity` and `brk` deltas all zero for both.
+    **The null is evidence because every counter it rests on was moved on the same bench in the same
+    session**: a rate mismatch moved `frame` by 18, `tcsendbreak` moved `brk` by 1, a present-but-slow
+    reader moved `overrun` by 5, a parity mismatch moved `parity` by 41. `buf_overrun` moved in none
+    and is not claimed as exercised.
+    *Run on a throwaway instrument BEFORE the shipped payload was touched, deliberately*, because
+    landing the inlay re-bases `max_reliable_baud` across every committed artifact under an unchanged
+    digest pair and owes a hand-announcement — a cost this measurement says buys nothing. So
+    `p14_payload` is **unchanged**, `probe_set` and `field_set` are unchanged, **no era moves**, and
+    `docs/doctor/README.md` owes nothing. The tags-and-inlay-together rule was honoured in the
+    experiment and is moot in the tree.
+    *Scope, stated rather than implied:* a null on a DC-coupled ~30 cm TTL crossover. The `0x00` run's
+    mechanism needs an AC-coupled, opto-isolated, RS-232-transceiver or long-cable path to bite. **The
+    decline is to the stimulus on this class of bench, not to the hypothesis** — design §13's rule
+    that an axis must be able to vary, applied to this item's own hypothesis as the entry demanded.
+    Re-opened by a bench with one of those paths, and by nothing else.
+    *One apparatus defect is recorded at notes §3.123 and is the more useful half:* the first
+    comparison wrote each payload whole and only then read, overran the receiver above 115200, and
+    made **both** arms fail identically — a broken apparatus reporting in the shape of agreement.
+    The original filing follows. *Origin:* the
     operator's battery proposal, accepted on its physical-stimulus half and declined on its
     detection half.
     *Why the detection half was declined, recorded so it is not re-proposed:* all-0 and all-1 are
@@ -3802,6 +3963,63 @@ what the reading around it turned up.
     unchanged digest pair. `docs/doctor/README.md` must say so in the same commit.
     *Validation:* name, per inlaid block, a hypothesis whose prediction differs from the others', and
     read the frame counters — replicates wearing a factor's name are not levels.
+
+### Items 99–100 — filed, not fixed, by the item 94/95 guard audit (2026-08-21)
+
+Both are residue from the four adversarial rounds that landed items 94 and 95's gates. **Neither is a
+product defect and neither is currently live** — each is a way a *future* edit to a normative document
+could go unnoticed. They are filed rather than fixed because each round's findings were narrower than
+the last and this is where the curve flattened; recording where it flattened is more useful than one
+more round. **Both were measured, and the measurement is the filing.**
+
+99. **The Status-table gate has a fourth truncator, and a cry-wolf in the same window** —
+    **open** (M). *Evidence:* `itest/tests/meta_derive.rs`'s `section_end_below` reads a section's end
+    as the first ATX heading with no row-shaped line before the *next* heading. **Two adjacent headings
+    inside the table therefore qualify while sitting inside it.** Measured: inserting
+    `"" / "#### Retired figures" / "" / a sentence / "" / "#### Retired table" / ""` before the plan's
+    line 50, plus a surplus cell on a row below it, leaves the gate **green** — `walk_rows=16`,
+    `non_blank_run=16`, `surface_rows=16`, `section_end=51` (the *planted* heading), `interruptions=[]`,
+    `offences=0` — while marked@15 and micromark both render the Status table as **16 body rows instead
+    of 33**, the malformed row among the seventeen that leave it. One heading inside the table is still
+    caught; two are not. **The reachable spelling is exactly what the gate's own remediation text
+    invites** — *move what is below it under its own header* — done without re-adding a header and
+    delimiter frame.
+    *The cry-wolf half, and it is the reason this is not a one-line fix:* a legitimate, well-formed
+    three-or-more-column table placed anywhere in §Status below the Status table **reddens** the gate,
+    with a self-contradicting message (*"the 33 row(s) this walk reached are the whole authority
+    surface"* — 33 is every row) directing the reader to fold an unrelated table in. A two-column table
+    does not trigger it, so from a reader's view the trigger is arbitrary. AGENTS §9's cry-wolf
+    direction, on a correct document.
+    *Shared root cause, which is what a fix must address:* the surface walk's extent is a whole-section
+    window, so every row-shaped line elsewhere in §Status is inside the gate's scope and anything that
+    moves the section boundary moves the yardstick. A fix keyed on the table's own frame rather than on
+    the enclosing section is the obvious direction and is not costed here.
+    *Validation:* the six plants above, each cross-checked against **two** GFM renderers, plus a control
+    that a clean document and a legitimate second table both come out right.
+
+100. **The ledger gate's mixed-entry rule has an unguarded mirror shape** — **open** (S).
+     *Evidence:* `itest/tests/meta_ledger.rs`'s repaired continuation rule covers a sentence stop
+     **inside** an open `**` run (whatever emphasis follows) and a stop outside it followed by `**`. It
+     does not cover a stop **outside** the run followed by `*` or by nothing. Four punctuation-only
+     rewrites, all identical under the file's own `letters_only` definition, silently move a mixture to
+     `EXECUTED`: item 64's `EXECUTED**; **(a)` → `EXECUTED**. *(a)` and → `EXECUTED**. (a)`; item 78's
+     `2026-08-16; (b) open**` → `2026-08-16**. (b) open` and → `2026-08-16**. *(b) open*`. The on-tree
+     guard **structurally cannot reach them**: `clause_separator` rewrites the `;` in place, which always
+     leaves the stop where the `;` was, so the plant can never move it across a `**` boundary.
+     *A fifth shape, one separator over, is also uncovered:* item 13's `**MEASURED …**, and **(b) open**`
+     with that comma rewritten as a full stop. On the tree it fails **loudly** — but only because item 13
+     happens to carry a live `Remainder`; the same declaration shape without one is silent.
+     *Why widening is not free, measured rather than asserted:* accepting a leading single `*` on the
+     continuation makes items 64 and 65 fail to parse; dropping the emphasis condition entirely refuses
+     55, 64 and 65. And `loose_head_number` cannot be widened to `98)` either — accepting `)` beside `.`
+     makes it read item 66's wrapped CI run id (`31689537882) and it moved the failure…`) as a head and
+     refuse every parse. **Both narrownesses have a document behind them**, which is why this is an item
+     and not a patch.
+     *Not live:* the derived open set is correct today and matches AGENTS §2 on all fourteen numbers and
+     all three clause letters.
+     *Validation:* a battery of punctuation-only separator rewrites across every mixed entry the ledger
+     contains, scored end to end through the gate, with the widening costs re-measured before any rule
+     moves.
 
 ### Evaluated and deliberately not scheduled — the closing register
 

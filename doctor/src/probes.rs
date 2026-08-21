@@ -5100,6 +5100,45 @@ fn p5_certify_pair(port_a: &Path, port_b: &Path) -> (Certificate, bool) {
 /// reads unwired.
 const P5_MODEM_SETTLE: Duration = Duration::from_millis(60);
 
+/// Drive `line` on `tx` to both levels and report whether `read` on `rx`
+/// followed. `false` for a line that does not move, `?` for a read that
+/// errored — which is a third answer and must not print as either of the
+/// other two.
+///
+/// **Module scope, not a nested `fn` inside [`p5_handshake`]** (plan §18 item 92).
+/// This is the stage that turns two bits into a cell word, and the
+/// `(false, false) -> "false"` mapping is the evidence item 92 rests on — that a
+/// manufactured-low input and a bare one arrive here identical and leave here
+/// identical. Nested, no test could reach it, and the only way to exercise the
+/// mapping was to plant the cell *word* one stage later, which assumes the very
+/// step under question. It takes closures already, so a test drives it from bits
+/// with no port: see `crosses_maps_each_pair_of_readings_to_its_own_word`.
+fn crosses(
+    set: impl Fn(bool) -> std::io::Result<()>,
+    read: impl Fn() -> std::io::Result<bool>,
+) -> String {
+    let mut seen = Vec::new();
+    for level in [true, false] {
+        if set(level).is_err() {
+            return "?".to_owned();
+        }
+        std::thread::sleep(P5_MODEM_SETTLE);
+        match read() {
+            Ok(v) => seen.push(v),
+            Err(_) => return "?".to_owned(),
+        }
+    }
+    let _ = set(false);
+    // Followed both levels, or followed neither. A line that reads `true` at
+    // both is stuck, not wired, and prints as `stuck-high`.
+    match (seen[0], seen[1]) {
+        (true, false) => "true".to_owned(),
+        (false, false) => "false".to_owned(),
+        (true, true) => "stuck-high".to_owned(),
+        (false, true) => "inverted".to_owned(),
+    }
+}
+
 /// **Handshake continuity across a verified pair — reported, never judged**
 /// (§15.52).
 ///
@@ -5136,36 +5175,6 @@ fn p5_handshake(port_a: &Path, port_b: &Path) -> String {
         let _ = p.set_dtr(false);
     }
     std::thread::sleep(P5_MODEM_SETTLE);
-
-    /// Drive `line` on `tx` to both levels and report whether `read` on `rx`
-    /// followed. `false` for a line that does not move, `?` for a read that
-    /// errored — which is a third answer and must not print as either of the
-    /// other two.
-    fn crosses(
-        set: impl Fn(bool) -> std::io::Result<()>,
-        read: impl Fn() -> std::io::Result<bool>,
-    ) -> String {
-        let mut seen = Vec::new();
-        for level in [true, false] {
-            if set(level).is_err() {
-                return "?".to_owned();
-            }
-            std::thread::sleep(P5_MODEM_SETTLE);
-            match read() {
-                Ok(v) => seen.push(v),
-                Err(_) => return "?".to_owned(),
-            }
-        }
-        let _ = set(false);
-        // Followed both levels, or followed neither. A line that reads `true` at
-        // both is stuck, not wired, and prints as `stuck-high`.
-        match (seen[0], seen[1]) {
-            (true, false) => "true".to_owned(),
-            (false, false) => "false".to_owned(),
-            (true, true) => "stuck-high".to_owned(),
-            (false, true) => "inverted".to_owned(),
-        }
-    }
 
     p5_handshake_line(&HandshakeCells {
         rts_ab: crosses(|v| a.set_rts(v), || b.read_cts()),
@@ -5214,7 +5223,19 @@ struct HandshakeCells {
 enum CellReading {
     /// The line followed the drive at both levels: a crossing.
     Carries,
-    /// The line followed neither level: measured absent, and sayable as such.
+    /// The line did not follow the drive at either level.
+    ///
+    /// **This is not a statement about a cable.** A bare conductor and a transport
+    /// that manufactures a constant level produce a bit-identical reading, and no
+    /// instrument in this tree can separate them: a genuine 3-wire FT232R bench
+    /// reads `false` on all eight cells
+    /// (`docs/doctor/linux-7.0-2026-08-13-8c00078-dirty-tier3.json`), the six
+    /// unconnected DSR/DCD/RI inputs of a 5-wire FT232R crossover read `false`
+    /// too (`docs/doctor/macos-24.6.0-2026-08-21-3a39896-ftdi5w-tier3.json`), and
+    /// Apple's CDC-ACM stack manufactures CTS **low**, which is the same bit
+    /// again (plan §18 item 92). So `Absent` licenses *the drive was not followed*
+    /// and nothing beyond it — unlike [`Inconclusive`](CellReading::Inconclusive),
+    /// whose readings announce their own failure.
     Absent,
     /// `stuck-high`, `inverted` or `?` — the cell answered, the wire did not.
     Inconclusive,
@@ -5228,6 +5249,32 @@ fn reading(cell: &str) -> CellReading {
         _ => CellReading::Inconclusive,
     }
 }
+
+/// The tail both all-`false` handshake sentences end on: what was read, and that
+/// the reading cannot choose between the two things that produce it.
+///
+/// **One place, because it is a cross-instrument invariant** (design §15.69
+/// clause 1, plan §18 items 92 and 56). The suite spells the same tail in
+/// `itest/tests/serial_hardware.rs`, and the two crates share no dependency edge —
+/// adding one would be a design change — so the comparison cannot live here. It
+/// lives in that file, as a test that reads this constant's literal out of this
+/// source file the way the meta-gates read files. Keeping the tail in a named
+/// constant is what makes that scan a two-line lookup rather than a fragile match
+/// on a wrapped string literal; and a constant that stopped being used would trip
+/// `dead_code` under the workspace's `-D warnings`, so it cannot quietly strand.
+///
+/// **The first noun in front of it differs between the two instruments, and that
+/// is deliberate.** See [`p5_handshake_line`]'s all-`false` arms.
+///
+/// **Reviewer's obligation, recorded here because no test can carry it.** The
+/// property design §15.69 clause 1 binds is a *meaning*: this sentence may not
+/// assert a cabling fact. Both instruments' guards are byte-pins, which catch an
+/// accidental re-word and judge nothing about what the new words say. If you
+/// change this text, the pins will tell you that you did; whether the replacement
+/// still refuses to state a cable is yours to decide. **Do not re-crimp a bench on
+/// this sentence** — that was the harm.
+const HANDSHAKE_AMBIGUITY_TAIL: &str =
+    "3-wire, or a transport that manufactures these lines — this reading cannot separate them";
 
 /// The handshake line's shape, split out pure so the wiring vocabulary is
 /// testable without a bench — the reason [`p5_pair_certificate`] is split the same
@@ -5291,13 +5338,43 @@ fn p5_handshake_line(c: &HandshakeCells) -> String {
             "UNREADABLE handshake: RTS/CTS gave no usable reading at either drive level — \
              this is not a 3-wire answer, {dtr_tail}"
         ),
-        // The exact legacy sentence, kept byte-for-byte for the all-`false` case:
-        // it is the design's stated common case and it rides in committed
-        // artifacts and in `expectation_gates.rs`'s fixtures.
+        // **The all-`false` case says what it read, and says it cannot tell what
+        // produced it.** §15.62 kept the legacy `3-wire: …` sentence byte-for-byte
+        // here — it was the design's stated common case and it rode in committed
+        // artifacts and in `expectation_gates.rs`'s fixtures — and that repair was
+        // keyed on the *reading*: `stuck-high`, `inverted` and `?` fold to
+        // Inconclusive because a line that holds high with the peer closed is
+        // doing something no wire can do, so the cell announces its own failure.
+        // **A constant low announces nothing**, and plan §18 item 92 found the
+        // harm: Apple's CDC-ACM stack manufactures CTS low, so the same two
+        // adapters on the same cable printed `UNREADABLE` on Linux and this
+        // cabling sentence on Darwin. The item left three remedies and declined
+        // to pick on one session's evidence; the measurement above at
+        // [`CellReading::Absent`] collapses the choice, because a positive
+        // control — *has this port's CTS ever read high?* — fails on every honest
+        // 3-wire bench too, so it licenses the legacy sentence nowhere and is the
+        // weakened sentence wearing another name. Only the **word** moves: the
+        // classification, the skip/fail routing and every other arm are unchanged,
+        // and a 3-wire bench is still the legitimate rig §5 assumes.
+        //
+        // **The two arms open on different nouns, deliberately** (plan §18 item 92,
+        // and the suite spells a third — see [`HANDSHAKE_AMBIGUITY_TAIL`]). This
+        // first arm is reached only when **all eight** cells answered and answered
+        // absent, RTS/CTS *and* the six DTR-family crossings, so *handshake* is the
+        // whole of what was read and the DTR tail would be a second way of saying
+        // it. The second arm is reached with a DTR cell that did not answer, so the
+        // only negative it may state is the RTS/CTS one, and the DTR tail says the
+        // rest. The suite's `handshake_shape` measures the two RTS/CTS cells and no
+        // others, so it spells `no RTS/CTS crossing read` in the arm that
+        // corresponds to this first one. **That is not drift — do not "fix" the
+        // three into agreement.** The invariant across the two instruments is the
+        // shared tail, and it is compared: see [`HANDSHAKE_AMBIGUITY_TAIL`].
         (false, false, false) if !dtr_inconclusive => {
-            "3-wire: no handshake lines carried".to_owned()
+            format!("no handshake crossing read: {HANDSHAKE_AMBIGUITY_TAIL}")
         }
-        (false, false, false) => format!("3-wire: no RTS/CTS crossing, {dtr_tail}"),
+        (false, false, false) => {
+            format!("no RTS/CTS crossing read: {HANDSHAKE_AMBIGUITY_TAIL}, {dtr_tail}")
+        }
     };
     format!(
         "{shape} [rts_a_to_cts_b={rts_ab} rts_b_to_cts_a={rts_ba} \
@@ -9315,9 +9392,16 @@ mod tests {
             "true", "true", "false", "false", "false", "false", "false", "false",
         ]);
         assert!(five_wire.starts_with("5-wire crossover"), "{five_wire}");
-        // The design's stated common case.
+        // The design's stated common case, named by what was **read** rather than
+        // by a cable this instrument cannot see (plan §18 item 92, design §15.69
+        // clause 1). Bound, not asserted here: every sentence this function can
+        // produce is byte-pinned once, in
+        // `every_arm_of_the_handshake_line_is_byte_pinned` against the literals in
+        // `handshake_pins`, and a second copy of a pin is a copy to keep in step
+        // rather than a second guard. What this test needs from it is that its
+        // *shape name* differs from the other four, which the `shapes.len() == 5`
+        // assertion below is.
         let three_wire = line(NONE);
-        assert!(three_wire.starts_with("3-wire"), "{three_wire}");
         // The state worth naming: it carries one way, which is a wiring fault a
         // reader would otherwise have to spot across eight cells.
         let half = line([
@@ -9482,15 +9566,16 @@ mod tests {
             .contains("HALF-CROSSED"),
             "one measured crossing plus one unreadable direction is half-crossed"
         );
-        // **The legacy sentence is byte-identical for the all-`false` case.**
-        // It rides in committed artifacts and in `expectation_gates.rs`'s fixture,
-        // so the repair above must not have reworded the common answer.
-        assert!(
-            line(NONE).starts_with("3-wire: no handshake lines carried ["),
-            "the all-false sentence was reworded; committed artifacts and the \
-             expectation-gate fixture spell it exactly: {}",
-            line(NONE)
-        );
+        // **The all-`false` case is pinned in its own test**, not here (plan §18
+        // item 92, design §15.69 clause 1). Three assertions stood in this spot and
+        // all three were defects: a byte-pin duplicating the one now in
+        // `every_arm_of_the_handshake_line_is_byte_pinned`, and two `starts_with`
+        // / `contains` checks on `3-wire` that **could not fail**, because the pin
+        // above them fixed every byte of the string they read. Their comment called
+        // them "the half that would survive a careless re-word back"; nothing
+        // survives a pin in the same test. AGENTS §3's tell, in the register where
+        // it is hardest to see: their passing output was identical to their not
+        // running.
         // **`?` is the fifth reading and the one that means the instrument itself
         // failed** — `crosses()` returns it when the `set` or the `read` errored.
         // Without this case, narrowing `reading()` to
@@ -9535,17 +9620,18 @@ mod tests {
             "false", "false", "inverted", "false", "false", "false", "false", "false",
         ]);
         assert!(
-            inverted_dtr.starts_with("3-wire") && inverted_dtr.contains("dtr_a_to_dsr_b=inverted"),
+            inverted_dtr.starts_with("no RTS/CTS crossing read:")
+                && inverted_dtr.contains("dtr_a_to_dsr_b=inverted"),
             "an inverted DTR reading was counted as a wired line, or was dropped \
              from the cells: {inverted_dtr}"
         );
         // The DTR tail on the **all-negative** arm, which was otherwise pinned only
-        // inside the `5-wire` sentence: collapsing the two `3-wire` arms back into
-        // the single legacy string would pass every other assertion here.
+        // inside the `5-wire` sentence: collapsing the two all-`false` arms back
+        // into one string would pass every other assertion here.
         assert!(
             inverted_dtr.contains("DTR not determinable"),
-            "the 3-wire sentence claimed DTR moves nothing while a DTR cell reads \
-             inverted: {inverted_dtr}"
+            "the all-false sentence claimed DTR moves nothing while a DTR cell \
+             reads inverted: {inverted_dtr}"
         );
         let inverted_rts = line([
             "inverted", "true", "false", "false", "false", "false", "false", "false",
@@ -9579,6 +9665,486 @@ mod tests {
         // declined: it could pin the two signatures and still miss the fold, which
         // makes it weaker than the sentence above it would claim — AGENTS §3's
         // second register of a gate that asserts nothing.
+    }
+
+    /// The ten sentences [`p5_handshake_line`] can produce, spelled out once.
+    ///
+    /// **Spelled here rather than built from the arms or from
+    /// [`HANDSHAKE_AMBIGUITY_TAIL`].** A pin that quotes the thing it is pinning
+    /// moves with it and asserts nothing — AGENTS §3's first register.
+    ///
+    /// **And spelled exactly once for the whole file.** The two all-`false`
+    /// sentences are read by [`every_arm_of_the_handshake_line_is_byte_pinned`],
+    /// whose job is the wording, and by
+    /// [`an_all_false_handshake_never_states_a_cable_fact`], whose job is the
+    /// per-DTR-cell walk; a second literal copy would be a copy to keep in step
+    /// rather than a second guard. A constant that stopped being read would trip
+    /// `dead_code` under the workspace's `-D warnings`, so none can strand.
+    ///
+    /// **Reviewer's obligation, unchanged and recorded at the words themselves**
+    /// ([`HANDSHAKE_AMBIGUITY_TAIL`]): these are byte-pins. They catch an
+    /// accidental re-word and judge nothing about what a new wording *means*.
+    mod handshake_pins {
+        pub const WIRED: &str = "wired: RTS/CTS both ways and at least one DTR line";
+        pub const FIVE_WIRE: &str = "5-wire crossover: RTS/CTS both ways, DTR moves nothing";
+        pub const FIVE_WIRE_DTR_UNREADABLE: &str =
+            "5-wire crossover: RTS/CTS both ways, DTR not determinable";
+        pub const HALF_CROSSED: &str = "HALF-CROSSED handshake: RTS/CTS carries one way only";
+        pub const DTR_WIRED_RTS_UNREADABLE: &str = "DTR wired; RTS/CTS not determinable";
+        pub const DTR_WIRED_RTS_ABSENT: &str = "DTR wired, RTS/CTS not";
+        pub const UNREADABLE: &str = "UNREADABLE handshake: RTS/CTS gave no usable reading at \
+             either drive level — this is not a 3-wire answer, DTR moves nothing";
+        pub const UNREADABLE_DTR_UNREADABLE: &str = "UNREADABLE handshake: RTS/CTS gave no \
+             usable reading at either drive level — this is not a 3-wire answer, DTR not \
+             determinable";
+        pub const ALL_EIGHT_ABSENT: &str = "no handshake crossing read: 3-wire, or a transport \
+             that manufactures these lines — this reading cannot separate them";
+        pub const RTS_ABSENT_DTR_UNREADABLE: &str = "no RTS/CTS crossing read: 3-wire, or a \
+             transport that manufactures these lines — this reading cannot separate them, DTR \
+             not determinable";
+    }
+
+    /// **Every sentence [`p5_handshake_line`] can produce is byte-pinned, and the
+    /// table proves it reached each one** (plan §18 item 92, design §15.69 clause 1,
+    /// AGENTS §3).
+    ///
+    /// The division of labour, because three tests now read this one function.
+    /// [`the_handshake_line_names_the_wiring_and_grades_none_of_it`] asserts *which
+    /// arm a given set of cells reaches* and that every one of the six DTR crossings
+    /// can move that answer; [`an_all_false_handshake_never_states_a_cable_fact`]
+    /// walks the DTR cells one position at a time across the two all-`false` arms.
+    /// Neither asserts *what an arm says*, beyond its first word or two — and this
+    /// one does nothing else.
+    ///
+    /// **Why it had to exist: five of these ten sentences were held by a
+    /// `starts_with` on their opening words, and gutting each left this file
+    /// 103/103 green.** Measured, one mutation at a time, against the tree before
+    /// this table:
+    ///
+    /// * `wired: RTS/CTS both ways and at least one DTR line` → `wired: RTS/CTS both
+    ///   ways`, deleting the DTR half of the claim;
+    /// * `5-wire crossover: RTS/CTS both ways, {dtr_tail}` → `5-wire crossover,
+    ///   {dtr_tail}`, deleting the reading the shape name is derived from;
+    /// * `HALF-CROSSED handshake: RTS/CTS carries one way only` → `HALF-CROSSED
+    ///   handshake`, deleting the one sentence in this probe that tells an operator
+    ///   a wire is miswired;
+    /// * `DTR wired, RTS/CTS not` → `DTR wired`;
+    /// * and the arm §15.62 created — `UNREADABLE handshake: …` → *"UNREADABLE
+    ///   handshake: definitely 3-wire, and NOT a transport that manufactures these
+    ///   lines — re-crimp the cable"*. That replacement asserts the cable outright
+    ///   and issues the re-crimp imperative the whole item exists to prevent, and it
+    ///   passed a suite that pinned its first two words. It is the same failure the
+    ///   suite's own guard was repaired for, one instrument over.
+    ///
+    /// So this is the doctor's copy of what
+    /// `itest/tests/serial_hardware.rs`'s
+    /// `the_all_false_handshake_reading_does_not_assert_a_cable` does: one row per
+    /// producible sentence, byte-pinned, **plus the coverage assertion** — because a
+    /// table that lost a row would pass every pin left in it and prove nine arms
+    /// while claiming ten, which is AGENTS §3's walker-versus-matcher hole.
+    #[test]
+    fn every_arm_of_the_handshake_line_is_byte_pinned() {
+        // Named fields, so a transposed cell cannot hide in a positional call —
+        // the shape that let the four-cell verdict ship (notes §3.73).
+        fn line(v: [&str; 8]) -> String {
+            p5_handshake_line(&HandshakeCells {
+                rts_ab: v[0].into(),
+                rts_ba: v[1].into(),
+                dtr_ab_dsr: v[2].into(),
+                dtr_ab_dcd: v[3].into(),
+                dtr_ab_ri: v[4].into(),
+                dtr_ba_dsr: v[5].into(),
+                dtr_ba_dcd: v[6].into(),
+                dtr_ba_ri: v[7].into(),
+            })
+        }
+
+        // At least one row per sentence, not per `match` arm: two arms carry the
+        // DTR tail, which is a second word that reaches the operator and had its
+        // own hole. Several rows where one sentence is reached by cell patterns a
+        // narrowed fold would route apart — see the MIXED block below.
+        let table: [(&str, [&str; 8], &str); 14] = [
+            (
+                "RTS/CTS both ways and one DTR line",
+                [
+                    "true", "true", "true", "false", "false", "false", "false", "false",
+                ],
+                handshake_pins::WIRED,
+            ),
+            (
+                "the bench rig: RTS/CTS both ways, every DTR cell answered absent",
+                [
+                    "true", "true", "false", "false", "false", "false", "false", "false",
+                ],
+                handshake_pins::FIVE_WIRE,
+            ),
+            (
+                "RTS/CTS both ways beside a DTR cell that did not answer",
+                [
+                    "true",
+                    "true",
+                    "stuck-high",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                ],
+                handshake_pins::FIVE_WIRE_DTR_UNREADABLE,
+            ),
+            (
+                "RTS/CTS carries one way only",
+                [
+                    "true", "false", "false", "false", "false", "false", "false", "false",
+                ],
+                handshake_pins::HALF_CROSSED,
+            ),
+            (
+                "a DTR line beside an unreadable RTS/CTS pair",
+                [
+                    "stuck-high",
+                    "stuck-high",
+                    "true",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                ],
+                handshake_pins::DTR_WIRED_RTS_UNREADABLE,
+            ),
+            (
+                "a DTR line beside an RTS/CTS pair that answered absent",
+                [
+                    "false", "false", "true", "false", "false", "false", "false", "false",
+                ],
+                handshake_pins::DTR_WIRED_RTS_ABSENT,
+            ),
+            (
+                "the measured CDC-ACM bench: both RTS/CTS cells stuck high",
+                [
+                    "stuck-high",
+                    "stuck-high",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                ],
+                handshake_pins::UNREADABLE,
+            ),
+            // **The MIXED pair, both ways round and in both inconclusive
+            // spellings.** One cell answered absent, the other announced its own
+            // failure — so the pair as a whole did not answer, and the sentence may
+            // not say *3-wire*. Every row above drives the two RTS cells alike, and
+            // the only mixed rows in this file pair an inconclusive cell with a
+            // `true`, which lands on HALF-CROSSED and never reaches this fold: with
+            // those rows alone, narrowing `rts_inconclusive` to either index left
+            // this file green while the fold printed the cabling-ambiguity sentence
+            // for `["false", "stuck-high"]`. That is §15.62's *not readable folded
+            // into not wired*, in the arm that exists to prevent it, and a mixed
+            // bench is not hypothetical: this record owns an FT232R pair and a
+            // CDC-ACM pair. The suite's `handshake_shape` is already symmetric here.
+            (
+                "MIXED: port A answered absent, port B announced its own failure",
+                [
+                    "false",
+                    "stuck-high",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                ],
+                handshake_pins::UNREADABLE,
+            ),
+            (
+                "MIXED, mirrored: port A announced its own failure, port B absent",
+                [
+                    "stuck-high",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                ],
+                handshake_pins::UNREADABLE,
+            ),
+            (
+                "MIXED in the other inconclusive spelling: absent beside `?`",
+                [
+                    "false", "?", "false", "false", "false", "false", "false", "false",
+                ],
+                handshake_pins::UNREADABLE,
+            ),
+            (
+                "MIXED in the other inconclusive spelling, mirrored: `?` beside absent",
+                [
+                    "?", "false", "false", "false", "false", "false", "false", "false",
+                ],
+                handshake_pins::UNREADABLE,
+            ),
+            (
+                "neither RTS/CTS nor DTR readable",
+                [
+                    "stuck-high",
+                    "stuck-high",
+                    "stuck-high",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                    "false",
+                ],
+                handshake_pins::UNREADABLE_DTR_UNREADABLE,
+            ),
+            (
+                "all eight cells answered, and answered absent",
+                ["false"; 8],
+                handshake_pins::ALL_EIGHT_ABSENT,
+            ),
+            (
+                "RTS/CTS answered absent beside a DTR cell the instrument could not read",
+                [
+                    "false", "false", "?", "false", "false", "false", "false", "false",
+                ],
+                handshake_pins::RTS_ABSENT_DTR_UNREADABLE,
+            ),
+        ];
+
+        let mut arms = std::collections::BTreeSet::new();
+        for (label, cells, sentence) in table {
+            let l = line(cells);
+            let (shape, printed) = l
+                .split_once(" [")
+                .unwrap_or_else(|| panic!("{label}: the cells did not travel with it: {l}"));
+            arms.insert(shape.to_owned());
+            assert_eq!(
+                shape, sentence,
+                "{label}: the handshake sentence is not the agreed wording. This is a \
+                 re-word check, not a meaning check: if you changed it on purpose, read \
+                 HANDSHAKE_AMBIGUITY_TAIL's doc and satisfy yourself the new words still \
+                 refuse to state a cable (design §15.69 clause 1)"
+            );
+            // Every cell, in its own slot — the sentence is a reading of them and a
+            // reader must be able to check it. Not implied by the pin, which covers
+            // everything *before* the ` [`; and reading the value rather than the
+            // key means a transposed `format!` argument reddens too.
+            for (key, word) in [
+                ("rts_a_to_cts_b=", cells[0]),
+                ("rts_b_to_cts_a=", cells[1]),
+                ("dtr_a_to_dsr_b=", cells[2]),
+                ("dtr_a_to_dcd_b=", cells[3]),
+                ("dtr_a_to_ri_b=", cells[4]),
+                ("dtr_b_to_dsr_a=", cells[5]),
+                ("dtr_b_to_dcd_a=", cells[6]),
+                ("dtr_b_to_ri_a=", cells[7]),
+            ] {
+                assert!(
+                    printed.contains(&format!("{key}{word}")),
+                    "{label}: {key}{word} is missing from the cells, or arrived in \
+                     another slot: {l}"
+                );
+            }
+        }
+        // **The walker proved its matcher against every arm it claims.** Not implied
+        // by the pins above: each takes whichever sentence the row names, so a table
+        // that lost its UNREADABLE rows — or a fold that collapsed two arms into one
+        // — would pass every pin left standing.
+        assert_eq!(
+            arms.len(),
+            10,
+            "the table did not reach all ten handshake sentences, so an arm is \
+             collapsed or a row was dropped: {arms:?}"
+        );
+    }
+
+    /// **An all-`false` handshake may not state a cable fact** — plan §18 item 92,
+    /// design §15.69 clause 1.
+    ///
+    /// §15.62 taught the fold that `stuck-high`, `inverted` and `?` are not answers
+    /// about a wire, and left the all-`false` case saying `3-wire: no handshake
+    /// lines carried`. That case is the one this test covers, and the reason it
+    /// cannot say that is measured, not argued: a bare CTS input and a CTS input a
+    /// driver manufactures low are **bit-identical**. See [`CellReading::Absent`]
+    /// for the two committed artifacts, and
+    /// [`crosses_maps_each_pair_of_readings_to_its_own_word`] for the stage that
+    /// makes them identical.
+    ///
+    /// **What this test is: a byte-pin of two agreed sentences, and it is worth
+    /// being plain about what that buys.** It catches an accidental re-word — any
+    /// edit to either all-`false` sentence reddens here, so the operator-facing
+    /// wording cannot drift by inattention, and a reviewer is told to look.
+    ///
+    /// **It does not judge meaning, and no assertion in this file could.** "Does
+    /// not assert a cabling fact" is semantic. An earlier spelling of this test
+    /// dressed `!starts_with("3-wire")` plus three `contains` checks as that
+    /// judgement, and an adversarial pass measured what they were worth: replacing
+    /// the arm with *reads 3-wire: no crossing carried (unlike a transport that
+    /// manufactures these lines — this reading cannot separate them)* — a sentence
+    /// that asserts the cable outright — left every one of them green. So the
+    /// meaning is a **review obligation**, recorded where the words are:
+    /// [`HANDSHAKE_AMBIGUITY_TAIL`].
+    ///
+    /// What the table adds beyond the pin is **coverage**: both all-`false` arms —
+    /// DTR determinate and DTR inconclusive — must actually be reached, or the
+    /// walker is proving a matcher against one arm and claiming two (AGENTS §3).
+    #[test]
+    fn an_all_false_handshake_never_states_a_cable_fact() {
+        fn line(rts: [&str; 2], dtr: [&str; 6]) -> String {
+            p5_handshake_line(&HandshakeCells {
+                rts_ab: rts[0].into(),
+                rts_ba: rts[1].into(),
+                dtr_ab_dsr: dtr[0].into(),
+                dtr_ab_dcd: dtr[1].into(),
+                dtr_ab_ri: dtr[2].into(),
+                dtr_ba_dsr: dtr[3].into(),
+                dtr_ba_dcd: dtr[4].into(),
+                dtr_ba_ri: dtr[5].into(),
+            })
+        }
+        // **Spelled in [`handshake_pins`], not built from
+        // [`HANDSHAKE_AMBIGUITY_TAIL`] and not copied a second time here.** A pin
+        // that reads the constant it is pinning moves with it and asserts nothing
+        // (AGENTS §3's first register); a pin copied into two tests is a copy to
+        // keep in step rather than a second guard. The cross-instrument half of the
+        // wording, which *is* shared, is compared against `HANDSHAKE_AMBIGUITY_TAIL`
+        // from `itest/tests/serial_hardware.rs`.
+        use handshake_pins::{ALL_EIGHT_ABSENT, RTS_ABSENT_DTR_UNREADABLE};
+
+        // Both RTS cells are `"false"` throughout: this test is about the arm
+        // where every RTS reading answered and answered *absent*. The DTR cells
+        // vary so that both all-`false` arms are exercised — all-answered, and
+        // one-per-position unreadable, `?` being the reading that most explicitly
+        // says the instrument failed.
+        let mut cases: Vec<(String, [&str; 6])> =
+            vec![("all six DTR cells answered".to_owned(), ["false"; 6])];
+        for (i, which) in [
+            "dtr_a_to_dsr_b",
+            "dtr_a_to_dcd_b",
+            "dtr_a_to_ri_b",
+            "dtr_b_to_dsr_a",
+            "dtr_b_to_dcd_a",
+            "dtr_b_to_ri_a",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut dtr = ["false"; 6];
+            dtr[i] = "?";
+            cases.push((format!("{which} unreadable"), dtr));
+        }
+        cases.push(("all six DTR cells unreadable".to_owned(), ["?"; 6]));
+
+        let mut arms = std::collections::BTreeSet::new();
+        for (label, dtr) in &cases {
+            let l = line(["false", "false"], *dtr);
+            let (shape, cells) = l
+                .split_once(" [")
+                .unwrap_or_else(|| panic!("{label}: the cells did not travel with it: {l}"));
+            arms.insert(shape.to_owned());
+            // Which arm this case is owed, computed from the case's own data — so
+            // an edit to the table above cannot quietly re-point the pin.
+            let expected = if dtr.contains(&"?") {
+                RTS_ABSENT_DTR_UNREADABLE
+            } else {
+                ALL_EIGHT_ABSENT
+            };
+            assert_eq!(
+                shape, expected,
+                "{label}: the all-`false` sentence is not the agreed wording. This \
+                 is a re-word check, not a meaning check: if you changed it on \
+                 purpose, read HANDSHAKE_AMBIGUITY_TAIL's doc and satisfy yourself \
+                 the new words still refuse to state a cable (design §15.69 clause 1)"
+            );
+            // The eight cells still travel with it: the sentence is a reading of
+            // them and a reader must be able to check it. Not implied by the pin —
+            // the pin covers everything *before* the ` [`.
+            assert!(
+                cells.contains("rts_a_to_cts_b=false") && cells.contains("rts_b_to_cts_a=false"),
+                "{label}: the RTS/CTS cells did not survive: {l}"
+            );
+        }
+        // **The walker proved its matcher against both arms it claims**, and this
+        // is not implied by the pins above: the pins take whichever arm the case's
+        // data selects, so a table that lost its unreadable-DTR rows would pass
+        // every one of them and reach one arm.
+        assert_eq!(
+            arms.len(),
+            2,
+            "the table did not reach both all-false arms — DTR-determinate and \
+             DTR-inconclusive: {arms:?}"
+        );
+    }
+
+    /// **[`crosses`] driven from bits, which is where item 92's evidence lives**
+    /// (plan §18 item 92, design §15.69 clause 1).
+    ///
+    /// The item's stated validation is "plant a constant-low CTS". Until this test
+    /// `crosses` was a nested `fn` inside [`p5_handshake`], unreachable from any
+    /// test, so the mapping could only be exercised one stage later by planting the
+    /// cell **word** — which assumes the step under question. The
+    /// `(false, false) -> "false"` row is the one the item rests on: a bare input
+    /// and a manufactured-low input arrive here as the same two bits and leave as
+    /// the same word, so nothing downstream can separate them and nothing
+    /// downstream may claim to.
+    ///
+    /// Five words, six rows: the four `(hi, lo)` pairs, plus the two ways the
+    /// instrument itself can fail — a `set` that errors and a `read` that errors
+    /// take different returns and both must print `?`, never a reading.
+    #[test]
+    fn crosses_maps_each_pair_of_readings_to_its_own_word() {
+        // The far end's two answers, replayed in the order `crosses` asks for them:
+        // peer driven high first, then low. No port, no bench — the whole point is
+        // that the two bits are all this stage ever sees.
+        fn word(readings: [bool; 2]) -> String {
+            let next = std::cell::Cell::new(0usize);
+            crosses(
+                |_| Ok(()),
+                || {
+                    let i = next.get();
+                    next.set(i + 1);
+                    Ok(readings[i])
+                },
+            )
+        }
+        assert_eq!(
+            word([true, false]),
+            "true",
+            "a line that followed both levels"
+        );
+        assert_eq!(
+            word([false, false]),
+            "false",
+            "**the row item 92 rests on**: low at both of the peer's drive levels. \
+             A bare conductor and a transport manufacturing the level produce these \
+             two bits alike, so this word may license no statement about a cable"
+        );
+        assert_eq!(
+            word([true, true]),
+            "stuck-high",
+            "a line high with the peer driven low is doing something no wire can \
+             do — the §15.62 reading, and it must not print as `false`"
+        );
+        assert_eq!(
+            word([false, true]),
+            "inverted",
+            "a line that followed both levels backwards is not a crossing"
+        );
+        assert_eq!(
+            crosses(|_| Err(std::io::Error::other("set")), || Ok(true)),
+            "?",
+            "a drive that could not be issued is an instrument failure, not a reading"
+        );
+        assert_eq!(
+            crosses(|_| Ok(()), || Err(std::io::Error::other("read"))),
+            "?",
+            "a read that errored is an instrument failure, not a reading"
+        );
     }
 
     /// The two constructors that feed the fold: a skipped characterization records

@@ -1285,17 +1285,33 @@ fn the_handshake_clause_rejects_a_certified_pair_that_reports_no_handshake() {
 
     // The same block WITH the reading — must be ACCEPTED, or the rejection above
     // proves nothing about the handshake and everything about some other clause.
+    //
+    // **The value is a sample, not a pin, and the clause is why** (plan §3 rule 14,
+    // plan §18 item 92). The gate reads `.value | type == "string"` and nothing
+    // else, so the shape word is invisible to it: the sentence below could say
+    // anything at all and this assertion would hold. **Measured, not assumed**:
+    // rewriting that value to `BANANA` in a committed Tier-3 capture
+    // (`docs/doctor/linux-7.0-2026-08-14-b58a1c4-tier3.json`) leaves
+    // `jq -e -f expectations/linux.jq` at exit 0, while rewriting it to the number
+    // `7` exits 1 — the clause reads the type and nothing else. That is deliberate:
+    // whether a rig crosses RTS is the operator's cabling, and a gate that pinned
+    // the answer would redden every honest bench — but it means **nothing in the jq
+    // lane guards this wording**. The wording's own guards are the two instruments'
+    // unit tests (`doctor/src/probes.rs`'s `crosses()` fold and
+    // `itest/tests/serial_hardware.rs`'s `handshake_shape`). The sample is kept in
+    // step with them anyway, so a reader of this file is not shown a sentence the
+    // product stopped printing.
     let honest = jq_filter(
         r#"(.probes[] | select(.id=="P5")) |= (.status = "supported"
            | .observations = [{"key":"a ↔ b cert","value":"rate_ladder=true deliberate_mismatch_observed=true"},
-                              {"key":"a ↔ b handshake","value":"3-wire: no handshake lines carried [rts_a_to_cts_b=false]"}])"#,
+                              {"key":"a ↔ b handshake","value":"no handshake crossing read: 3-wire, or a transport that manufactures these lines — this reading cannot separate them [rts_a_to_cts_b=false]"}])"#,
         &report,
     );
     assert!(
         gate_accepts(&expectation, &honest),
         "{} rejected a certified pair that DID report its handshake — and note the \
-         value says 3-wire, which must pass: whether this rig crosses RTS is the \
-         operator's cabling, not a gate condition",
+         value reports no crossing, which must pass: whether this rig crosses RTS is \
+         the operator's cabling, not a gate condition",
         expectation.display()
     );
 
