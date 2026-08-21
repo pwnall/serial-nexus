@@ -6,7 +6,7 @@
 #     scripts/bless              # debug   (what `cargo test` uses)
 #     scripts/bless --release    # release
 #     scripts/bless --all        # both
-#     scripts/bless --verify     # report state, change nothing, ask for no password
+#     scripts/bless --verify     # report state, install nothing, ask for no password
 #
 # What it does per profile: build the helper, install a copy at
 # `.snx-bin/<profile>/` with mode 0700, apply the helper's own required capability
@@ -88,14 +88,24 @@ for profile in "${profiles[@]}"; do
   built="$repo/target/$profile/serial-nexus-devprep"
   blessed="$repo/.snx-bin/$profile/serial-nexus-devprep"
 
-  if [ "$verify_only" -eq 0 ]; then
-    flags=(--locked -p serial-nexus-devprep)
-    [ "$profile" = "release" ] && flags+=(--release)
-    if ! cargo build "${flags[@]}"; then
-      echo "bless: ${profile}: build failed" >&2
-      rc=1
-      continue
-    fi
+  # **`--verify` builds too, and skipping it was a defect** (plan §18 item 101).
+  # `install --verify` compares the installed copy against
+  # `target/<profile>/serial-nexus-devprep`, and that path is a *hardlink* cargo
+  # re-points at whichever `deps/` artifact matches the last invocation's unit
+  # graph. A workspace-scoped build — which is every gate in AGENTS §3 — unifies
+  # features across the members (measured: `nix` gains `feature` and `user`,
+  # `memchr` gains `default`, `serde_core` gains `alloc` and `result`), so it
+  # produces a *different* devprep binary and re-points the link at it. `--verify`
+  # then read `Stale` on a correctly blessed tree. Building here costs a cached
+  # 0.03s, touches no installed copy and asks for no password; what it buys is that
+  # the artifact being compared against is the one this script would install, which
+  # is the only thing the comparison ever meant.
+  flags=(--locked -p serial-nexus-devprep)
+  [ "$profile" = "release" ] && flags+=(--release)
+  if ! cargo build "${flags[@]}"; then
+    echo "bless: ${profile}: build failed" >&2
+    rc=1
+    continue
   fi
 
   if [ ! -x "$built" ]; then

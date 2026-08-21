@@ -1274,7 +1274,14 @@ fn install_verb(profile: &str, verify: bool, print_setcap: bool, held: CapState)
                 }
                 other => {
                     println!("{}: {other:?}", path.display());
-                    println!("fix with:\n    {}", install::setcap_command(&path));
+                    // Keyed on the state. This line printed `setcap_command` for
+                    // every state until 2026-08-21, which sent an operator to
+                    // `sudo` for a `Stale` copy that needed only an unprivileged
+                    // re-copy (plan §18 item 101).
+                    println!(
+                        "fix with:\n    {}",
+                        install::remedy_for(&other, profile, &path)
+                    );
                     exit::BLOCKED_ON_BLESS
                 }
             }

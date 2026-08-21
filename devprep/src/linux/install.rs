@@ -372,9 +372,106 @@ pub fn setcap_command(blessed: &Path) -> String {
     )
 }
 
+/// The remedy for a state, **keyed on the state** rather than assumed to be the
+/// privileged one.
+///
+/// Until 2026-08-21 every non-`Ready` state printed [`setcap_command`], which is
+/// the right answer for exactly one of the four. For `Stale` it is actively wrong:
+/// the installed copy differs from the build, so re-applying a capability it
+/// already carries changes nothing, and the operator is sent to `sudo` for a
+/// repair that needs no privilege at all. That misreading cost a session its
+/// replug lane — it read `Stale`, saw a `sudo` in the remedy, found the box wanted
+/// a password, and recorded the lane as blocked while the helper was correctly
+/// blessed the whole time (plan §18 item 101).
+///
+/// Only `Unblessed` is a privileged repair. `Stale`, `Absent` and `WrongMode` are
+/// all fixed by the unprivileged copy `scripts/bless` performs — and when a
+/// `setcap` genuinely follows it, `scripts/bless` is what runs it, so naming the
+/// script is never an under-answer.
+pub fn remedy_for(state: &InstallState, profile: &str, blessed: &Path) -> String {
+    let bless = if profile == "release" {
+        "scripts/bless --release"
+    } else {
+        "scripts/bless"
+    };
+    match state {
+        // Already correct; callers do not ask, but a total function has no hole.
+        InstallState::Ready => format!("nothing to do ({})", ready_description()),
+        InstallState::Unblessed(_) => setcap_command(blessed),
+        InstallState::Stale => format!(
+            "{bless}   (the installed copy is not this build — it needs replacing, \
+             not re-capping, and the copy itself needs no privilege)"
+        ),
+        InstallState::Absent => format!("{bless}   (nothing is installed yet)"),
+        InstallState::WrongMode(_) => {
+            format!("{bless}   (the copy is installed but its mode is not 0700)")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Only one of the four repairs is privileged, and the report used to claim
+    /// all of them were.** Fail-first: with `remedy_for` replaced by
+    /// `setcap_command` — which is what every arm printed until 2026-08-21 — the
+    /// three unprivileged rows below fail, naming the state that was mis-advised.
+    ///
+    /// The row that matters is `Stale`. It is reachable on a correctly blessed tree
+    /// for a reason that has nothing to do with capabilities: `inspect` compares the
+    /// installed copy against `target/<profile>/serial-nexus-devprep`, a hardlink
+    /// cargo re-points at whichever `deps/` artifact matches the last build's unit
+    /// graph, and a workspace-scoped build produces a different devprep binary than
+    /// `-p serial-nexus-devprep` does. Sending that operator to `sudo` is how a
+    /// session came to record its replug lane as blocked while the helper was
+    /// blessed (plan §18 item 101).
+    #[test]
+    fn only_the_unblessed_state_is_advised_to_reach_for_privilege() {
+        let path = Path::new("/repo/.snx-bin/debug/serial-nexus-devprep");
+        let privileged = [InstallState::Unblessed("(none)".to_owned())];
+        let unprivileged = [
+            InstallState::Stale,
+            InstallState::Absent,
+            InstallState::WrongMode(0o755),
+        ];
+
+        for state in &privileged {
+            let r = remedy_for(state, "debug", path);
+            assert!(
+                r.contains("sudo") && r.contains("setcap"),
+                "{state:?} is the one repair only root can make, so its remedy must \
+                 name the privileged command: {r}"
+            );
+        }
+        for state in &unprivileged {
+            let r = remedy_for(state, "debug", path);
+            assert!(
+                !r.contains("sudo") && !r.contains("setcap"),
+                "{state:?} is repaired by an unprivileged copy, so its remedy must \
+                 not send the operator to root — that is the misreading item 101 \
+                 records: {r}"
+            );
+            assert!(
+                r.contains("scripts/bless"),
+                "{state:?}'s remedy must name the command that actually repairs it: {r}"
+            );
+        }
+
+        // The profile reaches the remedy, so a release-profile operator is not told
+        // to run the debug repair.
+        assert!(
+            remedy_for(&InstallState::Stale, "release", path).contains("scripts/bless --release"),
+            "the release profile's remedy must name --release"
+        );
+        assert!(
+            !remedy_for(&InstallState::Stale, "debug", path).contains("--release"),
+            "the debug profile's remedy must not name --release"
+        );
+
+        // A total function: `Ready` has an answer rather than a panic or a hole.
+        assert!(remedy_for(&InstallState::Ready, "debug", path).contains("nothing to do"));
+    }
 
     /// The `/deps/` trap, planted in every spelling it could take. A matcher that
     /// tests the whole line passes all of these; the field parser must not.

@@ -13620,9 +13620,12 @@ investigation. Recorded because a 342-failure baseline is the kind of number tha
 
 **The rig lane reads 1088 · 0 · 7 with five `required` words** — `SNX_CROSSOVER`, `SNX_RIG_FLOW`,
 `SNX_TLS`, `SNX_EXEC_CODEC`, `SNX_WEB_UI` — and **5 self-skip names**: the four replug tests and one
-root-only packaging test. **It is not the fully-spelled documented lane and must not be quoted as
-one:** `SNX_REPLUG=required` is dropped because `scripts/bless` needs an interactive `sudo` this
-session could not supply, so the blessed helper is stale. Every hardware test ran.
+root-only packaging test. *(**Corrected §3.124:** the reason given here for dropping `SNX_REPLUG` —
+that `scripts/bless` needed a `sudo` this session could not supply — was **false**. The helper was
+correctly blessed throughout. **The fully-spelled documented lane reads 1088 · 0 · 7 with a single
+self-skip**, the root-only packaging test, with all four replug tests passing. This paragraph's
+measurement stands; its explanation did not survive the operator asking about it.)* Every hardware
+test ran.
 `crossover_rig_rts_crosses_to_the_far_ports_cts` passed — the daemon's own `state.modem_lines` agreeing
 with P5 and with the Darwin standalone probe about this cable, a **third instrument** on it — and
 `rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes` took its **Honoured** arm, Linux
@@ -13797,3 +13800,73 @@ bite, and none was available. **The decline is to the stimulus on this class of 
 hypothesis**, and design §13's rule that an axis must be able to vary is what makes that distinction
 mandatory rather than polite. `p14_payload` is unchanged, `probe_set` and `field_set` are unchanged,
 no era moves, and `docs/doctor/README.md` owes nothing.
+
+### 3.124 A verify mode that skipped the one step that made it mean anything
+
+**How it surfaced, which matters more than the defect.** This session recorded the documented rig
+lane as blocked on privilege: `scripts/bless --verify` had reported the blessed helper `Stale` and
+printed `fix with: sudo setcap …`, `sudo -n` wanted a password, and that was written down as the
+reason `SNX_REPLUG=required` could not be spelled. **The operator then ran `scripts/bless` by hand
+and got `already blessed (build unchanged, mode 0700, +ep) — nothing to do`** — the opposite answer,
+from the same script, about the same tree, minutes later. Two readings of one state, and only one of
+them had been believed.
+
+**The mechanism, reproduced in a single command.** `install::inspect` compares the installed copy
+byte-for-byte against `target/<profile>/serial-nexus-devprep`. **That path is a hardlink**, and cargo
+re-points it at whichever `target/<profile>/deps/` artifact matches the last invocation's unit graph;
+`deps/` held **five** distinct devprep binaries when this was measured. `scripts/bless` builds its
+reference with `cargo build --locked -p serial-nexus-devprep`, and **every gate in AGENTS §3 builds
+it with `--workspace`**. Those two builds differ, and the diff of their unit graphs says why: `nix`
+gains `feature` and `user`, `memchr` gains `default`, `serde_core` gains `alloc` and `result` — all
+pulled in by *other members*, and devprep links `nix`. So:
+
+* `cargo build --workspace --locked`, compiling **nothing** (`Finished in 0.33s`), moved
+  `target/debug/serial-nexus-devprep` from `a7eed376…` to `30901880…` and `--verify` immediately read
+  `Stale`;
+* `cargo build --locked -p serial-nexus-devprep` moved it back to `a7eed376…` and `--verify` read
+  `already blessed`. Deterministic, both directions, several times.
+
+**`--verify` was the only mode that could be fooled, because it was the only mode that skipped the
+build** — `if [ "$verify_only" -eq 0 ]` sat around precisely the step that makes the comparison
+meaningful. Plain `scripts/bless` builds first and is therefore self-healing, which is exactly why the
+operator's run disagreed. The mode whose whole purpose is *tell me the state without changing
+anything* had bought that promise by giving up the only thing that defined the state.
+
+**The second defect is the one that converted confusion into a wrong conclusion.** The report's
+`other =>` arm printed `setcap_command` for **every** non-`Ready` state. Of the four, only
+`Unblessed` is a privileged repair; `Stale`, `Absent` and `WrongMode` are fixed by the unprivileged
+copy `scripts/bless` makes. **A `Stale` copy cannot be repaired by re-capping it** — it already
+carried the capability. So the operator was sent to `sudo` for a repair `sudo` does not perform, and
+the presence of `sudo` in the line is what made "the box will not give me a password" read as "this
+lane cannot run". **The report was not wrong about its own predicate; it was wrong about the world,
+and its remedy was wrong about both.**
+
+**What it cost.** The four replug tests were recorded as unrunnable and the lane was written up as
+*not the fully-spelled documented lane*. Run properly, it is **1088 · 0 · 7 with a single self-skip**
+— the root-only packaging test — with `a_real_usb_reenumeration_heals_the_node_at_its_canonical_identity`,
+`identity_survives_a_replug_that_renumbers_the_tty`, `by_path_identity_survives_a_replug_that_renumbers_the_tty`
+and `the_replug_discriminator_goes_quiet_when_no_write_happens` all passing, the blessed `grant` verb
+exercised across each re-enumeration.
+
+**The repairs, and what each is proven by.** `--verify` now builds — it costs a cached 0.03 s,
+installs nothing, asks for no password, and the header's promise is re-worded from *change nothing*
+to *install nothing*. `install::remedy_for(state, profile, path)` is keyed on the state and carries
+the profile, so a release operator is not handed the debug repair.
+`only_the_unblessed_state_is_advised_to_reach_for_privilege` pins the map in every arm and is
+fail-first proven by restoring the single-remedy behaviour in place, which reddens naming `Stale`.
+**The shell half has no guard and that is stated rather than implied**: the property — *the artifact
+compared against is the one this script would install* — is now true by construction, and a test
+asserting the build is not gated would be a proxy for it rather than the thing (AGENTS §9).
+
+**The register, which this repository already has a name for.** AGENTS §3 collects gates whose
+passing output is indistinguishable from their not-running output. This is the mirror: **a check
+whose failing output is indistinguishable from a real failure, produced by a predicate that was
+measuring the wrong artifact.** A cry-wolf, in the one tool whose answer decides whether a whole
+hardware lane runs — and cry-wolf is the failure mode §9 names as how a gate gets deleted. It was not
+caught by any gate; it was caught by a human running the command and reading the answer.
+
+***The lesson I would keep.*** Two instruments disagreed about one state and I believed the one that
+told me to stop. The cheap test — running the plain command that the `--verify` flag is a read-only
+shorthand *for* — was available the entire time and would have cost six seconds. **A flag that
+promises a safer version of a command is a claim that the two agree, and that claim is worth
+one invocation to check** when the answer is about to be written down as a blocker.
