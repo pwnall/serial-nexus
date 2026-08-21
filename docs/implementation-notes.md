@@ -13591,6 +13591,53 @@ vocabulary and cleared.
 second half"* is not a contradiction of its `EXECUTED` head — it sits inside the block the entry
 introduces with *"its record follows unchanged"*, which is the preserved filing, correctly marked.
 
+**The suite, both ends measured in one session so the delta is quotable.** Default CI scope reads
+**1088 · 0 · 7** at `25d8ecd` against **1051 · 0 · 7** at `432aa0c`, the baseline taken in a worktree
+on this box in this session precisely so rule 19's *one session measured both ends* is satisfied. The
+**+37** decomposes per target with nothing left over — `meta_ledger` +24, `serial_hardware` +8,
+`serial-nexus-doctor` +3, `meta_derive` +1, the itest lib +1 — and **every one of the thirty-seven is
+a guard**; the only product behaviour that moved in this session is the handshake sentence. **No delta
+may be derived against the 1044 row of 2026-08-17**: different commit, not re-measured.
+
+***One run in five failed once, its name was lost, and losing it was this session's own mistake.***
+The confirmation run read **1087 · 1 · 7**; the output had been piped through `awk` to sum the
+`test result:` lines, so the failing test's name was never captured — **AGENTS §8's *capture
+failing-test names verbatim before any rerun*, violated in the one place it costs something.** Four
+consecutive reruns then read 1088 · 0 · 7 at loads of 3.09, 5.37, 5.46 and idle. Under AGENTS §2's
+standing rule a lone unnamed load-sensitive failure is treated as one of the two recorded classes
+resurfacing — notes §3.65 F's parallelism-only rig failure, or §15.36's session's unnamed one — and
+**never as a fresh finding**, so nothing is claimed about it here beyond that it happened and that
+the instrument was mine. The box had just run the rig lane twice and a full baseline build; §8's
+*measure the machine before attributing anything to code* applies to the reruns as much as to the
+failure. The lesson is one line: **a pipeline that summarises a test run destroys the only artifact
+that makes its failures actionable**, and it destroys it silently, which is the same register as the
+`grep -c '^SKIP'` hazard this same session reproduced two paragraphs above.
+
+*The baseline's first reading was 709 · 342 · 7 and is a harness reading, not a tree reading.* A fresh
+worktree without `cargo build --workspace` has no plain binaries, and 94 targets fail naming exactly
+that — `itest/src/lib.rs:66` says so in its own panic text, which is why it cost one re-run and not an
+investigation. Recorded because a 342-failure baseline is the kind of number that gets quoted.
+
+**The rig lane reads 1088 · 0 · 7 with five `required` words** — `SNX_CROSSOVER`, `SNX_RIG_FLOW`,
+`SNX_TLS`, `SNX_EXEC_CODEC`, `SNX_WEB_UI` — and **5 self-skip names**: the four replug tests and one
+root-only packaging test. **It is not the fully-spelled documented lane and must not be quoted as
+one:** `SNX_REPLUG=required` is dropped because `scripts/bless` needs an interactive `sudo` this
+session could not supply, so the blessed helper is stale. Every hardware test ran.
+`crossover_rig_rts_crosses_to_the_far_ports_cts` passed — the daemon's own `state.modem_lines` agreeing
+with P5 and with the Darwin standalone probe about this cable, a **third instrument** on it — and
+`rts_cts_flow_control_stalls_the_writer_instead_of_losing_bytes` took its **Honoured** arm, Linux
+carrying `CRTSCTS` where Apple drops it. The skips are reported as **names** because `grep -c '^SKIP'`
+read **0** on the run before this one: `cargo test` captures a passing test's stderr without
+`--nocapture`, which is notes §3.78 reproducing itself on the first try, in this session, on the run
+that was about to be quoted.
+
+**The doctor artifacts.** Three Tier-3 captures at `25d8ecd`, `jq -e -f expectations/linux.jq` exit 0
+on all three, the eight handshake cells identical across them, and **both digests unchanged from the
+pre-change capture of the same bench** — `probe_set 4317ea5ac187f506`, `field_set 29e4071d23e8b474` —
+so no era closes and no field moves. The handshake *wording* change is a value this bench never
+produces, and the hand-announcement it owes is at `docs/doctor/README.md` beside the residual that
+makes it necessary.
+
 ### 3.121 Item 92: the sentence was the easy half, and the imperative was the harm
 
 **What overturned the decline.** Item 92 filed three candidate remedies and declined choosing on one
