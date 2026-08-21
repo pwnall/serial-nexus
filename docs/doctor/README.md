@@ -94,6 +94,22 @@ unchanged questions close nothing) while `field_set` moved: Tier-3
 **era-mate** of the `2b44c17` rows: diff them on the intersection, which is every
 cell both carry.
 
+**A third instance landed 2026-08-21** (design §15.68 clause 6, plan §18 items 97–98).
+P14's failing directions gained a `failure_detail` object naming the loss shape —
+`short-write` / `silent` / `starved` / `displaced` / `interleaved` / `garbled`, with
+`lost_bytes`, `duplicated_bytes`, `first_defect_offset` and four more cells. `P14_QUESTION`
+already asked *"and what stopped the search"*, so a better stop-reason is an **answer**:
+`probe_set` stays `4317ea5ac187f506` and **no era closes**, while `field_set` moves once for
+every capture taken after it. Every artifact above predates the cells and carries its own
+digest; diff across the boundary on the intersection, as with the move above.
+
+**And the residual §15.44 names is the thing to watch here, because plan §18 item 98 would
+trip it.** That item proposes changing P14's payload *bytes* — an inlaid stress inventory —
+and payload bytes are neither a `question` nor an observation *path*, so **neither digest
+would move** while `max_reliable_baud` silently re-bases across every artifact in this table.
+If item 98 lands, it owes an announcement in this file in the same commit; a digest pair that
+cannot see a change is exactly when the prose has to.
+
 Two things about that move the digests cannot say:
 
 1. **Which cells appeared.** P13 gained one top-level key

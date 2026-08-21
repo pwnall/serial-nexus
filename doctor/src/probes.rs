@@ -6318,10 +6318,29 @@ const P14_PAYLOAD_CAP: usize = 64 * 1024;
 /// P5's own ladder rate, so the rig is left exactly as the certificate needs it.
 const P14_BASELINE_BAUD: u32 = 115_200;
 
-/// How many payload-lengths of slack the reader accepts before calling a trial
-/// corrupt rather than continuing to wait. A garbled leading byte shifts the
-/// payload without losing it, which is why the judgement is `contains_sub` over
-/// a slack window rather than a prefix comparison.
+/// How many **bytes** of slack the reader accepts before calling a trial corrupt
+/// rather than continuing to wait. A garbled leading byte shifts the payload
+/// without losing it, which is why the judgement is `contains_sub` over a slack
+/// window rather than a prefix comparison.
+///
+/// **The units in this sentence were wrong until 2026-08-21** (plan §18 item 97).
+/// It read "how many payload-**lengths** of slack", and the code has always used
+/// it as bytes — `payload.len() + P14_READ_SLACK` at the read ceiling. At the
+/// ladder's rungs those two readings differ by four to five orders of magnitude,
+/// so the comment was describing a buffer this probe has never allocated. Items 83
+/// and 84 are the same register: a constant's comment is a claim, and it is the
+/// claim a reviewer reads instead of the code.
+///
+/// **And it does not bound the received buffer, which the ceiling test only looks
+/// like it does.** `p5_read_result` returns up to 4096 bytes per call and the
+/// `extend_from_slice` runs *before* the `got.len() >= ceiling` break, so `got` can
+/// reach `payload.len() + 63 + 4095` — not `payload.len() + 64`. **Deliberately not
+/// tightened**: every committed capture was measured under the loose bound, a
+/// tighter one could truncate a haystack that `contains_sub` would have matched,
+/// and the looseness is harmless against a payload whose 8-byte windows are unique
+/// (`P14_ALIGN_WINDOW`). It is recorded because it stops being harmless the moment
+/// anyone judges a *constant* payload here, which is the second reason the pattern
+/// battery of item 98 must never become the judgement.
 const P14_READ_SLACK: usize = 64;
 
 /// The wall-clock stop on the search, checked **between rungs**. The ladder is
@@ -6828,6 +6847,9 @@ struct TrialResult {
     /// How long this trial's payload took to arrive, from the first write to the
     /// moment the whole payload was matched. Only meaningful when `byte_exact`.
     elapsed_us: u64,
+    /// What the bytes did, computed on the failure path only and `None` otherwise.
+    /// Costs nothing on a passing trial, which is every trial on a healthy rig.
+    failure_detail: Option<P14Failure>,
 }
 
 impl TrialResult {
@@ -6856,6 +6878,240 @@ impl TrialResult {
         } else {
             Some(RungOutcome::Corrupt)
         }
+    }
+}
+
+/// The window the aligner indexes the expected payload by.
+///
+/// Eight bytes because that is the shortest window measured collision-free across
+/// every ladder payload the generator produces: 0 duplicate 8-grams at 240, 480,
+/// 2880 and 65536 bytes. `p14_payload`'s LCG tail is therefore already a position
+/// tag, one per byte, at no cost — which is why this repair needed no change to
+/// what P14 sends, only to what it does with what comes back.
+const P14_ALIGN_WINDOW: usize = 8;
+
+/// Above this share of unaligned bytes the edit script stops being a description.
+///
+/// A block edit script models *displacement* — runs that arrived, in the wrong
+/// place or twice. A bit-error field is not that, and narrating one as the other
+/// is how this instrument would start inventing findings at the top of a real
+/// ladder, where the failure is a marginal clock rather than a lost buffer. Past
+/// this share the class is [`P14FailureClass::Garbled`] and the run counts are
+/// withheld rather than printed.
+const P14_GARBLED_UNALIGNED_SHARE: (u64, u64) = (1, 4);
+
+/// Why a trial failed, at the resolution the bytes actually support.
+///
+/// **This refines [`RungOutcome`] rather than replacing it**, and deliberately: the
+/// two stall arms below all fold to `TimedOut` and the two displacement arms to
+/// `Corrupt`, so `ceiling_kind`, the ladder fold and every committed artifact's
+/// verdict are untouched. What moves is only what a reader is told about a failure
+/// that P14 already detected.
+///
+/// **The vocabulary is closed by the type rather than by a comment.** Plan §18 item
+/// 84 is the case against the other spelling: a class table whose closure was a
+/// sentence, enforced as *each word appears at least once*, so a fourth word passed.
+/// An enum cannot grow a fourth word without the compiler saying so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum P14FailureClass {
+    /// The write side never placed the whole payload. A transmit-side stall.
+    ShortWrite,
+    /// The payload went out and **nothing** came back. A dead link at this rate,
+    /// which on a stack that echoes an unrealizable line coding back unchanged is
+    /// the only cell that says so (§15.68 clause 4).
+    Silent,
+    /// Some bytes came back, fewer than were sent. A receive-side stall.
+    Starved,
+    /// Enough bytes came back, and runs of the payload arrived out of place, twice,
+    /// or not at all. §15.68 clause 3's shape.
+    Displaced,
+    /// Every payload byte arrived exactly once and in order, with foreign bytes
+    /// between them. Insertion rather than loss.
+    Interleaved,
+    /// Enough bytes, and too little of the payload is recognisable for a block edit
+    /// script to mean anything. See [`P14_GARBLED_UNALIGNED_SHARE`].
+    Garbled,
+}
+
+impl P14FailureClass {
+    fn label(self) -> &'static str {
+        match self {
+            P14FailureClass::ShortWrite => "short-write",
+            P14FailureClass::Silent => "silent",
+            P14FailureClass::Starved => "starved",
+            P14FailureClass::Displaced => "displaced",
+            P14FailureClass::Interleaved => "interleaved",
+            P14FailureClass::Garbled => "garbled",
+        }
+    }
+}
+
+/// What a failing trial's bytes did, named rather than folded to one word.
+#[derive(Debug, Clone, Copy)]
+struct P14Failure {
+    class: P14FailureClass,
+    written: u64,
+    received: u64,
+    payload_len: u64,
+    /// Whether the read buffer hit its bound. A saturated window means the trial
+    /// stopped reading, so `lost_bytes` below is a floor and not a total.
+    read_window_saturated: bool,
+    /// `None` on the stall classes, where there is no edit script to compute, and
+    /// on [`P14FailureClass::Garbled`], where there is one and it would lie.
+    lost_bytes: Option<u64>,
+    duplicated_bytes: Option<u64>,
+    matched_bytes: Option<u64>,
+    unaligned_bytes: Option<u64>,
+    /// The first expected offset that did not arrive exactly once.
+    first_defect_offset: Option<u64>,
+    /// `false` if the expected payload had a repeated window, which would make the
+    /// counts above approximate. Measured `true` on every ladder payload; carried
+    /// so a future generator change cannot silently degrade the numbers.
+    expected_windows_unique: Option<bool>,
+}
+
+impl P14Failure {
+    fn observations(this: Option<&Self>) -> serde_json::Value {
+        // Emitted with null members rather than omitted, so the observation paths
+        // are the same on a passing capture and a failing one (§15.49).
+        serde_json::json!({
+            "class": this.map(|f| f.class.label()),
+            "written": this.map(|f| f.written),
+            "received": this.map(|f| f.received),
+            "payload_len": this.map(|f| f.payload_len),
+            "read_window_saturated": this.map(|f| f.read_window_saturated),
+            "lost_bytes": this.and_then(|f| f.lost_bytes),
+            "duplicated_bytes": this.and_then(|f| f.duplicated_bytes),
+            "matched_bytes": this.and_then(|f| f.matched_bytes),
+            "unaligned_bytes": this.and_then(|f| f.unaligned_bytes),
+            "first_defect_offset": this.and_then(|f| f.first_defect_offset),
+            "expected_windows_unique": this.and_then(|f| f.expected_windows_unique),
+        })
+    }
+}
+
+/// How many times each expected byte arrived, and how much of the received buffer
+/// belonged to no run at all.
+///
+/// Returns `(coverage, unaligned_bytes, windows_unique)`. `coverage[i]` is the
+/// number of times expected byte `i` was delivered — `0` is a loss, `2` is a
+/// duplication, and the whole vector being `1` means every byte arrived exactly
+/// once. Greedy: each match extends as far as both sides agree before the walk
+/// resumes, so a displaced 32-byte block costs one lookup rather than 32.
+fn p14_align(expected: &[u8], got: &[u8]) -> (Vec<u32>, u64, bool) {
+    use std::collections::hash_map::Entry;
+    let w = P14_ALIGN_WINDOW;
+    let mut coverage = vec![0u32; expected.len()];
+    if expected.len() < w {
+        return (coverage, got.len() as u64, true);
+    }
+    let mut index: std::collections::HashMap<&[u8], usize> =
+        std::collections::HashMap::with_capacity(expected.len());
+    let mut unique = true;
+    for i in 0..=expected.len() - w {
+        match index.entry(&expected[i..i + w]) {
+            Entry::Vacant(e) => {
+                e.insert(i);
+            }
+            // Keep the first occurrence and say so, rather than silently letting a
+            // later one win and reporting exact-looking numbers from a guess.
+            Entry::Occupied(_) => unique = false,
+        }
+    }
+    let mut unaligned = 0u64;
+    let mut j = 0usize;
+    while j + w <= got.len() {
+        if let Some(&i) = index.get(&got[j..j + w]) {
+            let mut n = w;
+            while i + n < expected.len() && j + n < got.len() && expected[i + n] == got[j + n] {
+                n += 1;
+            }
+            for c in coverage.iter_mut().skip(i).take(n) {
+                *c = c.saturating_add(1);
+            }
+            j += n;
+        } else {
+            unaligned += 1;
+            j += 1;
+        }
+    }
+    // A tail shorter than one window can never be looked up; it is unaligned by
+    // construction, not by disagreement.
+    unaligned += (got.len() - j) as u64;
+    (coverage, unaligned, unique)
+}
+
+/// Classify a failing trial from exactly the bytes the trial had.
+///
+/// **Ordered so the strongest statement wins.** A short write is a fact about the
+/// transmit side and outranks anything the receive side did; silence outranks a
+/// partial arrival. Only the last arm — enough bytes, wrong bytes, which is
+/// [`RungOutcome::Corrupt`]'s own condition — runs the aligner.
+fn p14_failure_detail(
+    payload: &[u8],
+    got: &[u8],
+    written: u64,
+    read_window_saturated: bool,
+) -> P14Failure {
+    let payload_len = payload.len() as u64;
+    let received = got.len() as u64;
+    let stall = |class| P14Failure {
+        class,
+        written,
+        received,
+        payload_len,
+        read_window_saturated,
+        lost_bytes: None,
+        duplicated_bytes: None,
+        matched_bytes: None,
+        unaligned_bytes: None,
+        first_defect_offset: None,
+        expected_windows_unique: None,
+    };
+    if written < payload_len {
+        return stall(P14FailureClass::ShortWrite);
+    }
+    if received == 0 {
+        return stall(P14FailureClass::Silent);
+    }
+    if received < payload_len {
+        return stall(P14FailureClass::Starved);
+    }
+
+    let (coverage, unaligned, unique) = p14_align(payload, got);
+    let lost = coverage.iter().filter(|c| **c == 0).count() as u64;
+    let duplicated: u64 = coverage
+        .iter()
+        .map(|c| u64::from(c.saturating_sub(1)))
+        .sum();
+    let matched = coverage.iter().filter(|c| **c > 0).count() as u64;
+    let first_defect = coverage.iter().position(|c| *c != 1).map(|i| i as u64);
+
+    let (num, den) = P14_GARBLED_UNALIGNED_SHARE;
+    if unaligned * den > received * num {
+        return P14Failure {
+            unaligned_bytes: Some(unaligned),
+            expected_windows_unique: Some(unique),
+            ..stall(P14FailureClass::Garbled)
+        };
+    }
+    let class = if lost > 0 || duplicated > 0 {
+        P14FailureClass::Displaced
+    } else {
+        P14FailureClass::Interleaved
+    };
+    P14Failure {
+        class,
+        written,
+        received,
+        payload_len,
+        read_window_saturated,
+        lost_bytes: Some(lost),
+        duplicated_bytes: Some(duplicated),
+        matched_bytes: Some(matched),
+        unaligned_bytes: Some(unaligned),
+        first_defect_offset: first_defect,
+        expected_windows_unique: Some(unique),
     }
 }
 
@@ -6921,12 +7177,17 @@ fn p14_trial(tx: &SerialPort, rx: &SerialPort, payload: &[u8], deadline: Duratio
         }
     }
     let byte_exact = contains_sub(&got, payload);
+    // Computed here, where `got` is still in scope and has not been reduced to a
+    // count. The information was always present; the fold spent it on one word.
+    let failure_detail = (!byte_exact && !hung_up)
+        .then(|| p14_failure_detail(payload, &got, sent as u64, got.len() >= ceiling));
     TrialResult {
         written: sent as u64,
         received: got.len() as u64,
         byte_exact,
         hung_up,
         elapsed_us: start.elapsed().as_micros() as u64,
+        failure_detail,
     }
 }
 
@@ -6949,6 +7210,9 @@ struct DirectionResult {
     elapsed_us: u64,
     /// The failing trial's own classification, `None` while every trial passed.
     failure: Option<RungOutcome>,
+    /// The same failing trial's byte-level account, at the resolution
+    /// [`RungOutcome`]'s six words cannot carry.
+    failure_detail: Option<P14Failure>,
     /// **What the wire actually ran at, as a floor** — payload bits divided by
     /// the fastest clean trial's wall clock, so poll and syscall overhead can
     /// only push it *down*. `None` when no trial completed.
@@ -6985,6 +7249,7 @@ impl DirectionResult {
             "hung_up": self.hung_up,
             "elapsed_us": self.elapsed_us,
             "failure": self.failure.map(RungOutcome::label),
+            "failure_detail": P14Failure::observations(self.failure_detail.as_ref()),
             "achieved_baud_floor": self.achieved_baud_floor,
         })
     }
@@ -7025,6 +7290,7 @@ fn p14_direction(
             // on is still in scope. The caller no longer has to reconstruct it
             // from sums that a short circuit has already made ambiguous.
             d.failure = r.failure(payload_len as u64);
+            d.failure_detail = r.failure_detail;
             break;
         }
     }
@@ -11599,6 +11865,182 @@ mod tests {
             .collect()
     }
 
+    /// **The plant is §15.68 clause 3's measured shape, byte for byte.**
+    ///
+    /// Lose a 32-byte block at offset 352 and deliver the block after it twice, so
+    /// the total byte count is unchanged — which is exactly what makes it invisible
+    /// to a length check and to plan §3's `received + dropped_slow_consumer == sent`
+    /// fingerprint, and why the tree only ever caught it on a SHA-256.
+    fn displace_block(payload: &[u8], at: usize, len: usize) -> Vec<u8> {
+        let mut got = Vec::with_capacity(payload.len());
+        got.extend_from_slice(&payload[..at]);
+        got.extend_from_slice(&payload[at + len..at + 2 * len]);
+        got.extend_from_slice(&payload[at + len..at + 2 * len]);
+        got.extend_from_slice(&payload[at + 2 * len..]);
+        assert_eq!(
+            got.len(),
+            payload.len(),
+            "the plant must preserve the count"
+        );
+        got
+    }
+
+    /// **The property this repair promises, stated and then planted** (AGENTS §3's
+    /// sixth register): *the report names which loss shape occurred*. Before this
+    /// landed P14 could only say `corrupt`, so there is no spelling of this
+    /// assertion that the unfixed tree passes — the cell it reads did not exist.
+    #[test]
+    fn p14_names_a_count_preserving_displacement_instead_of_calling_it_corrupt() {
+        // The real 19200 rung: 480 bytes, the payload the bench actually failed on.
+        let payload = p14_payload(19_200, "ab", 0, p14_payload_len(19_200));
+        assert_eq!(payload.len(), 480);
+        let got = displace_block(&payload, 352, 32);
+
+        // The old judgement still says only "not byte-exact" — the premise.
+        assert!(!contains_sub(&got, &payload));
+
+        let f = p14_failure_detail(&payload, &got, payload.len() as u64, false);
+        assert_eq!(f.class, P14FailureClass::Displaced, "{f:?}");
+        assert_eq!(f.lost_bytes, Some(32), "{f:?}");
+        assert_eq!(f.duplicated_bytes, Some(32), "{f:?}");
+        assert_eq!(f.first_defect_offset, Some(352), "{f:?}");
+        assert_eq!(f.matched_bytes, Some(448), "{f:?}");
+        assert_eq!(f.unaligned_bytes, Some(0), "{f:?}");
+        assert_eq!(f.expected_windows_unique, Some(true), "{f:?}");
+        // And it still folds to the same rung outcome, so no committed verdict moves.
+        let t = TrialResult {
+            written: payload.len() as u64,
+            received: got.len() as u64,
+            byte_exact: false,
+            hung_up: false,
+            elapsed_us: 0,
+            failure_detail: Some(f),
+        };
+        assert_eq!(t.failure(payload.len() as u64), Some(RungOutcome::Corrupt));
+    }
+
+    /// **A displacement that is not a multiple of the window, which is the case the
+    /// run extension actually exists for.**
+    ///
+    /// Found by fail-first proof rather than by design: planting "stop extending
+    /// matched runs" into `p14_align` left every other guard here green, because a
+    /// 32-byte block at offset 352 is window-aligned and the 8-byte tiling
+    /// re-synchronises on its own. The extension only earns its place when the
+    /// displacement is *not* a multiple of `P14_ALIGN_WINDOW` — so that is what this
+    /// asserts, and it is the guard that reddens on that plant.
+    #[test]
+    fn p14_counts_a_displacement_that_is_not_a_multiple_of_the_align_window() {
+        let payload = p14_payload(19_200, "ab", 0, p14_payload_len(19_200));
+        let got = displace_block(&payload, 349, 33);
+        assert!(!contains_sub(&got, &payload));
+        let f = p14_failure_detail(&payload, &got, payload.len() as u64, false);
+        assert_eq!(f.class, P14FailureClass::Displaced, "{f:?}");
+        assert_eq!(f.lost_bytes, Some(33), "{f:?}");
+        assert_eq!(f.duplicated_bytes, Some(33), "{f:?}");
+        assert_eq!(f.first_defect_offset, Some(349), "{f:?}");
+        assert_eq!(f.unaligned_bytes, Some(0), "{f:?}");
+    }
+
+    /// **The two stall arms the record already carries, separated.** Both print
+    /// `timed-out` today and are different facts: the macOS CDC bench wrote its
+    /// whole payload and got nothing back, the Linux CDC bench never placed its
+    /// payload at all (§15.68 clause 5, notes §3.117).
+    #[test]
+    fn p14_separates_a_silent_link_from_a_transmit_side_stall() {
+        // macOS CDC-ACM, 15000 baud rung: bytes_sent 375 of 375, bytes_received 0.
+        let payload = p14_payload(15_000, "ab", 0, 375);
+        let silent = p14_failure_detail(&payload, &[], 375, false);
+        assert_eq!(silent.class, P14FailureClass::Silent);
+        assert_eq!(silent.received, 0);
+        assert_eq!(silent.lost_bytes, None, "no edit script on a stall");
+
+        // Linux CDC-ACM, 8000000 rung: 10240 written of a 65536-byte payload.
+        let big = p14_payload(8_000_000, "ab", 0, 65_536);
+        let short = p14_failure_detail(&big, &big[..384], 10_240, false);
+        assert_eq!(short.class, P14FailureClass::ShortWrite);
+        assert_eq!(short.written, 10_240);
+        assert_eq!(short.payload_len, 65_536);
+
+        // Some bytes back, fewer than sent, and the write completed: receive-side.
+        let starved = p14_failure_detail(&payload, &payload[..100], 375, false);
+        assert_eq!(starved.class, P14FailureClass::Starved);
+    }
+
+    /// **The honest-scope clause, planted rather than asserted.** A bit-error field
+    /// is not a block edit script; past the share the class says so and the run
+    /// counts are withheld instead of invented.
+    #[test]
+    fn p14_refuses_to_narrate_an_edit_script_over_a_bit_error_field() {
+        let payload = p14_payload(115_200, "ab", 0, 2_880);
+        let mut got = payload.clone();
+        // Flip one bit every fourth byte: the payload is still all "there", and
+        // none of it is recognisable at an 8-byte window.
+        for (i, b) in got.iter_mut().enumerate() {
+            if i % 4 == 0 {
+                *b ^= 0x01;
+            }
+        }
+        let f = p14_failure_detail(&payload, &got, payload.len() as u64, false);
+        assert_eq!(f.class, P14FailureClass::Garbled, "{f:?}");
+        assert_eq!(f.lost_bytes, None, "counts are withheld, not invented");
+        assert_eq!(f.duplicated_bytes, None);
+        assert_eq!(f.first_defect_offset, None);
+        assert!(f.unaligned_bytes.unwrap() > 0);
+    }
+
+    /// **Insertion is not loss, and the vocabulary has a word for it.** Every
+    /// payload byte arrives exactly once and in order, with foreign bytes between
+    /// them — `lost` and `duplicated` are both zero and the class must not be
+    /// `displaced`, which would read as bytes going missing.
+    #[test]
+    fn p14_calls_interleaved_foreign_bytes_by_their_own_name() {
+        let payload = p14_payload(9_600, "ba", 1, 240);
+        let mut got = Vec::new();
+        got.extend_from_slice(&payload[..120]);
+        got.extend_from_slice(b"\x00\x00\x00\x00");
+        got.extend_from_slice(&payload[120..]);
+        let f = p14_failure_detail(&payload, &got, payload.len() as u64, false);
+        assert_eq!(f.class, P14FailureClass::Interleaved, "{f:?}");
+        assert_eq!(f.lost_bytes, Some(0), "{f:?}");
+        assert_eq!(f.duplicated_bytes, Some(0), "{f:?}");
+        assert_eq!(f.unaligned_bytes, Some(4), "{f:?}");
+    }
+
+    /// **The aligner's premise, measured rather than assumed** — and measured at
+    /// every ladder length, because that is the claim `P14_ALIGN_WINDOW`'s comment
+    /// makes. A repeated window would make every count above approximate, which is
+    /// why `expected_windows_unique` rides in the report.
+    #[test]
+    fn p14_payload_windows_are_unique_at_every_ladder_length() {
+        for baud in [9_600u32, 19_200, 115_200, 921_600, 3_000_000] {
+            let len = p14_payload_len(baud);
+            for dir in ["ab", "ba"] {
+                for trial in 0..P14_TRIALS_PER_DIRECTION {
+                    let payload = p14_payload(baud, dir, trial, len);
+                    let (_, _, unique) = p14_align(&payload, &payload);
+                    assert!(
+                        unique,
+                        "baud {baud} dir {dir} trial {trial}: repeated {P14_ALIGN_WINDOW}-byte window"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A clean round trip computes no edit script at all — the cost claim.
+    #[test]
+    fn p14_a_passing_trial_carries_no_failure_detail() {
+        let payload = p14_payload(115_200, "ab", 0, 2_880);
+        let (coverage, unaligned, unique) = p14_align(&payload, &payload);
+        assert!(coverage.iter().all(|c| *c == 1));
+        assert_eq!(unaligned, 0);
+        assert!(unique);
+        assert_eq!(
+            P14Failure::observations(None)["class"],
+            serde_json::Value::Null
+        );
+    }
+
     #[test]
     fn p14_ladder_is_a_ladder_and_its_open_end_is_computed_not_listed() {
         // The analogue of `p10_ladder_is_a_ladder`: a collapsed ladder — one
@@ -12029,6 +12471,7 @@ mod tests {
             byte_exact: true,
             hung_up: false,
             elapsed_us: 1000,
+            failure_detail: None,
         };
         assert_eq!(clean.failure(L), None);
 
@@ -12057,6 +12500,7 @@ mod tests {
             byte_exact: false,
             hung_up: false,
             elapsed_us: 1000,
+            failure_detail: None,
         };
         assert_eq!(corrupt.failure(L), Some(RungOutcome::Corrupt));
         // A hangup outranks both: the rig left, no rate was reached.

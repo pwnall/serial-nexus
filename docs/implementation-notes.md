@@ -13429,3 +13429,61 @@ not a coincidence to be mined: a self-skipped test still *passes*, so the count 
 is not. What moved is the number of distinct self-skip names — **105** at default scope, **92** on the
 CDC-ACM lane, **91** here — and even those are a floor, extracted as names because the anchored `^SKIP`
 count is unstable under `--nocapture` (notes §3.78/§3.101).
+
+### 3.119 The payload was never the problem: what P14 already knew and would not say
+
+**The question.** The operator asked whether P14's baud tests should use a battery of patterns —
+all-0, all-1, alternating, CSPRNG — to be *robust to various loss types*. The answer is that P14's
+payload was already sufficient for every loss type it can meet, and its **reporting** was not, so
+the repair is in the fold and not on the wire. Design §15.68 clause 6 carries it; plan §18 items
+97–98 carry what the reading turned up.
+
+**What decided it, measured rather than argued.** Three things, in the order they mattered.
+
+1. **The shipped payload is already a position tag.** `p14_payload`'s LCG tail is **8-gram-unique
+   at every ladder length** — 0 duplicate 8-byte windows at 240, 480, 2880 and 65536 bytes, now
+   asserted by `p14_payload_windows_are_unique_at_every_ladder_length` across both directions and
+   all three trials. So the expected byte at any offset is computable and every displacement is
+   localizable, with no change to what goes out.
+2. **Three of the four proposed patterns are blind to the defect that motivated the question.**
+   Under `contains_sub`, an all-zero or all-ones payload is satisfied by *any* delivery preserving
+   the count and the head, and `0x55`/`0xAA` is satisfied by every **even**-length displacement —
+   which is every size measured on the §15.68 bench. The fourth, a CSPRNG, adds nothing the LCG
+   lacks and costs the determinism §16.13 rests on.
+3. **Content has almost never decided anything here.** Across all 43 rung-bearing artifacts in
+   `docs/doctor/` — 699 rungs — the content comparison has decided a rung **3 times** and a ceiling
+   **zero** times. Every one of the 43 ceilings was set by a refusal or a stall. Those 3 are the
+   §15.68 bench's 19200 rung, which the shipped LCG caught on trial 1 of 1 in both directions.
+
+**Two corrections to this session's own first answer, recorded because the reasoning was wrong
+before it was right.** The lead called a constant-payload rung *"a gate that asserts nothing"* — the
+wrong register: such a rung still reddens on zero bytes, a short delivery, a garbled byte and a
+damaged head, and the zero-byte arms are precisely what set the CDC-ACM bench's ceiling. The right
+register is the neighbouring one, *an assertion weaker than the sentence a reader takes from it*.
+And the lead treated adding patterns as if it were substituting them: trials are **conjunctive** —
+`p14_direction` breaks on the first failing trial and the rung is the worse of the two directions —
+so an added constant trial cannot mask the LCG trial. The blindness argument blocks **substitution**
+and blocks **prose**, never addition; the decline rests on cost and a measured-zero benefit instead.
+
+**What the taxonomy buys, on the record's own numbers.** The macOS CDC bench (`bytes_sent: 375`,
+`bytes_received: 0`) and the Linux CDC bench (10240 written of a **65536**-byte payload) both print
+`unreliable-timed-out` today — a **silent link** and a **transmit-side stall**, two different facts
+under one word. They now read `silent` and `short-write`. The 19200 rung reads `displaced`,
+`lost_bytes: 32`, `duplicated_bytes: 32`, `first_defect_offset: 352` — §15.68 clause 3 stated by the
+instrument rather than by a standalone C program. And the FT232R bench's own ceiling rung, captured
+after the change, moved from `timed-out` to `starved`, `written: 37500`, `received: 37482`.
+
+**The fail-first proof found a hole in its own guards, which is the entry's most useful line.**
+Three defects were planted into the new code. Removing the `garbled` share reddened its guard;
+collapsing `interleaved` into `displaced` reddened its guard; **stopping the aligner from extending
+matched runs reddened nothing**, because a 32-byte displacement at offset 352 is window-aligned and
+the 8-byte tiling re-synchronises on its own. Every plant in the suite used a multiple of the window.
+A guard for a **33-byte** displacement at offset 349 was added, and that plant now reddens. The
+extension is only load-bearing off the window grid, and no amount of reading would have said so —
+AGENTS §3's remedy, applied to the guard's *stated* property, is what found it.
+
+**Scope of the proof, stated rather than implied.** The plants drive `p14_failure_detail` and
+`p14_align`, which is the same path `p14_trial` calls on every failure, with the payload the ladder
+really generates. They do **not** drive the poll loop above it: that loop is unchanged by this work
+and a pty-driven test of it would be Linux-only, since `serial2` answers `ENOTTY` on a pts. That
+limit is why item 98's validation is written to read the frame counters rather than the buffer.

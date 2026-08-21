@@ -31,6 +31,7 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 
 | Figure | Scope | Date | Commit / record | Caveat |
 |---|---|---|---|---|
+| **1007 passing · 0 failed · 7 ignored** | **macOS**, x86_64 Mac rig box, default CI scope, `--no-fail-fast` | 2026-08-21 | the P14 failure-taxonomy session (notes §3.119) | **The macOS authority row**, superseding the 1000 above. **The +7 is quotable because both ends were measured in this session** on this box: it is exactly this change's seven new P14 guards — the count-preserving displacement, the same displacement off the 8-byte window grid, the silent/short-write/starved separation, the garbled suppression, the interleaved class, the payload-window uniqueness sweep, and the passing-trial null. No product behaviour changed: `RungOutcome`'s six words are untouched, so no committed verdict moves. |
 | **1000 passing · 0 failed · 7 ignored**, **91 distinct self-skip names** | **macOS**, x86_64 Mac rig box, **FT232R 5-wire bench** (`BH00L4KU` ↔ `BH00LW9U`) — `SNX_CROSSOVER=required` `SNX_CROSSOVER_A`/`_B` **`SNX_RIG_FLOW=required`** `SNX_TLS=required` `SNX_WEB_UI=required` `SNX_EXEC_CODEC=required`, `--no-fail-fast`, `--nocapture` | 2026-08-21 | the Darwin CDC-ACM bench session's cable-move control (notes §3.118, design §15.68) | `3a39896`. **The first macOS lane to carry `SNX_RIG_FLOW=required`**, which became settable only because the handshake precondition now *measures* true on this bench. **Still not the documented lane** (AGENTS §3), which also spells `SNX_REPLUG=required` with two device paths — Linux-only here — so this is **the fullest lane macOS can run**, not a fully-spelled one. **The equality with the 1000 default-scope row above is not a delta and must not be mined as one**: a self-skipped test still passes, so the count is unchanged while the work is not; what moved is 105 → 91 distinct self-skip names. `crossover_rig_rts_crosses_to_the_far_ports_cts` **ran** here rather than self-skipping. Same tree and same session as the 997 · 3 · 7 CDC-ACM row — **the three failures there are a transport defect that this bench does not have**, measured by the same probe reading 128 of 128 distinct records with 0 lost and 0 duplicated (design §15.68 clause 3). |
 | **1000 passing · 0 failed · 7 ignored**, 129 test-result lines, **105 distinct self-skip names** | **macOS**, x86_64 Mac rig box, default CI scope, `--no-fail-fast`, `--nocapture` | 2026-08-21 | the Darwin CDC-ACM bench session (notes §3.117) | **The macOS authority row.** `3a39896`. **Not comparable test-for-test with any Linux row** — this box self-skips ~105 device- and Linux-gated tests against Linux's ~14 at the same scope (AGENTS §2). **No delta is quotable against the 2026-08-13 row below**: only this end was measured this session, and that row's own arithmetic does not close (item 94). The self-skip figure is a count of **distinct names**, never of anchored `^SKIP` lines — the same log reads **978** by `grep -cE '^test .* \.\.\. ok$'` and **1000** by summing its `test result:` lines, which is notes §3.78/§3.101's hazard reproduced. |
 | **997 passing · 3 failed · 7 ignored**, **92 distinct self-skip names** | **macOS**, x86_64 Mac rig box, **rig lane** — `SNX_CROSSOVER=required` `SNX_CROSSOVER_A`/`_B` `SNX_TLS=required` `SNX_WEB_UI=required` `SNX_EXEC_CODEC=required`, `--no-fail-fast`, `--nocapture` | 2026-08-21 | the Darwin CDC-ACM bench session (notes §3.117, design §15.68) | `3a39896`. **`SNX_RIG_FLOW` is dropped and `SNX_REPLUG` is dropped, so this is not the fully-spelled lane and is not quotable as one** — P5 reads no handshake on this bench and both flow modes are refused at `load`, and the replug lane is Linux-only (`itest/src/lib.rs:2773`). **The three failures are one platform defect seen three times**, not a regression: `crossover_rig_data_plane_send_and_exclusivity`, `crossover_rig_custom_baud_byte_exact` and `exclusive_write_lock_is_byte_exact`, each a SHA-256 mismatch reported as *bytes lost/reordered across the wire*. The transport loses a 32-byte block and delivers the next one twice at a constant byte count (design §15.68 clause 3), so **a length check passes all three** and plan §3's loss fingerprint `received + dropped_slow_consumer == sent` balances. **The guard is working; the bench cannot go green until the platform does.** |
@@ -3735,6 +3736,72 @@ any one of them wants its own evidence.
     `docs/`, never in a `.rs` file. Annotated at §15.62 rather than rewritten (AGENTS §5).
     *Validation:* the citation gate already scopes filename-keyed claims; a symbol-keyed one has no
     equivalent, and whether that is worth building is the item's real question.
+
+### Items 97–98 — filed by the P14 failure-taxonomy session (2026-08-21)
+
+Both arrived from one question the operator asked — *should P14's baud tests use a battery of
+patterns (all-0 / all-1 / alternating / CSPRNG) to be robust to loss types?* — whose answer turned
+out to be that P14's **payload** was already sufficient and its **reporting** was not. The
+taxonomy that answers it landed the same day (design §15.68 clause 6, notes §3.119). These two are
+what the reading around it turned up.
+
+97. **`P14_READ_SLACK`'s comment claimed units the code has never used, and a bound it does not
+    have** — **EXECUTED 2026-08-21** (notes §3.119). *Evidence:* the doc read "How many payload-
+    **lengths** of slack the reader accepts"; the code has always used it as **bytes**
+    (`payload.len() + P14_READ_SLACK`, `doctor/src/probes.rs`), which at the ladder's rungs differ by
+    four to five orders of magnitude. Second, the ceiling does not bound the received buffer the way
+    the test reads: `p5_read_result` returns up to **4096** bytes per call and the
+    `extend_from_slice` runs *before* the `got.len() >= ceiling` break, so `got` can reach
+    `payload.len() + 63 + 4095`. Items 83 and 84 are the same register — a constant's comment is a
+    claim about placement, and placement is what a reviewer's eye slides over.
+    *Fixed by correcting the comment, and the bound is **deliberately not tightened**:* every
+    committed capture was measured under the loose bound, a tighter one could truncate a haystack
+    `contains_sub` would have matched, and the looseness is harmless against a payload whose 8-byte
+    windows are unique. It stops being harmless the moment anyone judges a **constant** payload
+    there, which is recorded at the constant and is the second reason item 98's inlay must never
+    become the judgement.
+
+98. **The pattern-stimulus experiment — open, and it is the first thing to run when this project is
+    next on Linux** — **open** (M; **Linux-gated, and blocked on nothing else**). *Origin:* the
+    operator's battery proposal, accepted on its physical-stimulus half and declined on its
+    detection half.
+    *Why the detection half was declined, recorded so it is not re-proposed:* all-0 and all-1 are
+    blind to the entire insert/delete/reorder class under `contains_sub`, and 0x55/0xAA is blind to
+    every **even**-length member — which is every displacement size measured on the §15.68 bench.
+    A CSPRNG adds nothing measurable: the shipped LCG tail is **8-gram-unique at every ladder
+    length** (0 duplicate 8-byte windows at 240, 480, 2880 and 65536 bytes, asserted by
+    `p14_payload_windows_are_unique_at_every_ladder_length`), and a CSPRNG would cost the
+    determinism the doctor states as doctrine and make a failing capture unreproducible from its own
+    artifact (§16.13).
+    *What is accepted, and its shape:* **not four patterns × three trials** — that costs 4× airtime
+    and lands two committed benches at **87 %** and **97 %** of `P14_BUDGET`, whose exhaustion
+    returns `Degraded` and refuses to fold a ceiling **while `jq -e` still exits 0**, which is
+    AGENTS §3's tell arriving as a side effect of a feature. Instead **one inlaid stress inventory
+    inside the existing single payload**: a 12-byte `0x00` run, a 12-byte `0xFF` run, a 16-byte
+    `0x55/0xAA` alternation, LCG everywhere else, **plus position tags per record** — because a
+    low-entropy block destroys the 8-gram uniqueness the aligner depends on exactly where the stress
+    sits, so **tags and inlay ship together or not at all**. Identical airtime, identical trial
+    count, and every rung gets the stress on every trial instead of a quarter of them.
+    *Why Linux, and why it is not a formality:* the consequence of a line-coding stress is
+    `frame_delta` / `overrun_delta` / `parity_delta` via `TIOCGICOUNT`, which is Linux-only —
+    `ICOUNTS_SUPPORTED = cfg!(target_os = "linux")` — and every macOS capture reads
+    `icounts_measurable: false`. On Darwin the inlay would buy the stimulus with **no readout** and
+    be judged by `contains_sub` alone, which is the measurement not happening.
+    *The pre-registration, written now so it cannot be fitted afterwards:* **the prediction is that
+    the inlay will change nothing on a short TTL-level crossover.** 8N1 caps every intra-frame run
+    at 9 bits and the shipped LCG payload already reaches that cap at every rung ≥ 19200, so the
+    per-frame extremes are already stimulated; the only unreachable condition is the **sustained
+    multi-frame** one (0.888 low duty, or 0.887 transitions/bit held for 250 ms), which needs an
+    AC-coupled, opto-isolated, RS-232-transceiver or long-cable path to bite. **If the bench cannot
+    separate inlay from LCG, that is a measured decline and it is worth more than the untested one
+    this entry would otherwise leave behind** — design §13's rule that an axis must be able to vary,
+    applied to this item's own hypothesis.
+    *Cost that neither digest can see, and therefore owes a hand-announcement:* payload **bytes**
+    change while `probe_set` is `(id, question)` and `field_set` is observation *paths*, so a
+    landing would silently re-base `max_reliable_baud` across every committed artifact under an
+    unchanged digest pair. `docs/doctor/README.md` must say so in the same commit.
+    *Validation:* name, per inlaid block, a hypothesis whose prediction differs from the others', and
+    read the frame counters — replicates wearing a factor's name are not levels.
 
 ### Evaluated and deliberately not scheduled — the closing register
 

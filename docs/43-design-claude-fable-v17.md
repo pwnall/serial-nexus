@@ -5215,7 +5215,39 @@ clause 4 made those silent — so `ceiling_kind = "unreliable-timed-out"` is rea
 received **zero** bytes — which makes it the *correct* word for a genuine stall, and evidence
 **against** a payload account rather than for one, since the displacement defect classifies as
 `Corrupt` and not `TimedOut`. **`max_reliable_baud` on this bench is not this adapter's maximum rate**,
-and no wording in P14 can currently say so.
+and no wording in P14 could say so.
+
+**6. The instrument now says which of those two happened, and that is the repair this entry
+earned.** P14 *detected* both defects with the payload it already sends and could name neither: one
+word, `corrupt`, for a count-preserving displacement, and one word, `timed-out`, for both a silent
+link and a transmit-side stall. The evidence was in every committed report and the fold spent it.
+Each failing direction now carries a `failure_detail` object naming the shape —
+`short-write` / `silent` / `starved` / `displaced` / `interleaved` / `garbled` — with
+`lost_bytes`, `duplicated_bytes`, `first_defect_offset`, `matched_bytes`, `unaligned_bytes`,
+`read_window_saturated` and `expected_windows_unique`.
+
+**It needed no change to what P14 sends**, which is the finding underneath the repair: `p14_payload`'s
+LCG tail is **8-gram-unique at every ladder length** — 0 duplicate 8-byte windows at 240, 480, 2880
+and 65536 bytes — so the expected byte at any offset is already computable and every displacement is
+already localizable. **A battery of constant patterns would have been a step backwards** on exactly
+this axis: all-zero and all-ones are blind to the whole insert/delete/reorder class under
+`contains_sub`, and `0x55`/`0xAA` is blind to every even-length member, which is every displacement
+size measured on this bench. The stimulus half of that idea is real and is filed as plan §18 item 98,
+Linux-gated because its readout is `TIOCGICOUNT`.
+
+**Three properties are preserved deliberately, and each is asserted.** `RungOutcome`'s six words are
+untouched — the stall arms still fold to `TimedOut` and the displacement arms to `Corrupt` — so
+`ceiling_kind`, the ladder fold and every committed verdict are unmoved. The cost is on the failure
+path only, so a healthy rig pays nothing. And the vocabulary is closed **by the type** rather than by
+a sentence: plan §18 item 84 is the case against the other spelling, where a class table's closure
+was a comment enforced as *each word appears at least once* and a fourth word passed.
+
+**`probe_set` does not move** — `P14_QUESTION` already asks *"and what stopped the search"*, so a
+better stop-reason is an answer rather than a new question — and **`field_set` moves once**, which
+closes no era (§13's era law clause 4). The FT232R bench reads the difference immediately: its
+ceiling rung printed `timed-out` and now prints `starved`, `written: 37500`, `received: 37482` — a
+receive-side stall eighteen bytes short of a completed write, which is a different sentence from the
+one the CDC-ACM bench's `silent` rungs earn.
 
 ## 16. Post-completion review: reliability through simplification
 
