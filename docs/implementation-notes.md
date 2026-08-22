@@ -15839,7 +15839,7 @@ This box has no passwordless sudo — measured, `sudo -n true` → `sudo: intera
 required`, exit 1 — and the rootless fallback is closed too (`unshare --mount --map-root-user` →
 `write failed /proc/self/uid_map: Operation not permitted`). Their first run is CI's `packaging` job.
 **Item 31 therefore stays open, and its remainder is one green root-arm run plus four one-line class
-edits.** The README rows read `measured (…)` for the halves that are measured and `unverified (…)`
+edits.** *(That run is CI 32551538826, 2026-08-22, and the item is closed — §3.151.)* The README rows read `measured (…)` for the halves that are measured and `unverified (…)`
 for what those probes will show, each naming its guard and saying the arm has not yet run it. Citing
 a run that has not happened is the same defect as a measurement nobody took, and item 31's own
 sequencing — land self-skipping, flip after a green run — is the precedent.
@@ -15869,7 +15869,7 @@ the host immediately before starting the unit and the payload must report it **`
 reads `tmp_sentinel=visible`, and adding `PrivateUsers=yes` changes neither reading. The **passing**
 arm has been measured on no machine anywhere, and the first green root-arm run should be read as its
 real fail-first proof: if it comes back `visible`, that is a finding about the runner, not a probe
-defect.
+defect. *(Answered 2026-08-22 on CI 32551538826: `hidden`, with `home_entries=0` — §3.151.)*
 
 ***The second trap is the same mistake in different clothes, and no amount of reading the code would
 have shown it.*** The generated probe payload was dumped from the real function and executed under
@@ -15891,7 +15891,12 @@ the correct edit.** Repaired by deriving every plant from the recipe the parser 
 to a source line *inside* the block — a bare needle also matches the prose above it, and a plant that
 lands in prose reddens nothing, which reads exactly like a gate that does not bite. Ten plants now,
 both arms measured: consistent rename green with each plant still reddening, half-rename red from
-either side.
+either side. **(Eleven, corrected 2026-08-22 — §3.151.** This sentence and `packaging/README.md`'s
+socket-group row both read *ten* until then; the array is `[(&str, String, String); 11]` and the test
+prints the count each run. The eleventh — *"the unit's `RuntimeDirectory=` moved and the recipe's stat
+did not follow"* — was added later in this same session, and its own comment records why: with the
+tie it covers disabled, the test stayed green and still printed `10 plants … each reddened`, which is
+a new check arriving with no plant of its own.**)
 
 **A sibling in the same sweep: the recipe's verification `stat` was checked only for shape** — a
 directory and something inside it, which two invented paths satisfy as well as the real ones. It is
@@ -16127,3 +16132,100 @@ which items happen to be open. This was the same fusion **with no assertion arou
 the two claims it meant. **A gate that hard-codes how much work is open is asserting a property of the
 project's schedule, not of its code — and completing work is what exposes it.** The tell is that its
 failure arrives on a green change, and the instruction it prints cannot be followed.
+
+### 3.151 A green job is not evidence that a gated test ran — item 31's root arm, read from two arms
+
+Plan §18 item 31's remainder was *one green root-arm run plus the four one-line class edits that run
+licenses* (§3.148). **CI run 32551538826 is that run**: workflow `CI`, job `packaging`, 2026-08-22
+04:22–04:24Z, commit `582c65f`, image `ubuntu-24.04` `20260816.277.1`, `PID 1:  systemd`,
+`uid:    1001   sudo: passwordless`, systemd 255 (255.4-1ubuntu8.17). The whole run was green. The
+root arm read `test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` in
+2.17 s, with a `MEASURED` line from each of the five root-gated probes — four of which §3.148 had
+recorded as having executed on **no machine anywhere**. AGENTS §7's citation discipline is written
+for *kernel* claims — a committed `docs/doctor/` report with its commit and date, never a terminal
+scrollback — and this is not one, so there is no such artifact to cite. The record here is the CI log
+itself, which is a legitimate citation for a CI-executed measurement precisely because it is
+addressable and re-readable; it is named by run id, job, date and commit rather than reduced to a
+bare number.
+
+**The finding worth recording is not that it passed.** A green job is not evidence that a gated test
+*ran*, and this job is the cleanest available demonstration because it runs the same test binary
+twice. In the **unprivileged** step (`SNX_PACKAGING=required`) libtest printed, under `--nocapture`:
+
+    SKIP dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown: effective uid
+      is 1001, not 0. Without root, `systemd-run` answers `Access denied … requires interactive
+      authentication` (polkit), and the rootless fallback is closed too: `unshare -Ur` is refused
+      with `write failed /proc/self/uid_map: Operation not permitted`
+    SKIP the_packaged_sandbox_starts_the_daemon_and_it_serves: <the same reason>
+    SKIP the_socket_group_recipe_hands_the_runtime_directory_to_the_operators_group: <same>
+    SKIP the_socket_group_recipe_widens_the_control_socket_to_the_operators_group: <same>
+    SKIP the_upgrade_procedures_root_copy_carries_the_snapshot_across: <same>
+    test result: ok. 13 passed; 0 failed; 0 ignored
+
+In the **root** step (`sudo -n env SNX_PACKAGING_ROOT=required "$BIN" --nocapture --test-threads=1`)
+those same five names printed `MEASURED`, zero `SKIP` lines appeared, and the totals were
+**identical**: `13 passed; 0 failed; 0 ignored`. (The five skip reasons are byte-identical to each
+other, which is why four are elided above.) So the job's conclusion is the same either way, the arm's own totals are the same either
+way, and the only reading that separates a measurement from a self-skip is **the two arms held
+against each other by name**. That is AGENTS §3's tell — *the passing output is identical to the
+not-running output* — with the subject moved from writing a gate to **reading** one's output, and it
+is a register the §3 list did not carry: every instance there is a gate that asserts nothing, and
+this is a gate that asserts plenty, read through a signal that cannot see whether it did.
+
+`SNX_PACKAGING_ROOT=required` is the half of this that is a guard rather than a reading: it makes the
+root arm's skip a red lane instead of a quiet pass, so the discrimination above is enforced and not
+merely observed. The observation is still worth taking each time, because the variable only defends
+the arm that sets it — nothing makes the *unprivileged* arm's five skips mandatory, and if that arm
+ever stopped skipping them the two arms would agree for the wrong reason.
+
+**What the four probes read.** The socket-group recipe's own
+`groupadd --system console-operators` + `useradd --system --no-create-home --shell
+/usr/sbin/nologin --gid console-operators --groups dialout serial-nexus` produced
+`dir_stat="serial-nexus console-operators 750"` and `sock_stat="serial-nexus console-operators 660"`,
+each equal to the prediction the unit's own comment block writes, with the daemon serving `state` and
+shutting down cleanly under it. The `SupplementaryGroups=` control put the operators' group in the
+service's group list (`groups="snx-pkg-sockgrp-4200-shared,dialout,console-operators"`) and **not** on
+the runtime directory (`dir_stat="… 700"`) — the pair §3.148 argued for, since either reading alone is
+consistent with the wrong story. The packaged sandbox started the real daemon at `uid=64349`: the
+host `/tmp` sentinel read **hidden** and `home_entries=0`, so the mount namespace was built — which is
+the positive control §3.148 wrote and could not run. It came back `hidden` rather than `visible`, so
+a real root manager does build the namespace the `systemd-run --user` rehearsal silently did not.
+The daemon bound, answered `state` in 1 × 50 ms, and exited 0 on `shutdown`. And the upgrade
+procedure ran step by step through `state_real="/var/lib/private/snx-pkg-upgrade-4200"` — the
+root-only indirection the procedure exists for — with the root `cp` keeping uid 63062 and mode `600`
+and the second start reporting nodes `"carried,"` and not the seed's.
+
+**The four class cells, and what was deliberately not flipped.** `packaging/README.md`'s socket-group
+row, hardening row and operators-group paragraph move to **measured**, each cell naming run
+32551538826, 2026-08-22, `582c65f` and **one `ubuntu-24.04` runner image** — the scope, because a
+recipe executed on one image is measured *there* and says nothing about another distro. The upgrade
+row splits: its `/var/lib/private` path and its three steps under the packaged `[Service]` properties
+are **measured**, and its `systemctl` verbs stay **unverified** *against an installed unit*, because
+no probe here copies the unit into `/etc/systemd/system`, reloads, or starts it by name — a bound
+`p8_packaging.rs`'s module doc already states, for the stated reason that installing the unit would
+overwrite a real deployment's. That clause is not an owed measurement and is not routed anywhere; it
+is the class its evidence warrants, which is what item 31 asked each row to carry. The evidence-row
+gate's tally moves `{"man-page": 10, "measured": 22, "unverified": 4}` →
+`{"man-page": 10, "measured": 26, "unverified": 2}`, the surviving two being the legend row and that
+clause.
+
+**Two stale figures found beside the flip, both by running the command rather than by reading.** The
+socket-group row and §3.148 above both say *ten plants*; `the_socket_group_recipe_agrees_with_itself`
+prints **11**, and the array is `[(&str, String, String); 11]`. The eleventh — *"the unit's
+`RuntimeDirectory=` moved and the recipe's stat did not follow"* — was added later in the same
+session, for the reason its own comment records: a new check had arrived with no plant of its own,
+and the test stayed green while still printing `10 plants … each reddened`. The README row is
+corrected to eleven; §3.148's sentence is annotated in place rather than rewritten. And the plan's
+2026-08-21 rig-lane Status row read *"None of the five has executed anywhere yet"* in the present
+tense; it is repaired to say what was true at that row's date, with this run named and **no delta
+derived across the two** — different box, different scope.
+
+**A sibling in the same pass, recorded because its shape is the same and it is still true.** Plan §18
+item 107 (the Playwright floors) is EXECUTED, and one of its three repairs — the `@slow` floor the
+per-push lane structurally *cannot* satisfy — has executed nowhere. `web-ui-nightly` runs only on
+`github.event_name == 'schedule'` or a hand-started `workflow_dispatch`, and the last scheduled run
+was 32455093660 (2026-08-21T06:36Z, `432aa0c`), six commits behind `582c65f`, the first commit to
+carry `SPECS_TOTAL` at all. Its figures were measured by hand on this box with `SNX_UI_SLOW=1`, which
+is a different thing from a lane having gated on them. Item 31's entry had been careful to say this
+about its own root assertions and item 107's had not; it says it now. **A fix that lands
+self-skipping is not yet a guard, and an entry that does not say so reads as though it were.**

@@ -41,7 +41,7 @@ cites the table. The figures restate the v15 record exactly, with its scopes, da
 | Figure | Scope | Date | Commit / record | Caveat |
 |---|---|---|---|---|
 | **1145 passing · 0 failed · 7 ignored**, exit 0, over 127 cargo targets | Linux, default CI scope, `--no-fail-fast`, box load 3.72 | 2026-08-21 | the loose-end inventory session, on the tree this commit lands (notes §3.125–§3.150) | **The Linux authority row.** **The +56 over the 1089 baseline row below is quotable because both ends are this session on this box** — Linux 7.0.0-30, 20 cores — the baseline taken at `800915b` before anything moved and this figure on the settled tree, at loads 2.4 and 3.7. **It is not "+56 of guards": product behaviour moved in four places** — the pattern wait gained a stated occupancy maximum (item 64(a)), the console stopped repainting the graph page on every snapshot (item 91), the privileged helper stopped exec-ing anything (item 103), and the stdin-EOF leash became one implementation across three binaries (item 79). ***No per-target split is derived, and that is a decision rather than an omission.*** Each item measured its own contribution against its own intermediate tree while other lanes were editing; one target moved in **both** directions; and the per-item readings do not sum to +56. **The remainder is undecomposed, and a later session wanting a per-binary delta must re-measure rather than subtract.** This row replaces a **1120** reading that was carried here marked *owed a re-measurement* — correct when taken, and not a statement about any tree that committed, because the ledger's item heads were non-contiguous at that moment and a concurrent lane was still editing `doctor/`, `expectations/`, `packaging/` and `ci.yml`. It was left standing rather than replaced by an invented figure (AGENTS §7 and rule 19 both forbid the substitute) and is overwritten here by the run it was waiting for. |
-| **1145 passing · 0 failed · 7 ignored**, exit 0, **5 distinct self-skip names** | Linux, **the fully-spelled documented rig lane** — `SNX_CROSSOVER=required` `SNX_REPLUG=required` `SNX_TLS=required` `SNX_RIG_FLOW=required` `SNX_WEB_UI=required` `SNX_EXEC_CODEC=required`, both `SNX_CROSSOVER_A`/`_B` and both `SNX_REPLUG_DEV`/`_DEV_B`, `--no-fail-fast --nocapture`, box load 7.34 | 2026-08-21 | the loose-end inventory session, same tree and same session as the authority row above | **The documented lane at the tree this commit lands, exit 0, on the FT232R 5-wire bench** (`BH00L4KU` ↔ `BH00LW9U`; P5 measured `5-wire crossover: RTS/CTS both ways, DTR moves nothing`, all six DTR crossings `false`, so **item 28 stays blocked for a sixth cabling**). All twelve hardware tests ran and passed — the four replug tests including `identity_survives_a_replug_that_renumbers_the_tty`, the whole `crossover_rig_*` set, `crossover_rig_rts_crosses_to_the_far_ports_cts` under `SNX_RIG_FLOW=required`, and `xon_xoff_is_refused_at_load_exactly_where_the_driver_drops_it` — and the blessed `grant` verb was exercised for real across re-enumeration. **Equal in count to the default-scope row above at the same tree in the same session, which is plan §18 item 30's dual-scope measurement**, and no delta is derived across the two scopes. **The self-skip count rises 1 → 5 against the previous documented lane, and every one of the four new names is root-gated**: item 31 added four root-arm tests this session, so the rise is the item landing rather than coverage lost — `the_packaged_sandbox_starts_the_daemon_and_it_serves`, both socket-group recipe tests and the upgrade-procedure test, beside the original `dynamic_user_state_directory…`. **None of the five has executed anywhere yet**; `sudo -n true` exits 1 on this box and their first run is a CI runner. |
+| **1145 passing · 0 failed · 7 ignored**, exit 0, **5 distinct self-skip names** | Linux, **the fully-spelled documented rig lane** — `SNX_CROSSOVER=required` `SNX_REPLUG=required` `SNX_TLS=required` `SNX_RIG_FLOW=required` `SNX_WEB_UI=required` `SNX_EXEC_CODEC=required`, both `SNX_CROSSOVER_A`/`_B` and both `SNX_REPLUG_DEV`/`_DEV_B`, `--no-fail-fast --nocapture`, box load 7.34 | 2026-08-21 | the loose-end inventory session, same tree and same session as the authority row above | **The documented lane at the tree this commit lands, exit 0, on the FT232R 5-wire bench** (`BH00L4KU` ↔ `BH00LW9U`; P5 measured `5-wire crossover: RTS/CTS both ways, DTR moves nothing`, all six DTR crossings `false`, so **item 28 stays blocked for a sixth cabling**). All twelve hardware tests ran and passed — the four replug tests including `identity_survives_a_replug_that_renumbers_the_tty`, the whole `crossover_rig_*` set, `crossover_rig_rts_crosses_to_the_far_ports_cts` under `SNX_RIG_FLOW=required`, and `xon_xoff_is_refused_at_load_exactly_where_the_driver_drops_it` — and the blessed `grant` verb was exercised for real across re-enumeration. **Equal in count to the default-scope row above at the same tree in the same session, which is plan §18 item 30's dual-scope measurement**, and no delta is derived across the two scopes. **The self-skip count rises 1 → 5 against the previous documented lane, and every one of the four new names is root-gated**: item 31 added four root-arm tests this session, so the rise is the item landing rather than coverage lost — `the_packaged_sandbox_starts_the_daemon_and_it_serves`, both socket-group recipe tests and the upgrade-procedure test, beside the original `dynamic_user_state_directory…`. **None of the five had executed anywhere at this row's date**; `sudo -n true` exits 1 on this box, and their first run was CI run 32551538826's root arm on 2026-08-22, where all five read `MEASURED` (plan §18 item 31, notes §3.151). That run does not move this row: it is a different box at a different scope, and no delta is derived across the two. |
 | **1089 passing · 0 failed · 7 ignored** | Linux, default CI scope, `--no-fail-fast` — the tree at **`800915b`**, built and run on this box in the same session as the row above | 2026-08-21 | the loose-end inventory session's baseline measurement | **taken solely to make the row above's delta quotable under rule 19**, which requires one session to measure both ends. Not an authority row, and superseded immediately by the row above. It reads the same count as the `dc49dfb`+ row below it, which is an **observation about two commits at default scope and not a derivation** — that row is a different session's measurement, and no delta is derived across the pair. |
 | **1089 passing · 0 failed · 7 ignored**, **1 distinct self-skip name** | Linux, **the fully-spelled documented rig lane** — `SNX_CROSSOVER=required` `SNX_REPLUG=required` `SNX_TLS=required` `SNX_RIG_FLOW=required` `SNX_WEB_UI=required` `SNX_EXEC_CODEC=required`, both `SNX_CROSSOVER_A`/`_B` and both `SNX_REPLUG_DEV`/`_DEV_B`, `--no-fail-fast --nocapture`, box load 0.77 | 2026-08-21 | the item 101 session, at `6e6dcd0` after the operator's re-bless (notes §3.124) | **The documented lane at the current tree, exit 0.** All twelve hardware tests ran and passed; the single self-skip is the root-only packaging test. **This is the row the 1088 lane below was reaching for**, and the difference between them is not the bench but item 101 — the earlier lane dropped `SNX_REPLUG` on a misread `Stale`. The re-bless it needed was real by then, because item 101's own fix changed `devprep/`: §15.45's design, and the *legitimate* `Stale` the same item makes legible. Equal in count to the default-scope row at the same tree. |
 | **1089 passing · 0 failed · 7 ignored** | Linux, default CI scope, `--no-fail-fast` | 2026-08-21 | the item 92–96/98 session after item 101, at `dc49dfb`+ (notes §3.124) | **superseded by the 1120 row above**, which is the loose-end inventory session's reading of a later tree. Was the Linux authority row when taken. The **+1** over the 1088 row below is one guard — `only_the_unblessed_state_is_advised_to_reach_for_privilege` — and it is quotable because both ends are this session, minutes apart, on this box. Item 101 also changed `devprep/`, so **`.snx-bin/` is now genuinely stale and a re-bless is owed** before the replug lane can be re-run: that is §15.45's design working, and it is the *legitimate* `Stale` the same item makes legible. |
@@ -1813,11 +1813,11 @@ Each item below uses the schema with its fields inline.
     equivalence has no reconcilable measurement at *any* era. *Validation:* one dual-scope run
     at the current era; both figures land in the plan Status table with their scopes named, and
     no delta is derived across them (plan §3's figure-scope rule).
-31. **The packaging evidence pass** — **open**, and **re-scoped 2026-08-12** from "needs a root
-    box" to "needs a root box *for one half*, and a CI job for the regression guard". The
-    re-scope is a decision about where the evidence lives: a measurement taken once on a
-    maintainer's laptop is not a regression guard, and the whole point of this item is claims whose
-    evidence class nobody can see.
+31. **The packaging evidence pass** — **EXECUTED 2026-08-22** (CI run 32551538826's root arm,
+    notes §3.151), and **re-scoped 2026-08-12** from "needs a root box" to "needs a root box *for
+    one half*, and a CI job for the regression guard". The re-scope is a decision about where the
+    evidence lives: a measurement taken once on a maintainer's laptop is not a regression guard,
+    and the whole point of this item is claims whose evidence class nobody can see.
     *Executed 2026-08-12: (a) and (b) in full, (c) built and self-skipping.* The README gained an
     **Evidence classes** section — a three-class vocabulary, a per-directive table for the unit and
     a per-claim table for the page, covering all **41 active directives**. Several claims moved
@@ -1842,12 +1842,12 @@ Each item below uses the schema with its fields inline.
     `private_stat=root:755` — and both halves of Claim 4 hold, so PKG-2's `DynamicUser`
     id-mapped-mount behaviour is **measured** and the step gates rather than reports. It took
     five successive probe defects to get there, none of them the packaged unit's, which is item
-    68's record and the reason that item exists separately from this one. *Remaining:* the four
-    `unverified` rows, whose machinery the root arm already has.
+    68's record and the reason that item exists separately from this one. *Remaining at that
+    date:* the four `unverified` rows, whose machinery the root arm already has.
     **The four `unverified` rows got their machinery on 2026-08-21 (notes §3.148), and the item
-    stays open, because none of it has run anywhere yet.** The root arm no longer only measures what
-    `DynamicUser=` does to a directory: it *executes the two recipes this repository prints for an
-    operator, each from the file that prints it*. The socket-group recipe is a comment block in
+    stayed open for a day, because until 2026-08-22 none of it had run anywhere.** The root arm no
+    longer only measures what `DynamicUser=` does to a directory: it *executes the two recipes this
+    repository prints for an operator, each from the file that prints it*. The socket-group recipe is a comment block in
     `packaging/serial-nexus-daemon.service` — its `groupadd`/`useradd` lines run verbatim but for
     the `sudo` the step already has, its static-identity directives are applied to the packaged
     properties, and both `stat` lines it predicts are checked. The upgrade procedure is
@@ -1867,15 +1867,15 @@ Each item below uses the schema with its fields inline.
     arm carry `if: ${{ !cancelled() }}`, and the arm keys on the **build** rather than on the
     unprivileged gate above it, so neither of the two signals can hide the other — notes §3.77's
     harm applied where it had not been.
-    ***What is emphatically not claimed: that any of this is measured.*** Every assertion added
-    here has executed on **no machine**. This box cannot take the measurement — `sudo -n true`
-    exits **1** with `sudo: interactive authentication is required` — so the first execution of all
-    four root-gated probes will be on a runner, and `SNX_PACKAGING_ROOT=required` is what turns a
-    skip there into a red lane rather than a quiet pass. `packaging/README.md`'s four rows say the
-    same thing in their own cells (*"has not yet had a run there"*) and each states what would move
-    it to plain **measured**: the run, cited. **So this item stays open, and its remainder is one
-    green root-arm run plus the four one-line class edits that run licenses** — the same sequencing
-    §15.52 made a rule and item 68 paid for: the gate lands self-skipping with its reason printed,
+    ***What was emphatically not claimed at that filing: that any of it was measured.*** Every
+    assertion added there had executed on **no machine**. This box cannot take the measurement —
+    `sudo -n true` exits **1** with `sudo: interactive authentication is required` — so the first
+    execution of all four root-gated probes would be on a runner, and `SNX_PACKAGING_ROOT=required`
+    is what turns a skip there into a red lane rather than a quiet pass. `packaging/README.md`'s
+    four rows said the same thing in their own cells (*"has not yet had a run there"*) and each
+    stated what would move it to plain **measured**: the run, cited. **So the item stayed open, and
+    its remainder was one green root-arm run plus the four one-line class edits that run
+    licenses** — the same sequencing §15.52 made a rule and item 68 paid for: the gate lands self-skipping with its reason printed,
     and only a green run turns the claim. Two further readings from that pass are recorded at notes
     §3.148 as *refuted evidence* rather than dropped, and both are AGENTS §3's tell with the subject
     changed from a gate to a sandbox: a `systemd-run --user` rehearsal reported success while
@@ -1883,6 +1883,46 @@ Each item below uses the schema with its fields inline.
     probe's first anti-vacuity reading — `home_entries == 0` under `ProtectHome=yes` — prints 0 for
     an empty `/home` and for no `/home` at all, replaced by a planted sentinel the payload must
     report **hidden**.
+    **The run is the push that landed the machinery: CI run 32551538826, `packaging` job,
+    2026-08-22, commit `582c65f`** — the same commit the paragraph above describes (notes §3.151). Image `ubuntu-24.04` `20260816.277.1`, `PID 1:  systemd`,
+    passwordless sudo, systemd 255 (255.4-1ubuntu8.17) — **one runner image and one systemd
+    version**, which is the scope every cell edited below now names, because a recipe executed on
+    one image is measured *there* and says nothing about another distro. The root arm read
+    `test result: ok. 13 passed; 0 failed; 0 ignored` with a `MEASURED` line from each of the five
+    root-gated probes, four of which had executed on **no machine** before it. What they read: the
+    socket-group recipe's own `groupadd`/`useradd` produced `dir_stat="serial-nexus
+    console-operators 750"` and `sock_stat="serial-nexus console-operators 660"`, each equal to the
+    prediction the unit's comment block writes, with the daemon serving `state` and exiting cleanly
+    under it; the `SupplementaryGroups=` control put the operators' group in the service's group
+    list (`groups="…,dialout,console-operators"`) and **not** on the directory (`dir_stat="… 700"`),
+    which is the pair the paragraph's premise needs and which neither reading gives alone; the
+    packaged sandbox started the real daemon — the host's `/tmp` sentinel read hidden and
+    `home_entries=0`, so the mount namespace was built — and answered `state` in 1 × 50 ms; and the
+    upgrade procedure ran step by step through `state_real="/var/lib/private/snx-pkg-upgrade-4200"`,
+    its root `cp` keeping uid and mode `600` and the second start reporting nodes `"carried,"` and
+    not the seed's. `packaging/README.md`'s four rows are edited to match, each cell naming **run
+    32551538826, 2026-08-22, `582c65f`, one `ubuntu-24.04` runner image**; one stale figure beside
+    them is corrected in the same pass, the socket-group row's *"ten plants"* against the eleven the
+    gate itself prints.
+    **One clause of one row stays `unverified`, and it is a stated bound rather than a debt.** The
+    upgrade row's `systemctl` verbs are unmeasured *against an installed unit*: every probe hands
+    the packaged `[Service]` directives to `systemd-run` as transient properties and none copies the
+    unit into `/etc/systemd/system`, reloads, or starts it by name — which `p8_packaging.rs`'s
+    module doc already lists under *what this gate provably does not catch*, for the stated reason
+    that a probe installing the unit would overwrite a real deployment's. `[Install]`, `Type=`,
+    `Restart=`/`RestartSec=` and `ExecStart=`'s `/usr/local/bin/` path are outside every measurement
+    here for the same reason and are classed **man-page**, which is the right class for them. So
+    nothing is routed onward: each row now carries the class its evidence warrants, which is the
+    whole of what this item asked for.
+    ***The finding is not that it passed.*** A green job is not evidence that a gated test ran.
+    Both arms of this job ended `test result: ok. 13 passed; 0 failed; 0 ignored`, and the
+    **unprivileged** arm reached that total having printed `SKIP` for exactly the five root-gated
+    names the root arm printed `MEASURED` for — so neither the run's conclusion nor the root arm's
+    own totals separate a measurement from a self-skip, and only the two arms read against each
+    other do. That is AGENTS §3's tell (*its passing output is identical to its not-running
+    output*) with the subject moved from writing a gate to **reading** one's output, and
+    `SNX_PACKAGING_ROOT=required` is the half of it that is a guard rather than a reading: it is
+    what makes the root arm's skip a red lane instead of a quiet pass.
     *Two live citations of this arm are stale, measured at this tree and repaired in neither, the
     file not being this lane's.* `docs/vmcell-requirements.md:17` routes item 31's root-needing work
     to `` `.github/workflows/ci.yml:399`–`:410` `` and `:740` cites `` `:419`–`:428` `` for the
@@ -5329,7 +5369,17 @@ from a deliberate change.
      slow lane, with the `@slow` count asserted directly as the slow lane's own so the two lanes can
      never again hold each other to the same number. That last floor is one the per-push lane
      **cannot** satisfy however green it is: its `--grep-invert @slow` leaves the same listing at
-     zero. *The `@device` tag is now the roster, and its matcher is asserted rather than assumed.*
+     zero. ***And for exactly that reason it has executed nowhere.*** `web-ui-nightly` runs only on
+     `github.event_name == 'schedule'` or a hand-started `workflow_dispatch`, never on a push, and
+     the last scheduled run was 32455093660 (2026-08-21T06:36Z, `432aa0c`), six commits behind
+     `582c65f`, which is the first commit to carry `SPECS_TOTAL` at all. So the `@slow` assertion —
+     the one repair of the three that the per-push lane structurally cannot reach — will first run
+     on a future scheduled build; every figure above was measured by hand on this box with
+     `SNX_UI_SLOW=1`, which is a different thing from a lane having gated on it. Item 31's entry
+     states the same distinction about its own root assertions, and the reason is the same: **a fix
+     that lands self-skipping is not yet a guard, and an entry that does not say so reads as though
+     it were.**
+     *The `@device` tag is now the roster, and its matcher is asserted rather than assumed.*
      Every device-gated spec carries `@device` beside the `test.skip(!ECHO, …)` / `test.skip(!HOSE,
      …)` guard it already ran — the same statement made twice on purpose, one readable *before* the
      run and one *at* it — and the device-free arm asserts the two agree, so a device-gated spec
