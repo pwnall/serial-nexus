@@ -7866,12 +7866,13 @@ enum WireReading {
     /// one a reviewer read (AGENTS §3's register). The bench that motivates the
     /// probe needs no tolerance at all: the FT232R pair delivers **0 of 1024**
     /// under backpressure in both directions across three captures
-    /// (`docs/doctor/linux-7.0-2026-08-21-800915b-dirty-wireflow-tier3{,-2,-3}.json`
-    /// — the `-dirty-` is `doctor/build.rs`'s stamp for a binary built from a tree
-    /// with uncommitted changes, unavoidable for a capture whose instrument was that
-    /// session's own in-flight change, and it costs the comparability ladder's rung 2
-    /// (*same binary*, §13) rather than the reading; the full note is at
-    /// [`WireFacts`]), so zero is what
+    /// (`docs/doctor/linux-7.0-2026-08-22-4125348-tier3{,-2,-3}.json`, three
+    /// sequential runs of one **clean-stamped** build — `build.commit`
+    /// `412534867464`, no `-dirty` — on the `BH00L4KU` ↔ `BH00LW9U` pair, P5
+    /// reading `5-wire crossover: RTS/CTS both ways, DTR moves nothing`. The
+    /// superseded `…-2026-08-21-800915b-dirty-wireflow-tier3{,-2,-3}.json` triple
+    /// read the same 0 of 1024 on the same bench and is kept rather than deleted;
+    /// what its stamp denied is at [`WireFacts`]), so zero is what
     /// the hardware of record measures and zero is what the code now requires. Nothing is refused on any of these words (§7.1 clause 2), so
     /// a stricter rule can only change a sentence in a report — never a lane.
     PartlyGated,
@@ -7931,33 +7932,38 @@ impl WireReading {
 /// bench is in front of you (§9).
 ///
 /// **Exactly one arm has been read off hardware**: the FT232R pair's `gated`
-/// (`docs/doctor/linux-7.0-2026-08-21-800915b-dirty-wireflow-tier3{,-2,-3}.json`).
+/// (`docs/doctor/linux-7.0-2026-08-22-4125348-tier3{,-2,-3}.json`).
 /// Every other arm — `inert` included — has executed under a fixture and on no
 /// bench. *(This doc claimed "the two arms this record can cite — the FT232R's
 /// `gated` and the CDC-ACM capture's `inert`" until 2026-08-21. No such capture
 /// exists: the CDC-ACM bench was measured 2026-08-16/17, before this cell existed,
-/// and no artifact in `docs/doctor/` carries a `wire_flow_control` block
-/// other than the three named above. §15.62's inert *finding* is real and was taken
-/// with a bespoke 2×2 in that session, not with this instrument — which is the
-/// distinction the sentence erased.)*
+/// and the only artifacts in `docs/doctor/` carrying a `wire_flow_control` block
+/// are the six named in this doc — the three above and the three superseded ones
+/// below, two cells each, both triples off this one bench. §15.62's inert
+/// *finding* is real and was taken with a bespoke 2×2 in that session, not with
+/// this instrument — which is the distinction the sentence erased.)*
 ///
-/// **The `-dirty-` in those three filenames is a provenance statement, and it is
-/// stated here rather than left to pass unremarked.** `doctor/build.rs` stamps
-/// `<sha>-dirty` whenever the tree the binary was built from carried uncommitted
-/// changes, and all three carry `800915bf4078-dirty`. It is unavoidable for a
-/// capture taken by a *new* instrument: the reading and the code that takes it
-/// cannot both be committed first, so the only clean-stamped capture of this cell
-/// is a re-capture after the fact, and taking one is what retires the caveat. What
-/// the stamp denies meanwhile is the comparability ladder's rung 2, **same binary**
-/// (§13) — nothing may be diffed against another capture on the strength of the
-/// build string, and the ladder says that rung has to be claimed in prose because
-/// no fingerprint can state it (§15.44). The `8c00078-dirty` rows in
-/// `docs/doctor/README.md` record the same limitation and the remedy they used,
-/// which was to state a scoped source diff instead. What the stamp does **not**
-/// touch is the reading itself, which is three sequential runs of one bench. The
-/// three files land committed in the same commit as this line, which is what
-/// AGENTS §7 requires of a cited artifact; a citation written before that commit
-/// exists is owed rather than paid.
+/// **The caveat this paragraph used to carry is paid, and the paid form is worth
+/// more than the deletion would be.** The cell was first read on
+/// `docs/doctor/linux-7.0-2026-08-21-800915b-dirty-wireflow-tier3{,-2,-3}.json`,
+/// stamped `800915bf4078-dirty` — `doctor/build.rs` stamps `<sha>-dirty` whenever
+/// the tree the binary was built from carried uncommitted changes, which is
+/// unavoidable for a capture taken by a *new* instrument, since the reading and
+/// the code that takes it cannot both be committed first. That stamp denied the
+/// comparability ladder's rung 2, **same binary** (§13) — nothing may be diffed
+/// against another capture on the strength of the build string, and the ladder
+/// says that rung has to be claimed in prose because no fingerprint can state it
+/// (§15.44). The remedy the doc named was a re-capture after the fact, and the
+/// `2026-08-22` triple above **is** it: same bench, same cabling, `build.commit`
+/// `412534867464` with no `-dirty`, `probe_set` unchanged at `4317ea5ac187f506`
+/// so **no era closes**. The superseded three are kept rather than deleted, as the
+/// `8c00078-dirty` rows in `docs/doctor/README.md` are kept: what a `-dirty-` stamp
+/// denies is a rung of the ladder, never the reading. **They also predate the
+/// `released_intact` field below**, which the final repair round
+/// added after they were taken — the one added observation path per port, `field_set`
+/// `9a75a9f83a83a617` → `b73dba8f32301a84` — so they license 1024 bytes back and
+/// the clean triple licenses the *payload's own continuation* back. Cite the clean
+/// triple for anything that rests on the content half.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WireFacts {
     payload: u64,
@@ -12576,10 +12582,14 @@ mod tests {
     /// here rather than on whichever bench is plugged in (§9):
     ///
     /// - the **functional** half is this rig, read *by this instrument*:
-    ///   `docs/doctor/linux-7.0-2026-08-21-800915b-dirty-wireflow-tier3{,-2,-3}.json`
-    ///   — 0 of 1024 delivered under backpressure, 1024 on release, 1024 in each
-    ///   control, both directions, three captures (on the `-dirty-` stamp these three
-    ///   carry, and what it does and does not cost, see [`WireFacts`]);
+    ///   `docs/doctor/linux-7.0-2026-08-22-4125348-tier3{,-2,-3}.json`
+    ///   — 0 of 1024 delivered under backpressure, 1024 on release **and
+    ///   `released_intact: true`** (the release was the payload's own continuation,
+    ///   not merely 1024 bytes of something), 1024 in each control, both
+    ///   directions, three captures, six cells of six, from a clean-stamped build.
+    ///   The superseded `…-800915b-dirty-wireflow-tier3*` triple read the same
+    ///   counts on the same bench but predates `released_intact`, so it licenses
+    ///   the count and not the content; see [`WireFacts`];
     /// - the **inert** half is the CDC-ACM bench of §15.62, whose 2×2 wrote 44672
     ///   bytes in all four cells with spread 0 — the same *shape*, scaled: the gated
     ///   cell equals its controls. **That reading was taken by a bespoke 2×2 in that
@@ -13775,11 +13785,23 @@ mod tests {
         );
 
         // **The bench of record's own sentence, pinned.** `docs/doctor/
-        // linux-7.0-2026-08-21-800915b-dirty-tier3.json` carries P15's consequence
-        // ending "2 of 2 named port(s) honoured it on read-back … so this reading
-        // clears these port(s) rather than merely describing them", from two ports
-        // whose cross-check agreed. Splitting the count must leave that capture
-        // reproducible, or the repair would have silently invalidated the artifact
+        // linux-7.0-2026-08-22-4125348-tier3{,-2,-3}.json` carry P15's consequence
+        // *containing* "2 of 2 named port(s) honoured it on read-back … so this
+        // reading clears these port(s) rather than merely describing them", from two
+        // ports whose cross-check agreed — `software_flow_control
+        // .shipped_predicate_agrees` is `true` on both named ports in all three —
+        // the clean-stamped re-capture of the bench, carrying the same clause as the
+        // `…-800915b-dirty-tier3.json` capture it supersedes. **It does not *end*
+        // there, and an earlier draft of this comment said it did.** Measured
+        // 2026-08-22 over the working tree's `docs/doctor/*.json`: seventeen
+        // artifacts contain the clause and **eleven end with it** — including
+        // `…-800915b-dirty-tier3.json`, so the "same sentence" half stands for that
+        // capture and not for this triple. The six that continue past it are exactly
+        // the two triples carrying plan §18 item 85's `wire_flow_control` block,
+        // whose consequence goes on to report the on-the-wire reading. The assertion
+        // below is therefore a `contains` and not an `ends_with`, which is what the
+        // artifacts license. Splitting the count must leave those captures
+        // reproducible, or the repair would have silently invalidated the artifacts
         // the item was executed against.
         let (_, c) = p15_verdict(
             1,

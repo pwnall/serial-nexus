@@ -3487,6 +3487,22 @@ for is one the next review cannot check was fixed — item 16's lesson.
     each, and this entry has Linux only; the macOS expectation file carries the same clause, so the
     first Darwin Tier-3 run after this lands is what discharges the other half, and until then no
     cross-kernel statement about this cell is licensed.
+    *The clean capture cited above is superseded, 2026-08-22, and this item's state does not move.*
+    `docs/doctor/linux-7.0-2026-08-21-800915b-dirty-tier3.json` was taken from an uncommitted tree
+    and predates item 85's `wire_flow_control` cell entirely, so the record needed two artifacts to
+    carry two readings of one probe. A clean tier-3 triple on the same FT232R fixture now carries
+    both: `docs/doctor/linux-7.0-2026-08-22-4125348-tier3{,-2,-3}.json`, `build.commit`
+    `412534867464` with **no `-dirty` suffix**, `field_set` `b73dba8f32301a84`, `probe_set`
+    unchanged at `4317ea5ac187f506` so **no era closes** (§13's era law clause 4), Linux
+    7.0.0-30-generic, FTDI `0403:6001` serials `BH00L4KU` ↔ `BH00LW9U`. In all three captures and on
+    both ports, `software_flow_control.shipped_predicate_agrees` reads `true` and the row's
+    top-level hardware `shipped_predicate_agrees` reads `true` — this entry's clean control, taken
+    again on a committed binary — beside the six `gated` `wire_flow_control` cells item 85's third
+    bound reports. `jq -e -f expectations/linux.jq` exits **0** on the superseded capture and on all
+    three of the new triple, measured at `4125348`. **The superseded capture is kept, not deleted**:
+    a `-dirty` stamp denies rung 2 of §13's comparability ladder (*same binary*), never the reading,
+    and it is the clean control this entry's two planted captures were read against. The bound on the
+    *other* kernel is untouched — still Linux only. Notes §3.152.
     The superseded filing follows. *Original state:* open (S/M).
     *Evidence, and why it changed status rather than being
     new:* P15 computes `shipped_predicate_agrees` for the **hardware** mode only —
@@ -4044,8 +4060,11 @@ different mechanisms and a later reader chasing any one of them wants its own ev
     `ftdi_sio`, `BH00L4KU` ↔ `BH00LW9U`, Linux 7.0.0-30). **Every other arm, `inert` included, has
     executed only under a fixture.** A first draft of this entry cited a CDC-ACM capture for the
     `inert` arm. **No such capture exists** — `grep -l wire_flow_control docs/doctor/*.json` returns
-    those three files and nothing else — because §15.62's 2×2 was a bespoke instrument in that
-    session and this probe did not exist yet. The fixture that carries `inert` is a *model* of that
+    those three files and nothing else [**count annotated 2026-08-22**: the same command now returns
+    **six** — those three plus `docs/doctor/linux-7.0-2026-08-22-4125348-tier3{,-2,-3}.json`, the
+    triple in the third bound below. All six are FT232R, so the sentence's claim — no CDC-ACM
+    artifact carries a `wire_flow_control` block — is unchanged] — because §15.62's 2×2 was a
+    bespoke instrument in that session and this probe did not exist yet. The fixture that carries `inert` is a *model* of that
     reading, and it is a model of the shape rather than a replay of the numbers. **The fabrication
     is recorded rather than quietly corrected**, because it is the failure mode this ledger keeps
     finding one register down: a citation that reads as measurement, in an entry whose whole subject
@@ -4057,6 +4076,39 @@ different mechanisms and a later reader chasing any one of them wants its own ev
     committed captures. So the release figure those artifacts license is **1024 bytes back**, not
     *the payload back*, and the content half is asserted in the fixtures only until a capture on
     this bench carries it.
+    ***Third bound, and it closes the second: 2026-08-22, a capture on this bench carries it.***
+    A clean tier-3 triple on the same FT232R fixture —
+    `docs/doctor/linux-7.0-2026-08-22-4125348-tier3{,-2,-3}.json`, `build.commit` `412534867464`
+    with **no `-dirty` suffix**, Linux 7.0.0-30-generic on Ubuntu 26.04 LTS, FTDI `0403:6001`
+    serials `BH00L4KU` ↔ `BH00LW9U`, P5 reading *5-wire crossover: RTS/CTS both ways, DTR moves
+    nothing* — carries `released_intact` in **6 of 6** cells (two ports
+    × three captures) and every one reads `true`. Each cell: `reading: "gated"`,
+    `honoured_on_the_wire: true`, `flag_on_peer_not_ready.bytes_delivered_to_the_peer: 0` of
+    `payload_bytes: 1024`, `released_after_peer_raised_rts: 1024`, `cts_after_release: true`,
+    against `control_flag_off_peer_not_ready` and `control_flag_on_peer_ready` each delivering 1024
+    with `delivered_intact: true`. The cell's own `why` now carries the claim in the artifact rather
+    than in this entry: *"0 of 1024 bytes crossed while the peer held RTS low, and 1024 arrived once
+    the peer raised it — byte-for-byte the payload's continuation — against 1024 and 1024 in the two
+    control cells on the same wire."* **So the release figure this bench licenses is the payload
+    back, not 1024 bytes back**, and the content half is no longer fixture-only.
+    *The first bound is untouched and still binds:* exactly **one** arm has been read off hardware,
+    `gated`; `inert`, `partly-gated`, `gated-then-lost`, `no-cts-path` and `unmeasurable` have run
+    under fixtures and on no bench, on this triple exactly as on the last.
+    *Cost, re-measured rather than carried forward.* `field_set` moves `9a75a9f83a83a617` →
+    `b73dba8f32301a84`, emission matching recompute on all three
+    (`serial-nexus-doctor --field-set <report>`), while `probe_set` is unchanged at
+    `4317ea5ac187f506`, so **no era closes** (§13's era law clause 4). Leaf paths **621 → 623**,
+    diffed path-by-path rather than counted: the two additions are
+    `P15.<port>.wire_flow_control.released_intact`, one per port, and **nothing was removed** — so
+    the cell's 24 leaf keys per measured port, above, are now **25**.
+    *The superseded three are kept, not deleted*, as this record already keeps its `8c00078-dirty`
+    rows: a `-dirty` stamp denies rung 2 of §13's comparability ladder (*same binary*), never the
+    reading. `jq -e -f expectations/linux.jq` exits **0** on all three of the new triple and **1**
+    on all three wireflow captures — measured both ways at `4125348`, and the second is the ordinary
+    state of a frozen artifact that predates a clause (§16.13), breaking no lane.
+    ***The part worth keeping cost nothing to learn:*** the triple was taken only to drop a
+    provenance stamp, and it moved `field_set`. The code had moved under the artifact between the
+    capture and the commit, and nothing in the reading says so — notes §3.152.
     *Cost, and it is the second of the two `field_set` moves these two items make between them —
     the chain is readable in the artifacts and no wider claim about the session is made.*
     `field_set` moves

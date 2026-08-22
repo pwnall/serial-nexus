@@ -15789,7 +15789,10 @@ hardware: the FT232R's `gated`.** `inert`, `partly-gated`, `gated-then-lost`, `n
 capture's `inert`" as the other half of the discrimination pair; `grep -l wire_flow_control
 docs/doctor/*.json` returns exactly three files, all FT232R, all reading `gated`, and **no CDC-ACM
 artifact carries a `wire_flow_control` block at all** — those captures are 2026-08-16/17, before the
-cell existed. §15.62's inert finding is real and was taken with that session's bespoke 2×2; it is not
+cell existed. [**Count annotated 2026-08-22 — §3.152**: the same command now returns **six**, those
+three plus the clean triple `docs/doctor/linux-7.0-2026-08-22-4125348-tier3{,-2,-3}.json`. All six
+are FT232R and all six read `gated`, so every claim in the sentence holds and only its count
+moved.] §15.62's inert finding is real and was taken with that session's bespoke 2×2; it is not
 a capture of this instrument. A second fabricated citation in the same file named a date,
 `2026-08-22`, that had not happened. **Both were caught by an adversarial pass running `ls`, not by
 reading** — the standing shape of this session, and §3.140's and §3.145's class arriving in a doc
@@ -15816,6 +15819,9 @@ and they are untracked as this entry is written: AGENTS §7 wants a *committed* 
 claim, so they must land in the same commit as the prose that cites them. Replacement captures taken
 with the repaired binary, passing `jq -e` with exit 0, exist and were measured; adopting them instead
 means updating the three citation sites in `doctor/src/probes.rs` that name the originals.
+**Discharged 2026-08-22 — §3.152.** The replacements were re-taken on a committed binary and land
+here; `doctor/src/probes.rs` cites them, the three originals are kept with their limitation stated,
+and the re-capture turned out to close item 85's second bound rather than only to drop a stamp.
 
 ### 3.148 Item 31: the recipes executed, two sandboxes that proved nothing, and a class nobody flipped
 
@@ -16229,3 +16235,90 @@ carry `SPECS_TOTAL` at all. Its figures were measured by hand on this box with `
 is a different thing from a lane having gated on them. Item 31's entry had been careful to say this
 about its own root assertions and item 107's had not; it says it now. **A fix that lands
 self-skipping is not yet a guard, and an entry that does not say so reads as though it were.**
+
+### 3.152 A capture dates the tree it was taken from, not the tree that ships
+
+The job was provenance and nothing else: item 73's and item 85's readings stood on four captures
+stamped `800915bf4078-dirty`, and §3.147's closing paragraph left the replacement as owed work with
+a trap attached — three artifacts cited in prose, `jq -e` failing on all three, and, when that
+paragraph was written, none of them committed. A clean tier-3 triple was taken on the FT232R fixture with a committed binary:
+`docs/doctor/linux-7.0-2026-08-22-4125348-tier3{,-2,-3}.json`, `build.commit` `412534867464` with
+**no `-dirty` suffix**, Linux 7.0.0-30-generic on Ubuntu 26.04 LTS, FTDI `0403:6001` serials
+`BH00L4KU` ↔ `BH00LW9U`, P5 reading *5-wire crossover: RTS/CTS both ways, DTR moves nothing*, all
+six DTR crossings `false`. `jq -e -f expectations/linux.jq` exits **0** on all three.
+
+**The finding is not that a capture was re-taken. It is that a re-capture taken only to remove a
+provenance stamp moved `field_set` and closed a stated bound.** The superseded triple's digest is
+`9a75a9f83a83a617`; the new one's is `b73dba8f32301a84`. Diffed path by path rather than counted,
+the delta is **one nested observation key added and none removed** —
+`P15.<port>.wire_flow_control.released_intact`, twice, once per port — so the digest's input goes
+**621 → 623** leaf paths and the wire cell's 24 leaf keys per measured port become **25**. Emission
+matches recompute on all three (`serial-nexus-doctor --field-set <report>` against the `build`
+block). `probe_set` is unchanged at `4317ea5ac187f506`, so **no era closes** (§13's era law
+clause 4), and the roster stays P1–P16.
+
+**The digest moved on a re-capture whose byte counts did not, which is the whole reason the digest
+exists — and the reading was not quite untouched either.** The two triples were taken on the same
+bench four hours apart (`generated_utc` `2026-08-22T01:13:45Z` and
+`2026-08-22T05:18:30Z`) at the same rate and payload, and they report the same six `gated` cells with
+the same byte counts, cell for cell: `0/1024` delivered under backpressure, `1024` released, `1024`
+in each control, both ports, three captures each. **Two keys separate them, and the digest can see
+only one of the two.** Diffed cell for cell over both ports in all three capture pairs, the
+`wire_flow_control` objects differ in exactly `released_intact` — absent, then `true` — and `why`,
+whose sentence gains the clause *— byte-for-byte the payload's continuation —*; the other
+**twenty-three** keys are byte-identical in every pair, the twelve of the three delivery cells and
+`reading`, `honoured_on_the_wire`, `cts_after_release`, `released_after_peer_raised_rts`, `asks`,
+`baud`, `measured`, `payload_bytes`, `peer_port`, `receive_window_ms` and `does_not_license`. So the
+sentence an operator reads changed too, and it reaches the Markdown twin as well as the JSON —
+`to_markdown` renders every observation value through `render_value`, which is what makes the
+committed twins print a nested cell as `modem[cts=false dsr=false …]`. **What the digest could not
+have caught is that half:** `field_set` digests leaf *paths* and never values (`report.rs`'s
+`field_set_fingerprint`, choice 1), so the added key moved it and the rewritten sentence could not
+have. **What the reading could not have caught is the other half, which is the entry's point:**
+`released_intact` did not exist when the first was taken: `git grep -c released_intact
+800915b -- doctor/ expectations/ itest/` returns **nothing**, while the same command at `582c65f`
+returns `doctor/src/probes.rs:16`, `expectations/linux.jq:2`, `expectations/macos.jq:2` and
+`itest/tests/expectation_gates.rs:2`. The final repair round added the key *after* the capture and
+*before* the commit, and §3.147 already records why the stamp cannot say so — four different trees in
+that session all stamp `800915bf4078-dirty`, because `-dirty` names *an* uncommitted tree and never
+*which* one. **An artifact captured mid-session dates the tree it was taken from, not the tree that
+ships**, and on a session that repairs its own instrument those are routinely different trees.
+
+**What the closure buys, stated in the ledger and repeated here because it is a real bound coming
+off.** Plan §18 item 85's second bound read *"those three captures predate `released_intact`, so
+they license 1024 bytes back, not the payload back."* On the clean triple, **6 of 6** cells (two
+ports × three captures) read `reading: "gated"`, `honoured_on_the_wire: true`,
+**`released_intact: true`**, `flag_on_peer_not_ready.bytes_delivered_to_the_peer: 0` of
+`payload_bytes: 1024`, `released_after_peer_raised_rts: 1024`, `cts_after_release: true`, against
+`control_flag_off_peer_not_ready` and `control_flag_on_peer_ready` each delivering 1024 with
+`delivered_intact: true`. The cell's own `why` now states the claim inside the artifact: *"0 of 1024
+bytes crossed while the peer held RTS low, and 1024 arrived once the peer raised it — byte-for-byte
+the payload's continuation — against 1024 and 1024 in the two control cells on the same wire."*
+**The item's other bound is untouched:** exactly one arm, `gated`, has been read off hardware;
+`inert`, `partly-gated`, `gated-then-lost`, `no-cts-path` and `unmeasurable` remain fixture-only.
+Item 73's capture is superseded by the same triple, which carries both readings —
+`software_flow_control.shipped_predicate_agrees: true` and the row's top-level hardware
+`shipped_predicate_agrees: true`, both ports, all three — and that item's state does not move.
+
+**The three superseded captures are kept, not deleted, and they now fail the gate.** `jq -e -f
+expectations/linux.jq` exits **1** on all three wireflow artifacts and **0** on
+`…-800915b-dirty-tier3.json`, which carries no `wire_flow_control` block at all and is tolerated by
+the clause for exactly that reason. A frozen artifact that predates a clause is the ordinary state of
+`docs/doctor/` (§16.13) and breaks no lane; this record already keeps its `8c00078-dirty` rows on the
+same terms. What a `-dirty` stamp denies is rung 2 of §13's comparability ladder — *same binary* —
+never the reading.
+
+***A check whose passing output was identical to its failing output, found in this session's own
+verification and not in the product.*** The first verification pass ran two loops shaped like this,
+
+    for f in …; do jq -e -f expectations/linux.jq "$f" >/dev/null 2>&1; echo "$(basename $f) exit=$?"; done
+
+and between them reported **exit 0 for all seven** artifacts, three of which fail. `$(basename $f)` is a command
+substitution: it runs before `$?` is expanded and resets it to its own status, which is 0. The loop
+was not reading `jq`'s exit code at all, and its output was byte-identical to what a fully-green
+sweep would print. It was caught by re-running one file by hand because the answer disagreed with
+§3.147's recorded prediction — the prediction, not the reading, is what caught it. This is AGENTS
+§3's tell arriving one level below the tree's gates, in the shell that *verifies* them: **the
+measurement harness is not exempt from the rule it is measuring**, and the cheap defence is the one
+that worked — a figure that contradicts a written prediction gets re-run one file at a time before
+either is believed.

@@ -6432,6 +6432,34 @@ move from closing anything, while `expectations/*.jq` requires each field from t
 so a Tier-3 capture satisfies that gate on the day it is taken and is cited afterwards under §16.13
 for the readings it carries, never for its exit status.
 
+*Annotated 2026-08-22 — both halves of the sentence above came off, and the paragraph's corpus
+figure moves with them. The original stands as the dated record of what was true when this entry was
+written (AGENTS §5).* A clean Tier-3 triple was taken on the same FT232R fixture and committed:
+`docs/doctor/linux-7.0-2026-08-22-4125348-tier3{,-2,-3}.json`, `build.commit` `412534867464` with
+**no `-dirty`**, `field_set` **`b73dba8f32301a84`** — the digest this paragraph names as the
+instrument's current one — and `probe_set` unchanged at `4317ea5ac187f506`, so **no era closes**
+(§13's era law clause 4). P5 reads the same
+`5-wire crossover: RTS/CTS both ways, DTR moves nothing` on `BH00L4KU` ↔ `BH00LW9U` in all three, so
+the bench is not a variable across the two triples either. **6 of 6** cells — both named ports ×
+three captures — read `reading: "gated"`, `honoured_on_the_wire: true` and **`released_intact:
+true`**, against `flag_on_peer_not_ready.bytes_delivered_to_the_peer: 0` of `payload_bytes: 1024`,
+`released_after_peer_raised_rts: 1024`, `cts_after_release: true`, and 1024 delivered with
+`delivered_intact: true` in each of the two control cells. So the corpus now holds three captures of
+this instrument at the current digest, and the **content** comparison has executed on hardware rather
+than under fixture only. `jq -e -f expectations/linux.jq` exits **0** on all three (measured
+2026-08-22), while the three `-dirty-wireflow-` captures cited above stay frozen and still exit
+**1** — §16.13's ordinary state, not a broken gate — so the paragraph's corpus figure becomes **18
+of 18** passive and **4 of 29** Tier-3, from 1 of 26, re-measured the same day by running each
+platform's expectation file over every current-era capture in `docs/doctor/`. **Three bounds above
+are untouched, and the first is the one worth restating.** Exactly one *arm*, `gated`, has been read
+off hardware: `released_intact` has answered `true` on this bench and has answered `false` nowhere —
+only these three artifacts carry the key at all — so `gated-then-lost`, the arm that comparison
+exists to separate, remains fixture-only alongside `inert`, `partly-gated`, `no-cts-path` and
+`unmeasurable`. The CDC-ACM paragraph stands unchanged: the transport whose defect prompted the
+measurement is still the transport this instrument cannot be run on. And what the `-dirty` stamp
+denied was rung 2 of §13's ladder for those three artifacts, never their reading. Notes §3.152
+carries the re-capture and the digest arithmetic.
+
 **Era, and it is the reason `question` was left alone.** Widening P15's `question` string is a
 `probe_set` move, which would close an era for a wording change — §15.59's first step, repeated on
 purpose — so the string is unchanged, `probe_set` stays `4317ea5ac187f506`, and **no era closes**
